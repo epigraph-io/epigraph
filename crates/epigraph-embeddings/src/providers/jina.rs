@@ -225,7 +225,7 @@ impl JinaProvider {
 
     /// Track token usage
     fn track_tokens(&self, tokens: usize) {
-        let mut usage = self.token_usage.lock().unwrap();
+        let mut usage = self.token_usage.lock().unwrap_or_else(|e| e.into_inner());
         usage.add(&TokenUsage::new(tokens));
     }
 
@@ -466,11 +466,11 @@ impl EmbeddingService for JinaProvider {
     }
 
     fn token_usage(&self) -> TokenUsage {
-        self.token_usage.lock().unwrap().clone()
+        self.token_usage.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn reset_token_usage(&self) {
-        let mut usage = self.token_usage.lock().unwrap();
+        let mut usage = self.token_usage.lock().unwrap_or_else(|e| e.into_inner());
         *usage = TokenUsage::default();
     }
 
