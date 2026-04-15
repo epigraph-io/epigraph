@@ -1189,6 +1189,7 @@ dependencies = [
  "epigraph-embeddings",
  "epigraph-engine",
  "epigraph-events",
+ "epigraph-interfaces",
  "futures",
  "hex",
  "hmac",
@@ -1258,6 +1259,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "epigraph-crypto",
+ "epigraph-interfaces",
  "hex",
  "proptest",
  "serde",
@@ -1386,6 +1388,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "epigraph-interfaces"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
  "uuid",
 ]
 

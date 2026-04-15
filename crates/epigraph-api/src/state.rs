@@ -17,6 +17,11 @@ use epigraph_core::Claim;
 use epigraph_embeddings::EmbeddingService;
 use epigraph_engine::{DatabasePropagator, PropagationConfig, PropagationOrchestrator};
 use epigraph_events::EventBus;
+use epigraph_interfaces::{
+    EncryptionProvider, NoOpEncryptionProvider,
+    OrchestrationBackend, NoOpOrchestrationBackend,
+    PolicyGate, NoOpPolicyGate,
+};
 use serde::{Deserialize, Serialize};
 
 /// Cached submission for idempotency
@@ -104,6 +109,24 @@ pub type SharedEmbeddingService = Arc<dyn EmbeddingService>;
 /// When absent, the endpoint returns 503 Service Unavailable.
 pub type SharedHarvesterClient = Arc<dyn HarvesterClient>;
 
+/// Thread-safe encryption provider type alias
+///
+/// Defaults to [`NoOpEncryptionProvider`] (pass-through). Enterprise deployments
+/// replace this with an AES-256-GCM group-keyed implementation at startup.
+pub type SharedEncryptionProvider = Arc<dyn EncryptionProvider>;
+
+/// Thread-safe policy gate type alias
+///
+/// Defaults to [`NoOpPolicyGate`] (allow all). Enterprise deployments replace
+/// this with an RBAC/ABAC enforcement implementation at startup.
+pub type SharedPolicyGate = Arc<dyn PolicyGate>;
+
+/// Thread-safe orchestration backend type alias
+///
+/// Defaults to [`NoOpOrchestrationBackend`] (silent drop). Enterprise deployments
+/// replace this with a durable task queue implementation at startup.
+pub type SharedOrchestrationBackend = Arc<dyn OrchestrationBackend>;
+
 /// Application state shared across all request handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -184,19 +207,24 @@ pub struct AppState {
     /// Used by the /oauth/revoke and bearer middleware.
     revoked_tokens: Arc<std::sync::RwLock<HashSet<String>>>,
 
-    /// Optional encryption provider — defaults to no-op (passthrough).
-    /// Enterprise: wire in `Arc<epigraph_privacy::PrivacyEncryptionProvider>`.
-    pub encryption_provider:
-        Option<std::sync::Arc<dyn epigraph_core::extensions::EncryptionProvider>>,
+    /// Encryption provider for subgraph key management.
+    ///
+    /// Defaults to [`NoOpEncryptionProvider`] (pass-through). Enterprise
+    /// deployments inject an AES-256-GCM implementation via `with_encryption_provider`.
+    /// Handlers check `is_active()` to skip metadata writes when the no-op is active.
+    pub encryption_provider: SharedEncryptionProvider,
 
-    /// Optional policy gate — defaults to no-op (allow-all).
-    /// Enterprise: wire in `Arc<epigraph_policy::RbacPolicyGate>`.
-    pub policy_gate: Option<std::sync::Arc<dyn epigraph_core::extensions::PolicyGate>>,
+    /// Policy gate for RBAC/ABAC enforcement.
+    ///
+    /// Defaults to [`NoOpPolicyGate`] (allow all). Enterprise deployments inject
+    /// a real enforcement implementation via `with_policy_gate`.
+    pub policy_gate: SharedPolicyGate,
 
-    /// Optional orchestration backend — defaults to no-op (returns Err on schedule).
-    /// Enterprise: wire in `Arc<epigraph_orchestrator::TaskOrchestrator>`.
-    pub orchestration_backend:
-        Option<std::sync::Arc<dyn epigraph_core::extensions::OrchestrationBackend>>,
+    /// Orchestration backend for durable task scheduling.
+    ///
+    /// Defaults to [`NoOpOrchestrationBackend`] (silent drop). Enterprise deployments
+    /// inject a durable queue implementation via `with_orchestration_backend`.
+    pub orchestration_backend: SharedOrchestrationBackend,
 }
 
 /// API configuration options
@@ -231,9 +259,9 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: None,
-            policy_gate: None,
-            orchestration_backend: None,
+            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
+            policy_gate: Arc::new(NoOpPolicyGate::new()),
+            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
         }
     }
 
@@ -275,9 +303,9 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: None,
-            policy_gate: None,
-            orchestration_backend: None,
+            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
+            policy_gate: Arc::new(NoOpPolicyGate::new()),
+            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
         }
     }
 
@@ -304,9 +332,9 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: None,
-            policy_gate: None,
-            orchestration_backend: None,
+            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
+            policy_gate: Arc::new(NoOpPolicyGate::new()),
+            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
         }
     }
 
@@ -335,9 +363,9 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: None,
-            policy_gate: None,
-            orchestration_backend: None,
+            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
+            policy_gate: Arc::new(NoOpPolicyGate::new()),
+            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
         }
     }
 
@@ -366,9 +394,9 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: None,
-            policy_gate: None,
-            orchestration_backend: None,
+            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
+            policy_gate: Arc::new(NoOpPolicyGate::new()),
+            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
         }
     }
 
@@ -399,9 +427,9 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: None,
-            policy_gate: None,
-            orchestration_backend: None,
+            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
+            policy_gate: Arc::new(NoOpPolicyGate::new()),
+            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
         }
     }
 
@@ -495,6 +523,36 @@ impl AppState {
         self.challenge_service = service;
         self
     }
+
+    /// Inject an enterprise encryption provider (builder pattern).
+    ///
+    /// Replaces the default [`NoOpEncryptionProvider`] with a real AES-256-GCM
+    /// implementation. Must be called at startup before the router is created.
+    #[must_use]
+    pub fn with_encryption_provider(mut self, provider: SharedEncryptionProvider) -> Self {
+        self.encryption_provider = provider;
+        self
+    }
+
+    /// Inject an enterprise policy gate (builder pattern).
+    ///
+    /// Replaces the default [`NoOpPolicyGate`] with a real RBAC/ABAC implementation.
+    /// Must be called at startup before the router is created.
+    #[must_use]
+    pub fn with_policy_gate(mut self, gate: SharedPolicyGate) -> Self {
+        self.policy_gate = gate;
+        self
+    }
+
+    /// Inject an enterprise orchestration backend (builder pattern).
+    ///
+    /// Replaces the default [`NoOpOrchestrationBackend`] with a durable queue
+    /// implementation. Must be called at startup before the router is created.
+    #[must_use]
+    pub fn with_orchestration_backend(mut self, backend: SharedOrchestrationBackend) -> Self {
+        self.orchestration_backend = backend;
+        self
+    }
 }
 
 impl Default for ApiConfig {
@@ -508,16 +566,18 @@ impl Default for ApiConfig {
 
 #[cfg(test)]
 mod extension_wiring_tests {
-    use epigraph_core::extensions::{NoOpEncryption, NoOpOrchestration, NoOpPolicyGate};
+    use epigraph_interfaces::{
+        NoOpEncryptionProvider, NoOpOrchestrationBackend, NoOpPolicyGate,
+    };
     use std::sync::Arc;
+    use super::{SharedEncryptionProvider, SharedOrchestrationBackend, SharedPolicyGate};
 
     #[test]
     fn appstate_accepts_noop_providers() {
         // Verifies the trait objects are correctly declared Send + Sync.
-        let _enc: Arc<dyn epigraph_core::extensions::EncryptionProvider> = Arc::new(NoOpEncryption);
-        let _pol: Arc<dyn epigraph_core::extensions::PolicyGate> = Arc::new(NoOpPolicyGate);
-        let _orc: Arc<dyn epigraph_core::extensions::OrchestrationBackend> =
-            Arc::new(NoOpOrchestration);
+        let _enc: SharedEncryptionProvider = Arc::new(NoOpEncryptionProvider::new());
+        let _pol: SharedPolicyGate = Arc::new(NoOpPolicyGate::new());
+        let _orc: SharedOrchestrationBackend = Arc::new(NoOpOrchestrationBackend::new());
         // If this compiles, the trait objects are correctly declared Send + Sync.
     }
 }

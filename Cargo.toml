@@ -4,6 +4,7 @@ exclude = [
     "crates/epigraph-harvester",
 ]
 members = [
+    "crates/epigraph-interfaces",
     "crates/epigraph-core",
     "crates/epigraph-crypto",
     "crates/epigraph-ds",
@@ -62,6 +63,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 curve25519-dalek = "4"
 
 # Internal crates (kernel only)
+epigraph-interfaces = { path = "crates/epigraph-interfaces" }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
 epigraph-core = { path = "crates/epigraph-core" }
 epigraph-crypto = { path = "crates/epigraph-crypto" }
 epigraph-db = { path = "crates/epigraph-db" }

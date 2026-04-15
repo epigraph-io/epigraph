@@ -26,6 +26,7 @@ path = "src/bin/server.rs"
 
 
 [dependencies]
+epigraph-interfaces = { workspace = true }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
 epigraph-core = { workspace = true }
 epigraph-crypto = { workspace = true }
 epigraph-engine = { workspace = true }
