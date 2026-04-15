@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, properties, created_at, updated_at)\n        VALUES ($1, $2, $3, $4, $5, NULL, COALESCE($6, '{}'::jsonb), $7, $7)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bytea",
+        "Float8",
+        "Uuid",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7897306ad67744810a7810d75ba77dc1bde8e7959fe94376d63475536abc5cfc"
+}

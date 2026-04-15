@@ -1,0 +1,10 @@
+/target/
+*.env
+.env.*
+!.env.example
+data/
+backups/
+*.dump
+*.pkl
+*.pyc
+__pycache__/

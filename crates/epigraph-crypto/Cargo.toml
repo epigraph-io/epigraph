@@ -1,0 +1,36 @@
+[package]
+name = "epigraph-crypto"
+description = "Cryptographic primitives for EpiGraph: BLAKE3 hashing, Ed25519 signing, canonical serialization"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+bs58 = { workspace = true }  # Base58 encoding for did:key identifiers
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+subtle = { workspace = true }
+aes-gcm = { workspace = true }
+x25519-dalek = { workspace = true }
+curve25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+recrypt = []  # Placeholder for future true PRE backend
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[[bench]]
+name = "crypto_benchmarks"
+harness = false
+
+[lints]
+workspace = true

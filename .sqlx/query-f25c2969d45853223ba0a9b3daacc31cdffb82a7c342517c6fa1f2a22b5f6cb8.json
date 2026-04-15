@@ -1,0 +1,78 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id, canonical_name, type_top, type_sub, properties, is_canonical,\n                       merged_into, created_at,\n                       (1.0 - (embedding <=> $1::vector)) AS similarity\n                FROM entities\n                WHERE is_canonical = true\n                  AND embedding IS NOT NULL\n                  AND type_top = $2\n                  AND (1.0 - (embedding <=> $1::vector)) >= $3\n                ORDER BY embedding <=> $1::vector\n                LIMIT $4\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "canonical_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "type_top",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "type_sub",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "properties",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_canonical",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "merged_into",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "similarity",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "vector",
+            "kind": "Simple"
+          }
+        },
+        "Text",
+        "Float8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      null
+    ]
+  },
+  "hash": "f25c2969d45853223ba0a9b3daacc31cdffb82a7c342517c6fa1f2a22b5f6cb8"
+}

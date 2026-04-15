@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO reasoning_traces (\n                id, claim_id, reasoning_type, confidence, explanation, properties, created_at\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7)\n            RETURNING id, claim_id, reasoning_type, confidence, explanation, properties, created_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "claim_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "reasoning_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "confidence",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 4,
+        "name": "explanation",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "properties",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Varchar",
+        "Float8",
+        "Text",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e6a1ef7f9816262027a3e938fbce42a68e5c50f45da5090daaa3e27b721a9d85"
+}

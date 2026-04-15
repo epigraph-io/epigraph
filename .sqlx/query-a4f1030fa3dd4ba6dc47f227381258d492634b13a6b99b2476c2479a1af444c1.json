@@ -1,0 +1,75 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                id,\n                event_type,\n                agent_id,\n                success,\n                details,\n                ip_address::text AS ip_address,\n                user_agent,\n                correlation_id,\n                created_at\n            FROM security_events\n            WHERE\n                ($1::uuid IS NULL        OR agent_id   = $1)\n            AND ($2::text IS NULL        OR event_type = $2)\n            AND ($3::timestamptz IS NULL OR created_at >= $3)\n            AND ($4::timestamptz IS NULL OR created_at <= $4)\n            AND (NOT $5                  OR success = false)\n            ORDER BY created_at DESC\n            LIMIT $6\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "event_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "agent_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "success",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "details",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "ip_address",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "user_agent",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "correlation_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Bool",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      null,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "a4f1030fa3dd4ba6dc47f227381258d492634b13a6b99b2476c2479a1af444c1"
+}

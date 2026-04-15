@@ -1,0 +1,19 @@
+[package]
+name = "epigraph-ds"
+description = "Dempster-Shafer / TBM math for EpiGraph epistemic reasoning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+epigraph-core = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,79 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO evidence (\n                id, content_hash, evidence_type, source_url, raw_content,\n                claim_id, signature, signer_id, properties, created_at\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\n            RETURNING id, content_hash, evidence_type, raw_content, claim_id,\n                      signature, signer_id, properties, created_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "content_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 2,
+        "name": "evidence_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "raw_content",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "claim_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "signature",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 6,
+        "name": "signer_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "properties",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Varchar",
+        "Text",
+        "Text",
+        "Uuid",
+        "Bytea",
+        "Uuid",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "f3e3256ea41afb3dcb8eb8067a35c3a956c98f7bf48709acb916cfbd5153df62"
+}

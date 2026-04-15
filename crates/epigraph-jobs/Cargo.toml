@@ -1,0 +1,36 @@
+[package]
+name = "epigraph-jobs"
+description = "Background job runner and task processing for EpiGraph agentic framework"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+epigraph-core = { workspace = true }
+epigraph-db = { workspace = true }  # PostgreSQL repos for DB-backed reputation service
+epigraph-engine = { workspace = true }  # For PropagationOrchestrator and Bayesian updates
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }  # For async trait definitions
+hmac = { workspace = true }  # HMAC for webhook signatures
+sha2 = { workspace = true }  # SHA-256 for HMAC-SHA256
+hex = { workspace = true }  # Hex encoding for signatures
+sqlx = { workspace = true }  # PostgreSQL persistence for job queue
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+proptest = { workspace = true }
+
+[features]
+default = []
+# Enable integration tests that require a live PostgreSQL database
+integration = []
+
+[lints]
+workspace = true

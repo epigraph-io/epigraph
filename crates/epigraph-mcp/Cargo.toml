@@ -1,0 +1,70 @@
+[package]
+name = "epigraph-mcp"
+description = "Full-framework MCP server for EpiGraph — delegates to workspace crates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Internal crates — the whole point: delegate, don't reimplement
+epigraph-core = { workspace = true }
+epigraph-crypto = { workspace = true }
+epigraph-db = { workspace = true }
+epigraph-ds = { workspace = true }
+epigraph-engine = { workspace = true }
+epigraph-embeddings = { workspace = true }
+
+# MCP protocol (no sqlx dep — coexists with workspace sqlx 0.7)
+rmcp = { workspace = true }
+schemars = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Identifiers & time
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# CLI
+clap = { workspace = true, features = ["derive", "env"] }
+
+# Logging (stderr — stdout reserved for MCP JSON-RPC)
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# HTTP client (for ingest_paper_url)
+reqwest = { workspace = true }
+
+# Crypto primitives
+hex = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+
+# Vendored OpenSSL for static (musl) builds
+openssl = { version = "0.10", features = ["vendored"], optional = true }
+
+# HTTP transport (axum 0.8 matches rmcp's streamable-http-server dep)
+axum = "0.8"
+
+[features]
+default = []
+vendored-openssl = ["dep:openssl"]
+
+[[bin]]
+name = "epigraph-mcp-full"
+path = "src/main.rs"
+
+[lints]
+workspace = true

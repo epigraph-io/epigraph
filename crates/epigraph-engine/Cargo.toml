@@ -1,0 +1,39 @@
+[package]
+name = "epigraph-engine"
+description = "Epistemic engine for EpiGraph: truth propagation, Bayesian updates, DAG validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+epigraph-core = { workspace = true }
+epigraph-crypto = { workspace = true }
+epigraph-ds = { workspace = true }
+ascent = { workspace = true }
+petgraph = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+chrono = { workspace = true }
+criterion = { workspace = true }
+proptest = { workspace = true }
+sqlx = { workspace = true }  # Live integration tests against PostgreSQL
+uuid = { workspace = true }  # Test claim/edge ID generation
+epigraph-ds = { workspace = true }  # DS types for frame/mass/measures tests
+
+[[bench]]
+name = "engine_benchmarks"
+harness = false
+
+[lints]
+workspace = true

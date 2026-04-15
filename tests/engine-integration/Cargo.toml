@@ -1,0 +1,15 @@
+[package]
+name = "engine-integration-tests"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[dependencies]
+epigraph-core = { path = "../../crates/epigraph-core" }
+epigraph-db = { path = "../../crates/epigraph-db" }
+epigraph-ds = { path = "../../crates/epigraph-ds" }
+epigraph-engine = { path = "../../crates/epigraph-engine" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }

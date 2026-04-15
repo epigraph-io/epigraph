@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO entity_mentions\n                    (entity_id, claim_id, surface_form, mention_role, confidence, extractor,\n                     span_start, span_end)\n                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n                RETURNING id\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Varchar",
+        "Float8",
+        "Varchar",
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7906908eb5aa0b6d9a62fa529e89908640d667aea2af57d09c4f7e2135bc0b6d"
+}

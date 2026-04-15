@@ -1,0 +1,73 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO entities (canonical_name, type_top, type_sub, embedding, properties)\n                VALUES ($1, $2, $3, $4::vector, $5)\n                ON CONFLICT (lower(canonical_name), type_top) WHERE is_canonical = true\n                DO UPDATE SET\n                    canonical_name = EXCLUDED.canonical_name,\n                    properties     = jsonb_strip_nulls(entities.properties || EXCLUDED.properties),\n                    embedding      = EXCLUDED.embedding\n                RETURNING id, canonical_name, type_top, type_sub, properties, is_canonical,\n                          merged_into, created_at\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "canonical_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "type_top",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "type_sub",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "properties",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_canonical",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "merged_into",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Varchar",
+        "Text",
+        {
+          "Custom": {
+            "name": "vector",
+            "kind": "Simple"
+          }
+        },
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "0128c3b96859992239a5ac6c2035d6fa6122554a021c5dacb12aeb008cd42e31"
+}

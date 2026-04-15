@@ -1,0 +1,124 @@
+[workspace]
+resolver = "2"
+exclude = [
+    "crates/epigraph-harvester",
+]
+members = [
+    "crates/epigraph-core",
+    "crates/epigraph-crypto",
+    "crates/epigraph-ds",
+    "crates/epigraph-db",
+    "crates/epigraph-embeddings",
+    "crates/epigraph-engine",
+    "crates/epigraph-api",
+    "crates/epigraph-cli",
+    "crates/epigraph-jobs",
+    "crates/epigraph-events",
+    "crates/epigraph-tools",
+    "crates/epigraph-mcp",
+    "crates/epigraph-ingest",
+    "tests/engine-integration",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/epigraph-io/epigraph"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3"
+toml = "0.8"
+
+# Identifiers
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Cryptography
+blake3 = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+subtle = "2"
+bs58 = "0.5"
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+curve25519-dalek = "4"
+
+# Internal crates (kernel only)
+epigraph-core = { path = "crates/epigraph-core" }
+epigraph-crypto = { path = "crates/epigraph-crypto" }
+epigraph-db = { path = "crates/epigraph-db" }
+epigraph-engine = { path = "crates/epigraph-engine" }
+epigraph-api = { path = "crates/epigraph-api" }
+epigraph-cli = { path = "crates/epigraph-cli" }
+epigraph-embeddings = { path = "crates/epigraph-embeddings", features = ["openai"] }
+epigraph-jobs = { path = "crates/epigraph-jobs" }
+epigraph-events = { path = "crates/epigraph-events" }
+epigraph-ds = { path = "crates/epigraph-ds" }
+epigraph-tools = { path = "crates/epigraph-tools" }
+epigraph-mcp = { path = "crates/epigraph-mcp" }
+epigraph-ingest = { path = "crates/epigraph-ingest" }
+
+# Graph algorithms
+petgraph = "0.7"
+ascent = "0.8"
+
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+
+# Database
+sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls", "macros", "migrate"] }
+
+# Vectors for embeddings
+pgvector = { version = "0.4", features = ["sqlx"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# API Documentation
+utoipa = { version = "5", features = ["chrono", "uuid"] }
+
+# CLI & Utilities
+clap = "4"
+reqwest = { version = "0.11", features = ["json"] }
+rmcp = { version = "0.15", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+schemars = "1"
+csv = "1.3"
+futures = "0.3"
+
+# Clustering
+linfa = "0.7"
+linfa-clustering = "0.7"
+ndarray = "0.15"
+
+# Text parsing
+regex = "1"
+
+# Testing
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+# pedantic and nursery are aspirational — opt in per-crate as the code matures

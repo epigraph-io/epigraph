@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: epigraph
+          POSTGRES_PASSWORD: epigraph
+          POSTGRES_DB: epigraph
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace
+      - name: Test (non-DB packages, parallel)
+        # Packages without DB tests can run fully in parallel.
+        # epigraph-engine has live integration tests that touch the DB,
+        # so it is excluded here and run sequentially below.
+        run: cargo test --workspace
+          --exclude epigraph-db
+          --exclude epigraph-api
+          --exclude epigraph-engine
+      - name: Test (epigraph-db, serialized)
+        # #[sqlx::test] creates a postgres template DB per binary; concurrent
+        # binaries race on _sqlx_migrations → "tuple concurrently updated".
+        # --test-threads=1 serializes within the binary; running packages
+        # sequentially prevents cross-binary races.
+        run: cargo test -p epigraph-db -- --test-threads=1
+      - name: Test (epigraph-api, serialized)
+        run: cargo test -p epigraph-api -- --test-threads=1
+      - name: Test (epigraph-engine, serialized)
+        run: cargo test -p epigraph-engine -- --test-threads=1
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+      - name: Format check
+        run: cargo fmt --check

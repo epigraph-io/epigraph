@@ -1,0 +1,274 @@
+// Harvester gRPC service definitions
+// Communication protocol between Rust orchestrator and Python intelligence worker
+
+syntax = "proto3";
+
+package harvester;
+
+// Main extraction service
+service ExtractionService {
+  // Process a single fragment
+  rpc ProcessFragment(FragmentRequest) returns (VerifiedGraph);
+
+  // Process multiple fragments in batch
+  rpc ProcessBatch(BatchRequest) returns (BatchResponse);
+
+  // Health check
+  rpc HealthCheck(HealthRequest) returns (HealthResponse);
+
+  // Streaming for large documents
+  rpc ProcessStream(stream FragmentRequest) returns (stream VerifiedGraph);
+}
+
+// ==================== Request Messages ====================
+
+message FragmentRequest {
+  string fragment_id = 1;
+  string source_id = 2;
+  bytes content_hash = 3;
+  string content_text = 4;
+  string context_window = 5;  // Surrounding text for context
+  Modality modality = 6;
+  FragmentMetadata metadata = 7;
+  ExtractionConfig config = 8;
+}
+
+message BatchRequest {
+  repeated FragmentRequest fragments = 1;
+  ExtractionConfig config = 2;
+}
+
+message HealthRequest {}
+
+// ==================== Response Messages ====================
+
+message VerifiedGraph {
+  string fragment_id = 1;
+  ExtractionStatus status = 2;
+  repeated ExtractedClaim claims = 3;
+  repeated ExtractedConcept concepts = 4;
+  repeated ExtractedRelation relations = 5;
+  AuditTrail audit_trail = 6;
+  float overall_confidence = 7;
+  string error_message = 8;  // Only set if status is error
+}
+
+message BatchResponse {
+  repeated VerifiedGraph results = 1;
+  int32 total_processed = 2;
+  int32 successful = 3;
+  int32 failed = 4;
+}
+
+message HealthResponse {
+  bool healthy = 1;
+  string model_name = 2;
+  string version = 3;
+  int64 uptime_seconds = 4;
+}
+
+// ==================== Domain Objects ====================
+
+message ExtractedClaim {
+  string id = 1;
+  string statement = 2;
+  string agent_name = 3;  // Who made this claim (author, cited study, etc.)
+  string reasoning_trace = 4;
+  Methodology methodology = 5;
+  repeated Citation citations = 6;
+  ClaimType claim_type = 7;
+  float confidence = 8;
+  bool low_confidence_flag = 9;
+}
+
+message ExtractedConcept {
+  string id = 1;
+  string name = 2;
+  string source_definition = 3;  // Definition from source text (if any)
+  string latent_definition = 4;  // Definition from LLM knowledge (if enriched)
+  string latent_source_model = 5;  // Model that provided latent definition
+  ConceptType concept_type = 6;
+}
+
+message ExtractedRelation {
+  string source_id = 1;  // ID of source claim or concept
+  string target_id = 2;  // ID of target claim or concept
+  RelationType relation_type = 3;
+  float weight = 4;
+}
+
+message Citation {
+  string quote = 1;
+  int32 char_start = 2;
+  int32 char_end = 3;
+}
+
+message FragmentMetadata {
+  string filename = 1;
+  string mime_type = 2;
+  int32 page_number = 3;
+  int64 char_offset_start = 4;
+  int64 char_offset_end = 5;
+  string section_title = 6;
+}
+
+// ==================== Audit Trail ====================
+
+message AuditTrail {
+  string extraction_id = 1;
+  SkepticReport skeptic_report = 2;
+  LogicianReport logician_report = 3;
+  VarianceReport variance_report = 4;
+  int32 synthesis_iterations = 5;
+  repeated string fixes_applied = 6;
+  TokenUsage token_usage = 7;
+  int64 processing_time_ms = 8;
+}
+
+message SkepticReport {
+  bool passed = 1;
+  int32 hallucinations_detected = 2;
+  int32 unsupported_claims = 3;
+  repeated SkepticFinding findings = 4;
+}
+
+message SkepticFinding {
+  string claim_id = 1;
+  FindingType finding_type = 2;
+  string explanation = 3;
+  Severity severity = 4;
+  string suggested_fix = 5;
+}
+
+message LogicianReport {
+  bool passed = 1;
+  int32 contradictions_found = 2;
+  int32 fallacies_detected = 3;
+  repeated LogicFinding findings = 4;
+}
+
+message LogicFinding {
+  repeated string claim_ids = 1;
+  LogicFindingType finding_type = 2;
+  string fallacy_name = 3;  // e.g., "ad hominem", "straw man"
+  string explanation = 4;
+}
+
+message VarianceReport {
+  bool passed = 1;
+  float similarity_score = 2;
+  int32 iterations = 3;
+  repeated string stable_entities = 4;
+  repeated string unstable_entities = 5;
+  float entity_jaccard = 6;
+  float claim_cosine = 7;
+}
+
+message TokenUsage {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 total_tokens = 3;
+  float estimated_cost_usd = 4;
+}
+
+// ==================== Configuration ====================
+
+message ExtractionConfig {
+  string primary_model = 1;
+  string fallback_model = 2;
+  float temperature = 3;
+  int32 max_tokens = 4;
+  CouncilConfig council = 5;
+  EnrichmentConfig enrichment = 6;
+}
+
+message CouncilConfig {
+  bool enable_skeptic = 1;
+  bool enable_logician = 2;
+  bool enable_variance_probe = 3;
+  int32 variance_iterations = 4;
+  float variance_temperature = 5;
+  float similarity_threshold = 6;
+}
+
+message EnrichmentConfig {
+  bool enabled = 1;
+  string enrichment_model = 2;
+  int32 max_concepts = 3;
+}
+
+// ==================== Enums ====================
+
+enum ExtractionStatus {
+  EXTRACTION_STATUS_UNSPECIFIED = 0;
+  SUCCESS = 1;           // All claims verified
+  LOW_CONFIDENCE = 2;    // Passed but flagged
+  PARTIAL_SUCCESS = 3;   // Some claims rejected
+  FAILED = 4;            // Complete failure
+  NO_CONTENT = 5;        // Empty/invalid input
+  TRANSIENT_ERROR = 6;   // Retry-able error
+}
+
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  TEXT = 1;
+  PDF = 2;
+  AUDIO = 3;
+}
+
+enum Methodology {
+  METHODOLOGY_UNSPECIFIED = 0;
+  DEDUCTIVE = 1;
+  INDUCTIVE = 2;
+  ABDUCTIVE = 3;
+  INSTRUMENTAL = 4;
+  EXTRACTION = 5;
+}
+
+enum ClaimType {
+  CLAIM_TYPE_UNSPECIFIED = 0;
+  FACTUAL = 1;
+  HYPOTHESIS = 2;
+  OPINION = 3;
+  DEFINITION = 4;
+}
+
+enum ConceptType {
+  CONCEPT_TYPE_UNSPECIFIED = 0;
+  ENTITY = 1;
+  PROCESS = 2;
+  PROPERTY = 3;
+  RELATION = 4;
+}
+
+enum RelationType {
+  RELATION_TYPE_UNSPECIFIED = 0;
+  SUPPORTS = 1;
+  REFUTES = 2;
+  ELABORATES = 3;
+  CITES = 4;
+  RELATES_TO = 5;
+}
+
+enum FindingType {
+  FINDING_TYPE_UNSPECIFIED = 0;
+  HALLUCINATION = 1;
+  UNSUPPORTED = 2;
+  MISQUOTE = 3;
+  EXAGGERATION = 4;
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  CRITICAL = 1;
+  MAJOR = 2;
+  MINOR = 3;
+}
+
+enum LogicFindingType {
+  LOGIC_FINDING_TYPE_UNSPECIFIED = 0;
+  CONTRADICTION = 1;
+  FALLACY = 2;
+  CIRCULAR_REASONING = 3;
+  MISSING_PREMISE = 4;
+}

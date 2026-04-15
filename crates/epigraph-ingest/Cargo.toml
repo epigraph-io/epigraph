@@ -1,0 +1,15 @@
+[package]
+name = "epigraph-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "v5"] }
+thiserror = { workspace = true }
+blake3 = "1"  # High-performance hashing for content-addressed atom IDs
+
+[lints]
+workspace = true

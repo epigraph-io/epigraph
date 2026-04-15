@@ -1,0 +1,151 @@
+[package]
+name = "epigraph-api"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2021"
+
+[features]
+default = ["db"]
+db = ["dep:epigraph-db", "dep:sqlx"]
+jina = ["epigraph-embeddings/jina"]
+genai = ["db"]  # LLM-dependent workflows; requires ANTHROPIC_API_KEY
+integration = []
+tls = ["axum-server"]  # TLS/HTTPS via axum-server + rustls (Caddy terminates TLS in production)
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+# Enterprise features: encrypted subgraphs, MPC, key rotation.
+# Enable only when epigraph-privacy is added as a dep (epigraph-enterprise repo).
+enterprise = []
+# Episcience features: structural isomorphism detection.
+# Enable only when epigraph-isomorphism is added as a dep (epigraph-io/episcience repo).
+episcience = []
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+
+[dependencies]
+epigraph-core = { workspace = true }
+epigraph-crypto = { workspace = true }
+epigraph-engine = { workspace = true }
+epigraph-embeddings = { workspace = true }
+epigraph-db = { workspace = true, optional = true }
+epigraph-ds = { workspace = true }  # Dempster-Shafer math for belief endpoints
+epigraph-events = { workspace = true }  # Event bus for pub/sub messaging
+# Enterprise and episcience deps are optional and not bundled in the kernel.
+# To enable, add the git dep and uncomment:
+# epigraph-privacy    = { git = "...", optional = true }
+# epigraph-isomorphism = { git = "...", optional = true }
+hmac = "0.12"  # HMAC signing for webhook payloads
+sha2 = "0.10"  # SHA-256 for webhook HMAC signatures
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }  # HTTP client for webhook delivery
+
+sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"], optional = true }
+
+axum = { workspace = true }  # Web framework
+axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }  # TLS support (feature-gated)
+tokio = { workspace = true }  # Async runtime
+tower = { version = "0.5", features = ["util", "timeout"] }  # Service abstraction
+tower-http = { version = "0.5", features = ["trace", "cors"] }  # HTTP middleware
+serde = { workspace = true }  # Serialization
+serde_json = { workspace = true }  # JSON support
+serde_with = { workspace = true }  # Helper macros for serde
+uuid = { workspace = true }  # UUID support
+chrono = { workspace = true }  # Date/time handling
+thiserror = { workspace = true }  # Error derive macros
+tracing = { workspace = true }  # Structured logging
+tracing-subscriber = { workspace = true }  # Logging subscriber
+subtle = "2.5"  # Constant-time comparison for signature verification
+hex = "0.4"  # Hex encoding for public keys
+base64 = "0.22"  # Base64 encoding for signatures
+utoipa = { workspace = true }  # OpenAPI documentation generation
+async-trait = { workspace = true }  # Async trait definitions for harvester client
+dotenvy = "0.15"  # Load .env file at startup
+prometheus-client = "0.22"  # Prometheus metrics exposition (GET /metrics)
+# OpenTelemetry — optional, enabled via --features otel
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
+nom = "8.0.0"
+jsonwebtoken = "9"        # JWT creation and validation
+rand = { workspace = true }  # Token generation, nonce generation
+blake3 = { workspace = true }  # Content hashing for refresh tokens
+ed25519-dalek = { workspace = true }  # Ed25519 agent assertion verification
+
+[dev-dependencies]
+axum-test = "14"  # Testing utilities for Axum
+tokio-test = "0.4"  # Async test utilities
+futures = "0.3"  # For concurrent test execution
+hex = "0.4"  # Hex decoding for signature tests
+http-body-util = "0.1"  # HTTP body utilities for collecting response bodies in tests
+epigraph-embeddings = { workspace = true }  # For embedding integration tests
+epigraph-db = { workspace = true }  # E2E encrypted subgraph tests
+blake3 = { workspace = true }  # Content hashing in E2E tests
+ed25519-dalek = { workspace = true }  # Agent signing keys in E2E tests
+rand = { workspace = true }  # Key generation in E2E tests
+
+[[test]]
+name = "db_integration_tests"
+path = "tests/integration/db_integration_tests.rs"
+
+[[test]]
+name = "signature_middleware_tests"
+path = "tests/middleware/signature_tests.rs"
+
+[[test]]
+name = "semantic_search_tests"
+path = "tests/routes/semantic_search_tests.rs"
+
+[[test]]
+name = "submit_packet_tests"
+path = "tests/routes/submit_packet_tests.rs"
+
+[[test]]
+name = "middleware_integration_tests"
+path = "tests/integration/middleware_integration_tests.rs"
+
+[[test]]
+name = "submit_persistence_tests"
+path = "tests/integration/submit_persistence_tests.rs"
+
+[[test]]
+name = "lineage_integration_tests"
+path = "tests/integration/lineage_integration_tests.rs"
+
+[[test]]
+name = "semantic_search_integration_tests"
+path = "tests/integration/semantic_search_integration_tests.rs"
+
+[[test]]
+name = "security_tests"
+path = "tests/security_tests.rs"
+
+[[test]]
+name = "signed_extractor_tests"
+path = "tests/extractors/signed_extractor_tests.rs"
+
+[[test]]
+name = "key_management_tests"
+path = "tests/key_management_tests.rs"
+
+[[test]]
+name = "audit_integration_tests"
+path = "tests/audit_integration_tests.rs"
+
+[[test]]
+name = "handler_audit_tests"
+path = "tests/handler_audit_tests.rs"
+
+[[test]]
+name = "rate_limit_tests"
+path = "tests/middleware/rate_limit_tests.rs"
+
+[[test]]
+name = "embedding_integration_tests"
+path = "tests/embedding_integration_tests.rs"
+
+[[test]]
+name = "rag_persistence_tests"
+path = "tests/integration/rag_persistence_tests.rs"

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO trace_parents (trace_id, parent_id)\n            VALUES ($1, $2)\n            ON CONFLICT (trace_id, parent_id) DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a6cad868feb490835164aa42bf9b5ecfb07996f2e83c4391f9a6c91fc2e68e08"
+}

@@ -1,0 +1,103 @@
+# EpiGraph CDST Calibration Constants
+# Ported from scripts/lib/cdst_bba.py (SciFact-calibrated, 0.948 F1)
+#
+# Mass function triplets are [base_support, base_against, base_ignorance].
+
+default_journal_reliability = 0.78
+
+# ── Methodology Profiles ────────────────────────────────────────────────────
+# Canonical profiles only. Aliases are in [methodology_aliases].
+# Each value is [base_support, base_against, base_ignorance].
+
+[methodology_profiles]
+legal_document_review    = [0.90, 0.02, 0.08]
+deductive_logic          = [0.85, 0.05, 0.10]
+meta_analysis            = [0.80, 0.05, 0.15]
+theoretical_derivation   = [0.80, 0.05, 0.15]
+statistical_analysis     = [0.75, 0.05, 0.20]
+bayesian_inference       = [0.70, 0.05, 0.25]
+computational            = [0.72, 0.05, 0.23]
+instrumental             = [0.80, 0.05, 0.15]
+inductive_generalization = [0.60, 0.08, 0.32]
+visual_inspection        = [0.55, 0.08, 0.37]
+observational            = [0.60, 0.08, 0.32]
+expert_elicitation       = [0.45, 0.10, 0.45]
+extraction               = [0.58, 0.07, 0.35]
+textbook_assertion       = [0.78, 0.04, 0.18]
+negative_result          = [0.70, 0.05, 0.25]
+default                  = [0.50, 0.08, 0.42]
+
+# ── Methodology Aliases ─────────────────────────────────────────────────────
+# Maps alternate names to canonical profile keys above.
+
+[methodology_aliases]
+deductive                = "deductive_logic"
+deductive_reasoning      = "deductive_logic"
+"meta-analysis"          = "meta_analysis"
+statistical              = "statistical_analysis"
+statistical_inference    = "statistical_analysis"
+bayesian                 = "bayesian_inference"
+computational_simulation = "computational"
+instrumental_measurement = "instrumental"
+experimental_observation = "instrumental"
+inductive                = "inductive_generalization"
+expert                   = "expert_elicitation"
+testimonial              = "expert_elicitation"
+llm_extraction           = "extraction"
+literature_synthesis     = "extraction"
+
+# ── Evidence Type Weights ───────────────────────────────────────────────────
+
+[evidence_type_weights]
+regulatory      = 1.0
+empirical       = 1.0
+statistical     = 0.9
+logical         = 0.85
+testimonial     = 0.6
+circumstantial  = 0.4
+conversational  = 0.3
+
+# ── Section Tier Weights ────────────────────────────────────────────────────
+# Fraction of informative mass retained (rest shifted to theta).
+
+[section_tier_weights]
+primary_provision = 1.0
+results      = 1.0
+methods      = 0.90
+discussion   = 0.70
+conclusion   = 0.65
+introduction = 0.50
+abstract     = 0.80
+other        = 0.75
+
+# ── Journal Reliability ─────────────────────────────────────────────────────
+
+[journal_reliability]
+"Nature"                  = 0.92
+"Science"                 = 0.92
+"Cell"                    = 0.90
+"The Lancet"              = 0.90
+"Nature Communications"   = 0.88
+"Physical Review Letters" = 0.88
+"PNAS"                    = 0.87
+"JACS"                    = 0.87
+"ACS Nano"                = 0.86
+"Chemical Reviews"        = 0.88
+"iScience"                = 0.82
+"Chemical Science"        = 0.84
+"MRS Bulletin"            = 0.83
+"Nanophotonics"           = 0.82
+"Annual Review"           = 0.88
+"arXiv preprint"          = 0.70
+"bioRxiv"                 = 0.70
+"chemRxiv"                = 0.70
+"medRxiv"                 = 0.70
+
+# ── Classifier Thresholds ───────────────────────────────────────────────────
+# Holdout sweep: 5-fold CV on 80% train, 0.940 F1 on 20% held-out test.
+
+[classifier_thresholds]
+nei_threshold          = 0.85
+support_threshold      = 0.15
+conflict_threshold     = 0.05
+has_opposing_threshold = 0.1

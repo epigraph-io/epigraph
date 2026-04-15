@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, canonical_name, type_top, type_sub, properties, is_canonical,\n                   merged_into, created_at\n            FROM entities\n            WHERE lower(canonical_name) = lower($1)\n              AND type_top = $2\n              AND is_canonical = true\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "canonical_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "type_top",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "type_sub",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "properties",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_canonical",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "merged_into",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "e906840994678bd5f03994cae083ee15102c5512250b12cf4ab5d8205cbd5712"
+}

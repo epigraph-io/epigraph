@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE agents\n            SET display_name = $2, labels = $3, orcid = $4, ror_id = $5, updated_at = NOW()\n            WHERE id = $1\n            RETURNING id, public_key, display_name, created_at, labels, orcid, ror_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "public_key",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 2,
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "labels",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 5,
+        "name": "orcid",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "ror_id",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "TextArray",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "cf76069d2c88280d4bb5148fb5eca01dfd25213a44b7ce6fd7e94000a636e53d"
+}

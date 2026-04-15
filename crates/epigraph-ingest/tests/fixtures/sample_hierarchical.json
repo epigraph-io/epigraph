@@ -1,0 +1,77 @@
+{
+  "source": {
+    "title": "The Advantage of Serial Entrepreneurs",
+    "doi": "10.1234/test-serial-ent",
+    "source_type": "Paper",
+    "authors": [
+      {"name": "Shaw, K.", "affiliations": ["Stanford University"]},
+      {"name": "Sorensen, A.", "affiliations": ["Stanford University"]}
+    ],
+    "journal": "Management Science",
+    "year": 2019,
+    "metadata": {}
+  },
+  "thesis": "Serial entrepreneurs outperform novice entrepreneurs due to transferable learning across ventures, not selection effects.",
+  "thesis_derivation": "TopDown",
+  "sections": [
+    {
+      "title": "Introduction",
+      "summary": "Prior literature debates whether serial entrepreneur advantage comes from innate ability (selection) or accumulated experience (learning). This paper uses Danish register data to distinguish the two.",
+      "paragraphs": [
+        {
+          "compound": "Serial entrepreneurs are defined as founders of more than one firm. Approximately 10% of Danish entrepreneurs are serial, with 73% operating as portfolio entrepreneurs running concurrent ventures.",
+          "supporting_text": "We define serial entrepreneurs as founders of more than one firm...",
+          "atoms": [
+            "Serial entrepreneurs are defined as entrepreneurs who have founded more than one firm.",
+            "Approximately 10% of entrepreneurs in Denmark are serial entrepreneurs.",
+            "73% of serial entrepreneurs are portfolio entrepreneurs who run two or more businesses concurrently.",
+            "27% of serial entrepreneurs are sequential entrepreneurs."
+          ],
+          "generality": [0, 2, 2, 2],
+          "confidence": 0.92,
+          "methodology": "extraction",
+          "evidence_type": "statistical"
+        }
+      ]
+    },
+    {
+      "title": "Results",
+      "summary": "Serial entrepreneurs achieve 67% higher sales than novice entrepreneurs. The advantage persists after controlling for personal characteristics and is concentrated in portfolio entrepreneurs.",
+      "paragraphs": [
+        {
+          "compound": "Serial entrepreneurs achieve 67% higher sales than novice entrepreneurs. This advantage is not explained by personal characteristics such as education, gender, or age.",
+          "supporting_text": "Table 3 shows that serial entrepreneurs achieve 67% higher sales...",
+          "atoms": [
+            "Serial entrepreneurs achieve 67% higher sales than novice entrepreneurs.",
+            "The serial entrepreneur sales advantage is not explained by personal characteristics such as education, gender, or age."
+          ],
+          "generality": [2, 1],
+          "confidence": 0.95,
+          "methodology": "statistical",
+          "evidence_type": "statistical"
+        },
+        {
+          "compound": "Among serial entrepreneurs, 73% are portfolio type. Portfolio entrepreneur sales are 77% above novices versus only 32% for sequential entrepreneurs.",
+          "supporting_text": "The sales gains of serial entrepreneurship are concentrated in portfolio entrepreneurs...",
+          "atoms": [
+            "Portfolio entrepreneur sales are 77% above novice entrepreneur sales.",
+            "Sequential entrepreneur sales are 32% above novice entrepreneur sales.",
+            "The serial entrepreneur sales advantage is concentrated in portfolio entrepreneurs."
+          ],
+          "generality": [2, 2, 1],
+          "confidence": 0.93,
+          "methodology": "statistical",
+          "evidence_type": "statistical"
+        }
+      ]
+    }
+  ],
+  "relationships": [
+    {
+      "source_path": "sections[1].paragraphs[0].atoms[0]",
+      "target_path": "sections[1].paragraphs[1].atoms[2]",
+      "relationship": "supports",
+      "rationale": "The 67% overall advantage is explained by concentration in portfolio entrepreneurs"
+    }
+  ]
+}

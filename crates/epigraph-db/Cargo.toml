@@ -1,0 +1,35 @@
+[package]
+name = "epigraph-db"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2021"
+
+[dependencies]
+epigraph-core = { workspace = true }
+epigraph-crypto = { workspace = true }
+epigraph-ds = { workspace = true }  # DS/TBM types for mass function persistence
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = "0.1"
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+blake3 = { workspace = true }
+serde = { workspace = true }
+epigraph-crypto = { workspace = true }
+
+# Enable sqlx test fixtures
+[[test]]
+name = "lineage_tests"
+path = "tests/lineage_tests.rs"
+
+[[test]]
+name = "batch_operations_tests"
+path = "tests/batch_operations_tests.rs"

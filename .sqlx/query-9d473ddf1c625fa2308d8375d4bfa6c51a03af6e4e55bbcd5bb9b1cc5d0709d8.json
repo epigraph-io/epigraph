@@ -1,0 +1,89 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT t.id,\n                   t.claim_id,\n                   t.subject_id,\n                   se.canonical_name  AS \"subject_name!\",\n                   t.predicate,\n                   t.object_id        AS \"object_id?\",\n                   oe.canonical_name  AS \"object_name?\",\n                   t.object_literal   AS \"object_literal?\",\n                   t.confidence,\n                   t.extractor,\n                   t.properties,\n                   t.created_at\n            FROM triples t\n            JOIN  entities se ON se.id = t.subject_id\n            LEFT JOIN entities oe ON oe.id = t.object_id\n            JOIN  claims c  ON c.id  = t.claim_id\n            WHERE c.is_current    = true\n              AND se.is_canonical = true\n              AND (t.subject_id = $1 OR t.object_id = $1)\n            ORDER BY t.predicate, t.confidence DESC\n            LIMIT $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "claim_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "subject_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "subject_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "predicate",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "object_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "object_name?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "object_literal?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "confidence",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 9,
+        "name": "extractor",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "properties",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9d473ddf1c625fa2308d8375d4bfa6c51a03af6e4e55bbcd5bb9b1cc5d0709d8"
+}

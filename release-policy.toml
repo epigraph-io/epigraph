@@ -1,0 +1,28 @@
+# EpiGraph Release Gate Policy
+#
+# These thresholds gate releases based on contract belief scores in EpiGraph.
+# The policy claim in the graph is authoritative — this file is a convenience
+# copy kept in sync with it.
+#
+# To change a threshold: submit a design-decision claim to EpiGraph first with
+# rationale and evidence, then update this file in the same commit.
+#
+# Query gate status:
+#   psql postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph -c \
+#     "SELECT c.content, b.pignistic_prob FROM claims c
+#      JOIN belief_states b ON b.claim_id = c.id
+#      WHERE c.labels @> ARRAY['contract','repo-split']
+#      ORDER BY b.pignistic_prob;"
+
+[release_gates]
+# Minimum pignistic probability (BetP) for open kernel contracts to gate a 1.0 release.
+# Tunable: depends on DS combination scheme, number of independent implementations,
+# and open-world discount factor applied to single-source evidence.
+open_kernel_contract_min_belief = 0.85
+
+# Higher bar for enterprise contracts — these carry commercial SLA expectations.
+enterprise_contract_min_belief = 0.90
+
+# Open-world discount factor applied when only a single implementation provides evidence.
+# Prevents a single passing test suite from producing overconfident belief.
+open_world_discount_factor = 0.15
