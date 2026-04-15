@@ -657,22 +657,22 @@ fn validate_packet(
             ));
         }
 
-        // In production, we would verify the signature against the agent's public key here
-        // For testing, we require a valid-looking signature (all zeros placeholder is rejected)
-        // A real signature would not be all zeros
-        let is_placeholder = packet.signature.chars().all(|c| c == '0');
-        if !is_placeholder {
-            // Any non-placeholder signature in test mode is considered invalid
-            // since we can't verify without the actual public key
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                ErrorResponse::with_details(
-                    "SignatureError",
-                    "Signature verification failed - invalid signature for agent",
-                    serde_json::json!({ "field": "signature" }),
-                ),
-            ));
-        }
+        // TODO(security): Implement Ed25519 signature verification here.
+        // This requires fetching the agent's public key from the database by
+        // packet.claim.agent_id, decoding the hex signature into a [u8; 64],
+        // and calling SignatureVerifier::verify(pub_key, canonical_content, sig).
+        // validate_packet is currently a sync fn; wiring in DB access requires
+        // making it async (or moving verification to the async handler).
+        // Until that is implemented, we fail closed: any request on the
+        // require_signatures path is rejected.
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            ErrorResponse::with_details(
+                "SignatureError",
+                "Signature verification is not yet implemented; submissions require a verified identity",
+                serde_json::json!({ "field": "signature" }),
+            ),
+        ));
     }
 
     Ok(())
