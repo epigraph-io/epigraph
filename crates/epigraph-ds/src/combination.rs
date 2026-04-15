@@ -655,7 +655,7 @@ pub fn cautious_combine(m1: &MassFunction, m2: &MassFunction) -> Result<MassFunc
     check_frame_compat(m1, m2)?;
 
     let frame = m1.frame();
-    let power_set = frame.power_set();
+    let power_set = frame.power_set()?;
 
     // 1. Compute combined commonality: q(A) = min(q1(A), q2(A))
     let mut q_combined: BTreeMap<FocalElement, f64> = BTreeMap::new();
