@@ -3071,12 +3071,12 @@ impl Default for InMemoryJobQueue {
 impl JobQueue for InMemoryJobQueue {
     async fn enqueue(&self, job: Job) -> Result<JobId, JobError> {
         let id = job.id;
-        self.jobs.write().unwrap().push(job);
+        self.jobs.write().unwrap_or_else(|e| e.into_inner()).push(job);
         Ok(id)
     }
 
     async fn dequeue(&self) -> Option<Job> {
-        let mut jobs = self.jobs.write().unwrap();
+        let mut jobs = self.jobs.write().unwrap_or_else(|e| e.into_inner());
         // Find first pending job (FIFO order)
         jobs.iter()
             .position(|j| j.state == JobState::Pending)
@@ -3084,7 +3084,7 @@ impl JobQueue for InMemoryJobQueue {
     }
 
     async fn update(&self, job: &Job) -> Result<(), JobError> {
-        let mut jobs = self.jobs.write().unwrap();
+        let mut jobs = self.jobs.write().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = jobs.iter_mut().find(|j| j.id == job.id) {
             *existing = job.clone();
         }
@@ -3094,7 +3094,7 @@ impl JobQueue for InMemoryJobQueue {
     async fn get(&self, id: JobId) -> Option<Job> {
         self.jobs
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|j| j.id == id)
             .cloned()
@@ -3103,7 +3103,7 @@ impl JobQueue for InMemoryJobQueue {
     async fn pending_jobs(&self) -> Vec<Job> {
         self.jobs
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|j| j.state == JobState::Pending)
             .cloned()
