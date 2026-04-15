@@ -25,11 +25,11 @@ jobs:
       DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
       SQLX_OFFLINE: "true"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4.3.1
+      - uses: dtolnay/rust-toolchain@v1
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.8.1
       - name: Build
         run: cargo build --workspace
       - name: Test (non-DB packages, parallel)

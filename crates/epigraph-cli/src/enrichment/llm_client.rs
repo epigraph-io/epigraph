@@ -347,9 +347,7 @@ pub fn create_llm_client(provider: &str) -> Result<Box<dyn LlmClient>, LlmError>
             Ok(Box::new(AnthropicClient::new(api_key, model)?))
         }
         other => Err(LlmError::RequestFailed {
-            message: format!(
-                "Unknown LLM provider: {other}. Use 'anthropic' or 'mock'."
-            ),
+            message: format!("Unknown LLM provider: {other}. Use 'anthropic' or 'mock'."),
         }),
     }
 }
