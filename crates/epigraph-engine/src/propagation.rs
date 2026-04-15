@@ -125,13 +125,21 @@ pub struct PropagationOrchestrator {
     audit_trail: Vec<PropagationAuditRecord>,
     /// Counter for audit sequence numbers
     sequence_counter: u64,
-    /// Agent reputation scores (stored but NEVER used in propagation)
+    /// Agent reputation scores (stored but NEVER used in propagation).
     ///
     /// # Why store if not used?
     ///
     /// Reputations are stored for other purposes (display, filtering, etc.)
     /// but explicitly excluded from propagation calculations. This design
     /// makes the "no reputation influence" principle explicit and auditable.
+    ///
+    /// # TODO
+    ///
+    /// Reserved for future reputation-weighted propagation feature where
+    /// agent credibility adjusts the *prior* on submitted evidence, not the
+    /// propagation calculation itself (to preserve the no-authority-cascade
+    /// invariant). Until that feature lands this field is write-only.
+    #[allow(dead_code)]
     agent_reputations: HashMap<AgentId, f64>,
 }
 
