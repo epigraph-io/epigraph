@@ -38,8 +38,7 @@ impl AuthContext {
 
 /// Middleware: extract Bearer token, validate JWT, inject AuthContext.
 ///
-/// Also supports legacy Ed25519 fallback: if no Bearer token is present
-/// but X-Signature headers are, falls through to the legacy middleware.
+/// Requests without a valid Bearer token are rejected with 401 Unauthorized.
 pub async fn bearer_auth_middleware(
     State(state): State<AppState>,
     mut request: Request<axum::body::Body>,
@@ -91,15 +90,8 @@ pub async fn bearer_auth_middleware(
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
         }
-        _ => {
-            // No Bearer token — check for legacy X-Signature headers
-            if request.headers().contains_key("x-signature") {
-                Ok(next.run(request).await)
-            } else {
-                Err(ApiError::Unauthorized {
-                    reason: "Missing Authorization header".to_string(),
-                })
-            }
-        }
+        _ => Err(ApiError::Unauthorized {
+            reason: "Missing Authorization header".to_string(),
+        }),
     }
 }
