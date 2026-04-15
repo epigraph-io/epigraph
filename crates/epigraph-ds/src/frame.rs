@@ -54,10 +54,18 @@ impl FrameOfDiscernment {
     /// Generate the power set (all 2^n subsets, excluding empty set)
     ///
     /// Each subset is a `BTreeSet<usize>` of hypothesis indices.
-    #[must_use]
-    pub fn power_set(&self) -> Vec<BTreeSet<usize>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DsError::FrameTooLarge`] if the frame has more than 20 hypotheses.
+    /// 2^20 = 1 048 576 subsets is the practical upper bound for in-memory enumeration.
+    /// Larger frames must use sparse representations.
+    pub fn power_set(&self) -> Result<Vec<BTreeSet<usize>>, DsError> {
         let n = self.hypotheses.len();
-        let total = 1usize << n; // 2^n
+        if n > 20 {
+            return Err(DsError::FrameTooLarge { n });
+        }
+        let total = 1usize << n; // 2^n — safe because n <= 20
         let mut subsets = Vec::with_capacity(total - 1);
 
         for mask in 1..total {
@@ -70,7 +78,7 @@ impl FrameOfDiscernment {
             subsets.push(subset);
         }
 
-        subsets
+        Ok(subsets)
     }
 
     /// The full set Theta (all hypothesis indices)
@@ -191,7 +199,10 @@ impl FrameOfDiscernment {
 
 impl PartialEq for FrameOfDiscernment {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        // Both id AND hypotheses must match: two frames with the same id but
+        // different hypothesis sets are mathematically incompatible and must
+        // not be silently treated as equal during Dempster-Shafer combination.
+        self.id == other.id && self.hypotheses == other.hypotheses
     }
 }
 
@@ -233,7 +244,7 @@ mod tests {
     #[test]
     fn power_set_binary_frame() {
         let frame = FrameOfDiscernment::new("binary", vec!["true".into(), "false".into()]).unwrap();
-        let ps = frame.power_set();
+        let ps = frame.power_set().unwrap();
         // 2^2 - 1 = 3 non-empty subsets: {0}, {1}, {0,1}
         assert_eq!(ps.len(), 3);
     }
@@ -242,9 +253,19 @@ mod tests {
     fn power_set_ternary_frame() {
         let frame =
             FrameOfDiscernment::new("ternary", vec!["a".into(), "b".into(), "c".into()]).unwrap();
-        let ps = frame.power_set();
+        let ps = frame.power_set().unwrap();
         // 2^3 - 1 = 7 non-empty subsets
         assert_eq!(ps.len(), 7);
+    }
+
+    #[test]
+    fn power_set_rejects_oversized_frame() {
+        let hypotheses: Vec<String> = (0..=20).map(|i| i.to_string()).collect(); // 21 hypotheses
+        let frame = FrameOfDiscernment::new("big", hypotheses).unwrap();
+        assert!(matches!(
+            frame.power_set(),
+            Err(DsError::FrameTooLarge { n: 21 })
+        ));
     }
 
     #[test]
@@ -263,11 +284,18 @@ mod tests {
     }
 
     #[test]
-    fn frame_equality_by_id() {
+    fn frame_equality_requires_matching_hypotheses() {
+        // Same id + same hypotheses → equal
         let f1 = FrameOfDiscernment::new("same_id", vec!["a".into()]).unwrap();
+        let f1b = FrameOfDiscernment::new("same_id", vec!["a".into()]).unwrap();
+        assert_eq!(f1, f1b);
+
+        // Same id but different hypotheses → NOT equal (would cause silent DS misuse)
         let f2 = FrameOfDiscernment::new("same_id", vec!["b".into()]).unwrap();
+        assert_ne!(f1, f2);
+
+        // Different id → not equal
         let f3 = FrameOfDiscernment::new("other_id", vec!["a".into()]).unwrap();
-        assert_eq!(f1, f2);
         assert_ne!(f1, f3);
     }
 
