@@ -17,6 +17,9 @@ use rand::rngs::OsRng;
 /// - Keys should be stored in secure enclaves or HSMs in production
 /// - This implementation uses OS-provided randomness for key generation
 pub struct AgentSigner {
+    /// `ed25519_dalek::SigningKey` derives `ZeroizeOnDrop`, so the secret key
+    /// bytes are automatically overwritten when `AgentSigner` is dropped.
+    /// No manual `Drop` impl is required.
     signing_key: SigningKey,
 }
 
@@ -53,7 +56,7 @@ impl AgentSigner {
     ///
     /// # Security Warning
     /// Only use this for key backup/export. Never log or transmit.
-    #[must_use]
+    #[must_use = "secret key material must be zeroized after use"]
     pub fn secret_key(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
     }

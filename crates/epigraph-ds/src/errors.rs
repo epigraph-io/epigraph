@@ -36,4 +36,8 @@ pub enum DsError {
     /// Need at least one mass function to combine
     #[error("Need at least one mass function (got 0)")]
     InsufficientSources,
+
+    /// Frame has too many hypotheses for full power-set enumeration
+    #[error("Frame too large for power-set enumeration (n={n}, max=20)")]
+    FrameTooLarge { n: usize },
 }
