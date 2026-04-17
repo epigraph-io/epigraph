@@ -151,9 +151,9 @@ impl MassFunctionRepository {
             "#,
         )
         .bind(id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
-        .ok();
+        .map_err(DbError::from)?;
 
         Ok(row)
     }
