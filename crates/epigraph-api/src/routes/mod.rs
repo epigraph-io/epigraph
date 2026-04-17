@@ -69,6 +69,7 @@ pub mod political;
 pub mod provenance;
 pub mod rag;
 pub mod reasoning;
+pub mod revoke_signature;
 #[cfg(feature = "db")]
 pub mod search;
 pub mod spans;
@@ -190,6 +191,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/claims/:id/supersede",
             post(versioning::supersede_claim),
+        )
+        .route(
+            "/api/v1/claims/:id/revoke-signature",
+            post(revoke_signature::revoke_claim_signature),
         )
         .route("/api/v1/claims/batch", post(batch::batch_create_claims))
         .route("/api/v1/claims/:id/labels", patch(claims::update_labels))
@@ -758,6 +763,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/claims/:id/supersede",
             post(versioning::supersede_claim),
+        )
+        .route(
+            "/api/v1/claims/:id/revoke-signature",
+            post(revoke_signature::revoke_claim_signature),
         )
         .route("/api/v1/claims/batch", post(batch::batch_create_claims))
         .route("/api/v1/claims/:id/labels", patch(claims::update_labels))
