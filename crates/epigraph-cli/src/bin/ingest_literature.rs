@@ -532,10 +532,10 @@ fn build_packets(
                 idempotency_key: None,
             };
 
-            // Sign the entire packet
-            let packet_bytes = serde_json::to_vec(&(&claim_submission, &evidence_items, &trace))
-                .unwrap_or_default();
-            let packet_signature = hex::encode(signer.sign(&packet_bytes));
+            // The submit/packet endpoint requires a placeholder signature (128 hex zeros)
+            // until Ed25519 verification is wired up server-side. Real signatures are
+            // rejected by the current server implementation (see submit.rs validation).
+            let packet_signature = "0".repeat(128);
 
             EpistemicPacket {
                 claim: claim_submission,
@@ -664,13 +664,26 @@ async fn main() {
         }
     };
 
+    // Build a reqwest client with optional Bearer token from EPIGRAPH_TOKEN env var
+    let auth_client = {
+        let mut builder = reqwest::Client::builder();
+        if let Ok(token) = std::env::var("EPIGRAPH_TOKEN") {
+            let mut headers = reqwest::header::HeaderMap::new();
+            let header_val = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .expect("token must be ASCII");
+            headers.insert(reqwest::header::AUTHORIZATION, header_val);
+            builder = builder.default_headers(headers);
+        }
+        builder.build().expect("Failed to build HTTP client")
+    };
+
     // In live mode, register agent via API; in dry-run, use random UUID
     let agent_id = if args.dry_run {
         let id = Uuid::new_v4();
         println!("Agent ID: {id} (dry-run, not registered)");
         id
     } else {
-        let client = reqwest::Client::new();
+        let client = auth_client.clone();
         let display_name = format!("literature-ingester:{}", extraction.source.doi);
         match register_agent(&client, &args.endpoint, &signer, &display_name).await {
             Ok(id) => {
@@ -797,7 +810,7 @@ async fn main() {
     }
 
     // Submit packets
-    let client = reqwest::Client::new();
+    let client = auth_client;
     let mut submitted = 0;
     let mut failed = 0;
 
