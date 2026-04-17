@@ -1007,6 +1007,13 @@ async fn entity_exists(
             .map_err(|e| ApiError::InternalError {
                 message: format!("DB check failed: {e}"),
             })?,
+        "paper" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM papers WHERE id = $1)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB check failed: {e}"),
+            })?,
         _ => false, // Unknown types already rejected by validation above
     };
     Ok(exists)
