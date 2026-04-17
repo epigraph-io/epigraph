@@ -67,6 +67,30 @@ impl ClaimRepository {
         // Calculate content hash using BLAKE3
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
+        // Dedup: if a claim with this content already exists, return it instead of
+        // inserting a duplicate. Two round-trips are acceptable; the race window is
+        // tiny and duplicate claims are idempotent in practice.
+        let existing = sqlx::query!(
+            r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+               FROM claims WHERE content_hash = $1 LIMIT 1"#,
+            content_hash.as_slice()
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(existing_row) = existing {
+            let tv = TruthValue::new(existing_row.truth_value)?;
+            return Ok(claim_from_row(
+                existing_row.id,
+                existing_row.content,
+                existing_row.agent_id,
+                existing_row.trace_id,
+                tv,
+                existing_row.created_at,
+                existing_row.updated_at,
+            ));
+        }
+
         let row = sqlx::query!(
             r#"
             INSERT INTO claims (
@@ -121,6 +145,30 @@ impl ClaimRepository {
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
         use sqlx::Row;
+
+        // Dedup check within the same transaction
+        let existing = sqlx::query(
+            "SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+             FROM claims WHERE content_hash = $1 LIMIT 1",
+        )
+        .bind(content_hash.as_slice())
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        if let Some(existing_row) = existing {
+            let truth_val: f64 = existing_row.get("truth_value");
+            let tv = TruthValue::new(truth_val)?;
+            return Ok(claim_from_row(
+                existing_row.get("id"),
+                existing_row.get("content"),
+                existing_row.get("agent_id"),
+                existing_row.get("trace_id"),
+                tv,
+                existing_row.get("created_at"),
+                existing_row.get("updated_at"),
+            ));
+        }
+
         let row = sqlx::query(
             r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
