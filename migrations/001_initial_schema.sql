@@ -3912,6 +3912,10 @@ ALTER TABLE ONLY public.triples
 ALTER TABLE ONLY public.workflow_executions
     ADD CONSTRAINT workflow_executions_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.agents(id);
 
+-- Restore search_path so sqlx-cli can resolve _sqlx_migrations (unqualified)
+-- for its post-migration bookkeeping insert. Line 21 cleared it for the dump.
+SELECT pg_catalog.set_config('search_path', 'public', false);
+
 --
 --
 
