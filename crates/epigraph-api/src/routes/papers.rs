@@ -99,24 +99,64 @@ pub async fn create_paper(
     }
 
     use sqlx::Row;
-    let row = sqlx::query(
-        r#"
-        INSERT INTO papers (doi, title, journal)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (doi) DO UPDATE
-            SET title   = COALESCE(EXCLUDED.title, papers.title),
-                journal = COALESCE(EXCLUDED.journal, papers.journal)
-        RETURNING id, doi, title, journal, created_at
-        "#,
+
+    // Check for existing paper first (papers.doi has btree index but no UNIQUE constraint)
+    let existing: Option<_> = sqlx::query(
+        "SELECT id, doi, title, journal, created_at FROM papers WHERE doi = $1 LIMIT 1",
     )
     .bind(&request.doi)
-    .bind(&request.title)
-    .bind(&request.journal)
-    .fetch_one(&state.db_pool)
+    .fetch_optional(&state.db_pool)
     .await
     .map_err(|e| ApiError::DatabaseError {
-        message: format!("Failed to upsert paper: {e}"),
+        message: format!("Failed to query paper: {e}"),
     })?;
+
+    let row = if let Some(existing_row) = existing {
+        // Paper exists — update title/journal if new values provided, then re-fetch
+        if request.title.is_some() || request.journal.is_some() {
+            sqlx::query(
+                r#"UPDATE papers
+                   SET title   = COALESCE($2, title),
+                       journal = COALESCE($3, journal)
+                   WHERE doi = $1"#,
+            )
+            .bind(&request.doi)
+            .bind(&request.title)
+            .bind(&request.journal)
+            .execute(&state.db_pool)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to update paper: {e}"),
+            })?;
+            // Re-fetch updated row
+            sqlx::query(
+                "SELECT id, doi, title, journal, created_at FROM papers WHERE doi = $1 LIMIT 1",
+            )
+            .bind(&request.doi)
+            .fetch_one(&state.db_pool)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to re-fetch paper: {e}"),
+            })?
+        } else {
+            existing_row
+        }
+    } else {
+        // New paper — insert
+        sqlx::query(
+            r#"INSERT INTO papers (doi, title, journal)
+               VALUES ($1, $2, $3)
+               RETURNING id, doi, title, journal, created_at"#,
+        )
+        .bind(&request.doi)
+        .bind(&request.title)
+        .bind(&request.journal)
+        .fetch_one(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to insert paper: {e}"),
+        })?
+    };
 
     Ok(Json(PaperResponse {
         id: row.get("id"),
