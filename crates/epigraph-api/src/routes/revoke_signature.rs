@@ -89,6 +89,42 @@ struct AlreadyRevokedDetail {
     revoked_at: DateTime<Utc>,
 }
 
+/// Parse the optional `expected_signature_prefix` field into raw bytes.
+///
+/// Accepts None, empty, or a hex string optionally prefixed with `0x`.
+/// Rejects odd-length hex, prefixes longer than the 64-byte signature
+/// they would guard, and invalid hex characters.
+///
+/// Pulled out of the handler so it can be unit-tested without a DB.
+fn parse_expected_signature_prefix(
+    input: Option<&str>,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let Some(s) = input else { return Ok(None) };
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let cleaned = s.trim().trim_start_matches("0x").to_ascii_lowercase();
+    if cleaned.len() % 2 != 0 {
+        return Err(ApiError::ValidationError {
+            field: "expected_signature_prefix".to_string(),
+            reason: "hex prefix must have an even number of characters".to_string(),
+        });
+    }
+    if cleaned.len() > 128 {
+        return Err(ApiError::ValidationError {
+            field: "expected_signature_prefix".to_string(),
+            reason: "hex prefix is longer than the 64-byte signature it would guard"
+                .to_string(),
+        });
+    }
+    Ok(Some(hex::decode(&cleaned).map_err(|e| {
+        ApiError::ValidationError {
+            field: "expected_signature_prefix".to_string(),
+            reason: format!("invalid hex: {e}"),
+        }
+    })?))
+}
+
 /// Revoke the signature on a claim.
 ///
 /// POST /api/v1/claims/:id/revoke-signature
@@ -162,31 +198,8 @@ pub async fn revoke_claim_signature(
 
     // Parse expected_signature_prefix early so we don't start a transaction
     // just to reject malformed hex.
-    let expected_prefix_bytes: Option<Vec<u8>> = match &request.expected_signature_prefix {
-        None => None,
-        Some(s) if s.is_empty() => None,
-        Some(s) => {
-            let cleaned = s.trim().trim_start_matches("0x").to_ascii_lowercase();
-            if cleaned.len() % 2 != 0 {
-                return Err(ApiError::ValidationError {
-                    field: "expected_signature_prefix".to_string(),
-                    reason: "hex prefix must have an even number of characters".to_string(),
-                });
-            }
-            if cleaned.len() > 128 {
-                // 64-byte signature = 128 hex chars; longer is nonsense.
-                return Err(ApiError::ValidationError {
-                    field: "expected_signature_prefix".to_string(),
-                    reason: "hex prefix is longer than the 64-byte signature it would guard"
-                        .to_string(),
-                });
-            }
-            Some(hex::decode(&cleaned).map_err(|e| ApiError::ValidationError {
-                field: "expected_signature_prefix".to_string(),
-                reason: format!("invalid hex: {e}"),
-            })?)
-        }
-    };
+    let expected_prefix_bytes: Option<Vec<u8>> =
+        parse_expected_signature_prefix(request.expected_signature_prefix.as_deref())?;
 
     // ---- DB transaction. ----
     let mut tx = state
@@ -379,4 +392,179 @@ pub async fn revoke_claim_signature(
     Err(ApiError::ServiceUnavailable {
         service: "Signature revocation requires database".to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- parse_expected_signature_prefix ----
+
+    #[test]
+    fn prefix_none_returns_none() {
+        let out = parse_expected_signature_prefix(None).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn prefix_empty_string_returns_none() {
+        let out = parse_expected_signature_prefix(Some("")).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn prefix_accepts_lowercase_hex() {
+        let out = parse_expected_signature_prefix(Some("deadbeef"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn prefix_accepts_uppercase_hex() {
+        let out = parse_expected_signature_prefix(Some("DEADBEEF"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn prefix_strips_0x_prefix() {
+        let out = parse_expected_signature_prefix(Some("0xdeadbeef"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn prefix_trims_whitespace() {
+        let out = parse_expected_signature_prefix(Some("  deadbeef  "))
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn prefix_rejects_odd_length() {
+        let err = parse_expected_signature_prefix(Some("abc")).unwrap_err();
+        match err {
+            ApiError::ValidationError { field, reason } => {
+                assert_eq!(field, "expected_signature_prefix");
+                assert!(reason.contains("even number"), "got: {reason}");
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_rejects_too_long() {
+        // 130 hex chars = longer than a 64-byte (128-hex-char) signature.
+        // Must be even so we hit the length check rather than the odd-length
+        // check that would otherwise short-circuit.
+        let long = "a".repeat(130);
+        let err = parse_expected_signature_prefix(Some(&long)).unwrap_err();
+        match err {
+            ApiError::ValidationError { field, reason } => {
+                assert_eq!(field, "expected_signature_prefix");
+                assert!(
+                    reason.contains("longer than the 64-byte signature"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_accepts_full_64_byte_signature() {
+        // 128 hex chars = exactly one 64-byte signature, should pass.
+        let full = "a".repeat(128);
+        let out = parse_expected_signature_prefix(Some(&full)).unwrap().unwrap();
+        assert_eq!(out.len(), 64);
+    }
+
+    #[test]
+    fn prefix_rejects_invalid_hex_chars() {
+        let err = parse_expected_signature_prefix(Some("gggg")).unwrap_err();
+        match err {
+            ApiError::ValidationError { field, reason } => {
+                assert_eq!(field, "expected_signature_prefix");
+                assert!(reason.contains("invalid hex"), "got: {reason}");
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    // ---- DTO serde roundtrip ----
+
+    #[test]
+    fn request_deserializes_minimal() {
+        let req: RevokeSignatureRequest = serde_json::from_value(serde_json::json!({
+            "reason": "hash drift",
+        }))
+        .unwrap();
+        assert_eq!(req.reason, "hash drift");
+        assert!(req.superseded_by.is_none());
+        assert!(req.expected_signature_prefix.is_none());
+    }
+
+    #[test]
+    fn request_deserializes_full() {
+        let sup_by = Uuid::new_v4();
+        let req: RevokeSignatureRequest = serde_json::from_value(serde_json::json!({
+            "reason": "superseded",
+            "superseded_by": sup_by.to_string(),
+            "expected_signature_prefix": "0xdead",
+        }))
+        .unwrap();
+        assert_eq!(req.reason, "superseded");
+        assert_eq!(req.superseded_by, Some(sup_by));
+        assert_eq!(req.expected_signature_prefix.as_deref(), Some("0xdead"));
+    }
+
+    #[test]
+    fn response_serializes_roundtrip() {
+        let resp = RevokeSignatureResponse {
+            claim_id: Uuid::new_v4(),
+            revocation_id: Uuid::new_v4(),
+            previous_signer_id: Some(Uuid::new_v4()),
+            revoked_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("claim_id").is_some());
+        assert!(json.get("revocation_id").is_some());
+        assert!(json.get("previous_signer_id").is_some());
+        assert!(json.get("revoked_at").is_some());
+        let back: RevokeSignatureResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back.claim_id, resp.claim_id);
+        assert_eq!(back.revocation_id, resp.revocation_id);
+        assert_eq!(back.previous_signer_id, resp.previous_signer_id);
+    }
+
+    // ---- Non-db stub returns 503 ----
+
+    #[cfg(not(feature = "db"))]
+    mod stub {
+        use super::*;
+        use crate::state::{ApiConfig, AppState};
+
+        #[tokio::test]
+        async fn stub_returns_service_unavailable() {
+            let state = AppState::new(ApiConfig::default());
+            let claim_id = Uuid::new_v4();
+            let req = RevokeSignatureRequest {
+                reason: "test".to_string(),
+                superseded_by: None,
+                expected_signature_prefix: None,
+            };
+            let err = revoke_claim_signature(
+                axum::extract::State(state),
+                axum::extract::Path(claim_id),
+                axum::Json(req),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ApiError::ServiceUnavailable { .. }));
+        }
+    }
 }
