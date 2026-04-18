@@ -395,7 +395,7 @@ impl LineageRepository {
         // Build topological order (sorted by depth descending, so ancestors come first)
         let mut topological_order: Vec<(Uuid, i32)> =
             lineage_rows.iter().map(|r| (r.id, r.depth)).collect();
-        topological_order.sort_by(|a, b| b.1.cmp(&a.1)); // Descending depth
+        topological_order.sort_by_key(|b| std::cmp::Reverse(b.1)); // Descending depth
         let topological_order: Vec<Uuid> =
             topological_order.into_iter().map(|(id, _)| id).collect();
 
@@ -557,7 +557,7 @@ impl LineageRepository {
 
         // Sort by depth descending (ancestors first)
         let mut sorted: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.id, r.depth)).collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         Ok(sorted.into_iter().map(|(id, _)| id).collect())
     }
@@ -785,7 +785,7 @@ impl LineageRepository {
         // Build topological order (sorted by depth ascending for descendants)
         let mut topological_order: Vec<(Uuid, i32)> =
             lineage_rows.iter().map(|r| (r.id, r.depth)).collect();
-        topological_order.sort_by(|a, b| a.1.cmp(&b.1)); // Ascending depth for descendants
+        topological_order.sort_by_key(|a| a.1); // Ascending depth for descendants
         let topological_order: Vec<Uuid> =
             topological_order.into_iter().map(|(id, _)| id).collect();
 
@@ -855,7 +855,7 @@ impl LineageRepository {
 
         // Sort by depth ascending (root first)
         let mut sorted: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.id, r.depth)).collect();
-        sorted.sort_by(|a, b| a.1.cmp(&b.1));
+        sorted.sort_by_key(|a| a.1);
 
         Ok(sorted.into_iter().map(|(id, _)| id).collect())
     }
@@ -989,21 +989,21 @@ mod tests {
         let child_b = Uuid::new_v4();
 
         // Insert claims
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(parent_id)
             .bind("Parent claim")
             .bind(test_agent)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(child_a)
             .bind("Child A")
             .bind(test_agent)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(child_b)
             .bind("Child B")
             .bind(test_agent)
@@ -1048,14 +1048,14 @@ mod tests {
         let claim_a = Uuid::new_v4();
         let claim_b = Uuid::new_v4();
 
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(claim_a)
             .bind("Isolated claim A")
             .bind(test_agent)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(claim_b)
             .bind("Isolated claim B")
             .bind(test_agent)
@@ -1091,7 +1091,7 @@ mod tests {
 
         // Insert claims
         for (id, content) in [(root, "Root claim"), (mid_a, "Mid A"), (mid_b, "Mid B")] {
-            sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+            sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
                 .bind(id)
                 .bind(content)
                 .bind(test_agent)
@@ -1130,14 +1130,14 @@ mod tests {
         let ancestor = Uuid::new_v4();
         let descendant = Uuid::new_v4();
 
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(ancestor)
             .bind("Ancestor claim")
             .bind(test_agent)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(descendant)
             .bind("Descendant claim")
             .bind(test_agent)

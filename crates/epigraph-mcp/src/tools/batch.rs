@@ -41,7 +41,11 @@ pub async fn batch_submit_claims(
                     .first()
                     .and_then(|c| c.as_text())
                     .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
-                    .and_then(|v| v.get("claim_id").and_then(|id| id.as_str()).map(String::from))
+                    .and_then(|v| {
+                        v.get("claim_id")
+                            .and_then(|id| id.as_str())
+                            .map(String::from)
+                    })
                     .unwrap_or_default();
                 submitted.push(serde_json::json!({
                     "index": i,
