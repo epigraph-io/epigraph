@@ -133,17 +133,17 @@ fn parse_expected_signature_prefix(input: Option<&str>) -> Result<Option<Vec<u8>
 ///    optional superseded_by UUID (must reference an existing claim).
 /// 3. In a single DB transaction:
 ///    a. SELECT the claim's current (signature, signer_id, content_hash).
-///       Returns 404 if the claim doesn't exist.
-///       Returns 409 with prior-revocation reference if signature is already NULL.
+///    Returns 404 if the claim doesn't exist.
+///    Returns 409 with prior-revocation reference if signature is already NULL.
 ///    b. If `expected_signature_prefix` is set, checks it against the stored
-///       signature's hex. Returns 409 on mismatch.
+///    signature's hex. Returns 409 on mismatch.
 ///    c. If `superseded_by` is set, verifies the target claim exists.
-///       Returns 400 if it doesn't.
+///    Returns 400 if it doesn't.
 ///    d. INSERTs a row into claim_signature_revocations with the preserved
-///       signature, signer_id, content_hash, reason, and the caller's agent_id
-///       as revoked_by.
+///    signature, signer_id, content_hash, reason, and the caller's agent_id
+///    as revoked_by.
 ///    e. UPDATEs the claim to set signature = NULL AND signer_id = NULL
-///       (satisfies the migration 073 CHECK constraint).
+///    (satisfies the migration 073 CHECK constraint).
 ///
 /// # Errors
 ///
@@ -208,7 +208,8 @@ pub async fn revoke_claim_signature(
         })?;
 
     // Fetch current signature state.
-    let row: Option<(Option<Vec<u8>>, Option<Uuid>, Option<Vec<u8>>)> =
+    type ClaimSigRow = (Option<Vec<u8>>, Option<Uuid>, Option<Vec<u8>>);
+    let row: Option<ClaimSigRow> =
         sqlx::query_as("SELECT signature, signer_id, content_hash FROM claims WHERE id = $1")
             .bind(claim_id)
             .fetch_optional(&mut *tx)
