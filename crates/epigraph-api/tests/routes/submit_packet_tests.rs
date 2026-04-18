@@ -235,6 +235,27 @@ fn create_test_app_no_sig() -> axum::Router {
     create_router(state)
 }
 
+/// Mint a test Bearer token valid against the dev JWT secret.
+///
+/// The secret is the same fallback used by `default_jwt_config()` in
+/// state.rs when `EPIGRAPH_JWT_SECRET` is not set, so it works against
+/// the test app router without any env-var setup.
+fn test_bearer_token() -> String {
+    use epigraph_api::oauth::JwtConfig;
+    let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
+    let (token, _) = jwt_config
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["epigraph:write".to_string(), "epigraph:read".to_string()],
+            "service",
+            None,
+            None,
+            chrono::Duration::seconds(300),
+        )
+        .expect("issue_access_token must succeed for tests");
+    token
+}
+
 /// Register a test agent in the database so submit validation passes.
 ///
 /// The submit handler validates that `agent_id` exists in the DB.
@@ -331,7 +352,10 @@ async fn submit_packet(app: axum::Router, packet: &EpistemicPacket) -> (StatusCo
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-signature", "test-bypass") // Pass bearer_auth_middleware (falls through to legacy path)
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", test_bearer_token()),
+        )
         .body(Body::from(body))
         .unwrap();
 
@@ -431,7 +455,10 @@ async fn test_packet_missing_claim_returns_400() {
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-signature", "test-bypass")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", test_bearer_token()),
+        )
         .body(Body::from(malformed_packet.to_string()))
         .unwrap();
 
@@ -571,7 +598,10 @@ async fn test_packet_truth_value_nan_returns_400() {
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-signature", "test-bypass")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", test_bearer_token()),
+        )
         .body(Body::from(packet_json.to_string()))
         .unwrap();
 
@@ -619,7 +649,10 @@ async fn test_packet_truth_value_infinity_returns_400() {
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-signature", "test-bypass")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", test_bearer_token()),
+        )
         .body(Body::from(packet_json.to_string()))
         .unwrap();
 
@@ -660,7 +693,10 @@ async fn test_packet_missing_reasoning_trace_returns_400() {
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-signature", "test-bypass")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", test_bearer_token()),
+        )
         .body(Body::from(packet_json.to_string()))
         .unwrap();
 
@@ -1455,7 +1491,10 @@ async fn test_rate_limit_headers_present() {
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-signature", "test-bypass")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", test_bearer_token()),
+        )
         .body(Body::from(body))
         .unwrap();
 
@@ -1804,7 +1843,10 @@ async fn test_malformed_json_returns_400() {
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-signature", "test-bypass")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", test_bearer_token()),
+        )
         .body(Body::from("{ this is not valid json }"))
         .unwrap();
 
@@ -1828,7 +1870,10 @@ async fn test_wrong_content_type_returns_415() {
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "text/plain") // Wrong!
-        .header("x-signature", "test-bypass")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", test_bearer_token()),
+        )
         .body(Body::from(serde_json::to_string(&packet).unwrap()))
         .unwrap();
 
