@@ -1182,6 +1182,7 @@ impl ClaimRepository {
             r#"
             SELECT id, content FROM claims
             WHERE embedding IS NULL
+              AND is_current = true
               AND content NOT LIKE 'Agent sent message%'
               AND content NOT LIKE 'Container epiclaw%'
               AND content NOT LIKE 'Received message from%'
