@@ -989,21 +989,21 @@ mod tests {
         let child_b = Uuid::new_v4();
 
         // Insert claims
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(parent_id)
             .bind("Parent claim")
             .bind(test_agent)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(child_a)
             .bind("Child A")
             .bind(test_agent)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(child_b)
             .bind("Child B")
             .bind(test_agent)
@@ -1048,14 +1048,14 @@ mod tests {
         let claim_a = Uuid::new_v4();
         let claim_b = Uuid::new_v4();
 
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(claim_a)
             .bind("Isolated claim A")
             .bind(test_agent)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(claim_b)
             .bind("Isolated claim B")
             .bind(test_agent)
@@ -1091,7 +1091,7 @@ mod tests {
 
         // Insert claims
         for (id, content) in [(root, "Root claim"), (mid_a, "Mid A"), (mid_b, "Mid B")] {
-            sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+            sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
                 .bind(id)
                 .bind(content)
                 .bind(test_agent)
@@ -1130,14 +1130,14 @@ mod tests {
         let ancestor = Uuid::new_v4();
         let descendant = Uuid::new_v4();
 
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(ancestor)
             .bind("Ancestor claim")
             .bind(test_agent)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 0.5, $3)")
+        sqlx::query("INSERT INTO claims (id, content, content_hash, truth_value, agent_id) VALUES ($1, $2, sha256($1::text::bytea), 0.5, $3)")
             .bind(descendant)
             .bind("Descendant claim")
             .bind(test_agent)
