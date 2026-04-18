@@ -96,9 +96,7 @@ struct AlreadyRevokedDetail {
 /// they would guard, and invalid hex characters.
 ///
 /// Pulled out of the handler so it can be unit-tested without a DB.
-fn parse_expected_signature_prefix(
-    input: Option<&str>,
-) -> Result<Option<Vec<u8>>, ApiError> {
+fn parse_expected_signature_prefix(input: Option<&str>) -> Result<Option<Vec<u8>>, ApiError> {
     let Some(s) = input else { return Ok(None) };
     if s.is_empty() {
         return Ok(None);
@@ -113,8 +111,7 @@ fn parse_expected_signature_prefix(
     if cleaned.len() > 128 {
         return Err(ApiError::ValidationError {
             field: "expected_signature_prefix".to_string(),
-            reason: "hex prefix is longer than the 64-byte signature it would guard"
-                .to_string(),
+            reason: "hex prefix is longer than the 64-byte signature it would guard".to_string(),
         });
     }
     Ok(Some(hex::decode(&cleaned).map_err(|e| {
@@ -211,15 +208,14 @@ pub async fn revoke_claim_signature(
         })?;
 
     // Fetch current signature state.
-    let row: Option<(Option<Vec<u8>>, Option<Uuid>, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT signature, signer_id, content_hash FROM claims WHERE id = $1",
-    )
-    .bind(claim_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| ApiError::DatabaseError {
-        message: format!("claim lookup failed: {e}"),
-    })?;
+    let row: Option<(Option<Vec<u8>>, Option<Uuid>, Option<Vec<u8>>)> =
+        sqlx::query_as("SELECT signature, signer_id, content_hash FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("claim lookup failed: {e}"),
+            })?;
 
     let (current_signature, current_signer_id, current_content_hash) =
         row.ok_or_else(|| ApiError::NotFound {
@@ -286,19 +282,16 @@ pub async fn revoke_claim_signature(
 
     // If superseded_by is set, verify the target claim exists.
     if let Some(sup_by) = request.superseded_by {
-        let exists: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM claims WHERE id = $1")
-                .bind(sup_by)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| ApiError::DatabaseError {
-                    message: format!("superseded_by lookup failed: {e}"),
-                })?;
+        let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM claims WHERE id = $1")
+            .bind(sup_by)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("superseded_by lookup failed: {e}"),
+            })?;
         if exists.is_none() {
             return Err(ApiError::BadRequest {
-                message: format!(
-                    "superseded_by claim {sup_by} does not exist"
-                ),
+                message: format!("superseded_by claim {sup_by} does not exist"),
             });
         }
     }
@@ -347,15 +340,14 @@ pub async fn revoke_claim_signature(
     }
 
     // Fetch revoked_at from the just-inserted row so the response is authoritative.
-    let revoked_at: DateTime<Utc> = sqlx::query_scalar(
-        "SELECT revoked_at FROM claim_signature_revocations WHERE id = $1",
-    )
-    .bind(revocation_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| ApiError::DatabaseError {
-        message: format!("revoked_at fetch failed: {e}"),
-    })?;
+    let revoked_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT revoked_at FROM claim_signature_revocations WHERE id = $1")
+            .bind(revocation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("revoked_at fetch failed: {e}"),
+            })?;
 
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("transaction commit failed: {e}"),
@@ -479,7 +471,9 @@ mod tests {
     fn prefix_accepts_full_64_byte_signature() {
         // 128 hex chars = exactly one 64-byte signature, should pass.
         let full = "a".repeat(128);
-        let out = parse_expected_signature_prefix(Some(&full)).unwrap().unwrap();
+        let out = parse_expected_signature_prefix(Some(&full))
+            .unwrap()
+            .unwrap();
         assert_eq!(out.len(), 64);
     }
 

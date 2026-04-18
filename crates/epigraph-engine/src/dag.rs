@@ -148,8 +148,7 @@ impl DagValidator {
                 if on_stack.contains(&next) {
                     // Back-edge found: extract the cycle from path
                     if let Some(pos) = path.iter().position(|&n| n == next) {
-                        let cycle: Vec<Uuid> =
-                            path[pos..].iter().map(|&n| self.graph[n]).collect();
+                        let cycle: Vec<Uuid> = path[pos..].iter().map(|&n| self.graph[n]).collect();
                         return cycle;
                     }
                 } else if !visited.contains(&next) {

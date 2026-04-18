@@ -16,8 +16,8 @@
 //!   backend does not need to allocate them.
 
 use async_trait::async_trait;
-use uuid::Uuid;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::InterfaceError;
 
@@ -65,11 +65,7 @@ pub trait OrchestrationBackend: Send + Sync + 'static {
     /// the task without waiting for the backend to allocate an ID.
     ///
     /// The no-op silently discards the submission.
-    async fn submit(
-        &self,
-        task_id: Uuid,
-        payload: Value,
-    ) -> Result<(), OrchestrationError>;
+    async fn submit(&self, task_id: Uuid, payload: Value) -> Result<(), OrchestrationError>;
 
     /// Query the current status of a previously submitted task.
     ///
@@ -100,11 +96,7 @@ impl NoOpOrchestrationBackend {
 
 #[async_trait]
 impl OrchestrationBackend for NoOpOrchestrationBackend {
-    async fn submit(
-        &self,
-        _task_id: Uuid,
-        _payload: Value,
-    ) -> Result<(), OrchestrationError> {
+    async fn submit(&self, _task_id: Uuid, _payload: Value) -> Result<(), OrchestrationError> {
         Ok(())
     }
 
@@ -125,7 +117,9 @@ mod tests {
     async fn noop_submit_succeeds_silently() {
         let backend = NoOpOrchestrationBackend::new();
         let id = Uuid::new_v4();
-        let result = backend.submit(id, serde_json::json!({"step": "test"})).await;
+        let result = backend
+            .submit(id, serde_json::json!({"step": "test"}))
+            .await;
         assert!(result.is_ok());
     }
 
