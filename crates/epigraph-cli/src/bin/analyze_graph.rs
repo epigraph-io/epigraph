@@ -311,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}\n", "=".repeat(60));
 
     let mut clusters_sorted: Vec<_> = result.support_clusters.iter().collect();
-    clusters_sorted.sort_by(|a, b| b.supporters.len().cmp(&a.supporters.len()));
+    clusters_sorted.sort_by_key(|b| std::cmp::Reverse(b.supporters.len()));
 
     println!(
         "  {} target(s) have multiple supporters\n",
@@ -439,7 +439,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut influence_ranked: Vec<_> = source_influence.iter().collect();
-    influence_ranked.sort_by(|a, b| b.1.cmp(a.1));
+    influence_ranked.sort_by_key(|a| std::cmp::Reverse(*a.1));
 
     println!("  Top 10 most influential claims (support others transitively):");
     for (i, (id, count)) in influence_ranked.iter().take(10).enumerate() {
@@ -461,7 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n  Top 10 most dependent claims (supported by others transitively):");
     let mut dep_ranked: Vec<_> = target_dependence.iter().collect();
-    dep_ranked.sort_by(|a, b| b.1.cmp(a.1));
+    dep_ranked.sort_by_key(|a| std::cmp::Reverse(*a.1));
     for (i, (id, count)) in dep_ranked.iter().take(10).enumerate() {
         let truth = claims
             .iter()
