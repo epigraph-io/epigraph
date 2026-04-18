@@ -1413,10 +1413,17 @@ async fn test_different_idempotency_keys_create_different_claims() {
     let agent_id = Uuid::new_v4();
     ensure_agent_in_db(agent_id).await;
 
+    // Distinct content per packet — migration 097 added a UNIQUE constraint on
+    // (content_hash, agent_id), so two packets with the same content under the
+    // same agent would now violate the constraint regardless of idempotency key.
+    // The test still validates the original intent: different idempotency keys
+    // (paired with materially different requests) produce different claims.
     let mut packet1 = create_valid_packet(agent_id);
+    packet1.claim.content = "Hypothesis A is supported by evidence".to_string();
     packet1.claim.idempotency_key = Some("key_one".to_string());
 
     let mut packet2 = create_valid_packet(agent_id);
+    packet2.claim.content = "Hypothesis B is supported by evidence".to_string();
     packet2.claim.idempotency_key = Some("key_two".to_string());
 
     let (status1, body1) = submit_packet(app.clone(), &packet1).await;
