@@ -5,7 +5,10 @@
 -- 1. Composite index on edges for path queries
 --    (note: idx_edges_unique_triple covers the same columns with a UNIQUE constraint;
 --     this non-unique index is added for query planner flexibility on non-unique paths)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_edges_source_target_rel
+--    CONCURRENTLY dropped: sqlx 0.7 wraps migrations in a transaction, which forbids
+--    CREATE INDEX CONCURRENTLY. For production clean-rollouts on a live DB, a DBA
+--    should reissue this with CONCURRENTLY outside a transaction.
+CREATE INDEX IF NOT EXISTS idx_edges_source_target_rel
     ON edges(source_id, target_id, relationship);
 
 -- 2. idx_claims_agent_id already exists in 001_initial_schema.sql — skipped.
@@ -13,7 +16,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_edges_source_target_rel
 -- 3. Missing index on bp_messages.factor_id
 --    (the existing UNIQUE constraint covers (factor_id, variable_id, direction) but
 --     a standalone factor_id index improves single-column lookups and joins)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bp_messages_factor_id
+CREATE INDEX IF NOT EXISTS idx_bp_messages_factor_id
     ON bp_messages(factor_id);
 
 -- 4. UNIQUE constraint on claims deduplication
