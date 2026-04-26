@@ -280,8 +280,6 @@ BEGIN
         WHEN 'analysis'              THEN EXISTS (SELECT 1 FROM analyses WHERE id = entity_id)
         WHEN 'activity'              THEN EXISTS (SELECT 1 FROM activities WHERE id = entity_id)
         WHEN 'source_artifact'       THEN EXISTS (SELECT 1 FROM source_artifacts WHERE id = entity_id)
-        WHEN 'propaganda_technique'  THEN EXISTS (SELECT 1 FROM propaganda_techniques WHERE id = entity_id)
-        WHEN 'coalition'             THEN EXISTS (SELECT 1 FROM coalitions WHERE id = entity_id)
         WHEN 'span'                  THEN EXISTS (SELECT 1 FROM agent_spans WHERE id = entity_id)
         WHEN 'entity'                THEN EXISTS (SELECT 1 FROM entities WHERE id = entity_id)
         WHEN 'task'                  THEN EXISTS (SELECT 1 FROM tasks WHERE id = entity_id)
@@ -309,8 +307,6 @@ BEGIN
         WHEN 'analysis'              THEN EXISTS (SELECT 1 FROM analyses WHERE id = entity_id)
         WHEN 'activity'              THEN EXISTS (SELECT 1 FROM activities WHERE id = entity_id)
         WHEN 'source_artifact'       THEN EXISTS (SELECT 1 FROM source_artifacts WHERE id = entity_id)
-        WHEN 'propaganda_technique'  THEN EXISTS (SELECT 1 FROM propaganda_techniques WHERE id = entity_id)
-        WHEN 'coalition'             THEN EXISTS (SELECT 1 FROM coalitions WHERE id = entity_id)
         WHEN 'span'                  THEN EXISTS (SELECT 1 FROM agent_spans WHERE id = entity_id)
         WHEN 'entity'                THEN EXISTS (SELECT 1 FROM entities WHERE id = entity_id)
         WHEN 'task'                  THEN EXISTS (SELECT 1 FROM tasks WHERE id = entity_id)
@@ -772,7 +768,7 @@ CREATE TABLE public.edges (
     signer_id uuid,
     content_hash bytea,
     CONSTRAINT edges_content_hash_length CHECK (((content_hash IS NULL) OR (octet_length(content_hash) = 32))),
-    CONSTRAINT edges_entity_types_valid CHECK ((((source_type)::text = ANY (ARRAY['claim'::text, 'agent'::text, 'evidence'::text, 'trace'::text, 'node'::text, 'activity'::text, 'paper'::text, 'perspective'::text, 'community'::text, 'context'::text, 'frame'::text, 'analysis'::text, 'experiment'::text, 'experiment_result'::text, 'propaganda_technique'::text, 'coalition'::text, 'source_artifact'::text, 'span'::text, 'entity'::text, 'task'::text, 'event'::text])) AND ((target_type)::text = ANY (ARRAY['claim'::text, 'agent'::text, 'evidence'::text, 'trace'::text, 'node'::text, 'activity'::text, 'paper'::text, 'perspective'::text, 'community'::text, 'context'::text, 'frame'::text, 'analysis'::text, 'experiment'::text, 'experiment_result'::text, 'propaganda_technique'::text, 'coalition'::text, 'source_artifact'::text, 'span'::text, 'entity'::text, 'task'::text, 'event'::text])))),
+    CONSTRAINT edges_entity_types_valid CHECK ((((source_type)::text = ANY (ARRAY['claim'::text, 'agent'::text, 'evidence'::text, 'trace'::text, 'node'::text, 'activity'::text, 'paper'::text, 'perspective'::text, 'community'::text, 'context'::text, 'frame'::text, 'analysis'::text, 'source_artifact'::text, 'span'::text, 'entity'::text, 'task'::text, 'event'::text])) AND ((target_type)::text = ANY (ARRAY['claim'::text, 'agent'::text, 'evidence'::text, 'trace'::text, 'node'::text, 'activity'::text, 'paper'::text, 'perspective'::text, 'community'::text, 'context'::text, 'frame'::text, 'analysis'::text, 'source_artifact'::text, 'span'::text, 'entity'::text, 'task'::text, 'event'::text])))),
     CONSTRAINT edges_no_self_loop CHECK (((source_id <> target_id) OR ((source_type)::text <> (target_type)::text))),
     CONSTRAINT edges_relationship_not_empty CHECK ((length(TRIM(BOTH FROM relationship)) > 0)),
     CONSTRAINT edges_signature_length CHECK (((signature IS NULL) OR (octet_length(signature) = 64))),
