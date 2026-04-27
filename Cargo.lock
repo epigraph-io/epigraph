@@ -1190,6 +1190,7 @@ dependencies = [
  "epigraph-engine",
  "epigraph-events",
  "epigraph-interfaces",
+ "epigraph-jobs",
  "futures",
  "hex",
  "hmac",

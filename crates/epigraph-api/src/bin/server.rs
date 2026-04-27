@@ -1,7 +1,13 @@
 use epigraph_api::metrics::Metrics;
 use epigraph_api::routes::webhooks::{start_webhook_dispatcher, WebhookDeliveryConfig};
 use epigraph_api::{create_router, ApiConfig, AppState};
+#[cfg(feature = "db")]
+use epigraph_jobs::{
+    cluster_graph::ClusterGraphHandler, EpiGraphJob, JobQueue, JobRunner, PostgresJobQueue,
+};
 use std::sync::Arc;
+#[cfg(feature = "db")]
+use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Create the embedding service based on environment configuration.
@@ -159,7 +165,7 @@ async fn main() {
 
     // Create application state — connect to PostgreSQL when db feature is enabled
     #[cfg(feature = "db")]
-    let state = {
+    let (state, job_pool) = {
         let database_url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL must be set when running with db feature");
         tracing::info!("Connecting to PostgreSQL...");
@@ -167,11 +173,63 @@ async fn main() {
             .await
             .expect("Failed to connect to PostgreSQL");
         tracing::info!("PostgreSQL connected");
-        AppState::with_db(pool, config).with_embedding_service(embedding_service)
+        let job_pool = pool.clone();
+        let state = AppState::with_db(pool, config).with_embedding_service(embedding_service);
+        (state, job_pool)
     };
 
     #[cfg(not(feature = "db"))]
     let state = AppState::new(config).with_embedding_service(embedding_service);
+
+    // Start background job runner with ClusterGraph handler (db feature only).
+    // The runner uses PostgresJobQueue for durable persistence.  The cron loop
+    // fires 60 s after startup then every 24 h thereafter.
+    #[cfg(feature = "db")]
+    {
+        let queue: Arc<dyn JobQueue> =
+            Arc::new(PostgresJobQueue::new(job_pool.clone()));
+        let queue_for_cron = Arc::clone(&queue);
+
+        let handler_pool = Arc::new(job_pool);
+        let mut runner = JobRunner::new(2, queue);
+        runner.register_handler(Arc::new(ClusterGraphHandler::new(handler_pool)));
+
+        tokio::spawn(async move {
+            runner.start().await;
+        });
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            loop {
+                match (EpiGraphJob::ClusterGraph {
+                    resolution: 1.0,
+                    retain_runs: 3,
+                })
+                .into_job()
+                {
+                    Ok(job) => {
+                        if let Err(e) = queue_for_cron.enqueue(job).await {
+                            tracing::error!(
+                                error = %e,
+                                "failed to enqueue nightly ClusterGraph job"
+                            );
+                        } else {
+                            tracing::info!("Enqueued nightly ClusterGraph job");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "failed to serialize ClusterGraph job payload"
+                        );
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(86_400)).await;
+            }
+        });
+
+        tracing::info!("Job runner started (2 workers); nightly ClusterGraph job scheduled");
+    }
 
     // Start webhook dispatcher (subscribes to event bus for delivery)
     let _webhook_sub = start_webhook_dispatcher(
