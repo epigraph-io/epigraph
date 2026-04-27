@@ -156,3 +156,7 @@ path = "tests/embedding_integration_tests.rs"
 [[test]]
 name = "rag_persistence_tests"
 path = "tests/integration/rag_persistence_tests.rs"
+
+[[test]]
+name = "staleness_events"
+path = "tests/events/staleness_events_test.rs"
