@@ -1355,6 +1355,7 @@ dependencies = [
  "epigraph-crypto",
  "epigraph-db",
  "epigraph-ds",
+ "epigraph-embeddings",
  "petgraph 0.7.1",
  "proptest",
  "regex",
@@ -1433,6 +1434,7 @@ dependencies = [
 name = "epigraph-mcp"
 version = "0.3.0"
 dependencies = [
+ "async-trait",
  "axum 0.8.8",
  "chrono",
  "clap",

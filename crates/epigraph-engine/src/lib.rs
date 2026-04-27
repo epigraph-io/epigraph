@@ -37,6 +37,7 @@ pub mod interval_bp;
 pub mod lifecycle;
 pub mod promotion;
 pub mod propagation;
+pub mod recall;
 pub mod reasoning;
 pub mod reconciliation;
 pub mod reputation;
@@ -70,6 +71,7 @@ pub use error_mass::{
     build_error_mass, ErrorBudget, ErrorMassResult, EvidenceDirection, ScopeLimitation,
 };
 pub use belief_query::{get_belief, BeliefInterval, BeliefQueryError};
+pub use recall::{recall, RecallError, RecallResult};
 pub use errors::EngineError;
 pub use evidence::{EvidenceType, EvidenceWeightConfig, EvidenceWeighter};
 pub use interval_bp::{
