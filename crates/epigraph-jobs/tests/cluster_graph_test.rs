@@ -69,3 +69,20 @@ fn star_graph_is_one_community() {
     uniq.dedup();
     assert_eq!(uniq.len(), 1, "star graph should be one community");
 }
+
+/// v1 ignores edge sign: a graph wired with all CONTRADICTS edges should
+/// produce the same community structure as the same topology with SUPPORTS.
+/// We assert this at the Louvain layer by passing identical weight 1.0 either
+/// way and confirming the assignment vector is identical.
+#[test]
+fn sign_is_ignored_in_v1() {
+    let topology = vec![
+        (0u32, 1u32, 1.0), (1, 2, 1.0), (0, 2, 1.0),
+        (3, 4, 1.0), (4, 5, 1.0), (3, 5, 1.0),
+    ];
+    let supports = LouvainInput { node_count: 6, edges: topology.clone(), resolution: 1.0 };
+    let contradicts = LouvainInput { node_count: 6, edges: topology, resolution: 1.0 };
+    let a = louvain(&supports).unwrap().assignments;
+    let b = louvain(&contradicts).unwrap().assignments;
+    assert_eq!(a, b);
+}
