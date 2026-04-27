@@ -516,6 +516,14 @@ pub fn create_router(state: AppState) -> Router {
             get(graph_overview::graph_neighborhood),
         )
         .route(
+            "/api/v1/graph/communities/overview",
+            get(graph_overview::communities_overview),
+        )
+        .route(
+            "/api/v1/graph/communities/:id/expand",
+            get(graph_overview::expand_community),
+        )
+        .route(
             "/api/v1/graph/query",
             post(graph_query::execute_graph_query),
         )
@@ -934,6 +942,14 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/graph/neighborhood",
             get(graph_overview::graph_neighborhood),
+        )
+        .route(
+            "/api/v1/graph/communities/overview",
+            get(graph_overview::communities_overview),
+        )
+        .route(
+            "/api/v1/graph/communities/:id/expand",
+            get(graph_overview::expand_community),
         )
         .route("/api/v1/evidence/:id", get(edges::get_evidence))
         .route(

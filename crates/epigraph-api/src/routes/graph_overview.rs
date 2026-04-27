@@ -1,8 +1,17 @@
-//! Cluster-level graph endpoints driven by the `claim_themes` table.
+//! Cluster-level graph endpoints.
 //!
-//! - `GET /api/v1/graph/overview` — list themes as supernodes for the high-level view
-//! - `GET /api/v1/graph/clusters/:id/expand` — claim-level subgraph for one theme
-//! - `GET /api/v1/graph/neighborhood` — n-hop subgraph around a single claim
+//! Two cluster sources are supported:
+//!
+//! Theme view (semantic clusters from `claim_themes`):
+//! - `GET /api/v1/graph/overview`
+//! - `GET /api/v1/graph/clusters/:id/expand`
+//!
+//! Community view (graph-algorithm communities from `graph_communities`):
+//! - `GET /api/v1/graph/communities/overview`
+//! - `GET /api/v1/graph/communities/:id/expand`
+//!
+//! Plus the source-agnostic node neighborhood:
+//! - `GET /api/v1/graph/neighborhood`
 
 use axum::{
     extract::{Path, Query, State},
@@ -417,6 +426,260 @@ async fn fetch_subgraph_edges(
             relationship: r.get("relationship"),
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Community-detection handlers (sourced from graph_communities tables)
+// ---------------------------------------------------------------------------
+
+const COMMUNITY_NODE_LIMIT: i64 = 200;
+
+/// `GET /api/v1/graph/communities/overview`
+#[cfg(feature = "db")]
+pub async fn communities_overview(
+    State(state): State<AppState>,
+) -> Result<Json<OverviewResponse>, ApiError> {
+    let pool = &state.db_pool;
+
+    let run_row = sqlx::query(
+        r#"
+        SELECT id, generated_at
+        FROM graph_community_runs
+        ORDER BY generated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Latest run lookup failed: {}", e),
+    })?;
+
+    let Some(run_row) = run_row else {
+        return Ok(Json(OverviewResponse {
+            run_id: None,
+            generated_at: None,
+            degraded: true,
+            supernodes: Vec::new(),
+            cluster_edges: Vec::new(),
+        }));
+    };
+
+    let run_id: Uuid = run_row.get("id");
+    let generated_at: chrono::DateTime<chrono::Utc> = run_row.get("generated_at");
+
+    let supernode_rows = sqlx::query(
+        r#"
+        SELECT
+            l.community_id,
+            l.label,
+            l.size::bigint AS size,
+            l.dominant_theme_id,
+            AVG(c.pignistic_prob) AS mean_betp
+        FROM graph_community_labels l
+        LEFT JOIN graph_communities gc
+            ON gc.run_id = l.run_id AND gc.community_id = l.community_id
+        LEFT JOIN claims c ON c.id = gc.claim_id AND c.is_current = true
+        WHERE l.run_id = $1
+        GROUP BY l.community_id, l.label, l.size, l.dominant_theme_id
+        ORDER BY l.size DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(SUPERNODE_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Community overview query failed: {}", e),
+    })?;
+
+    let supernodes: Vec<Supernode> = supernode_rows
+        .into_iter()
+        .map(|r| {
+            let community_id: i32 = r.get("community_id");
+            let dominant_theme_id: Option<Uuid> = r.try_get("dominant_theme_id").ok();
+            Supernode {
+                cluster_id: community_id.to_string(),
+                label: r.get("label"),
+                size: r.get("size"),
+                mean_betp: r.try_get("mean_betp").ok(),
+                dominant_type: Some("claim".to_string()),
+                dominant_frame_id: dominant_theme_id,
+            }
+        })
+        .collect();
+
+    // Inter-community edges: count claim-claim edges that span communities,
+    // weighted by edge count. Cap to keep payload bounded.
+    let edge_rows = sqlx::query(
+        r#"
+        SELECT
+            LEAST(gs.community_id, gt.community_id) AS a,
+            GREATEST(gs.community_id, gt.community_id) AS b,
+            COUNT(*)::bigint AS weight
+        FROM edges e
+        JOIN graph_communities gs
+            ON gs.claim_id = e.source_id AND gs.run_id = $1
+        JOIN graph_communities gt
+            ON gt.claim_id = e.target_id AND gt.run_id = $1
+        WHERE e.source_type = 'claim'
+          AND e.target_type = 'claim'
+          AND gs.community_id <> gt.community_id
+          AND e.relationship = ANY($2::text[])
+        GROUP BY a, b
+        ORDER BY weight DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(run_id)
+    .bind(GRAPH_EDGE_RELATIONSHIPS)
+    .bind(CLUSTER_EDGE_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Community edge aggregation failed: {}", e),
+    })?;
+
+    let cluster_edges: Vec<ClusterEdge> = edge_rows
+        .into_iter()
+        .map(|r| {
+            let a: i32 = r.get("a");
+            let b: i32 = r.get("b");
+            ClusterEdge {
+                a: a.to_string(),
+                b: b.to_string(),
+                weight: r.get("weight"),
+            }
+        })
+        .collect();
+
+    Ok(Json(OverviewResponse {
+        run_id: Some(run_id.to_string()),
+        generated_at: Some(generated_at.to_rfc3339()),
+        degraded: supernodes.is_empty(),
+        supernodes,
+        cluster_edges,
+    }))
+}
+
+/// `GET /api/v1/graph/communities/:id/expand?budget=N`
+#[cfg(feature = "db")]
+pub async fn expand_community(
+    State(state): State<AppState>,
+    Path(community_id): Path<i32>,
+    Query(params): Query<BudgetQuery>,
+) -> Result<Json<ClusterSubgraphResponse>, ApiError> {
+    let pool = &state.db_pool;
+    let budget = params
+        .budget
+        .unwrap_or(DEFAULT_BUDGET)
+        .clamp(1, COMMUNITY_NODE_LIMIT);
+
+    let run_row = sqlx::query("SELECT id FROM graph_community_runs ORDER BY generated_at DESC LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Latest run lookup failed: {}", e),
+        })?;
+
+    let Some(run_row) = run_row else {
+        return Ok(Json(ClusterSubgraphResponse {
+            cluster_id: community_id.to_string(),
+            truncated: false,
+            total_size: 0,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        }));
+    };
+    let run_id: Uuid = run_row.get("id");
+
+    let total_size: i64 = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT size FROM graph_community_labels WHERE run_id = $1 AND community_id = $2), 0)::bigint",
+    )
+    .bind(run_id)
+    .bind(community_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Community size lookup failed: {}", e),
+    })?;
+
+    let node_rows = sqlx::query(
+        r#"
+        SELECT c.id, c.content, c.pignistic_prob, c.theme_id
+        FROM graph_communities gc
+        JOIN claims c ON c.id = gc.claim_id
+        WHERE gc.run_id = $1
+          AND gc.community_id = $2
+          AND c.is_current = true
+        ORDER BY c.pignistic_prob DESC NULLS LAST, c.created_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(run_id)
+    .bind(community_id)
+    .bind(budget)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Community claim fetch failed: {}", e),
+    })?;
+
+    let nodes: Vec<GraphNodeDto> = node_rows
+        .into_iter()
+        .map(|r| {
+            let content: String = r.get("content");
+            GraphNodeDto {
+                id: r.get("id"),
+                label: truncate_label(&content, 120),
+                entity_type: "claim".to_string(),
+                pignistic_prob: r.try_get("pignistic_prob").ok(),
+                frame_id: None,
+                cluster_id: r.try_get("theme_id").ok(),
+                conflict_k: None,
+            }
+        })
+        .collect();
+
+    let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
+    let edges = fetch_subgraph_edges(pool, &node_ids).await?;
+
+    Ok(Json(ClusterSubgraphResponse {
+        cluster_id: community_id.to_string(),
+        truncated: (nodes.len() as i64) < total_size,
+        total_size,
+        nodes,
+        edges,
+    }))
+}
+
+#[cfg(not(feature = "db"))]
+pub async fn communities_overview(
+    State(_): State<AppState>,
+) -> Result<Json<OverviewResponse>, ApiError> {
+    Ok(Json(OverviewResponse {
+        run_id: None,
+        generated_at: None,
+        degraded: true,
+        supernodes: Vec::new(),
+        cluster_edges: Vec::new(),
+    }))
+}
+
+#[cfg(not(feature = "db"))]
+pub async fn expand_community(
+    State(_): State<AppState>,
+    Path(community_id): Path<i32>,
+    Query(_): Query<BudgetQuery>,
+) -> Result<Json<ClusterSubgraphResponse>, ApiError> {
+    Ok(Json(ClusterSubgraphResponse {
+        cluster_id: community_id.to_string(),
+        truncated: false,
+        total_size: 0,
+        nodes: Vec::new(),
+        edges: Vec::new(),
+    }))
 }
 
 fn truncate_label(content: &str, max: usize) -> String {
