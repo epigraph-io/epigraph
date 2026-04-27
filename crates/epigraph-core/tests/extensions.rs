@@ -43,7 +43,10 @@ async fn orchestration_noop_submits_silently() {
         .submit(task_id, serde_json::json!({"type": "test"}))
         .await;
     assert!(result.is_ok(), "no-op orchestration must return Ok(())");
-    assert!(!orch.is_active(), "no-op orchestration must report inactive");
+    assert!(
+        !orch.is_active(),
+        "no-op orchestration must report inactive"
+    );
 }
 
 #[tokio::test]

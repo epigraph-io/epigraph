@@ -122,7 +122,7 @@ pub async fn get_agent_timeline(
     entries.extend(act_entries);
 
     // --- 5. Sort by timestamp DESC, take top 100 ----------------------------
-    entries.sort_unstable_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    entries.sort_unstable_by_key(|b| std::cmp::Reverse(b.timestamp));
     entries.truncate(100);
 
     Ok(Json(entries))

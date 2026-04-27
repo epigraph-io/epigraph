@@ -18,9 +18,8 @@ use epigraph_embeddings::EmbeddingService;
 use epigraph_engine::{DatabasePropagator, PropagationConfig, PropagationOrchestrator};
 use epigraph_events::EventBus;
 use epigraph_interfaces::{
-    EncryptionProvider, NoOpEncryptionProvider,
-    OrchestrationBackend, NoOpOrchestrationBackend,
-    PolicyGate, NoOpPolicyGate,
+    EncryptionProvider, NoOpEncryptionProvider, NoOpOrchestrationBackend, NoOpPolicyGate,
+    OrchestrationBackend, PolicyGate,
 };
 use serde::{Deserialize, Serialize};
 
@@ -566,11 +565,9 @@ impl Default for ApiConfig {
 
 #[cfg(test)]
 mod extension_wiring_tests {
-    use epigraph_interfaces::{
-        NoOpEncryptionProvider, NoOpOrchestrationBackend, NoOpPolicyGate,
-    };
-    use std::sync::Arc;
     use super::{SharedEncryptionProvider, SharedOrchestrationBackend, SharedPolicyGate};
+    use epigraph_interfaces::{NoOpEncryptionProvider, NoOpOrchestrationBackend, NoOpPolicyGate};
+    use std::sync::Arc;
 
     #[test]
     fn appstate_accepts_noop_providers() {

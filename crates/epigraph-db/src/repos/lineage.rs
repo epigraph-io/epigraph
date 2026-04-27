@@ -395,7 +395,7 @@ impl LineageRepository {
         // Build topological order (sorted by depth descending, so ancestors come first)
         let mut topological_order: Vec<(Uuid, i32)> =
             lineage_rows.iter().map(|r| (r.id, r.depth)).collect();
-        topological_order.sort_by(|a, b| b.1.cmp(&a.1)); // Descending depth
+        topological_order.sort_by_key(|b| std::cmp::Reverse(b.1)); // Descending depth
         let topological_order: Vec<Uuid> =
             topological_order.into_iter().map(|(id, _)| id).collect();
 
@@ -557,7 +557,7 @@ impl LineageRepository {
 
         // Sort by depth descending (ancestors first)
         let mut sorted: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.id, r.depth)).collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         Ok(sorted.into_iter().map(|(id, _)| id).collect())
     }
@@ -785,7 +785,7 @@ impl LineageRepository {
         // Build topological order (sorted by depth ascending for descendants)
         let mut topological_order: Vec<(Uuid, i32)> =
             lineage_rows.iter().map(|r| (r.id, r.depth)).collect();
-        topological_order.sort_by(|a, b| a.1.cmp(&b.1)); // Ascending depth for descendants
+        topological_order.sort_by_key(|a| a.1); // Ascending depth for descendants
         let topological_order: Vec<Uuid> =
             topological_order.into_iter().map(|(id, _)| id).collect();
 
@@ -855,7 +855,7 @@ impl LineageRepository {
 
         // Sort by depth ascending (root first)
         let mut sorted: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.id, r.depth)).collect();
-        sorted.sort_by(|a, b| a.1.cmp(&b.1));
+        sorted.sort_by_key(|a| a.1);
 
         Ok(sorted.into_iter().map(|(id, _)| id).collect())
     }

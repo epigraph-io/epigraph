@@ -44,21 +44,13 @@ pub trait EncryptionProvider: Send + Sync + 'static {
     ///
     /// Returns the ciphertext. The no-op implementation returns `plaintext`
     /// unchanged.
-    async fn encrypt(
-        &self,
-        plaintext: &[u8],
-        key_id: &str,
-    ) -> Result<Vec<u8>, EncryptionError>;
+    async fn encrypt(&self, plaintext: &[u8], key_id: &str) -> Result<Vec<u8>, EncryptionError>;
 
     /// Decrypt `ciphertext` under the key identified by `key_id`.
     ///
     /// Returns the plaintext. The no-op implementation returns `ciphertext`
     /// unchanged.
-    async fn decrypt(
-        &self,
-        ciphertext: &[u8],
-        key_id: &str,
-    ) -> Result<Vec<u8>, EncryptionError>;
+    async fn decrypt(&self, ciphertext: &[u8], key_id: &str) -> Result<Vec<u8>, EncryptionError>;
 
     /// Return `true` if this provider performs real encryption.
     ///
@@ -84,19 +76,11 @@ impl NoOpEncryptionProvider {
 
 #[async_trait]
 impl EncryptionProvider for NoOpEncryptionProvider {
-    async fn encrypt(
-        &self,
-        plaintext: &[u8],
-        _key_id: &str,
-    ) -> Result<Vec<u8>, EncryptionError> {
+    async fn encrypt(&self, plaintext: &[u8], _key_id: &str) -> Result<Vec<u8>, EncryptionError> {
         Ok(plaintext.to_vec())
     }
 
-    async fn decrypt(
-        &self,
-        ciphertext: &[u8],
-        _key_id: &str,
-    ) -> Result<Vec<u8>, EncryptionError> {
+    async fn decrypt(&self, ciphertext: &[u8], _key_id: &str) -> Result<Vec<u8>, EncryptionError> {
         Ok(ciphertext.to_vec())
     }
 
