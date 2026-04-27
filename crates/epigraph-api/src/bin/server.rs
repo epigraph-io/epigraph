@@ -186,8 +186,7 @@ async fn main() {
     // fires 60 s after startup then every 24 h thereafter.
     #[cfg(feature = "db")]
     {
-        let queue: Arc<dyn JobQueue> =
-            Arc::new(PostgresJobQueue::new(job_pool.clone()));
+        let queue: Arc<dyn JobQueue> = Arc::new(PostgresJobQueue::new(job_pool.clone()));
         let queue_for_cron = Arc::clone(&queue);
 
         let handler_pool = Arc::new(job_pool);

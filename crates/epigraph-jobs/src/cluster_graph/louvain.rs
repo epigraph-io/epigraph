@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 
-use rand::{seq::SliceRandom, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{seq::SliceRandom, SeedableRng};
 
 #[derive(Debug, Clone)]
 pub struct LouvainInput {
@@ -34,7 +34,10 @@ pub enum LouvainError {
 pub fn louvain(input: &LouvainInput) -> Result<LouvainResult, LouvainError> {
     let n = input.node_count;
     if n == 0 {
-        return Ok(LouvainResult { assignments: Vec::new(), modularity: 0.0 });
+        return Ok(LouvainResult {
+            assignments: Vec::new(),
+            modularity: 0.0,
+        });
     }
 
     // Build adjacency: adj[node] -> Vec<(neighbor, weight)>.
@@ -42,12 +45,20 @@ pub fn louvain(input: &LouvainInput) -> Result<LouvainResult, LouvainError> {
     let mut total_weight: f64 = 0.0;
     for &(a, b, w) in &input.edges {
         if (a as usize) >= n {
-            return Err(LouvainError::InvalidEdge { node: a, node_count: n });
+            return Err(LouvainError::InvalidEdge {
+                node: a,
+                node_count: n,
+            });
         }
         if (b as usize) >= n {
-            return Err(LouvainError::InvalidEdge { node: b, node_count: n });
+            return Err(LouvainError::InvalidEdge {
+                node: b,
+                node_count: n,
+            });
         }
-        if a == b { continue; } // ignore self-loops
+        if a == b {
+            continue;
+        } // ignore self-loops
         adj[a as usize].push((b, w));
         adj[b as usize].push((a, w));
         total_weight += w;
@@ -56,14 +67,18 @@ pub fn louvain(input: &LouvainInput) -> Result<LouvainResult, LouvainError> {
     if two_m == 0.0 {
         // No edges: every node is its own community.
         let assignments: Vec<u32> = (0..n as u32).collect();
-        return Ok(LouvainResult { assignments, modularity: 0.0 });
+        return Ok(LouvainResult {
+            assignments,
+            modularity: 0.0,
+        });
     }
 
     // Each node starts in its own community.
     let mut comm: Vec<u32> = (0..n as u32).collect();
 
     // k_i = sum of weights incident to node i.
-    let k: Vec<f64> = adj.iter()
+    let k: Vec<f64> = adj
+        .iter()
         .map(|nbrs| nbrs.iter().map(|(_, w)| *w).sum())
         .collect();
 
@@ -94,9 +109,13 @@ pub fn louvain(input: &LouvainInput) -> Result<LouvainResult, LouvainError> {
             // Build map: neighbor community -> sum of weights from i into that community.
             let mut k_i_in: HashMap<u32, f64> = HashMap::new();
             for &(j, w) in &adj[i] {
-                if (j as usize) == i { continue; }
+                if (j as usize) == i {
+                    continue;
+                }
                 let cj = comm[j as usize];
-                if cj == u32::MAX { continue; }
+                if cj == u32::MAX {
+                    continue;
+                }
                 *k_i_in.entry(cj).or_insert(0.0) += w;
             }
 
@@ -129,14 +148,20 @@ pub fn louvain(input: &LouvainInput) -> Result<LouvainResult, LouvainError> {
 
     // Densify community ids (0-based contiguous).
     let mut remap: HashMap<u32, u32> = HashMap::new();
-    let assignments: Vec<u32> = comm.iter().map(|c| {
-        let next = remap.len() as u32;
-        *remap.entry(*c).or_insert(next)
-    }).collect();
+    let assignments: Vec<u32> = comm
+        .iter()
+        .map(|c| {
+            let next = remap.len() as u32;
+            *remap.entry(*c).or_insert(next)
+        })
+        .collect();
 
     // Compute modularity for diagnostic output.
     let modularity = compute_modularity(&adj, &assignments, total_weight, resolution);
-    Ok(LouvainResult { assignments, modularity })
+    Ok(LouvainResult {
+        assignments,
+        modularity,
+    })
 }
 
 fn compute_modularity(
@@ -145,7 +170,9 @@ fn compute_modularity(
     total_weight: f64,
     resolution: f64,
 ) -> f64 {
-    if total_weight == 0.0 { return 0.0; }
+    if total_weight == 0.0 {
+        return 0.0;
+    }
     let n = adj.len();
     let mut k = vec![0.0_f64; n];
     for (i, nbrs) in adj.iter().enumerate() {

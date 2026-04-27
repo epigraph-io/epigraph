@@ -1,8 +1,8 @@
 //! Orchestrates a single clustering run: load edges + claims, run Louvain,
 //! compute supernode metadata, persist results, GC old runs.
 
-use std::collections::HashMap;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::louvain::{louvain, LouvainInput};
@@ -33,8 +33,8 @@ struct ClaimRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct EdgeRow {
-    source: Uuid,   // aliased from edges.source_id in SELECT
-    target: Uuid,   // aliased from edges.target_id in SELECT
+    source: Uuid, // aliased from edges.source_id in SELECT
+    target: Uuid, // aliased from edges.target_id in SELECT
 }
 
 pub async fn run_clustering(pool: &PgPool, cfg: &RunConfig) -> Result<RunSummary, sqlx::Error> {
@@ -75,7 +75,9 @@ pub async fn run_clustering(pool: &PgPool, cfg: &RunConfig) -> Result<RunSummary
         let (Some(&a), Some(&b)) = (id_to_idx.get(&e.source), id_to_idx.get(&e.target)) else {
             continue;
         };
-        if a == b { continue; }
+        if a == b {
+            continue;
+        }
         edge_pairs.push((a, b, 1.0));
     }
 
@@ -108,22 +110,27 @@ pub async fn run_clustering(pool: &PgPool, cfg: &RunConfig) -> Result<RunSummary
 
     gc_old_runs(pool, cfg.retain_runs).await?;
 
-    Ok(RunSummary { run_id, cluster_count, degraded })
+    Ok(RunSummary {
+        run_id,
+        cluster_count,
+        degraded,
+    })
 }
 
 fn unique_count(assignments: &[u32]) -> usize {
     let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    for a in assignments { seen.insert(*a); }
+    for a in assignments {
+        seen.insert(*a);
+    }
     seen.len()
 }
 
 async fn unique_count_after_write(pool: &PgPool, run_id: Uuid) -> Result<usize, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*)::bigint FROM graph_clusters WHERE run_id = $1",
-    )
-    .bind(run_id)
-    .fetch_one(pool)
-    .await?;
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*)::bigint FROM graph_clusters WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await?;
     Ok(row.0 as usize)
 }
 
@@ -159,8 +166,15 @@ async fn write_clusters(
                 *frame_counts.entry(f).or_insert(0) += 1;
             }
         }
-        let mean_betp = if count_betp > 0 { Some(sum_betp / count_betp as f64) } else { None };
-        let dominant_frame_id = frame_counts.iter().max_by_key(|(_, c)| **c).map(|(k, _)| *k);
+        let mean_betp = if count_betp > 0 {
+            Some(sum_betp / count_betp as f64)
+        } else {
+            None
+        };
+        let dominant_frame_id = frame_counts
+            .iter()
+            .max_by_key(|(_, c)| **c)
+            .map(|(k, _)| *k);
         let label = dominant_frame_id
             .map(|f| f.to_string())
             .unwrap_or_else(|| format!("cluster-{comm}"));
@@ -224,9 +238,8 @@ async fn flush_membership(
     batch: &[(Uuid, Uuid)],
     run_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    let mut q = String::from(
-        "INSERT INTO claim_cluster_membership (claim_id, cluster_id, run_id) VALUES ",
-    );
+    let mut q =
+        String::from("INSERT INTO claim_cluster_membership (claim_id, cluster_id, run_id) VALUES ");
     let mut params: Vec<String> = Vec::with_capacity(batch.len());
     for i in 0..batch.len() {
         let base = i * 3;
@@ -314,9 +327,16 @@ fn mean_betp_of(claims: &[ClaimRow], idxs: &[usize]) -> Option<f64> {
     let mut sum = 0.0_f64;
     let mut n = 0i32;
     for &i in idxs {
-        if let Some(b) = claims[i].pignistic_prob { sum += b; n += 1; }
+        if let Some(b) = claims[i].pignistic_prob {
+            sum += b;
+            n += 1;
+        }
     }
-    if n == 0 { None } else { Some(sum / n as f64) }
+    if n == 0 {
+        None
+    } else {
+        Some(sum / n as f64)
+    }
 }
 
 async fn gc_old_runs(pool: &PgPool, retain: u32) -> Result<(), sqlx::Error> {

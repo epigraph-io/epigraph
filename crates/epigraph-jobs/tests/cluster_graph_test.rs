@@ -62,7 +62,11 @@ fn singleton_nodes_each_get_own_community() {
 fn star_graph_is_one_community() {
     let center = 0u32;
     let edges: Vec<(u32, u32, f64)> = (1..=8u32).map(|leaf| (center, leaf, 1.0)).collect();
-    let input = LouvainInput { node_count: 9, edges, resolution: 1.0 };
+    let input = LouvainInput {
+        node_count: 9,
+        edges,
+        resolution: 1.0,
+    };
     let result = louvain(&input).expect("louvain runs");
     let mut uniq: Vec<u32> = result.assignments.iter().copied().collect();
     uniq.sort();
@@ -77,11 +81,23 @@ fn star_graph_is_one_community() {
 #[test]
 fn sign_is_ignored_in_v1() {
     let topology = vec![
-        (0u32, 1u32, 1.0), (1, 2, 1.0), (0, 2, 1.0),
-        (3, 4, 1.0), (4, 5, 1.0), (3, 5, 1.0),
+        (0u32, 1u32, 1.0),
+        (1, 2, 1.0),
+        (0, 2, 1.0),
+        (3, 4, 1.0),
+        (4, 5, 1.0),
+        (3, 5, 1.0),
     ];
-    let supports = LouvainInput { node_count: 6, edges: topology.clone(), resolution: 1.0 };
-    let contradicts = LouvainInput { node_count: 6, edges: topology, resolution: 1.0 };
+    let supports = LouvainInput {
+        node_count: 6,
+        edges: topology.clone(),
+        resolution: 1.0,
+    };
+    let contradicts = LouvainInput {
+        node_count: 6,
+        edges: topology,
+        resolution: 1.0,
+    };
     let a = louvain(&supports).unwrap().assignments;
     let b = louvain(&contradicts).unwrap().assignments;
     assert_eq!(a, b);
@@ -98,27 +114,35 @@ mod integration {
     async fn end_to_end_two_cliques_produce_two_clusters() {
         let url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL must point at a scratch DB with 001+002 applied");
-        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
 
         // Seed (caller is responsible for cleaning up).
         let seed = include_str!("fixtures/seed_two_cliques.sql");
         sqlx::raw_sql(seed).execute(&pool).await.unwrap();
 
-        let summary = run_clustering(&pool, &RunConfig {
-            resolution: 1.0,
-            retain_runs: 3,
-        }).await.unwrap();
+        let summary = run_clustering(
+            &pool,
+            &RunConfig {
+                resolution: 1.0,
+                retain_runs: 3,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.cluster_count, 2);
         assert!(!summary.degraded);
 
         // Verify cluster_edges has zero rows for this run (cliques are disjoint).
-        let (n,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*)::bigint FROM cluster_edges WHERE run_id = $1"
-        )
-        .bind(summary.run_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::bigint FROM cluster_edges WHERE run_id = $1")
+                .bind(summary.run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(n, 0, "no inter-cluster edges expected");
 
         // Verify the OCCUPIES edge was excluded — both endpoints in same cluster

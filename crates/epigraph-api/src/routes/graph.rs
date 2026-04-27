@@ -1,7 +1,10 @@
 //! /api/v1/graph/{overview, clusters/:id/expand, neighborhood} — read-only
 //! endpoints over the latest successful clustering run.
 
-use axum::{extract::{Path, Query, State}, Json};
+use axum::{
+    extract::{Path, Query, State},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -74,7 +77,9 @@ pub struct ExpandParams {
     #[serde(default = "default_budget")]
     pub budget: i64,
 }
-const fn default_budget() -> i64 { 200 }
+const fn default_budget() -> i64 {
+    200
+}
 
 #[derive(Debug, Deserialize)]
 pub struct NeighborhoodParams {
@@ -84,7 +89,9 @@ pub struct NeighborhoodParams {
     #[serde(default = "default_budget")]
     pub budget: i64,
 }
-const fn default_hops() -> i64 { 1 }
+const fn default_hops() -> i64 {
+    1
+}
 
 pub async fn overview(
     State(state): State<AppState>,
@@ -146,30 +153,29 @@ pub async fn expand(
 ) -> Result<Json<ExpandResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
     let pool: &PgPool = &state.db_pool;
-    let latest_run: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(internal)?;
+    let latest_run: Option<(Uuid,)> =
+        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .map_err(internal)?;
     let Some((run_id,)) = latest_run else {
         return Err((StatusCode::NOT_FOUND, "no completed run".into()));
     };
-    let cluster_exists: Option<(i64,)> = sqlx::query_as(
-        "SELECT size::bigint FROM graph_clusters WHERE id = $1 AND run_id = $2",
-    )
-    .bind(cluster_id)
-    .bind(run_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(internal)?;
+    let cluster_exists: Option<(i64,)> =
+        sqlx::query_as("SELECT size::bigint FROM graph_clusters WHERE id = $1 AND run_id = $2")
+            .bind(cluster_id)
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(internal)?;
     let Some((total_size,)) = cluster_exists else {
         return Err((StatusCode::NOT_FOUND, "cluster not in latest run".into()));
     };
 
     let budget = params.budget.max(1);
     // Re-use the canonical list from epigraph-jobs rather than duplicating it.
-    let rel_list: Vec<&str> = epigraph_jobs::cluster_graph::runner::EPISTEMIC_RELATIONSHIPS.to_vec();
+    let rel_list: Vec<&str> =
+        epigraph_jobs::cluster_graph::runner::EPISTEMIC_RELATIONSHIPS.to_vec();
     let nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
         "WITH degree AS (
             SELECT m.claim_id, COUNT(e.*) AS deg
@@ -228,7 +234,8 @@ pub async fn neighborhood(
     let pool: &PgPool = &state.db_pool;
     let hops = params.hops.clamp(1, 2);
     let budget = params.budget.max(1);
-    let rel_list: Vec<&str> = epigraph_jobs::cluster_graph::runner::EPISTEMIC_RELATIONSHIPS.to_vec();
+    let rel_list: Vec<&str> =
+        epigraph_jobs::cluster_graph::runner::EPISTEMIC_RELATIONSHIPS.to_vec();
 
     let nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
         r#"
