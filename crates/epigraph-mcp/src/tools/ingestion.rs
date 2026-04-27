@@ -49,9 +49,18 @@ pub async fn ingest_paper(
     server: &EpiGraphMcpFull,
     params: IngestPaperParams,
 ) -> Result<CallToolResult, McpError> {
-    let data = tokio::fs::read_to_string(&params.file_path)
+    let canonical = std::fs::canonicalize(&params.file_path)
+        .map_err(|e| invalid_params(format!("invalid file path: {e}")))?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| internal_error(format!("cannot determine CWD: {e}")))?;
+    if !canonical.starts_with(&cwd) {
+        return Err(invalid_params(
+            "file path must be within the working directory",
+        ));
+    }
+    let data = tokio::fs::read_to_string(&canonical)
         .await
-        .map_err(|e| invalid_params(format!("cannot read {}: {e}", params.file_path)))?;
+        .map_err(|e| invalid_params(format!("cannot read {}: {e}", canonical.display())))?;
 
     let extraction: LiteratureExtraction =
         serde_json::from_str(&data).map_err(|e| invalid_params(format!("invalid JSON: {e}")))?;

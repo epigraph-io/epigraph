@@ -253,7 +253,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}\n", "=".repeat(60));
 
     let mut ts_sorted: Vec<_> = result.transitive_supports.iter().collect();
-    ts_sorted.sort_by(|a, b| b.chain_strength.partial_cmp(&a.chain_strength).unwrap());
+    ts_sorted.sort_by(|a, b| {
+        b.chain_strength
+            .partial_cmp(&a.chain_strength)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Only show indirect (not direct) supports in top chains
     let direct_edges: std::collections::HashSet<(Uuid, Uuid)> = edges

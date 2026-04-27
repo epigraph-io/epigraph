@@ -35,11 +35,23 @@ pub async fn batch_submit_claims(
 
         match crate::tools::claims::submit_claim(server, claim_params).await {
             Ok(result) => {
+                // Extract claim_id from the JSON text content returned by submit_claim
+                let claim_id = result
+                    .content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
+                    .and_then(|v| {
+                        v.get("claim_id")
+                            .and_then(|id| id.as_str())
+                            .map(String::from)
+                    })
+                    .unwrap_or_default();
                 submitted.push(serde_json::json!({
                     "index": i,
                     "status": "ok",
+                    "claim_id": claim_id,
                 }));
-                let _ = result; // result consumed
             }
             Err(e) => {
                 errors.push(serde_json::json!({
