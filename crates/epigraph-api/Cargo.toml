@@ -27,6 +27,7 @@ path = "src/bin/server.rs"
 
 [dependencies]
 epigraph-interfaces = { workspace = true }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
+epigraph-jobs = { workspace = true }  # Background job runner + ClusterGraph handler
 epigraph-core = { workspace = true }
 epigraph-crypto = { workspace = true }
 epigraph-engine = { workspace = true }
@@ -86,6 +87,10 @@ epigraph-db = { workspace = true }  # E2E encrypted subgraph tests
 blake3 = { workspace = true }  # Content hashing in E2E tests
 ed25519-dalek = { workspace = true }  # Agent signing keys in E2E tests
 rand = { workspace = true }  # Key generation in E2E tests
+
+[[test]]
+name = "graph_routes_test"
+path = "tests/graph_routes_test.rs"
 
 [[test]]
 name = "db_integration_tests"
