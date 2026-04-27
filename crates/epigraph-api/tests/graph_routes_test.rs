@@ -112,3 +112,19 @@ async fn neighborhood_returns_one_hop_seed_and_neighbors() {
     let nodes = body["nodes"].as_array().unwrap();
     assert!(nodes.len() >= 2, "seed + at least one neighbor");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_endpoints_require_bearer() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    for path in [
+        "/api/v1/graph/overview".to_string(),
+        format!("/api/v1/graph/clusters/{}/expand", uuid::Uuid::new_v4()),
+        format!("/api/v1/graph/neighborhood?node_id={}", uuid::Uuid::new_v4()),
+    ] {
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}{path}"))
+            .send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 401, "missing auth path={path}");
+    }
+}
