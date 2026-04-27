@@ -21,6 +21,8 @@ async-trait = { workspace = true }  # For async trait definitions
 hmac = { workspace = true }  # HMAC for webhook signatures
 sha2 = { workspace = true }  # SHA-256 for HMAC-SHA256
 hex = { workspace = true }  # Hex encoding for signatures
+petgraph = { workspace = true }
+rand = { workspace = true }  # used by Louvain to break ties between equal-modularity moves
 sqlx = { workspace = true }  # PostgreSQL persistence for job queue
 
 [dev-dependencies]

@@ -40,6 +40,8 @@ pub mod experiments;
 #[cfg(feature = "db")]
 pub mod gaps;
 #[cfg(feature = "db")]
+pub mod graph;
+#[cfg(feature = "db")]
 pub mod graph_query;
 #[cfg(feature = "db")]
 pub mod graph_query_utils;
@@ -401,7 +403,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/tasks/:id/complete", post(tasks::complete_task))
         .route("/api/v1/tasks/:id/fail", post(tasks::fail_task))
         // Security audit log — requires audit:read scope
-        .route("/api/v1/audit/security", get(audit::query_security_events));
+        .route("/api/v1/audit/security", get(audit::query_security_events))
+        .route("/api/v1/graph/overview", get(graph::overview))
+        .route("/api/v1/graph/clusters/:id/expand", get(graph::expand))
+        .route("/api/v1/graph/neighborhood", get(graph::neighborhood));
 
     // Auth middleware stack (outermost runs first):
     // 1. bearer_auth_middleware: if Bearer token present, validate JWT + inject AuthContext

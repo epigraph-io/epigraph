@@ -60,6 +60,8 @@ pub use postgres_queue::PostgresJobQueue;
 mod db_reputation_service;
 pub use db_reputation_service::DbReputationService;
 
+pub mod cluster_graph;
+
 // ============================================================================
 // Job Identifier
 // ============================================================================
@@ -685,6 +687,14 @@ pub enum EpiGraphJob {
         /// Number of days to retain data
         retention_days: u32,
     },
+
+    /// Recompute graph clusters via Louvain over the epistemic edge subgraph.
+    ClusterGraph {
+        /// Resolution parameter (1.0 default; >1.0 finer, <1.0 coarser).
+        resolution: f64,
+        /// Maximum number of historical runs to retain.
+        retain_runs: u32,
+    },
 }
 
 impl EpiGraphJob {
@@ -697,6 +707,7 @@ impl EpiGraphJob {
             Self::ReputationUpdate { .. } => "reputation_update",
             Self::WebhookNotification { .. } => "webhook_notification",
             Self::DataCleanup { .. } => "data_cleanup",
+            Self::ClusterGraph { .. } => "cluster_graph",
         }
     }
 
