@@ -1353,6 +1353,7 @@ dependencies = [
  "criterion",
  "epigraph-core",
  "epigraph-crypto",
+ "epigraph-db",
  "epigraph-ds",
  "petgraph 0.7.1",
  "proptest",

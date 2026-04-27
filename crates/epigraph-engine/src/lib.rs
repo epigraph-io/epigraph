@@ -14,6 +14,7 @@
 
 pub mod agent_assessment;
 pub mod bayesian;
+pub mod belief_query;
 pub mod bba;
 pub mod belief_gate;
 pub mod bp;
@@ -68,6 +69,7 @@ pub use epistemic_interval::{
 pub use error_mass::{
     build_error_mass, ErrorBudget, ErrorMassResult, EvidenceDirection, ScopeLimitation,
 };
+pub use belief_query::{get_belief, BeliefInterval, BeliefQueryError};
 pub use errors::EngineError;
 pub use evidence::{EvidenceType, EvidenceWeightConfig, EvidenceWeighter};
 pub use interval_bp::{
