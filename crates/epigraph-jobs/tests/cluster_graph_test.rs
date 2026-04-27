@@ -55,3 +55,17 @@ fn singleton_nodes_each_get_own_community() {
     comms.dedup();
     assert_eq!(comms.len(), 3, "three isolated nodes -> three communities");
 }
+
+/// A star graph (one center connected to 8 leaves) is a single dense
+/// community; Louvain should not split it.
+#[test]
+fn star_graph_is_one_community() {
+    let center = 0u32;
+    let edges: Vec<(u32, u32, f64)> = (1..=8u32).map(|leaf| (center, leaf, 1.0)).collect();
+    let input = LouvainInput { node_count: 9, edges, resolution: 1.0 };
+    let result = louvain(&input).expect("louvain runs");
+    let mut uniq: Vec<u32> = result.assignments.iter().copied().collect();
+    uniq.sort();
+    uniq.dedup();
+    assert_eq!(uniq.len(), 1, "star graph should be one community");
+}
