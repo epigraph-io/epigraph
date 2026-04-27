@@ -40,6 +40,8 @@ pub mod experiments;
 #[cfg(feature = "db")]
 pub mod gaps;
 #[cfg(feature = "db")]
+pub mod graph;
+#[cfg(feature = "db")]
 pub mod graph_query;
 #[cfg(feature = "db")]
 pub mod graph_query_utils;
