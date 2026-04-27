@@ -160,3 +160,7 @@ path = "tests/integration/rag_persistence_tests.rs"
 [[test]]
 name = "edges_validation"
 path = "tests/routes/edges_validation.rs"
+
+[[test]]
+name = "staleness_events"
+path = "tests/events/staleness_events_test.rs"

@@ -762,6 +762,40 @@ pub async fn create_edge(
         valid_to: request.valid_to,
     };
 
+    // Emit edge.added event (Task 0.3 / Phase 0 — staleness trigger)
+    {
+        let actor_id = auth_ctx.as_ref().and_then(|axum::Extension(a)| a.agent_id);
+        let event_store = super::events::global_event_store();
+        event_store
+            .push(
+                "edge.added".to_string(),
+                actor_id,
+                serde_json::json!({
+                    "edge_id": response.id,
+                    "source_type": response.source_type,
+                    "source_id": response.source_id,
+                    "target_type": response.target_type,
+                    "target_id": response.target_id,
+                    "relationship": response.relationship,
+                }),
+            )
+            .await;
+
+        // If this is a supersedes edge, also emit claim.superseded
+        if response.relationship.eq_ignore_ascii_case("supersedes") {
+            event_store
+                .push(
+                    "claim.superseded".to_string(),
+                    actor_id,
+                    serde_json::json!({
+                        "superseded_claim_id": response.target_id,
+                        "superseded_by_claim_id": response.source_id,
+                    }),
+                )
+                .await;
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -811,6 +845,19 @@ pub async fn delete_edge(
         {
             tracing::warn!(edge_id = %id, error = %e, "Failed to record edge delete provenance");
         }
+    }
+
+    // Emit edge.deleted event (Task 0.3 / Phase 0 — staleness trigger)
+    {
+        let actor_id = auth_ctx.as_ref().and_then(|axum::Extension(a)| a.agent_id);
+        let event_store = super::events::global_event_store();
+        event_store
+            .push(
+                "edge.deleted".to_string(),
+                actor_id,
+                serde_json::json!({ "edge_id": id }),
+            )
+            .await;
     }
 
     Ok(StatusCode::NO_CONTENT)
