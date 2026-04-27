@@ -9,7 +9,7 @@ edition = "2021"
 default = ["db"]
 db = ["dep:epigraph-db", "dep:sqlx"]
 jina = ["epigraph-embeddings/jina"]
-genai = ["db"]  # LLM-dependent workflows; requires ANTHROPIC_API_KEY
+genai = ["db", "dep:epigraph-cli"]  # LLM-dependent workflows; requires ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN)
 integration = []
 tls = ["axum-server"]  # TLS/HTTPS via axum-server + rustls (Caddy terminates TLS in production)
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
@@ -35,6 +35,7 @@ epigraph-embeddings = { workspace = true }
 epigraph-db = { workspace = true, optional = true }
 epigraph-ds = { workspace = true }  # Dempster-Shafer math for belief endpoints
 epigraph-events = { workspace = true }  # Event bus for pub/sub messaging
+epigraph-cli = { workspace = true, optional = true }  # LlmClient trait + AnthropicClient (genai feature)
 # Enterprise and episcience deps are optional and not bundled in the kernel.
 # To enable, add the git dep and uncomment:
 # epigraph-privacy    = { git = "...", optional = true }
