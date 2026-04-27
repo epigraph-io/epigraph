@@ -39,6 +39,7 @@ pub mod experiment_loop;
 pub mod experiments;
 #[cfg(feature = "db")]
 pub mod gaps;
+pub mod graph_overview;
 #[cfg(feature = "db")]
 pub mod graph_query;
 #[cfg(feature = "db")]
@@ -503,6 +504,18 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/graph/edges", get(edges::graph_edges))
         .route("/api/v1/graph/full", get(edges::graph_full))
         .route(
+            "/api/v1/graph/overview",
+            get(graph_overview::graph_overview),
+        )
+        .route(
+            "/api/v1/graph/clusters/:id/expand",
+            get(graph_overview::expand_cluster),
+        )
+        .route(
+            "/api/v1/graph/neighborhood",
+            get(graph_overview::graph_neighborhood),
+        )
+        .route(
             "/api/v1/graph/query",
             post(graph_query::execute_graph_query),
         )
@@ -910,6 +923,18 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/graph/edges", get(edges::graph_edges))
         .route("/api/v1/graph/full", get(edges::graph_full))
+        .route(
+            "/api/v1/graph/overview",
+            get(graph_overview::graph_overview),
+        )
+        .route(
+            "/api/v1/graph/clusters/:id/expand",
+            get(graph_overview::expand_cluster),
+        )
+        .route(
+            "/api/v1/graph/neighborhood",
+            get(graph_overview::graph_neighborhood),
+        )
         .route("/api/v1/evidence/:id", get(edges::get_evidence))
         .route(
             "/api/v1/claims/:id/provenance",
