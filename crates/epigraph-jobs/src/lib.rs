@@ -60,6 +60,8 @@ pub use postgres_queue::PostgresJobQueue;
 mod db_reputation_service;
 pub use db_reputation_service::DbReputationService;
 
+pub mod cluster_graph;
+
 // ============================================================================
 // Job Identifier
 // ============================================================================
