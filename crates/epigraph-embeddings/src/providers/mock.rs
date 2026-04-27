@@ -250,7 +250,10 @@ impl EmbeddingService for MockProvider {
     }
 
     fn token_usage(&self) -> TokenUsage {
-        self.token_usage.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.token_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn reset_token_usage(&self) {
@@ -367,7 +370,10 @@ impl MockMultimodalProvider {
     /// Get the number of times `generate_from_image` was called
     #[allow(clippy::missing_panics_doc)]
     pub fn image_call_count(&self) -> usize {
-        *self.image_call_count.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .image_call_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -432,7 +438,10 @@ impl MultimodalEmbeddingService for MockMultimodalProvider {
             });
         }
 
-        *self.image_call_count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        *self
+            .image_call_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) += 1;
 
         // Generate deterministic embedding from image data hash
         let dim = self.inner.dimension();

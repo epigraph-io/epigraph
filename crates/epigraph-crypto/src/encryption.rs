@@ -51,10 +51,7 @@ impl EncryptedPayload {
         }
         if bytes.len() > MAX_ENCRYPTED_PAYLOAD_BYTES {
             return Err(CryptoError::InvalidPayload {
-                reason: format!(
-                    "payload exceeds 10 MiB limit: {} bytes",
-                    bytes.len()
-                ),
+                reason: format!("payload exceeds 10 MiB limit: {} bytes", bytes.len()),
             });
         }
         let mut nonce = [0u8; 12];
