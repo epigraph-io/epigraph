@@ -55,16 +55,19 @@ pub async fn seed_one_cluster(pool: &PgPool, size: usize) -> uuid::Uuid {
         .bind(cluster_id).bind(run_id).bind(size as i32).execute(pool).await.unwrap();
     sqlx::query("INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded) VALUES ($1, 1, FALSE)")
         .bind(run_id).execute(pool).await.unwrap();
-    for i in 0..size {
+    for _ in 0..size {
         let claim_id = uuid::Uuid::new_v4();
-        let hash_byte = (i as u8).wrapping_add(0x10);
+        // Derive content_hash from claim_id so each call produces unique hashes.
+        // Tests share a Postgres DB; fixed hashes would hit ON CONFLICT from
+        // earlier seedings and orphan the membership row → undercount.
+        let hash: Vec<u8> = claim_id.as_bytes().iter().chain(claim_id.as_bytes().iter()).copied().collect();
         sqlx::query(
             "INSERT INTO claims (id, content, content_hash, agent_id, pignistic_prob)
-             VALUES ($1, 'x', decode(repeat($2, 32), 'hex'), $3, 0.5)
+             VALUES ($1, 'x', $2, $3, 0.5)
              ON CONFLICT DO NOTHING",
         )
         .bind(claim_id)
-        .bind(format!("{hash_byte:02x}"))
+        .bind(hash)
         .bind(test_agent_id)
         .execute(pool).await.unwrap();
         sqlx::query("INSERT INTO claim_cluster_membership (claim_id, cluster_id, run_id) VALUES ($1, $2, $3)")
@@ -90,15 +93,18 @@ pub async fn seed_three_node_chain(pool: &PgPool) -> uuid::Uuid {
     let a = uuid::Uuid::new_v4();
     let b = uuid::Uuid::new_v4();
     let c = uuid::Uuid::new_v4();
-    for (i, &id) in [a, b, c].iter().enumerate() {
-        let hb = (i as u8).wrapping_add(0x20);
+    for &id in &[a, b, c] {
+        // Same rationale as seed_one_cluster: derive content_hash from the
+        // claim's UUID so it's unique per call and won't collide with prior
+        // tests' claim rows on this shared DB.
+        let hash: Vec<u8> = id.as_bytes().iter().chain(id.as_bytes().iter()).copied().collect();
         sqlx::query(
             "INSERT INTO claims (id, content, content_hash, agent_id, pignistic_prob)
-             VALUES ($1, 'x', decode(repeat($2, 32), 'hex'), $3, 0.5)
+             VALUES ($1, 'x', $2, $3, 0.5)
              ON CONFLICT DO NOTHING",
         )
         .bind(id)
-        .bind(format!("{hb:02x}"))
+        .bind(hash)
         .bind(test_agent_id)
         .execute(pool).await.unwrap();
     }
