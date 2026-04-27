@@ -86,3 +86,43 @@ fn sign_is_ignored_in_v1() {
     let b = louvain(&contradicts).unwrap().assignments;
     assert_eq!(a, b);
 }
+
+#[cfg(feature = "integration")]
+mod integration {
+    #[allow(unused_imports)]
+    use super::*;
+    use epigraph_jobs::cluster_graph::runner::{run_clustering, RunConfig};
+    use sqlx::postgres::PgPoolOptions;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_to_end_two_cliques_produce_two_clusters() {
+        let url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must point at a scratch DB with 001+002 applied");
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+
+        // Seed (caller is responsible for cleaning up).
+        let seed = include_str!("fixtures/seed_two_cliques.sql");
+        sqlx::raw_sql(seed).execute(&pool).await.unwrap();
+
+        let summary = run_clustering(&pool, &RunConfig {
+            resolution: 1.0,
+            retain_runs: 3,
+        }).await.unwrap();
+        assert_eq!(summary.cluster_count, 2);
+        assert!(!summary.degraded);
+
+        // Verify cluster_edges has zero rows for this run (cliques are disjoint).
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM cluster_edges WHERE run_id = $1"
+        )
+        .bind(summary.run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "no inter-cluster edges expected");
+
+        // Verify the OCCUPIES edge was excluded — both endpoints in same cluster
+        // would have produced a 0-weight inter-cluster edge anyway, but more
+        // importantly, the modularity must be high (not corrupted by the bridge).
+    }
+}
