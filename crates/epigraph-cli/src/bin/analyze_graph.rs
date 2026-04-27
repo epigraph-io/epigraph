@@ -307,7 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}\n", "=".repeat(60));
 
     let mut clusters_sorted: Vec<_> = result.support_clusters.iter().collect();
-    clusters_sorted.sort_by(|a, b| b.supporters.len().cmp(&a.supporters.len()));
+    clusters_sorted.sort_by_key(|b| std::cmp::Reverse(b.supporters.len()));
 
     println!(
         "  {} target(s) have multiple supporters\n",
