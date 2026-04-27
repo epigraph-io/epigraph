@@ -1182,6 +1182,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "ed25519-dalek",
+ "epigraph-cli",
  "epigraph-core",
  "epigraph-crypto",
  "epigraph-db",
