@@ -89,6 +89,10 @@ ed25519-dalek = { workspace = true }  # Agent signing keys in E2E tests
 rand = { workspace = true }  # Key generation in E2E tests
 
 [[test]]
+name = "graph_routes_test"
+path = "tests/graph_routes_test.rs"
+
+[[test]]
 name = "db_integration_tests"
 path = "tests/integration/db_integration_tests.rs"
 
