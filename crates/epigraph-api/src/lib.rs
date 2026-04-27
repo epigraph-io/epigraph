@@ -25,3 +25,13 @@ pub use state::{
     ApiConfig, AppState, ClaimStore, SharedAuditLog, SharedChallengeService,
     SharedEmbeddingService, SharedEventBus,
 };
+
+#[cfg(feature = "db")]
+pub async fn build_app_for_tests(database_url: &str) -> Result<axum::Router, sqlx::Error> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(database_url)
+        .await?;
+    let state = crate::state::AppState::with_db(pool, crate::state::ApiConfig::default());
+    Ok(crate::routes::create_router(state))
+}

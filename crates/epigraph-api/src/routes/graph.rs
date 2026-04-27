@@ -1,7 +1,7 @@
 //! /api/v1/graph/{overview, clusters/:id/expand, neighborhood} — read-only
 //! endpoints over the latest successful clustering run.
 
-use axum::{extract::{Path, Query, State}, http::StatusCode, response::IntoResponse, Json};
+use axum::{extract::{Path, Query, State}, Json};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -85,3 +85,60 @@ pub struct NeighborhoodParams {
     pub budget: i64,
 }
 const fn default_hops() -> i64 { 1 }
+
+pub async fn overview(
+    State(state): State<AppState>,
+    Query(_params): Query<OverviewParams>,
+) -> Result<Json<OverviewResponse>, (axum::http::StatusCode, String)> {
+    let pool: &PgPool = &state.db_pool;
+    let latest: Option<(Uuid, chrono::DateTime<chrono::Utc>, bool)> = sqlx::query_as(
+        "SELECT run_id, completed_at, degraded
+         FROM graph_cluster_runs
+         ORDER BY completed_at DESC
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(internal)?;
+    let Some((run_id, generated_at, degraded)) = latest else {
+        return Ok(Json(OverviewResponse {
+            run_id: None,
+            generated_at: None,
+            degraded: false,
+            status: Some("no_clusters_computed"),
+            supernodes: vec![],
+            cluster_edges: vec![],
+        }));
+    };
+    let supernodes: Vec<Supernode> = sqlx::query_as::<_, Supernode>(
+        "SELECT id AS cluster_id, label, size, mean_betp, dominant_type, dominant_frame_id
+         FROM graph_clusters
+         WHERE run_id = $1
+         ORDER BY size DESC",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+    let cluster_edges: Vec<ClusterEdgeOut> = sqlx::query_as::<_, ClusterEdgeOut>(
+        "SELECT cluster_a AS a, cluster_b AS b, weight
+         FROM cluster_edges
+         WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(OverviewResponse {
+        run_id: Some(run_id),
+        generated_at: Some(generated_at),
+        degraded,
+        status: None,
+        supernodes,
+        cluster_edges,
+    }))
+}
+
+fn internal(e: sqlx::Error) -> (axum::http::StatusCode, String) {
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
