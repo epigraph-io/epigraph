@@ -62,3 +62,53 @@ async fn overview_returns_seeded_supernodes() {
     assert_eq!(body["cluster_edges"][0]["weight"], 4);
     assert_eq!(body["degraded"], false);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expand_returns_cluster_members_with_induced_edges() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+    let cluster_id = common::seed_one_cluster(&pool, 5).await;
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/graph/clusters/{cluster_id}/expand?budget=10"))
+        .header("Authorization", format!("Bearer {}", common::test_bearer_token()))
+        .send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["nodes"].as_array().unwrap().len(), 5);
+    assert_eq!(body["truncated"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expand_returns_404_for_unknown_cluster() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+    // Need at least one run row so the handler reaches the per-cluster check (404
+    // also happens when no run exists, but we want to specifically test the
+    // "no such cluster in latest run" branch). seed_one_cluster sets that up.
+    let _ = common::seed_one_cluster(&pool, 1).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let bogus = uuid::Uuid::new_v4();
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/graph/clusters/{bogus}/expand"))
+        .header("Authorization", format!("Bearer {}", common::test_bearer_token()))
+        .send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn neighborhood_returns_one_hop_seed_and_neighbors() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+    let seed = common::seed_three_node_chain(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/graph/neighborhood?node_id={seed}&hops=1&budget=20"))
+        .header("Authorization", format!("Bearer {}", common::test_bearer_token()))
+        .send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let nodes = body["nodes"].as_array().unwrap();
+    assert!(nodes.len() >= 2, "seed + at least one neighbor");
+}

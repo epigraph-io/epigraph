@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use tokio::sync::oneshot;
+use sqlx::PgPool;
 
 pub async fn spawn_app(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) {
     let app = epigraph_api::build_app_for_tests(database_url).await
@@ -33,4 +34,79 @@ pub fn test_bearer_token() -> String {
         )
         .expect("test JWT issued");
     token
+}
+
+pub async fn seed_one_cluster(pool: &PgPool, size: usize) -> uuid::Uuid {
+    sqlx::query("DELETE FROM graph_cluster_runs").execute(pool).await.unwrap();
+    sqlx::query("DELETE FROM claim_cluster_membership").execute(pool).await.unwrap();
+    sqlx::query("DELETE FROM graph_clusters").execute(pool).await.unwrap();
+    sqlx::query("DELETE FROM cluster_edges").execute(pool).await.unwrap();
+
+    let test_agent_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000aa").unwrap();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, display_name, agent_type)
+         VALUES ($1, decode(repeat('00', 32), 'hex'), 'graph-routes-test', 'system')
+         ON CONFLICT (id) DO NOTHING",
+    ).bind(test_agent_id).execute(pool).await.unwrap();
+
+    let run_id = uuid::Uuid::new_v4();
+    let cluster_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO graph_clusters (id, run_id, label, size, mean_betp, dominant_type, dominant_frame_id, degraded) VALUES ($1, $2, 'C', $3, 0.5, 'claim', NULL, FALSE)")
+        .bind(cluster_id).bind(run_id).bind(size as i32).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded) VALUES ($1, 1, FALSE)")
+        .bind(run_id).execute(pool).await.unwrap();
+    for i in 0..size {
+        let claim_id = uuid::Uuid::new_v4();
+        let hash_byte = (i as u8).wrapping_add(0x10);
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, agent_id, pignistic_prob)
+             VALUES ($1, 'x', decode(repeat($2, 32), 'hex'), $3, 0.5)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(claim_id)
+        .bind(format!("{hash_byte:02x}"))
+        .bind(test_agent_id)
+        .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO claim_cluster_membership (claim_id, cluster_id, run_id) VALUES ($1, $2, $3)")
+            .bind(claim_id).bind(cluster_id).bind(run_id)
+            .execute(pool).await.unwrap();
+    }
+    cluster_id
+}
+
+pub async fn seed_three_node_chain(pool: &PgPool) -> uuid::Uuid {
+    let test_agent_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000aa").unwrap();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, display_name, agent_type)
+         VALUES ($1, decode(repeat('00', 32), 'hex'), 'graph-routes-test', 'system')
+         ON CONFLICT (id) DO NOTHING",
+    ).bind(test_agent_id).execute(pool).await.unwrap();
+
+    // Disable user triggers on `edges` because validate_edge_reference depends
+    // on tables (propaganda_techniques, coalitions, etc.) that the 001+002
+    // migration set doesn't create.
+    sqlx::query("ALTER TABLE edges DISABLE TRIGGER USER").execute(pool).await.unwrap();
+
+    let a = uuid::Uuid::new_v4();
+    let b = uuid::Uuid::new_v4();
+    let c = uuid::Uuid::new_v4();
+    for (i, &id) in [a, b, c].iter().enumerate() {
+        let hb = (i as u8).wrapping_add(0x20);
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, agent_id, pignistic_prob)
+             VALUES ($1, 'x', decode(repeat($2, 32), 'hex'), $3, 0.5)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(format!("{hb:02x}"))
+        .bind(test_agent_id)
+        .execute(pool).await.unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship)
+         VALUES ($1, 'claim', $2, 'claim', 'SUPPORTS'),
+                ($2, 'claim', $3, 'claim', 'SUPPORTS')",
+    )
+    .bind(a).bind(b).bind(c).execute(pool).await.unwrap();
+    b
 }
