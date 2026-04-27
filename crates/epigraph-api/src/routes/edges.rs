@@ -40,6 +40,7 @@ const VALID_ENTITY_TYPES: &[&str] = &[
     "experiment_result",
     "propaganda_technique",
     "coalition",
+    "synthesis",
 ];
 
 /// Valid relationship types for edge creation
@@ -105,13 +106,19 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "GOVERNS",         // claim → claim (convention governs a system/scope)
     "FAILED_TO_COMPLETE", // claim → claim (agent failed to complete a task)
     "RESOLVED_BY",     // claim → claim (plugin mod resolved by upstream release)
+    // Synthesis (PROV-O), used by episcience paper-synthesis pipeline
+    "WAS_DERIVED_FROM", // synthesis → claim (prov:wasDerivedFrom)
+    "REFINES",          // synthesis → synthesis (upper-case form; lower-case "refines" above is claim → claim refinement)
+    "COMPOSED_OF",      // synthesis → synthesis (prereq composition)
+    "METHODOLOGY",      // claim → claim (methodology relation, traversal)
+    "SUPERSEDES",       // upper-case alias of lower-case "supersedes" above; synthesis-side callers use upper-case per PROV-O convention
 ];
 
-fn is_valid_entity_type(s: &str) -> bool {
+pub fn is_valid_entity_type(s: &str) -> bool {
     VALID_ENTITY_TYPES.contains(&s)
 }
 
-fn is_valid_relationship(s: &str) -> bool {
+pub fn is_valid_relationship(s: &str) -> bool {
     VALID_RELATIONSHIPS.contains(&s)
 }
 
