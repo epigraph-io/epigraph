@@ -288,9 +288,68 @@ pub async fn list_claims_query(
         None => None,
     };
 
-    // ---- Query PostgreSQL ----
-    // Fetch claims from DB, apply remaining filters in-memory.
-    // We push the content_contains search down to PostgreSQL ILIKE macro for efficiency.
+    // ---- Fast path: no post-fetch filters, default sort ----
+    // The legacy in-memory pipeline below caps the working set at 10_000 rows
+    // and reports `total` as the slice length, which understates the true table
+    // count on large databases. When the request needs no truth/agent/date/
+    // methodology/evidence-type filtering and uses the default sort, we can let
+    // PostgreSQL do COUNT(*) + LIMIT/OFFSET directly.
+    let needs_in_memory_filters = params.truth_min.is_some()
+        || params.truth_max.is_some()
+        || params.agent_id.is_some()
+        || params.is_current.is_some()
+        || params.created_after.is_some()
+        || params.created_before.is_some()
+        || methodology_ids.is_some()
+        || evidence_type_ids.is_some()
+        || sort_by != "created_at"
+        || sort_order != "desc";
+
+    if !needs_in_memory_filters {
+        let total = ClaimRepository::count(
+            &state.db_pool,
+            params.content_contains.as_deref(),
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Database count failed: {}", e),
+        })? as usize;
+
+        let rows = ClaimRepository::list(
+            &state.db_pool,
+            limit as i64,
+            offset as i64,
+            params.content_contains.as_deref(),
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Database query failed: {}", e),
+        })?;
+
+        let paginated: Vec<ClaimSummary> = rows
+            .into_iter()
+            .map(|c| ClaimSummary {
+                id: c.id.as_uuid(),
+                statement: c.content.clone(),
+                content: c.content.clone(),
+                truth_value: c.truth_value.value(),
+                agent_id: c.agent_id.as_uuid(),
+                is_current: c.is_current,
+                created_at: c.created_at,
+                updated_at: c.updated_at,
+            })
+            .collect();
+
+        return Ok(Json(ClaimListResponse {
+            claims: paginated,
+            total,
+            limit,
+            offset,
+        }));
+    }
+
+    // ---- Slow path: filters/sort require fetching a working set into memory ----
+    // Capped at 10_000 rows; the reported `total` reflects the filtered slice.
     let all_claims = ClaimRepository::list(
         &state.db_pool,
         10_000,
