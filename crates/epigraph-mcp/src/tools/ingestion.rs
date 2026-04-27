@@ -54,7 +54,9 @@ pub async fn ingest_paper(
     let cwd = std::env::current_dir()
         .map_err(|e| internal_error(format!("cannot determine CWD: {e}")))?;
     if !canonical.starts_with(&cwd) {
-        return Err(invalid_params("file path must be within the working directory"));
+        return Err(invalid_params(
+            "file path must be within the working directory",
+        ));
     }
     let data = tokio::fs::read_to_string(&canonical)
         .await

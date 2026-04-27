@@ -3071,7 +3071,10 @@ impl Default for InMemoryJobQueue {
 impl JobQueue for InMemoryJobQueue {
     async fn enqueue(&self, job: Job) -> Result<JobId, JobError> {
         let id = job.id;
-        self.jobs.write().unwrap_or_else(|e| e.into_inner()).push(job);
+        self.jobs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(job);
         Ok(id)
     }
 
