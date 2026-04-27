@@ -259,6 +259,27 @@ fn create_test_router(pool: PgPool) -> Router {
     create_router(state)
 }
 
+/// Mint a test Bearer token valid against the dev JWT secret.
+///
+/// The secret is the same fallback used by `default_jwt_config()` in
+/// state.rs when `EPIGRAPH_JWT_SECRET` is not set, so it works against
+/// the test app router without any env-var setup.
+fn test_bearer_token() -> String {
+    use epigraph_api::oauth::JwtConfig;
+    let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
+    let (token, _) = jwt_config
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["epigraph:write".to_string(), "epigraph:read".to_string()],
+            "service",
+            None,
+            None,
+            chrono::Duration::seconds(300),
+        )
+        .expect("issue_access_token must succeed for tests");
+    token
+}
+
 /// Make a POST request to the submit packet endpoint (creates fresh router per call)
 async fn submit_packet_request(pool: &PgPool, packet: &EpistemicPacket) -> (StatusCode, String) {
     let router = create_test_router(pool.clone());
@@ -274,7 +295,10 @@ async fn send_packet(router: &Router, packet: &EpistemicPacket) -> (StatusCode, 
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-signature", "test-bypass") // Pass bearer_auth_middleware (falls through to legacy path)
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", test_bearer_token()),
+        )
         .body(Body::from(body))
         .expect("Failed to build request");
 

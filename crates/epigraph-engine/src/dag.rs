@@ -6,7 +6,7 @@
 use crate::errors::EngineError;
 use petgraph::algo::is_cyclic_directed;
 use petgraph::graph::{DiGraph, NodeIndex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// DAG validator for reasoning graphs
@@ -113,22 +113,111 @@ impl DagValidator {
         Ok(order.into_iter().map(|idx| self.graph[idx]).collect())
     }
 
-    /// Find a cycle path starting from a given node
+    /// Find a cycle path starting from a given node using DFS.
+    ///
+    /// Performs a depth-first search from `start`, tracking the current DFS
+    /// stack. When a back-edge is found (a neighbor already on the stack),
+    /// the cycle is extracted by slicing the stack from that node's position
+    /// to the current node (inclusive), giving the full cycle path.
+    ///
+    /// Returns the cycle as a `Vec<Uuid>` from the cycle-entry point back to
+    /// where it closes. Falls back to `vec![start]` if no back-edge is found
+    /// (e.g., the graph has changed between the cycle check and this call).
     fn find_cycle_path(&self, start: Uuid) -> Vec<Uuid> {
-        // Simplified: return the start node if we know a cycle exists
-        // Full implementation would trace the actual cycle
-        if let Some(&idx) = self.node_map.get(&start) {
-            vec![self.graph[idx]]
-        } else {
-            vec![start]
+        let Some(&start_idx) = self.node_map.get(&start) else {
+            return vec![start];
+        };
+
+        // DFS iterative: stack holds (node, iterator-position-in-neighbors)
+        let mut path: Vec<NodeIndex> = Vec::new();
+        let mut on_stack: HashSet<NodeIndex> = HashSet::new();
+        let mut visited: HashSet<NodeIndex> = HashSet::new();
+
+        // Iterative DFS using an explicit call stack of (node, neighbor_iter)
+        let mut call_stack: Vec<(NodeIndex, usize)> = vec![(start_idx, 0)];
+        path.push(start_idx);
+        on_stack.insert(start_idx);
+        visited.insert(start_idx);
+
+        while let Some((node, neighbor_pos)) = call_stack.last_mut() {
+            let node = *node;
+            let neighbors: Vec<NodeIndex> = self.graph.neighbors(node).collect();
+            if *neighbor_pos < neighbors.len() {
+                let next = neighbors[*neighbor_pos];
+                *neighbor_pos += 1;
+                if on_stack.contains(&next) {
+                    // Back-edge found: extract the cycle from path
+                    if let Some(pos) = path.iter().position(|&n| n == next) {
+                        let cycle: Vec<Uuid> = path[pos..].iter().map(|&n| self.graph[n]).collect();
+                        return cycle;
+                    }
+                } else if !visited.contains(&next) {
+                    visited.insert(next);
+                    on_stack.insert(next);
+                    path.push(next);
+                    call_stack.push((next, 0));
+                }
+            } else {
+                // Exhausted neighbors: backtrack
+                on_stack.remove(&node);
+                path.pop();
+                call_stack.pop();
+            }
         }
+
+        // Fallback: cycle must exist (caller verified it) but DFS didn't find
+        // a back-edge from this start node; return just the start.
+        vec![start]
     }
 
-    /// Find any cycle in the graph
+    /// Find any cycle in the graph using DFS.
+    ///
+    /// Iterates over all nodes as potential DFS roots, skipping already-visited
+    /// ones. Returns the first cycle found, or an empty `Vec` if the graph is
+    /// acyclic (which should not happen when called after `is_cyclic_directed`).
     fn find_any_cycle(&self) -> Vec<Uuid> {
-        // Simplified: return first few nodes
-        // Full implementation would find actual cycle path
-        self.node_map.keys().take(3).copied().collect()
+        let mut globally_visited: HashSet<NodeIndex> = HashSet::new();
+
+        for &start_idx in self.node_map.values() {
+            if globally_visited.contains(&start_idx) {
+                continue;
+            }
+
+            let mut path: Vec<NodeIndex> = Vec::new();
+            let mut on_stack: HashSet<NodeIndex> = HashSet::new();
+            let mut call_stack: Vec<(NodeIndex, usize)> = vec![(start_idx, 0)];
+            path.push(start_idx);
+            on_stack.insert(start_idx);
+            globally_visited.insert(start_idx);
+
+            while let Some((node, neighbor_pos)) = call_stack.last_mut() {
+                let node = *node;
+                let neighbors: Vec<NodeIndex> = self.graph.neighbors(node).collect();
+                if *neighbor_pos < neighbors.len() {
+                    let next = neighbors[*neighbor_pos];
+                    *neighbor_pos += 1;
+                    if on_stack.contains(&next) {
+                        // Back-edge found: extract cycle
+                        if let Some(pos) = path.iter().position(|&n| n == next) {
+                            let cycle: Vec<Uuid> =
+                                path[pos..].iter().map(|&n| self.graph[n]).collect();
+                            return cycle;
+                        }
+                    } else if !globally_visited.contains(&next) {
+                        globally_visited.insert(next);
+                        on_stack.insert(next);
+                        path.push(next);
+                        call_stack.push((next, 0));
+                    }
+                } else {
+                    on_stack.remove(&node);
+                    path.pop();
+                    call_stack.pop();
+                }
+            }
+        }
+
+        Vec::new()
     }
 
     /// Get the number of nodes in the validation graph

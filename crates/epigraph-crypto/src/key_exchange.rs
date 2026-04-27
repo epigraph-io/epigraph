@@ -31,28 +31,37 @@ pub fn ed25519_to_x25519_secret(signing_key: &SigningKey) -> X25519Secret {
 ///
 /// Uses the birational map from Edwards to Montgomery form.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `verifying_key` encodes an invalid Edwards point. In practice
-/// this cannot happen because `ed25519_dalek::VerifyingKey` always holds a
-/// valid, compressed Edwards-y coordinate.
-#[must_use]
-pub fn ed25519_to_x25519_public(verifying_key: &VerifyingKey) -> X25519Public {
+/// Returns [`CryptoError::InvalidPublicKey`] if `verifying_key` encodes an
+/// invalid (low-order) Edwards point that cannot be decompressed. In practice
+/// `ed25519_dalek::VerifyingKey` always holds a valid compressed Edwards-y
+/// coordinate, but we propagate errors rather than panic on malformed input.
+pub fn ed25519_to_x25519_public(verifying_key: &VerifyingKey) -> Result<X25519Public, CryptoError> {
     let edwards = curve25519_dalek::edwards::CompressedEdwardsY(verifying_key.to_bytes());
     let point = edwards
         .decompress()
-        .expect("valid Ed25519 public key decompresses");
+        .ok_or_else(|| CryptoError::InvalidPublicKey {
+            reason: "Ed25519 public key decompression failed (invalid Edwards point)".into(),
+        })?;
     let montgomery = point.to_montgomery();
-    X25519Public::from(montgomery.to_bytes())
+    Ok(X25519Public::from(montgomery.to_bytes()))
 }
 
 /// Compute ECDH shared secret between two parties.
-#[must_use]
-pub fn ecdh_shared_secret(our_secret: &SigningKey, their_public: &VerifyingKey) -> [u8; 32] {
+///
+/// # Errors
+///
+/// Returns [`CryptoError::InvalidPublicKey`] if `their_public` cannot be
+/// converted to an X25519 key (see [`ed25519_to_x25519_public`]).
+pub fn ecdh_shared_secret(
+    our_secret: &SigningKey,
+    their_public: &VerifyingKey,
+) -> Result<[u8; 32], CryptoError> {
     let x_secret = ed25519_to_x25519_secret(our_secret);
-    let x_public = ed25519_to_x25519_public(their_public);
+    let x_public = ed25519_to_x25519_public(their_public)?;
     let shared = x_secret.diffie_hellman(&x_public);
-    *shared.as_bytes()
+    Ok(*shared.as_bytes())
 }
 
 /// Wrap a 32-byte group key using an ECDH-derived shared secret.
@@ -99,8 +108,8 @@ mod tests {
         let alice = SigningKey::generate(&mut OsRng);
         let bob = SigningKey::generate(&mut OsRng);
 
-        let secret_ab = ecdh_shared_secret(&alice, &bob.verifying_key());
-        let secret_ba = ecdh_shared_secret(&bob, &alice.verifying_key());
+        let secret_ab = ecdh_shared_secret(&alice, &bob.verifying_key()).unwrap();
+        let secret_ba = ecdh_shared_secret(&bob, &alice.verifying_key()).unwrap();
         assert_eq!(secret_ab, secret_ba);
     }
 
@@ -110,8 +119,8 @@ mod tests {
         let bob = SigningKey::generate(&mut OsRng);
         let carol = SigningKey::generate(&mut OsRng);
 
-        let ab = ecdh_shared_secret(&alice, &bob.verifying_key());
-        let ac = ecdh_shared_secret(&alice, &carol.verifying_key());
+        let ab = ecdh_shared_secret(&alice, &bob.verifying_key()).unwrap();
+        let ac = ecdh_shared_secret(&alice, &carol.verifying_key()).unwrap();
         assert_ne!(ab, ac);
     }
 
@@ -120,7 +129,7 @@ mod tests {
         let alice = SigningKey::generate(&mut OsRng);
         let bob = SigningKey::generate(&mut OsRng);
 
-        let shared = ecdh_shared_secret(&alice, &bob.verifying_key());
+        let shared = ecdh_shared_secret(&alice, &bob.verifying_key()).unwrap();
         let group_key = [77u8; 32];
 
         let wrapped = wrap_group_key(&group_key, &shared).unwrap();
@@ -133,7 +142,7 @@ mod tests {
         let alice = SigningKey::generate(&mut OsRng);
         let bob = SigningKey::generate(&mut OsRng);
 
-        let shared = ecdh_shared_secret(&alice, &bob.verifying_key());
+        let shared = ecdh_shared_secret(&alice, &bob.verifying_key()).unwrap();
         let group_key = [77u8; 32];
 
         let wrapped = wrap_group_key(&group_key, &shared).unwrap();

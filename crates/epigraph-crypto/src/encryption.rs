@@ -10,6 +10,13 @@ use aes_gcm::{
 
 use crate::errors::CryptoError;
 
+/// Maximum size of a serialized [`EncryptedPayload`] accepted during parsing.
+///
+/// 10 MiB: nonce (12 bytes) + ciphertext + tag (16 bytes). Payloads larger than
+/// this indicate either a programming error or a malicious/corrupted input and
+/// are rejected before any heap allocation.
+const MAX_ENCRYPTED_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+
 /// Encrypted content with nonce and authentication tag.
 ///
 /// Wire format: `nonce (12 bytes) || ciphertext+tag (variable)`.
@@ -40,6 +47,11 @@ impl EncryptedPayload {
         if bytes.len() < 12 + 16 {
             return Err(CryptoError::InvalidPayload {
                 reason: format!("payload too short: {} bytes (min 28)", bytes.len()),
+            });
+        }
+        if bytes.len() > MAX_ENCRYPTED_PAYLOAD_BYTES {
+            return Err(CryptoError::InvalidPayload {
+                reason: format!("payload exceeds 10 MiB limit: {} bytes", bytes.len()),
             });
         }
         let mut nonce = [0u8; 12];

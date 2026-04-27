@@ -185,8 +185,12 @@ async fn main() {
     let metrics = Arc::new(Metrics::new());
     let app = create_router(state).layer(axum::Extension(metrics));
 
-    // Bind to address
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
+    // Bind to address. EPIGRAPH_PORT env var allows side-by-side test runs.
+    let port: u16 = std::env::var("EPIGRAPH_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
 
     // Check for TLS configuration via environment variables.
     // EPIGRAPH_TLS_CERT and EPIGRAPH_TLS_KEY must both be set to enable TLS.

@@ -99,7 +99,7 @@ impl MockProvider {
             return false;
         }
 
-        let mut count = self.call_count.lock().unwrap();
+        let mut count = self.call_count.lock().unwrap_or_else(|e| e.into_inner());
         *count += 1;
 
         // Simple deterministic "randomness" based on call count
@@ -110,7 +110,7 @@ impl MockProvider {
     /// Track token usage
     fn track_tokens(&self, text: &str) {
         let tokens = self.tokenizer.count_tokens(text);
-        let mut usage = self.token_usage.lock().unwrap();
+        let mut usage = self.token_usage.lock().unwrap_or_else(|e| e.into_inner());
         usage.add(&TokenUsage::new(tokens));
     }
 }
@@ -250,11 +250,14 @@ impl EmbeddingService for MockProvider {
     }
 
     fn token_usage(&self) -> TokenUsage {
-        self.token_usage.lock().unwrap().clone()
+        self.token_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn reset_token_usage(&self) {
-        let mut usage = self.token_usage.lock().unwrap();
+        let mut usage = self.token_usage.lock().unwrap_or_else(|e| e.into_inner());
         *usage = TokenUsage::default();
     }
 
@@ -367,7 +370,10 @@ impl MockMultimodalProvider {
     /// Get the number of times `generate_from_image` was called
     #[allow(clippy::missing_panics_doc)]
     pub fn image_call_count(&self) -> usize {
-        *self.image_call_count.lock().unwrap()
+        *self
+            .image_call_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -432,7 +438,10 @@ impl MultimodalEmbeddingService for MockMultimodalProvider {
             });
         }
 
-        *self.image_call_count.lock().unwrap() += 1;
+        *self
+            .image_call_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) += 1;
 
         // Generate deterministic embedding from image data hash
         let dim = self.inner.dimension();

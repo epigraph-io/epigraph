@@ -441,7 +441,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (i, score)
             })
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         println!("  Composite information score (higher = more informative):\n");
         for (rank, (idx, score)) in scored.iter().enumerate() {
