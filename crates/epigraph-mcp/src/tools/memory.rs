@@ -8,7 +8,7 @@ use crate::tools::ds_auto;
 use crate::types::*;
 
 use epigraph_core::{
-    AgentId, Claim, ClaimId, Evidence, EvidenceType, Methodology, ReasoningTrace, TraceInput,
+    AgentId, Claim, Evidence, EvidenceType, Methodology, ReasoningTrace, TraceInput,
     TruthValue,
 };
 use epigraph_crypto::ContentHasher;
@@ -121,44 +121,29 @@ pub async fn recall(
     server: &EpiGraphMcpFull,
     params: RecallParams,
 ) -> Result<CallToolResult, McpError> {
-    let limit = params.limit.unwrap_or(10).clamp(1, 50);
+    let limit = params.limit.unwrap_or(10).clamp(1, 50) as usize;
     let min_truth = params.min_truth.unwrap_or(0.3);
 
-    // Try semantic search first
-    let results = if let Ok(hits) = server.embedder.search(&params.query, limit).await {
-        let mut results = Vec::new();
-        for (claim_id, similarity) in hits {
-            if let Ok(Some(claim)) =
-                ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id)).await
-            {
-                let tv = claim.truth_value.value();
-                if tv >= min_truth {
-                    results.push(RecallResult {
-                        claim_id: claim_id.to_string(),
-                        content: claim.content,
-                        truth_value: tv,
-                        similarity,
-                    });
-                }
-            }
-        }
-        results
-    } else {
-        // Fallback to text search
-        let claims = ClaimRepository::list(&server.pool, limit, 0, Some(&params.query))
-            .await
-            .map_err(internal_error)?;
-        claims
-            .into_iter()
-            .filter(|c| c.truth_value.value() >= min_truth)
-            .map(|c| RecallResult {
-                claim_id: c.id.as_uuid().to_string(),
-                content: c.content,
-                truth_value: c.truth_value.value(),
-                similarity: 0.0,
-            })
-            .collect()
-    };
+    let lib_results = epigraph_engine::recall(
+        &server.pool,
+        server.embedder.as_ref(),
+        &params.query,
+        limit,
+        min_truth,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    // Shape into the MCP response type (RecallResult is defined in crate::types).
+    let results: Vec<RecallResult> = lib_results
+        .into_iter()
+        .map(|r| RecallResult {
+            claim_id: r.claim_id,
+            content: r.content,
+            truth_value: r.truth_value,
+            similarity: r.similarity,
+        })
+        .collect();
 
     success_json(&results)
 }
