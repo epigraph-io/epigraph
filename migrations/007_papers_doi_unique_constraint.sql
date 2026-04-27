@@ -1,0 +1,16 @@
+-- 007_papers_doi_unique_constraint.sql (no-op marker; was internal 097)
+--
+-- Internal migration 097 reconciles duplicate-DOI papers, drops the
+-- non-unique idx_papers_doi index, and adds a UNIQUE constraint named
+-- papers_doi_unique. The constraint is already present in
+-- 001_initial_schema.sql (the pg_dump baseline captured internal state
+-- past migration 097), so re-running the ALTER TABLE ADD CONSTRAINT
+-- would error with "constraint already exists".
+--
+-- The duplicate-DOI reconciliation logic in 097 was a one-time data
+-- cleanup against internal's production DB; it has no parallel data
+-- to clean in public deployments.
+--
+-- Carries the migration as a no-op marker (SELECT 1;) so the public
+-- sequence stays aligned with internal numbering.
+SELECT 1;
