@@ -530,10 +530,23 @@ impl JobRunner {
                     if let Some(mut job) = queue.dequeue().await {
                         // Find handler for this job type
                         if let Some(handler) = handlers.get(&job.job_type) {
-                            // Check if we've exceeded max retries
+                            // Check if we've exceeded max retries.
+                            //
+                            // Path A — the dequeue handed us a job that was
+                            // already at retry_count >= max_retries. Mark it
+                            // failed, but PRESERVE any prior error_message
+                            // that earlier retry attempts captured. Replacing
+                            // it with a generic "Maximum retries exceeded"
+                            // hides the actual stage failure; instead we
+                            // append.
                             if job.retry_count >= job.max_retries {
                                 job.state = JobState::Failed;
-                                job.error_message = Some("Maximum retries exceeded".into());
+                                let prior = job.error_message.clone().unwrap_or_default();
+                                job.error_message = Some(if prior.is_empty() {
+                                    "Maximum retries exceeded (no prior error captured)".to_string()
+                                } else {
+                                    format!("Maximum retries exceeded; last error: {prior}")
+                                });
                                 let _ = queue.update(&job).await;
                                 continue;
                             }

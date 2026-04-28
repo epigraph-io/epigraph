@@ -236,92 +236,33 @@ pub async fn get_belief(
     params: GetBeliefParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
+    let frame_id = params.frame_id.as_deref().map(parse_uuid).transpose()?;
 
-    if let Some(frame_id_str) = &params.frame_id {
-        // Live recomputation from stored BBAs
-        let frame_id = parse_uuid(frame_id_str)?;
-        let frame_row = FrameRepository::get_by_id(&server.pool, frame_id)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| invalid_params(format!("frame {frame_id} not found")))?;
-
-        let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())
-            .map_err(internal_error)?;
-
-        let assignment = FrameRepository::get_claim_assignment(&server.pool, claim_id, frame_id)
-            .await
-            .map_err(internal_error)?;
-        let hypothesis_index = assignment.and_then(|a| a.hypothesis_index).unwrap_or(0) as usize;
-
-        let all_bbas =
-            MassFunctionRepository::get_for_claim_frame(&server.pool, claim_id, frame_id)
-                .await
-                .map_err(internal_error)?;
-
-        if all_bbas.is_empty() {
-            return success_json(&BeliefResponse {
-                claim_id: claim_id.to_string(),
-                belief: 0.0,
-                plausibility: 1.0,
-                ignorance: 1.0,
-                pignistic_prob: 1.0 / frame.hypothesis_count() as f64,
-                mass_on_conflict: 0.0,
-                mass_on_missing: 0.0,
-                source: "no_bbas".to_string(),
-            });
-        }
-
-        let mut mass_fns = Vec::new();
-        for row in &all_bbas {
-            mass_fns.push(parse_masses_json(&frame, &row.masses)?);
-        }
-
-        let combined = if mass_fns.len() == 1 {
-            mass_fns.into_iter().next().unwrap()
-        } else {
-            let mut result = mass_fns[0].clone();
-            for mf in &mass_fns[1..] {
-                result = combine_two(&result, mf, CombinationMethod::Dempster, None)?;
+    let interval = epigraph_engine::belief_query::get_belief(&server.pool, claim_id, frame_id)
+        .await
+        .map_err(|e| match e {
+            epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
+                invalid_params(format!("frame {id} not found"))
             }
-            result
-        };
+            epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
+                invalid_params(format!("claim {id} not found"))
+            }
+            epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
+                invalid_params(format!("invalid mass function: {msg}"))
+            }
+            other => internal_error(other),
+        })?;
 
-        let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
-        let bel = epigraph_ds::measures::belief(&combined, &target);
-        let pl = epigraph_ds::measures::plausibility(&combined, &target);
-        let betp = epigraph_ds::measures::pignistic_probability(&combined, hypothesis_index);
-
-        return success_json(&BeliefResponse {
-            claim_id: claim_id.to_string(),
-            belief: bel,
-            plausibility: pl,
-            ignorance: pl - bel,
-            pignistic_prob: betp,
-            mass_on_conflict: combined.mass_of_conflict(),
-            mass_on_missing: combined.mass_of_missing(),
-            source: "recomputed".to_string(),
-        });
-    }
-
-    // Return cached DS columns from claim
-    let claim = epigraph_db::ClaimRepository::get_by_id(
-        &server.pool,
-        epigraph_core::ClaimId::from_uuid(claim_id),
-    )
-    .await
-    .map_err(internal_error)?
-    .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
-
-    // The claim may have DS columns — we return what we have
+    let ignorance = interval.plausibility - interval.belief;
     success_json(&BeliefResponse {
         claim_id: claim_id.to_string(),
-        belief: claim.truth_value.value(),
-        plausibility: 1.0,
-        ignorance: 1.0 - claim.truth_value.value(),
-        pignistic_prob: claim.truth_value.value(),
-        mass_on_conflict: 0.0,
-        mass_on_missing: 0.0,
-        source: "cached".to_string(),
+        belief: interval.belief,
+        plausibility: interval.plausibility,
+        ignorance,
+        pignistic_prob: interval.pignistic_prob,
+        mass_on_conflict: interval.mass_on_conflict,
+        mass_on_missing: interval.mass_on_missing,
+        source: interval.source,
     })
 }
 

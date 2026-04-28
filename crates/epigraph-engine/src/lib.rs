@@ -16,6 +16,7 @@ pub mod agent_assessment;
 pub mod bayesian;
 pub mod bba;
 pub mod belief_gate;
+pub mod belief_query;
 pub mod bp;
 pub mod calibration;
 pub mod cdst_bp;
@@ -37,6 +38,7 @@ pub mod lifecycle;
 pub mod promotion;
 pub mod propagation;
 pub mod reasoning;
+pub mod recall;
 pub mod reconciliation;
 pub mod reputation;
 pub mod retention;
@@ -50,6 +52,7 @@ pub mod voi;
 
 #[allow(deprecated)]
 pub use bayesian::BayesianUpdater;
+pub use belief_query::{get_belief, BeliefInterval, BeliefQueryError};
 pub use bp::{run_bp, BpConfig, BpResult, FactorPotential};
 pub use cdst_sheaf::{
     classify_obstruction, compute_cdst_cohomology, compute_cdst_edge_inconsistency,
@@ -82,6 +85,7 @@ pub use reasoning::{
     Contradiction, IndirectChallenge, ReasoningClaim, ReasoningEdge, ReasoningEngine,
     ReasoningResult, ReasoningStats, SupportCluster, TransitiveSupport,
 };
+pub use recall::{recall, RecallError, RecallResult};
 pub use reconciliation::{
     cluster_obstructions, extract_cospan, reconcile, ClusterSummary, ReconciliationConfig,
     ReconciliationResult,

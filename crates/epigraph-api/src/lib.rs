@@ -26,6 +26,15 @@ pub use state::{
     SharedEmbeddingService, SharedEventBus,
 };
 
+/// Test-only re-export of the module-level event store.
+///
+/// Returns a clone of the `Arc<EventStore>` singleton so integration tests can
+/// drain or inspect events without going through the HTTP API.
+#[doc(hidden)]
+pub fn _test_event_store() -> std::sync::Arc<crate::routes::events::EventStore> {
+    crate::routes::events::global_event_store().clone()
+}
+
 #[cfg(feature = "db")]
 pub async fn build_app_for_tests(database_url: &str) -> Result<axum::Router, sqlx::Error> {
     let pool = sqlx::postgres::PgPoolOptions::new()

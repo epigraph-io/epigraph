@@ -9,7 +9,9 @@ repository.workspace = true
 [dependencies]
 epigraph-core = { workspace = true }
 epigraph-crypto = { workspace = true }
+epigraph-db = { workspace = true }
 epigraph-ds = { workspace = true }
+epigraph-embeddings = { workspace = true }
 ascent = { workspace = true }
 petgraph = { workspace = true }
 serde = { workspace = true }

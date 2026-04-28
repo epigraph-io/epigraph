@@ -37,6 +37,9 @@ chrono = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 
+# Async trait support (for impl EmbeddingService for McpEmbedder)
+async-trait = { workspace = true }
+
 # CLI
 clap = { workspace = true, features = ["derive", "env"] }
 
