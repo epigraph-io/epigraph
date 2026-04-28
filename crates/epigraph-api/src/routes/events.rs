@@ -31,7 +31,13 @@ use uuid::Uuid;
 // ── Event store singleton ────────────────────────────────────────────────────
 
 /// Module-level singleton so all handlers share the same store.
-pub(crate) fn global_event_store() -> &'static Arc<EventStore> {
+///
+/// Exposed as `pub` so integration tests (and any future cross-crate consumer
+/// that needs to drive the in-memory event bus) can push to the same store
+/// the route handlers read from. The store has no externally observable
+/// state beyond what its own methods expose, so widening visibility doesn't
+/// break encapsulation.
+pub fn global_event_store() -> &'static Arc<EventStore> {
     static STORE: OnceLock<Arc<EventStore>> = OnceLock::new();
     STORE.get_or_init(|| Arc::new(EventStore::new()))
 }
@@ -220,18 +226,24 @@ pub async fn list_events(
     #[cfg(feature = "db")]
     {
         let limit = filter.limit.unwrap_or(100).min(1000);
+        let offset = filter.offset.unwrap_or(0);
+
+        // 1. Pull from the persisted events table. Overfetch (limit + offset)
+        //    plus headroom so dedup against the in-memory store doesn't
+        //    starve the page. We still apply the final limit/offset post-merge.
+        let overfetch = (limit.saturating_add(offset)).saturating_mul(2).max(limit);
         let rows = epigraph_db::EventRepository::list(
             &_state.db_pool,
             filter.event_type.as_deref(),
-            None,
-            limit as i64,
+            None, // actor_id — not part of the public filter
+            overfetch as i64,
         )
         .await
         .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to list events: {e}"),
+            message: format!("Failed to list persisted events: {e}"),
         })?;
-        let total = rows.len();
-        let events: Vec<GraphEvent> = rows
+
+        let mut events: Vec<GraphEvent> = rows
             .into_iter()
             .map(|r| GraphEvent {
                 id: r.id,
@@ -242,6 +254,41 @@ pub async fn list_events(
                 created_at: r.created_at,
             })
             .collect();
+
+        // 2. Drain the in-memory event store, filtered by event_type and
+        //    since. EventStore::list also caps at `limit` internally, so we
+        //    pass a large limit here and re-page after merging.
+        let in_mem_filter = EventFilter {
+            since: filter.since,
+            event_type: filter.event_type.clone(),
+            limit: Some(usize::MAX),
+            offset: None,
+        };
+        let (in_mem, _) = global_event_store().list(&in_mem_filter).await;
+        events.extend(in_mem);
+
+        // 3. Defensive since-filter on the merged set. The DB query above
+        //    didn't narrow by `since`, so persisted events older than the
+        //    cutoff need to be dropped here.
+        if let Some(since) = filter.since {
+            events.retain(|e| e.created_at >= since);
+        }
+
+        // 4. Dedup by event id. Persisted rows are first in the vec, so
+        //    `retain` keeps the persisted copy when the same id appears in
+        //    both stores.
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        events.retain(|e| seen.insert(e.id));
+
+        // 5. Sort by `created_at` ascending. ASC matches the natural
+        //    polling semantics of `since`-based subscribers (oldest-first
+        //    so the next `since` cursor is just the last event's `created_at`).
+        events.sort_by_key(|e| e.created_at);
+
+        // 6. Apply offset + limit to the merged, sorted, deduped set.
+        let total = events.len();
+        let events = events.into_iter().skip(offset).take(limit).collect();
+
         Ok(Json(EventListResponse { events, total }))
     }
     #[cfg(not(feature = "db"))]
