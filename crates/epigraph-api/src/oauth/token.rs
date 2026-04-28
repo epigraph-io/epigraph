@@ -463,85 +463,35 @@ pub(crate) async fn provision_google_user(
     claims: &GoogleIdTokenClaims,
     requested_scope: Option<&str>,
 ) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
-    use epigraph_db::repos::oauth_client::OAuthClientRepository;
+    use epigraph_interfaces::{ClientType, ProviderIdentity};
 
     let email = claims.email.clone().unwrap_or_default();
     let name = claims.name.clone().unwrap_or_else(|| email.clone());
 
-    // The oauth_clients.client_id for Google-authed humans is "google:<sub>"
-    let oauth_client_id = format!("google:{}", claims.sub);
-
-    // Find or create the human client
-    let client = match OAuthClientRepository::get_by_client_id(&state.db_pool, &oauth_client_id)
-        .await
-    {
-        Ok(Some(client)) => client,
-        Ok(None) => {
-            // Auto-provision: create a new human client with default scopes
-            let default_scopes = vec![
-                "claims:read".to_string(),
-                "claims:write".to_string(),
-                "claims:challenge".to_string(),
-                "evidence:read".to_string(),
-                "evidence:submit".to_string(),
-                "edges:read".to_string(),
-                "edges:write".to_string(),
-                "agents:read".to_string(),
-                "agents:write".to_string(),
-                "groups:read".to_string(),
-                "groups:manage".to_string(),
-                "analysis:belief".to_string(),
-                "analysis:propagation".to_string(),
-                "analysis:reasoning".to_string(),
-                "analysis:gaps".to_string(),
-                "analysis:structural".to_string(),
-                "analysis:hypothesis".to_string(),
-                "analysis:political".to_string(),
-                "clients:register".to_string(),
-            ];
-
-            let id = OAuthClientRepository::create(
-                &state.db_pool,
-                &oauth_client_id,
-                None, // no secret — Google ID token is the credential
-                &name,
-                "human",
-                &default_scopes,
-                &default_scopes, // auto-grant all default scopes
-                "active",
-                None, // no agent_id
-                None, // no owner_id (humans own themselves)
-                None, // no legal entity
-                Some(&email),
-            )
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to create human client: {e}"),
-            })?;
-
-            tracing::info!(email = %email, client_id = %oauth_client_id, "Auto-provisioned human OAuth client via Google Sign-In");
-
-            OAuthClientRepository::get_by_id(&state.db_pool, id)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: e.to_string(),
-                })?
-                .ok_or(ApiError::InternalError {
-                    message: "Failed to read newly created client".to_string(),
-                })?
-        }
-        Err(e) => {
-            return Err(ApiError::InternalError {
-                message: e.to_string(),
-            })
-        }
+    let identity = ProviderIdentity {
+        client_id_prefix: "google",
+        external_id: claims.sub.clone(),
+        email: if email.is_empty() { None } else { Some(email.clone()) },
+        display_name: Some(name.clone()),
+        default_scopes: crate::auth::human_default_scopes(),
+        client_type: ClientType::Human,
     };
+
+    let auth_ctx = state
+        .identity_resolver
+        .resolve_or_provision(&identity)
+        .await?;
+
+    // Per review B12/E5: rely on auth_ctx.scopes (populated from the row's
+    // granted_scopes inside the resolver) instead of doing another read.
+    let granted_scopes = auth_ctx.scopes.clone();
+    let client_uuid = auth_ctx.client_id;
 
     // Issue EpiGraph tokens (same logic as client_credentials for humans)
     let ttl = Duration::hours(1);
 
     let effective_scopes = {
-        let granted = &client.granted_scopes;
+        let granted = &granted_scopes;
         match requested_scope {
             Some(requested) => {
                 let requested: Vec<String> = requested.split(' ').map(|s| s.to_string()).collect();
@@ -557,7 +507,7 @@ pub(crate) async fn provision_google_user(
     let (access_token, _jti) = state
         .jwt_config
         .issue_access_token(
-            client.id,
+            client_uuid,
             effective_scopes.clone(),
             "human",
             None, // humans have no owner
@@ -578,7 +528,7 @@ pub(crate) async fn provision_google_user(
         epigraph_db::repos::refresh_token::RefreshTokenRepository::create(
             &state.db_pool,
             hash.as_bytes(),
-            client.id,
+            client_uuid,
             &effective_scopes,
             Utc::now() + refresh_ttl,
         )
