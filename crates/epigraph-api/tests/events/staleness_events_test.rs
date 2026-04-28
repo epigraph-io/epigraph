@@ -19,8 +19,8 @@
 //! filters by event_type and asserts "at least one event with matching payload"
 //! rather than "exactly one event total".
 
-use epigraph_api::routes::events::EventFilter;
 use epigraph_api::_test_event_store;
+use epigraph_api::routes::events::EventFilter;
 use uuid::Uuid;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -89,7 +89,9 @@ async fn test_edge_added_payload_schema() {
         .await;
 
     let events = events_of_type("edge.added").await;
-    let found = events.iter().find(|e| e.payload["edge_id"] == serde_json::json!(edge_id));
+    let found = events
+        .iter()
+        .find(|e| e.payload["edge_id"] == serde_json::json!(edge_id));
     assert!(found.is_some(), "edge.added event not found");
 
     let e = found.unwrap();

@@ -108,10 +108,10 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "RESOLVED_BY",     // claim → claim (plugin mod resolved by upstream release)
     // Synthesis (PROV-O), used by episcience paper-synthesis pipeline
     "WAS_DERIVED_FROM", // synthesis → claim (prov:wasDerivedFrom)
-    "REFINES",          // synthesis → synthesis (upper-case form; lower-case "refines" above is claim → claim refinement)
-    "COMPOSED_OF",      // synthesis → synthesis (prereq composition)
-    "METHODOLOGY",      // claim → claim (methodology relation, traversal)
-    "SUPERSEDES",       // upper-case alias of lower-case "supersedes" above; synthesis-side callers use upper-case per PROV-O convention
+    "REFINES", // synthesis → synthesis (upper-case form; lower-case "refines" above is claim → claim refinement)
+    "COMPOSED_OF", // synthesis → synthesis (prereq composition)
+    "METHODOLOGY", // claim → claim (methodology relation, traversal)
+    "SUPERSEDES", // upper-case alias of lower-case "supersedes" above; synthesis-side callers use upper-case per PROV-O convention
 ];
 
 pub fn is_valid_entity_type(s: &str) -> bool {

@@ -9,9 +9,7 @@
 use std::collections::BTreeSet;
 
 use epigraph_core::ClaimId;
-use epigraph_db::{
-    ClaimRepository, FrameRepository, MassFunctionRepository, PgPool,
-};
+use epigraph_db::{ClaimRepository, FrameRepository, MassFunctionRepository, PgPool};
 use epigraph_ds::{
     combination::{self, CombinationMethod},
     FocalElement, FrameOfDiscernment, MassFunction,
@@ -118,12 +116,10 @@ pub async fn get_belief(
             .await?
             .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
 
-        let frame =
-            FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
+        let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
 
         let assignment = FrameRepository::get_claim_assignment(pool, claim_id, frame_id).await?;
-        let hypothesis_index =
-            assignment.and_then(|a| a.hypothesis_index).unwrap_or(0) as usize;
+        let hypothesis_index = assignment.and_then(|a| a.hypothesis_index).unwrap_or(0) as usize;
 
         let all_bbas =
             MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id).await?;
@@ -144,9 +140,8 @@ pub async fn get_belief(
         } else {
             let mut result = mass_fns[0].clone();
             for mf in &mass_fns[1..] {
-                result =
-                    combination::redistribute(&result, mf, CombinationMethod::Dempster, None)
-                        .map_err(BeliefQueryError::Ds)?;
+                result = combination::redistribute(&result, mf, CombinationMethod::Dempster, None)
+                    .map_err(BeliefQueryError::Ds)?;
             }
             result
         };

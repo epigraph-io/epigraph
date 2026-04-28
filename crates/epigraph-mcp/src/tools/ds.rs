@@ -236,11 +236,7 @@ pub async fn get_belief(
     params: GetBeliefParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
-    let frame_id = params
-        .frame_id
-        .as_deref()
-        .map(parse_uuid)
-        .transpose()?;
+    let frame_id = params.frame_id.as_deref().map(parse_uuid).transpose()?;
 
     let interval = epigraph_engine::belief_query::get_belief(&server.pool, claim_id, frame_id)
         .await

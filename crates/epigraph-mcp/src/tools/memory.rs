@@ -8,8 +8,7 @@ use crate::tools::ds_auto;
 use crate::types::*;
 
 use epigraph_core::{
-    AgentId, Claim, Evidence, EvidenceType, Methodology, ReasoningTrace, TraceInput,
-    TruthValue,
+    AgentId, Claim, Evidence, EvidenceType, Methodology, ReasoningTrace, TraceInput, TruthValue,
 };
 use epigraph_crypto::ContentHasher;
 use epigraph_db::{ClaimRepository, EvidenceRepository, ReasoningTraceRepository};

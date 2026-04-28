@@ -13,9 +13,9 @@
 //! back to text search via `ClaimRepository::list`. This matches the existing
 //! MCP behaviour.
 
+use epigraph_core::ClaimId;
 use epigraph_db::{ClaimRepository, EvidenceRepository, PgPool};
 use epigraph_embeddings::EmbeddingService;
-use epigraph_core::ClaimId;
 use thiserror::Error;
 
 /// Errors from the library-level `recall` function.

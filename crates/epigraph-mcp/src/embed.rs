@@ -111,12 +111,12 @@ impl EmbeddingService for McpEmbedder {
         let mut results = Vec::with_capacity(texts.len());
         for text in texts {
             // Call the inherent method and map String → EmbeddingError.
-            let embedding = McpEmbedder::generate(self, text)
-                .await
-                .map_err(|msg| EmbeddingError::ApiError {
+            let embedding = McpEmbedder::generate(self, text).await.map_err(|msg| {
+                EmbeddingError::ApiError {
                     message: msg,
                     status_code: None,
-                })?;
+                }
+            })?;
             results.push(embedding);
         }
         Ok(results)
@@ -128,14 +128,10 @@ impl EmbeddingService for McpEmbedder {
     /// Here we delegate to that path: format the vector, then call the DB method.
     async fn store(&self, claim_id: uuid::Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
         let pgvec = format_pgvector(embedding);
-        epigraph_db::EvidenceRepository::store_embedding(
-            &self.pool,
-            claim_id.into(),
-            &pgvec,
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| EmbeddingError::DatabaseError(e.to_string()))
+        epigraph_db::EvidenceRepository::store_embedding(&self.pool, claim_id.into(), &pgvec)
+            .await
+            .map(|_| ())
+            .map_err(|e| EmbeddingError::DatabaseError(e.to_string()))
     }
 
     /// `McpEmbedder` does not expose a point-query for stored embeddings.
@@ -156,13 +152,10 @@ impl EmbeddingService for McpEmbedder {
         min_similarity: f32,
     ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
         let pgvec = format_pgvector(embedding);
-        let rows = epigraph_db::EvidenceRepository::search_by_embedding(
-            &self.pool,
-            &pgvec,
-            k as i64,
-        )
-        .await
-        .map_err(|e| EmbeddingError::DatabaseError(e.to_string()))?;
+        let rows =
+            epigraph_db::EvidenceRepository::search_by_embedding(&self.pool, &pgvec, k as i64)
+                .await
+                .map_err(|e| EmbeddingError::DatabaseError(e.to_string()))?;
 
         Ok(rows
             .into_iter()
