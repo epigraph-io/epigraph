@@ -440,7 +440,13 @@ pub fn create_router_with_extensions(state: AppState, extra_routes: Router<AppSt
         // Security audit log — requires audit:read scope
         .route("/api/v1/audit/security", get(audit::query_security_events));
 
-    let protected = build_protected_router_db(&state, protected);
+    // Merge overlay-supplied routes into the protected route table BEFORE
+    // applying the auth-chain/bearer/signature middleware stack, so the
+    // overlay sees AuthContext set by whichever provider authenticated.
+    // (axum's `Router::merge` keeps each merged router's per-route services,
+    // so layering after merge would skip the overlay; layering before merge
+    // is the only way for the overlay to inherit the protected stack.)
+    let protected = build_protected_router_db(&state, protected.merge(extra_routes));
 
     // Public read operations - no authentication required
     let public = Router::new()
@@ -703,7 +709,6 @@ pub fn create_router_with_extensions(state: AppState, extra_routes: Router<AppSt
         .merge(protected)
         .merge(public)
         .merge(oauth)
-        .merge(extra_routes)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -890,7 +895,8 @@ pub fn create_router_with_extensions(state: AppState, extra_routes: Router<AppSt
         .route("/api/v1/coalitions", post(political::create_coalition));
     // /api/v1/mpc/joint-recall is an enterprise route; register via enterprise feature
 
-    let protected = build_protected_router_no_db(&state, protected);
+    // See db variant for why extra_routes merges into protected before layers.
+    let protected = build_protected_router_no_db(&state, protected.merge(extra_routes));
 
     // Public read operations
     let public = Router::new()
@@ -1074,7 +1080,6 @@ pub fn create_router_with_extensions(state: AppState, extra_routes: Router<AppSt
         .merge(protected)
         .merge(public)
         .merge(oauth)
-        .merge(extra_routes)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
         .layer(middleware::from_fn_with_state(
             state.clone(),
