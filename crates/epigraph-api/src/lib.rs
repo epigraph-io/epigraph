@@ -1,4 +1,5 @@
 pub mod access_control;
+pub mod auth;
 pub mod errors;
 pub mod extractors;
 pub mod metrics;
