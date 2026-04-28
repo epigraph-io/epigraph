@@ -17,6 +17,7 @@ pub use auth::{
 pub use rate_limit::{rate_limit_middleware, RateLimitResponse};
 
 // Re-export OAuth2 middleware
+#[allow(deprecated)]
 pub use bearer::{bearer_auth_middleware, AuthContext, ClientType};
 #[cfg(feature = "db")]
 pub use group_authz::require_group_admin;

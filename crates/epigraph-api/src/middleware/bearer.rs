@@ -22,12 +22,13 @@ pub struct AuthContext {
     pub jti: Uuid,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ClientType {
-    Agent,
-    Human,
-    Service,
-}
+// Canonical home is `epigraph_interfaces::auth::ClientType` (D12).
+// Re-exported here for back-compat. Will be removed in a future major.
+#[deprecated(
+    since = "0.4.0",
+    note = "Import ClientType from epigraph_interfaces::auth (or via epigraph_interfaces::ClientType)"
+)]
+pub use epigraph_interfaces::ClientType;
 
 impl AuthContext {
     /// Check if the context has a specific scope.
@@ -45,6 +46,12 @@ pub async fn bearer_auth_middleware(
     mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // Early-return if a chained AuthProvider already set AuthContext.
+    // Mirrors how `require_signature` short-circuits at middleware/mod.rs:114.
+    if request.extensions().get::<AuthContext>().is_some() {
+        return Ok(next.run(request).await);
+    }
+
     let auth_header = request
         .headers()
         .get("authorization")
@@ -72,6 +79,7 @@ pub async fn bearer_auth_middleware(
                     })?;
 
             // Build AuthContext
+            #[allow(deprecated)]
             let client_type = match claims.client_type.as_str() {
                 "agent" => ClientType::Agent,
                 "human" => ClientType::Human,
@@ -101,5 +109,76 @@ pub async fn bearer_auth_middleware(
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod early_return_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::middleware;
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    // Sentinel handler that records whether it ran.
+    async fn ok_handler() -> &'static str { "ok" }
+
+    // Construct a no-db AppState we can attach to the middleware. We use the
+    // non-db `AppState::new` constructor so we don't need a live DB pool.
+    #[cfg(not(feature = "db"))]
+    fn test_state() -> crate::state::AppState {
+        crate::state::AppState::new(crate::state::ApiConfig::default())
+    }
+
+    #[cfg(not(feature = "db"))]
+    #[tokio::test]
+    async fn bearer_early_returns_when_authcontext_already_set() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/probe", get(ok_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                bearer_auth_middleware,
+            ))
+            .with_state(state);
+
+        let mut req = Request::builder().uri("/probe").body(Body::empty()).unwrap();
+        #[allow(deprecated)]
+        let ctx = AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: None,
+            owner_id: None,
+            client_type: ClientType::Human,
+            scopes: vec!["claims:read".into()],
+            jti: Uuid::new_v4(),
+        };
+        req.extensions_mut().insert(ctx);
+
+        // Despite no Authorization header, bearer should pass through because
+        // AuthContext is already set in the request extensions.
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[cfg(not(feature = "db"))]
+    #[tokio::test]
+    async fn bearer_rejects_when_authcontext_missing_and_no_auth_header() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/probe", get(ok_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                bearer_auth_middleware,
+            ))
+            .with_state(state);
+
+        let req = Request::builder().uri("/probe").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Pre-existing behavior: 401 when neither AuthContext nor Authorization
+        // header nor x-signature is present.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

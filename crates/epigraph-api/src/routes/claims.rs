@@ -1840,7 +1840,8 @@ mod tests {
 #[cfg(all(test, feature = "db"))]
 mod db_tests {
     use super::*;
-    use crate::middleware::bearer::{AuthContext, ClientType};
+    use crate::middleware::bearer::AuthContext;
+    use epigraph_interfaces::ClientType;
     use crate::state::{ApiConfig, AppState};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
