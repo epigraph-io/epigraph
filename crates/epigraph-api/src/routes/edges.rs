@@ -40,6 +40,7 @@ const VALID_ENTITY_TYPES: &[&str] = &[
     "experiment_result",
     "propaganda_technique",
     "coalition",
+    "synthesis",
 ];
 
 /// Valid relationship types for edge creation
@@ -105,13 +106,19 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "GOVERNS",         // claim → claim (convention governs a system/scope)
     "FAILED_TO_COMPLETE", // claim → claim (agent failed to complete a task)
     "RESOLVED_BY",     // claim → claim (plugin mod resolved by upstream release)
+    // Synthesis (PROV-O), used by episcience paper-synthesis pipeline
+    "WAS_DERIVED_FROM", // synthesis → claim (prov:wasDerivedFrom)
+    "REFINES", // synthesis → synthesis (upper-case form; lower-case "refines" above is claim → claim refinement)
+    "COMPOSED_OF", // synthesis → synthesis (prereq composition)
+    "METHODOLOGY", // claim → claim (methodology relation, traversal)
+    "SUPERSEDES", // upper-case alias of lower-case "supersedes" above; synthesis-side callers use upper-case per PROV-O convention
 ];
 
-fn is_valid_entity_type(s: &str) -> bool {
+pub fn is_valid_entity_type(s: &str) -> bool {
     VALID_ENTITY_TYPES.contains(&s)
 }
 
-fn is_valid_relationship(s: &str) -> bool {
+pub fn is_valid_relationship(s: &str) -> bool {
     VALID_RELATIONSHIPS.contains(&s)
 }
 
@@ -755,6 +762,40 @@ pub async fn create_edge(
         valid_to: request.valid_to,
     };
 
+    // Emit edge.added event (Task 0.3 / Phase 0 — staleness trigger)
+    {
+        let actor_id = auth_ctx.as_ref().and_then(|axum::Extension(a)| a.agent_id);
+        let event_store = super::events::global_event_store();
+        event_store
+            .push(
+                "edge.added".to_string(),
+                actor_id,
+                serde_json::json!({
+                    "edge_id": response.id,
+                    "source_type": response.source_type,
+                    "source_id": response.source_id,
+                    "target_type": response.target_type,
+                    "target_id": response.target_id,
+                    "relationship": response.relationship,
+                }),
+            )
+            .await;
+
+        // If this is a supersedes edge, also emit claim.superseded
+        if response.relationship.eq_ignore_ascii_case("supersedes") {
+            event_store
+                .push(
+                    "claim.superseded".to_string(),
+                    actor_id,
+                    serde_json::json!({
+                        "superseded_claim_id": response.target_id,
+                        "superseded_by_claim_id": response.source_id,
+                    }),
+                )
+                .await;
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -804,6 +845,19 @@ pub async fn delete_edge(
         {
             tracing::warn!(edge_id = %id, error = %e, "Failed to record edge delete provenance");
         }
+    }
+
+    // Emit edge.deleted event (Task 0.3 / Phase 0 — staleness trigger)
+    {
+        let actor_id = auth_ctx.as_ref().and_then(|axum::Extension(a)| a.agent_id);
+        let event_store = super::events::global_event_store();
+        event_store
+            .push(
+                "edge.deleted".to_string(),
+                actor_id,
+                serde_json::json!({ "edge_id": id }),
+            )
+            .await;
     }
 
     Ok(StatusCode::NO_CONTENT)
