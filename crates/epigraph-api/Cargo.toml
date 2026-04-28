@@ -81,6 +81,7 @@ tokio-test = "0.4"  # Async test utilities
 futures = "0.3"  # For concurrent test execution
 hex = "0.4"  # Hex decoding for signature tests
 http-body-util = "0.1"  # HTTP body utilities for collecting response bodies in tests
+http = "1"  # http::request::Parts in AuthProvider trait impls (auth_chain_tests)
 epigraph-embeddings = { workspace = true }  # For embedding integration tests
 epigraph-db = { workspace = true }  # E2E encrypted subgraph tests
 blake3 = { workspace = true }  # Content hashing in E2E tests
@@ -150,3 +151,7 @@ path = "tests/embedding_integration_tests.rs"
 [[test]]
 name = "rag_persistence_tests"
 path = "tests/integration/rag_persistence_tests.rs"
+
+[[test]]
+name = "auth_chain_tests"
+path = "tests/middleware/auth_chain_tests.rs"

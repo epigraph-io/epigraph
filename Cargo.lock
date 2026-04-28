@@ -1193,6 +1193,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "http 1.4.0",
  "http-body-util",
  "jsonwebtoken",
  "nom 8.0.0",
