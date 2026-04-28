@@ -1396,6 +1396,7 @@ name = "epigraph-interfaces"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "http 1.4.0",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

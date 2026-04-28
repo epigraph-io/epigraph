@@ -23,10 +23,12 @@
 //!   skip expensive metadata writes that would be meaningless without a real
 //!   backend.
 
+pub mod auth;
 pub mod encryption;
 pub mod orchestration;
 pub mod policy;
 
+pub use auth::{AuthError, AuthProvider, ClientType, ProviderIdentity};
 pub use encryption::{EncryptionError, EncryptionProvider, NoOpEncryptionProvider};
 pub use orchestration::{
     NoOpOrchestrationBackend, OrchestrationBackend, OrchestrationError, TaskStatus,
