@@ -16,7 +16,7 @@ pub mod tls;
 pub mod webhook_bridge;
 
 pub use errors::ApiError;
-pub use routes::create_router;
+pub use routes::{create_router, create_router_with_extensions};
 pub use security::{
     AgentKey, AgentRateLimiter, KeyError, KeyRevocationRequest, KeyRotationRequest, KeyStatus,
     KeyType, RateLimitConfig, RateLimitError, SecurityAuditLog, SecurityEvent, SecurityEventFilter,

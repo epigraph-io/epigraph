@@ -87,7 +87,7 @@ pub mod webhooks;
 pub mod workflows;
 
 use crate::metrics;
-use crate::middleware::{bearer_auth_middleware, rate_limit_middleware, require_signature};
+use crate::middleware::{auth_chain_middleware, bearer_auth_middleware, rate_limit_middleware, require_signature};
 use crate::state::AppState;
 use axum::{
     extract::DefaultBodyLimit,
@@ -95,6 +95,42 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Router,
 };
+
+/// Internal helper: wrap the supplied protected-route table in the standard
+/// auth middleware stack (rate-limit is applied later, on the merged router).
+///
+/// Layer order (axum applies outer-most-added first per request):
+///   protected.layer(require_signature?).layer(bearer).layer(auth_chain)
+///
+/// Effective request flow: `auth_chain → bearer → require_signature → handler`.
+/// This preserves today's bearer-outermost ordering (the spec diagram differs;
+/// see the architectural drift note in the implementation plan).
+#[cfg(feature = "db")]
+fn build_protected_router_db(
+    state: &AppState,
+    protected: Router<AppState>,
+) -> Router<AppState> {
+    let with_signature = if state.config.require_signatures {
+        protected
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_signature,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                bearer_auth_middleware,
+            ))
+    } else {
+        protected.layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            bearer_auth_middleware,
+        ))
+    };
+    with_signature.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        auth_chain_middleware,
+    ))
+}
 
 /// Create the main application router with all routes
 ///
@@ -134,8 +170,14 @@ use axum::{
 /// All routes (except health endpoints) are subject to rate limiting when
 /// a rate limiter is configured in AppState. Rate limits apply per-agent
 /// for authenticated requests and per-IP for unauthenticated requests.
+/// Build the kernel router with all standard routes and middleware,
+/// optionally merging in additional routes from an overlay.
+///
+/// Overlay routes share the kernel's middleware stack (auth chain + bearer +
+/// optional signature), so an overlay-mounted route (e.g., `/oauth/cf/exchange`)
+/// sees `AuthContext` set by whichever chained provider authenticated the request.
 #[cfg(feature = "db")]
-pub fn create_router(state: AppState) -> Router {
+pub fn create_router_with_extensions(state: AppState, extra_routes: Router<AppState>) -> Router {
     // Protected write operations - require signature verification
     let protected = Router::new()
         .route("/claims", post(claims::create_claim))
@@ -398,29 +440,7 @@ pub fn create_router(state: AppState) -> Router {
         // Security audit log — requires audit:read scope
         .route("/api/v1/audit/security", get(audit::query_security_events));
 
-    // Auth middleware stack (outermost runs first):
-    // 1. bearer_auth_middleware: if Bearer token present, validate JWT + inject AuthContext
-    //    If no Bearer but X-Signature present, falls through to next layer.
-    // 2. require_signature: Ed25519 signature verification (legacy)
-    //
-    // Axum layers are applied inner-to-outer, so we apply signature first, then bearer.
-    let protected = if state.config.require_signatures {
-        protected
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                require_signature,
-            ))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                bearer_auth_middleware,
-            ))
-    } else {
-        // Even without signature requirement, accept bearer tokens when present
-        protected.layer(middleware::from_fn_with_state(
-            state.clone(),
-            bearer_auth_middleware,
-        ))
-    };
+    let protected = build_protected_router_db(&state, protected);
 
     // Public read operations - no authentication required
     let public = Router::new()
@@ -683,12 +703,50 @@ pub fn create_router(state: AppState) -> Router {
         .merge(protected)
         .merge(public)
         .merge(oauth)
+        .merge(extra_routes)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit_middleware,
         ))
         .with_state(state)
+}
+
+/// Backwards-compatible wrapper. Calls `create_router_with_extensions` with no
+/// overlay routes — existing in-tree consumers (e.g. `bin/server.rs`) continue
+/// to work without changes.
+#[cfg(feature = "db")]
+pub fn create_router(state: AppState) -> Router {
+    create_router_with_extensions(state, Router::new())
+}
+
+/// Internal helper (no-db variant): see `build_protected_router_db` for the
+/// layer-order rationale.
+#[cfg(not(feature = "db"))]
+fn build_protected_router_no_db(
+    state: &AppState,
+    protected: Router<AppState>,
+) -> Router<AppState> {
+    let with_signature = if state.config.require_signatures {
+        protected
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_signature,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                bearer_auth_middleware,
+            ))
+    } else {
+        protected.layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            bearer_auth_middleware,
+        ))
+    };
+    with_signature.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        auth_chain_middleware,
+    ))
 }
 
 /// Create a router without database-dependent routes
@@ -708,7 +766,7 @@ pub fn create_router(state: AppState) -> Router {
 /// All routes (except health endpoints) are subject to rate limiting when
 /// a rate limiter is configured in AppState.
 #[cfg(not(feature = "db"))]
-pub fn create_router(state: AppState) -> Router {
+pub fn create_router_with_extensions(state: AppState, extra_routes: Router<AppState>) -> Router {
     // Protected write operations
     let protected = Router::new()
         .route(
@@ -832,23 +890,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/coalitions", post(political::create_coalition));
     // /api/v1/mpc/joint-recall is an enterprise route; register via enterprise feature
 
-    // Auth middleware: bearer first, then signature fallback (same as db variant)
-    let protected = if state.config.require_signatures {
-        protected
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                require_signature,
-            ))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                bearer_auth_middleware,
-            ))
-    } else {
-        protected.layer(middleware::from_fn_with_state(
-            state.clone(),
-            bearer_auth_middleware,
-        ))
-    };
+    let protected = build_protected_router_no_db(&state, protected);
 
     // Public read operations
     let public = Router::new()
@@ -1032,12 +1074,18 @@ pub fn create_router(state: AppState) -> Router {
         .merge(protected)
         .merge(public)
         .merge(oauth)
+        .merge(extra_routes)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit_middleware,
         ))
         .with_state(state)
+}
+
+#[cfg(not(feature = "db"))]
+pub fn create_router(state: AppState) -> Router {
+    create_router_with_extensions(state, Router::new())
 }
 
 // Tests are disabled when db feature is enabled since they need a real database
