@@ -2,12 +2,11 @@
 
 #[cfg(feature = "db")]
 use epigraph_db::{repos::oauth_client::{OAuthClientRepository, OAuthClientRow}, PgPool};
-use epigraph_interfaces::{ClientType as InterfaceClientType, ProviderIdentity};
+use epigraph_interfaces::{ClientType, ProviderIdentity};
 use uuid::Uuid;
 
 use crate::errors::ApiError;
-#[allow(deprecated)]
-use crate::middleware::bearer::{AuthContext, ClientType};
+use crate::middleware::bearer::AuthContext;
 
 /// Resolve `ProviderIdentity` to `AuthContext`, find-or-creating an `oauth_clients` row.
 ///
@@ -36,9 +35,11 @@ impl IdentityResolver {
     ) -> Result<AuthContext, ApiError> {
         let client_id = format!("{}:{}", identity.client_id_prefix, identity.external_id);
 
-        // Defensive length check for VARCHAR(64) constraint.
+        // Defensive length check for VARCHAR(64) constraint. The client_id length
+        // is determined entirely by the external provider's claims, so an oversized
+        // value is malformed input — return 400, not 500.
         if client_id.len() > 64 {
-            return Err(ApiError::InternalError {
+            return Err(ApiError::BadRequest {
                 message: format!(
                     "client_id length {} exceeds VARCHAR(64); prefix={} external_id_len={}",
                     client_id.len(),
@@ -48,17 +49,14 @@ impl IdentityResolver {
             });
         }
 
-        if let Some(row) = OAuthClientRepository::get_by_client_id(&self.pool, &client_id)
-            .await
-            .map_err(|e| ApiError::InternalError { message: e.to_string() })?
-        {
+        if let Some(row) = OAuthClientRepository::get_by_client_id(&self.pool, &client_id).await? {
             return Ok(build_auth_context(&row));
         }
 
         let kernel_client_type = match identity.client_type {
-            InterfaceClientType::Human => "human",
-            InterfaceClientType::Agent => "agent",
-            InterfaceClientType::Service => "service",
+            ClientType::Human => "human",
+            ClientType::Agent => "agent",
+            ClientType::Service => "service",
         };
 
         let display = identity.display_name.clone().unwrap_or_else(|| client_id.clone());
@@ -78,13 +76,13 @@ impl IdentityResolver {
             identity.email.as_deref(),
         )
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to create client {}: {e}", client_id),
+        .map_err(|e| {
+            tracing::error!(client_id = %client_id, error = %e, "Failed to create oauth_clients row");
+            ApiError::from(e)
         })?;
 
         let row = OAuthClientRepository::get_by_id(&self.pool, id)
-            .await
-            .map_err(|e| ApiError::InternalError { message: e.to_string() })?
+            .await?
             .ok_or(ApiError::InternalError {
                 message: "Failed to read newly created client".to_string(),
             })?;
@@ -100,13 +98,19 @@ impl IdentityResolver {
 }
 
 #[cfg(feature = "db")]
-#[allow(deprecated)]
 fn build_auth_context(row: &OAuthClientRow) -> AuthContext {
     let client_type = match row.client_type.as_str() {
         "agent" => ClientType::Agent,
         "human" => ClientType::Human,
         "service" => ClientType::Service,
-        _ => ClientType::Service,
+        unknown => {
+            tracing::warn!(
+                client_type = unknown,
+                client_id = %row.client_id,
+                "unknown client_type in oauth_clients row, defaulting to Service"
+            );
+            ClientType::Service
+        }
     };
     AuthContext {
         client_id: row.id,
@@ -141,7 +145,7 @@ mod tests {
             email: None,
             display_name: None,
             default_scopes: vec![],
-            client_type: InterfaceClientType::Human,
+            client_type: ClientType::Human,
         };
         let formatted = format!("{}:{}", identity.client_id_prefix, identity.external_id);
         assert!(formatted.len() > 64);
