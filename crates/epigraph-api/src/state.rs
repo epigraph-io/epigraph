@@ -18,6 +18,7 @@ use epigraph_embeddings::EmbeddingService;
 use epigraph_engine::{DatabasePropagator, PropagationConfig, PropagationOrchestrator};
 use epigraph_events::EventBus;
 use epigraph_interfaces::{
+    AuthProvider,
     EncryptionProvider, NoOpEncryptionProvider,
     OrchestrationBackend, NoOpOrchestrationBackend,
     PolicyGate, NoOpPolicyGate,
@@ -127,6 +128,9 @@ pub type SharedPolicyGate = Arc<dyn PolicyGate>;
 /// replace this with a durable task queue implementation at startup.
 pub type SharedOrchestrationBackend = Arc<dyn OrchestrationBackend>;
 
+/// Type alias for a registered authentication provider.
+pub type SharedAuthProvider = Arc<dyn AuthProvider>;
+
 /// Application state shared across all request handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -225,6 +229,15 @@ pub struct AppState {
     /// Defaults to [`NoOpOrchestrationBackend`] (silent drop). Enterprise deployments
     /// inject a durable queue implementation via `with_orchestration_backend`.
     pub orchestration_backend: SharedOrchestrationBackend,
+
+    /// Registered authentication providers, tried in registration order.
+    /// Empty by default (kernel is dormant — bearer middleware handles all auth).
+    pub auth_providers: Vec<SharedAuthProvider>,
+
+    /// Resolver that maps verified `ProviderIdentity` → `AuthContext` via find-or-create.
+    /// Wired to the same DB pool as the kernel.
+    #[cfg(feature = "db")]
+    pub identity_resolver: crate::auth::IdentityResolver,
 }
 
 /// API configuration options
@@ -262,6 +275,7 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            auth_providers: Vec::new(),
         }
     }
 
@@ -286,7 +300,7 @@ impl AppState {
         let signature_state =
             SignatureVerificationState::new().with_max_request_size(config.max_request_size);
         Self {
-            db_pool,
+            db_pool: db_pool.clone(),
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -306,6 +320,8 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            auth_providers: Vec::new(),
+            identity_resolver: crate::auth::IdentityResolver::new(db_pool),
         }
     }
 
@@ -335,6 +351,7 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            auth_providers: Vec::new(),
         }
     }
 
@@ -346,7 +363,7 @@ impl AppState {
         signature_state: SignatureVerificationState,
     ) -> Self {
         Self {
-            db_pool,
+            db_pool: db_pool.clone(),
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -366,6 +383,8 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            auth_providers: Vec::new(),
+            identity_resolver: crate::auth::IdentityResolver::new(db_pool),
         }
     }
 
@@ -397,6 +416,7 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            auth_providers: Vec::new(),
         }
     }
 
@@ -410,7 +430,7 @@ impl AppState {
         let signature_state =
             SignatureVerificationState::new().with_max_request_size(config.max_request_size);
         Self {
-            db_pool,
+            db_pool: db_pool.clone(),
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -430,6 +450,8 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            auth_providers: Vec::new(),
+            identity_resolver: crate::auth::IdentityResolver::new(db_pool),
         }
     }
 
@@ -551,6 +573,17 @@ impl AppState {
     #[must_use]
     pub fn with_orchestration_backend(mut self, backend: SharedOrchestrationBackend) -> Self {
         self.orchestration_backend = backend;
+        self
+    }
+
+    /// Register an authentication provider (builder pattern).
+    ///
+    /// Providers are tried in registration order; first match wins. The kernel
+    /// is dormant by default (empty Vec) — only overlay binaries register
+    /// providers (e.g., `wrhq-epigraph-server` registers `CloudflareAccessProvider`).
+    #[must_use]
+    pub fn with_auth_provider(mut self, provider: SharedAuthProvider) -> Self {
+        self.auth_providers.push(provider);
         self
     }
 }

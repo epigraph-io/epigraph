@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod auth_chain;
 pub mod bearer;
 #[cfg(feature = "db")]
 pub mod group_authz;
@@ -19,6 +20,7 @@ pub use rate_limit::{rate_limit_middleware, RateLimitResponse};
 // Re-export OAuth2 middleware
 #[allow(deprecated)]
 pub use bearer::{bearer_auth_middleware, AuthContext, ClientType};
+pub use auth_chain::auth_chain_middleware;
 #[cfg(feature = "db")]
 pub use group_authz::require_group_admin;
 #[cfg(feature = "db")]
