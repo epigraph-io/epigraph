@@ -1,0 +1,31 @@
+-- Add embedding column to evidence for semantic recall.
+--
+-- The `evidence.embedding vector(1536)` column is already declared in
+-- 001_initial_schema.sql, but pre-existing databases that were snapshotted
+-- before that line was added (e.g., the prod `epigraph` DB and the dev
+-- `epigraph_dev_synthesis`) lack the column. Without it, `epigraph_engine::
+-- recall::recall` silently falls back to ILIKE text search instead of
+-- vector cosine search, which the prod e2e of episcience surfaced.
+--
+-- This migration is additive and idempotent (`IF NOT EXISTS`) so:
+--   - Fresh databases built from 001 are no-ops.
+--   - Older databases pick up the column and can begin populating it.
+--
+-- Index creation is intentionally omitted here. With ~40k existing rows on
+-- prod and NULL embeddings until reingest, an immediate hnsw build would
+-- (a) take a meaningful amount of write time on a hot table and (b) be
+-- pointless until the column is actually populated. When ready, mirror
+-- the existing 001_initial_schema.sql definition (kept here for reference):
+--
+--   CREATE INDEX idx_evidence_embedding
+--     ON public.evidence USING hnsw (embedding public.vector_cosine_ops)
+--     WHERE (embedding IS NOT NULL);
+--
+-- Existing rows have NULL embeddings until reingested. Until then,
+-- `recall::recall` continues to fall back to text search for evidence —
+-- the addition of the column alone does not retroactively populate it.
+--
+-- The operator must apply this migration to prod separately; this commit
+-- only adds the file.
+
+ALTER TABLE evidence ADD COLUMN IF NOT EXISTS embedding vector(1536);
