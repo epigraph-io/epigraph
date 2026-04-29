@@ -5,7 +5,7 @@
 //! Evidence mass functions anchor each variable so graph messages cannot
 //! wash out evidence-derived beliefs.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::LazyLock;
 
 use uuid::Uuid;
@@ -148,11 +148,9 @@ pub fn compute_cdst_factor_message(
 
 /// Configuration for CDST belief propagation.
 ///
-/// **Iteration limit:** Keep `max_iterations` at 10-20 for full-graph runs.
-/// The damping formula (discount+combine) injects monotonic Theta mass each
-/// iteration; beyond ~25 iterations mass functions degenerate toward vacuous
-/// and BetP oscillates. A structural fix (linear focal mass interpolation
-/// or Theta clamping) is needed before raising the limit.
+/// Damping is applied as linear interpolation on focal masses
+/// (see [`damp`]), so no Theta bias accumulates across iterations and
+/// `max_iterations` can be raised without degenerating toward vacuous.
 #[derive(Debug, Clone)]
 pub struct CdstBpConfig {
     pub max_iterations: usize,
@@ -185,6 +183,45 @@ pub struct CdstBpResult {
     /// Frame closure candidates detected during iteration (empty for now;
     /// future extension will port detection logic from interval_bp.rs).
     pub frame_evidence_proposals: Vec<crate::cdst_sheaf::FrameEvidenceProposal>,
+}
+
+// -- Damping ---------------------------------------------------------------
+
+/// Damp a freshly-combined belief against the previous iteration's belief.
+///
+/// Linear interpolation on focal masses:
+/// `m(A) = (1 − d) · m_new(A) + d · m_old(A)` for every focal element.
+/// Preserves the evidence fixed point — iterating `damp(m_combined, ·, d)`
+/// converges to `m_combined` exactly, with no Theta leak.
+///
+/// Frames must match; if they don't, the fresh belief is returned unchanged.
+fn damp(m_new: &MassFunction, m_old: &MassFunction, d: f64) -> MassFunction {
+    let d = d.clamp(0.0, 1.0);
+    if (d - 1.0).abs() < 1e-10 {
+        return m_old.clone();
+    }
+    if d < 1e-10 {
+        return m_new.clone();
+    }
+    if m_new.frame() != m_old.frame() {
+        return m_new.clone();
+    }
+
+    let mut masses: BTreeMap<FocalElement, f64> = BTreeMap::new();
+    for (fe, &mass) in m_new.focal_elements() {
+        let v = (1.0 - d) * mass;
+        if v > 0.0 {
+            *masses.entry(fe.clone()).or_insert(0.0) += v;
+        }
+    }
+    for (fe, &mass) in m_old.focal_elements() {
+        let v = d * mass;
+        if v > 0.0 {
+            *masses.entry(fe.clone()).or_insert(0.0) += v;
+        }
+    }
+
+    MassFunction::new(m_new.frame().clone(), masses).unwrap_or_else(|_| m_new.clone())
 }
 
 // -- BP iteration with evidence anchoring ----------------------------------
@@ -255,19 +292,7 @@ pub fn cdst_bp_iteration(
             Err(_) => m_evidence,
         };
 
-        // Damping via discount+combine
-        let d = config.damping.clamp(0.0, 1.0);
-        let new_m = if (d - 1.0).abs() < 1e-10 {
-            old_m.clone()
-        } else if d < 1e-10 {
-            m_combined
-        } else {
-            let m_new_disc = discount(&m_combined, 1.0 - d).unwrap_or_else(|_| vacuous());
-            let m_old_disc = discount(&old_m, d).unwrap_or_else(|_| vacuous());
-            adaptive_combine(&m_new_disc, &m_old_disc, config.conflict_threshold)
-                .map(|(m, _)| m)
-                .unwrap_or_else(|_| m_combined)
-        };
+        let new_m = damp(&m_combined, &old_m, config.damping);
 
         let new_iv = mass_to_interval(&new_m);
         let change = old_iv.hausdorff_distance(&new_iv);
@@ -579,6 +604,66 @@ mod tests {
         assert!(
             b_betp > 0.5,
             "unanchored claim should follow graph toward supported, got {b_betp}"
+        );
+    }
+
+    /// Regression for bug 4bf645f3: the old discount-based damping injected
+    /// Theta mass each iteration, so iterating `damp(m_evidence, ·, 0.5)`
+    /// converged to BetP ≈ 0.81 instead of the evidence's true BetP = 0.95.
+    /// Linear-interpolation damping must converge to the evidence exactly.
+    #[test]
+    fn test_damping_fixed_point_preserves_evidence() {
+        let m_evidence = strong_supported(0.9);
+        let betp_target = pignistic_probability(&m_evidence, H_SUPPORTED);
+
+        let mut m = vacuous();
+        for _ in 0..100 {
+            m = damp(&m_evidence, &m, 0.5);
+        }
+        let betp = pignistic_probability(&m, H_SUPPORTED);
+        assert!(
+            (betp - betp_target).abs() < 0.001,
+            "damping fixed point BetP should equal evidence BetP ({betp_target}), got {betp}"
+        );
+    }
+
+    /// Running the full BP loop past the historical ~25-iteration degeneration
+    /// threshold on a single evidence-anchored variable must not erode BetP.
+    #[test]
+    fn test_bp_no_theta_leak_over_long_run() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        let m_strong = strong_supported(0.9);
+        let mut initial = HashMap::new();
+        initial.insert(a, m_strong.clone());
+        initial.insert(b, vacuous());
+
+        let mut evidence = HashMap::new();
+        evidence.insert(a, m_strong.clone());
+        evidence.insert(b, vacuous());
+
+        let factors = vec![(
+            Uuid::new_v4(),
+            FactorPotential::EvidentialSupport { strength: 0.5 },
+            vec![a, b],
+        )];
+
+        let config = CdstBpConfig {
+            max_iterations: 60,
+            convergence_threshold: 1e-9,
+            ..CdstBpConfig::default()
+        };
+        let result = run_cdst_bp(&factors, &initial, &evidence, &config);
+        let a_betp = result
+            .updated_betps
+            .iter()
+            .find(|(id, _)| *id == a)
+            .map(|(_, b)| *b)
+            .unwrap_or(0.0);
+        assert!(
+            a_betp > 0.9,
+            "anchored evidence BetP=0.95 must not erode toward 0.5 over 60 iterations, got {a_betp}"
         );
     }
 
