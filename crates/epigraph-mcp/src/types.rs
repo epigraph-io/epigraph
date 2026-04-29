@@ -577,6 +577,31 @@ pub struct AuthorResponse {
     pub name: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IngestDocumentParams {
+    #[schemars(
+        description = "Absolute or working-directory-relative path to a JSON file containing a hierarchical DocumentExtraction (thesis -> sections -> paragraphs -> atoms)."
+    )]
+    pub file_path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestDocumentResponse {
+    pub paper_id: String,
+    pub paper_title: String,
+    pub doi: String,
+    pub authors: Vec<AuthorResponse>,
+    pub claims_ingested: usize,
+    pub claims_embedded: usize,
+    pub claims_skipped_dedup: usize,
+    pub relationships_created: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claims_ds_wired: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ds_frame_id: Option<String>,
+    pub already_ingested: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PaperResponse {
     pub doi: String,

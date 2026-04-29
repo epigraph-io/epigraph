@@ -72,6 +72,73 @@ impl EdgeRepository {
         Ok(row.id)
     }
 
+    /// Like [`create`], but if an edge with the same
+    /// `(source_id, target_id, relationship)` triple already exists, returns
+    /// that edge's id without inserting a duplicate. Idempotent.
+    ///
+    /// Uses check-then-insert in a transaction. The `edges` table has no
+    /// unique index on this triple (multiple parallel edges with different
+    /// `properties` are valid in the general case), so we cannot rely on
+    /// `ON CONFLICT`. Two round-trips are acceptable for the ingestion
+    /// path; the race window is small and edges are idempotent in practice.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any database operation fails.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(pool, properties))]
+    pub async fn create_if_not_exists(
+        pool: &PgPool,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Uuid, DbError> {
+        let mut tx = pool.begin().await?;
+
+        let existing = sqlx::query!(
+            r#"
+            SELECT id FROM edges
+            WHERE source_id = $1 AND target_id = $2 AND relationship = $3
+            LIMIT 1
+            "#,
+            source_id,
+            target_id,
+            relationship,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(row) = existing {
+            tx.commit().await?;
+            return Ok(row.id);
+        }
+
+        let properties = properties.unwrap_or(serde_json::json!({}));
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id
+            "#,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.id)
+    }
+
     /// Get edges by source entity
     ///
     /// # Errors

@@ -15,6 +15,7 @@ epigraph-db = { workspace = true }
 epigraph-ds = { workspace = true }
 epigraph-engine = { workspace = true }
 epigraph-embeddings = { workspace = true }
+epigraph-ingest = { workspace = true }
 
 # MCP protocol (no sqlx dep — coexists with workspace sqlx 0.7)
 rmcp = { workspace = true }
@@ -60,6 +61,9 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 # HTTP transport (axum 0.8 matches rmcp's streamable-http-server dep)
 axum = "0.8"
+
+[dev-dependencies]
+epigraph-ingest = { workspace = true }
 
 [features]
 default = []

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO papers (doi, title, journal)\n            VALUES ($1, $2, $3)\n            ON CONFLICT (doi) DO UPDATE SET\n                title = COALESCE(EXCLUDED.title, papers.title),\n                journal = COALESCE(EXCLUDED.journal, papers.journal)\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "85097da8538e4c132e96f0a1adc7069198e526e258c07bc9cf1c14dee1a1ebbd"
+}

@@ -74,12 +74,12 @@ pub use repos::{
     MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes,
     MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper,
     MethodUsageExample, OAuthClientRepository, OAuthClientRow, OwnershipRepository,
-    PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository, ProvenanceLogRow,
-    ProvenanceRepository, ReEncryptionKeyRepository, ReEncryptionKeyRow, ReasoningTraceRepository,
-    RefreshTokenRepository, RefreshTokenRow, ScopedBeliefRepository, SecurityEventRepository,
-    SecurityEventRow, SheafRepository, TaskRepository, TaskRow, TripleRepository, TripleRow,
-    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowListRow, WorkflowRecallResult,
-    WorkflowRepository,
+    PaperRepository, PaperRow, PatternTemplateRepository, PatternTemplateRow,
+    PerspectiveRepository, ProvenanceLogRow, ProvenanceRepository, ReEncryptionKeyRepository,
+    ReEncryptionKeyRow, ReasoningTraceRepository, RefreshTokenRepository, RefreshTokenRow,
+    ScopedBeliefRepository, SecurityEventRepository, SecurityEventRow, SheafRepository,
+    TaskRepository, TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository,
+    WorkflowExecutionRow, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
 };
 
 // Re-export sqlx types that users will need
