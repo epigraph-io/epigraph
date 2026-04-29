@@ -214,6 +214,17 @@ impl EpiGraphMcpFull {
         tools::ingestion::ingest_paper_url(self, params).await
     }
 
+    #[tool(
+        description = "Ingest a hierarchical DocumentExtraction JSON file (thesis -> sections -> paragraphs -> atoms). Creates a paper node, claims at each level, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent for re-runs at the same pipeline version."
+    )]
+    async fn ingest_document(
+        &self,
+        Parameters(params): Parameters<IngestDocumentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::ingestion::ingest_document(self, params).await
+    }
+
     // ── Paper Queries (3 tools) ──
 
     #[tool(description = "Look up a paper by its DOI, returning title, authors, and claims.")]
