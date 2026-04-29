@@ -54,6 +54,7 @@ tower-http = { version = "0.5", features = ["trace", "cors"] }  # HTTP middlewar
 serde = { workspace = true }  # Serialization
 serde_json = { workspace = true }  # JSON support
 serde_with = { workspace = true }  # Helper macros for serde
+toml = "0.8"  # provider config parsing
 uuid = { workspace = true }  # UUID support
 chrono = { workspace = true }  # Date/time handling
 thiserror = { workspace = true }  # Error derive macros
@@ -88,6 +89,10 @@ epigraph-db = { workspace = true }  # E2E encrypted subgraph tests
 blake3 = { workspace = true }  # Content hashing in E2E tests
 ed25519-dalek = { workspace = true }  # Agent signing keys in E2E tests
 rand = { workspace = true }  # Key generation in E2E tests
+wiremock = "0.6"  # HTTP fixture for OAuth provider integration tests
+rsa = "0.9"  # RSA keypair fixture for OAuth tests
+pkcs1 = "0.7"  # PKCS#1 encoding for RSA fixtures
+toml = "0.8"  # provider config TOML parsing in tests
 
 [[test]]
 name = "graph_routes_test"
