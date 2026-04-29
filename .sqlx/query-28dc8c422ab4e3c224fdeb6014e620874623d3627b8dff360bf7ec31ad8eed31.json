@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT 1 AS exists_marker\n            FROM edges\n            WHERE source_id = $1\n              AND source_type = 'paper'\n              AND relationship = 'processed_by'\n              AND properties ->> 'pipeline' = $2\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists_marker",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "28dc8c422ab4e3c224fdeb6014e620874623d3627b8dff360bf7ec31ad8eed31"
+}
