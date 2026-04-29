@@ -12,7 +12,7 @@ use epigraph_core::{
     TruthValue,
 };
 use epigraph_crypto::ContentHasher;
-use epigraph_db::{ClaimRepository, EvidenceRepository, ReasoningTraceRepository};
+use epigraph_db::{ClaimRepository, EdgeRepository, EvidenceRepository, ReasoningTraceRepository};
 
 fn parse_methodology(s: &str) -> Result<Methodology, String> {
     match s.to_lowercase().replace('-', "_").as_str() {
@@ -81,22 +81,22 @@ pub async fn submit_claim(
     let pub_key = server.signer.public_key();
     let confidence = params.confidence.clamp(0.0, 1.0);
 
-    // Compute initial truth: confidence * evidence_type_weight (from calibration.toml)
-    // I-3: use helper that checks CALIBRATION_PATH env var before relative path
     let weight = load_evidence_type_weight(&params.evidence_type);
     let raw_truth = (confidence * weight).clamp(0.01, 0.99);
     let truth_value = TruthValue::clamped(raw_truth);
 
-    // Create claim (trace_id starts as None; linked after trace creation)
     let mut claim = Claim::new(params.content.clone(), agent_id_typed, pub_key, truth_value);
-    let claim_uuid = claim.id.as_uuid();
-
-    // Compute content hash and signature
     let content_hash = ContentHasher::hash(params.content.as_bytes());
     claim.content_hash = content_hash;
     claim.signature = Some(server.signer.sign(&content_hash));
 
-    // Create evidence
+    // Idempotent canonical claim create + AUTHORED verb-edge.
+    let (claim, was_created) =
+        crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "submit_claim").await?;
+    let claim_uuid = claim.id.as_uuid();
+
+    // Build Evidence + Trace from this submission. Both are noun-claims with
+    // their own UUIDs and signatures regardless of was_created.
     let evidence_hash = ContentHasher::hash(params.evidence_data.as_bytes());
     let evidence = Evidence::new(
         agent_id_typed,
@@ -112,7 +112,6 @@ pub async fn submit_claim(
         e
     };
 
-    // Create reasoning trace
     let explanation = params.reasoning.unwrap_or_else(|| {
         format!(
             "Claim submitted via MCP with {} methodology",
@@ -130,63 +129,102 @@ pub async fn submit_claim(
         explanation,
     );
 
-    // Persist: claim (NULL trace_id) → trace → evidence → link trace
-    ClaimRepository::create(&server.pool, &claim)
-        .await
-        .map_err(internal_error)?;
+    // Persist Trace + Evidence on every submission.
     ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
         .await
         .map_err(internal_error)?;
     EvidenceRepository::create(&server.pool, &evidence_with_sig)
         .await
         .map_err(internal_error)?;
-    ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
-        .await
-        .map_err(internal_error)?;
 
-    // DS auto-wire (best-effort — errors logged but do not abort claim creation)
-    let ds_result = ds_auto::auto_wire_ds_for_claim(
+    // Verb-edges: every submission references its own Evidence + Trace.
+    // Emitted on both branches per the architecture doc's "re-occurrence
+    // = new edge" rule. Matches ingest_paper's hoist (S3a Task 6, fix #1).
+    // The was_created marker on properties lets queries distinguish
+    // first-create from resubmit edges.
+    //
+    // Note: the API handler at routes/claims.rs:585-614 still follows the
+    // pre-S3a skip-on-resubmit rule. Aligning the API to MCP's accumulating
+    // semantics is spec backlog item #10.
+    let _ = EdgeRepository::create(
         &server.pool,
         claim_uuid,
-        agent_id,
-        confidence,
-        weight,
-        true,
-        Some(&params.evidence_type),
+        "claim",
+        evidence_with_sig.id.as_uuid(),
+        "evidence",
+        "DERIVED_FROM",
+        Some(serde_json::json!({"was_created": was_created})),
+        None,
+        None,
     )
     .await;
-    if let Err(ref e) = ds_result {
-        tracing::warn!(claim_id = %claim_uuid, "ds auto-wire failed: {e}");
-    }
+    let _ = EdgeRepository::create(
+        &server.pool,
+        claim_uuid,
+        "claim",
+        trace.id.as_uuid(),
+        "trace",
+        "HAS_TRACE",
+        Some(serde_json::json!({"was_created": was_created})),
+        None,
+        None,
+    )
+    .await;
 
-    // Overwrite truth_value with CDST pignistic probability when available
-    if let Ok(ref ds) = ds_result {
-        let ds_truth = TruthValue::clamped(ds.pignistic_prob);
-        // I-4: log rather than silently discard truth update errors
-        if let Err(e) = ClaimRepository::update_truth_value(
+    let (final_truth, ds, embedded) = if was_created {
+        // First-create: full lineage. update_trace_id, DS auto-wire, embed.
+        ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
+            .await
+            .map_err(internal_error)?;
+
+        let ds_result = ds_auto::auto_wire_ds_for_claim(
             &server.pool,
-            ClaimId::from_uuid(claim_uuid),
-            ds_truth,
+            claim_uuid,
+            agent_id,
+            confidence,
+            weight,
+            true,
+            Some(&params.evidence_type),
         )
-        .await
-        {
-            tracing::warn!(claim_id = %claim_uuid, "failed to update truth from DS pignistic: {e}");
-        }
-    }
-    let ds = ds_result.ok();
-
-    // Embed (best-effort)
-    let embedded = server
-        .embedder
-        .embed_and_store(claim_uuid, &params.content)
         .await;
+        if let Err(ref e) = ds_result {
+            tracing::warn!(claim_id = %claim_uuid, "ds auto-wire failed: {e}");
+        }
+        if let Ok(ref ds) = ds_result {
+            let ds_truth = TruthValue::clamped(ds.pignistic_prob);
+            if let Err(e) = ClaimRepository::update_truth_value(
+                &server.pool,
+                ClaimId::from_uuid(claim_uuid),
+                ds_truth,
+            )
+            .await
+            {
+                tracing::warn!(
+                    claim_id = %claim_uuid,
+                    "failed to update truth from DS pignistic: {e}"
+                );
+            }
+        }
+        let ds = ds_result.ok();
 
-    // Report the truth value that was actually stored (pignistic if DS succeeded,
-    // otherwise the initial confidence*weight estimate).
-    let final_truth = ds
-        .as_ref()
-        .map(|d| d.pignistic_prob.clamp(0.01, 0.99))
-        .unwrap_or(raw_truth);
+        let embedded = server
+            .embedder
+            .embed_and_store(claim_uuid, &params.content)
+            .await;
+
+        let final_truth = ds
+            .as_ref()
+            .map(|d| d.pignistic_prob.clamp(0.01, 0.99))
+            .unwrap_or(raw_truth);
+
+        (final_truth, ds, embedded)
+    } else {
+        // Resubmit (Option B): verb-edges already emitted above. Skip
+        // update_trace_id (canonical trace immutable), skip DS auto-wire
+        // (canonical truth set on first create), skip embed (canonical
+        // embedding already exists). Report canonical truth, not raw.
+        (claim.truth_value.value(), None, false)
+    };
 
     success_json(&SubmitClaimResponse {
         claim_id: claim_uuid.to_string(),
