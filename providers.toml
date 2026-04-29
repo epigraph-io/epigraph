@@ -1,0 +1,38 @@
+# Example providers.toml — copy to providers.toml and edit, or set EPIGRAPH_PROVIDERS_CONFIG to override path.
+
+[[provider]]
+name              = "google"
+flow              = "redirect"
+grant_type        = "google_id_token"
+issuer            = "https://accounts.google.com"
+extra_issuers     = ["accounts.google.com"]
+jwks_url          = "https://www.googleapis.com/oauth2/v3/certs"
+audience_env      = "GOOGLE_CLIENT_ID"
+client_id_env     = "GOOGLE_CLIENT_ID"
+client_secret_env = "GOOGLE_CLIENT_SECRET"
+auth_endpoint     = "https://accounts.google.com/o/oauth2/v2/auth"
+token_endpoint    = "https://oauth2.googleapis.com/token"
+redirect_uri_env  = "EPIGRAPH_REDIRECT_URI"
+auto_provision    = true
+default_scopes = [
+  "claims:read", "claims:write", "claims:challenge",
+  "evidence:read", "evidence:submit",
+  "edges:read", "edges:write",
+  "agents:read", "agents:write",
+  "groups:read", "groups:manage",
+  "analysis:belief", "analysis:propagation", "analysis:reasoning",
+  "analysis:gaps", "analysis:structural", "analysis:hypothesis",
+  "analysis:political",
+  "clients:register",
+]
+
+# Uncomment to enable Cloudflare Access:
+# [[provider]]
+# name           = "cloudflare-access"
+# flow           = "assertion"
+# grant_type     = "cloudflare_access_jwt"
+# issuer         = "https://your-team.cloudflareaccess.com"
+# jwks_url       = "https://your-team.cloudflareaccess.com/cdn-cgi/access/certs"
+# audience_env   = "CF_ACCESS_AUD"
+# auto_provision = true
+# default_scopes = ["claims:read", "claims:write", "evidence:read", "evidence:submit"]

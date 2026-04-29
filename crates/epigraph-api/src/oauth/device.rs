@@ -1,37 +1,43 @@
-//! OAuth2 Authorization Code exchange for browser-based Google login.
+//! Generic browser-based OAuth2 redirect flow for any OIDC redirect provider.
 //!
-//! POST /oauth/google/auth-url   — returns the Google consent URL + PKCE verifier
-//! POST /oauth/google/exchange   — exchanges auth code + verifier for EpiGraph tokens
+//! POST /oauth/{provider}/auth-url   — returns the consent URL + PKCE verifier
+//! POST /oauth/{provider}/exchange   — exchanges auth code + verifier for EpiGraph tokens
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::ApiError;
 use crate::state::AppState;
 
-// ── Request / Response types ────────────────────────────────────────
-
 #[derive(Debug, Serialize)]
 pub struct AuthUrlResponse {
     pub auth_url: String,
     pub code_verifier: String,
+    /// CSRF binding token. The caller must verify this matches the `state` returned
+    /// on the redirect callback before calling `/oauth/{provider}/exchange`.
+    pub state: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct AuthUrlRequest {
+    /// Optional override; falls back to provider config or EPIGRAPH_REDIRECT_URI.
+    pub redirect_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ExchangeRequest {
-    /// The authorization code from Google (or full redirect URL containing it)
     pub code: String,
-    /// The PKCE code_verifier that was generated with the auth URL
     pub code_verifier: String,
+    pub redirect_uri: Option<String>,
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
-/// Generate PKCE code_verifier and code_challenge (S256).
 fn generate_pkce() -> (String, String) {
     use base64::Engine;
     use sha2::Digest;
-
     let verifier_bytes: [u8; 32] = rand::random();
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
     let challenge_hash = sha2::Sha256::digest(verifier.as_bytes());
@@ -39,16 +45,20 @@ fn generate_pkce() -> (String, String) {
     (verifier, challenge)
 }
 
-/// Extract the authorization code from user input.
-/// They might paste the raw code or the full redirect URL.
+/// Generate an OAuth `state` value (32 random bytes, base64url-encoded). Used as a
+/// CSRF binding token that the caller must verify on the redirect callback.
+fn generate_state() -> String {
+    use base64::Engine;
+    let bytes: [u8; 32] = rand::random();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 fn extract_code(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.contains("code=") {
-        // Parse query string from URL like http://127.0.0.1:1?code=4/0A...&scope=...
         if let Some(query_part) = trimmed.split('?').nth(1) {
             for pair in query_part.split('&') {
                 if let Some(val) = pair.strip_prefix("code=") {
-                    // URL-decode the value
                     return percent_decode(val);
                 }
             }
@@ -76,195 +86,145 @@ fn percent_decode(input: &str) -> String {
     result
 }
 
-// ── Endpoints ───────────────────────────────────────────────────────
+/// Resolve the redirect URI in priority order:
+/// 1. Caller-supplied (request body `redirect_uri`).
+/// 2. Provider-configured default (from `OidcRedirectFlow::default_redirect_uri`).
+/// 3. Legacy fallback: `EPIGRAPH_REDIRECT_URI` env var, defaulting to `http://127.0.0.1:1`.
+fn resolve_redirect_uri(caller: Option<&str>, provider_default: Option<&str>) -> String {
+    if let Some(uri) = caller {
+        return uri.to_string();
+    }
+    if let Some(uri) = provider_default {
+        return uri.to_string();
+    }
+    std::env::var("EPIGRAPH_REDIRECT_URI").unwrap_or_else(|_| "http://127.0.0.1:1".to_string())
+}
 
-/// POST /oauth/google/auth-url
-///
-/// Returns a Google consent URL and the PKCE code_verifier the client must
-/// send back when exchanging the resulting authorization code.
 #[cfg(feature = "db")]
-pub async fn google_auth_url_endpoint(
-    State(_state): State<AppState>,
+pub async fn auth_url_endpoint(
+    State(state): State<AppState>,
+    Path(provider_name): Path<String>,
+    body: Option<Json<AuthUrlRequest>>,
 ) -> Result<(StatusCode, Json<AuthUrlResponse>), ApiError> {
-    let client_id = std::env::var("GOOGLE_CLIENT_ID").map_err(|_| ApiError::InternalError {
-        message: "GOOGLE_CLIENT_ID not configured on server".to_string(),
-    })?;
+    if state.providers.by_name(&provider_name).is_none() {
+        return Err(ApiError::NotFound {
+            entity: "provider".into(),
+            id: provider_name.clone(),
+        });
+    }
+    let flow = state
+        .providers
+        .redirect_flow(&provider_name)
+        .ok_or(ApiError::BadRequest {
+            message: format!("provider {provider_name} does not support redirect flow"),
+        })?;
 
+    let req = body.map(|Json(b)| b).unwrap_or_default();
     let redirect_uri =
-        std::env::var("EPIGRAPH_REDIRECT_URI").unwrap_or_else(|_| "http://127.0.0.1:1".to_string());
-
+        resolve_redirect_uri(req.redirect_uri.as_deref(), flow.default_redirect_uri());
     let (verifier, challenge) = generate_pkce();
-
-    let auth_url = format!(
-        "https://accounts.google.com/o/oauth2/v2/auth\
-         ?client_id={client_id}\
-         &redirect_uri={}\
-         &response_type=code\
-         &scope=openid+email+profile\
-         &code_challenge={challenge}\
-         &code_challenge_method=S256\
-         &access_type=offline",
-        redirect_uri.as_str(),
-    );
+    let csrf_state = generate_state();
+    let auth_url = flow.build_auth_url(&csrf_state, &challenge, &redirect_uri);
 
     Ok((
         StatusCode::OK,
         Json(AuthUrlResponse {
             auth_url,
             code_verifier: verifier,
+            state: csrf_state,
         }),
     ))
 }
 
-/// POST /oauth/google/exchange
-///
-/// Exchanges a Google authorization code + PKCE verifier for EpiGraph tokens.
-/// The client obtains the code by completing Google sign-in in a browser tab
-/// and copying the code from the redirect URL.
 #[cfg(feature = "db")]
-pub async fn google_exchange_endpoint(
+pub async fn exchange_endpoint(
     State(state): State<AppState>,
+    Path(provider_name): Path<String>,
     Json(req): Json<ExchangeRequest>,
 ) -> Result<(StatusCode, Json<super::token::TokenResponse>), ApiError> {
-    use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+    use crate::oauth::providers::{provision_external_user, ProviderError};
 
-    let client_id = std::env::var("GOOGLE_CLIENT_ID").map_err(|_| ApiError::InternalError {
-        message: "GOOGLE_CLIENT_ID not configured".to_string(),
-    })?;
-    let client_secret =
-        std::env::var("GOOGLE_CLIENT_SECRET").map_err(|_| ApiError::InternalError {
-            message: "GOOGLE_CLIENT_SECRET not configured".to_string(),
+    let provider = state
+        .providers
+        .by_name(&provider_name)
+        .ok_or(ApiError::NotFound {
+            entity: "provider".into(),
+            id: provider_name.clone(),
         })?;
-
-    let redirect_uri =
-        std::env::var("EPIGRAPH_REDIRECT_URI").unwrap_or_else(|_| "http://127.0.0.1:1".to_string());
+    let flow = state
+        .providers
+        .redirect_flow(&provider_name)
+        .ok_or(ApiError::BadRequest {
+            message: format!("provider {provider_name} does not support redirect flow"),
+        })?;
 
     let code = extract_code(&req.code);
     if code.is_empty() {
         return Err(ApiError::BadRequest {
-            message: "No authorization code found in input".to_string(),
+            message: "No authorization code found in input".into(),
         });
     }
 
-    // Exchange the authorization code for Google tokens
-    let params = [
-        ("client_id", client_id.as_str()),
-        ("client_secret", client_secret.as_str()),
-        ("code", code.as_str()),
-        ("code_verifier", req.code_verifier.as_str()),
-        ("grant_type", "authorization_code"),
-        ("redirect_uri", redirect_uri.as_str()),
-    ];
+    let redirect_uri =
+        resolve_redirect_uri(req.redirect_uri.as_deref(), flow.default_redirect_uri());
 
-    let resp = reqwest::Client::new()
-        .post("https://oauth2.googleapis.com/token")
-        .form(&params)
-        .send()
+    let id_token = flow
+        .exchange_code(&code, &redirect_uri, &req.code_verifier)
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to contact Google token endpoint: {e}"),
+        .map_err(|e| match e {
+            ProviderError::Upstream(msg) => ApiError::BadGateway { reason: msg },
+            ProviderError::InvalidAssertion(msg) => ApiError::BadRequest { message: msg },
+            ProviderError::Config(msg) => ApiError::InternalError { message: msg },
+            ProviderError::JwksFetch(msg) => ApiError::ServiceUnavailable {
+                service: format!("JWKS unavailable: {msg}"),
+            },
         })?;
 
-    let body = resp.text().await.unwrap_or_default();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| ApiError::InternalError {
-            message: format!("Failed to parse Google token response: {e}"),
-        })?;
+    let identity = match provider.validate(&id_token).await {
+        Ok(id) => id,
+        Err(e) => {
+            crate::oauth::providers::provision::emit_oauth_audit(
+                &state.db_pool,
+                "oauth_assertion_rejected",
+                false,
+                serde_json::json!({
+                    "provider": provider.name(),
+                    "flow": "redirect",
+                    "reason": format!("{e}"),
+                }),
+            );
+            return Err(match e {
+                ProviderError::InvalidAssertion(msg) => ApiError::Unauthorized { reason: msg },
+                ProviderError::JwksFetch(msg) => ApiError::ServiceUnavailable {
+                    service: format!("JWKS unavailable: {msg}"),
+                },
+                ProviderError::Upstream(msg) => ApiError::BadGateway { reason: msg },
+                ProviderError::Config(msg) => ApiError::InternalError { message: msg },
+            });
+        }
+    };
 
-    if let Some(error) = parsed.get("error").and_then(|e| e.as_str()) {
-        let desc = parsed
-            .get("error_description")
-            .and_then(|d| d.as_str())
-            .unwrap_or("unknown error");
-        return Err(ApiError::BadRequest {
-            message: format!("Google token exchange failed: {error}: {desc}"),
-        });
-    }
-
-    // Extract and validate the ID token
-    let id_token_str =
-        parsed
-            .get("id_token")
-            .and_then(|v| v.as_str())
-            .ok_or(ApiError::InternalError {
-                message: "Google returned no id_token".to_string(),
-            })?;
-
-    let header = decode_header(id_token_str).map_err(|e| ApiError::BadRequest {
-        message: format!("Invalid ID token header: {e}"),
-    })?;
-    let kid = header.kid.ok_or(ApiError::BadRequest {
-        message: "ID token missing kid header".to_string(),
-    })?;
-
-    // Fetch Google's JWKS
-    let jwks_url = "https://www.googleapis.com/oauth2/v3/certs";
-    let jwks_resp = reqwest::get(jwks_url)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to fetch Google JWKS: {e}"),
-        })?;
-    let jwks_body: serde_json::Value =
-        jwks_resp
-            .json()
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to parse Google JWKS: {e}"),
-            })?;
-
-    let keys = jwks_body["keys"]
-        .as_array()
-        .ok_or(ApiError::InternalError {
-            message: "Google JWKS has no keys array".to_string(),
-        })?;
-    let jwk = keys
-        .iter()
-        .find(|k| k["kid"].as_str() == Some(&kid))
-        .ok_or(ApiError::Unauthorized {
-            reason: "ID token kid not found in Google JWKS".to_string(),
-        })?;
-
-    let n = jwk["n"].as_str().ok_or(ApiError::InternalError {
-        message: "Google JWK missing 'n' field".to_string(),
-    })?;
-    let e_val = jwk["e"].as_str().ok_or(ApiError::InternalError {
-        message: "Google JWK missing 'e' field".to_string(),
-    })?;
-
-    let decoding_key =
-        DecodingKey::from_rsa_components(n, e_val).map_err(|err| ApiError::InternalError {
-            message: format!("Failed to build RSA key from Google JWK: {err}"),
-        })?;
-
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.set_audience(&[&client_id]);
-    validation.set_issuer(&["https://accounts.google.com", "accounts.google.com"]);
-
-    let token_data =
-        decode::<super::token::GoogleIdTokenClaims>(id_token_str, &decoding_key, &validation)
-            .map_err(|e| ApiError::Unauthorized {
-                reason: format!("Google ID token validation failed: {e}"),
-            })?;
-
-    // Use shared provisioning logic
-    super::token::provision_google_user(&state, &token_data.claims, None).await
+    provision_external_user(&state, provider.as_ref(), &identity, None).await
 }
 
 #[cfg(not(feature = "db"))]
-pub async fn google_auth_url_endpoint(
-    State(_state): State<AppState>,
+pub async fn auth_url_endpoint(
+    State(_): State<AppState>,
+    Path(_): Path<String>,
+    _body: Option<Json<AuthUrlRequest>>,
 ) -> Result<(StatusCode, Json<AuthUrlResponse>), ApiError> {
     Err(ApiError::ServiceUnavailable {
-        service: "database required for OAuth2".to_string(),
+        service: "database required for OAuth2".into(),
     })
 }
 
 #[cfg(not(feature = "db"))]
-pub async fn google_exchange_endpoint(
-    State(_state): State<AppState>,
-    Json(_req): Json<ExchangeRequest>,
+pub async fn exchange_endpoint(
+    State(_): State<AppState>,
+    Path(_): Path<String>,
+    Json(_): Json<ExchangeRequest>,
 ) -> Result<(StatusCode, Json<super::token::TokenResponse>), ApiError> {
     Err(ApiError::ServiceUnavailable {
-        service: "database required for OAuth2".to_string(),
+        service: "database required for OAuth2".into(),
     })
 }
