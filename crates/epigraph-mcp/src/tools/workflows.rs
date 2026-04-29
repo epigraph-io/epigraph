@@ -90,7 +90,6 @@ pub async fn store_workflow(
     let tags = params.tags.unwrap_or_default();
     let prereqs = params.prerequisites.unwrap_or_default();
 
-    // Workflow content is stored as JSON
     let content = serde_json::json!({
         "goal": params.goal,
         "steps": params.steps,
@@ -106,7 +105,7 @@ pub async fn store_workflow(
     });
     let content_str = serde_json::to_string(&content).map_err(internal_error)?;
 
-    let raw_truth = (confidence * 0.5).clamp(0.01, 0.99); // Workflows start unproven
+    let raw_truth = (confidence * 0.5).clamp(0.01, 0.99);
     let mut claim = Claim::new(
         content_str.clone(),
         agent_id_typed,
@@ -116,74 +115,81 @@ pub async fn store_workflow(
     claim.content_hash = ContentHasher::hash(content_str.as_bytes());
     claim.signature = Some(server.signer.sign(&claim.content_hash));
 
-    let evidence_text = format!("Workflow hypothesis: {}", params.goal);
-    let evidence_hash = ContentHasher::hash(evidence_text.as_bytes());
-    let mut evidence = Evidence::new(
-        agent_id_typed,
-        pub_key,
-        evidence_hash,
-        EvidenceType::Testimony {
-            source: "mcp-workflow".to_string(),
-            testified_at: chrono::Utc::now(),
-            verification: None,
-        },
-        Some(evidence_text),
-        claim.id,
-    );
-    evidence.signature = Some(server.signer.sign(&evidence_hash));
+    let (claim, was_created) =
+        crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "store_workflow")
+            .await?;
+    let claim_uuid = claim.id.as_uuid();
 
-    let trace = ReasoningTrace::new(
-        agent_id_typed,
-        pub_key,
-        Methodology::Heuristic,
-        vec![TraceInput::Evidence { id: evidence.id }],
-        confidence,
-        format!("Workflow stored: {}", params.goal),
-    );
+    let (final_truth, ds, embedded) = if was_created {
+        let evidence_text = format!("Workflow hypothesis: {}", params.goal);
+        let evidence_hash = ContentHasher::hash(evidence_text.as_bytes());
+        let mut evidence = Evidence::new(
+            agent_id_typed,
+            pub_key,
+            evidence_hash,
+            EvidenceType::Testimony {
+                source: "mcp-workflow".to_string(),
+                testified_at: chrono::Utc::now(),
+                verification: None,
+            },
+            Some(evidence_text),
+            claim.id,
+        );
+        evidence.signature = Some(server.signer.sign(&evidence_hash));
 
-    ClaimRepository::create(&server.pool, &claim)
-        .await
-        .map_err(internal_error)?;
-    ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
-        .await
-        .map_err(internal_error)?;
-    EvidenceRepository::create(&server.pool, &evidence)
-        .await
-        .map_err(internal_error)?;
-    ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
-        .await
-        .map_err(internal_error)?;
+        let trace = ReasoningTrace::new(
+            agent_id_typed,
+            pub_key,
+            Methodology::Heuristic,
+            vec![TraceInput::Evidence { id: evidence.id }],
+            confidence,
+            format!("Workflow stored: {}", params.goal),
+        );
 
-    // DS auto-wire (best-effort, workflow weight = 0.5)
-    let ds = match ds_auto::auto_wire_ds_for_claim(
-        &server.pool,
-        claim.id.as_uuid(),
-        agent_id,
-        confidence,
-        0.5,
-        true,
-        None, // evidence_type: Task 4 will populate
-    )
-    .await
-    {
-        Ok(r) => Some(r),
-        Err(e) => {
-            tracing::warn!(workflow_id = %claim.id.as_uuid(), "ds auto-wire workflow failed: {e}");
-            None
-        }
+        ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
+            .await
+            .map_err(internal_error)?;
+        EvidenceRepository::create(&server.pool, &evidence)
+            .await
+            .map_err(internal_error)?;
+        ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
+            .await
+            .map_err(internal_error)?;
+
+        let ds = match ds_auto::auto_wire_ds_for_claim(
+            &server.pool,
+            claim_uuid,
+            agent_id,
+            confidence,
+            0.5,
+            true,
+            None,
+        )
+        .await
+        {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(workflow_id = %claim_uuid, "ds auto-wire workflow failed: {e}");
+                None
+            }
+        };
+
+        let embed_text = workflow_embed_text(&params.goal, &params.steps, &prereqs);
+        let embedded = server
+            .embedder
+            .embed_and_store(claim_uuid, &embed_text)
+            .await;
+
+        (raw_truth, ds, embedded)
+    } else {
+        (claim.truth_value.value(), None, false)
     };
 
-    let embed_text = workflow_embed_text(&params.goal, &params.steps, &prereqs);
-    let embedded = server
-        .embedder
-        .embed_and_store(claim.id.as_uuid(), &embed_text)
-        .await;
-
     success_json(&StoreWorkflowResponse {
-        workflow_id: claim.id.as_uuid().to_string(),
+        workflow_id: claim_uuid.to_string(),
         goal: params.goal,
         step_count: params.steps.len(),
-        truth_value: raw_truth,
+        truth_value: final_truth,
         embedded,
         belief: ds.as_ref().map(|d| d.belief),
         plausibility: ds.as_ref().map(|d| d.plausibility),
@@ -546,88 +552,96 @@ pub async fn improve_workflow(
         content_str.clone(),
         agent_id_typed,
         pub_key,
-        TruthValue::clamped(0.5), // Unproven variant
+        TruthValue::clamped(0.5),
     );
     claim.content_hash = ContentHasher::hash(content_str.as_bytes());
     claim.signature = Some(server.signer.sign(&claim.content_hash));
 
-    let evidence_text = format!(
-        "Improved variant of workflow {}. Rationale: {}",
-        parent_id, params.change_rationale
-    );
-    let evidence_hash = ContentHasher::hash(evidence_text.as_bytes());
-    let mut evidence = Evidence::new(
-        agent_id_typed,
-        pub_key,
-        evidence_hash,
-        EvidenceType::Testimony {
-            source: "mcp-workflow-improve".to_string(),
-            testified_at: chrono::Utc::now(),
-            verification: None,
-        },
-        Some(evidence_text),
-        claim.id,
-    );
-    evidence.signature = Some(server.signer.sign(&evidence_hash));
+    let (claim, was_created) =
+        crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "improve_workflow")
+            .await?;
+    let claim_uuid = claim.id.as_uuid();
 
-    let trace = ReasoningTrace::new(
-        agent_id_typed,
-        pub_key,
-        Methodology::Heuristic,
-        vec![
-            TraceInput::Evidence { id: evidence.id },
-            TraceInput::Claim {
-                id: epigraph_core::ClaimId::from_uuid(parent_id),
-            },
-        ],
-        0.5,
-        format!(
-            "Workflow variant of {}. {}",
+    let embedded = if was_created {
+        let evidence_text = format!(
+            "Improved variant of workflow {}. Rationale: {}",
             parent_id, params.change_rationale
-        ),
-    );
+        );
+        let evidence_hash = ContentHasher::hash(evidence_text.as_bytes());
+        let mut evidence = Evidence::new(
+            agent_id_typed,
+            pub_key,
+            evidence_hash,
+            EvidenceType::Testimony {
+                source: "mcp-workflow-improve".to_string(),
+                testified_at: chrono::Utc::now(),
+                verification: None,
+            },
+            Some(evidence_text),
+            claim.id,
+        );
+        evidence.signature = Some(server.signer.sign(&evidence_hash));
 
-    ClaimRepository::create(&server.pool, &claim)
-        .await
-        .map_err(internal_error)?;
-    ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
-        .await
-        .map_err(internal_error)?;
-    EvidenceRepository::create(&server.pool, &evidence)
-        .await
-        .map_err(internal_error)?;
-    ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
+        let trace = ReasoningTrace::new(
+            agent_id_typed,
+            pub_key,
+            Methodology::Heuristic,
+            vec![
+                TraceInput::Evidence { id: evidence.id },
+                TraceInput::Claim {
+                    id: epigraph_core::ClaimId::from_uuid(parent_id),
+                },
+            ],
+            0.5,
+            format!(
+                "Workflow variant of {}. {}",
+                parent_id, params.change_rationale
+            ),
+        );
+
+        ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
+            .await
+            .map_err(internal_error)?;
+        EvidenceRepository::create(&server.pool, &evidence)
+            .await
+            .map_err(internal_error)?;
+        ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
+            .await
+            .map_err(internal_error)?;
+
+        // First-create only: the parent → variant relationship.
+        EdgeRepository::create(
+            &server.pool,
+            claim_uuid,
+            "claim",
+            parent_id,
+            "claim",
+            "variant_of",
+            Some(serde_json::json!({"generation": generation})),
+            None,
+            None,
+        )
         .await
         .map_err(internal_error)?;
 
-    // Create variant_of edge
-    EdgeRepository::create(
-        &server.pool,
-        claim.id.as_uuid(),
-        "claim",
-        parent_id,
-        "claim",
-        "variant_of",
-        Some(serde_json::json!({"generation": generation})),
-        None,
-        None,
-    )
-    .await
-    .map_err(internal_error)?;
-
-    let embed_text = workflow_embed_text(&goal, &steps, &prereqs);
-    let embedded = server
-        .embedder
-        .embed_and_store(claim.id.as_uuid(), &embed_text)
-        .await;
+        let embed_text = workflow_embed_text(&goal, &steps, &prereqs);
+        server
+            .embedder
+            .embed_and_store(claim_uuid, &embed_text)
+            .await
+    } else {
+        // Option A + idempotent variant_of: skip everything including the
+        // variant_of edge (already created on first variant insert).
+        false
+    };
 
     success_json(&ImproveWorkflowResponse {
-        variant_id: claim.id.as_uuid().to_string(),
+        variant_id: claim_uuid.to_string(),
         parent_id: parent_id.to_string(),
         goal,
         step_count: steps.len(),
         generation,
-        truth_value: 0.5,
+        truth_value: claim.truth_value.value(),
         embedded,
     })
 }
