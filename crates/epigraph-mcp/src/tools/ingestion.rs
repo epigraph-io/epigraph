@@ -23,7 +23,6 @@ use epigraph_db::{
 use epigraph_ingest::builder::{build_ingest_plan, PlannedClaim};
 use epigraph_ingest::schema::DocumentExtraction;
 
-
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
