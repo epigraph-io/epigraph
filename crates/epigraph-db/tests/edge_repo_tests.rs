@@ -2,19 +2,16 @@
 
 mod helpers;
 
-use epigraph_db::{
-    AgentRepository, ClaimRepository, EdgeRepository, PaperRepository, PgPool,
-};
+use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, PaperRepository, PgPool};
 use helpers::{make_agent, make_claim};
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn create_if_not_exists_is_idempotent(pool: PgPool) {
     // Set up real source (paper) and target (claim) so the edge-validation
     // trigger doesn't reject the insert.
-    let paper_id =
-        PaperRepository::get_or_create(&pool, "10.1234/idem", Some("Idempotency"), None)
-            .await
-            .expect("create paper");
+    let paper_id = PaperRepository::get_or_create(&pool, "10.1234/idem", Some("Idempotency"), None)
+        .await
+        .expect("create paper");
 
     let agent = make_agent(Some("a"));
     let agent_row = AgentRepository::create(&pool, &agent).await.unwrap();
@@ -23,15 +20,7 @@ async fn create_if_not_exists_is_idempotent(pool: PgPool) {
     let claim_id: uuid::Uuid = claim_row.id.into();
 
     let id1 = EdgeRepository::create_if_not_exists(
-        &pool,
-        paper_id,
-        "paper",
-        claim_id,
-        "claim",
-        "asserts",
-        None,
-        None,
-        None,
+        &pool, paper_id, "paper", claim_id, "claim", "asserts", None, None, None,
     )
     .await
     .expect("first call inserts");
@@ -55,10 +44,9 @@ async fn create_if_not_exists_is_idempotent(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn create_if_not_exists_distinguishes_by_relationship(pool: PgPool) {
-    let paper_id =
-        PaperRepository::get_or_create(&pool, "10.1234/rel", Some("Relationship"), None)
-            .await
-            .expect("create paper");
+    let paper_id = PaperRepository::get_or_create(&pool, "10.1234/rel", Some("Relationship"), None)
+        .await
+        .expect("create paper");
 
     let agent = make_agent(Some("b"));
     let agent_row = AgentRepository::create(&pool, &agent).await.unwrap();

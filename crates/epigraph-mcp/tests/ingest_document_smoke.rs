@@ -97,7 +97,10 @@ async fn happy_path_ingests_full_hierarchy(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(claim_count.0, 5, "all 5 hierarchy levels persisted as claims");
+    assert_eq!(
+        claim_count.0, 5,
+        "all 5 hierarchy levels persisted as claims"
+    );
 
     // 3. Paper -> claim asserts edges exist for every claim.
     let assert_edges: (i64,) = sqlx::query_as(
@@ -168,13 +171,6 @@ async fn re_ingest_hits_version_gate(pool: PgPool) {
 }
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
-    let content = result
-        .content
-        .first()
-        .expect("at least one content block");
-    content
-        .as_text()
-        .expect("text content")
-        .text
-        .clone()
+    let content = result.content.first().expect("at least one content block");
+    content.as_text().expect("text content").text.clone()
 }

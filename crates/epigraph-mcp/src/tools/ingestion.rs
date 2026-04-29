@@ -573,10 +573,16 @@ pub async fn do_ingest_document(
             };
             (agent_uuid, "agent".to_string())
         } else {
-            let mapped = id_map.get(&edge.source_id).copied().unwrap_or(edge.source_id);
+            let mapped = id_map
+                .get(&edge.source_id)
+                .copied()
+                .unwrap_or(edge.source_id);
             (mapped, edge.source_type.clone())
         };
-        let tgt = id_map.get(&edge.target_id).copied().unwrap_or(edge.target_id);
+        let tgt = id_map
+            .get(&edge.target_id)
+            .copied()
+            .unwrap_or(edge.target_id);
 
         EdgeRepository::create_if_not_exists(
             pool,
