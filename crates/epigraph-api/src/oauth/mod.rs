@@ -3,11 +3,12 @@
 pub mod device;
 pub mod introspect;
 pub mod jwt;
+pub mod providers;
 pub mod register;
 pub mod revoke;
 pub mod token;
 
-pub use device::{google_auth_url_endpoint, google_exchange_endpoint};
+pub use device::{auth_url_endpoint, exchange_endpoint};
 pub use introspect::introspect_endpoint;
 pub use jwt::{EpiGraphClaims, JwtConfig};
 pub use register::{register_endpoint, RegisterRequest, RegisterResponse};

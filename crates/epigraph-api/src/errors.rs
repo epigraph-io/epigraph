@@ -50,6 +50,9 @@ pub enum ApiError {
 
     #[error("Conflict: {reason}")]
     Conflict { reason: String },
+
+    #[error("Bad gateway: {reason}")]
+    BadGateway { reason: String },
 }
 
 /// JSON error response structure
@@ -126,6 +129,11 @@ impl IntoResponse for ApiError {
             ApiError::Conflict { reason } => (
                 StatusCode::CONFLICT,
                 "Conflict",
+                Some(serde_json::json!({ "reason": reason })),
+            ),
+            ApiError::BadGateway { reason } => (
+                StatusCode::BAD_GATEWAY,
+                "BadGateway",
                 Some(serde_json::json!({ "reason": reason })),
             ),
         };

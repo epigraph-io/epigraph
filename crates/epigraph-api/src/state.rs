@@ -8,6 +8,7 @@ use uuid::Uuid;
 use epigraph_db::PgPool;
 
 use crate::middleware::SignatureVerificationState;
+use crate::oauth::providers::ProviderRegistry;
 use crate::routes::harvest::HarvesterClient;
 use crate::security::audit::InMemorySecurityAuditLog;
 use crate::security::AgentRateLimiter;
@@ -224,6 +225,11 @@ pub struct AppState {
     /// Defaults to [`NoOpOrchestrationBackend`] (silent drop). Enterprise deployments
     /// inject a durable queue implementation via `with_orchestration_backend`.
     pub orchestration_backend: SharedOrchestrationBackend,
+
+    /// External identity provider registry. Built once at startup from `providers.toml`.
+    /// Empty by default — server still works for agent/service auth and existing tokens,
+    /// but external `grant_type=*` requests return 400 unsupported_grant_type.
+    pub providers: Arc<ProviderRegistry>,
 }
 
 /// API configuration options
@@ -261,6 +267,7 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            providers: Arc::new(ProviderRegistry::empty()),
         }
     }
 
@@ -305,6 +312,7 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            providers: Arc::new(ProviderRegistry::empty()),
         }
     }
 
@@ -334,6 +342,7 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            providers: Arc::new(ProviderRegistry::empty()),
         }
     }
 
@@ -365,6 +374,7 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            providers: Arc::new(ProviderRegistry::empty()),
         }
     }
 
@@ -396,6 +406,7 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            providers: Arc::new(ProviderRegistry::empty()),
         }
     }
 
@@ -429,6 +440,7 @@ impl AppState {
             encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            providers: Arc::new(ProviderRegistry::empty()),
         }
     }
 
@@ -550,6 +562,17 @@ impl AppState {
     #[must_use]
     pub fn with_orchestration_backend(mut self, backend: SharedOrchestrationBackend) -> Self {
         self.orchestration_backend = backend;
+        self
+    }
+
+    /// Replace the external-provider registry (builder pattern).
+    ///
+    /// Call at startup after loading `providers.toml`. When omitted, the registry
+    /// is empty — agent/service/refresh auth still works; external grant types
+    /// return 400 unsupported_grant_type.
+    #[must_use]
+    pub fn with_providers(mut self, providers: Arc<ProviderRegistry>) -> Self {
+        self.providers = providers;
         self
     }
 }
