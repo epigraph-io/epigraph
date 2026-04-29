@@ -786,6 +786,7 @@ mod tests {
                 encryption_epoch: None,
                 group_id: None,
                 labels: Vec::new(),
+                was_created: false,
             },
             attribution: serde_json::json!({
                 "prov": "wasAttributedTo",
