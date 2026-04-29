@@ -51,7 +51,16 @@ fn claim_from_row(
 }
 
 impl ClaimRepository {
-    /// Create a new claim in the database
+    /// Create a new claim in the database (LEGACY — implicit content-hash dedup)
+    ///
+    /// **Legacy behavior:** dedups on `content_hash` alone (NOT on
+    /// `(content_hash, agent_id)`), so a request from agent B with the same
+    /// content as an earlier claim from agent A returns agent A's row. This is
+    /// a noun-claim invariant violation. New code should use
+    /// `find_by_content_hash_and_agent` + `create_or_get` / `create_strict`
+    /// (see `docs/architecture/noun-claims-and-verb-edges.md`). The ~44
+    /// internal callers of this method are migrated as a separate
+    /// out-of-band task.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -125,10 +134,14 @@ impl ClaimRepository {
         ))
     }
 
-    /// Create a new claim within an existing transaction
+    /// Create a new claim within an existing transaction (LEGACY — implicit content-hash dedup)
     ///
     /// Same as `create()` but accepts a `&mut PgConnection` for transactional use.
     /// Uses runtime query (not compile-time macro) to support the connection executor.
+    ///
+    /// **Legacy behavior:** see the note on `create()` — this method shares
+    /// the same cross-agent collapse bug. New transactional code should use
+    /// `create_or_get` / `create_strict`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -1067,6 +1080,180 @@ impl ClaimRepository {
         tx.commit().await?;
 
         Ok((new_uuid, old_uuid))
+    }
+
+    // ============================================================
+    // S1 noun-claims-and-verb-edges helpers
+    // (see docs/architecture/noun-claims-and-verb-edges.md)
+    // ============================================================
+
+    /// Find an existing claim by `(content_hash, agent_id)`.
+    ///
+    /// Returns the matching row if any, else `None`. Unlike `create()` /
+    /// `create_with_tx()` (which dedup on `content_hash` alone and return
+    /// the first agent's row regardless of requester), this helper enforces
+    /// the noun-claim invariant that `(content_hash, agent_id)` is the
+    /// canonical key.
+    ///
+    /// Takes `&mut PgConnection` so the caller can compose the lookup with
+    /// edge creation in the same transaction.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn find_by_content_hash_and_agent(
+        conn: &mut sqlx::PgConnection,
+        content_hash: &[u8],
+        agent_id: Uuid,
+    ) -> Result<Option<Claim>, DbError> {
+        use sqlx::Row;
+
+        let row = sqlx::query(
+            r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+               FROM claims
+               WHERE content_hash = $1 AND agent_id = $2
+               LIMIT 1"#,
+        )
+        .bind(content_hash)
+        .bind(agent_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        match row {
+            Some(row) => {
+                let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
+                Ok(Some(claim_from_row(
+                    row.get("id"),
+                    row.get("content"),
+                    row.get("agent_id"),
+                    row.get("trace_id"),
+                    tv,
+                    row.get("created_at"),
+                    row.get("updated_at"),
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Insert a claim row unconditionally (no implicit dedup).
+    ///
+    /// Use this when the caller has already determined that an insert is
+    /// the correct action (or wants the post-107 UNIQUE constraint to be
+    /// the authoritative dedup gate).
+    ///
+    /// **Pre-107:** inserts a duplicate row when `(content_hash, agent_id)`
+    /// already exists.
+    ///
+    /// **Post-107:** the `uq_claims_content_hash_agent` constraint surfaces
+    /// duplicate insertions as `DbError::DuplicateKey`.
+    ///
+    /// Takes `&mut PgConnection` for transactional composition.
+    ///
+    /// # Errors
+    /// Returns `DbError::DuplicateKey` on a `(content_hash, agent_id)`
+    /// collision (post-107 only). Returns `DbError::QueryFailed` for other
+    /// database errors.
+    pub async fn create_strict(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+    ) -> Result<Claim, DbError> {
+        use sqlx::Row;
+
+        let id: Uuid = claim.id.into();
+        let agent_id: Uuid = claim.agent_id.into();
+        let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
+        let truth_value = claim.truth_value.value();
+        let created_at = claim.created_at;
+        let updated_at = claim.updated_at;
+        let content_hash = ContentHasher::hash(claim.content.as_bytes());
+
+        let row = sqlx::query(
+            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
+        )
+        .bind(id)
+        .bind(&claim.content)
+        .bind(content_hash.as_slice())
+        .bind(truth_value)
+        .bind(agent_id)
+        .bind(trace_id)
+        .bind(created_at)
+        .bind(updated_at)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
+        Ok(claim_from_row(
+            row.get("id"),
+            row.get("content"),
+            row.get("agent_id"),
+            row.get("trace_id"),
+            tv,
+            row.get("created_at"),
+            row.get("updated_at"),
+        ))
+    }
+
+    /// Find-or-insert a claim by `(content_hash, agent_id)`.
+    ///
+    /// Looks up an existing row first; if found, returns it with
+    /// `was_created=false`. Otherwise inserts and returns the new row with
+    /// `was_created=true`.
+    ///
+    /// **Post-107 race handling:** if a concurrent writer inserts the same
+    /// `(content_hash, agent_id)` between the find and the insert, the INSERT
+    /// fails with the unique constraint. This helper catches that error,
+    /// re-runs the find, and returns the resulting row with
+    /// `was_created=false`.
+    ///
+    /// **Pre-107 (constraint not yet applied):** the catch path is
+    /// unreachable, and a concurrent race may produce two rows. S2 backfill
+    /// (future) cleans up any rows produced during the S1→S4 transition.
+    ///
+    /// **Constraint match assumption:** the post-107 catch path matches
+    /// `DbError::DuplicateKey { .. }` only because
+    /// `uq_claims_content_hash_agent` is the only unique constraint that can
+    /// fire on a fresh-UUID `INSERT INTO claims`. If a future migration adds
+    /// another unique constraint to `claims`, narrow this match to inspect
+    /// the constraint name.
+    ///
+    /// Takes `&mut PgConnection` for transactional composition.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` for non-unique-violation database errors.
+    pub async fn create_or_get(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+    ) -> Result<(Claim, bool), DbError> {
+        let agent_id: Uuid = claim.agent_id.into();
+        let content_hash = ContentHasher::hash(claim.content.as_bytes());
+
+        if let Some(existing) =
+            Self::find_by_content_hash_and_agent(&mut *conn, content_hash.as_slice(), agent_id)
+                .await?
+        {
+            return Ok((existing, false));
+        }
+
+        match Self::create_strict(&mut *conn, claim).await {
+            Ok(c) => Ok((c, true)),
+            Err(DbError::DuplicateKey { .. }) => {
+                // Post-107 race: another writer won. Re-find and return.
+                let existing = Self::find_by_content_hash_and_agent(
+                    &mut *conn,
+                    content_hash.as_slice(),
+                    agent_id,
+                )
+                .await?
+                .ok_or_else(|| DbError::InvalidData {
+                    reason: "DuplicateKey from create_strict but no row found on re-find"
+                        .to_string(),
+                })?;
+                Ok((existing, false))
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
