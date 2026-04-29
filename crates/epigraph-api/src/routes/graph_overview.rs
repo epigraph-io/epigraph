@@ -139,6 +139,11 @@ pub struct ClusterSubgraphResponse {
     pub total_size: i64,
     pub nodes: Vec<GraphNodeDto>,
     pub edges: Vec<GraphEdgeDto>,
+    /// Count of edges between the returned `nodes` whose `relationship` is
+    /// not in `GRAPH_EDGE_RELATIONSHIPS` (e.g. `produced`, `same_source`,
+    /// `CONTAINS`). Lets the GUI render "this node has N relationships not
+    /// shown in the readability tier" instead of an ambiguous empty payload.
+    pub filtered_edge_count: i64,
 }
 
 #[derive(Deserialize)]
@@ -307,7 +312,7 @@ pub async fn expand_cluster(
         .collect();
 
     let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
-    let edges = fetch_subgraph_edges(pool, &node_ids).await?;
+    let (edges, filtered_edge_count) = fetch_subgraph_edges(pool, &node_ids).await?;
 
     Ok(Json(ClusterSubgraphResponse {
         cluster_id: cluster_id.to_string(),
@@ -315,6 +320,7 @@ pub async fn expand_cluster(
         total_size,
         nodes,
         edges,
+        filtered_edge_count,
     }))
 }
 
@@ -397,7 +403,7 @@ pub async fn graph_neighborhood(
             .collect()
     };
 
-    let edges = fetch_subgraph_edges(pool, &node_ids).await?;
+    let (edges, filtered_edge_count) = fetch_subgraph_edges(pool, &node_ids).await?;
     let total_size = nodes.len() as i64;
 
     Ok(Json(ClusterSubgraphResponse {
@@ -406,6 +412,7 @@ pub async fn graph_neighborhood(
         total_size,
         nodes,
         edges,
+        filtered_edge_count,
     }))
 }
 
@@ -413,20 +420,20 @@ pub async fn graph_neighborhood(
 async fn fetch_subgraph_edges(
     pool: &sqlx::PgPool,
     node_ids: &[Uuid],
-) -> Result<Vec<GraphEdgeDto>, ApiError> {
+) -> Result<(Vec<GraphEdgeDto>, i64), ApiError> {
     if node_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
 
     let rows = sqlx::query(
         r#"
-        SELECT source_id, target_id, relationship
+        SELECT source_id, target_id, relationship,
+               (relationship = ANY($2::text[])) AS is_allowed
         FROM edges
         WHERE source_type = 'claim'
           AND target_type = 'claim'
           AND source_id = ANY($1::uuid[])
           AND target_id = ANY($1::uuid[])
-          AND relationship = ANY($2::text[])
         LIMIT $3
         "#,
     )
@@ -439,14 +446,21 @@ async fn fetch_subgraph_edges(
         message: format!("Subgraph edge query failed: {}", e),
     })?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| GraphEdgeDto {
-            source: r.get("source_id"),
-            target: r.get("target_id"),
-            relationship: r.get("relationship"),
-        })
-        .collect())
+    let mut edges = Vec::new();
+    let mut filtered: i64 = 0;
+    for r in rows {
+        let is_allowed: bool = r.get("is_allowed");
+        if is_allowed {
+            edges.push(GraphEdgeDto {
+                source: r.get("source_id"),
+                target: r.get("target_id"),
+                relationship: r.get("relationship"),
+            });
+        } else {
+            filtered += 1;
+        }
+    }
+    Ok((edges, filtered))
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +625,7 @@ pub async fn expand_community(
             total_size: 0,
             nodes: Vec::new(),
             edges: Vec::new(),
+            filtered_edge_count: 0,
         }));
     };
     let run_id: Uuid = run_row.get("id");
@@ -664,7 +679,7 @@ pub async fn expand_community(
         .collect();
 
     let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
-    let edges = fetch_subgraph_edges(pool, &node_ids).await?;
+    let (edges, filtered_edge_count) = fetch_subgraph_edges(pool, &node_ids).await?;
 
     Ok(Json(ClusterSubgraphResponse {
         cluster_id: community_id.to_string(),
@@ -672,6 +687,7 @@ pub async fn expand_community(
         total_size,
         nodes,
         edges,
+        filtered_edge_count,
     }))
 }
 
@@ -700,6 +716,7 @@ pub async fn expand_community(
         total_size: 0,
         nodes: Vec::new(),
         edges: Vec::new(),
+        filtered_edge_count: 0,
     }))
 }
 
@@ -743,6 +760,7 @@ pub async fn expand_cluster(
         total_size: 0,
         nodes: Vec::new(),
         edges: Vec::new(),
+        filtered_edge_count: 0,
     }))
 }
 
@@ -757,6 +775,7 @@ pub async fn graph_neighborhood(
         total_size: 0,
         nodes: Vec::new(),
         edges: Vec::new(),
+        filtered_edge_count: 0,
     }))
 }
 
@@ -805,5 +824,20 @@ mod tests {
                 "should not be in allowlist: {rel}",
             );
         }
+    }
+
+    #[test]
+    fn cluster_subgraph_response_serializes_filtered_count() {
+        use super::ClusterSubgraphResponse;
+        let r = ClusterSubgraphResponse {
+            cluster_id: "x".into(),
+            truncated: false,
+            total_size: 1,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            filtered_edge_count: 7,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["filtered_edge_count"], 7);
     }
 }
