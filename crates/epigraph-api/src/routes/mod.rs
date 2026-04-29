@@ -679,12 +679,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/oauth/revoke", post(crate::oauth::revoke_endpoint))
         .route("/oauth/introspect", post(crate::oauth::introspect_endpoint))
         .route(
-            "/oauth/google/auth-url",
-            post(crate::oauth::google_auth_url_endpoint),
+            "/oauth/:provider/auth-url",
+            post(crate::oauth::auth_url_endpoint),
         )
         .route(
-            "/oauth/google/exchange",
-            post(crate::oauth::google_exchange_endpoint),
+            "/oauth/:provider/exchange",
+            post(crate::oauth::exchange_endpoint),
         );
 
     // Apply rate limiting and body limit as outermost layers
@@ -1032,12 +1032,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/oauth/revoke", post(crate::oauth::revoke_endpoint))
         .route("/oauth/introspect", post(crate::oauth::introspect_endpoint))
         .route(
-            "/oauth/google/auth-url",
-            post(crate::oauth::google_auth_url_endpoint),
+            "/oauth/:provider/auth-url",
+            post(crate::oauth::auth_url_endpoint),
         )
         .route(
-            "/oauth/google/exchange",
-            post(crate::oauth::google_exchange_endpoint),
+            "/oauth/:provider/exchange",
+            post(crate::oauth::exchange_endpoint),
         );
 
     // Apply rate limiting and body limit as outermost layers
