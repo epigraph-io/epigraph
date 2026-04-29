@@ -19,7 +19,9 @@ async fn get_pool() -> Option<PgPool> {
 async fn create_test_claim(pool: &PgPool, content: &str, truth_value: f64) -> Uuid {
     let id = Uuid::new_v4();
     // content_hash is derived from the per-row UUID via Postgres sha256 so each
-    // test claim satisfies migration 097's UNIQUE(content_hash, agent_id).
+    // test claim satisfies migration 106's UNIQUE(content_hash, agent_id)
+    // — the constraint is pending in source (Task 7 disposition); test
+    // setup must apply it via sqlx::migrate! before this assertion holds.
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
          VALUES ($1, $2, sha256($1::text::bytea), $3, (SELECT id FROM agents LIMIT 1), true)",
