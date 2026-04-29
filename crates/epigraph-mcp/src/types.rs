@@ -1,7 +1,36 @@
 #![allow(clippy::doc_markdown)]
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+// Defensive deserializer for `Option<Vec<String>>` parameters.
+//
+// Some MCP clients double-encode array arguments when they appear
+// alongside required string fields, so `tags: ["a","b"]` arrives at
+// the server as the JSON-encoded string `"[\"a\",\"b\"]"`. The default
+// `Vec` deserializer rejects this with `expected a sequence` and the
+// tool call fails before any work happens. Accept both shapes so a
+// client bug doesn't silently break every call.
+fn deserialize_opt_string_array<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Vec(Vec<String>),
+        Str(String),
+    }
+
+    match Option::<Either>::deserialize(d)? {
+        None => Ok(None),
+        Some(Either::Vec(v)) => Ok(Some(v)),
+        Some(Either::Str(s)) if s.is_empty() => Ok(None),
+        Some(Either::Str(s)) => serde_json::from_str(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
 
 // ── Claims ──
 
@@ -111,6 +140,7 @@ pub struct MemorizeParams {
     #[schemars(
         description = "Tags for categorization, e.g. ['code', 'rust'] or ['decision', 'architecture']"
     )]
+    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub tags: Option<Vec<String>>,
 }
 
@@ -221,6 +251,7 @@ pub struct StoreWorkflowParams {
     #[schemars(
         description = "Conditions that must hold before starting (e.g. ['Rust toolchain installed'])"
     )]
+    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub prerequisites: Option<Vec<String>>,
 
     #[schemars(description = "Expected outcome when the workflow succeeds")]
@@ -230,6 +261,7 @@ pub struct StoreWorkflowParams {
     pub confidence: Option<f64>,
 
     #[schemars(description = "Tags for categorization (e.g. ['deployment', 'rust', 'windows'])")]
+    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub tags: Option<Vec<String>>,
 }
 
@@ -299,9 +331,11 @@ pub struct ImproveWorkflowParams {
     pub goal: Option<String>,
 
     #[schemars(description = "Updated steps (omit to inherit from parent)")]
+    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub steps: Option<Vec<String>>,
 
     #[schemars(description = "Updated prerequisites (omit to inherit from parent)")]
+    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub prerequisites: Option<Vec<String>>,
 
     #[schemars(description = "Updated expected outcome (omit to inherit from parent)")]
@@ -313,6 +347,7 @@ pub struct ImproveWorkflowParams {
     pub change_rationale: String,
 
     #[schemars(description = "Tags for categorization (inherits from parent + adds these)")]
+    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub tags: Option<Vec<String>>,
 }
 
@@ -1086,6 +1121,7 @@ pub struct CreatePerspectiveParams {
     pub perspective_type: Option<String>,
 
     #[schemars(description = "Frame UUIDs this perspective is associated with")]
+    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub frame_ids: Option<Vec<String>>,
 
     #[schemars(
@@ -1180,4 +1216,49 @@ pub struct SearchTriplesParams {
     pub query: String,
     #[schemars(description = "Maximum results (default 20)")]
     pub limit: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memorize_tags_accepts_array() {
+        let p: MemorizeParams =
+            serde_json::from_str(r#"{"content":"x","tags":["a","b"]}"#).unwrap();
+        assert_eq!(p.tags.as_deref(), Some(["a".into(), "b".into()].as_slice()));
+    }
+
+    #[test]
+    fn memorize_tags_accepts_double_encoded_string() {
+        // Some MCP clients double-encode array params alongside string params.
+        let p: MemorizeParams =
+            serde_json::from_str(r#"{"content":"x","tags":"[\"a\",\"b\"]"}"#).unwrap();
+        assert_eq!(p.tags.as_deref(), Some(["a".into(), "b".into()].as_slice()));
+    }
+
+    #[test]
+    fn memorize_tags_accepts_null() {
+        let p: MemorizeParams = serde_json::from_str(r#"{"content":"x","tags":null}"#).unwrap();
+        assert!(p.tags.is_none());
+    }
+
+    #[test]
+    fn memorize_tags_accepts_missing() {
+        let p: MemorizeParams = serde_json::from_str(r#"{"content":"x"}"#).unwrap();
+        assert!(p.tags.is_none());
+    }
+
+    #[test]
+    fn memorize_tags_empty_string_is_none() {
+        let p: MemorizeParams = serde_json::from_str(r#"{"content":"x","tags":""}"#).unwrap();
+        assert!(p.tags.is_none());
+    }
+
+    #[test]
+    fn memorize_tags_invalid_string_errors() {
+        let r: Result<MemorizeParams, _> =
+            serde_json::from_str(r#"{"content":"x","tags":"not-json"}"#);
+        assert!(r.is_err());
+    }
 }
