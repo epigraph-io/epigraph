@@ -35,32 +35,53 @@ const MAX_HOPS: i32 = 3;
 const NODE_EDGE_LIMIT: i64 = 5_000;
 
 /// Claim-level edge relationships exposed to the graph view.
-/// Covers the dominant relationship types in the corpus (hierarchical
-/// decomposition, corroboration, support/contradiction, refinement, etc.)
-/// plus their case variants. Anything not on this list (e.g. `same_source`,
-/// `produced`, `CONTAINS`) is omitted to keep the subgraph readable.
+///
+/// Covers the dominant epistemic relationship types in the corpus —
+/// hierarchical decomposition, corroboration, support/contradiction,
+/// refinement, equivalence, evidence, etc. — plus their case variants.
+///
+/// Excluded by design (kept out to keep the subgraph readable):
+///   `same_source`, `produced` — provenance, not epistemic
+///   `has_method_capability` — agent↔method, not claim↔claim
+///   `section_follows`, `CONTAINS` — document structure
+///   `DUPLICATE` — flagged for triage, not render
 const GRAPH_EDGE_RELATIONSHIPS: &[&str] = &[
+    // Hierarchical
     "decomposes_to",
-    "CORROBORATES",
-    "corroborates",
-    "continues_argument",
     "refines",
     "REFINES",
+    "specializes",
+    // Corroboration / support
+    "CORROBORATES",
+    "corroborates",
     "supports",
     "SUPPORTS",
+    "provides_evidence",
+    "asserts",
+    "enables",
+    // Contradiction / challenge
     "refutes",
     "contradicts",
     "CONTRADICTS",
+    "challenges",
+    // Argument continuation
+    "continues_argument",
+    "elaborates",
+    // Equivalence / variants
+    "same_as",
+    "equivalent_to",
+    "analogous",
+    "variant_of",
+    "definitional_variant_of",
+    // Generic / cross-reference
     "relates_to",
     "RELATES_TO",
+    // Lineage / temporal
     "supersedes",
+    "SUPERSEDES",
     "derived_from",
     "DERIVED_FROM",
     "derives_from",
-    "same_as",
-    "analogous",
-    "asserts",
-    "enables",
 ];
 
 // ---------------------------------------------------------------------------
