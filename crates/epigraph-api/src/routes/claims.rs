@@ -73,6 +73,14 @@ pub struct CreateClaimRequest {
     /// Optional labels to assign on creation (e.g., ["ndi-roadmap", "fet-sensing"])
     #[serde(default)]
     pub labels: Vec<String>,
+    /// When true, the server checks for an existing claim by
+    /// `(content_hash, agent_id)` and returns the existing claim's id if
+    /// found; otherwise inserts. Response body's `was_created` reflects
+    /// which branch ran. Defaults to false (raw INSERT semantics; post-107
+    /// duplicate `(content_hash, agent_id)` insertions return 409 Conflict).
+    /// See docs/architecture/noun-claims-and-verb-edges.md.
+    #[serde(default)]
+    pub if_not_exists: bool,
 }
 
 /// Claim response structure
@@ -100,6 +108,11 @@ pub struct ClaimResponse {
     /// Labels classifying this claim (e.g., "methodology:deductive_logic")
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// Whether the server inserted a new row (true) or returned an existing
+    /// row matching `(content_hash, agent_id)` (false). Set explicitly by
+    /// the create handler; omitted from non-create responses (GET/PATCH/list).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub was_created: bool,
 }
 
 impl From<Claim> for ClaimResponse {
@@ -117,6 +130,7 @@ impl From<Claim> for ClaimResponse {
             encryption_epoch: None,
             group_id: None,
             labels: Vec::new(),
+            was_created: false,
         }
     }
 }
@@ -290,6 +304,23 @@ pub async fn create_claim(
     // Validate privacy fields first (needed to know if content check applies)
     let privacy_tier = validate_privacy_fields(&request)?;
 
+    // S1 noun-claims-and-verb-edges validations:
+    // (see docs/architecture/noun-claims-and-verb-edges.md)
+    if request.if_not_exists {
+        if privacy_tier != "public" {
+            return Err(ApiError::ValidationError {
+                field: "if_not_exists".to_string(),
+                reason: "if_not_exists=true is only supported for privacy_tier=public; encrypted/private claims do not have a coherent cross-group dedup design (deferred to a future spec)".to_string(),
+            });
+        }
+        if request.content_hash.is_some() {
+            return Err(ApiError::ValidationError {
+                field: "if_not_exists".to_string(),
+                reason: "if_not_exists=true is incompatible with the content_hash override; new ingestion paths should compute hashes server-side".to_string(),
+            });
+        }
+    }
+
     // Validate content is not empty (skip for fully_private — content will be overridden to "[private]")
     if privacy_tier != "fully_private" && request.content.trim().is_empty() {
         return Err(ApiError::ValidationError {
@@ -409,12 +440,32 @@ pub async fn create_claim(
             message: format!("Failed to begin transaction: {e}"),
         })?;
 
-    // Persist claim
-    let created_claim = ClaimRepository::create_with_tx(&mut tx, &claim).await?;
+    // Persist claim — branch on if_not_exists per noun-claims-and-verb-edges S1.
+    let (created_claim, was_created) = if request.if_not_exists {
+        ClaimRepository::create_or_get(&mut tx, &claim).await?
+    } else {
+        match ClaimRepository::create_strict(&mut tx, &claim).await {
+            Ok(c) => (c, true),
+            Err(epigraph_db::DbError::DuplicateKey { .. }) => {
+                // Post-107: the (content_hash, agent_id) UNIQUE constraint fired.
+                // Surface as 409 Conflict so callers can distinguish "already
+                // exists for this agent" from a generic 400. Pre-107 this branch
+                // is unreachable because the constraint does not exist.
+                return Err(ApiError::Conflict {
+                    reason: "claim already exists for this (content_hash, agent_id); use if_not_exists=true to retrieve it".to_string(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
     let claim_uuid = Uuid::from(created_claim.id);
 
-    // Apply optional content_hash override and properties within the same transaction
-    if request.content_hash.is_some() || request.properties.is_some() {
+    // Apply optional content_hash override and properties only when we inserted
+    // a new row. Mutating an existing canonical noun-claim from a different
+    // caller's request would bypass ownership/authorisation checks and can
+    // clobber metadata that another agent set previously. See
+    // docs/architecture/noun-claims-and-verb-edges.md §"if_not_exists semantics".
+    if was_created && (request.content_hash.is_some() || request.properties.is_some()) {
         let content_hash_bytes: Option<Vec<u8>> = if let Some(ref hex_hash) = request.content_hash {
             Some(
                 hex::decode(hex_hash).map_err(|_| ApiError::ValidationError {
@@ -434,8 +485,19 @@ pub async fn create_claim(
         .bind(claim_uuid)
         .execute(&mut *tx)
         .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to set content_hash/properties: {e}"),
+        .map_err(|e| match e {
+            // Post-107: the override sets a content_hash already used by another
+            // row of the same agent. Spec §API surface (line 116) specifies this
+            // surfaces as 409 Conflict from the UPDATE on the
+            // if_not_exists: false path. Pre-107 this branch is unreachable.
+            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+                ApiError::Conflict {
+                    reason: "content_hash override collides with an existing claim for this agent".to_string(),
+                }
+            }
+            other => ApiError::DatabaseError {
+                message: format!("Failed to set content_hash/properties: {other}"),
+            },
         })?;
     }
 
@@ -549,6 +611,7 @@ pub async fn create_claim(
     response.encryption_epoch = encryption_response.2;
     response.group_id = encryption_response.3;
     response.labels = request.labels;
+    response.was_created = was_created;
 
     // Record provenance chain of custody when OAuth2-authenticated
     if let Some(axum::Extension(ref auth)) = auth_ctx {
@@ -623,6 +686,7 @@ pub async fn create_claim(
         encryption_epoch: None,
         group_id: None,
         labels: Vec::new(),
+        was_created: false,
     };
 
     Ok(Json(response))
@@ -762,6 +826,7 @@ pub async fn get_claim(
         encryption_epoch: None,
         group_id: None,
         labels: Vec::new(),
+        was_created: false,
     };
 
     Ok(Json(response))
