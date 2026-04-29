@@ -518,8 +518,15 @@ pub fn combine_multiple(
                 (result, CombinationMethod::Conjunctive)
             }
             CombinationRule::YagerOpen => {
-                let result = yager_open_combine(&accumulated, m)?;
-                (result, CombinationMethod::YagerOpen)
+                // Route conflict to missing=(Omega,true) not vacuous=(empty,true).
+                // Vacuous is a neutral pass-through in cdst_intersect: it distributes
+                // to Theta in subsequent steps, inflating Pl regardless of refutation
+                // (the one-way ratchet). Missing creates genuine conflict with all
+                // positives, so Pl contracts correctly as contradicting evidence accumulates.
+                // Inagaki(γ=1.0) sends all conflict K to missing — equivalent semantics
+                // to YagerOpen's open-world intent but without the ratchet.
+                let result = inagaki_combine(&accumulated, m, 1.0)?;
+                (result, CombinationMethod::Inagaki)
             }
             CombinationRule::Inagaki => {
                 let result = inagaki_combine(&accumulated, m, 0.5)?;
@@ -1628,26 +1635,93 @@ mod tests {
     }
 
     #[test]
-    fn combine_multiple_open_world_uses_yager() {
+    fn combine_multiple_open_world_uses_inagaki_full() {
+        // Renamed: the adaptive selector now routes YagerOpen-regime to Inagaki(γ=1.0)
+        // to prevent the plausibility one-way ratchet (vacuous pass-through bug).
         let frame = binary_frame();
-        // Create a mass function with open-world (complement) mass
+        // positive({0})=0.6 × positive({1})=0.9 → K_c=0.54 ≥ 0.5, owf=0.3 > 0.03
+        // → select_combination_rule returns YagerOpen
         let mut masses1 = BTreeMap::new();
-        masses1.insert(FocalElement::positive(BTreeSet::from([0])), 0.5);
-        masses1.insert(FocalElement::negative(BTreeSet::from([0])), 0.3); // complement element
-        masses1.insert(FocalElement::theta(&frame), 0.2);
+        masses1.insert(FocalElement::positive(BTreeSet::from([0])), 0.6);
+        masses1.insert(FocalElement::negative(BTreeSet::from([0])), 0.3); // complement → owf
+        masses1.insert(FocalElement::theta(&frame), 0.1);
         let m1 = MassFunction::new(frame.clone(), masses1).unwrap();
 
         // Second source disagrees strongly
         let m2 = MassFunction::simple(frame, BTreeSet::from([1]), 0.9).unwrap();
 
-        // m1 has open_world_fraction = 0.3 (the complement element)
-        assert!((m1.open_world_fraction() - 0.3).abs() < 1e-10);
-
         let k = conflict_coefficient(&m1, &m2).unwrap();
-        if k >= 0.5 {
-            // Should select YagerOpen due to high owf
-            let (_result, reports) = combine_multiple(&[m1, m2], 0.1).unwrap();
-            assert_eq!(reports[0].method_used, CombinationMethod::YagerOpen);
-        }
+        assert!(
+            k >= 0.5,
+            "test requires K≥0.5 to hit YagerOpen rule; got {k}"
+        );
+        assert!(m1.open_world_fraction() > 0.03, "test requires owf>0.03");
+
+        // High owf+high K → YagerOpen rule selected, routed to Inagaki(γ=1.0) to avoid ratchet.
+        let (_result, reports) = combine_multiple(&[m1, m2], 0.1).unwrap();
+        assert_eq!(reports[0].method_used, CombinationMethod::Inagaki);
+    }
+
+    // ======== Plausibility ratchet regression ========
+
+    /// Regression: plausibility must NOT be a one-way ratchet.
+    ///
+    /// Scenario: accumulated BBA has high open_world_fraction (triggers YagerOpen path).
+    /// A new supporting BBA is combined. Then a strongly contradicting BBA is combined.
+    /// Before the fix, vacuous=(empty,true) from YagerOpen passed through cdst_intersect
+    /// as a neutral element and distributed to Theta, inflating Pl even after refutation.
+    /// After the fix (Inagaki γ=1.0 replaces YagerOpen in combine_multiple), conflict
+    /// goes to missing=(Omega,true) which creates genuine conflict in subsequent steps,
+    /// keeping Pl low.
+    #[test]
+    fn pl_does_not_ratchet_after_supporting_evidence_in_high_conflict_regime() {
+        use crate::measures::plausibility;
+
+        let frame = binary_frame(); // hypotheses: {0}=supported, {1}=refuted
+        let h0 = BTreeSet::from([0usize]);
+        let h1 = BTreeSet::from([1usize]);
+
+        // Build an accumulated BBA that already has open-world mass (owf > 0.03)
+        // and high prior conflict so the YagerOpen rule would fire.
+        let mut base_masses = BTreeMap::new();
+        base_masses.insert(FocalElement::positive(h0.clone()), 0.05);
+        base_masses.insert(FocalElement::positive(h1.clone()), 0.55);
+        base_masses.insert(FocalElement::missing(&frame), 0.40); // owf = 0.40 > 0.03
+        let accumulated = MassFunction::new(frame.clone(), base_masses).unwrap();
+        assert!(accumulated.open_world_fraction() > 0.03);
+
+        // Supporting evidence for H0
+        let support = MassFunction::simple(frame.clone(), h0.clone(), 0.8).unwrap();
+        // Contradicting evidence against H0 (strong support for H1)
+        let refutation = MassFunction::simple(frame.clone(), h1.clone(), 0.9).unwrap();
+
+        let fe_h0 = FocalElement::positive(h0.clone());
+
+        // Step 1: combine accumulated + support (triggers YagerOpen/Inagaki path)
+        let (after_support, reports1) = combine_multiple(&[accumulated, support], 0.1).unwrap();
+        // Pin the routing: if this ever reverts to YagerOpen the ratchet will silently return.
+        assert_eq!(
+            reports1[0].method_used,
+            CombinationMethod::Inagaki,
+            "YagerOpen-regime must route to Inagaki to prevent the plausibility ratchet"
+        );
+        let pl_after_support = plausibility(&after_support, &fe_h0);
+
+        // Step 2: combine result + strong refutation
+        let (after_refutation, _) = combine_multiple(&[after_support, refutation], 0.1).unwrap();
+        let pl_after_refutation = plausibility(&after_refutation, &fe_h0);
+
+        // Pl MUST contract (or at least not increase) after adding contradicting evidence.
+        assert!(
+            pl_after_refutation <= pl_after_support + 1e-9,
+            "Plausibility ratchet detected: Pl rose from {pl_after_support:.6} to \
+             {pl_after_refutation:.6} after strong refutation evidence"
+        );
+
+        // Pl after refutation must be significantly below 1.0
+        assert!(
+            pl_after_refutation < 0.5,
+            "Pl({pl_after_refutation:.6}) should be well below 0.5 after strong refutation"
+        );
     }
 }
