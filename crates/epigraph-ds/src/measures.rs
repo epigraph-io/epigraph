@@ -111,7 +111,18 @@ pub fn pignistic_probability(m: &MassFunction, hypothesis_idx: usize) -> f64 {
         })
         .sum();
 
-    sum * normalizer
+    // Floating-point combination can produce tiny negative values (e.g. -0.0) when
+    // non_classical_mass is close to 1.0 and sum underflows. Use explicit
+    // comparisons — clamp() preserves IEEE 754 -0.0 sign, which would cause
+    // -0.0 to be stored verbatim in the divergence cache.
+    let result = sum * normalizer;
+    if result.is_nan() || !result.is_finite() || result <= 0.0 {
+        return 0.0_f64;
+    }
+    if result >= 1.0 {
+        return 1.0_f64;
+    }
+    result
 }
 
 /// Commonality function: total mass of all positive supersets of target
@@ -597,6 +608,54 @@ mod tests {
         // Total should sum to 1
         let total: f64 = m.masses().values().sum();
         assert!((total - 1.0).abs() < 1e-10);
+    }
+
+    /// Regression: BetP must be in [0, 1] when nearly all mass is non-classical
+    /// (high ignorance / under-studied frame, missing mass near 1.0).
+    ///
+    /// The affected claim (2026-04-16 enrichment) had ignorance = 0.707 and
+    /// pignistic_prob was cached as -0.0 due to floating-point underflow in the
+    /// sum * normalizer product when non_classical_mass ≈ 1.0.
+    #[test]
+    fn pignistic_non_negative_with_high_missing_mass() {
+        let frame = binary_frame();
+        // Construct a mass function where nearly all mass is on the complement
+        // element (~{0}, true) — simulates "frame may be incomplete" scenario.
+        let mut masses = BTreeMap::new();
+        // A tiny positive mass for hypothesis 0 — everything else on complement
+        masses.insert(FocalElement::positive(BTreeSet::from([0])), 1e-15_f64);
+        // The complement element carries essentially all the mass
+        let complement = FocalElement::negative(BTreeSet::from([0]));
+        masses.insert(complement, 1.0 - 1e-15_f64);
+        let m = MassFunction::new(frame.clone(), masses).unwrap();
+
+        let betp0 = pignistic_probability(&m, 0);
+        let betp1 = pignistic_probability(&m, 1);
+
+        assert!(betp0 >= 0.0, "BetP(0) must be non-negative: {betp0}");
+        assert!(betp0 <= 1.0, "BetP(0) must be <= 1.0: {betp0}");
+        assert!(betp1 >= 0.0, "BetP(1) must be non-negative: {betp1}");
+        assert!(betp1 <= 1.0, "BetP(1) must be <= 1.0: {betp1}");
+        assert!(!betp0.is_nan(), "BetP(0) must not be NaN");
+        assert!(!betp1.is_nan(), "BetP(1) must not be NaN");
+    }
+
+    /// Regression: BetP must be in [0, 1] when non_classical_mass is just below
+    /// the 1e-9 tolerance (pathological case: denominator approaches zero).
+    #[test]
+    fn pignistic_non_negative_when_denominator_near_zero() {
+        let frame = binary_frame();
+        let near_one = 1.0 - 2e-9_f64; // just outside the 1e-9 guard
+        let mut masses = BTreeMap::new();
+        masses.insert(FocalElement::negative(BTreeSet::from([0])), near_one);
+        // Tiny remainder on conflict to make masses sum to 1
+        masses.insert(FocalElement::conflict(), 1.0 - near_one);
+        let m = MassFunction::new(frame, masses).unwrap();
+
+        let betp = pignistic_probability(&m, 0);
+        assert!(betp >= 0.0, "BetP must be >= 0: {betp}");
+        assert!(betp <= 1.0, "BetP must be <= 1: {betp}");
+        assert!(!betp.is_nan(), "BetP must not be NaN");
     }
 
     #[test]
