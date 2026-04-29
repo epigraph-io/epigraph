@@ -306,14 +306,11 @@ pub async fn list_claims_query(
         || sort_order != "desc";
 
     if !needs_in_memory_filters {
-        let total = ClaimRepository::count(
-            &state.db_pool,
-            params.content_contains.as_deref(),
-        )
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Database count failed: {}", e),
-        })? as usize;
+        let total = ClaimRepository::count(&state.db_pool, params.content_contains.as_deref())
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Database count failed: {}", e),
+            })? as usize;
 
         let rows = ClaimRepository::list(
             &state.db_pool,
