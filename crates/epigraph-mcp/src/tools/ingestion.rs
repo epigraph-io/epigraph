@@ -385,20 +385,33 @@ pub async fn do_ingest_document(
     .map_err(internal_error)?;
 
     // ── 3. Ensure author agents + agent --authored--> paper ──
+    // Each author gets a deterministic ed25519 keypair via
+    // `did_key_for_author` — same name (or ORCID, when present in the
+    // extraction) maps to the same agent across papers, which is how
+    // co-authorship lights up in the graph. Affiliations and roles are
+    // not yet first-class on Agent and remain in the extraction JSON
+    // pending an AgentRepository properties surface.
     let mut author_responses = Vec::new();
     let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
     for (idx, author) in extraction.source.authors.iter().enumerate() {
         if author.name.is_empty() {
             continue;
         }
-        // Public's Agent::new doesn't model affiliations/roles structurally;
-        // they remain in the DocumentExtraction JSON for now (TODO: stash in
-        // agent properties JSON when AgentRepository gains that surface).
-        let author_agent = epigraph_core::Agent::new([0u8; 32], Some(author.name.clone()));
-        let created = AgentRepository::create(pool, &author_agent)
-            .await
-            .map_err(internal_error)?;
-        let agent_uuid: Uuid = created.id.into();
+        let (_did, pub_key_bytes) =
+            epigraph_crypto::did_key::did_key_for_author(None, &author.name);
+        let agent_uuid = if let Some(existing) =
+            AgentRepository::get_by_public_key(pool, &pub_key_bytes)
+                .await
+                .map_err(internal_error)?
+        {
+            existing.id.into()
+        } else {
+            let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
+            let created = AgentRepository::create(pool, &author_agent)
+                .await
+                .map_err(internal_error)?;
+            created.id.into()
+        };
         EdgeRepository::create_if_not_exists(
             pool,
             agent_uuid,
@@ -409,6 +422,7 @@ pub async fn do_ingest_document(
             Some(serde_json::json!({
                 "position": idx,
                 "role": author.roles.first().map_or("author", String::as_str),
+                "affiliations": author.affiliations,
             })),
             None,
             None,
@@ -453,13 +467,22 @@ pub async fn do_ingest_document(
         claim.signature = Some(server.signer.sign(&claim.content_hash));
 
         // ClaimRepository::create dedupes by content_hash and returns the
-        // existing row when the hash matches. A non-equal returned id means
-        // we hit dedup → just link the existing claim to this paper.
+        // existing row when the hash matches. Two dedup paths exist:
+        //   (a) deterministic-id collision: persisted_id != planned.id
+        //       (e.g. content_hash matched some other claim with a different
+        //       UUID — shouldn't happen for atoms or compounds we built,
+        //       but we handle it for safety).
+        //   (b) atom convergence across papers: planned.id is
+        //       uuid_v5(ATOM_NAMESPACE, content_hash), so the existing
+        //       atom has the same id. We detect this via persisted.trace_id
+        //       already being Some (the original ingestion already wrote
+        //       trace + evidence; we must NOT clobber that provenance).
         let persisted = ClaimRepository::create(pool, &claim)
             .await
             .map_err(internal_error)?;
         let persisted_id: Uuid = persisted.id.into();
-        if persisted_id != planned.id {
+        let already_had_trace = persisted.trace_id.is_some();
+        if persisted_id != planned.id || already_had_trace {
             EdgeRepository::create_if_not_exists(
                 pool,
                 paper_id,
