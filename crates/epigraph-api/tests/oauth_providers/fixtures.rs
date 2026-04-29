@@ -13,6 +13,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 pub const TEST_KID: &str = "test-key-1";
 
 pub struct ProviderFixture {
+    #[allow(dead_code)] // shared across test binaries; not all use the mock_server handle.
     pub mock_server: MockServer,
     pub jwks_url: String,
     private_key: RsaPrivateKey,
