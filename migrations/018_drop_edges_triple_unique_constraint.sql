@@ -1,0 +1,46 @@
+-- Widen migration 017 to all verb-edges, not just AUTHORED.
+--
+-- Migration 017 introduced idx_edges_unique_triple_non_authored — a partial
+-- unique index that excluded AUTHORED but kept triple-uniqueness for every
+-- other relationship. That preserved the original 001_initial_schema.sql
+-- behavior for DERIVED_FROM, HAS_TRACE, SUPPORTS, CONTRADICTS, variant_of, etc.
+--
+-- That ran into S3a Task 6 (ingest_paper resubmit), where SUPPORTS edges
+-- between two canonical claims need to multi-emit per submission per the
+-- architecture doc's "re-occurrence = new edge" rule. With the partial
+-- index in place, the second do_ingest's SUPPORTS insert tripped the
+-- constraint.
+--
+-- This migration drops the remaining constraint so every relationship
+-- behaves like a verb-edge: accumulating per-submission. Application
+-- code is responsible for idempotency where the relationship is
+-- semantically a noun-edge (e.g., improve_workflow's variant_of edge,
+-- which the migrated code already skips on the was_created=false branch).
+--
+-- The PRIMARY KEY on edges.id continues to ensure row-level uniqueness;
+-- only the (source_id, target_id, relationship) triple-uniqueness is gone.
+--
+-- BLAST RADIUS — read carefully before merging.
+--
+-- This is a global semantic change: every edge accumulates by default. The
+-- following callsites previously relied on the index for silent dedup via
+-- `let _ = EdgeRepository::create(...)` (now they multi-emit, and any
+-- call-site needing dedup must enforce it in application code):
+--
+--   crates/epigraph-api/src/routes/edges.rs       — RELATES_TO bidirectional
+--   crates/epigraph-api/src/routes/spans.rs       — generated, uses_evidence, attributed_to
+--   crates/epigraph-api/src/routes/conventions.rs — AUTHORED, SUPPORTS, TRACES, HAS_TRACE
+--   crates/epigraph-api/src/routes/workflows.rs   — AUTHORED on workflow variants
+--
+-- AUTHORED accumulation in the conventions and workflows routes is
+-- intentional post-S3a (matches architecture doc). The remaining (RELATES_TO,
+-- three span edges) need a per-callsite audit to decide between (a)
+-- verb-event accumulation (current default), (b) explicit
+-- existence-check-then-insert for noun-edge semantics. Backlog item filed
+-- with s3a-followup label: "Audit non-AUTHORED let-_-EdgeRepo callsites
+-- for noun-edge vs verb-event semantics post-migration-018."
+--
+-- No `ON CONFLICT (source_id, target_id, relationship)` upsert sites exist
+-- in crates/, so no INSERT … ON CONFLICT statements break.
+
+DROP INDEX IF EXISTS idx_edges_unique_triple_non_authored;

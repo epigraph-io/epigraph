@@ -150,7 +150,7 @@ async fn download_pdf(url: &str, output_dir: &str, name: &str) -> Result<String,
 }
 
 #[allow(clippy::too_many_lines)]
-async fn do_ingest(
+pub async fn do_ingest(
     server: &EpiGraphMcpFull,
     extraction: &LiteratureExtraction,
 ) -> Result<CallToolResult, McpError> {
@@ -161,13 +161,18 @@ async fn do_ingest(
     let doi = &extraction.source.doi;
     let title = &extraction.source.title;
 
-    // Ensure author agents exist
+    // BUG (s3a-followup): every author Agent is constructed with the same
+    // hardcoded public_key=[0u8; 32]. Migration 057's
+    // agents_public_key_unique constraint then rejects the second author of
+    // any paper with 2+ distinct names. Pre-existing bug; not introduced by
+    // S3a. Tier-2 test uses authors=vec![] to sidestep. Backlog item:
+    // "ingest_paper hardcoded author key bug — assign per-author keypairs
+    // or look up agents by name". Filed in EpiGraph with s3a-followup label.
     for author_val in &extraction.source.authors {
         let name = parse_author_entry(author_val);
         if name.is_empty() {
             continue;
         }
-        // Create or get agent for author
         let author_agent = epigraph_core::Agent::new([0u8; 32], Some(name.clone()));
         let _created = AgentRepository::create(&server.pool, &author_agent)
             .await
@@ -194,6 +199,15 @@ async fn do_ingest(
         claim.content_hash = ContentHasher::hash(lit_claim.statement.as_bytes());
         claim.signature = Some(server.signer.sign(&claim.content_hash));
 
+        // Idempotent canonical claim create + AUTHORED verb-edge.
+        let (claim, was_created) =
+            crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "ingest_paper")
+                .await?;
+        let claim_uuid = claim.id.as_uuid();
+
+        // Build per-call Evidence + Trace regardless of was_created. Each
+        // ingest run carries its own (possibly different) supporting passage,
+        // so we preserve them as noun-claims linked via verb-edges.
         let evidence_hash = ContentHasher::hash(lit_claim.supporting_text.as_bytes());
         let mut evidence = Evidence::new(
             agent_id_typed,
@@ -221,50 +235,82 @@ async fn do_ingest(
             format!("Extracted from paper: {title} (DOI: {doi})"),
         );
 
-        ClaimRepository::create(&server.pool, &claim)
-            .await
-            .map_err(internal_error)?;
         ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
             .await
             .map_err(internal_error)?;
         EvidenceRepository::create(&server.pool, &evidence)
             .await
             .map_err(internal_error)?;
-        ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
-            .await
-            .map_err(internal_error)?;
 
-        // Embed
-        if server
-            .embedder
-            .embed_and_store(claim.id.as_uuid(), &lit_claim.statement)
-            .await
-        {
-            claims_embedded += 1;
+        // Verb-edges: every submission references its own Evidence + Trace.
+        // Emitted on both branches per the architecture doc's "re-occurrence
+        // = new edge" rule. Matches submit_claim's hoist (S3a Task 2). The
+        // was_created marker on properties lets queries distinguish
+        // first-create from resubmit edges.
+        let _ = EdgeRepository::create(
+            &server.pool,
+            claim_uuid,
+            "claim",
+            evidence.id.as_uuid(),
+            "evidence",
+            "DERIVED_FROM",
+            Some(serde_json::json!({"was_created": was_created})),
+            None,
+            None,
+        )
+        .await;
+        let _ = EdgeRepository::create(
+            &server.pool,
+            claim_uuid,
+            "claim",
+            trace.id.as_uuid(),
+            "trace",
+            "HAS_TRACE",
+            Some(serde_json::json!({"was_created": was_created})),
+            None,
+            None,
+        )
+        .await;
+
+        if was_created {
+            ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
+                .await
+                .map_err(internal_error)?;
+
+            if server
+                .embedder
+                .embed_and_store(claim_uuid, &lit_claim.statement)
+                .await
+            {
+                claims_embedded += 1;
+            }
+
+            ds_entries.push(BatchDsEntry {
+                claim_id: claim_uuid,
+                confidence,
+                weight,
+            });
         }
 
-        // Collect for DS batch wiring
-        ds_entries.push(BatchDsEntry {
-            claim_id: claim.id.as_uuid(),
-            confidence,
-            weight,
-        });
-
-        claim_ids.push(claim.id.as_uuid().to_string());
-        claim_uuids.push(claim.id.as_uuid());
+        // Always push to claim_ids / claim_uuids — relationship edges below
+        // reference these by index. Multi-emit on resubmit is intentional
+        // per architecture rule 1 ("re-occurrence = new edge").
+        claim_ids.push(claim_uuid.to_string());
+        claim_uuids.push(claim_uuid);
     }
 
-    // DS batch auto-wire (best-effort)
-    let (claims_ds_wired, ds_frame_id) =
+    let (claims_ds_wired, ds_frame_id) = if ds_entries.is_empty() {
+        (None, None)
+    } else {
         match ds_auto::auto_wire_ds_batch(&server.pool, &ds_entries, agent_id).await {
             Ok((fid, count)) => (Some(count), Some(fid.to_string())),
             Err(e) => {
                 tracing::warn!("ds auto-wire batch failed: {e}");
                 (None, None)
             }
-        };
+        }
+    };
 
-    // Create relationship edges
     let mut relationships_created = 0;
     for rel in &extraction.relationships {
         if rel.source_index < claim_uuids.len() && rel.target_index < claim_uuids.len() {
@@ -303,7 +349,6 @@ async fn do_ingest(
         ds_frame_id,
     })
 }
-
 // ────────────────────────────────────────────────────────────────────────────
 // ingest_document — hierarchical DocumentExtraction → graph
 // ────────────────────────────────────────────────────────────────────────────

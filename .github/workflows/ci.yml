@@ -35,12 +35,13 @@ jobs:
         run: cargo build --workspace
       - name: Test (non-DB packages, parallel)
         # Packages without DB tests can run fully in parallel.
-        # epigraph-engine has live integration tests that touch the DB,
-        # so it is excluded here and run sequentially below.
+        # epigraph-engine and epigraph-mcp have live integration tests
+        # that touch the DB, so they are excluded here and run sequentially below.
         run: cargo test --workspace
           --exclude epigraph-db
           --exclude epigraph-api
           --exclude epigraph-engine
+          --exclude epigraph-mcp
       - name: Test (epigraph-db, serialized)
         # #[sqlx::test] creates a postgres template DB per binary; concurrent
         # binaries race on _sqlx_migrations → "tuple concurrently updated".
@@ -51,6 +52,10 @@ jobs:
         run: cargo test -p epigraph-api -- --test-threads=1
       - name: Test (epigraph-engine, serialized)
         run: cargo test -p epigraph-engine -- --test-threads=1
+      - name: Test (epigraph-mcp, serialized)
+        # claim_helper_tests adds a temporary CHECK constraint on `edges`
+        # that would race with sibling tests under parallel execution.
+        run: cargo test -p epigraph-mcp -- --test-threads=1
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
       - name: Format check
