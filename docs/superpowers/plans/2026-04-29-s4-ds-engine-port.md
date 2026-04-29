@@ -231,9 +231,20 @@ max_iterations. Internal commit: 6affb77f."
 
 ---
 
-## Task 4: Drop legacy `belief_query` + `recall` modules
+## Task 4: Drop legacy `belief_query` + `recall` modules — DEFERRED
 
-These two files have zero external callers (verified in pre-task Step 3) and are absent from internal-main. Removing them, the matching `lib.rs` declarations, and the `pub use` re-exports must land in a single commit so each intermediate commit still compiles.
+**Status: deferred to follow-up.** During execution the workspace gate (`cargo check --workspace`) caught two live external callers on `origin/main` that the slice spec's "verified zero callers" premise missed:
+
+- `crates/epigraph-mcp/src/tools/ds.rs:241` — calls `epigraph_engine::belief_query::get_belief` and matches on `epigraph_engine::BeliefQueryError`.
+- `crates/epigraph-mcp/src/tools/memory.rs:126` — calls `epigraph_engine::recall`.
+
+Internal-main has inline reimplementations of both at those callsites (so the modules became dead code there). PR #17 (S3a MCP writer migration) does inline `recall` in `tools/memory.rs` but does **not** touch `tools/ds.rs::get_belief`. Porting these inline migrations from S4 would conflict with S3a's in-flight `memory.rs` rewrite.
+
+The deletion + lib.rs update + Cargo.toml dep contraction are deferred to a follow-up slice that lands after S3a (PR #17) merges and that ports `tools/ds.rs::get_belief` inline from internal-main in the same commit.
+
+Original task plan retained below for the follow-up.
+
+These two files have zero external callers — TO BE RE-VERIFIED after S3a merges and the `tools/ds.rs::get_belief` inline port. The matching `lib.rs` declarations and `pub use` re-exports must land in the same commit as the file deletes so each intermediate commit still compiles.
 
 **Files:**
 - Delete: `crates/epigraph-engine/src/belief_query.rs`
@@ -296,7 +307,11 @@ crate-level [dependencies] contraction follows in a separate commit."
 
 ---
 
-## Task 5: Drop `epigraph-db` + `epigraph-embeddings` deps
+## Task 5: Drop `epigraph-db` + `epigraph-embeddings` deps — DEFERRED
+
+**Status: deferred** alongside Task 4. The two crate deps remain consumed by `belief_query.rs` and `recall.rs`, which are still in-tree because of the live MCP callers documented in Task 4.
+
+Original task plan retained below for the follow-up.
 
 After Task 4, neither `epigraph-db` nor `epigraph-embeddings` has any remaining consumer in `epigraph-engine`. Internal-main's `Cargo.toml` reflects this. The slice spec mentions only `epigraph-db`, but a `git diff origin/main internal-main -- crates/epigraph-engine/Cargo.toml` shows `epigraph-embeddings` is also removed (sole consumer was `recall.rs`). Match internal-main exactly.
 
