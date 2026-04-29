@@ -181,6 +181,18 @@ async fn main() {
     #[cfg(not(feature = "db"))]
     let state = AppState::new(config).with_embedding_service(embedding_service);
 
+    // Load external identity providers from providers.toml.
+    // EPIGRAPH_PROVIDERS_CONFIG overrides the default path. Missing config is
+    // a hard startup error to prevent silent degradation to an empty registry.
+    let state = {
+        let providers_path = std::env::var("EPIGRAPH_PROVIDERS_CONFIG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("providers.toml"));
+        let providers = epigraph_api::oauth::providers::build_registry(providers_path.as_path())
+            .expect("failed to build providers registry");
+        state.with_providers(providers)
+    };
+
     // Start background job runner with ClusterGraph handler (db feature only).
     // The runner uses PostgresJobQueue for durable persistence.  The cron loop
     // fires 60 s after startup then every 24 h thereafter.
