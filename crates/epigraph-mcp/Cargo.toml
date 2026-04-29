@@ -59,6 +59,9 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 # HTTP transport (axum 0.8 matches rmcp's streamable-http-server dep)
 axum = "0.8"
 
+[dev-dependencies]
+epigraph-ingest = { workspace = true }
+
 [features]
 default = []
 vendored-openssl = ["dep:openssl"]

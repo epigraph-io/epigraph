@@ -332,8 +332,11 @@ pub async fn ingest_document(
     do_ingest_document(server, &extraction).await
 }
 
+/// Core ingestion logic factored out so integration tests can drive a parsed
+/// `DocumentExtraction` without round-tripping through the file-path validation
+/// in `ingest_document`.
 #[allow(clippy::too_many_lines)]
-async fn do_ingest_document(
+pub async fn do_ingest_document(
     server: &EpiGraphMcpFull,
     extraction: &DocumentExtraction,
 ) -> Result<CallToolResult, McpError> {
@@ -605,14 +608,16 @@ async fn do_ingest_document(
     };
 
     // ── 7. Mark paper as processed by this pipeline (version gate for re-runs) ──
-    // Use a self-edge on the paper so future runs can short-circuit. Target
-    // type "paper" is valid in the edges check constraint.
+    // Edge target is the server's agent — paper -processed_by-> agent
+    // models "this paper was processed by this agent at this pipeline
+    // version". (Self-loops on paper are blocked by the edges_no_self_loop
+    // check constraint, so we cannot point the edge back at the paper.)
     EdgeRepository::create_if_not_exists(
         pool,
         paper_id,
         "paper",
-        paper_id,
-        "paper",
+        agent_id,
+        "agent",
         "processed_by",
         Some(serde_json::json!({
             "pipeline": PIPELINE_VERSION,
