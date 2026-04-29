@@ -519,6 +519,7 @@ pub async fn agent_claims(
                 encryption_epoch: None,
                 group_id: None,
                 labels: Vec::new(),
+                was_created: false,
             };
             AttributedClaimResponse {
                 claim,
