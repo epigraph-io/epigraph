@@ -11,6 +11,60 @@ use uuid::Uuid;
 
 use crate::AppState;
 
+/// Claim-level edge relationships exposed to the graph view.
+///
+/// Covers the dominant epistemic relationship types in the corpus —
+/// hierarchical decomposition, corroboration, support/contradiction,
+/// refinement, equivalence, evidence, etc. — plus their case variants.
+///
+/// This is intentionally *broader* than [`epigraph_jobs::cluster_graph::runner::EPISTEMIC_RELATIONSHIPS`]
+/// (which is the clustering job's edge set). Rendering filters by readability;
+/// clustering filters by what it weights as community-formation signal.
+///
+/// Excluded by design (kept out to keep the subgraph readable):
+///   `same_source`, `produced` — provenance, not epistemic
+///   `has_method_capability` — agent↔method, not claim↔claim
+///   `section_follows`, `CONTAINS` — document structure
+///   `DUPLICATE` — flagged for triage, not render
+const GRAPH_VIEW_RELATIONSHIPS: &[&str] = &[
+    // Hierarchical
+    "decomposes_to",
+    "refines",
+    "REFINES",
+    "specializes",
+    // Corroboration / support
+    "CORROBORATES",
+    "corroborates",
+    "supports",
+    "SUPPORTS",
+    "provides_evidence",
+    "asserts",
+    "enables",
+    // Contradiction / challenge
+    "refutes",
+    "contradicts",
+    "CONTRADICTS",
+    "challenges",
+    // Argument continuation
+    "continues_argument",
+    "elaborates",
+    // Equivalence / variants
+    "same_as",
+    "equivalent_to",
+    "analogous",
+    "variant_of",
+    "definitional_variant_of",
+    // Generic / cross-reference
+    "relates_to",
+    "RELATES_TO",
+    // Lineage / temporal
+    "supersedes",
+    "SUPERSEDES",
+    "derived_from",
+    "DERIVED_FROM",
+    "derives_from",
+];
+
 #[derive(Debug, Serialize)]
 pub struct OverviewResponse {
     pub run_id: Option<Uuid>,
@@ -52,6 +106,11 @@ pub struct ExpandResponse {
     pub total_size: i64,
     pub nodes: Vec<NodeOut>,
     pub edges: Vec<EdgeOut>,
+    /// Count of edges between the returned `nodes` whose `relationship` is
+    /// not in `GRAPH_VIEW_RELATIONSHIPS` (e.g. `produced`, `same_source`,
+    /// `CONTAINS`). Lets the GUI render "this node has N relationships not
+    /// shown in the readability tier" instead of an ambiguous empty payload.
+    pub filtered_edge_count: i64,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -173,9 +232,7 @@ pub async fn expand(
     };
 
     let budget = params.budget.max(1);
-    // Re-use the canonical list from epigraph-jobs rather than duplicating it.
-    let rel_list: Vec<&str> =
-        epigraph_jobs::cluster_graph::runner::EPISTEMIC_RELATIONSHIPS.to_vec();
+    let rel_list: Vec<&str> = GRAPH_VIEW_RELATIONSHIPS.to_vec();
     let nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
         "WITH degree AS (
             SELECT m.claim_id, COUNT(e.*) AS deg
@@ -206,16 +263,7 @@ pub async fn expand(
     .map_err(internal)?;
 
     let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
-    let edges: Vec<EdgeOut> = sqlx::query_as::<_, EdgeOut>(
-        "SELECT source_id AS source, target_id AS target, relationship
-         FROM edges
-         WHERE source_id = ANY($1) AND target_id = ANY($1) AND relationship = ANY($2)",
-    )
-    .bind(&node_ids)
-    .bind(rel_list)
-    .fetch_all(pool)
-    .await
-    .map_err(internal)?;
+    let (edges, filtered_edge_count) = fetch_subgraph_edges(pool, &node_ids, &rel_list).await?;
 
     Ok(Json(ExpandResponse {
         cluster_id,
@@ -223,6 +271,7 @@ pub async fn expand(
         total_size,
         nodes,
         edges,
+        filtered_edge_count,
     }))
 }
 
@@ -234,8 +283,7 @@ pub async fn neighborhood(
     let pool: &PgPool = &state.db_pool;
     let hops = params.hops.clamp(1, 2);
     let budget = params.budget.max(1);
-    let rel_list: Vec<&str> =
-        epigraph_jobs::cluster_graph::runner::EPISTEMIC_RELATIONSHIPS.to_vec();
+    let rel_list: Vec<&str> = GRAPH_VIEW_RELATIONSHIPS.to_vec();
 
     let nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
         r#"
@@ -275,16 +323,7 @@ pub async fn neighborhood(
     }
 
     let ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
-    let edges: Vec<EdgeOut> = sqlx::query_as::<_, EdgeOut>(
-        "SELECT source_id AS source, target_id AS target, relationship
-         FROM edges
-         WHERE source_id = ANY($1) AND target_id = ANY($1) AND relationship = ANY($2)",
-    )
-    .bind(&ids)
-    .bind(rel_list)
-    .fetch_all(pool)
-    .await
-    .map_err(internal)?;
+    let (edges, filtered_edge_count) = fetch_subgraph_edges(pool, &ids, &rel_list).await?;
 
     Ok(Json(ExpandResponse {
         cluster_id: Uuid::nil(),
@@ -292,9 +331,146 @@ pub async fn neighborhood(
         total_size: nodes.len() as i64,
         nodes,
         edges,
+        filtered_edge_count,
     }))
+}
+
+/// Fetch edges *between* the given node ids, partitioned into:
+/// - edges whose `relationship` is in `rel_list` (returned as `edges`)
+/// - edges whose `relationship` is *not* in `rel_list` (returned as count)
+///
+/// Single round-trip: tags each row with an `is_allowed` flag computed in
+/// the SELECT list, then partitions in Rust.
+async fn fetch_subgraph_edges(
+    pool: &PgPool,
+    node_ids: &[Uuid],
+    rel_list: &[&str],
+) -> Result<(Vec<EdgeOut>, i64), (axum::http::StatusCode, String)> {
+    if node_ids.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let rows: Vec<(Uuid, Uuid, String, bool)> = sqlx::query_as(
+        "SELECT source_id, target_id, relationship,
+                (relationship = ANY($2)) AS is_allowed
+         FROM edges
+         WHERE source_id = ANY($1) AND target_id = ANY($1)",
+    )
+    .bind(node_ids)
+    .bind(rel_list)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+
+    let mut edges = Vec::new();
+    let mut filtered: i64 = 0;
+    for (source, target, relationship, is_allowed) in rows {
+        if is_allowed {
+            edges.push(EdgeOut {
+                source,
+                target,
+                relationship,
+            });
+        } else {
+            filtered += 1;
+        }
+    }
+    Ok((edges, filtered))
 }
 
 fn internal(e: sqlx::Error) -> (axum::http::StatusCode, String) {
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Relationship types we expect the graph view to traverse.
+    /// Adding a row here without adding the matching string to
+    /// `GRAPH_VIEW_RELATIONSHIPS` will fail this test, which is the point:
+    /// the constant is the single source of truth for what the GUI's
+    /// expand-this-node action will surface.
+    const EXPECTED_INCLUDED: &[&str] = &[
+        // Hierarchical
+        "decomposes_to",
+        "refines",
+        "REFINES",
+        "specializes",
+        // Corroboration / support
+        "CORROBORATES",
+        "corroborates",
+        "supports",
+        "SUPPORTS",
+        "provides_evidence",
+        "asserts",
+        "enables",
+        // Contradiction / challenge
+        "refutes",
+        "contradicts",
+        "CONTRADICTS",
+        "challenges",
+        // Argument continuation
+        "continues_argument",
+        "elaborates",
+        // Equivalence / variants
+        "same_as",
+        "equivalent_to",
+        "analogous",
+        "variant_of",
+        "definitional_variant_of",
+        // Generic / cross-reference
+        "relates_to",
+        "RELATES_TO",
+        // Lineage / temporal
+        "supersedes",
+        "SUPERSEDES",
+        "derived_from",
+        "DERIVED_FROM",
+        "derives_from",
+    ];
+
+    /// Relationships the design explicitly excludes — keep them out so a
+    /// future "just add everything" refactor doesn't pollute the subgraph.
+    const EXPECTED_EXCLUDED: &[&str] = &[
+        "same_source",
+        "produced",
+        "has_method_capability",
+        "section_follows",
+        "CONTAINS",
+        "DUPLICATE",
+    ];
+
+    #[test]
+    fn graph_view_allowlist_contains_expected_relationships() {
+        for rel in EXPECTED_INCLUDED {
+            assert!(
+                GRAPH_VIEW_RELATIONSHIPS.contains(rel),
+                "missing from allowlist: {rel}",
+            );
+        }
+    }
+
+    #[test]
+    fn graph_view_allowlist_excludes_design_excluded_relationships() {
+        for rel in EXPECTED_EXCLUDED {
+            assert!(
+                !GRAPH_VIEW_RELATIONSHIPS.contains(rel),
+                "should not be in allowlist: {rel}",
+            );
+        }
+    }
+
+    #[test]
+    fn expand_response_serializes_filtered_count() {
+        let r = ExpandResponse {
+            cluster_id: Uuid::nil(),
+            truncated: false,
+            total_size: 1,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            filtered_edge_count: 7,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["filtered_edge_count"], 7);
+    }
 }
