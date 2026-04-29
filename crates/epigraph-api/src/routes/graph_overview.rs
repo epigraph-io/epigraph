@@ -738,3 +738,51 @@ pub async fn graph_neighborhood(
         edges: Vec::new(),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::GRAPH_EDGE_RELATIONSHIPS;
+
+    /// Relationship types we expect to traverse. Adding a row here without
+    /// adding the matching string to GRAPH_EDGE_RELATIONSHIPS will fail this
+    /// test, which is the point: the allowlist is the single source of truth
+    /// for which edges the GUI can expand.
+    const EXPECTED_INCLUDED: &[&str] = &[
+        // Pre-existing (regression-protect)
+        "decomposes_to", "CORROBORATES", "corroborates", "continues_argument",
+        "refines", "REFINES", "supports", "SUPPORTS", "refutes",
+        "contradicts", "CONTRADICTS", "relates_to", "RELATES_TO",
+        "supersedes", "derived_from", "DERIVED_FROM", "derives_from",
+        "same_as", "analogous", "asserts", "enables",
+        // Newly added in this PR
+        "variant_of", "equivalent_to", "provides_evidence", "challenges",
+        "specializes", "definitional_variant_of", "elaborates", "SUPERSEDES",
+    ];
+
+    /// Relationships the design explicitly excludes — keep them out so a
+    /// future "just add everything" refactor doesn't pollute the subgraph.
+    const EXPECTED_EXCLUDED: &[&str] = &[
+        "same_source", "produced", "has_method_capability",
+        "section_follows", "CONTAINS", "DUPLICATE",
+    ];
+
+    #[test]
+    fn allowlist_contains_expected_relationships() {
+        for rel in EXPECTED_INCLUDED {
+            assert!(
+                GRAPH_EDGE_RELATIONSHIPS.contains(rel),
+                "missing from allowlist: {rel}",
+            );
+        }
+    }
+
+    #[test]
+    fn allowlist_excludes_design_excluded_relationships() {
+        for rel in EXPECTED_EXCLUDED {
+            assert!(
+                !GRAPH_EDGE_RELATIONSHIPS.contains(rel),
+                "should not be in allowlist: {rel}",
+            );
+        }
+    }
+}
