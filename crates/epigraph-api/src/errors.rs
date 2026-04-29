@@ -47,6 +47,9 @@ pub enum ApiError {
 
     #[error("Forbidden: {reason}")]
     Forbidden { reason: String },
+
+    #[error("Conflict: {reason}")]
+    Conflict { reason: String },
 }
 
 /// JSON error response structure
@@ -118,6 +121,11 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden { reason } => (
                 StatusCode::FORBIDDEN,
                 "Forbidden",
+                Some(serde_json::json!({ "reason": reason })),
+            ),
+            ApiError::Conflict { reason } => (
+                StatusCode::CONFLICT,
+                "Conflict",
                 Some(serde_json::json!({ "reason": reason })),
             ),
         };
