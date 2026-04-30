@@ -77,13 +77,17 @@ pub fn extract_md(text: &str) -> Result<String> {
         let end = after.find("```").ok_or_else(|| anyhow!("unterminated code fence"))?;
         return Ok(after[..end].trim().to_string());
     }
+    // Check for # Table header before generic fence (avoids matching inner ```sql blocks)
+    if let Some(start) = text.find("# Table") {
+        return Ok(text[start..].trim().to_string());
+    }
+    // Fallback: bare fence (only if no # Table header found)
     if let Some(start) = text.find("```") {
         let after = &text[start + 3..];
         let end = after.find("```").ok_or_else(|| anyhow!("unterminated code fence"))?;
         return Ok(after[..end].trim().to_string());
     }
-    let start = text.find("# Table").ok_or_else(|| anyhow!("no '# Table' header"))?;
-    Ok(text[start..].trim().to_string())
+    Err(anyhow!("no '# Table' header or code fence"))
 }
 
 pub fn invoke_claude(prompt: &str) -> Result<String> {
