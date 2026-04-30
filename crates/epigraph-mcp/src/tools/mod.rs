@@ -12,5 +12,6 @@ pub mod perspectives;
 pub mod provenance;
 pub mod rdf;
 pub mod sheaf;
+pub mod workflow_hierarchical;
 pub mod workflow_ingest;
 pub mod workflows;

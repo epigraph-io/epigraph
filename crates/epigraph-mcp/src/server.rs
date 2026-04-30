@@ -319,6 +319,45 @@ impl EpiGraphMcpFull {
         tools::workflows::deprecate_workflow(self, params).await
     }
 
+    // ── Hierarchical Workflows (3 tools) ──
+    //
+    // Counterparts to the flat `store_workflow` family above. These operate
+    // on the `workflows` table where every step is a claim node connected
+    // via `executes` edges, so each step accrues evidence and Darwinian
+    // variants independently of its workflow root.
+
+    #[tool(
+        description = "Ingest a hierarchical WorkflowExtraction: persists thesis → phases → steps → operation atoms as claim nodes, writes `executes` edges from the workflow root to every planned claim, and resolves author identities. Idempotent: re-ingesting the same canonical_name+generation is a no-op."
+    )]
+    async fn ingest_workflow(
+        &self,
+        Parameters(params): Parameters<IngestWorkflowParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::workflow_ingest::ingest_workflow(self, params).await
+    }
+
+    #[tool(
+        description = "Search hierarchical workflows by free-text over goal and canonical_name (ILIKE). Returns rows from the `workflows` table — distinct from `find_workflow` which searches flat workflow claims."
+    )]
+    async fn find_workflow_hierarchical(
+        &self,
+        Parameters(params): Parameters<FindWorkflowHierarchicalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::workflow_hierarchical::find_workflow_hierarchical(self, params).await
+    }
+
+    #[tool(
+        description = "Record an outcome for a hierarchical workflow run. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution with step_claim_id resolved from the workflow's `executes` edges in plan order. Use `report_workflow_outcome` instead for flat workflow claims."
+    )]
+    async fn report_hierarchical_outcome(
+        &self,
+        Parameters(params): Parameters<ReportHierarchicalOutcomeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::workflow_hierarchical::report_hierarchical_outcome(self, params).await
+    }
+
     // ── Graph (2 tools) ──
 
     #[tool(
