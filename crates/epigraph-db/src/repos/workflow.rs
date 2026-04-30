@@ -44,6 +44,55 @@ pub struct WorkflowListRow {
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
+    /// Insert a row into the new `workflows` table (added in migration 020).
+    /// Used by `epigraph-mcp::tools::workflow_ingest::do_ingest_workflow`.
+    /// Idempotent on `(canonical_name, generation)` UNIQUE — repeated inserts
+    /// of the same identity are silently ignored.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails for reasons other
+    /// than a duplicate-key conflict on the UNIQUE constraint.
+    pub async fn insert_root(
+        pool: &PgPool,
+        id: Uuid,
+        canonical_name: &str,
+        generation: i32,
+        goal: &str,
+        parent_id: Option<Uuid>,
+        metadata: serde_json::Value,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO workflows (id, canonical_name, generation, goal, parent_id, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (canonical_name, generation) DO NOTHING",
+        )
+        .bind(id)
+        .bind(canonical_name)
+        .bind(generation)
+        .bind(goal)
+        .bind(parent_id)
+        .bind(metadata)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Look up a workflow root by `(canonical_name, generation)`.
+    pub async fn find_root_by_canonical(
+        pool: &PgPool,
+        canonical_name: &str,
+        generation: i32,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM workflows WHERE canonical_name = $1 AND generation = $2",
+        )
+        .bind(canonical_name)
+        .bind(generation)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
     /// Semantic search for workflows by embedding with hybrid scoring.
     pub async fn find_by_embedding(
         pool: &PgPool,
@@ -249,5 +298,38 @@ impl WorkflowRepository {
         .await?;
 
         Ok(root.map(|(id,)| id).unwrap_or(workflow_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_root_creates_workflows_row(pool: sqlx::PgPool) {
+        let id = uuid::Uuid::new_v4();
+        WorkflowRepository::insert_root(
+            &pool,
+            id,
+            "deploy-canary",
+            0,
+            "Deploy a canary release safely.",
+            None,
+            serde_json::json!({"tags": ["deploy"]}),
+        )
+        .await
+        .unwrap();
+
+        let row: (String, i32, String, serde_json::Value) = sqlx::query_as(
+            "SELECT canonical_name, generation, goal, metadata FROM workflows WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "deploy-canary");
+        assert_eq!(row.1, 0);
+        assert_eq!(row.2, "Deploy a canary release safely.");
+        assert_eq!(row.3["tags"][0], "deploy");
     }
 }
