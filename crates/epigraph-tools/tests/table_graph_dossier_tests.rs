@@ -57,3 +57,37 @@ fn fk_targets_dedup() {
     let targets = extract_fk_targets(ddl);
     assert_eq!(targets, vec!["claims".to_string()]);
 }
+
+#[path = "../examples/table_graph/llm.rs"]
+mod llm;
+
+#[test]
+fn build_prompt_includes_dossier_sections() {
+    use crate::types::*;
+    let d = Dossier {
+        table: TableRef { repo: "epigraph".into(), name: "claims".into(),
+                          migration: "001_initial_schema.sql".into() },
+        ddl: "CREATE TABLE claims (id uuid);".into(),
+        commits: vec![GitCommit { sha: "abc12345".into(), date: "2025-01-01T00:00:00Z".into(),
+                                   subject: "init".into(), body: "".into() }],
+        call_sites: vec![CallSite {
+            crate_name: "epigraph-api".into(), function: "submit_claim_route".into(),
+            snippet: "INSERT INTO claims (id".into(), kind: CallKind::WritesTo,
+        }],
+        fk_targets: vec!["agents".into()],
+    };
+    let p = llm::build_prompt(&d);
+    assert!(p.contains("claims"));
+    assert!(p.contains("CREATE TABLE claims"));
+    assert!(p.contains("submit_claim_route"));
+    assert!(p.contains("agents"));
+    assert!(p.contains("init"));
+}
+
+#[test]
+fn extract_md_from_response_strips_codefence() {
+    let raw = "Sure, here you go:\n\n```markdown\n# Table `claims`\n\n## Purpose\n\ntext\n```";
+    let md = llm::extract_md(raw).unwrap();
+    assert!(md.starts_with("# Table"));
+    assert!(!md.contains("```"));
+}
