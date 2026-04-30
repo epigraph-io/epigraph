@@ -280,6 +280,10 @@ pub fn create_router(state: AppState) -> Router {
             post(workflows::ingest_workflow),
         )
         .route(
+            "/api/v1/workflows/hierarchical/:id/outcome",
+            post(workflows::report_hierarchical_outcome),
+        )
+        .route(
             "/api/v1/workflows/:id/outcome",
             post(workflows::report_outcome),
         )
