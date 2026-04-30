@@ -71,7 +71,7 @@ const GRAPH_VIEW_RELATIONSHIPS: &[&str] = &[
 /// `Some("*")` or `Some("all")` → returns `None` (caller treats as "no filter").
 /// Otherwise → comma-split, trimmed, non-empty entries.
 fn resolve_relationship_filter(override_param: Option<&str>) -> Option<Vec<String>> {
-    match override_param {
+    match override_param.map(str::trim).filter(|s| !s.is_empty()) {
         None => Some(
             GRAPH_VIEW_RELATIONSHIPS
                 .iter()
@@ -531,6 +531,46 @@ mod tests {
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["filtered_edge_count"], 7);
+    }
+
+    #[test]
+    fn resolve_filter_none_returns_default_allowlist() {
+        let result = resolve_relationship_filter(None).unwrap();
+        // Pick any well-known default from GRAPH_VIEW_RELATIONSHIPS to avoid coupling
+        // this test to the full set. Either "decomposes_to" or "supports" is a stable
+        // choice — see the constant definition near the top of graph.rs.
+        assert!(result.contains(&"decomposes_to".to_string()));
+        assert!(result.contains(&"supports".to_string()));
+    }
+
+    #[test]
+    fn resolve_filter_empty_string_falls_back_to_default() {
+        let result = resolve_relationship_filter(Some("")).unwrap();
+        assert!(result.contains(&"decomposes_to".to_string()));
+    }
+
+    #[test]
+    fn resolve_filter_whitespace_only_falls_back_to_default() {
+        let result = resolve_relationship_filter(Some("   ")).unwrap();
+        assert!(result.contains(&"decomposes_to".to_string()));
+    }
+
+    #[test]
+    fn resolve_filter_star_returns_none() {
+        assert!(resolve_relationship_filter(Some("*")).is_none());
+    }
+
+    #[test]
+    fn resolve_filter_all_case_insensitive() {
+        assert!(resolve_relationship_filter(Some("ALL")).is_none());
+        assert!(resolve_relationship_filter(Some("All")).is_none());
+        assert!(resolve_relationship_filter(Some("all")).is_none());
+    }
+
+    #[test]
+    fn resolve_filter_comma_separated_trims_and_filters_empty() {
+        let result = resolve_relationship_filter(Some("produced, same_source ,  ,CONTAINS")).unwrap();
+        assert_eq!(result, vec!["produced".to_string(), "same_source".to_string(), "CONTAINS".to_string()]);
     }
 }
 
