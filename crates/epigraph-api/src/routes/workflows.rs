@@ -408,7 +408,7 @@ pub async fn get_workflow(
     Ok(Json(serde_json::json!({
         "workflow_id": row.id,
         "content": serde_json::from_str::<serde_json::Value>(&row.content)
-            .unwrap_or_else(|_| serde_json::Value::String(row.content)),
+            .unwrap_or(serde_json::Value::String(row.content)),
         "truth_value": row.truth_value,
         "properties": row.properties,
     })))
