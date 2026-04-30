@@ -712,7 +712,11 @@ pub async fn report_hierarchical_outcome(
     let quality = request.quality.unwrap_or(if success { 1.0 } else { 0.0 });
 
     // 3. Update metadata counters
-    let use_count = metadata.get("use_count").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+    let use_count = metadata
+        .get("use_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        + 1;
     let success_count = metadata
         .get("success_count")
         .and_then(|v| v.as_i64())
@@ -1102,10 +1106,10 @@ pub async fn ingest_workflow(
     State(state): State<AppState>,
     Json(extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use std::collections::HashMap;
     use epigraph_core::{AgentId, TruthValue};
     use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, WorkflowRepository};
     use epigraph_ingest::workflow::builder::root_workflow_id;
+    use std::collections::HashMap;
 
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let pool = &state.db_pool;
@@ -1116,9 +1120,12 @@ pub async fn ingest_workflow(
     let workflow_id = root_workflow_id(&extraction);
 
     // ── 1. Idempotency gate ──────────────────────────────────────────────
-    if let Some(existing_id) = WorkflowRepository::find_root_by_canonical(pool, canonical_name, generation)
-        .await
-        .map_err(|e| ApiError::InternalError { message: e.to_string() })?
+    if let Some(existing_id) =
+        WorkflowRepository::find_root_by_canonical(pool, canonical_name, generation)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?
     {
         let edge_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM edges \
@@ -1127,7 +1134,9 @@ pub async fn ingest_workflow(
         .bind(existing_id)
         .fetch_one(pool)
         .await
-        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
 
         if edge_count > 0 {
             return Ok(Json(serde_json::json!({
@@ -1151,7 +1160,9 @@ pub async fn ingest_workflow(
     let parent_id = if let Some(ref pcn) = extraction.source.parent_canonical_name {
         WorkflowRepository::find_root_by_canonical(pool, pcn, generation.saturating_sub(1))
             .await
-            .map_err(|e| ApiError::InternalError { message: e.to_string() })?
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?
     } else {
         None
     };
@@ -1166,7 +1177,9 @@ pub async fn ingest_workflow(
         extraction.source.metadata.clone(),
     )
     .await
-    .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+    .map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+    })?;
 
     // ── 4. Author agents ─────────────────────────────────────────────────
     let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
@@ -1179,14 +1192,17 @@ pub async fn ingest_workflow(
         let agent_uuid: Uuid = if let Some(existing) =
             AgentRepository::get_by_public_key(pool, &pub_key_bytes)
                 .await
-                .map_err(|e| ApiError::InternalError { message: e.to_string() })?
-        {
+                .map_err(|e| ApiError::InternalError {
+                    message: e.to_string(),
+                })? {
             existing.id.into()
         } else {
             let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
             let created = AgentRepository::create(pool, &author_agent)
                 .await
-                .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+                .map_err(|e| ApiError::InternalError {
+                    message: e.to_string(),
+                })?;
             created.id.into()
         };
         author_agent_map.insert(idx, agent_uuid);
@@ -1217,7 +1233,9 @@ pub async fn ingest_workflow(
             &labels,
         )
         .await
-        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
 
         if was_new {
             sqlx::query("UPDATE claims SET properties = $1 WHERE id = $2")
@@ -1225,7 +1243,9 @@ pub async fn ingest_workflow(
                 .bind(planned.id)
                 .execute(pool)
                 .await
-                .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+                .map_err(|e| ApiError::InternalError {
+                    message: e.to_string(),
+                })?;
             claims_ingested += 1;
         } else {
             claims_skipped_dedup += 1;
@@ -1248,7 +1268,9 @@ pub async fn ingest_workflow(
             None,
         )
         .await
-        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
         executes_edges += 1;
     }
 
@@ -1285,7 +1307,9 @@ pub async fn ingest_workflow(
             None,
         )
         .await
-        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
         relationships_created += 1;
     }
 
@@ -1315,10 +1339,8 @@ pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uu
     {
         Ok(a.id.as_uuid())
     } else {
-        let agent = epigraph_core::Agent::new(
-            pub_key_bytes,
-            Some("workflow-ingest-system".to_string()),
-        );
+        let agent =
+            epigraph_core::Agent::new(pub_key_bytes, Some("workflow-ingest-system".to_string()));
         let created = epigraph_db::AgentRepository::create(pool, &agent)
             .await
             .map_err(|e| ApiError::InternalError {
@@ -1467,35 +1489,10 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    // ── Test scaffolding (legacy style: try_test_pool + skip) ──
-
-    async fn try_test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(3)
-            .connect(&url)
-            .await
-            .ok()?;
-        sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
-        Some(pool)
-    }
-
-    macro_rules! test_pool_or_skip {
-        () => {{
-            match try_test_pool().await {
-                Some(p) => p,
-                None => {
-                    eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                    return;
-                }
-            }
-        }};
-    }
-
     fn parse_body_bytes(bytes: &[u8]) -> serde_json::Value {
-        serde_json::from_slice(bytes).unwrap_or_else(|_| {
-            serde_json::json!({"error": String::from_utf8_lossy(bytes).to_string()})
-        })
+        serde_json::from_slice(bytes).unwrap_or_else(
+            |_| serde_json::json!({"error": String::from_utf8_lossy(bytes).to_string()}),
+        )
     }
 
     fn test_router(pool: sqlx::PgPool) -> axum::Router {
@@ -1574,9 +1571,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn ingest_workflow_http_returns_workflow_id() {
-        let pool = test_pool_or_skip!();
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_workflow_http_returns_workflow_id(pool: PgPool) {
         let app = test_router(pool);
 
         let body = serde_json::to_vec(&ingest_payload("http-test-ingest-workflow")).unwrap();
@@ -1606,13 +1602,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn report_hierarchical_outcome_updates_workflow_metadata() {
-        let pool = match try_test_pool().await {
-            Some(p) => p,
-            None => return,
-        };
-
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_updates_workflow_metadata(pool: PgPool) {
         // Seed a hierarchical workflow directly via the DB layer so we don't depend on
         // the full HTTP ingest flow inside this test.
         let workflow_id = uuid::Uuid::new_v4();
@@ -1629,7 +1620,7 @@ mod tests {
         .unwrap();
 
         // Build a minimal axum app with just the outcome route.
-        use crate::state::{AppState, ApiConfig};
+        use crate::state::{ApiConfig, AppState};
         let state = AppState::with_db(pool.clone(), ApiConfig::default());
         let app = axum::Router::new()
             .route(
@@ -1647,7 +1638,9 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/v1/workflows/hierarchical/{workflow_id}/outcome"))
+                    .uri(&format!(
+                        "/api/v1/workflows/hierarchical/{workflow_id}/outcome"
+                    ))
                     .method("POST")
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
@@ -1657,25 +1650,19 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let metadata: serde_json::Value = sqlx::query_scalar(
-            "SELECT metadata FROM workflows WHERE id = $1",
-        )
-        .bind(workflow_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let metadata: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM workflows WHERE id = $1")
+                .bind(workflow_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(metadata["use_count"], 1);
         assert_eq!(metadata["success_count"], 1);
     }
 
-    #[tokio::test]
-    async fn report_hierarchical_outcome_404s_on_unknown_id() {
-        let pool = match try_test_pool().await {
-            Some(p) => p,
-            None => return,
-        };
-
-        use crate::state::{AppState, ApiConfig};
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_404s_on_unknown_id(pool: PgPool) {
+        use crate::state::{ApiConfig, AppState};
         let state = AppState::with_db(pool.clone(), ApiConfig::default());
         let app = axum::Router::new()
             .route(
@@ -1701,13 +1688,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn find_workflow_hierarchical_returns_match() {
-        let pool = match try_test_pool().await {
-            Some(p) => p,
-            None => return,
-        };
-
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_workflow_hierarchical_returns_match(pool: PgPool) {
         // Seed a hierarchical workflow.
         let workflow_id = uuid::Uuid::new_v4();
         let canonical = "search-e2e-test";
@@ -1723,7 +1705,7 @@ mod tests {
         .await
         .unwrap();
 
-        use crate::state::{AppState, ApiConfig};
+        use crate::state::{ApiConfig, AppState};
         let state = AppState::with_db(pool.clone(), ApiConfig::default());
         let app = axum::Router::new()
             .route(
@@ -1735,7 +1717,9 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/v1/workflows/hierarchical/search?q={canonical}"))
+                    .uri(&format!(
+                        "/api/v1/workflows/hierarchical/search?q={canonical}"
+                    ))
                     .method("GET")
                     .body(Body::empty())
                     .unwrap(),
@@ -1755,6 +1739,9 @@ mod tests {
             .unwrap()
             .iter()
             .any(|w| w["canonical_name"].as_str() == Some(canonical));
-        assert!(found, "expected to find the seeded canonical_name in results");
+        assert!(
+            found,
+            "expected to find the seeded canonical_name in results"
+        );
     }
 }

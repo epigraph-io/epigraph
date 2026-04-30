@@ -2025,7 +2025,7 @@ mod label_tests {
 
         // cleanup
         let _ = sqlx::query("DELETE FROM claims WHERE id = ANY($1)")
-            .bind(&[claim_id_1, claim_id_2])
+            .bind([claim_id_1, claim_id_2])
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM agents WHERE id = $1")
