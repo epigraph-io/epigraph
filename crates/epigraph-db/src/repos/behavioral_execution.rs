@@ -34,6 +34,7 @@ pub struct BehavioralExecutionRow {
     pub deviation_count: i32,
     pub total_steps: i32,
     pub created_at: DateTime<Utc>,
+    pub step_claim_id: Option<uuid::Uuid>,
 }
 
 /// Repository for `behavioral_executions` table operations.
@@ -66,16 +67,19 @@ impl BehavioralExecutionRepository {
                 INSERT INTO behavioral_executions (
                     id, workflow_id, goal_text, goal_embedding,
                     success, step_beliefs, tool_pattern,
-                    quality, deviation_count, total_steps, created_at
+                    quality, deviation_count, total_steps, created_at,
+                    step_claim_id
                 )
                 VALUES (
                     $1, $2, $3, $4::vector,
                     $5, $6, $7,
-                    $8, $9, $10, $11
+                    $8, $9, $10, $11,
+                    $12
                 )
                 RETURNING id, workflow_id, goal_text,
                           success, step_beliefs, tool_pattern,
-                          quality, deviation_count, total_steps, created_at
+                          quality, deviation_count, total_steps, created_at,
+                          step_claim_id
                 "#,
             )
             .bind(row.id)
@@ -89,6 +93,7 @@ impl BehavioralExecutionRepository {
             .bind(row.deviation_count)
             .bind(row.total_steps)
             .bind(row.created_at)
+            .bind(row.step_claim_id)
             .fetch_one(pool)
             .await
         } else {
@@ -97,16 +102,19 @@ impl BehavioralExecutionRepository {
                 INSERT INTO behavioral_executions (
                     id, workflow_id, goal_text,
                     success, step_beliefs, tool_pattern,
-                    quality, deviation_count, total_steps, created_at
+                    quality, deviation_count, total_steps, created_at,
+                    step_claim_id
                 )
                 VALUES (
                     $1, $2, $3,
                     $4, $5, $6,
-                    $7, $8, $9, $10
+                    $7, $8, $9, $10,
+                    $11
                 )
                 RETURNING id, workflow_id, goal_text,
                           success, step_beliefs, tool_pattern,
-                          quality, deviation_count, total_steps, created_at
+                          quality, deviation_count, total_steps, created_at,
+                          step_claim_id
                 "#,
             )
             .bind(row.id)
@@ -119,6 +127,7 @@ impl BehavioralExecutionRepository {
             .bind(row.deviation_count)
             .bind(row.total_steps)
             .bind(row.created_at)
+            .bind(row.step_claim_id)
             .fetch_one(pool)
             .await
         }
@@ -325,8 +334,72 @@ impl BehavioralExecutionRepository {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_behavioral_execution_placeholder(_pool: sqlx::PgPool) {
         // Integration tests need workflow claim fixtures
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn behavioral_execution_persists_step_claim_id(pool: sqlx::PgPool) {
+        // Seed an agent and a claim to reference.
+        let agent_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(blake3::hash(b"test-agent").as_bytes().as_slice())
+        .bind("test-agent")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let claim_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind("test claim")
+        .bind(blake3::hash(b"test claim").as_bytes().as_slice())
+        .bind(agent_id)
+        .bind(0.5_f64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let workflow_root_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind("workflow root")
+        .bind(blake3::hash(b"workflow root").as_bytes().as_slice())
+        .bind(agent_id)
+        .bind(0.5_f64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let row = BehavioralExecutionRow {
+            id: uuid::Uuid::new_v4(),
+            workflow_id: workflow_root_id,
+            goal_text: "test".into(),
+            success: true,
+            step_beliefs: serde_json::json!({}),
+            tool_pattern: vec!["t1".into()],
+            quality: Some(0.9),
+            deviation_count: 0,
+            total_steps: 1,
+            created_at: chrono::Utc::now(),
+            step_claim_id: Some(claim_id),
+        };
+        BehavioralExecutionRepository::create(&pool, row, None)
+            .await
+            .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM behavioral_executions WHERE step_claim_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(count >= 1);
     }
 }
