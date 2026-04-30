@@ -147,13 +147,20 @@ impl ClaimRepository {
         properties: serde_json::Value,
     ) -> Result<(), DbError> {
         let id: Uuid = claim_id.into();
-        sqlx::query!(
+        let result = sqlx::query!(
             "UPDATE claims SET properties = $2, updated_at = NOW() WHERE id = $1",
             id,
             properties
         )
         .execute(pool)
         .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound {
+                entity: "Claim".to_string(),
+                id,
+            });
+        }
         Ok(())
     }
 
