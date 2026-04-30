@@ -592,6 +592,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/policies/network",
             get(policies::list_network_policies),
         )
+        .route(
+            "/api/v1/policies/:claim_id/outcome",
+            post(policies::record_outcome),
+        )
         .route("/api/v1/methods/search", get(experiments::find_methods))
         .route(
             "/api/v1/methods/gap-analysis",
