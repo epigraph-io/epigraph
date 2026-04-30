@@ -270,6 +270,32 @@ async fn cross_paper_atom_and_author_converge(pool: PgPool) {
     assert_eq!(authored_edges.0, 2, "alice authored both papers");
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_document_persists_planned_properties(pool: PgPool) {
+    let server = make_server(pool.clone());
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+
+    do_ingest_document(&server, &extraction).await.expect("ingest succeeds");
+
+    let count_with_props: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE properties::text != '{}'"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(count_with_props > 0,
+        "expected at least one claim with non-empty properties");
+
+    // Thesis is at level 0 — confirm level-based filtering works.
+    let level_zero: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE properties->>'level' = '0'"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(level_zero, 1, "thesis (level 0) should be queryable by properties->>'level'");
+}
+
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     let content = result.content.first().expect("at least one content block");
     content.as_text().expect("text content").text.clone()

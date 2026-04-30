@@ -547,6 +547,16 @@ pub async fn do_ingest_document(
             continue;
         }
 
+        // Persist hierarchy metadata (level, section, source_type, generality)
+        // from the ingest plan onto the new claim's `properties` column.
+        ClaimRepository::set_properties(
+            pool,
+            ClaimId::from_uuid(persisted_id),
+            planned.properties.clone(),
+        )
+        .await
+        .map_err(internal_error)?;
+
         // New claim: write the supporting evidence and reasoning trace.
         let evidence_text = planned
             .supporting_text
