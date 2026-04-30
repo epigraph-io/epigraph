@@ -66,6 +66,8 @@ mod negative_tests;
 pub mod ownership;
 pub mod papers;
 pub mod perspective;
+#[cfg(feature = "db")]
+pub mod policies;
 pub mod political;
 #[cfg(feature = "db")]
 pub mod provenance;
