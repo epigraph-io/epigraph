@@ -6,6 +6,7 @@ mod types;
 use dossier::collect_ddl;
 use dossier::collect_git_context;
 use dossier::collect_call_sites;
+use dossier::extract_fk_targets;
 
 #[test]
 fn ddl_for_claims_includes_create_table() {
@@ -41,4 +42,18 @@ fn finds_claim_repo_call_sites() {
         assert!(!s.function.is_empty(), "function name must be filled");
         assert!(!s.function.contains(':'), "function should be ident, not file:line");
     }
+}
+
+#[test]
+fn fk_targets_for_evidence_includes_claims() {
+    let ddl = "CREATE TABLE evidence (id uuid, claim_id uuid REFERENCES claims(id));";
+    let targets = extract_fk_targets(ddl);
+    assert!(targets.contains(&"claims".to_string()));
+}
+
+#[test]
+fn fk_targets_dedup() {
+    let ddl = "FOO REFERENCES claims(id), BAR REFERENCES claims(id)";
+    let targets = extract_fk_targets(ddl);
+    assert_eq!(targets, vec!["claims".to_string()]);
 }
