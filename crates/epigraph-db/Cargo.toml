@@ -33,3 +33,7 @@ path = "tests/lineage_tests.rs"
 [[test]]
 name = "batch_operations_tests"
 path = "tests/batch_operations_tests.rs"
+
+[[test]]
+name = "cascade_delete_tests"
+path = "tests/cascade_delete_tests.rs"
