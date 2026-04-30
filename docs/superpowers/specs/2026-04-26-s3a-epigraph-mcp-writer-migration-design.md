@@ -1,5 +1,9 @@
 # S3a — `epigraph-mcp` Writer Migration Design
 
+> **Origin:** Ported from `epigraph-internal` (private dev repo) as historical
+> design context. The implementation landed on this repo as **#17**. Branch /
+> PR-number references below point to the original `epigraph-internal` artifacts.
+
 **Date:** 2026-04-26
 **Branch:** `feat/s3a-mcp-writer-migration` (created off `chore/migration-renumber-2026-04-25` so S1 helpers are the base); separate PR from #6
 **Status:** Approved for spec → plan → implementation
