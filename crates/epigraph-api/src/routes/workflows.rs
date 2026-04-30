@@ -96,6 +96,13 @@ pub struct DeprecateQuery {
 
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize)]
+pub struct HierarchicalSearchQuery {
+    pub q: String,
+    pub limit: Option<i64>,
+}
+
+#[cfg(feature = "db")]
+#[derive(Debug, Deserialize)]
 pub struct RecordBehavioralExecutionRequest {
     pub goal_text: String,
     pub success: bool,
@@ -581,6 +588,48 @@ pub async fn report_outcome(
         "variance": variance,
         "total_uses": use_count,
         "success_rate": success_rate,
+    })))
+}
+
+/// GET /api/v1/workflows/hierarchical/search?q=...&limit=N - Search
+/// hierarchical workflows by free-text query.
+///
+/// Returns workflows whose `goal` or `canonical_name` matches `q` (ILIKE),
+/// ordered newest first. Limit defaults to 10, max 50.
+///
+/// Use `GET /api/v1/workflows/search` for flat-JSON workflows.
+#[cfg(feature = "db")]
+pub async fn find_workflow_hierarchical(
+    State(state): State<AppState>,
+    Query(params): Query<HierarchicalSearchQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = params.limit.unwrap_or(10).clamp(1, 50);
+    let rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
+        &state.db_pool,
+        &params.q,
+        limit,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("hierarchical search failed: {e}"),
+    })?;
+    let workflows: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "workflow_id": r.id,
+                "canonical_name": r.canonical_name,
+                "generation": r.generation,
+                "goal": r.goal,
+                "parent_id": r.parent_id,
+                "metadata": r.metadata,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "workflows": workflows,
+        "total": workflows.len(),
     })))
 }
 
@@ -1477,5 +1526,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn find_workflow_hierarchical_returns_match() {
+        let pool = match try_test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Seed a hierarchical workflow.
+        let workflow_id = uuid::Uuid::new_v4();
+        let canonical = "search-e2e-test";
+        epigraph_db::WorkflowRepository::insert_root(
+            &pool,
+            workflow_id,
+            canonical,
+            0,
+            "A workflow for end-to-end search testing.",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        use crate::state::{AppState, ApiConfig};
+        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/search",
+                axum::routing::get(find_workflow_hierarchical),
+            )
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/v1/workflows/hierarchical/search?q={canonical}"))
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert!(body["total"].as_u64().unwrap_or(0) >= 1);
+        let found = body["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["canonical_name"].as_str() == Some(canonical));
+        assert!(found, "expected to find the seeded canonical_name in results");
     }
 }
