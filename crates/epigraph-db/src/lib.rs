@@ -80,6 +80,7 @@ pub use repos::{
     ScopedBeliefRepository, SecurityEventRepository, SecurityEventRow, SheafRepository,
     TaskRepository, TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository,
     WorkflowExecutionRow, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    HierarchicalWorkflowRow,
 };
 
 // Re-export sqlx types that users will need
