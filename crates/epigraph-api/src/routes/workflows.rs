@@ -889,6 +889,217 @@ pub async fn record_behavioral_execution(
     })))
 }
 
+/// POST /api/v1/workflows/ingest - Ingest a hierarchical `WorkflowExtraction`.
+///
+/// Parses a `WorkflowExtraction` JSON body, persists the claim hierarchy
+/// (thesis → phases → steps → operation atoms), writes `workflow —executes→ claim`
+/// edges, resolves author-placeholder edges, and returns a summary. Idempotent:
+/// if the workflow row already has `executes` edges, returns `already_ingested: true`
+/// without touching the DB further.
+#[cfg(feature = "db")]
+pub async fn ingest_workflow(
+    State(state): State<AppState>,
+    Json(extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use std::collections::HashMap;
+    use epigraph_core::{AgentId, TruthValue};
+    use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, WorkflowRepository};
+    use epigraph_ingest::workflow::builder::root_workflow_id;
+
+    let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
+    let pool = &state.db_pool;
+
+    let canonical_name = &extraction.source.canonical_name;
+    let generation = extraction.source.generation as i32;
+    let goal = &extraction.source.goal;
+    let workflow_id = root_workflow_id(&extraction);
+
+    // ── 1. Idempotency gate ──────────────────────────────────────────────
+    if let Some(existing_id) = WorkflowRepository::find_root_by_canonical(pool, canonical_name, generation)
+        .await
+        .map_err(|e| ApiError::InternalError { message: e.to_string() })?
+    {
+        let edge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM edges \
+             WHERE source_id = $1 AND source_type = 'workflow' AND relationship = 'executes'",
+        )
+        .bind(existing_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+
+        if edge_count > 0 {
+            return Ok(Json(serde_json::json!({
+                "workflow_id": existing_id,
+                "canonical_name": canonical_name,
+                "generation": generation,
+                "claims_ingested": 0,
+                "claims_skipped_dedup": 0,
+                "executes_edges": edge_count,
+                "relationships_created": 0,
+                "already_ingested": true,
+            })));
+        }
+    }
+
+    // ── 2. System agent ──────────────────────────────────────────────────
+    let system_agent_id = get_or_create_system_agent(pool).await?;
+    let _agent_id_typed = AgentId::from_uuid(system_agent_id);
+
+    // ── 3. Workflow row (idempotent) ──────────────────────────────────────
+    let parent_id = if let Some(ref pcn) = extraction.source.parent_canonical_name {
+        WorkflowRepository::find_root_by_canonical(pool, pcn, generation.saturating_sub(1))
+            .await
+            .map_err(|e| ApiError::InternalError { message: e.to_string() })?
+    } else {
+        None
+    };
+
+    WorkflowRepository::insert_root(
+        pool,
+        workflow_id,
+        canonical_name,
+        generation,
+        goal,
+        parent_id,
+        extraction.source.metadata.clone(),
+    )
+    .await
+    .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+
+    // ── 4. Author agents ─────────────────────────────────────────────────
+    let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
+    for (idx, author) in extraction.source.authors.iter().enumerate() {
+        if author.name.is_empty() {
+            continue;
+        }
+        let (_did, pub_key_bytes) =
+            epigraph_crypto::did_key::did_key_for_author(None, &author.name);
+        let agent_uuid: Uuid = if let Some(existing) =
+            AgentRepository::get_by_public_key(pool, &pub_key_bytes)
+                .await
+                .map_err(|e| ApiError::InternalError { message: e.to_string() })?
+        {
+            existing.id.into()
+        } else {
+            let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
+            let created = AgentRepository::create(pool, &author_agent)
+                .await
+                .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+            created.id.into()
+        };
+        author_agent_map.insert(idx, agent_uuid);
+    }
+
+    // ── 5. Claims ────────────────────────────────────────────────────────
+    let mut claims_ingested = 0_usize;
+    let mut claims_skipped_dedup = 0_usize;
+    let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
+
+    for planned in &plan.claims {
+        let confidence = planned.confidence.clamp(0.0, 1.0);
+        let truth = TruthValue::clamped(confidence.clamp(0.01, 0.99));
+        let kind = planned
+            .properties
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("workflow_claim");
+        let labels = vec!["claim".to_string(), kind.to_string()];
+
+        let was_new = ClaimRepository::create_with_id_if_absent(
+            pool,
+            planned.id,
+            &planned.content,
+            &planned.content_hash,
+            system_agent_id,
+            truth,
+            &labels,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+
+        if was_new {
+            sqlx::query("UPDATE claims SET properties = $1 WHERE id = $2")
+                .bind(&planned.properties)
+                .bind(planned.id)
+                .execute(pool)
+                .await
+                .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+            claims_ingested += 1;
+        } else {
+            claims_skipped_dedup += 1;
+        }
+        id_map.insert(planned.id, planned.id);
+    }
+
+    // ── 6. executes edges ────────────────────────────────────────────────
+    let mut executes_edges = 0_usize;
+    for planned in &plan.claims {
+        EdgeRepository::create_if_not_exists(
+            pool,
+            workflow_id,
+            "workflow",
+            planned.id,
+            "claim",
+            "executes",
+            Some(serde_json::json!({"level": planned.level})),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+        executes_edges += 1;
+    }
+
+    // ── 7. Intra-claim plan edges ─────────────────────────────────────────
+    let mut relationships_created = 0_usize;
+    for edge in &plan.edges {
+        let (src, src_type) = if edge.source_type == "author_placeholder" {
+            let idx = edge.properties["author_index"].as_u64().unwrap_or(0) as usize;
+            let Some(&agent_uuid) = author_agent_map.get(&idx) else {
+                continue;
+            };
+            (agent_uuid, "agent".to_string())
+        } else {
+            let mapped = id_map
+                .get(&edge.source_id)
+                .copied()
+                .unwrap_or(edge.source_id);
+            (mapped, edge.source_type.clone())
+        };
+        let tgt = id_map
+            .get(&edge.target_id)
+            .copied()
+            .unwrap_or(edge.target_id);
+
+        EdgeRepository::create_if_not_exists(
+            pool,
+            src,
+            &src_type,
+            tgt,
+            &edge.target_type,
+            &edge.relationship,
+            Some(edge.properties.clone()),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+        relationships_created += 1;
+    }
+
+    Ok(Json(serde_json::json!({
+        "workflow_id": workflow_id,
+        "canonical_name": canonical_name,
+        "generation": generation,
+        "claims_ingested": claims_ingested,
+        "claims_skipped_dedup": claims_skipped_dedup,
+        "executes_edges": executes_edges,
+        "relationships_created": relationships_created,
+        "already_ingested": false,
+    })))
+}
+
 // ── Internal helpers ──
 
 #[cfg(feature = "db")]
@@ -957,7 +1168,7 @@ mod tests {
     use sqlx::PgPool;
     use tower::ServiceExt;
 
-    // ── Test scaffolding ──
+    // ── Test scaffolding (modern style: #[sqlx::test]) ──
 
     /// Build a minimal AppState backed by the given pool.
     fn test_state(pool: PgPool) -> AppState {
@@ -1051,6 +1262,70 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    // ── Test scaffolding (legacy style: try_test_pool + skip) ──
+
+    async fn try_test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect(&url)
+            .await
+            .ok()?;
+        sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
+        Some(pool)
+    }
+
+    macro_rules! test_pool_or_skip {
+        () => {{
+            match try_test_pool().await {
+                Some(p) => p,
+                None => {
+                    eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
+                    return;
+                }
+            }
+        }};
+    }
+
+    fn parse_body_bytes(bytes: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(bytes).unwrap_or_else(|_| {
+            serde_json::json!({"error": String::from_utf8_lossy(bytes).to_string()})
+        })
+    }
+
+    fn test_router(pool: sqlx::PgPool) -> axum::Router {
+        use axum::routing::post;
+        let state = AppState::with_db(pool, ApiConfig::default());
+        axum::Router::new()
+            .route("/api/v1/workflows/ingest", post(ingest_workflow))
+            .with_state(state)
+    }
+
+    fn ingest_payload(canonical_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "source": {
+                "canonical_name": canonical_name,
+                "goal": "HTTP ingest test workflow",
+                "generation": 0,
+                "authors": []
+            },
+            "thesis": "Test that the HTTP endpoint persists claims correctly",
+            "thesis_derivation": "TopDown",
+            "phases": [{
+                "title": "Phase One",
+                "summary": "Single test phase",
+                "steps": [{
+                    "compound": "Execute the HTTP ingest handler",
+                    "rationale": "Verify end-to-end",
+                    "operations": ["POST /api/v1/workflows/ingest"],
+                    "generality": [1],
+                    "confidence": 0.85
+                }]
+            }],
+            "relationships": []
+        })
+    }
+
     // ── Tests ──
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1092,5 +1367,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ingest_workflow_http_returns_workflow_id() {
+        let pool = test_pool_or_skip!();
+        let app = test_router(pool);
+
+        let body = serde_json::to_vec(&ingest_payload("http-test-ingest-workflow")).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/workflows/ingest")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = parse_body_bytes(&bytes);
+
+        assert_eq!(status, StatusCode::OK, "response: {json}");
+        assert!(
+            json.get("workflow_id").is_some(),
+            "must return workflow_id; got: {json}"
+        );
+        assert_eq!(
+            json["already_ingested"].as_bool(),
+            Some(false),
+            "first ingest must not be a no-op"
+        );
     }
 }

@@ -1218,6 +1218,7 @@ dependencies = [
  "epigraph-embeddings",
  "epigraph-engine",
  "epigraph-events",
+ "epigraph-ingest",
  "epigraph-interfaces",
  "epigraph-jobs",
  "futures",
