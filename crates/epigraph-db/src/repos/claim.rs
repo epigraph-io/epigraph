@@ -134,6 +134,36 @@ impl ClaimRepository {
         ))
     }
 
+    /// Set the `properties` JSONB column on an existing claim. Overwrites the
+    /// existing value (does not merge). Used by ingest to attach hierarchy
+    /// metadata (level, section, source_type, generality) at creation time.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, properties))]
+    pub async fn set_properties(
+        pool: &PgPool,
+        claim_id: ClaimId,
+        properties: serde_json::Value,
+    ) -> Result<(), DbError> {
+        let id: Uuid = claim_id.into();
+        let result = sqlx::query!(
+            "UPDATE claims SET properties = $2, updated_at = NOW() WHERE id = $1",
+            id,
+            properties
+        )
+        .execute(pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound {
+                entity: "Claim".to_string(),
+                id,
+            });
+        }
+        Ok(())
+    }
+
     /// Create a new claim within an existing transaction (LEGACY — implicit content-hash dedup)
     ///
     /// Same as `create()` but accepts a `&mut PgConnection` for transactional use.
@@ -1530,6 +1560,43 @@ mod tests {
             .await
             .unwrap();
         assert!(missing.iter().any(|(id, _)| *id == claim_id));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn set_properties_writes_jsonb_column(pool: sqlx::PgPool) {
+        // Seed agent inline (no epigraph_test_support helper available),
+        // following the existing pattern in this test module.
+        let (agent_id, agent_pk): (Uuid, Vec<u8>) = sqlx::query_as(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'set-props-test', 'system', ARRAY['test'])
+             RETURNING id, public_key",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut public_key = [0u8; 32];
+        public_key.copy_from_slice(&agent_pk);
+
+        let claim = Claim::new(
+            "Test claim for properties".to_string(),
+            AgentId::from_uuid(agent_id),
+            public_key,
+            TruthValue::clamped(0.5),
+        );
+        let persisted = ClaimRepository::create(&pool, &claim).await.unwrap();
+        let props = serde_json::json!({"level": 3, "section": "Body", "source_type": "Wiki"});
+
+        ClaimRepository::set_properties(&pool, persisted.id, props.clone())
+            .await
+            .unwrap();
+
+        let row: (serde_json::Value,) =
+            sqlx::query_as("SELECT properties FROM claims WHERE id = $1")
+                .bind(Uuid::from(persisted.id))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, props);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

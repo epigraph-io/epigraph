@@ -382,6 +382,38 @@ pub async fn list_workflows(
     })))
 }
 
+/// GET /api/v1/workflows/:id - Fetch a single workflow by ID.
+///
+/// Returns 404 if the claim does not exist or is not labeled `workflow`.
+#[cfg(feature = "db")]
+pub async fn get_workflow(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let row = sqlx::query_as::<_, WorkflowContentRow>(
+        "SELECT id, content, truth_value, properties \
+         FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
+    )
+    .bind(workflow_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to fetch workflow: {e}"),
+    })?
+    .ok_or(ApiError::NotFound {
+        entity: "workflow".to_string(),
+        id: workflow_id.to_string(),
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "workflow_id": row.id,
+        "content": serde_json::from_str::<serde_json::Value>(&row.content)
+            .unwrap_or(serde_json::Value::String(row.content)),
+        "truth_value": row.truth_value,
+        "properties": row.properties,
+    })))
+}
+
 /// POST /api/v1/workflows/:id/outcome - Report execution outcome.
 #[cfg(feature = "db")]
 pub async fn report_outcome(
@@ -860,7 +892,7 @@ pub async fn record_behavioral_execution(
 // ── Internal helpers ──
 
 #[cfg(feature = "db")]
-async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, ApiError> {
+pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, ApiError> {
     let pub_key = [0u8; 32];
     if let Some(a) = epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key)
         .await
@@ -911,4 +943,154 @@ struct WorkflowContentRow {
     content: String,
     truth_value: Option<f64>,
     properties: Option<serde_json::Value>,
+}
+
+#[cfg(all(test, feature = "db"))]
+mod tests {
+    use super::*;
+    use crate::state::{ApiConfig, AppState};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    // ── Test scaffolding ──
+
+    /// Build a minimal AppState backed by the given pool.
+    fn test_state(pool: PgPool) -> AppState {
+        AppState::with_db(pool, ApiConfig::default())
+    }
+
+    /// Build a router exposing just the workflow GET-by-id route under test.
+    fn workflow_router(state: AppState) -> Router {
+        Router::new()
+            .route("/api/v1/workflows/:id", get(get_workflow))
+            .with_state(state)
+    }
+
+    /// Insert a system agent (mirrors `get_or_create_system_agent` but without
+    /// going through the public API) and return its id.
+    async fn ensure_system_agent(pool: &PgPool) -> Uuid {
+        let pub_key = vec![0u8; 32];
+        // Try existing first
+        if let Some(id) =
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE public_key = $1")
+                .bind(&pub_key)
+                .fetch_optional(pool)
+                .await
+                .unwrap()
+        {
+            return id;
+        }
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(&pub_key)
+        .bind("api-system-test")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Insert a workflow-labeled claim with the given goal and steps.
+    /// Mirrors the canonical `store_workflow` SQL at workflows.rs:135.
+    async fn seed_test_workflow(pool: &PgPool, goal: &str, steps: &[&str]) -> Uuid {
+        let agent_id = ensure_system_agent(pool).await;
+        let empty: Vec<&str> = vec![];
+        let content = serde_json::json!({
+            "goal": goal,
+            "steps": steps,
+            "prerequisites": empty,
+            "expected_outcome": serde_json::Value::Null,
+            "tags": empty,
+        });
+        let content_str = content.to_string();
+        let content_hash = epigraph_crypto::ContentHasher::hash(content_str.as_bytes());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties) \
+             VALUES ($1, $2, $3, $4, ARRAY['workflow'], $5) RETURNING id",
+        )
+        .bind(&content_str)
+        .bind(content_hash.as_slice())
+        .bind(agent_id)
+        .bind(0.5_f64)
+        .bind(serde_json::json!({
+            "generation": 0,
+            "use_count": 0,
+            "success_count": 0,
+            "failure_count": 0,
+            "avg_variance": 0.0,
+        }))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Insert a plain (non-workflow-labeled) claim and return its id.
+    async fn seed_plain_claim(pool: &PgPool, content: &str) -> Uuid {
+        let agent_id = ensure_system_agent(pool).await;
+        let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(content)
+        .bind(content_hash.as_slice())
+        .bind(agent_id)
+        .bind(0.5_f64)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn parse_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ── Tests ──
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_workflow_returns_single_workflow(pool: PgPool) {
+        let state = test_state(pool.clone());
+        let workflow_id = seed_test_workflow(&pool, "deploy-canary", &["step1", "step2"]).await;
+
+        let router = workflow_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/v1/workflows/{workflow_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = parse_body(response).await;
+        assert_eq!(body["workflow_id"], workflow_id.to_string());
+        assert!(body["content"].is_string() || body["content"].is_object());
+        assert!(body["truth_value"].is_number());
+        assert!(body["properties"].is_object());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_workflow_returns_404_for_non_workflow_claim(pool: PgPool) {
+        let state = test_state(pool.clone());
+        let claim_id = seed_plain_claim(&pool, "not a workflow").await;
+
+        let router = workflow_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/v1/workflows/{claim_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }

@@ -65,6 +65,30 @@ const GRAPH_VIEW_RELATIONSHIPS: &[&str] = &[
     "derives_from",
 ];
 
+/// Resolve the effective relationship allowlist for a single request.
+///
+/// `None` → default (`GRAPH_VIEW_RELATIONSHIPS`).
+/// `Some("*")` or `Some("all")` → returns `None` (caller treats as "no filter").
+/// Otherwise → comma-split, trimmed, non-empty entries.
+fn resolve_relationship_filter(override_param: Option<&str>) -> Option<Vec<String>> {
+    match override_param.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Some(
+            GRAPH_VIEW_RELATIONSHIPS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        ),
+        Some(s) if s == "*" || s.eq_ignore_ascii_case("all") => None,
+        Some(s) => Some(
+            s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct OverviewResponse {
     pub run_id: Option<Uuid>,
@@ -135,6 +159,11 @@ pub struct EdgeOut {
 pub struct ExpandParams {
     #[serde(default = "default_budget")]
     pub budget: i64,
+    /// Override the default relationship allowlist for this request.
+    /// Comma-separated list of relationship strings, or "*" / "all" for no filter.
+    /// When absent, uses `GRAPH_VIEW_RELATIONSHIPS`.
+    #[serde(default)]
+    pub relationships: Option<String>,
 }
 const fn default_budget() -> i64 {
     200
@@ -147,6 +176,11 @@ pub struct NeighborhoodParams {
     pub hops: i64,
     #[serde(default = "default_budget")]
     pub budget: i64,
+    /// Override the default relationship allowlist for this request.
+    /// Comma-separated list of relationship strings, or "*" / "all" for no filter.
+    /// When absent, uses `GRAPH_VIEW_RELATIONSHIPS`.
+    #[serde(default)]
+    pub relationships: Option<String>,
 }
 const fn default_hops() -> i64 {
     1
@@ -232,7 +266,17 @@ pub async fn expand(
     };
 
     let budget = params.budget.max(1);
-    let rel_list: Vec<&str> = GRAPH_VIEW_RELATIONSHIPS.to_vec();
+    let allowlist = resolve_relationship_filter(params.relationships.as_deref());
+    // For ordering by allowlisted-degree, fall back to the full default list
+    // when the request opts into "no filter" (i.e. `*`/`all`); otherwise the
+    // ORDER BY collapses to all-zero and ordering becomes arbitrary.
+    let degree_list: Vec<String> = match allowlist.as_deref() {
+        Some(list) => list.to_vec(),
+        None => GRAPH_VIEW_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    };
     let nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
         "WITH degree AS (
             SELECT m.claim_id, COUNT(e.*) AS deg
@@ -256,14 +300,15 @@ pub async fn expand(
     )
     .bind(cluster_id)
     .bind(run_id)
-    .bind(rel_list.clone())
+    .bind(degree_list)
     .bind(budget)
     .fetch_all(pool)
     .await
     .map_err(internal)?;
 
     let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
-    let (edges, filtered_edge_count) = fetch_subgraph_edges(pool, &node_ids, &rel_list).await?;
+    let (edges, filtered_edge_count) =
+        fetch_subgraph_edges(pool, &node_ids, allowlist.as_deref()).await?;
 
     Ok(Json(ExpandResponse {
         cluster_id,
@@ -283,8 +328,13 @@ pub async fn neighborhood(
     let pool: &PgPool = &state.db_pool;
     let hops = params.hops.clamp(1, 2);
     let budget = params.budget.max(1);
-    let rel_list: Vec<&str> = GRAPH_VIEW_RELATIONSHIPS.to_vec();
+    let allowlist = resolve_relationship_filter(params.relationships.as_deref());
 
+    // BFS traverses via *all* edge types so that the response can report
+    // `filtered_edge_count` for nodes whose only edges are design-excluded
+    // (e.g. `produced`, `same_source`). The render filter applies in
+    // `fetch_subgraph_edges` below; the BFS only bounds the neighborhood by
+    // hop depth and the overall `budget`.
     let nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
         r#"
         WITH RECURSIVE bfs(id, depth) AS (
@@ -295,7 +345,6 @@ pub async fn neighborhood(
             FROM bfs b
             JOIN edges e
               ON (e.source_id = b.id OR e.target_id = b.id)
-             AND e.relationship = ANY($3)
             WHERE b.depth < $2
         )
         SELECT DISTINCT
@@ -307,12 +356,11 @@ pub async fn neighborhood(
                NULL::uuid AS cluster_id,
                NULL::float8 AS conflict_k
         FROM bfs b JOIN claims c ON c.id = b.id
-        LIMIT $4
+        LIMIT $3
         "#,
     )
     .bind(params.node_id)
     .bind(hops)
-    .bind(rel_list.clone())
     .bind(budget)
     .fetch_all(pool)
     .await
@@ -323,7 +371,8 @@ pub async fn neighborhood(
     }
 
     let ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
-    let (edges, filtered_edge_count) = fetch_subgraph_edges(pool, &ids, &rel_list).await?;
+    let (edges, filtered_edge_count) =
+        fetch_subgraph_edges(pool, &ids, allowlist.as_deref()).await?;
 
     Ok(Json(ExpandResponse {
         cluster_id: Uuid::nil(),
@@ -344,21 +393,35 @@ pub async fn neighborhood(
 async fn fetch_subgraph_edges(
     pool: &PgPool,
     node_ids: &[Uuid],
-    rel_list: &[&str],
+    rel_list: Option<&[String]>,
 ) -> Result<(Vec<EdgeOut>, i64), (axum::http::StatusCode, String)> {
     if node_ids.is_empty() {
         return Ok((Vec::new(), 0));
     }
-    let rows: Vec<(Uuid, Uuid, String, bool)> = sqlx::query_as(
-        "SELECT source_id, target_id, relationship,
-                (relationship = ANY($2)) AS is_allowed
-         FROM edges
-         WHERE source_id = ANY($1) AND target_id = ANY($1)",
-    )
-    .bind(node_ids)
-    .bind(rel_list)
-    .fetch_all(pool)
-    .await
+    let rows: Vec<(Uuid, Uuid, String, bool)> = match rel_list {
+        Some(allowlist) => {
+            sqlx::query_as(
+                "SELECT source_id, target_id, relationship, \
+                    (relationship = ANY($2)) AS is_allowed \
+             FROM edges \
+             WHERE source_id = ANY($1) AND target_id = ANY($1)",
+            )
+            .bind(node_ids)
+            .bind(allowlist)
+            .fetch_all(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT source_id, target_id, relationship, true AS is_allowed \
+             FROM edges \
+             WHERE source_id = ANY($1) AND target_id = ANY($1)",
+            )
+            .bind(node_ids)
+            .fetch_all(pool)
+            .await
+        }
+    }
     .map_err(internal)?;
 
     let mut edges = Vec::new();
@@ -472,5 +535,189 @@ mod tests {
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["filtered_edge_count"], 7);
+    }
+
+    #[test]
+    fn resolve_filter_none_returns_default_allowlist() {
+        let result = resolve_relationship_filter(None).unwrap();
+        // Pick any well-known default from GRAPH_VIEW_RELATIONSHIPS to avoid coupling
+        // this test to the full set. Either "decomposes_to" or "supports" is a stable
+        // choice — see the constant definition near the top of graph.rs.
+        assert!(result.contains(&"decomposes_to".to_string()));
+        assert!(result.contains(&"supports".to_string()));
+    }
+
+    #[test]
+    fn resolve_filter_empty_string_falls_back_to_default() {
+        let result = resolve_relationship_filter(Some("")).unwrap();
+        assert!(result.contains(&"decomposes_to".to_string()));
+    }
+
+    #[test]
+    fn resolve_filter_whitespace_only_falls_back_to_default() {
+        let result = resolve_relationship_filter(Some("   ")).unwrap();
+        assert!(result.contains(&"decomposes_to".to_string()));
+    }
+
+    #[test]
+    fn resolve_filter_star_returns_none() {
+        assert!(resolve_relationship_filter(Some("*")).is_none());
+    }
+
+    #[test]
+    fn resolve_filter_all_case_insensitive() {
+        assert!(resolve_relationship_filter(Some("ALL")).is_none());
+        assert!(resolve_relationship_filter(Some("All")).is_none());
+        assert!(resolve_relationship_filter(Some("all")).is_none());
+    }
+
+    #[test]
+    fn resolve_filter_comma_separated_trims_and_filters_empty() {
+        let result =
+            resolve_relationship_filter(Some("produced, same_source ,  ,CONTAINS")).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                "produced".to_string(),
+                "same_source".to_string(),
+                "CONTAINS".to_string()
+            ]
+        );
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod integration_tests {
+    use super::*;
+    use crate::state::{ApiConfig, AppState};
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::get;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    fn test_state(pool: PgPool) -> AppState {
+        AppState::with_db(pool, ApiConfig::default())
+    }
+
+    fn graph_router(state: AppState) -> Router {
+        Router::new()
+            .route("/api/v1/graph/neighborhood", get(neighborhood))
+            .route("/api/v1/graph/clusters/:id/expand", get(expand))
+            .with_state(state)
+    }
+
+    async fn parse_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Insert a system agent for tests (mirrors the pattern in policies.rs).
+    async fn ensure_test_agent(pool: &PgPool) -> Uuid {
+        let pub_key = vec![1u8; 32];
+        if let Some(id) =
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE public_key = $1")
+                .bind(&pub_key)
+                .fetch_optional(pool)
+                .await
+                .unwrap()
+        {
+            return id;
+        }
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(&pub_key)
+        .bind("graph-test-agent")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Seed two claims and return their ids.
+    async fn seed_two_claims(pool: &PgPool) -> (Uuid, Uuid) {
+        let agent_id = ensure_test_agent(pool).await;
+        let a_content = format!("graph-test-claim-a-{}", Uuid::new_v4());
+        let b_content = format!("graph-test-claim-b-{}", Uuid::new_v4());
+        let a_hash = epigraph_crypto::ContentHasher::hash(a_content.as_bytes());
+        let b_hash = epigraph_crypto::ContentHasher::hash(b_content.as_bytes());
+        let a = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
+             VALUES ($1, $2, $3, 0.5) RETURNING id",
+        )
+        .bind(&a_content)
+        .bind(a_hash.as_slice())
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let b = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
+             VALUES ($1, $2, $3, 0.5) RETURNING id",
+        )
+        .bind(&b_content)
+        .bind(b_hash.as_slice())
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (a, b)
+    }
+
+    /// Seed a claim->claim edge with the given relationship.
+    async fn seed_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'claim', $2, 'claim', $3)",
+        )
+        .bind(source)
+        .bind(target)
+        .bind(relationship)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Build a `GET /api/v1/graph/neighborhood` request scoped to `node_id`,
+    /// with optional `?relationships=` override.
+    fn neighborhood_request(node_id: Uuid, relationships: Option<&str>) -> Request<Body> {
+        let uri = match relationships {
+            Some(r) => format!(
+                "/api/v1/graph/neighborhood?node_id={}&relationships={}",
+                node_id, r
+            ),
+            None => format!("/api/v1/graph/neighborhood?node_id={}", node_id),
+        };
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn neighborhood_relationships_param_overrides_allowlist(pool: PgPool) {
+        let (a, b) = seed_two_claims(&pool).await;
+        seed_edge(&pool, a, b, "produced").await; // NOT in default allowlist
+
+        let state = test_state(pool.clone());
+        let router = graph_router(state);
+
+        // Without relationships override: edge is filtered.
+        let response = router
+            .clone()
+            .oneshot(neighborhood_request(a, None))
+            .await
+            .unwrap();
+        let body: serde_json::Value = parse_body(response).await;
+        assert_eq!(body["edges"].as_array().unwrap().len(), 0);
+        assert_eq!(body["filtered_edge_count"], 1);
+
+        // With relationships=produced: edge is returned.
+        let response = router
+            .oneshot(neighborhood_request(a, Some("produced")))
+            .await
+            .unwrap();
+        let body: serde_json::Value = parse_body(response).await;
+        assert_eq!(body["edges"].as_array().unwrap().len(), 1);
+        assert_eq!(body["edges"][0]["relationship"], "produced");
     }
 }
