@@ -37,3 +37,7 @@ path = "tests/batch_operations_tests.rs"
 [[test]]
 name = "cascade_delete_tests"
 path = "tests/cascade_delete_tests.rs"
+
+[[test]]
+name = "edge_validation_tests"
+path = "tests/edge_validation_tests.rs"
