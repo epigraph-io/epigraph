@@ -26,11 +26,12 @@
 //! **single synthetic neighborhood** holding all claims.  This avoids spending
 //! Louvain iterations on trivially small subgraphs.
 //!
-//! Both thresholds are set to **0** in this v1 so that the Louvain path is
-//! always exercised.  In production the thresholds are intentionally low because
-//! Louvain is cheap, and small themes *should* be clustered to expose their
-//! internal structure.  If per-theme performance becomes a problem in the future,
-//! raise the thresholds here (they are `pub` so callers can inspect them).
+//! Both thresholds default to **50 nodes** and **10 edges**.  When a theme has
+//! fewer than `skip_threshold_nodes` nodes **or** fewer than
+//! `skip_threshold_edges` positive-weight edges we skip Louvain and produce a
+//! single synthetic neighborhood.  These values are overridable via `Config`
+//! so that integration tests can set them to 0 and always exercise the Louvain
+//! path without needing large fixtures.
 
 use std::collections::HashMap;
 
@@ -43,17 +44,31 @@ use super::louvain::{louvain, LouvainInput};
 #[derive(Debug)]
 pub struct Config {
     pub resolution: f64,
+    /// Minimum number of in-theme nodes required to run Louvain.
+    /// Themes with fewer nodes than this emit a single synthetic neighborhood.
+    pub skip_threshold_nodes: usize,
+    /// Minimum number of positive-weight edges required to run Louvain.
+    /// Themes with fewer edges than this emit a single synthetic neighborhood.
+    pub skip_threshold_edges: usize,
 }
 
-/// Minimum number of in-theme nodes required to run Louvain.
-/// Below this, we emit a single synthetic neighborhood.
-/// Set to 0 so Louvain is always exercised (even in unit tests with small fixtures).
-pub const SKIP_THRESHOLD_NODES: usize = 0;
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            resolution: 1.0,
+            skip_threshold_nodes: SKIP_THRESHOLD_NODES,
+            skip_threshold_edges: SKIP_THRESHOLD_EDGES,
+        }
+    }
+}
 
-/// Minimum number of positive-weight edges required to run Louvain.
+/// Minimum number of in-theme nodes required to run Louvain (production default).
 /// Below this, we emit a single synthetic neighborhood.
-/// Set to 0 so Louvain is always exercised (even in unit tests with small fixtures).
-pub const SKIP_THRESHOLD_EDGES: usize = 0;
+pub const SKIP_THRESHOLD_NODES: usize = 50;
+
+/// Minimum number of positive-weight edges required to run Louvain (production default).
+/// Below this, we emit a single synthetic neighborhood.
+pub const SKIP_THRESHOLD_EDGES: usize = 10;
 
 #[derive(Debug, sqlx::FromRow)]
 struct ThemeRow {
@@ -170,7 +185,7 @@ async fn run_one_theme(
     .await?;
 
     // Below threshold: emit a single synthetic neighborhood.
-    if atoms.len() <= SKIP_THRESHOLD_NODES || edges.len() <= SKIP_THRESHOLD_EDGES {
+    if atoms.len() < cfg.skip_threshold_nodes || edges.len() < cfg.skip_threshold_edges {
         return write_single_neighborhood(pool, run_id, theme_id, &atoms).await;
     }
 

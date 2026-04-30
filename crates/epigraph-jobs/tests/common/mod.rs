@@ -21,18 +21,19 @@ pub async fn reset_neighborhood_tables(pool: &sqlx::PgPool) {
 }
 
 /// Seeds a fresh run_id, one `claim_themes` row, six atoms in two cliques,
-/// and one "near-standalone" claim assigned to the same theme.
+/// and one truly-standalone claim assigned to the same theme (no edges).
 ///
 /// Graph topology (all edges SUPPORTS):
 /// ```text
-///   Clique 1: a - b - c - a   (3 atoms, plus standalone s attached to a)
+///   Clique 1: a - b - c - a   (3 atoms)
 ///   Clique 2: d - e - f - d   (3 atoms)
 ///   Cross:    a → d           (weight 0.7)
-///   Extra:    s → a           (pulls standalone into clique 1)
+///   Standalone: s             (no edges in either direction)
 /// ```
 ///
-/// With Louvain + resolution=1.0 the a-b-c-s group forms one community
-/// and d-e-f forms another, for exactly **2 neighborhoods** totalling 7 claims.
+/// With Louvain + resolution=1.0 the a-b-c group forms one community,
+/// d-e-f forms another, and s forms a singleton, for exactly **3 neighborhoods**
+/// totalling 7 claims.
 ///
 /// The cross edge a→d (forward_strength=0.7) produces one `neighborhood_edge`
 /// with weight 0.7 after the cross-neighborhood edge pass.
@@ -130,8 +131,8 @@ pub async fn seed_two_clique_theme(
         .unwrap();
     }
 
-    // 6. standalone — attached to clique 1 via s→atoms[0] so it merges into
-    //    clique 1's neighborhood (7 total claims, 2 neighborhoods).
+    // 6. standalone — no edges in either direction, so Louvain places it in its
+    //    own singleton neighborhood (7 total claims, 3 neighborhoods).
     let standalone = Uuid::new_v4();
     let hash: Vec<u8> = standalone
         .as_bytes()
@@ -147,17 +148,6 @@ pub async fn seed_two_clique_theme(
     .bind(hash)
     .bind(agent_id)
     .bind(theme_id)
-    .execute(pool)
-    .await
-    .unwrap();
-
-    // edge: standalone → atoms[0]  (SUPPORTS, fwd_strength=0.7)
-    sqlx::query(
-        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship)
-         VALUES ($1, $2, 'claim', 'claim', 'SUPPORTS')",
-    )
-    .bind(standalone)
-    .bind(atoms[0])
     .execute(pool)
     .await
     .unwrap();
