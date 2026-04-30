@@ -1140,6 +1140,264 @@ pub async fn reassign_claim(
 }
 
 // =============================================================================
+// THEME MAINTENANCE: BUILD FROM CORPUS
+// =============================================================================
+
+/// Request to bootstrap themes from the existing corpus by k-means.
+#[derive(Deserialize)]
+pub struct BuildThemesFromCorpusRequest {
+    /// If `Some`, fit k-means with exactly this many clusters. If `None`,
+    /// search `k_min..=k_max` and pick the best inertia (elbow-penalized).
+    pub k: Option<usize>,
+    /// Lower bound when searching k. Default 4.
+    pub k_min: Option<usize>,
+    /// Upper bound when searching k. Default 16.
+    pub k_max: Option<usize>,
+    /// Skip clusters with fewer than this many claims (no theme created;
+    /// claims left unthemed). Default 5.
+    pub min_claims_per_theme: Option<usize>,
+    /// Cap on claims pulled into k-means. Default 500. Higher values risk
+    /// OOM on small VMs (the calibration done on the wrhq deployment OOMs
+    /// the kernel host above ~2000 embeddings).
+    pub limit: Option<i64>,
+    /// Theme labels are auto-named `"{prefix}-{idx}"`. Default `"auto"`.
+    pub label_prefix: Option<String>,
+    /// If true, `DELETE FROM claim_themes` before building. Default false —
+    /// callers that want a clean slate must opt in explicitly.
+    pub wipe_first: Option<bool>,
+}
+
+/// k-means bootstrap of `claim_themes` from the existing corpus. Required
+/// before `/api/v1/search/semantic?diverse=true` can return diverse-by-
+/// theme results on a fresh deployment.
+///
+/// Synchronous: blocks the HTTP request until k-means + theme creation
+/// finishes. Sub-second on the wrhq-scale corpus (1607 claims, 1536d).
+/// Larger corpora should expect tens of seconds and may OOM small VMs;
+/// see the `limit` field on the request.
+///
+/// **Quality caveat**: themes built from `claims.embedding` (currently
+/// `vector(1536)`) sit at the `text-embedding-3-small` noise floor on
+/// short hierarchical claims (#48 part 2 — widening to 3072d is a
+/// separate migration). Bootstrap works, but the resulting themes will
+/// be lower-quality than 3072d would produce.
+///
+/// POST /api/v1/themes/build-from-corpus
+#[cfg(feature = "db")]
+pub async fn build_themes_from_corpus(
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Json(request): Json<BuildThemesFromCorpusRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use linfa::prelude::*;
+    use linfa_clustering::KMeans;
+    use ndarray::Array2;
+
+    if let Some(axum::Extension(ref auth)) = auth_ctx {
+        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
+    }
+
+    let k_min = request.k_min.unwrap_or(4);
+    let k_max = request.k_max.unwrap_or(16);
+    let min_claims = request.min_claims_per_theme.unwrap_or(5);
+    let limit = request.limit.unwrap_or(500).max(1);
+    let label_prefix = request
+        .label_prefix
+        .unwrap_or_else(|| "auto".to_string());
+    let wipe_first = request.wipe_first.unwrap_or(false);
+
+    if k_min == 0 || k_max < k_min {
+        return Err(ApiError::BadRequest {
+            message: "k_min must be ≥1 and k_max ≥ k_min".to_string(),
+        });
+    }
+
+    if wipe_first {
+        epigraph_db::ClaimThemeRepository::delete_all(&state.db_pool).await?;
+    }
+
+    // 1. Pull claims with embeddings.
+    let rows: Vec<(Uuid, Vec<f32>)> = sqlx::query_as(
+        "SELECT id, embedding::text::float4[] \
+         FROM claims \
+         WHERE embedding IS NOT NULL \
+         ORDER BY id \
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to fetch claim embeddings: {e}"),
+    })?;
+
+    let n_claims = rows.len();
+    if n_claims < k_min {
+        return Ok(Json(serde_json::json!({
+            "themes_created": 0,
+            "claims_assigned": 0,
+            "k_used": null,
+            "claims_with_embeddings": n_claims,
+            "skipped_reason": format!("only {} claims with embeddings (need ≥ k_min={})", n_claims, k_min),
+        })));
+    }
+
+    // 2. Build the dense matrix.
+    let dim = rows[0].1.len();
+    let mut data = Array2::<f64>::zeros((n_claims, dim));
+    for (i, (_, emb)) in rows.iter().enumerate() {
+        if emb.len() != dim {
+            return Err(ApiError::InternalError {
+                message: format!(
+                    "embedding dim mismatch at claim {}: got {}, expected {}",
+                    rows[i].0, emb.len(), dim,
+                ),
+            });
+        }
+        for (j, &v) in emb.iter().enumerate() {
+            data[[i, j]] = f64::from(v);
+        }
+    }
+    let dataset = linfa::DatasetBase::from(data.view());
+
+    // 3. Pick k. Either explicit or elbow-penalized search.
+    let actual_k_max = k_max.min(n_claims);
+    let chosen_k = if let Some(k) = request.k {
+        if k == 0 || k > n_claims {
+            return Err(ApiError::BadRequest {
+                message: format!("k must be in 1..={n_claims}"),
+            });
+        }
+        k
+    } else {
+        let mut best_k = k_min;
+        let mut best_score = f64::NEG_INFINITY;
+        for k in k_min..=actual_k_max {
+            let model = KMeans::params(k)
+                .max_n_iterations(100)
+                .tolerance(1e-4)
+                .fit(&dataset)
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("k-means fit failed at k={k}: {e}"),
+                })?;
+            let labels: Vec<usize> = model.predict(&dataset).iter().copied().collect();
+            let centroids = model.centroids();
+            let mut total_dist = 0.0;
+            for (i, label) in labels.iter().enumerate() {
+                let centroid = centroids.row(*label);
+                let point = data.row(i);
+                let dist: f64 = point
+                    .iter()
+                    .zip(centroid.iter())
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum();
+                total_dist += dist;
+            }
+            let inertia = -total_dist / n_claims as f64;
+            // Elbow penalty: discourage runaway k.
+            let penalized = inertia * (1.0 - 0.05 * k as f64);
+            if penalized > best_score {
+                best_score = penalized;
+                best_k = k;
+            }
+        }
+        best_k
+    };
+
+    // 4. Final fit at chosen_k.
+    let model = KMeans::params(chosen_k)
+        .max_n_iterations(200)
+        .tolerance(1e-5)
+        .fit(&dataset)
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Final k-means fit failed at k={chosen_k}: {e}"),
+        })?;
+    let labels: Vec<usize> = model.predict(&dataset).iter().copied().collect();
+    let centroids = model.centroids();
+
+    // 5. Persist: theme per cluster, then bulk-assign claim_ids.
+    let mut themes_created = 0_usize;
+    let mut claims_assigned = 0_usize;
+
+    for cluster_idx in 0..chosen_k {
+        let cluster_claim_ids: Vec<Uuid> = labels
+            .iter()
+            .enumerate()
+            .filter(|(_, &l)| l == cluster_idx)
+            .map(|(i, _)| rows[i].0)
+            .collect();
+
+        if cluster_claim_ids.len() < min_claims {
+            continue;
+        }
+
+        let theme_label = format!("{label_prefix}-{cluster_idx:02}");
+        let theme_description = format!(
+            "Auto-built from {} claims by k-means at k={} (1536d embedding)",
+            cluster_claim_ids.len(),
+            chosen_k,
+        );
+        let theme = epigraph_db::ClaimThemeRepository::create(
+            &state.db_pool,
+            &theme_label,
+            &theme_description,
+        )
+        .await?;
+
+        let centroid_row = centroids.row(cluster_idx);
+        let centroid_str = format!(
+            "[{}]",
+            centroid_row
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        epigraph_db::ClaimThemeRepository::set_centroid(
+            &state.db_pool,
+            theme.id,
+            &centroid_str,
+        )
+        .await?;
+
+        let assigned = epigraph_db::ClaimThemeRepository::bulk_assign(
+            &state.db_pool,
+            &cluster_claim_ids,
+            theme.id,
+        )
+        .await?;
+        epigraph_db::ClaimThemeRepository::update_count(
+            &state.db_pool,
+            theme.id,
+            assigned as i32,
+        )
+        .await?;
+
+        themes_created += 1;
+        claims_assigned += assigned as usize;
+    }
+
+    Ok(Json(serde_json::json!({
+        "themes_created": themes_created,
+        "claims_assigned": claims_assigned,
+        "k_used": chosen_k,
+        "claims_with_embeddings": n_claims,
+        "centroid_dim": dim,
+    })))
+}
+
+#[cfg(not(feature = "db"))]
+pub async fn build_themes_from_corpus(
+    State(_state): State<AppState>,
+    _auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Json(_request): Json<BuildThemesFromCorpusRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Build themes requires database".to_string(),
+    })
+}
+
+// =============================================================================
 // THEME MAINTENANCE: ASSIGN UNTHEMED
 // =============================================================================
 
@@ -1522,4 +1780,70 @@ pub async fn create_theme_with_centroid(
     Err(ApiError::ServiceUnavailable {
         service: "Create theme requires database".to_string(),
     })
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "db"))]
+mod tests {
+    use super::*;
+    use crate::state::{AppState, ApiConfig};
+
+    async fn try_test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect(&url)
+            .await
+            .ok()?;
+        sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
+        Some(pool)
+    }
+
+    macro_rules! test_pool_or_skip {
+        () => {{
+            match try_test_pool().await {
+                Some(p) => p,
+                None => {
+                    eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
+                    return;
+                }
+            }
+        }};
+    }
+
+    /// Empty-corpus path: when no claim has an embedding, build-from-corpus
+    /// returns 0 themes and 0 assigned with a `skipped_reason`. This is the
+    /// path operators hit on a fresh deployment before any document has
+    /// been ingested + embedded; it must succeed (200), not error.
+    #[tokio::test]
+    async fn build_themes_from_corpus_empty_corpus_returns_zero_themes() {
+        let pool = test_pool_or_skip!();
+        // Clear any prior claims to make the empty-corpus assertion stable.
+        let _ = sqlx::query("UPDATE claims SET embedding = NULL")
+            .execute(&pool)
+            .await;
+
+        let state = AppState::with_db(pool, ApiConfig::default());
+        let result = build_themes_from_corpus(
+            axum::extract::State(state),
+            None,
+            axum::Json(BuildThemesFromCorpusRequest {
+                k: None,
+                k_min: Some(2),
+                k_max: Some(4),
+                min_claims_per_theme: None,
+                limit: Some(100),
+                label_prefix: None,
+                wipe_first: Some(false),
+            }),
+        )
+        .await
+        .expect("build-from-corpus must succeed on empty corpus");
+
+        let body = result.0;
+        assert_eq!(body["themes_created"], serde_json::json!(0));
+        assert_eq!(body["claims_assigned"], serde_json::json!(0));
+        assert!(body.get("skipped_reason").is_some());
+    }
 }
