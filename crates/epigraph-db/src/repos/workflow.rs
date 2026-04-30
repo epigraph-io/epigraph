@@ -324,12 +324,12 @@ impl WorkflowRepository {
         query: &str,
         limit: i64,
     ) -> Result<Vec<HierarchicalWorkflowRow>, sqlx::Error> {
-        let pattern = format!("%{query}%");
+        let pattern = format!("%{}%", query.trim());
         sqlx::query_as::<_, HierarchicalWorkflowRow>(
             "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at \
              FROM workflows \
              WHERE goal ILIKE $1 OR canonical_name ILIKE $1 \
-             ORDER BY created_at DESC \
+             ORDER BY created_at DESC, id ASC \
              LIMIT $2",
         )
         .bind(&pattern)
