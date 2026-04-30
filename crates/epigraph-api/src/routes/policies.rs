@@ -7,7 +7,17 @@
 //!
 //! Reference implementation: `epigraph-nano/src/persistence.rs:7332-7530`.
 
+#[cfg(feature = "db")]
+use axum::{
+    extract::{Query, State},
+    Json,
+};
 use serde::Deserialize;
+#[cfg(feature = "db")]
+use uuid::Uuid;
+
+#[cfg(feature = "db")]
+use crate::{errors::ApiError, AppState};
 
 #[derive(Debug, Deserialize)]
 pub struct ListPoliciesQuery {
@@ -34,4 +44,160 @@ pub struct CreateChallengeRequest {
 #[derive(Debug, Deserialize)]
 pub struct ResolveChallengeRequest {
     pub approved: bool,
+}
+
+/// GET /api/v1/policies/network — list active network-access policies.
+#[cfg(feature = "db")]
+pub async fn list_network_policies(
+    State(state): State<AppState>,
+    Query(params): Query<ListPoliciesQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let min_truth = params.min_truth.clamp(0.0, 1.0);
+    let rows: Vec<(Uuid, f64, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, truth_value, properties \
+         FROM claims \
+         WHERE 'policy:active' = ANY(labels) \
+           AND 'policy:network' = ANY(labels) \
+           AND truth_value >= $1 \
+         ORDER BY truth_value DESC",
+    )
+    .bind(min_truth)
+    .fetch_all(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to list policies: {e}"),
+    })?;
+
+    let policies: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, truth_value, properties)| {
+            serde_json::json!({
+                "claim_id": id,
+                "host": properties.get("host"),
+                "port": properties.get("port"),
+                "protocol": properties.get("protocol"),
+                "truth_value": truth_value,
+                "decay_exempt": properties.get("decay_exempt").and_then(|v| v.as_bool()).unwrap_or(false),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "policies": policies })))
+}
+
+#[cfg(all(test, feature = "db"))]
+mod tests {
+    use super::*;
+    use crate::state::{ApiConfig, AppState};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    // ── Test scaffolding ──
+
+    /// Build a minimal AppState backed by the given pool.
+    fn test_state(pool: PgPool) -> AppState {
+        AppState::with_db(pool, ApiConfig::default())
+    }
+
+    /// Build a router exposing just the policy list route under test.
+    fn policy_router(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/policies/network",
+                get(list_network_policies),
+            )
+            .with_state(state)
+    }
+
+    /// Insert a system agent (mirrors `get_or_create_system_agent` but without
+    /// going through the public API) and return its id.
+    async fn ensure_system_agent(pool: &PgPool) -> Uuid {
+        let pub_key = vec![0u8; 32];
+        if let Some(id) = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM agents WHERE public_key = $1",
+        )
+        .bind(&pub_key)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            return id;
+        }
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(&pub_key)
+        .bind("api-system-test")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Insert a claim labeled `policy:active` + `policy:network` with the
+    /// given network attributes in `properties`.
+    async fn seed_policy(
+        pool: &PgPool,
+        host: &str,
+        port: i64,
+        protocol: &str,
+        truth: f64,
+        decay_exempt: bool,
+    ) -> Uuid {
+        let agent_id = ensure_system_agent(pool).await;
+        let content = format!("policy:network {host}:{port}/{protocol}");
+        let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties) \
+             VALUES ($1, $2, $3, $4, ARRAY['policy:active','policy:network'], $5) RETURNING id",
+        )
+        .bind(&content)
+        .bind(content_hash.as_slice())
+        .bind(agent_id)
+        .bind(truth)
+        .bind(serde_json::json!({
+            "host": host,
+            "port": port,
+            "protocol": protocol,
+            "decay_exempt": decay_exempt,
+        }))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn parse_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ── Tests ──
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_network_policies_returns_active_policies_above_min_truth(pool: PgPool) {
+        seed_policy(&pool, "example.com", 443, "https", 0.92, false).await;
+        seed_policy(&pool, "blocked.com", 443, "https", 0.10, false).await;
+        let state = test_state(pool.clone());
+
+        let router = policy_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/policies/network?min_truth=0.5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = parse_body(response).await;
+        let policies = body["policies"].as_array().unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0]["host"], "example.com");
+    }
 }
