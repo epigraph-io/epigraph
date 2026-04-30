@@ -23,8 +23,8 @@ async fn run_theme_neighborhoods_seeds_two_neighborhoods_per_theme() {
     common::reset_neighborhood_tables(&pool).await;
 
     // Seed: one theme T with 6 atoms split into two clearly-separated SUPPORTS
-    // cliques (a-b-c, d-e-f), one weak cross-edge a→d, and one "near-standalone"
-    // claim s that is connected to atoms[0] so it merges into clique 1.
+    // cliques (a-b-c, d-e-f), one weak cross-edge a→d, and one truly-standalone
+    // claim s with no edges in either direction (forms its own singleton).
     // See common::seed_two_clique_theme for the full topology comment.
     let (run_id, theme_id, _atoms, _standalone) =
         common::seed_two_clique_theme(&pool).await;
@@ -32,16 +32,23 @@ async fn run_theme_neighborhoods_seeds_two_neighborhoods_per_theme() {
     // Pass Some(&[theme_id]) to scope the run to just this test theme.
     // This avoids processing the ~68 real themes already in the live DB,
     // which would take many minutes and produce cross-run noise in assertions.
+    // Set skip_threshold_nodes/edges to 0 so Louvain always runs even on this
+    // small fixture (production defaults are 50 nodes / 10 edges).
     epigraph_jobs::cluster_graph::neighborhood::run_theme_neighborhoods(
         &pool,
         run_id,
-        &epigraph_jobs::cluster_graph::neighborhood::Config { resolution: 1.0 },
+        &epigraph_jobs::cluster_graph::neighborhood::Config {
+            resolution: 1.0,
+            skip_threshold_nodes: 0,
+            skip_threshold_edges: 0,
+        },
         Some(&[theme_id]),
     )
     .await
     .unwrap();
 
-    // Expect exactly 2 neighborhoods whose sizes sum to 7.
+    // Expect exactly 3 neighborhoods: clique-a-b-c, clique-d-e-f, singleton-s.
+    // Total size = 7 (6 atoms + 1 standalone).
     let neighborhoods: Vec<(Uuid, i32)> = sqlx::query_as(
         "SELECT id, size FROM graph_neighborhoods
          WHERE run_id = $1 AND theme_id = $2
@@ -53,7 +60,7 @@ async fn run_theme_neighborhoods_seeds_two_neighborhoods_per_theme() {
     .await
     .unwrap();
 
-    assert_eq!(neighborhoods.len(), 2, "expected exactly 2 neighborhoods");
+    assert_eq!(neighborhoods.len(), 3, "expected 3 neighborhoods: two cliques + singleton");
     let total_size: i32 = neighborhoods.iter().map(|(_, s)| *s).sum();
     assert_eq!(total_size, 7, "all 6 atoms + 1 standalone in some neighborhood");
 
