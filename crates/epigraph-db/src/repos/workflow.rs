@@ -41,6 +41,18 @@ pub struct WorkflowListRow {
     pub properties: serde_json::Value,
 }
 
+/// Row type returned by `WorkflowRepository::search_hierarchical_by_text`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HierarchicalWorkflowRow {
+    pub id: Uuid,
+    pub canonical_name: String,
+    pub generation: i32,
+    pub goal: String,
+    pub parent_id: Option<Uuid>,
+    pub metadata: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
@@ -299,6 +311,32 @@ impl WorkflowRepository {
 
         Ok(root.map(|(id,)| id).unwrap_or(workflow_id))
     }
+
+    /// Search hierarchical workflows by free-text query against `goal` and
+    /// `canonical_name`. ILIKE pattern; ranks newest first by `created_at`.
+    ///
+    /// Used by `GET /api/v1/workflows/hierarchical/search`.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn search_hierarchical_by_text(
+        pool: &PgPool,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<HierarchicalWorkflowRow>, sqlx::Error> {
+        let pattern = format!("%{query}%");
+        sqlx::query_as::<_, HierarchicalWorkflowRow>(
+            "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at \
+             FROM workflows \
+             WHERE goal ILIKE $1 OR canonical_name ILIKE $1 \
+             ORDER BY created_at DESC \
+             LIMIT $2",
+        )
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -375,5 +413,50 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_hierarchical_by_text_returns_matches(pool: sqlx::PgPool) {
+        WorkflowRepository::insert_root(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "data-pipeline-v1",
+            0,
+            "Process incoming sensor data and write to warehouse.",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        WorkflowRepository::insert_root(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "deploy-canary",
+            0,
+            "Deploy a canary release safely.",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        let hits = WorkflowRepository::search_hierarchical_by_text(&pool, "sensor", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].canonical_name, "data-pipeline-v1");
+
+        // canonical_name match also works
+        let hits = WorkflowRepository::search_hierarchical_by_text(&pool, "deploy-canary", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].canonical_name, "deploy-canary");
+
+        // limit respected
+        let hits = WorkflowRepository::search_hierarchical_by_text(&pool, "%", 1)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }
