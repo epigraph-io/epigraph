@@ -3,13 +3,14 @@
 //! names (phases/steps/operations) and workflow-specific source metadata
 //! (canonical_name, generation, parent_canonical_name).
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::common::schema::{AuthorEntry, ClaimRelationship, ThesisDerivation};
 use crate::document::schema::default_confidence;
 
 /// Top-level extraction result from a workflow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowExtraction {
     pub source: WorkflowSource,
     #[serde(default)]
@@ -23,7 +24,7 @@ pub struct WorkflowExtraction {
 }
 
 /// Metadata about the workflow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowSource {
     /// Required slug; drives the deterministic root ID.
     pub canonical_name: String,
@@ -44,7 +45,7 @@ pub struct WorkflowSource {
 }
 
 /// A phase within a workflow (analog of `document::schema::Section`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Phase {
     pub title: String,
     #[serde(default)]
@@ -56,7 +57,7 @@ pub struct Phase {
 /// A step within a phase (analog of `document::schema::Paragraph`).
 /// Paper-specific fields (methodology, evidence_type, page, instruments_used,
 /// reagents_involved, conditions) are intentionally absent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Step {
     pub compound: String,
     #[serde(default)]
