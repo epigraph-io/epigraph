@@ -587,6 +587,7 @@ pub async fn report_outcome(
         deviation_count,
         total_steps,
         created_at: chrono::Utc::now(),
+        step_claim_id: None,
     };
 
     if let Err(e) = epigraph_db::BehavioralExecutionRepository::create(
@@ -612,6 +613,143 @@ pub async fn report_outcome(
         "variance": variance,
         "total_uses": use_count,
         "success_rate": success_rate,
+    })))
+}
+
+/// POST /api/v1/workflows/hierarchical/:id/outcome - Report execution outcome
+/// for a hierarchical workflow (one whose root lives in the `workflows` table).
+///
+/// Updates `workflows.metadata` counters (use_count, success_count, failure_count,
+/// avg_variance) and writes per-step `behavioral_executions` rows with
+/// `step_claim_id` populated for each step in `step_executions`.
+///
+/// Returns 404 if the id does not correspond to a `workflows` row. Use
+/// `POST /api/v1/workflows/:id/outcome` for flat-JSON workflows.
+#[cfg(feature = "db")]
+pub async fn report_hierarchical_outcome(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<Uuid>,
+    Json(request): Json<ReportOutcomeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // 1. Confirm this is a hierarchical workflow root
+    let row: Option<(serde_json::Value,)> =
+        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1")
+            .bind(workflow_id)
+            .fetch_optional(&state.db_pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("workflows lookup failed: {e}"),
+            })?;
+    let mut metadata = match row {
+        Some((m,)) => m,
+        None => {
+            return Err(ApiError::NotFound {
+                entity: "hierarchical workflow".into(),
+                id: workflow_id.to_string(),
+            });
+        }
+    };
+
+    // 2. Compute deltas
+    let success = request.success;
+    let variance = request.step_executions.as_ref().map_or(0.0, |steps| {
+        if steps.is_empty() {
+            0.0
+        } else {
+            let dev = steps.iter().filter(|s| s.deviated).count();
+            dev as f64 / steps.len() as f64
+        }
+    });
+    let quality = request.quality.unwrap_or(if success { 1.0 } else { 0.0 });
+
+    // 3. Update metadata counters
+    let use_count = metadata.get("use_count").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+    let success_count = metadata
+        .get("success_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        + i64::from(success);
+    let failure_count = metadata
+        .get("failure_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        + i64::from(!success);
+    let prev_avg_var = metadata
+        .get("avg_variance")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let avg_variance = if use_count > 0 {
+        (prev_avg_var * (use_count - 1) as f64 + variance) / use_count as f64
+    } else {
+        variance
+    };
+    metadata["use_count"] = serde_json::json!(use_count);
+    metadata["success_count"] = serde_json::json!(success_count);
+    metadata["failure_count"] = serde_json::json!(failure_count);
+    metadata["avg_variance"] = serde_json::json!(avg_variance);
+
+    sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
+        .bind(&metadata)
+        .bind(workflow_id)
+        .execute(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("metadata update failed: {e}"),
+        })?;
+
+    // 4. Resolve step_index → step_claim_id via the workflow's executes edges,
+    //    sorted by claim level=2 (steps), in plan order. Plan order is the
+    //    insertion order of `executes` edges; we use edges.created_at as proxy.
+    let step_claims: Vec<(i32, Uuid)> = sqlx::query_as(
+        "SELECT (c.properties->>'level')::int AS level, c.id \
+         FROM edges e \
+         JOIN claims c ON c.id = e.target_id \
+         WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
+         ORDER BY e.created_at ASC, c.id ASC",
+    )
+    .bind(workflow_id)
+    .fetch_all(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("step lookup failed: {e}"),
+    })?;
+    let step_claim_ids: Vec<Uuid> = step_claims.into_iter().map(|(_, id)| id).collect();
+
+    // 5. Write per-step behavioral_executions rows
+    if let Some(ref step_execs) = request.step_executions {
+        for step_exec in step_execs {
+            let step_claim_id = step_claim_ids.get(step_exec.step_index).copied();
+            let step_beliefs = serde_json::json!({
+                "deviated": step_exec.deviated,
+                "deviation_reason": step_exec.deviation_reason,
+            });
+            let row = epigraph_db::BehavioralExecutionRow {
+                id: Uuid::new_v4(),
+                workflow_id,
+                goal_text: request
+                    .goal_text
+                    .clone()
+                    .unwrap_or_else(|| String::from("hierarchical")),
+                success,
+                step_beliefs,
+                tool_pattern: vec![step_exec.planned.clone()],
+                quality: Some(quality),
+                deviation_count: i32::from(step_exec.deviated),
+                total_steps: 1,
+                created_at: chrono::Utc::now(),
+                step_claim_id,
+            };
+            let _ = epigraph_db::BehavioralExecutionRepository::create(&state.db_pool, row, None)
+                .await;
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "workflow_id": workflow_id,
+        "use_count": use_count,
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "variance": variance,
     })))
 }
 
@@ -869,6 +1007,7 @@ pub async fn record_behavioral_execution(
         deviation_count: body.deviation_count,
         total_steps: body.total_steps,
         created_at: chrono::Utc::now(),
+        step_claim_id: None,
     };
 
     let created = epigraph_db::BehavioralExecutionRepository::create(
@@ -1403,5 +1542,100 @@ mod tests {
             Some(false),
             "first ingest must not be a no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn report_hierarchical_outcome_updates_workflow_metadata() {
+        let pool = match try_test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Seed a hierarchical workflow directly via the DB layer so we don't depend on
+        // the full HTTP ingest flow inside this test.
+        let workflow_id = uuid::Uuid::new_v4();
+        epigraph_db::WorkflowRepository::insert_root(
+            &pool,
+            workflow_id,
+            "outcome-test",
+            0,
+            "Test workflow for outcome reporting.",
+            None,
+            serde_json::json!({"use_count": 0, "success_count": 0, "failure_count": 0, "avg_variance": 0.0}),
+        )
+        .await
+        .unwrap();
+
+        // Build a minimal axum app with just the outcome route.
+        use crate::state::{AppState, ApiConfig};
+        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/:id/outcome",
+                axum::routing::post(report_hierarchical_outcome),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "success": true,
+            "outcome_details": "ok",
+            "step_executions": []
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/v1/workflows/hierarchical/{workflow_id}/outcome"))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let metadata: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata FROM workflows WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(metadata["use_count"], 1);
+        assert_eq!(metadata["success_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn report_hierarchical_outcome_404s_on_unknown_id() {
+        let pool = match try_test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+
+        use crate::state::{AppState, ApiConfig};
+        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/:id/outcome",
+                axum::routing::post(report_hierarchical_outcome),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({"success": true, "outcome_details": "ok"});
+        let unknown = uuid::Uuid::new_v4();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/v1/workflows/hierarchical/{unknown}/outcome"))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
