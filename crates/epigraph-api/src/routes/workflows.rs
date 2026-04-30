@@ -1136,6 +1136,30 @@ pub async fn ingest_workflow(
     .await
     .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
 
+    // ── 3a. variant_of edge: new generation —variant_of→ parent ──────────
+    // Mirrors the claims.derived_from + derived_from edge redundancy: the
+    // workflows.parent_id FK records lineage in the table, and the edge row
+    // makes the same lineage visible to graph-traversal queries that don't
+    // know about the workflows table.
+    if let Some(parent_workflow_id) = parent_id {
+        EdgeRepository::create_if_not_exists(
+            pool,
+            workflow_id,
+            "workflow",
+            parent_workflow_id,
+            "workflow",
+            "variant_of",
+            Some(serde_json::json!({
+                "generation_from": generation - 1,
+                "generation_to": generation,
+            })),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
+    }
+
     // ── 4. Author agents ─────────────────────────────────────────────────
     let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
     for (idx, author) in extraction.source.authors.iter().enumerate() {
@@ -1431,6 +1455,73 @@ mod tests {
             Some(false),
             "first ingest must not be a no-op"
         );
+    }
+
+    /// HTTP path: ingesting a gen=1 workflow whose parent_canonical_name points at
+    /// an existing gen=0 workflow must write a workflow→workflow `variant_of` edge.
+    /// Regression guard for #51 on the API surface (mirror of the MCP test in
+    /// epigraph-mcp::tools::workflow_ingest).
+    #[tokio::test]
+    async fn ingest_workflow_http_writes_variant_of_edge() {
+        let pool = test_pool_or_skip!();
+        let app = test_router(pool.clone());
+
+        let canonical = "http-variant-of-test";
+
+        // gen=0
+        let gen0_body = serde_json::to_vec(&ingest_payload(canonical)).unwrap();
+        let resp0 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/workflows/ingest")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(gen0_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp0.status(), StatusCode::OK);
+        let bytes0 = axum::body::to_bytes(resp0.into_body(), usize::MAX).await.unwrap();
+        let json0 = parse_body(&bytes0);
+        let gen0_id = uuid::Uuid::parse_str(json0["workflow_id"].as_str().unwrap()).unwrap();
+
+        // gen=1, parent_canonical_name = canonical
+        let mut gen1_payload = ingest_payload(canonical);
+        gen1_payload["source"]["generation"] = serde_json::json!(1);
+        gen1_payload["source"]["parent_canonical_name"] = serde_json::json!(canonical);
+        let gen1_body = serde_json::to_vec(&gen1_payload).unwrap();
+        let resp1 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/workflows/ingest")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(gen1_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let bytes1 = axum::body::to_bytes(resp1.into_body(), usize::MAX).await.unwrap();
+        let json1 = parse_body(&bytes1);
+        let gen1_id = uuid::Uuid::parse_str(json1["workflow_id"].as_str().unwrap()).unwrap();
+        assert_ne!(gen0_id, gen1_id);
+
+        // Exactly one variant_of edge gen1 → gen0.
+        let edge_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges \
+             WHERE source_id = $1 AND source_type = 'workflow' \
+               AND target_id = $2 AND target_type = 'workflow' \
+               AND relationship = 'variant_of'",
+        )
+        .bind(gen1_id)
+        .bind(gen0_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(edge_count, 1, "expected one variant_of edge gen1→gen0");
     }
 
     #[tokio::test]

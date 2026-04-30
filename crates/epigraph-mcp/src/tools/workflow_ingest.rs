@@ -110,6 +110,30 @@ pub async fn do_ingest_workflow_via_pool(
     .await
     .map_err(internal_error)?;
 
+    // ── 3a. variant_of edge: new generation —variant_of→ parent ──────────
+    // Mirrors the claims.derived_from + derived_from edge redundancy: the
+    // workflows.parent_id FK records lineage in the table, and the edge row
+    // makes the same lineage visible to graph-traversal queries that don't
+    // know about the workflows table.
+    if let Some(parent_workflow_id) = parent_id {
+        EdgeRepository::create_if_not_exists(
+            pool,
+            workflow_id,
+            "workflow",
+            parent_workflow_id,
+            "workflow",
+            "variant_of",
+            Some(serde_json::json!({
+                "generation_from": generation - 1,
+                "generation_to": generation,
+            })),
+            None,
+            None,
+        )
+        .await
+        .map_err(internal_error)?;
+    }
+
     // ── 4. Ensure author agents ──────────────────────────────────────────
     let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
     for (idx, author) in extraction.source.authors.iter().enumerate() {
@@ -520,5 +544,120 @@ mod tests {
             "DB edge count must match reported executes_edges"
         );
         assert!(db_count > 0, "must have at least one executes edge");
+    }
+
+    /// Build a `WorkflowExtraction` whose every claim text is uniquely seeded
+    /// so it cannot collide with other tests on the `(content_hash, agent_id)`
+    /// uniqueness constraint when the suite is run end-to-end against a shared
+    /// DB. Compound IDs are seeded by `canonical_name` and atom IDs are
+    /// content-addressed; both must be distinct across tests.
+    fn unique_extraction(seed: &str) -> WorkflowExtraction {
+        WorkflowExtraction {
+            source: WorkflowSource {
+                canonical_name: format!("test-wf-{seed}"),
+                goal: format!("Goal for {seed}"),
+                generation: 0,
+                parent_canonical_name: None,
+                authors: vec![],
+                expected_outcome: None,
+                tags: vec![],
+                metadata: serde_json::json!({}),
+            },
+            thesis: Some(format!("Thesis for {seed}")),
+            thesis_derivation: epigraph_ingest::common::schema::ThesisDerivation::TopDown,
+            phases: vec![Phase {
+                title: format!("Phase {seed}"),
+                summary: format!("Phase summary {seed}"),
+                steps: vec![Step {
+                    compound: format!("Step compound {seed}"),
+                    rationale: format!("Step rationale {seed}"),
+                    operations: vec![format!("op-a-{seed}"), format!("op-b-{seed}")],
+                    generality: vec![2, 1],
+                    confidence: 0.9,
+                }],
+            }],
+            relationships: vec![],
+        }
+    }
+
+    /// variant_of edge: ingesting a gen=1 workflow with parent_canonical_name
+    /// set must write a single workflow→workflow `variant_of` edge from the new
+    /// generation back to the parent.
+    #[tokio::test]
+    async fn ingest_workflow_writes_variant_of_edge() {
+        let pool = test_pool_or_skip!();
+        let canonical = "variant-of";
+
+        // gen=0
+        let mut gen0 = unique_extraction("variant-of-gen0");
+        gen0.source.canonical_name = format!("test-wf-{canonical}");
+        let r0 = do_ingest_workflow_via_pool(&pool, &gen0)
+            .await
+            .expect("gen=0 ingest");
+        let gen0_id = Uuid::parse_str(&r0.workflow_id).expect("valid uuid");
+
+        // gen=1, parent_canonical_name pointing at gen=0
+        let mut gen1 = unique_extraction("variant-of-gen1");
+        gen1.source.canonical_name = format!("test-wf-{canonical}");
+        gen1.source.generation = 1;
+        gen1.source.parent_canonical_name = Some(format!("test-wf-{canonical}"));
+        let r1 = do_ingest_workflow_via_pool(&pool, &gen1)
+            .await
+            .expect("gen=1 ingest");
+        let gen1_id = Uuid::parse_str(&r1.workflow_id).expect("valid uuid");
+
+        assert_ne!(gen0_id, gen1_id, "different generations must have distinct ids");
+
+        // Exactly one variant_of edge from gen1 → gen0.
+        let edge_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges \
+             WHERE source_id = $1 AND source_type = 'workflow' \
+               AND target_id = $2 AND target_type = 'workflow' \
+               AND relationship = 'variant_of'",
+        )
+        .bind(gen1_id)
+        .bind(gen0_id)
+        .fetch_one(&pool)
+        .await
+        .expect("variant_of count");
+        assert_eq!(edge_count, 1, "expected exactly one variant_of edge gen1→gen0");
+
+        // Re-ingest gen=1 must not duplicate the variant_of edge.
+        let r1b = do_ingest_workflow_via_pool(&pool, &gen1)
+            .await
+            .expect("gen=1 re-ingest");
+        assert!(r1b.already_ingested, "second ingest should be a no-op");
+        let edge_count_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges \
+             WHERE source_id = $1 AND target_id = $2 AND relationship = 'variant_of'",
+        )
+        .bind(gen1_id)
+        .bind(gen0_id)
+        .fetch_one(&pool)
+        .await
+        .expect("variant_of count after");
+        assert_eq!(edge_count_after, 1, "re-ingest must not duplicate variant_of");
+    }
+
+    /// gen=0 (no parent) must NOT write a variant_of edge.
+    #[tokio::test]
+    async fn ingest_workflow_gen0_no_variant_of_edge() {
+        let pool = test_pool_or_skip!();
+        let extraction = unique_extraction("no-variant-of-gen0");
+
+        let result = do_ingest_workflow_via_pool(&pool, &extraction)
+            .await
+            .expect("gen=0 ingest");
+        let wf_id = Uuid::parse_str(&result.workflow_id).expect("valid uuid");
+
+        let edge_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges \
+             WHERE source_id = $1 AND relationship = 'variant_of'",
+        )
+        .bind(wf_id)
+        .fetch_one(&pool)
+        .await
+        .expect("variant_of count");
+        assert_eq!(edge_count, 0, "gen=0 must not have a variant_of edge");
     }
 }
