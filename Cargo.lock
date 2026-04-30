@@ -1422,6 +1422,7 @@ name = "epigraph-ingest"
 version = "0.3.0"
 dependencies = [
  "blake3",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
