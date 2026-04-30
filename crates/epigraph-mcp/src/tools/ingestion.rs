@@ -662,6 +662,15 @@ pub async fn do_ingest_document(
             .copied()
             .unwrap_or(edge.target_id);
 
+        // Filter self-loops introduced by content-hash dedup collapsing
+        // distinct planned UUIDs (e.g. compound paragraph and its sole
+        // atom that share text) onto the same persisted claim. The
+        // semantically correct outcome is a no-op decomposition; the DB
+        // would otherwise reject this with edges_no_self_loop.
+        if src == tgt && src_type == edge.target_type {
+            continue;
+        }
+
         EdgeRepository::create_if_not_exists(
             pool,
             src,
