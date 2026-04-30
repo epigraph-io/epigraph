@@ -700,8 +700,8 @@ pub async fn report_hierarchical_outcome(
     // 4. Resolve step_index → step_claim_id via the workflow's executes edges,
     //    sorted by claim level=2 (steps), in plan order. Plan order is the
     //    insertion order of `executes` edges; we use edges.created_at as proxy.
-    let step_claims: Vec<(i32, Uuid)> = sqlx::query_as(
-        "SELECT (c.properties->>'level')::int AS level, c.id \
+    let step_claim_rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT c.id \
          FROM edges e \
          JOIN claims c ON c.id = e.target_id \
          WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
@@ -713,12 +713,22 @@ pub async fn report_hierarchical_outcome(
     .map_err(|e| ApiError::InternalError {
         message: format!("step lookup failed: {e}"),
     })?;
-    let step_claim_ids: Vec<Uuid> = step_claims.into_iter().map(|(_, id)| id).collect();
+    let step_claim_ids: Vec<Uuid> = step_claim_rows.into_iter().map(|(id,)| id).collect();
 
-    // 5. Write per-step behavioral_executions rows
+    // 5. Write per-step behavioral_executions rows. Capture timestamp once so
+    //    rows from a single outcome report group cleanly downstream.
+    let report_ts = chrono::Utc::now();
     if let Some(ref step_execs) = request.step_executions {
         for step_exec in step_execs {
             let step_claim_id = step_claim_ids.get(step_exec.step_index).copied();
+            if step_claim_id.is_none() && !step_claim_ids.is_empty() {
+                tracing::warn!(
+                    workflow_id = %workflow_id,
+                    step_index = step_exec.step_index,
+                    known_steps = step_claim_ids.len(),
+                    "step_index out of range; behavioral_executions row will have NULL step_claim_id"
+                );
+            }
             let step_beliefs = serde_json::json!({
                 "deviated": step_exec.deviated,
                 "deviation_reason": step_exec.deviation_reason,
@@ -736,11 +746,14 @@ pub async fn report_hierarchical_outcome(
                 quality: Some(quality),
                 deviation_count: i32::from(step_exec.deviated),
                 total_steps: 1,
-                created_at: chrono::Utc::now(),
+                created_at: report_ts,
                 step_claim_id,
             };
-            let _ = epigraph_db::BehavioralExecutionRepository::create(&state.db_pool, row, None)
-                .await;
+            if let Err(e) =
+                epigraph_db::BehavioralExecutionRepository::create(&state.db_pool, row, None).await
+            {
+                tracing::warn!(workflow_id = %workflow_id, "behavioral_executions write failed: {e}");
+            }
         }
     }
 
