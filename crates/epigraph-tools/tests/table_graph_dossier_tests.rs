@@ -5,6 +5,7 @@ mod types;
 
 use dossier::collect_ddl;
 use dossier::collect_git_context;
+use dossier::collect_call_sites;
 
 #[test]
 fn ddl_for_claims_includes_create_table() {
@@ -26,4 +27,18 @@ fn git_context_for_claims_returns_some_commits() {
     let n = shas.len();
     shas.dedup();
     assert_eq!(shas.len(), n, "duplicate SHAs in commit list");
+}
+
+#[test]
+fn finds_claim_repo_call_sites() {
+    let sites = collect_call_sites("/home/jeremy/epigraph", "claims").unwrap();
+    assert!(!sites.is_empty(), "claims should have many call sites");
+    assert!(
+        sites.iter().any(|s| s.crate_name == "epigraph-db" || s.crate_name == "epigraph-api"),
+        "expected db or api crate among call sites"
+    );
+    for s in &sites {
+        assert!(!s.function.is_empty(), "function name must be filled");
+        assert!(!s.function.contains(':'), "function should be ident, not file:line");
+    }
 }
