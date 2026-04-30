@@ -892,7 +892,7 @@ pub async fn record_behavioral_execution(
 // ── Internal helpers ──
 
 #[cfg(feature = "db")]
-async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, ApiError> {
+pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, ApiError> {
     let pub_key = [0u8; 32];
     if let Some(a) = epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key)
         .await
