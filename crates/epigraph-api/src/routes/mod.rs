@@ -600,6 +600,18 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/policies/decay-sweep",
             post(policies::decay_sweep),
         )
+        .route(
+            "/api/v1/policy-challenges",
+            post(policies::create_challenge),
+        )
+        .route(
+            "/api/v1/policy-challenges/:id",
+            get(policies::get_challenge),
+        )
+        .route(
+            "/api/v1/policy-challenges/:id/resolve",
+            post(policies::resolve_challenge),
+        )
         .route("/api/v1/methods/search", get(experiments::find_methods))
         .route(
             "/api/v1/methods/gap-analysis",
