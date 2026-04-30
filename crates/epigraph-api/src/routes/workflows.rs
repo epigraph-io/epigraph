@@ -1060,237 +1060,21 @@ pub async fn record_behavioral_execution(
 
 /// POST /api/v1/workflows/ingest - Ingest a hierarchical `WorkflowExtraction`.
 ///
-/// Parses a `WorkflowExtraction` JSON body, persists the claim hierarchy
-/// (thesis → phases → steps → operation atoms), writes `workflow —executes→ claim`
-/// edges, resolves author-placeholder edges, and returns a summary. Idempotent:
-/// if the workflow row already has `executes` edges, returns `already_ingested: true`
-/// without touching the DB further.
+/// Thin HTTP wrapper over
+/// `epigraph_ingest_executor::workflow::ingest_workflow`. The flow used to
+/// be inlined here and step-for-step duplicated by the MCP tool surface;
+/// both now share the executor crate (#44).
 #[cfg(feature = "db")]
 pub async fn ingest_workflow(
     State(state): State<AppState>,
     Json(extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use std::collections::HashMap;
-    use epigraph_core::{AgentId, TruthValue};
-    use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, WorkflowRepository};
-    use epigraph_ingest::workflow::builder::root_workflow_id;
-
-    let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
-    let pool = &state.db_pool;
-
-    let canonical_name = &extraction.source.canonical_name;
-    let generation = extraction.source.generation as i32;
-    let goal = &extraction.source.goal;
-    let workflow_id = root_workflow_id(&extraction);
-
-    // ── 1. Idempotency gate ──────────────────────────────────────────────
-    if let Some(existing_id) = WorkflowRepository::find_root_by_canonical(pool, canonical_name, generation)
-        .await
-        .map_err(|e| ApiError::InternalError { message: e.to_string() })?
-    {
-        let edge_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM edges \
-             WHERE source_id = $1 AND source_type = 'workflow' AND relationship = 'executes'",
-        )
-        .bind(existing_id)
-        .fetch_one(pool)
+    let response = epigraph_ingest_executor::workflow::ingest_workflow(&state.db_pool, &extraction)
         .await
         .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
-
-        if edge_count > 0 {
-            return Ok(Json(serde_json::json!({
-                "workflow_id": existing_id,
-                "canonical_name": canonical_name,
-                "generation": generation,
-                "claims_ingested": 0,
-                "claims_skipped_dedup": 0,
-                "executes_edges": edge_count,
-                "relationships_created": 0,
-                "already_ingested": true,
-            })));
-        }
-    }
-
-    // ── 2. System agent ──────────────────────────────────────────────────
-    let system_agent_id = get_or_create_system_agent(pool).await?;
-    let _agent_id_typed = AgentId::from_uuid(system_agent_id);
-
-    // ── 3. Workflow row (idempotent) ──────────────────────────────────────
-    let parent_id = if let Some(ref pcn) = extraction.source.parent_canonical_name {
-        WorkflowRepository::find_root_by_canonical(pool, pcn, generation.saturating_sub(1))
-            .await
-            .map_err(|e| ApiError::InternalError { message: e.to_string() })?
-    } else {
-        None
-    };
-
-    WorkflowRepository::insert_root(
-        pool,
-        workflow_id,
-        canonical_name,
-        generation,
-        goal,
-        parent_id,
-        extraction.source.metadata.clone(),
-    )
-    .await
-    .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
-
-    // ── 3a. variant_of edge: new generation —variant_of→ parent ──────────
-    // Mirrors the claims.derived_from + derived_from edge redundancy: the
-    // workflows.parent_id FK records lineage in the table, and the edge row
-    // makes the same lineage visible to graph-traversal queries that don't
-    // know about the workflows table.
-    if let Some(parent_workflow_id) = parent_id {
-        EdgeRepository::create_if_not_exists(
-            pool,
-            workflow_id,
-            "workflow",
-            parent_workflow_id,
-            "workflow",
-            "variant_of",
-            Some(serde_json::json!({
-                "generation_from": generation - 1,
-                "generation_to": generation,
-            })),
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
-    }
-
-    // ── 4. Author agents ─────────────────────────────────────────────────
-    let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
-    for (idx, author) in extraction.source.authors.iter().enumerate() {
-        if author.name.is_empty() {
-            continue;
-        }
-        let (_did, pub_key_bytes) =
-            epigraph_crypto::did_key::did_key_for_author(None, &author.name);
-        let agent_uuid: Uuid = if let Some(existing) =
-            AgentRepository::get_by_public_key(pool, &pub_key_bytes)
-                .await
-                .map_err(|e| ApiError::InternalError { message: e.to_string() })?
-        {
-            existing.id.into()
-        } else {
-            let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
-            let created = AgentRepository::create(pool, &author_agent)
-                .await
-                .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
-            created.id.into()
-        };
-        author_agent_map.insert(idx, agent_uuid);
-    }
-
-    // ── 5. Claims ────────────────────────────────────────────────────────
-    let mut claims_ingested = 0_usize;
-    let mut claims_skipped_dedup = 0_usize;
-    let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
-
-    for planned in &plan.claims {
-        let confidence = planned.confidence.clamp(0.0, 1.0);
-        let truth = TruthValue::clamped(confidence.clamp(0.01, 0.99));
-        let kind = planned
-            .properties
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("workflow_claim");
-        let labels = vec!["claim".to_string(), kind.to_string()];
-
-        let was_new = ClaimRepository::create_with_id_if_absent(
-            pool,
-            planned.id,
-            &planned.content,
-            &planned.content_hash,
-            system_agent_id,
-            truth,
-            &labels,
-        )
-        .await
-        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
-
-        if was_new {
-            sqlx::query("UPDATE claims SET properties = $1 WHERE id = $2")
-                .bind(&planned.properties)
-                .bind(planned.id)
-                .execute(pool)
-                .await
-                .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
-            claims_ingested += 1;
-        } else {
-            claims_skipped_dedup += 1;
-        }
-        id_map.insert(planned.id, planned.id);
-    }
-
-    // ── 6. executes edges ────────────────────────────────────────────────
-    let mut executes_edges = 0_usize;
-    for planned in &plan.claims {
-        EdgeRepository::create_if_not_exists(
-            pool,
-            workflow_id,
-            "workflow",
-            planned.id,
-            "claim",
-            "executes",
-            Some(serde_json::json!({"level": planned.level})),
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
-        executes_edges += 1;
-    }
-
-    // ── 7. Intra-claim plan edges ─────────────────────────────────────────
-    let mut relationships_created = 0_usize;
-    for edge in &plan.edges {
-        let (src, src_type) = if edge.source_type == "author_placeholder" {
-            let idx = edge.properties["author_index"].as_u64().unwrap_or(0) as usize;
-            let Some(&agent_uuid) = author_agent_map.get(&idx) else {
-                continue;
-            };
-            (agent_uuid, "agent".to_string())
-        } else {
-            let mapped = id_map
-                .get(&edge.source_id)
-                .copied()
-                .unwrap_or(edge.source_id);
-            (mapped, edge.source_type.clone())
-        };
-        let tgt = id_map
-            .get(&edge.target_id)
-            .copied()
-            .unwrap_or(edge.target_id);
-
-        EdgeRepository::create_if_not_exists(
-            pool,
-            src,
-            &src_type,
-            tgt,
-            &edge.target_type,
-            &edge.relationship,
-            Some(edge.properties.clone()),
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| ApiError::InternalError { message: e.to_string() })?;
-        relationships_created += 1;
-    }
-
-    Ok(Json(serde_json::json!({
-        "workflow_id": workflow_id,
-        "canonical_name": canonical_name,
-        "generation": generation,
-        "claims_ingested": claims_ingested,
-        "claims_skipped_dedup": claims_skipped_dedup,
-        "executes_edges": executes_edges,
-        "relationships_created": relationships_created,
-        "already_ingested": false,
-    })))
+    Ok(Json(serde_json::to_value(&response).map_err(|e| {
+        ApiError::InternalError { message: e.to_string() }
+    })?))
 }
 
 // ── Internal helpers ──
@@ -1461,15 +1245,45 @@ mod tests {
     /// an existing gen=0 workflow must write a workflow→workflow `variant_of` edge.
     /// Regression guard for #51 on the API surface (mirror of the MCP test in
     /// epigraph-mcp::tools::workflow_ingest).
+    ///
+    /// Uses uniquely-seeded claim text (not the shared `ingest_payload`) so it
+    /// can't collide with other workflow tests on the
+    /// `uq_claims_content_hash_agent` constraint when the suite is run end-to-
+    /// end against a shared DB.
     #[tokio::test]
     async fn ingest_workflow_http_writes_variant_of_edge() {
+        fn unique_payload(seed: &str, generation: u32) -> serde_json::Value {
+            serde_json::json!({
+                "source": {
+                    "canonical_name": format!("http-wf-{seed}"),
+                    "goal": format!("Goal http-wf-{seed}"),
+                    "generation": generation,
+                    "authors": []
+                },
+                "thesis": format!("Thesis for http-wf-{seed} gen{generation}"),
+                "thesis_derivation": "TopDown",
+                "phases": [{
+                    "title": format!("Phase http-wf-{seed} gen{generation}"),
+                    "summary": format!("Phase summary http-wf-{seed} gen{generation}"),
+                    "steps": [{
+                        "compound": format!("Step compound http-wf-{seed} gen{generation}"),
+                        "rationale": format!("Step rationale http-wf-{seed} gen{generation}"),
+                        "operations": [format!("op-http-{seed}-gen{generation}")],
+                        "generality": [1],
+                        "confidence": 0.85
+                    }]
+                }],
+                "relationships": []
+            })
+        }
+
         let pool = test_pool_or_skip!();
         let app = test_router(pool.clone());
 
-        let canonical = "http-variant-of-test";
+        let canonical = "variant-of";
 
         // gen=0
-        let gen0_body = serde_json::to_vec(&ingest_payload(canonical)).unwrap();
+        let gen0_body = serde_json::to_vec(&unique_payload(canonical, 0)).unwrap();
         let resp0 = app
             .clone()
             .oneshot(
@@ -1488,9 +1302,9 @@ mod tests {
         let gen0_id = uuid::Uuid::parse_str(json0["workflow_id"].as_str().unwrap()).unwrap();
 
         // gen=1, parent_canonical_name = canonical
-        let mut gen1_payload = ingest_payload(canonical);
-        gen1_payload["source"]["generation"] = serde_json::json!(1);
-        gen1_payload["source"]["parent_canonical_name"] = serde_json::json!(canonical);
+        let mut gen1_payload = unique_payload(canonical, 1);
+        gen1_payload["source"]["parent_canonical_name"] =
+            serde_json::json!(format!("http-wf-{canonical}"));
         let gen1_body = serde_json::to_vec(&gen1_payload).unwrap();
         let resp1 = app
             .oneshot(

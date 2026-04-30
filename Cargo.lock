@@ -1219,6 +1219,7 @@ dependencies = [
  "epigraph-engine",
  "epigraph-events",
  "epigraph-ingest",
+ "epigraph-ingest-executor",
  "epigraph-interfaces",
  "epigraph-jobs",
  "futures",
@@ -1429,6 +1430,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "epigraph-ingest-executor"
+version = "0.3.0"
+dependencies = [
+ "epigraph-core",
+ "epigraph-crypto",
+ "epigraph-db",
+ "epigraph-ingest",
+ "serde",
+ "serde_json",
+ "sqlx 0.7.4",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "epigraph-interfaces"
 version = "0.3.0"
 dependencies = [
@@ -1480,6 +1497,7 @@ dependencies = [
  "epigraph-embeddings",
  "epigraph-engine",
  "epigraph-ingest",
+ "epigraph-ingest-executor",
  "hex",
  "openssl",
  "rand 0.8.5",

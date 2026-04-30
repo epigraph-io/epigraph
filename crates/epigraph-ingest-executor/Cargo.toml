@@ -1,0 +1,34 @@
+[package]
+name = "epigraph-ingest-executor"
+description = "Plan-application layer: persists ingest plans (claims, edges, agent placeholders) to the kernel DB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Internal crates — couples the leaf-ish ingest schemas/builders with the
+# DB repos. Hosts both layers' shared call sites so the MCP and HTTP
+# surfaces don't reimplement the same flow.
+epigraph-core = { workspace = true }
+epigraph-crypto = { workspace = true }
+epigraph-db = { workspace = true }
+epigraph-ingest = { workspace = true }
+
+# Async + DB pool type
+tokio = { workspace = true }
+sqlx = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Identifiers
+uuid = { workspace = true }
+
+# Errors
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
