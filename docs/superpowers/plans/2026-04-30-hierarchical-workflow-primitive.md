@@ -79,12 +79,14 @@ The committed file extends both `edges_entity_types_valid` source/target allow-l
 
 **STATUS: ✅ Complete (commit `2e6b1c6d`).**
 
+> **Note:** The embedded SQL template below was the *original* single-migration draft. The committed `migrations/020_workflows_table.sql` differs in two ways: (a) its constraint allow-list and trigger function bodies start from the post-019 state, so they include `'experiment'` and `'experiment_result'` alongside `'workflow'`; (b) the comment header is updated to "Migration 020". When re-running this plan from scratch, copy the committed file directly rather than the template here.
+
 - [ ] **Step 1.1.1: Write the migration**
 
 Create `migrations/020_workflows_table.sql` with this exact content:
 
 ```sql
--- Migration 019: workflows table + edges constraint expansion + trigger update for #34
+-- Migration 020: workflows table + edges constraint expansion + trigger update for #34
 -- Adds the `workflows` source-node type as the metadata anchor for hierarchical
 -- workflows. Expands the edges_entity_types_valid CHECK and validate_edge_reference
 -- overloads so workflow→claim edges (executes, supersedes, variant_of) can be inserted.
