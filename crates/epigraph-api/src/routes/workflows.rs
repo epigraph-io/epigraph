@@ -96,6 +96,13 @@ pub struct DeprecateQuery {
 
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize)]
+pub struct HierarchicalSearchQuery {
+    pub q: String,
+    pub limit: Option<i64>,
+}
+
+#[cfg(feature = "db")]
+#[derive(Debug, Deserialize)]
 pub struct RecordBehavioralExecutionRequest {
     pub goal_text: String,
     pub success: bool,
@@ -587,6 +594,7 @@ pub async fn report_outcome(
         deviation_count,
         total_steps,
         created_at: chrono::Utc::now(),
+        step_claim_id: None,
     };
 
     if let Err(e) = epigraph_db::BehavioralExecutionRepository::create(
@@ -612,6 +620,202 @@ pub async fn report_outcome(
         "variance": variance,
         "total_uses": use_count,
         "success_rate": success_rate,
+    })))
+}
+
+/// GET /api/v1/workflows/hierarchical/search?q=...&limit=N - Search
+/// hierarchical workflows by free-text query.
+///
+/// Returns workflows whose `goal` or `canonical_name` matches `q` (ILIKE),
+/// ordered newest first. Limit defaults to 10, max 50.
+///
+/// Use `GET /api/v1/workflows/search` for flat-JSON workflows.
+#[cfg(feature = "db")]
+pub async fn find_workflow_hierarchical(
+    State(state): State<AppState>,
+    Query(params): Query<HierarchicalSearchQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = params.limit.unwrap_or(10).clamp(1, 50);
+    let rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
+        &state.db_pool,
+        &params.q,
+        limit,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("hierarchical search failed: {e}"),
+    })?;
+    let workflows: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "workflow_id": r.id,
+                "canonical_name": r.canonical_name,
+                "generation": r.generation,
+                "goal": r.goal,
+                "parent_id": r.parent_id,
+                "metadata": r.metadata,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "workflows": workflows,
+        "total": workflows.len(),
+    })))
+}
+
+/// POST /api/v1/workflows/hierarchical/:id/outcome - Report execution outcome
+/// for a hierarchical workflow (one whose root lives in the `workflows` table).
+///
+/// Updates `workflows.metadata` counters (use_count, success_count, failure_count,
+/// avg_variance) and writes per-step `behavioral_executions` rows with
+/// `step_claim_id` populated for each step in `step_executions`.
+///
+/// Returns 404 if the id does not correspond to a `workflows` row. Use
+/// `POST /api/v1/workflows/:id/outcome` for flat-JSON workflows.
+#[cfg(feature = "db")]
+pub async fn report_hierarchical_outcome(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<Uuid>,
+    Json(request): Json<ReportOutcomeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // 1. Confirm this is a hierarchical workflow root
+    let row: Option<(serde_json::Value,)> =
+        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1")
+            .bind(workflow_id)
+            .fetch_optional(&state.db_pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("workflows lookup failed: {e}"),
+            })?;
+    let mut metadata = match row {
+        Some((m,)) => m,
+        None => {
+            return Err(ApiError::NotFound {
+                entity: "hierarchical workflow".into(),
+                id: workflow_id.to_string(),
+            });
+        }
+    };
+
+    // 2. Compute deltas
+    let success = request.success;
+    let variance = request.step_executions.as_ref().map_or(0.0, |steps| {
+        if steps.is_empty() {
+            0.0
+        } else {
+            let dev = steps.iter().filter(|s| s.deviated).count();
+            dev as f64 / steps.len() as f64
+        }
+    });
+    let quality = request.quality.unwrap_or(if success { 1.0 } else { 0.0 });
+
+    // 3. Update metadata counters
+    let use_count = metadata
+        .get("use_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        + 1;
+    let success_count = metadata
+        .get("success_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        + i64::from(success);
+    let failure_count = metadata
+        .get("failure_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        + i64::from(!success);
+    let prev_avg_var = metadata
+        .get("avg_variance")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let avg_variance = if use_count > 0 {
+        (prev_avg_var * (use_count - 1) as f64 + variance) / use_count as f64
+    } else {
+        variance
+    };
+    metadata["use_count"] = serde_json::json!(use_count);
+    metadata["success_count"] = serde_json::json!(success_count);
+    metadata["failure_count"] = serde_json::json!(failure_count);
+    metadata["avg_variance"] = serde_json::json!(avg_variance);
+
+    sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
+        .bind(&metadata)
+        .bind(workflow_id)
+        .execute(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("metadata update failed: {e}"),
+        })?;
+
+    // 4. Resolve step_index → step_claim_id via the workflow's executes edges,
+    //    sorted by claim level=2 (steps), in plan order. Plan order is the
+    //    insertion order of `executes` edges; we use edges.created_at as proxy.
+    let step_claim_rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT c.id \
+         FROM edges e \
+         JOIN claims c ON c.id = e.target_id \
+         WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
+         ORDER BY e.created_at ASC, c.id ASC",
+    )
+    .bind(workflow_id)
+    .fetch_all(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("step lookup failed: {e}"),
+    })?;
+    let step_claim_ids: Vec<Uuid> = step_claim_rows.into_iter().map(|(id,)| id).collect();
+
+    // 5. Write per-step behavioral_executions rows. Capture timestamp once so
+    //    rows from a single outcome report group cleanly downstream.
+    let report_ts = chrono::Utc::now();
+    if let Some(ref step_execs) = request.step_executions {
+        for step_exec in step_execs {
+            let step_claim_id = step_claim_ids.get(step_exec.step_index).copied();
+            if step_claim_id.is_none() && !step_claim_ids.is_empty() {
+                tracing::warn!(
+                    workflow_id = %workflow_id,
+                    step_index = step_exec.step_index,
+                    known_steps = step_claim_ids.len(),
+                    "step_index out of range; behavioral_executions row will have NULL step_claim_id"
+                );
+            }
+            let step_beliefs = serde_json::json!({
+                "deviated": step_exec.deviated,
+                "deviation_reason": step_exec.deviation_reason,
+            });
+            let row = epigraph_db::BehavioralExecutionRow {
+                id: Uuid::new_v4(),
+                workflow_id,
+                goal_text: request
+                    .goal_text
+                    .clone()
+                    .unwrap_or_else(|| String::from("hierarchical")),
+                success,
+                step_beliefs,
+                tool_pattern: vec![step_exec.planned.clone()],
+                quality: Some(quality),
+                deviation_count: i32::from(step_exec.deviated),
+                total_steps: 1,
+                created_at: report_ts,
+                step_claim_id,
+            };
+            if let Err(e) =
+                epigraph_db::BehavioralExecutionRepository::create(&state.db_pool, row, None).await
+            {
+                tracing::warn!(workflow_id = %workflow_id, "behavioral_executions write failed: {e}");
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "workflow_id": workflow_id,
+        "use_count": use_count,
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "variance": variance,
     })))
 }
 
@@ -869,6 +1073,7 @@ pub async fn record_behavioral_execution(
         deviation_count: body.deviation_count,
         total_steps: body.total_steps,
         created_at: chrono::Utc::now(),
+        step_claim_id: None,
     };
 
     let created = epigraph_db::BehavioralExecutionRepository::create(
@@ -889,12 +1094,244 @@ pub async fn record_behavioral_execution(
     })))
 }
 
+/// POST /api/v1/workflows/ingest - Ingest a hierarchical `WorkflowExtraction`.
+///
+/// Parses a `WorkflowExtraction` JSON body, persists the claim hierarchy
+/// (thesis → phases → steps → operation atoms), writes `workflow —executes→ claim`
+/// edges, resolves author-placeholder edges, and returns a summary. Idempotent:
+/// if the workflow row already has `executes` edges, returns `already_ingested: true`
+/// without touching the DB further.
+#[cfg(feature = "db")]
+pub async fn ingest_workflow(
+    State(state): State<AppState>,
+    Json(extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use epigraph_core::{AgentId, TruthValue};
+    use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, WorkflowRepository};
+    use epigraph_ingest::workflow::builder::root_workflow_id;
+    use std::collections::HashMap;
+
+    let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
+    let pool = &state.db_pool;
+
+    let canonical_name = &extraction.source.canonical_name;
+    let generation = extraction.source.generation as i32;
+    let goal = &extraction.source.goal;
+    let workflow_id = root_workflow_id(&extraction);
+
+    // ── 1. Idempotency gate ──────────────────────────────────────────────
+    if let Some(existing_id) =
+        WorkflowRepository::find_root_by_canonical(pool, canonical_name, generation)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?
+    {
+        let edge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM edges \
+             WHERE source_id = $1 AND source_type = 'workflow' AND relationship = 'executes'",
+        )
+        .bind(existing_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
+
+        if edge_count > 0 {
+            return Ok(Json(serde_json::json!({
+                "workflow_id": existing_id,
+                "canonical_name": canonical_name,
+                "generation": generation,
+                "claims_ingested": 0,
+                "claims_skipped_dedup": 0,
+                "executes_edges": edge_count,
+                "relationships_created": 0,
+                "already_ingested": true,
+            })));
+        }
+    }
+
+    // ── 2. System agent ──────────────────────────────────────────────────
+    let system_agent_id = get_or_create_system_agent(pool).await?;
+    let _agent_id_typed = AgentId::from_uuid(system_agent_id);
+
+    // ── 3. Workflow row (idempotent) ──────────────────────────────────────
+    let parent_id = if let Some(ref pcn) = extraction.source.parent_canonical_name {
+        WorkflowRepository::find_root_by_canonical(pool, pcn, generation.saturating_sub(1))
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?
+    } else {
+        None
+    };
+
+    WorkflowRepository::insert_root(
+        pool,
+        workflow_id,
+        canonical_name,
+        generation,
+        goal,
+        parent_id,
+        extraction.source.metadata.clone(),
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+    })?;
+
+    // ── 4. Author agents ─────────────────────────────────────────────────
+    let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
+    for (idx, author) in extraction.source.authors.iter().enumerate() {
+        if author.name.is_empty() {
+            continue;
+        }
+        let (_did, pub_key_bytes) =
+            epigraph_crypto::did_key::did_key_for_author(None, &author.name);
+        let agent_uuid: Uuid = if let Some(existing) =
+            AgentRepository::get_by_public_key(pool, &pub_key_bytes)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: e.to_string(),
+                })? {
+            existing.id.into()
+        } else {
+            let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
+            let created = AgentRepository::create(pool, &author_agent)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: e.to_string(),
+                })?;
+            created.id.into()
+        };
+        author_agent_map.insert(idx, agent_uuid);
+    }
+
+    // ── 5. Claims ────────────────────────────────────────────────────────
+    let mut claims_ingested = 0_usize;
+    let mut claims_skipped_dedup = 0_usize;
+    let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
+
+    for planned in &plan.claims {
+        let confidence = planned.confidence.clamp(0.0, 1.0);
+        let truth = TruthValue::clamped(confidence.clamp(0.01, 0.99));
+        let kind = planned
+            .properties
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("workflow_claim");
+        let labels = vec!["claim".to_string(), kind.to_string()];
+
+        let was_new = ClaimRepository::create_with_id_if_absent(
+            pool,
+            planned.id,
+            &planned.content,
+            &planned.content_hash,
+            system_agent_id,
+            truth,
+            &labels,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
+
+        if was_new {
+            sqlx::query("UPDATE claims SET properties = $1 WHERE id = $2")
+                .bind(&planned.properties)
+                .bind(planned.id)
+                .execute(pool)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: e.to_string(),
+                })?;
+            claims_ingested += 1;
+        } else {
+            claims_skipped_dedup += 1;
+        }
+        id_map.insert(planned.id, planned.id);
+    }
+
+    // ── 6. executes edges ────────────────────────────────────────────────
+    let mut executes_edges = 0_usize;
+    for planned in &plan.claims {
+        EdgeRepository::create_if_not_exists(
+            pool,
+            workflow_id,
+            "workflow",
+            planned.id,
+            "claim",
+            "executes",
+            Some(serde_json::json!({"level": planned.level})),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
+        executes_edges += 1;
+    }
+
+    // ── 7. Intra-claim plan edges ─────────────────────────────────────────
+    let mut relationships_created = 0_usize;
+    for edge in &plan.edges {
+        let (src, src_type) = if edge.source_type == "author_placeholder" {
+            let idx = edge.properties["author_index"].as_u64().unwrap_or(0) as usize;
+            let Some(&agent_uuid) = author_agent_map.get(&idx) else {
+                continue;
+            };
+            (agent_uuid, "agent".to_string())
+        } else {
+            let mapped = id_map
+                .get(&edge.source_id)
+                .copied()
+                .unwrap_or(edge.source_id);
+            (mapped, edge.source_type.clone())
+        };
+        let tgt = id_map
+            .get(&edge.target_id)
+            .copied()
+            .unwrap_or(edge.target_id);
+
+        EdgeRepository::create_if_not_exists(
+            pool,
+            src,
+            &src_type,
+            tgt,
+            &edge.target_type,
+            &edge.relationship,
+            Some(edge.properties.clone()),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
+        relationships_created += 1;
+    }
+
+    Ok(Json(serde_json::json!({
+        "workflow_id": workflow_id,
+        "canonical_name": canonical_name,
+        "generation": generation,
+        "claims_ingested": claims_ingested,
+        "claims_skipped_dedup": claims_skipped_dedup,
+        "executes_edges": executes_edges,
+        "relationships_created": relationships_created,
+        "already_ingested": false,
+    })))
+}
+
 // ── Internal helpers ──
 
 #[cfg(feature = "db")]
 pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, ApiError> {
-    let pub_key = [0u8; 32];
-    if let Some(a) = epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key)
+    let (_did, pub_key_bytes) =
+        epigraph_crypto::did_key::did_key_for_author(None, "workflow-ingest-system");
+    if let Some(a) = epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key_bytes)
         .await
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
@@ -902,7 +1339,8 @@ pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uu
     {
         Ok(a.id.as_uuid())
     } else {
-        let agent = epigraph_core::Agent::new(pub_key, Some("api-system".to_string()));
+        let agent =
+            epigraph_core::Agent::new(pub_key_bytes, Some("workflow-ingest-system".to_string()));
         let created = epigraph_db::AgentRepository::create(pool, &agent)
             .await
             .map_err(|e| ApiError::InternalError {
@@ -957,7 +1395,7 @@ mod tests {
     use sqlx::PgPool;
     use tower::ServiceExt;
 
-    // ── Test scaffolding ──
+    // ── Test scaffolding (modern style: #[sqlx::test]) ──
 
     /// Build a minimal AppState backed by the given pool.
     fn test_state(pool: PgPool) -> AppState {
@@ -1051,6 +1489,45 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    fn parse_body_bytes(bytes: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(bytes).unwrap_or_else(
+            |_| serde_json::json!({"error": String::from_utf8_lossy(bytes).to_string()}),
+        )
+    }
+
+    fn test_router(pool: sqlx::PgPool) -> axum::Router {
+        use axum::routing::post;
+        let state = AppState::with_db(pool, ApiConfig::default());
+        axum::Router::new()
+            .route("/api/v1/workflows/ingest", post(ingest_workflow))
+            .with_state(state)
+    }
+
+    fn ingest_payload(canonical_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "source": {
+                "canonical_name": canonical_name,
+                "goal": "HTTP ingest test workflow",
+                "generation": 0,
+                "authors": []
+            },
+            "thesis": "Test that the HTTP endpoint persists claims correctly",
+            "thesis_derivation": "TopDown",
+            "phases": [{
+                "title": "Phase One",
+                "summary": "Single test phase",
+                "steps": [{
+                    "compound": "Execute the HTTP ingest handler",
+                    "rationale": "Verify end-to-end",
+                    "operations": ["POST /api/v1/workflows/ingest"],
+                    "generality": [1],
+                    "confidence": 0.85
+                }]
+            }],
+            "relationships": []
+        })
+    }
+
     // ── Tests ──
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1092,5 +1569,179 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_workflow_http_returns_workflow_id(pool: PgPool) {
+        let app = test_router(pool);
+
+        let body = serde_json::to_vec(&ingest_payload("http-test-ingest-workflow")).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/workflows/ingest")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = parse_body_bytes(&bytes);
+
+        assert_eq!(status, StatusCode::OK, "response: {json}");
+        assert!(
+            json.get("workflow_id").is_some(),
+            "must return workflow_id; got: {json}"
+        );
+        assert_eq!(
+            json["already_ingested"].as_bool(),
+            Some(false),
+            "first ingest must not be a no-op"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_updates_workflow_metadata(pool: PgPool) {
+        // Seed a hierarchical workflow directly via the DB layer so we don't depend on
+        // the full HTTP ingest flow inside this test.
+        let workflow_id = uuid::Uuid::new_v4();
+        epigraph_db::WorkflowRepository::insert_root(
+            &pool,
+            workflow_id,
+            "outcome-test",
+            0,
+            "Test workflow for outcome reporting.",
+            None,
+            serde_json::json!({"use_count": 0, "success_count": 0, "failure_count": 0, "avg_variance": 0.0}),
+        )
+        .await
+        .unwrap();
+
+        // Build a minimal axum app with just the outcome route.
+        use crate::state::{ApiConfig, AppState};
+        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/:id/outcome",
+                axum::routing::post(report_hierarchical_outcome),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "success": true,
+            "outcome_details": "ok",
+            "step_executions": []
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!(
+                        "/api/v1/workflows/hierarchical/{workflow_id}/outcome"
+                    ))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let metadata: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM workflows WHERE id = $1")
+                .bind(workflow_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(metadata["use_count"], 1);
+        assert_eq!(metadata["success_count"], 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_404s_on_unknown_id(pool: PgPool) {
+        use crate::state::{ApiConfig, AppState};
+        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/:id/outcome",
+                axum::routing::post(report_hierarchical_outcome),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({"success": true, "outcome_details": "ok"});
+        let unknown = uuid::Uuid::new_v4();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/v1/workflows/hierarchical/{unknown}/outcome"))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_workflow_hierarchical_returns_match(pool: PgPool) {
+        // Seed a hierarchical workflow.
+        let workflow_id = uuid::Uuid::new_v4();
+        let canonical = "search-e2e-test";
+        epigraph_db::WorkflowRepository::insert_root(
+            &pool,
+            workflow_id,
+            canonical,
+            0,
+            "A workflow for end-to-end search testing.",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        use crate::state::{ApiConfig, AppState};
+        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/search",
+                axum::routing::get(find_workflow_hierarchical),
+            )
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!(
+                        "/api/v1/workflows/hierarchical/search?q={canonical}"
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert!(body["total"].as_u64().unwrap_or(0) >= 1);
+        let found = body["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["canonical_name"].as_str() == Some(canonical));
+        assert!(
+            found,
+            "expected to find the seeded canonical_name in results"
+        );
     }
 }

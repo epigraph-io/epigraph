@@ -1125,7 +1125,7 @@ mod tests {
         let frame = binary_frame();
         let m = MassFunction::simple(frame, BTreeSet::from([0]), 0.7).unwrap();
 
-        let (result, reports) = combine_multiple(&[m.clone()], 0.3).unwrap();
+        let (result, reports) = combine_multiple(std::slice::from_ref(&m), 0.3).unwrap();
         assert!(reports.is_empty());
         let fe0 = FocalElement::positive(BTreeSet::from([0]));
         assert!((result.mass_of(&fe0) - 0.7).abs() < 1e-10);

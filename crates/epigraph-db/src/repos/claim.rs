@@ -1285,6 +1285,41 @@ impl ClaimRepository {
             Err(e) => Err(e),
         }
     }
+
+    /// Insert a claim with a caller-supplied id. Returns `true` if the row
+    /// was newly inserted, `false` if the id already existed (silently
+    /// skipped via `ON CONFLICT (id) DO NOTHING`). Used by ingest paths that
+    /// generate deterministic UUIDs and rely on idempotent re-runs.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` for non-conflict failures.
+    #[instrument(skip(pool, content, content_hash, labels))]
+    pub async fn create_with_id_if_absent(
+        pool: &PgPool,
+        id: Uuid,
+        content: &str,
+        content_hash: &[u8; 32],
+        agent_id: Uuid,
+        truth: TruthValue,
+        labels: &[String],
+    ) -> Result<bool, DbError> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (id) DO NOTHING \
+             RETURNING (xmax = 0) AS was_inserted",
+        )
+        .bind(id)
+        .bind(content)
+        .bind(content_hash.as_slice())
+        .bind(agent_id)
+        .bind(truth.value())
+        .bind(labels)
+        .fetch_optional(pool)
+        .await?;
+        // RETURNING is empty when the conflict path is taken, so None == not new.
+        Ok(row.map(|(b,)| b).unwrap_or(false))
+    }
 }
 
 /// Result of a pairwise cosine distance query between two claims.
@@ -1628,6 +1663,45 @@ mod tests {
         let first = &results[0];
         assert!((first.distance - expected_distance).abs() < 1e-6);
     }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_with_id_if_absent_is_idempotent(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'test-create-idempotent', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let id = uuid::Uuid::new_v4();
+        let hash = blake3::hash(b"x");
+        let was_new1 = ClaimRepository::create_with_id_if_absent(
+            &pool,
+            id,
+            "x",
+            hash.as_bytes(),
+            agent_id,
+            TruthValue::clamped(0.5),
+            &["test".to_string()],
+        )
+        .await
+        .unwrap();
+        let was_new2 = ClaimRepository::create_with_id_if_absent(
+            &pool,
+            id,
+            "x",
+            hash.as_bytes(),
+            agent_id,
+            TruthValue::clamped(0.5),
+            &["test".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(was_new1);
+        assert!(!was_new2);
+    }
 }
 
 // ── Label Mutation ──
@@ -1951,7 +2025,7 @@ mod label_tests {
 
         // cleanup
         let _ = sqlx::query("DELETE FROM claims WHERE id = ANY($1)")
-            .bind(&[claim_id_1, claim_id_2])
+            .bind([claim_id_1, claim_id_2])
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM agents WHERE id = $1")

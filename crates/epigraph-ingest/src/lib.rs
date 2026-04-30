@@ -1,6 +1,9 @@
 pub mod builder;
+pub mod common;
+pub mod document;
 pub mod errors;
 pub mod schema;
+pub mod workflow;
 
 #[cfg(test)]
 mod tests {
@@ -398,6 +401,188 @@ mod tests {
             cross_edges.len(),
             1,
             "slash-path relationship should resolve"
+        );
+    }
+
+    // ── WorkflowExtraction ingest tests ──
+
+    use crate::workflow::schema as wf_schema;
+
+    fn make_workflow(json: &str) -> wf_schema::WorkflowExtraction {
+        serde_json::from_str(json).expect("test workflow JSON should parse")
+    }
+
+    fn minimal_workflow_json() -> &'static str {
+        r#"{
+            "source": {
+                "canonical_name": "deploy-canary",
+                "goal": "Deploy a canary release safely.",
+                "generation": 0,
+                "authors": []
+            },
+            "thesis": "Workflow for canary deployment with monitoring.",
+            "phases": [{
+                "title": "Pre-flight",
+                "summary": "Verify prerequisites.",
+                "steps": [{
+                    "compound": "Confirm CI passing.",
+                    "operations": ["Run `gh pr checks`."],
+                    "generality": [1],
+                    "confidence": 0.9
+                }]
+            }],
+            "relationships": []
+        }"#
+    }
+
+    #[test]
+    fn test_workflow_build_plan_counts() {
+        let wf = make_workflow(minimal_workflow_json());
+        let plan = crate::workflow::build_ingest_plan(&wf);
+
+        // 1 thesis + 1 phase + 1 step + 1 operation
+        assert_eq!(plan.claims.len(), 4);
+
+        let level_counts: Vec<usize> = (0..=3)
+            .map(|l| plan.claims.iter().filter(|c| c.level == l).count())
+            .collect();
+        assert_eq!(level_counts, vec![1, 1, 1, 1]);
+
+        let decompose_count = plan
+            .edges
+            .iter()
+            .filter(|e| e.relationship == "decomposes_to")
+            .count();
+        assert_eq!(decompose_count, 3, "thesis->phase, phase->step, step->op");
+    }
+
+    #[test]
+    fn test_workflow_uses_phase_follows_not_section_follows() {
+        let json = r#"{
+            "source": {"canonical_name": "two-phase", "goal": "G", "authors": []},
+            "thesis": "T",
+            "phases": [
+                {"title": "P1", "summary": "S1", "steps": []},
+                {"title": "P2", "summary": "S2", "steps": []}
+            ],
+            "relationships": []
+        }"#;
+        let plan = crate::workflow::build_ingest_plan(&make_workflow(json));
+        assert!(
+            plan.edges.iter().any(|e| e.relationship == "phase_follows"),
+            "must emit phase_follows for adjacent phases"
+        );
+        assert!(
+            plan.edges
+                .iter()
+                .all(|e| e.relationship != "section_follows"),
+            "must NOT emit section_follows in workflow plans"
+        );
+    }
+
+    #[test]
+    fn test_workflow_step_follows_within_phase() {
+        let json = r#"{
+            "source": {"canonical_name": "two-step", "goal": "G", "authors": []},
+            "thesis": "T",
+            "phases": [{
+                "title": "P1", "summary": "S1",
+                "steps": [
+                    {"compound": "Step1", "operations": ["op1"], "generality": [1], "confidence": 0.8},
+                    {"compound": "Step2", "operations": ["op2"], "generality": [1], "confidence": 0.8}
+                ]
+            }],
+            "relationships": []
+        }"#;
+        let plan = crate::workflow::build_ingest_plan(&make_workflow(json));
+        let step_follows: Vec<_> = plan
+            .edges
+            .iter()
+            .filter(|e| e.relationship == "step_follows")
+            .collect();
+        assert_eq!(
+            step_follows.len(),
+            1,
+            "exactly one step_follows between two adjacent steps"
+        );
+        assert!(
+            plan.edges
+                .iter()
+                .all(|e| e.relationship != "continues_argument"),
+            "must NOT emit continues_argument in workflow plans"
+        );
+    }
+
+    #[test]
+    fn test_workflow_atom_converges_with_document_atom() {
+        let doc_json = r#"{
+            "source": {"title": "P", "source_type": "Paper", "authors": []},
+            "sections": [{
+                "title": "Body", "summary": "S",
+                "paragraphs": [{
+                    "compound": "C",
+                    "atoms": ["text-embedding-3-large produces 3072-dimensional vectors."],
+                    "generality": [1], "confidence": 0.9
+                }]
+            }]
+        }"#;
+        let wf_json = r#"{
+            "source": {"canonical_name": "embed-pipeline", "goal": "G", "authors": []},
+            "thesis": "T",
+            "phases": [{
+                "title": "Embed", "summary": "Embed step",
+                "steps": [{
+                    "compound": "Run embedding.",
+                    "operations": ["text-embedding-3-large produces 3072-dimensional vectors."],
+                    "generality": [1], "confidence": 0.9
+                }]
+            }]
+        }"#;
+        let doc: crate::document::schema::DocumentExtraction =
+            serde_json::from_str(doc_json).unwrap();
+        let wf: wf_schema::WorkflowExtraction = serde_json::from_str(wf_json).unwrap();
+
+        let doc_plan = crate::document::build_ingest_plan(&doc);
+        let wf_plan = crate::workflow::build_ingest_plan(&wf);
+
+        let doc_atom = doc_plan
+            .claims
+            .iter()
+            .find(|c| c.level == 3)
+            .expect("doc has atom");
+        let wf_op = wf_plan
+            .claims
+            .iter()
+            .find(|c| c.level == 3)
+            .expect("wf has operation");
+
+        assert_eq!(
+            doc_atom.id, wf_op.id,
+            "operation atom in workflow must converge with document atom of same text (ATOM_NAMESPACE shared)"
+        );
+    }
+
+    #[test]
+    fn test_workflow_compound_ids_scoped_by_canonical_name() {
+        let json_a = r#"{
+            "source": {"canonical_name": "wf-a", "goal": "G", "authors": []},
+            "thesis": "Same thesis text",
+            "phases": [],
+            "relationships": []
+        }"#;
+        let json_b = r#"{
+            "source": {"canonical_name": "wf-b", "goal": "G", "authors": []},
+            "thesis": "Same thesis text",
+            "phases": [],
+            "relationships": []
+        }"#;
+        let plan_a = crate::workflow::build_ingest_plan(&make_workflow(json_a));
+        let plan_b = crate::workflow::build_ingest_plan(&make_workflow(json_b));
+        let thesis_a = plan_a.claims.iter().find(|c| c.level == 0).unwrap();
+        let thesis_b = plan_b.claims.iter().find(|c| c.level == 0).unwrap();
+        assert_ne!(
+            thesis_a.id, thesis_b.id,
+            "compound nodes must NOT converge across workflows with different canonical_name"
         );
     }
 }
