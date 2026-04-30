@@ -154,9 +154,20 @@ async fn main() {
         }
     }
 
-    // Configure API settings
+    // Configure API settings.
+    //
+    // `require_signatures` enables a packet-signature gate on the write path
+    // (`/api/v1/submit/packet`) that currently fails closed because the
+    // Ed25519 verifier is still TODO in `routes/submit.rs`. Until that lands,
+    // make it env-driven so deployments can opt out and continue recording
+    // provenance via OAuth2 Bearer auth alone. Default off; flip to `1`/`true`
+    // to re-enable the gate once the verifier ships.
+    let require_signatures = std::env::var("EPIGRAPH_REQUIRE_SIGNATURES")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
     let config = ApiConfig {
-        require_signatures: true, // OAuth2 + Ed25519 auth enforced on write paths
+        require_signatures,
         max_request_size: 10 * 1024 * 1024, // 10MB — figure evidence carries base64 images
     };
 
