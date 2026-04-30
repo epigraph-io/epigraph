@@ -332,4 +332,48 @@ mod tests {
         assert_eq!(row.2, "Deploy a canary release safely.");
         assert_eq!(row.3["tags"][0], "deploy");
     }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_root_is_idempotent_on_canonical_generation(pool: sqlx::PgPool) {
+        let id1 = uuid::Uuid::new_v4();
+        WorkflowRepository::insert_root(
+            &pool,
+            id1,
+            "idempo-test",
+            0,
+            "first goal",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        // Second insert with a different id but same (canonical_name, generation) is a no-op.
+        let id2 = uuid::Uuid::new_v4();
+        WorkflowRepository::insert_root(
+            &pool,
+            id2,
+            "idempo-test",
+            0,
+            "different goal text",
+            None,
+            serde_json::json!({"foo": "bar"}),
+        )
+        .await
+        .unwrap();
+
+        // Original row preserved; the second insert was silently dropped.
+        let found = WorkflowRepository::find_root_by_canonical(&pool, "idempo-test", 0)
+            .await
+            .unwrap();
+        assert_eq!(found, Some(id1));
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM workflows WHERE canonical_name = 'idempo-test'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
 }
