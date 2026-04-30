@@ -43,12 +43,11 @@ async fn deleting_task_cascades_to_edges(pool: PgPool) -> sqlx::Result<()> {
     .execute(&pool)
     .await?;
 
-    let edges_before: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM edges WHERE source_id = $1 OR target_id = $1",
-    )
-    .bind(task_id)
-    .fetch_one(&pool)
-    .await?;
+    let edges_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM edges WHERE source_id = $1 OR target_id = $1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(edges_before, 1, "edge should exist before delete");
 
     sqlx::query("DELETE FROM tasks WHERE id = $1")
@@ -56,13 +55,15 @@ async fn deleting_task_cascades_to_edges(pool: PgPool) -> sqlx::Result<()> {
         .execute(&pool)
         .await?;
 
-    let edges_after: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM edges WHERE source_id = $1 OR target_id = $1",
-    )
-    .bind(task_id)
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(edges_after, 0, "cascade trigger should have removed orphan edges");
+    let edges_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM edges WHERE source_id = $1 OR target_id = $1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        edges_after, 0,
+        "cascade trigger should have removed orphan edges"
+    );
 
     Ok(())
 }
@@ -109,12 +110,11 @@ async fn deleting_event_cascades_to_edges(pool: PgPool) -> sqlx::Result<()> {
         .execute(&pool)
         .await?;
 
-    let edges_after: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM edges WHERE source_id = $1 OR target_id = $1",
-    )
-    .bind(event_id)
-    .fetch_one(&pool)
-    .await?;
+    let edges_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM edges WHERE source_id = $1 OR target_id = $1")
+            .bind(event_id)
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(edges_after, 0);
 
     Ok(())
@@ -162,12 +162,11 @@ async fn deleting_workflow_cascades_to_edges(pool: PgPool) -> sqlx::Result<()> {
         .execute(&pool)
         .await?;
 
-    let edges_after: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM edges WHERE source_id = $1 OR target_id = $1",
-    )
-    .bind(workflow_id)
-    .fetch_one(&pool)
-    .await?;
+    let edges_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM edges WHERE source_id = $1 OR target_id = $1")
+            .bind(workflow_id)
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(edges_after, 0);
 
     Ok(())
