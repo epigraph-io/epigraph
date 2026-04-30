@@ -1,5 +1,6 @@
 pub mod builder;
 pub mod common;
+pub mod document;
 pub mod errors;
 pub mod schema;
 
