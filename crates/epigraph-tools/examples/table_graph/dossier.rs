@@ -1,10 +1,8 @@
 //! Per-table dossier: DDL, git context, call sites, FK targets.
 
-#[allow(unused_imports)]
 use crate::types::*;
 use anyhow::Result;
 use regex::Regex;
-#[allow(unused_imports)]
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
@@ -121,6 +119,33 @@ pub fn collect_call_sites(repo: &str, table: &str) -> Result<Vec<CallSite>> {
         }
     }
     Ok(out)
+}
+
+pub fn extract_fk_targets(ddl: &str) -> Vec<String> {
+    let re = Regex::new(r"(?i)REFERENCES\s+(?:public\.)?(\w+)\s*\(").expect("regex");
+    let mut out: Vec<String> = re.captures_iter(ddl)
+        .map(|c| c[1].to_lowercase())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn build_dossier(
+    repo_root: &str, migration_dir: &str, table: &TableRef,
+) -> Result<Dossier> {
+    let ddl = collect_ddl(migration_dir, &table.name)?;
+    let commits = collect_git_context(repo_root, &table.migration, &table.name)?;
+    let call_sites = collect_call_sites(repo_root, &table.name)?;
+    let fk_targets = extract_fk_targets(&ddl);
+    Ok(Dossier { table: table.clone(), ddl, commits, call_sites, fk_targets })
+}
+
+pub fn content_hash<T: serde::Serialize>(v: &T) -> Result<String> {
+    let bytes = serde_json::to_vec(v)?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    Ok(hex::encode(h.finalize()))
 }
 
 pub fn run(_only: Option<&str>) -> Result<()> {
