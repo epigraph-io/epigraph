@@ -48,7 +48,9 @@ async fn migrate_one_flat_workflow(pool: sqlx::PgPool) {
     let claim_id = seed_flat_workflow(&pool, "Test goal one", &["s1", "s2"], &["test"]).await;
 
     // Fetch + parse + build extraction (the bin's first pass).
-    let rows = fetch_unmigrated(&pool, Some(10), Some(claim_id)).await.unwrap();
+    let rows = fetch_unmigrated(&pool, Some(10), Some(claim_id))
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     let parsed: FlatContent = serde_json::from_str(&rows[0].content).unwrap();
     let extraction = build_extraction(&parsed, "test-goal-one".to_string(), 0, None);
@@ -59,7 +61,10 @@ async fn migrate_one_flat_workflow(pool: sqlx::PgPool) {
         .unwrap();
 
     // workflow_id is a String — parse it as Uuid.
-    let new_workflow_id: Uuid = result.workflow_id.parse().expect("workflow_id is a valid UUID");
+    let new_workflow_id: Uuid = result
+        .workflow_id
+        .parse()
+        .expect("workflow_id is a valid UUID");
 
     // Mark legacy + supersede (the bin's second pass).
     mark_legacy_and_supersede(&pool, claim_id, new_workflow_id)
@@ -67,22 +72,22 @@ async fn migrate_one_flat_workflow(pool: sqlx::PgPool) {
         .unwrap();
 
     // Old claim now carries 'legacy_flat'.
-    let labels: Vec<String> = sqlx::query_scalar(
-        "SELECT labels FROM claims WHERE id = $1",
-    )
-    .bind(claim_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(labels.iter().any(|l| l == "legacy_flat"), "old claim should be labeled legacy_flat");
+    let labels: Vec<String> = sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        labels.iter().any(|l| l == "legacy_flat"),
+        "old claim should be labeled legacy_flat"
+    );
 
     // workflows row exists.
-    let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM workflows WHERE canonical_name = 'test-goal-one'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM workflows WHERE canonical_name = 'test-goal-one'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(count, 1);
 
     // supersedes edge from new workflow to old claim.
@@ -110,14 +115,21 @@ async fn migrate_idempotent_skips_already_migrated(pool: sqlx::PgPool) {
     let result = workflow_ingest::do_ingest_workflow_via_pool(&pool, &extraction)
         .await
         .unwrap();
-    let new_workflow_id: Uuid = result.workflow_id.parse().expect("workflow_id is a valid UUID");
+    let new_workflow_id: Uuid = result
+        .workflow_id
+        .parse()
+        .expect("workflow_id is a valid UUID");
     mark_legacy_and_supersede(&pool, claim_id, new_workflow_id)
         .await
         .unwrap();
 
     // Second pass: fetch_unmigrated must skip this claim now.
     let rows2 = fetch_unmigrated(&pool, None, Some(claim_id)).await.unwrap();
-    assert_eq!(rows2.len(), 0, "already-migrated claim should be filtered out");
+    assert_eq!(
+        rows2.len(),
+        0,
+        "already-migrated claim should be filtered out"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

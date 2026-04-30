@@ -57,9 +57,10 @@ pub async fn do_ingest_workflow_via_pool(
     let workflow_id = root_workflow_id(extraction);
 
     // ── 1. Idempotency gate: skip if workflow row already processed ──────
-    if let Some(existing_id) = WorkflowRepository::find_root_by_canonical(pool, canonical_name, generation)
-        .await
-        .map_err(internal_error)?
+    if let Some(existing_id) =
+        WorkflowRepository::find_root_by_canonical(pool, canonical_name, generation)
+            .await
+            .map_err(internal_error)?
     {
         // Workflow row exists — check if any executes edges have been written.
         let edge_count: i64 = sqlx::query_scalar(
@@ -271,10 +272,8 @@ async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, McpErro
     {
         Ok(existing.id.into())
     } else {
-        let agent = epigraph_core::Agent::new(
-            pub_key_bytes,
-            Some("workflow-ingest-system".to_string()),
-        );
+        let agent =
+            epigraph_core::Agent::new(pub_key_bytes, Some("workflow-ingest-system".to_string()));
         let created = AgentRepository::create(pool, &agent)
             .await
             .map_err(internal_error)?;
@@ -318,49 +317,30 @@ mod tests {
         }
     }
 
-    async fn try_test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(3)
-            .connect(&url)
-            .await
-            .ok()?;
-        sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
-        Some(pool)
-    }
-
-    macro_rules! test_pool_or_skip {
-        () => {{
-            match try_test_pool().await {
-                Some(p) => p,
-                None => {
-                    eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                    return;
-                }
-            }
-        }};
-    }
-
     /// Smoke test: a fresh extraction ingests without error and returns
     /// `already_ingested: false` with at least one claim inserted.
-    #[tokio::test]
-    async fn ingest_workflow_smoke() {
-        let pool = test_pool_or_skip!();
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_workflow_smoke(pool: sqlx::PgPool) {
         let extraction = minimal_extraction();
         let result = do_ingest_workflow_via_pool(&pool, &extraction)
             .await
             .expect("ingest must succeed");
 
-        assert!(!result.already_ingested, "first ingest should not be skipped");
-        assert!(result.claims_ingested > 0, "expected at least one new claim");
+        assert!(
+            !result.already_ingested,
+            "first ingest should not be skipped"
+        );
+        assert!(
+            result.claims_ingested > 0,
+            "expected at least one new claim"
+        );
         assert!(result.executes_edges > 0, "expected executes edges");
     }
 
     /// Idempotency test: ingesting the same extraction twice returns
     /// `already_ingested: true` on the second call.
-    #[tokio::test]
-    async fn ingest_workflow_idempotent() {
-        let pool = test_pool_or_skip!();
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_workflow_idempotent(pool: sqlx::PgPool) {
         let mut extraction = minimal_extraction();
         // Use a unique canonical_name so this test doesn't collide with smoke.
         extraction.source.canonical_name = "test-workflow-idempotent".to_string();
@@ -384,8 +364,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            exec_edges_after,
-            r1.executes_edges as i64,
+            exec_edges_after, r1.executes_edges as i64,
             "re-ingest must not duplicate executes edges"
         );
 
@@ -398,17 +377,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            claim_count_after,
-            r1.executes_edges as i64,
+            claim_count_after, r1.executes_edges as i64,
             "re-ingest must not duplicate claims"
         );
     }
 
     /// Cross-source convergence: same atom text in a document and a workflow → same claim id.
-    #[tokio::test]
-    async fn ingest_workflow_atom_converges_with_document_atom() {
-        let pool = test_pool_or_skip!();
-
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_workflow_atom_converges_with_document_atom(pool: sqlx::PgPool) {
         // Build the document's plan deterministically and manually persist its atom claim.
         let doc_extraction: epigraph_ingest::document::DocumentExtraction = serde_json::from_str(
             r#"{
@@ -494,9 +470,8 @@ mod tests {
     }
 
     /// executes-edges test: the workflow row is linked to every planned claim.
-    #[tokio::test]
-    async fn ingest_workflow_executes_edges_created() {
-        let pool = test_pool_or_skip!();
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_workflow_executes_edges_created(pool: sqlx::PgPool) {
         let mut extraction = minimal_extraction();
         extraction.source.canonical_name = "test-workflow-executes".to_string();
 

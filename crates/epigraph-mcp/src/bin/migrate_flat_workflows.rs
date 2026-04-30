@@ -13,7 +13,10 @@ use epigraph_mcp::migrate_flat::{
 };
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Migrate flat-JSON workflows to hierarchical form (#34)")]
+#[command(
+    version,
+    about = "Migrate flat-JSON workflows to hierarchical form (#34)"
+)]
 struct Args {
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
@@ -72,7 +75,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         row_canonical_pairs.push((row, parsed, canonical.clone()));
     }
     for (row, _parsed, canonical) in &row_canonical_pairs {
-        by_canonical.entry(canonical.clone()).or_default().push(*row);
+        by_canonical
+            .entry(canonical.clone())
+            .or_default()
+            .push(*row);
     }
 
     let mut migrated = 0_usize;
@@ -102,15 +108,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        match epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
-            &pool,
-            &extraction,
-        )
-        .await
+        match epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(&pool, &extraction)
+            .await
         {
             Ok(result) => {
                 let new_workflow_id: Uuid = result.workflow_id.parse().unwrap_or_else(|e| {
-                    panic!("workflow_id '{}' is not a valid UUID: {e}", result.workflow_id)
+                    panic!(
+                        "workflow_id '{}' is not a valid UUID: {e}",
+                        result.workflow_id
+                    )
                 });
                 if let Err(e) = mark_legacy_and_supersede(&pool, row.id, new_workflow_id).await {
                     eprintln!("FAIL post-migration markup for {}: {e}", row.id);

@@ -100,7 +100,9 @@ pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
 pub use trace::ReasoningTraceRepository;
 pub use triple::{MentionRow, TripleRepository, TripleRow};
-pub use workflow::{HierarchicalWorkflowRow, WorkflowListRow, WorkflowRecallResult, WorkflowRepository};
+pub use workflow::{
+    HierarchicalWorkflowRow, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+};
 
 // Privacy / encryption repositories
 pub use behavioral_execution::{BehavioralExecutionRepository, BehavioralExecutionRow};

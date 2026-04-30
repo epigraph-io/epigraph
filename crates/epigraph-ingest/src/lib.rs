@@ -473,7 +473,9 @@ mod tests {
             "must emit phase_follows for adjacent phases"
         );
         assert!(
-            plan.edges.iter().all(|e| e.relationship != "section_follows"),
+            plan.edges
+                .iter()
+                .all(|e| e.relationship != "section_follows"),
             "must NOT emit section_follows in workflow plans"
         );
     }
@@ -493,10 +495,20 @@ mod tests {
             "relationships": []
         }"#;
         let plan = crate::workflow::build_ingest_plan(&make_workflow(json));
-        let step_follows: Vec<_> = plan.edges.iter().filter(|e| e.relationship == "step_follows").collect();
-        assert_eq!(step_follows.len(), 1, "exactly one step_follows between two adjacent steps");
+        let step_follows: Vec<_> = plan
+            .edges
+            .iter()
+            .filter(|e| e.relationship == "step_follows")
+            .collect();
+        assert_eq!(
+            step_follows.len(),
+            1,
+            "exactly one step_follows between two adjacent steps"
+        );
         assert!(
-            plan.edges.iter().all(|e| e.relationship != "continues_argument"),
+            plan.edges
+                .iter()
+                .all(|e| e.relationship != "continues_argument"),
             "must NOT emit continues_argument in workflow plans"
         );
     }
@@ -533,8 +545,16 @@ mod tests {
         let doc_plan = crate::document::build_ingest_plan(&doc);
         let wf_plan = crate::workflow::build_ingest_plan(&wf);
 
-        let doc_atom = doc_plan.claims.iter().find(|c| c.level == 3).expect("doc has atom");
-        let wf_op = wf_plan.claims.iter().find(|c| c.level == 3).expect("wf has operation");
+        let doc_atom = doc_plan
+            .claims
+            .iter()
+            .find(|c| c.level == 3)
+            .expect("doc has atom");
+        let wf_op = wf_plan
+            .claims
+            .iter()
+            .find(|c| c.level == 3)
+            .expect("wf has operation");
 
         assert_eq!(
             doc_atom.id, wf_op.id,
