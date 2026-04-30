@@ -85,6 +85,11 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
         phase_ids.push(phase_id);
         path_index.insert(phase_path.clone(), phase_id);
 
+        // `kind: "workflow_step"` is intentionally shared with level-2 step claims
+        // below. The label parallels this — `'workflow_step'` covers levels 1 and 2
+        // so that `WHERE 'workflow_step' = ANY(labels)` returns all non-thesis,
+        // non-atomic hierarchical content under a workflow as a single set. Use
+        // `properties.level` (1 vs 2) to disambiguate phase from step when needed.
         claims.push(PlannedClaim {
             id: phase_id,
             content: phase.summary.clone(),
