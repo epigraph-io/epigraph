@@ -80,6 +80,11 @@ pub struct ClaimQueryParams {
     /// Filter by the agent who created the claim
     pub agent_id: Option<Uuid>,
 
+    /// Exclude claims created by this agent. Composes with `agent_id`
+    /// (if both are set, `agent_id` filters in and `exclude_agent_id`
+    /// filters out — useful for "all claims except those from the host").
+    pub exclude_agent_id: Option<Uuid>,
+
     /// Filter by current/superseded status
     pub is_current: Option<bool>,
 
@@ -297,6 +302,7 @@ pub async fn list_claims_query(
     let needs_in_memory_filters = params.truth_min.is_some()
         || params.truth_max.is_some()
         || params.agent_id.is_some()
+        || params.exclude_agent_id.is_some()
         || params.is_current.is_some()
         || params.created_after.is_some()
         || params.created_before.is_some()
@@ -369,6 +375,10 @@ pub async fn list_claims_query(
     }
     if let Some(agent_id) = params.agent_id {
         claims.retain(|c| c.agent_id.as_uuid() == agent_id);
+    }
+    // Filter out a specific agent (composes with agent_id above)
+    if let Some(exclude_agent_id) = params.exclude_agent_id {
+        claims.retain(|c| c.agent_id.as_uuid() != exclude_agent_id);
     }
     if let Some(is_current) = params.is_current {
         claims.retain(|c| c.is_current == is_current);
@@ -572,6 +582,11 @@ pub async fn list_claims_query(
     // Filter by agent_id
     if let Some(agent_id) = params.agent_id {
         claims.retain(|c| c.agent_id.as_uuid() == agent_id);
+    }
+
+    // Filter out a specific agent (composes with agent_id above)
+    if let Some(exclude_agent_id) = params.exclude_agent_id {
+        claims.retain(|c| c.agent_id.as_uuid() != exclude_agent_id);
     }
 
     // Filter by is_current
@@ -973,6 +988,35 @@ mod tests {
                 "All returned claims should belong to the target agent"
             );
         }
+    }
+
+    // ---- Test 8b: Filter out claims by agent_id (exclude_agent_id) ----
+
+    #[tokio::test]
+    async fn list_claims_excludes_agent_id() {
+        let state = AppState::new(ApiConfig::default());
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+        insert_test_claim_with_agent(&state, "from agent A", 0.5, agent_a);
+        insert_test_claim_with_agent(&state, "from agent B", 0.5, agent_b);
+
+        let router = test_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(&format!(
+                        "/api/v1/claims?exclude_agent_id={}",
+                        agent_a.as_uuid()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let resp = parse_response(response).await;
+        assert_eq!(resp.claims.len(), 1);
+        assert_eq!(resp.claims[0].content, "from agent B");
     }
 
     // ---- Test 9: Sort by truth_value ascending ----
