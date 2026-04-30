@@ -70,6 +70,59 @@ pub fn collect_git_context(repo: &str, migration_file: &str, table: &str) -> Res
     Ok(all)
 }
 
+fn back_scan_function(lines: &[&str], hit_idx: usize) -> String {
+    let fn_re = Regex::new(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").expect("regex");
+    for i in (0..=hit_idx).rev() {
+        if let Some(c) = fn_re.captures(lines[i]) {
+            return c[1].to_string();
+        }
+    }
+    "<top-level>".to_string()
+}
+
+fn classify(line: &str) -> Option<CallKind> {
+    let l = line.to_uppercase();
+    if l.contains("INSERT INTO") || l.contains("UPDATE ") || l.contains("DELETE FROM")
+        || l.contains("UPSERT") || l.contains("COPY ") {
+        Some(CallKind::WritesTo)
+    } else if l.contains("SELECT") || l.contains("QUERY_AS") || l.contains("FROM ") {
+        Some(CallKind::ReadsFrom)
+    } else {
+        None
+    }
+}
+
+pub fn collect_call_sites(repo: &str, table: &str) -> Result<Vec<CallSite>> {
+    let crates_dir = format!("{}/crates", repo);
+    let word_re = Regex::new(&format!(r"\b{}\b", regex::escape(table)))?;
+    let mut out = Vec::new();
+    for entry in WalkDir::new(&crates_dir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() { continue; }
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("rs") { continue; }
+        if p.components().any(|c| c.as_os_str() == "target"
+            || c.as_os_str() == ".sqlx"
+            || c.as_os_str() == "migrations") { continue; }
+        let rel = p.strip_prefix(&crates_dir).unwrap();
+        let crate_name = rel.components().next()
+            .and_then(|c| c.as_os_str().to_str())
+            .unwrap_or("?").to_string();
+        let text = match std::fs::read_to_string(p) { Ok(t) => t, Err(_) => continue };
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("///") || trimmed.starts_with("//!") { continue; }
+            if !word_re.is_match(line) { continue; }
+            let kind = match classify(line) { Some(k) => k, None => continue };
+            let function = back_scan_function(&lines, i);
+            let end = (i + 2).min(lines.len());
+            let snippet = lines[i..end].join("\n").trim().to_string();
+            out.push(CallSite { crate_name: crate_name.clone(), function, snippet, kind });
+        }
+    }
+    Ok(out)
+}
+
 pub fn run(_only: Option<&str>) -> Result<()> {
     todo!("filled in by Task 10")
 }
