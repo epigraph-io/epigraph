@@ -156,6 +156,20 @@ pub struct SemanticSearchResult {
     /// Graph neighbors providing epistemic context (only in diverse mode)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_neighbors: Option<Vec<GraphNeighbor>>,
+
+    /// Theme this claim belongs to (k-means partition over `claim_themes`).
+    /// `Some` when populated by `POST /api/v1/themes/build-from-corpus`;
+    /// always emitted in diverse mode so callers can render or filter by
+    /// theme. `None` if the claim hasn't been assigned. Flat-search results
+    /// omit this field via `skip_serializing_if`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme_id: Option<Uuid>,
+
+    /// Graph community this claim belongs to in the latest cluster run
+    /// (Louvain over edges, populated by the cluster_graph job). Same
+    /// emission semantics as `theme_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<Uuid>,
 }
 
 /// A graph neighbor of a search result, providing epistemic context
@@ -505,12 +519,24 @@ pub async fn semantic_search(
                 let selected_claim_ids: Vec<Uuid> =
                     selected.iter().map(|&idx| candidates[idx].0).collect();
 
-                // Fetch full claim data for the selected IDs (including CDST columns)
+                // Fetch full claim data for the selected IDs (including CDST
+                // columns + theme_id and the latest cluster_id from
+                // claim_cluster_membership). #49: surface the partition
+                // labels so callers can render or filter by them.
                 let full_rows = sqlx::query(
                     r#"
                     SELECT c.id, c.content, c.truth_value, c.belief, c.plausibility,
                            c.agent_id, c.trace_id,
                            c.labels[1] as claim_type, c.created_at,
+                           c.theme_id,
+                           (
+                               SELECT m.cluster_id
+                               FROM claim_cluster_membership m
+                               JOIN graph_cluster_runs r ON r.run_id = m.run_id
+                               WHERE m.claim_id = c.id
+                               ORDER BY r.completed_at DESC
+                               LIMIT 1
+                           ) AS cluster_id,
                            1 - (c.embedding <=> $1::vector) as similarity
                     FROM claims c
                     WHERE c.id = ANY($2)
@@ -599,6 +625,8 @@ pub async fn semantic_search(
                             claim_type: row.get("claim_type"),
                             created_at: row.get("created_at"),
                             graph_neighbors: neighbors,
+                            theme_id: row.try_get::<Option<Uuid>, _>("theme_id").ok().flatten(),
+                            cluster_id: row.try_get::<Option<Uuid>, _>("cluster_id").ok().flatten(),
                         }
                     })
                     .collect();
@@ -684,6 +712,8 @@ pub async fn semantic_search(
                 claim_type: row.get("claim_type"),
                 created_at: row.get("created_at"),
                 graph_neighbors: None,
+                theme_id: None,
+                cluster_id: None,
             })
             .collect();
 
@@ -784,6 +814,8 @@ mod tests {
                 claim_type: Some("factual".to_string()),
                 created_at: None,
                 graph_neighbors: None,
+                theme_id: None,
+                cluster_id: None,
             }],
             total: 1,
             query_time_ms: 15,
@@ -811,6 +843,8 @@ mod tests {
             claim_type: None,
             created_at: None,
             graph_neighbors: None,
+            theme_id: None,
+            cluster_id: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -819,6 +853,8 @@ mod tests {
         assert!(!json.contains("claim_type"));
         assert!(!json.contains("created_at"));
         assert!(!json.contains("graph_neighbors"));
+        assert!(!json.contains("theme_id"));
+        assert!(!json.contains("cluster_id"));
     }
 
     #[test]
@@ -828,6 +864,8 @@ mod tests {
         let agent_id = Uuid::new_v4();
         let trace_id = Uuid::new_v4();
 
+        let theme_id = Uuid::new_v4();
+        let cluster_id = Uuid::new_v4();
         let result = SemanticSearchResult {
             claim_id,
             statement: "Full claim".to_string(),
@@ -838,12 +876,16 @@ mod tests {
             claim_type: Some("hypothesis".to_string()),
             created_at: Some(now),
             graph_neighbors: None,
+            theme_id: Some(theme_id),
+            cluster_id: Some(cluster_id),
         };
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"trace_id\":"));
         assert!(json.contains("\"claim_type\":\"hypothesis\""));
         assert!(json.contains("\"created_at\":"));
+        assert!(json.contains(&format!("\"theme_id\":\"{theme_id}\"")));
+        assert!(json.contains(&format!("\"cluster_id\":\"{cluster_id}\"")));
     }
 
     #[test]
