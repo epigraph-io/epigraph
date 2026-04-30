@@ -129,6 +129,33 @@ pub async fn record_outcome(
     })))
 }
 
+/// POST /api/v1/policies/decay-sweep — pull stale active policies toward 0.5.
+///
+/// Skips claims with `properties->>'decay_exempt' = 'true'`. Returns the
+/// number of rows updated.
+#[cfg(feature = "db")]
+pub async fn decay_sweep(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = sqlx::query(
+        "UPDATE claims SET \
+            truth_value = truth_value + 0.1 * (0.5 - truth_value), \
+            updated_at = NOW() \
+         WHERE 'policy:active' = ANY(labels) \
+           AND COALESCE((properties->>'decay_exempt')::boolean, false) IS NOT TRUE \
+           AND updated_at < NOW() - INTERVAL '90 days'",
+    )
+    .execute(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Decay sweep failed: {e}"),
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "rows_affected": result.rows_affected(),
+    })))
+}
+
 #[cfg(all(test, feature = "db"))]
 mod tests {
     use super::*;
@@ -159,6 +186,10 @@ mod tests {
             .route(
                 "/api/v1/policies/:claim_id/outcome",
                 post(record_outcome),
+            )
+            .route(
+                "/api/v1/policies/decay-sweep",
+                post(decay_sweep),
             )
             .with_state(state)
     }
@@ -219,6 +250,39 @@ mod tests {
         .unwrap()
     }
 
+    /// Like `seed_policy` but additionally backdates `updated_at` to simulate
+    /// a stale or fresh policy. Used by the decay sweep test.
+    ///
+    /// The `claims_updated_at` trigger normally forces `updated_at = NOW()`
+    /// on every UPDATE, so we temporarily disable user triggers around the
+    /// backdating UPDATE.
+    async fn seed_policy_with_age(
+        pool: &PgPool,
+        host: &str,
+        port: i64,
+        protocol: &str,
+        truth: f64,
+        decay_exempt: bool,
+        days_old: i64,
+    ) -> Uuid {
+        let id = seed_policy(pool, host, port, protocol, truth, decay_exempt).await;
+        sqlx::query("ALTER TABLE claims DISABLE TRIGGER claims_updated_at")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE claims SET updated_at = NOW() - ($2 || ' days')::interval WHERE id = $1")
+            .bind(id)
+            .bind(days_old.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE claims ENABLE TRIGGER claims_updated_at")
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
     async fn parse_body(response: axum::response::Response) -> serde_json::Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
@@ -275,5 +339,42 @@ mod tests {
             .unwrap();
         assert!(new_truth > 0.5, "expected truth to increase, got {new_truth}");
         assert!(new_truth <= 0.99);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn decay_sweep_pulls_stale_truth_toward_one_half(pool: PgPool) {
+        let stale_id = seed_policy_with_age(&pool, "stale.com", 443, "https", 0.9, false, 100).await;
+        let fresh_id = seed_policy_with_age(&pool, "fresh.com", 443, "https", 0.9, false, 1).await;
+        let exempt_id = seed_policy_with_age(&pool, "exempt.com", 443, "https", 0.9, true, 100).await;
+        let state = test_state(pool.clone());
+
+        let router = policy_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/policies/decay-sweep")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = parse_body(response).await;
+        assert_eq!(body["rows_affected"], 1);
+
+        let stale_truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+            .bind(stale_id)
+            .fetch_one(&pool).await.unwrap();
+        assert!(stale_truth < 0.9 && stale_truth > 0.5,
+            "stale should have decayed toward 0.5; got {stale_truth}");
+
+        let fresh_truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+            .bind(fresh_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(fresh_truth, 0.9, "fresh policy must not decay");
+
+        let exempt_truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+            .bind(exempt_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(exempt_truth, 0.9, "decay_exempt policy must not decay");
     }
 }
