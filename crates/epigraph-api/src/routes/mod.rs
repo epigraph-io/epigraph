@@ -274,6 +274,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/claims/:id/relate", post(edges::relate_claims))
         .route("/api/v1/workflows", post(workflows::store_workflow))
         .route(
+            "/api/v1/workflows/ingest",
+            post(workflows::ingest_workflow),
+        )
+        .route(
             "/api/v1/workflows/:id/outcome",
             post(workflows::report_outcome),
         )
