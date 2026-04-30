@@ -786,13 +786,28 @@ async fn validate_packet(
                 &sig_bytes,
             ) {
                 Ok(true) => { /* fall through */ }
-                Ok(false) | Err(_) => {
+                Ok(false) => {
                     return Err((
                         StatusCode::UNAUTHORIZED,
                         ErrorResponse::with_details(
                             "SignatureError",
                             "Signature verification failed",
                             serde_json::json!({ "field": "signature" }),
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "Stored public key rejected by Ed25519 verifier — possibly corrupted in agents table"
+                    );
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorResponse::with_details(
+                            "InternalError",
+                            "Public key verification error",
+                            serde_json::json!({}),
                         ),
                     ));
                 }
