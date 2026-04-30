@@ -1469,7 +1469,7 @@ fn create_test_agent_registry() -> Vec<AgentWithIdentity> {
 
 #[test]
 fn test_workflow_state_variants_exist() {
-    let states = vec![
+    let states = [
         WorkflowState::Created,
         WorkflowState::Running,
         WorkflowState::Completed,

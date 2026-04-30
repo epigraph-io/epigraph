@@ -3,6 +3,7 @@
 pub mod claim_helper;
 pub mod embed;
 pub mod errors;
+pub mod migrate_flat;
 pub mod server;
 pub mod tools;
 pub mod types;

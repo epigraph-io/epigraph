@@ -275,6 +275,11 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/claims/:id/relate", post(edges::relate_claims))
         .route("/api/v1/workflows", post(workflows::store_workflow))
+        .route("/api/v1/workflows/ingest", post(workflows::ingest_workflow))
+        .route(
+            "/api/v1/workflows/hierarchical/:id/outcome",
+            post(workflows::report_hierarchical_outcome),
+        )
         .route(
             "/api/v1/workflows/:id/outcome",
             post(workflows::report_outcome),
@@ -587,6 +592,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/workflows", get(workflows::list_workflows))
         .route("/api/v1/workflows/search", get(workflows::search_workflows))
+        .route(
+            "/api/v1/workflows/hierarchical/search",
+            get(workflows::find_workflow_hierarchical),
+        )
         .route("/api/v1/workflows/:id", get(workflows::get_workflow))
         .route(
             "/api/v1/policies/network",

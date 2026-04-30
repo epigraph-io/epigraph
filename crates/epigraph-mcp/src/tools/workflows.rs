@@ -465,6 +465,7 @@ pub async fn report_workflow_outcome(
         deviation_count,
         total_steps,
         created_at: chrono::Utc::now(),
+        step_claim_id: None,
     };
 
     if let Err(e) = BehavioralExecutionRepository::create(

@@ -371,7 +371,7 @@ mod tests {
             public_key,
             hash,
             EvidenceType::Consensus {
-                participants: participants,
+                participants,
                 quorum: 0.67,
                 voting_mechanism: Some("majority".to_string()),
             },
