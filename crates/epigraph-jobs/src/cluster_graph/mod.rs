@@ -3,6 +3,7 @@
 
 pub mod handler;
 pub mod louvain;
+pub mod neighborhood;
 pub mod runner;
 
 pub use handler::ClusterGraphHandler;
