@@ -90,6 +90,19 @@ const MAX_TRACE_INPUTS: usize = 50;
 #[serde(transparent)]
 pub struct OptionalTruth(pub Option<f64>);
 
+impl OptionalTruth {
+    /// Helper for `#[serde(skip_serializing_if = ...)]` on `ClaimSubmission`.
+    ///
+    /// When the wrapped value is `None`, the field is omitted entirely
+    /// from JSON output. This keeps round-tripping (serialize then
+    /// deserialize) symmetric with the deserializer, which rejects
+    /// explicit `null` but treats absent as valid.
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
 impl<'de> Deserialize<'de> for OptionalTruth {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -126,8 +139,10 @@ pub struct ClaimSubmission {
     /// Note: This is only a suggestion - actual truth is calculated from evidence
     ///
     /// Uses custom wrapper to reject explicit `null` values
-    /// (which could represent NaN from languages that serialize NaN as null)
-    #[serde(default)]
+    /// (which could represent NaN from languages that serialize NaN as null).
+    /// Serializes as absent (not `null`) when `None`, so re-deserializing
+    /// the canonical bytes still parses cleanly.
+    #[serde(default, skip_serializing_if = "OptionalTruth::is_none")]
     #[schema(value_type = Option<f64>)]
     pub initial_truth: OptionalTruth,
 
@@ -268,6 +283,36 @@ pub struct EpistemicPacket {
     pub signature: String,
 }
 
+impl EpistemicPacket {
+    /// Canonical byte representation of the packet *excluding* the signature
+    /// field. This is what the agent signs over and what the server
+    /// recomputes for verification.
+    ///
+    /// # Canonical Scheme
+    ///
+    /// The bytes are the canonical-JSON serialization of the tuple-like
+    /// view `(claim, evidence, reasoning_trace)`. The packet's `signature`
+    /// field is excluded so a client can sign these bytes and the server
+    /// can recompute identical bytes from the received packet for
+    /// verification.
+    ///
+    /// # Errors
+    /// Returns `CryptoError::SerializationError` if canonical serialization fails.
+    pub fn signable_bytes(&self) -> Result<Vec<u8>, epigraph_crypto::CryptoError> {
+        #[derive(serde::Serialize)]
+        struct PacketSignable<'a> {
+            claim: &'a ClaimSubmission,
+            evidence: &'a [EvidenceSubmission],
+            reasoning_trace: &'a ReasoningTraceSubmission,
+        }
+        epigraph_crypto::to_canonical_bytes(&PacketSignable {
+            claim: &self.claim,
+            evidence: &self.evidence,
+            reasoning_trace: &self.reasoning_trace,
+        })
+    }
+}
+
 /// Successful submission response
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SubmitPacketResponse {
@@ -323,7 +368,7 @@ impl ErrorResponse {
 // =============================================================================
 
 /// Validate the epistemic packet and return any errors
-fn validate_packet(
+async fn validate_packet(
     packet: &EpistemicPacket,
     state: &AppState,
 ) -> Result<(), (StatusCode, ErrorResponse)> {
@@ -657,22 +702,126 @@ fn validate_packet(
             ));
         }
 
-        // TODO(security): Implement Ed25519 signature verification here.
-        // This requires fetching the agent's public key from the database by
-        // packet.claim.agent_id, decoding the hex signature into a [u8; 64],
-        // and calling SignatureVerifier::verify(pub_key, canonical_content, sig).
-        // validate_packet is currently a sync fn; wiring in DB access requires
-        // making it async (or moving verification to the async handler).
-        // Until that is implemented, we fail closed: any request on the
-        // require_signatures path is rejected.
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            ErrorResponse::with_details(
-                "SignatureError",
-                "Signature verification is not yet implemented; submissions require a verified identity",
-                serde_json::json!({ "field": "signature" }),
-            ),
-        ));
+        // 1. Look up the claim agent's public key.
+        //
+        // When the `db` feature is disabled, we have no public-key store to
+        // verify against, so we fail closed: any request on the
+        // require_signatures path is rejected. Builds with `db` enabled
+        // perform the real Ed25519 verification below.
+        #[cfg(feature = "db")]
+        {
+            let agent_id: Uuid = packet.claim.agent_id;
+            let pub_key_row: Option<(Vec<u8>,)> =
+                sqlx::query_as("SELECT public_key FROM agents WHERE id = $1")
+                    .bind(agent_id)
+                    .fetch_optional(&state.db_pool)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            ErrorResponse::with_details(
+                                "InternalError",
+                                "Failed to look up agent public key",
+                                serde_json::json!({ "error": e.to_string() }),
+                            ),
+                        )
+                    })?;
+
+            let pub_key_bytes: [u8; 32] = pub_key_row
+                .ok_or_else(|| {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        ErrorResponse::with_details(
+                            "SignatureError",
+                            "Agent not registered",
+                            serde_json::json!({ "field": "claim.agent_id" }),
+                        ),
+                    )
+                })?
+                .0
+                .try_into()
+                .map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorResponse::with_details(
+                            "InternalError",
+                            "Stored public key has wrong length",
+                            serde_json::json!({}),
+                        ),
+                    )
+                })?;
+
+            // 2. Decode the hex signature.
+            let mut sig_bytes = [0u8; 64];
+            hex::decode_to_slice(&packet.signature, &mut sig_bytes).map_err(|_| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    ErrorResponse::with_details(
+                        "SignatureError",
+                        "Signature contains invalid hex characters",
+                        serde_json::json!({ "field": "signature" }),
+                    ),
+                )
+            })?;
+
+            // 3. Recompute the canonical bytes the client should have signed.
+            // The canonical scheme: serialized (claim, evidence, reasoning_trace)
+            // tuple, signature field excluded. See EpistemicPacket::signable_bytes.
+            let canonical = packet.signable_bytes().map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::with_details(
+                        "InternalError",
+                        "Failed to canonicalize packet for verification",
+                        serde_json::json!({ "error": e.to_string() }),
+                    ),
+                )
+            })?;
+
+            // 4. Verify.
+            match epigraph_crypto::SignatureVerifier::verify(&pub_key_bytes, &canonical, &sig_bytes)
+            {
+                Ok(true) => { /* fall through */ }
+                Ok(false) => {
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        ErrorResponse::with_details(
+                            "SignatureError",
+                            "Signature verification failed",
+                            serde_json::json!({ "field": "signature" }),
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "Stored public key rejected by Ed25519 verifier — possibly corrupted in agents table"
+                    );
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorResponse::with_details(
+                            "InternalError",
+                            "Public key verification error",
+                            serde_json::json!({}),
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Without the `db` feature there is no public-key store; fail closed.
+        #[cfg(not(feature = "db"))]
+        {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                ErrorResponse::with_details(
+                    "SignatureError",
+                    "Signature verification requires the `db` feature; submissions require a verified identity",
+                    serde_json::json!({ "field": "signature" }),
+                ),
+            ));
+        }
     }
 
     Ok(())
@@ -1188,7 +1337,7 @@ pub async fn submit_packet(
     }
 
     // 2. Validate the packet
-    if let Err((status, error)) = validate_packet(&packet, &state) {
+    if let Err((status, error)) = validate_packet(&packet, &state).await {
         return (status, Json(error)).into_response();
     }
 
@@ -1824,6 +1973,177 @@ mod event_tests {
             response.status(),
             StatusCode::CREATED,
             "Figure evidence submission should succeed"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod signature_verification_tests {
+    use super::*;
+    use crate::state::{ApiConfig, AppState};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    // ── Test scaffolding ──
+
+    /// Build an `AppState` backed by `pool` with `require_signatures` enabled.
+    fn test_state_with_required_signatures(pool: PgPool) -> AppState {
+        AppState::with_db(
+            pool,
+            ApiConfig {
+                require_signatures: true,
+                ..ApiConfig::default()
+            },
+        )
+    }
+
+    /// Insert an agent with the given Ed25519 public key into the agents
+    /// table. Returns the agent's UUID.
+    async fn seed_agent_with_pubkey(pool: &PgPool, pub_key: [u8; 32]) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(pub_key.as_slice())
+        .bind("signature-verification-test")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Build a minimal `ClaimSubmission` with the given content and agent.
+    fn build_test_claim_submission(agent_id: Uuid, content: &str) -> ClaimSubmission {
+        ClaimSubmission {
+            content: content.to_string(),
+            initial_truth: OptionalTruth(None),
+            agent_id,
+            idempotency_key: None,
+            properties: None,
+        }
+    }
+
+    /// Build a minimal `ReasoningTraceSubmission` with no inputs and no
+    /// inner signature. The packet-level signature is what we exercise.
+    fn build_test_trace() -> ReasoningTraceSubmission {
+        ReasoningTraceSubmission {
+            methodology: MethodologySubmission::Deductive,
+            inputs: vec![],
+            confidence: 0.8,
+            explanation: "Trace explanation for signature verification test.".to_string(),
+            signature: None,
+        }
+    }
+
+    /// Send the packet through the submit endpoint and return the response.
+    async fn submit_packet_endpoint(
+        state: AppState,
+        packet: EpistemicPacket,
+    ) -> axum::response::Response {
+        let router = Router::new()
+            .route("/api/v1/submit/packet", post(submit_packet))
+            .with_state(state);
+
+        let body = serde_json::to_string(&packet).unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/submit/packet")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        router.oneshot(request).await.unwrap()
+    }
+
+    // ── Tests ──
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn submit_with_valid_signature_succeeds(pool: PgPool) {
+        let signer = epigraph_crypto::AgentSigner::generate();
+        let pub_key = signer.public_key();
+        let agent_id = seed_agent_with_pubkey(&pool, pub_key).await;
+
+        let state = test_state_with_required_signatures(pool.clone());
+
+        let claim = build_test_claim_submission(agent_id, "Verifiable claim content.");
+        let evidence: Vec<EvidenceSubmission> = vec![];
+        let reasoning_trace = build_test_trace();
+
+        let mut packet = EpistemicPacket {
+            claim,
+            evidence,
+            reasoning_trace,
+            signature: String::new(),
+        };
+        let canonical = packet.signable_bytes().unwrap();
+        packet.signature = hex::encode(signer.sign(&canonical));
+
+        let response = submit_packet_endpoint(state, packet).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "Valid Ed25519 signature should pass verification and create the claim"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn submit_with_invalid_signature_returns_401(pool: PgPool) {
+        let real_key = epigraph_crypto::AgentSigner::generate();
+        let attacker_key = epigraph_crypto::AgentSigner::generate();
+        let agent_id = seed_agent_with_pubkey(&pool, real_key.public_key()).await;
+
+        let state = test_state_with_required_signatures(pool.clone());
+
+        let claim = build_test_claim_submission(agent_id, "Forged content.");
+        let evidence: Vec<EvidenceSubmission> = vec![];
+        let reasoning_trace = build_test_trace();
+
+        let mut packet = EpistemicPacket {
+            claim,
+            evidence,
+            reasoning_trace,
+            signature: String::new(),
+        };
+        let canonical = packet.signable_bytes().unwrap();
+        // Sign with the attacker's key — wrong key for the agent's stored pubkey.
+        packet.signature = hex::encode(attacker_key.sign(&canonical));
+
+        let response = submit_packet_endpoint(state, packet).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Signature signed by the wrong key must be rejected"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn submit_with_unknown_agent_id_returns_401(pool: PgPool) {
+        let signer = epigraph_crypto::AgentSigner::generate();
+        // Never seed this agent into the agents table.
+        let unknown_agent = Uuid::new_v4();
+
+        let state = test_state_with_required_signatures(pool.clone());
+
+        let claim = build_test_claim_submission(unknown_agent, "Orphan claim.");
+        let evidence: Vec<EvidenceSubmission> = vec![];
+        let reasoning_trace = build_test_trace();
+
+        let mut packet = EpistemicPacket {
+            claim,
+            evidence,
+            reasoning_trace,
+            signature: String::new(),
+        };
+        let canonical = packet.signable_bytes().unwrap();
+        packet.signature = hex::encode(signer.sign(&canonical));
+
+        let response = submit_packet_endpoint(state, packet).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Submission for an unregistered agent must be rejected"
         );
     }
 }

@@ -66,6 +66,8 @@ mod negative_tests;
 pub mod ownership;
 pub mod papers;
 pub mod perspective;
+#[cfg(feature = "db")]
+pub mod policies;
 pub mod political;
 #[cfg(feature = "db")]
 pub mod provenance;
@@ -585,6 +587,28 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/workflows", get(workflows::list_workflows))
         .route("/api/v1/workflows/search", get(workflows::search_workflows))
+        .route("/api/v1/workflows/:id", get(workflows::get_workflow))
+        .route(
+            "/api/v1/policies/network",
+            get(policies::list_network_policies),
+        )
+        .route(
+            "/api/v1/policies/:claim_id/outcome",
+            post(policies::record_outcome),
+        )
+        .route("/api/v1/policies/decay-sweep", post(policies::decay_sweep))
+        .route(
+            "/api/v1/policy-challenges",
+            post(policies::create_challenge),
+        )
+        .route(
+            "/api/v1/policy-challenges/:id",
+            get(policies::get_challenge),
+        )
+        .route(
+            "/api/v1/policy-challenges/:id/resolve",
+            post(policies::resolve_challenge),
+        )
         .route("/api/v1/methods/search", get(experiments::find_methods))
         .route(
             "/api/v1/methods/gap-analysis",
