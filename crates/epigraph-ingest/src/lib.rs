@@ -565,4 +565,155 @@ mod tests {
             "compound nodes must NOT converge across workflows with different canonical_name"
         );
     }
+
+    /// Workflow with no thesis: symmetric to `test_build_plan_no_thesis` for
+    /// documents — the plan must still walk phases/steps/operations and emit
+    /// `decomposes_to` from the phase level downward, with no level-0 claim.
+    #[test]
+    fn test_workflow_build_plan_no_thesis() {
+        let json = r#"{
+            "source": {"canonical_name": "wf-no-thesis", "goal": "G", "authors": []},
+            "thesis": null,
+            "thesis_derivation": "BottomUp",
+            "phases": [{
+                "title": "Phase 1",
+                "summary": "Phase summary",
+                "steps": [{
+                    "compound": "Step compound",
+                    "operations": ["op-a"],
+                    "generality": [1],
+                    "confidence": 0.8
+                }]
+            }],
+            "relationships": []
+        }"#;
+        let plan = crate::workflow::build_ingest_plan(&make_workflow(json));
+
+        assert_eq!(
+            plan.claims.iter().filter(|c| c.level == 0).count(),
+            0,
+            "no thesis means no level-0 claim",
+        );
+        assert_eq!(plan.claims.len(), 3, "1 phase + 1 step + 1 atom");
+        let decompose_count = plan
+            .edges
+            .iter()
+            .filter(|e| e.relationship == "decomposes_to")
+            .count();
+        assert_eq!(decompose_count, 2, "phase->step, step->op");
+    }
+
+    /// Workflow with a phase that has zero steps: must produce the phase claim
+    /// but emit no step claims, no step_follows, and no decomposes_to from the
+    /// phase. Asserts the negative case that
+    /// `test_workflow_uses_phase_follows_not_section_follows` only exercises.
+    #[test]
+    fn test_workflow_phase_with_no_steps() {
+        let json = r#"{
+            "source": {"canonical_name": "wf-empty-phase", "goal": "G", "authors": []},
+            "thesis": "T",
+            "phases": [{
+                "title": "Empty Phase",
+                "summary": "Phase with no steps",
+                "steps": []
+            }],
+            "relationships": []
+        }"#;
+        let plan = crate::workflow::build_ingest_plan(&make_workflow(json));
+
+        let level1: Vec<_> = plan.claims.iter().filter(|c| c.level == 1).collect();
+        let level2 = plan.claims.iter().filter(|c| c.level == 2).count();
+        let level3 = plan.claims.iter().filter(|c| c.level == 3).count();
+        assert_eq!(level1.len(), 1, "the empty phase still produces one claim");
+        assert_eq!(level2, 0, "no steps");
+        assert_eq!(level3, 0, "no operations");
+
+        let phase_id = level1[0].id;
+        let phase_decomposes = plan
+            .edges
+            .iter()
+            .filter(|e| e.relationship == "decomposes_to" && e.source_id == phase_id)
+            .count();
+        assert_eq!(phase_decomposes, 0, "phase with no steps emits no decomposes_to");
+        assert!(
+            plan.edges.iter().all(|e| e.relationship != "step_follows"),
+            "no step_follows when there are no steps",
+        );
+    }
+
+    /// `parent_canonical_name` documents lineage but is NOT mixed into the
+    /// compound-ID seed. Two workflows that share `canonical_name` and
+    /// thesis text must produce the same compound IDs whether or not the
+    /// second one declares a parent.
+    #[test]
+    fn test_workflow_parent_canonical_name_does_not_change_compound_ids() {
+        let without_parent = r#"{
+            "source": {"canonical_name": "wf-with-parent", "goal": "G", "generation": 0, "authors": []},
+            "thesis": "Shared thesis",
+            "phases": [],
+            "relationships": []
+        }"#;
+        let with_parent = r#"{
+            "source": {
+                "canonical_name": "wf-with-parent",
+                "parent_canonical_name": "some-other-workflow",
+                "goal": "G",
+                "generation": 1,
+                "authors": []
+            },
+            "thesis": "Shared thesis",
+            "phases": [],
+            "relationships": []
+        }"#;
+        let plan_no_parent = crate::workflow::build_ingest_plan(&make_workflow(without_parent));
+        let plan_with_parent = crate::workflow::build_ingest_plan(&make_workflow(with_parent));
+
+        let thesis_no = plan_no_parent.claims.iter().find(|c| c.level == 0).unwrap();
+        let thesis_with = plan_with_parent.claims.iter().find(|c| c.level == 0).unwrap();
+        assert_eq!(
+            thesis_no.id, thesis_with.id,
+            "parent_canonical_name must not feed into compound_claim_id",
+        );
+    }
+
+    /// A cross-reference relationship whose source/target paths cannot be
+    /// resolved to a planned claim must be silently skipped, not panic. Walker
+    /// is best-effort: it pushes resolvable edges and ignores the rest so
+    /// extraction errors don't abort ingest.
+    #[test]
+    fn test_workflow_unresolvable_cross_reference_is_skipped() {
+        let json = r#"{
+            "source": {"canonical_name": "wf-bad-xref", "goal": "G", "authors": []},
+            "thesis": "T",
+            "phases": [{
+                "title": "P1", "summary": "S1",
+                "steps": [{
+                    "compound": "Step compound",
+                    "operations": ["op-a"],
+                    "generality": [1],
+                    "confidence": 0.9
+                }]
+            }],
+            "relationships": [{
+                "source_path": "phases[9].steps[9].operations[9]",
+                "target_path": "phases[0].steps[0].operations[0]",
+                "relationship": "supports"
+            }]
+        }"#;
+        let plan = crate::workflow::build_ingest_plan(&make_workflow(json));
+
+        let supports: Vec<_> = plan
+            .edges
+            .iter()
+            .filter(|e| e.relationship == "supports")
+            .collect();
+        assert!(
+            supports.is_empty(),
+            "unresolvable relationship paths must produce no edge, not panic",
+        );
+        assert!(
+            plan.claims.iter().any(|c| c.level == 3),
+            "the rest of the plan still walks the resolvable hierarchy",
+        );
+    }
 }

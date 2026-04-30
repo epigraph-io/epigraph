@@ -5,38 +5,11 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
+use crate::common::edges::decomposes_edge;
 use crate::common::ids::{atom_id, compound_claim_id, content_hash};
+use crate::common::paths::normalize_claim_path;
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
-use crate::common::schema::ThesisDerivation;
 use crate::document::schema::{DocumentExtraction, Paragraph, SourceType};
-
-/// Convert slash-delimited paths from extraction ("sections/0/paragraphs/1/atoms/2")
-/// to the bracket-dot notation used by path_index ("sections[0].paragraphs[1].atoms[2]").
-/// Passes through paths that are already in bracket-dot format unchanged.
-#[must_use]
-pub fn normalize_claim_path(path: &str) -> String {
-    if path.contains('[') {
-        return path.to_string();
-    }
-    let parts: Vec<&str> = path.split('/').collect();
-    let mut result = String::new();
-    let mut i = 0;
-    while i < parts.len() {
-        if i > 0 {
-            result.push('.');
-        }
-        result.push_str(parts[i]);
-        if i + 1 < parts.len() && parts[i + 1].parse::<usize>().is_ok() {
-            result.push('[');
-            result.push_str(parts[i + 1]);
-            result.push(']');
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-    result
-}
 
 const fn source_type_str(st: &SourceType) -> &'static str {
     match st {
@@ -47,24 +20,6 @@ const fn source_type_str(st: &SourceType) -> &'static str {
         SourceType::Transcript => "Transcript",
         SourceType::Legal => "Legal",
         SourceType::Tabular => "Tabular",
-    }
-}
-
-const fn thesis_derivation_str(td: &ThesisDerivation) -> &'static str {
-    match td {
-        ThesisDerivation::TopDown => "TopDown",
-        ThesisDerivation::BottomUp => "BottomUp",
-    }
-}
-
-fn decomposes_edge(source_id: Uuid, target_id: Uuid) -> PlannedEdge {
-    PlannedEdge {
-        source_id,
-        source_type: "claim".to_string(),
-        target_id,
-        target_type: "claim".to_string(),
-        relationship: "decomposes_to".to_string(),
-        properties: serde_json::json!({}),
     }
 }
 
@@ -101,7 +56,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
             properties: serde_json::json!({
                 "level": 0,
                 "source_type": source_type,
-                "thesis_derivation": thesis_derivation_str(&extraction.thesis_derivation),
+                "thesis_derivation": extraction.thesis_derivation.as_str(),
             }),
             content_hash: hash,
             confidence: 1.0,

@@ -34,3 +34,16 @@ pub enum ThesisDerivation {
     TopDown,
     BottomUp,
 }
+
+impl ThesisDerivation {
+    /// Stable string form used in claim properties. Distinct from `serde`'s
+    /// JSON encoding so that downstream consumers (graph queries, exports)
+    /// don't depend on serialization details.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::TopDown => "TopDown",
+            Self::BottomUp => "BottomUp",
+        }
+    }
+}

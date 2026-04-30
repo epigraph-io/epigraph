@@ -7,29 +7,11 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
+use crate::common::edges::decomposes_edge;
 use crate::common::ids::{atom_id, compound_claim_id, content_hash, workflow_root_id};
+use crate::common::paths::normalize_claim_path;
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
-use crate::common::schema::ThesisDerivation;
-use crate::document::builder::normalize_claim_path;
 use crate::workflow::schema::WorkflowExtraction;
-
-const fn thesis_derivation_str(td: &ThesisDerivation) -> &'static str {
-    match td {
-        ThesisDerivation::TopDown => "TopDown",
-        ThesisDerivation::BottomUp => "BottomUp",
-    }
-}
-
-fn decomposes_edge(source_id: Uuid, target_id: Uuid) -> PlannedEdge {
-    PlannedEdge {
-        source_id,
-        source_type: "claim".to_string(),
-        target_id,
-        target_type: "claim".to_string(),
-        relationship: "decomposes_to".to_string(),
-        properties: serde_json::json!({}),
-    }
-}
 
 /// Walk a `WorkflowExtraction` tree and produce a flat list of operations.
 ///
@@ -61,7 +43,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
             properties: serde_json::json!({
                 "level": 0,
                 "source_type": source_type,
-                "thesis_derivation": thesis_derivation_str(&extraction.thesis_derivation),
+                "thesis_derivation": extraction.thesis_derivation.as_str(),
                 "kind": "workflow_thesis",
             }),
             content_hash: hash,
