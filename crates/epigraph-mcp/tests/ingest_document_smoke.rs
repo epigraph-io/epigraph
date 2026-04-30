@@ -296,6 +296,56 @@ async fn ingest_document_persists_planned_properties(pool: PgPool) {
     assert_eq!(level_zero, 1, "thesis (level 0) should be queryable by properties->>'level'");
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_document_handles_compound_equals_atom(pool: sqlx::PgPool) {
+    let server = make_server(pool.clone());
+
+    // Reproduces the wrhq 2026-04-30 collision: paragraph compound text
+    // is identical to its sole atom — same content_hash → same persisted
+    // claim → planned decomposes_to becomes a self-loop after id_map.
+    let extraction_json = serde_json::json!({
+        "source": {
+            "title": "compound-atom-test",
+            "doi": "wrhq:test/compound-atom-collision",
+            "source_type": "InternalDocument",
+            "authors": [{"name": "test", "affiliations": [], "roles": ["author"]}],
+            "year": 2026,
+            "metadata": {}
+        },
+        "thesis": "Test of compound==atom collision.",
+        "thesis_derivation": "TopDown",
+        "sections": [{
+            "title": "Body",
+            "summary": "One section, one paragraph, one atom.",
+            "paragraphs": [{
+                "compound": "Class B agents have a contract.active flag.",
+                "supporting_text": "Class B agents have a contract.active flag.",
+                "atoms": ["Class B agents have a contract.active flag."],
+                "generality": [0],
+                "confidence": 0.8,
+                "methodology": "extraction",
+                "evidence_type": "testimonial"
+            }]
+        }],
+        "relationships": []
+    });
+    let extraction: epigraph_ingest::schema::DocumentExtraction =
+        serde_json::from_value(extraction_json).expect("fixture parses");
+
+    // Must not panic and must not return Err with a CHECK violation.
+    let result = do_ingest_document(&server, &extraction).await;
+    assert!(result.is_ok(), "expected ingest to succeed, got: {result:?}");
+
+    // No self-loop edges should exist.
+    let self_loops: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = target_id"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(self_loops, 0, "self-loop edges should be filtered, found {self_loops}");
+}
+
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     let content = result.content.first().expect("at least one content block");
     content.as_text().expect("text content").text.clone()
