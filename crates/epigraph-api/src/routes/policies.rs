@@ -9,7 +9,7 @@
 
 #[cfg(feature = "db")]
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     Json,
 };
 use serde::Deserialize;
@@ -85,13 +85,57 @@ pub async fn list_network_policies(
     Ok(Json(serde_json::json!({ "policies": policies })))
 }
 
+/// POST /api/v1/policies/:claim_id/outcome — Bayesian-style nudge.
+///
+/// `supports = true` increases truth toward 1.0; `false` decreases.
+/// `strength` is the magnitude in (0, 1]; clamped server-side.
+#[cfg(feature = "db")]
+pub async fn record_outcome(
+    State(state): State<AppState>,
+    Path(claim_id): Path<Uuid>,
+    Json(req): Json<OutcomeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let strength = req.strength.clamp(0.0, 1.0);
+    let signed = if req.supports { strength } else { -strength };
+
+    // Same closed-form update as epigraph-nano/src/persistence.rs:7430.
+    let row: Option<(f64,)> = sqlx::query_as(
+        "UPDATE claims SET \
+            truth_value = LEAST(0.99, GREATEST(0.01, \
+                truth_value + $1 * (1.0 - truth_value) * \
+                CASE WHEN $1 > 0 THEN 1.0 ELSE truth_value END)), \
+            updated_at = NOW() \
+         WHERE id = $2 AND 'policy:active' = ANY(labels) \
+         RETURNING truth_value",
+    )
+    .bind(signed)
+    .bind(claim_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to update policy outcome: {e}"),
+    })?;
+
+    let new_truth = row
+        .ok_or(ApiError::NotFound {
+            entity: "policy".to_string(),
+            id: claim_id.to_string(),
+        })?
+        .0;
+
+    Ok(Json(serde_json::json!({
+        "claim_id": claim_id,
+        "truth_value": new_truth,
+    })))
+}
+
 #[cfg(all(test, feature = "db"))]
 mod tests {
     use super::*;
     use crate::state::{ApiConfig, AppState};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum::Router;
     use http_body_util::BodyExt;
     use sqlx::PgPool;
@@ -105,12 +149,16 @@ mod tests {
         AppState::with_db(pool, ApiConfig::default())
     }
 
-    /// Build a router exposing just the policy list route under test.
+    /// Build a router exposing the policy routes under test.
     fn policy_router(state: AppState) -> Router {
         Router::new()
             .route(
                 "/api/v1/policies/network",
                 get(list_network_policies),
+            )
+            .route(
+                "/api/v1/policies/:claim_id/outcome",
+                post(record_outcome),
             )
             .with_state(state)
     }
@@ -199,5 +247,33 @@ mod tests {
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 1);
         assert_eq!(policies[0]["host"], "example.com");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn outcome_supports_true_increases_truth_value(pool: PgPool) {
+        let claim_id = seed_policy(&pool, "example.com", 443, "https", 0.5, false).await;
+        let state = test_state(pool.clone());
+
+        let router = policy_router(state.clone());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&format!("/api/v1/policies/{claim_id}/outcome"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"supports": true, "strength": 0.05}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let new_truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(new_truth > 0.5, "expected truth to increase, got {new_truth}");
+        assert!(new_truth <= 0.99);
     }
 }
