@@ -1218,6 +1218,7 @@ dependencies = [
  "epigraph-embeddings",
  "epigraph-engine",
  "epigraph-events",
+ "epigraph-ingest",
  "epigraph-interfaces",
  "epigraph-jobs",
  "futures",
@@ -1468,6 +1469,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum 0.8.8",
+ "blake3",
  "chrono",
  "clap",
  "ed25519-dalek",
