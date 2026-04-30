@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;
+use crate::types::IngestWorkflowParams;
 
 use epigraph_core::{AgentId, TruthValue};
 use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, WorkflowRepository};
@@ -259,6 +260,14 @@ pub async fn do_ingest_workflow(
 ) -> Result<CallToolResult, McpError> {
     let response = do_ingest_workflow_via_pool(&server.pool, extraction).await?;
     success_json(&response)
+}
+
+/// Param-driven MCP tool entry point. Thin wrapper over `do_ingest_workflow`.
+pub async fn ingest_workflow(
+    server: &EpiGraphMcpFull,
+    params: IngestWorkflowParams,
+) -> Result<CallToolResult, McpError> {
+    do_ingest_workflow(server, &params.extraction).await
 }
 
 // ── Internal helper ────────────────────────────────────────────────────────
