@@ -976,13 +976,12 @@ mod tests {
     async fn ensure_system_agent(pool: &PgPool) -> Uuid {
         let pub_key = vec![0u8; 32];
         // Try existing first
-        if let Some(id) = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM agents WHERE public_key = $1",
-        )
-        .bind(&pub_key)
-        .fetch_optional(pool)
-        .await
-        .unwrap()
+        if let Some(id) =
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE public_key = $1")
+                .bind(&pub_key)
+                .fetch_optional(pool)
+                .await
+                .unwrap()
         {
             return id;
         }

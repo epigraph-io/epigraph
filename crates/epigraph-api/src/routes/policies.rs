@@ -308,26 +308,11 @@ mod tests {
     /// Build a router exposing the policy routes under test.
     fn policy_router(state: AppState) -> Router {
         Router::new()
-            .route(
-                "/api/v1/policies/network",
-                get(list_network_policies),
-            )
-            .route(
-                "/api/v1/policies/:claim_id/outcome",
-                post(record_outcome),
-            )
-            .route(
-                "/api/v1/policies/decay-sweep",
-                post(decay_sweep),
-            )
-            .route(
-                "/api/v1/policy-challenges",
-                post(create_challenge),
-            )
-            .route(
-                "/api/v1/policy-challenges/:id",
-                get(get_challenge),
-            )
+            .route("/api/v1/policies/network", get(list_network_policies))
+            .route("/api/v1/policies/:claim_id/outcome", post(record_outcome))
+            .route("/api/v1/policies/decay-sweep", post(decay_sweep))
+            .route("/api/v1/policy-challenges", post(create_challenge))
+            .route("/api/v1/policy-challenges/:id", get(get_challenge))
             .route(
                 "/api/v1/policy-challenges/:id/resolve",
                 post(resolve_challenge),
@@ -339,13 +324,12 @@ mod tests {
     /// going through the public API) and return its id.
     async fn ensure_system_agent(pool: &PgPool) -> Uuid {
         let pub_key = vec![0u8; 32];
-        if let Some(id) = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM agents WHERE public_key = $1",
-        )
-        .bind(&pub_key)
-        .fetch_optional(pool)
-        .await
-        .unwrap()
+        if let Some(id) =
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE public_key = $1")
+                .bind(&pub_key)
+                .fetch_optional(pool)
+                .await
+                .unwrap()
         {
             return id;
         }
@@ -411,12 +395,14 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE claims SET updated_at = NOW() - ($2 || ' days')::interval WHERE id = $1")
-            .bind(id)
-            .bind(days_old.to_string())
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE claims SET updated_at = NOW() - ($2 || ' days')::interval WHERE id = $1",
+        )
+        .bind(id)
+        .bind(days_old.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
         sqlx::query("ALTER TABLE claims ENABLE TRIGGER claims_updated_at")
             .execute(pool)
             .await
@@ -519,15 +505,20 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert!(new_truth > 0.5, "expected truth to increase, got {new_truth}");
+        assert!(
+            new_truth > 0.5,
+            "expected truth to increase, got {new_truth}"
+        );
         assert!(new_truth <= 0.99);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn decay_sweep_pulls_stale_truth_toward_one_half(pool: PgPool) {
-        let stale_id = seed_policy_with_age(&pool, "stale.com", 443, "https", 0.9, false, 100).await;
+        let stale_id =
+            seed_policy_with_age(&pool, "stale.com", 443, "https", 0.9, false, 100).await;
         let fresh_id = seed_policy_with_age(&pool, "fresh.com", 443, "https", 0.9, false, 1).await;
-        let exempt_id = seed_policy_with_age(&pool, "exempt.com", 443, "https", 0.9, true, 100).await;
+        let exempt_id =
+            seed_policy_with_age(&pool, "exempt.com", 443, "https", 0.9, true, 100).await;
         let state = test_state(pool.clone());
 
         let router = policy_router(state);
@@ -547,16 +538,26 @@ mod tests {
 
         let stale_truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
             .bind(stale_id)
-            .fetch_one(&pool).await.unwrap();
-        assert!(stale_truth < 0.9 && stale_truth > 0.5,
-            "stale should have decayed toward 0.5; got {stale_truth}");
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            stale_truth < 0.9 && stale_truth > 0.5,
+            "stale should have decayed toward 0.5; got {stale_truth}"
+        );
 
         let fresh_truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
-            .bind(fresh_id).fetch_one(&pool).await.unwrap();
+            .bind(fresh_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(fresh_truth, 0.9, "fresh policy must not decay");
 
         let exempt_truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
-            .bind(exempt_id).fetch_one(&pool).await.unwrap();
+            .bind(exempt_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(exempt_truth, 0.9, "decay_exempt policy must not decay");
     }
 
@@ -636,7 +637,9 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert!((default_deny_truth - 0.63).abs() < 1e-6,
-            "expected 0.6 + 0.03 = 0.63, got {default_deny_truth}");
+        assert!(
+            (default_deny_truth - 0.63).abs() < 1e-6,
+            "expected 0.6 + 0.03 = 0.63, got {default_deny_truth}"
+        );
     }
 }

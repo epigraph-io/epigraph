@@ -596,10 +596,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/policies/:claim_id/outcome",
             post(policies::record_outcome),
         )
-        .route(
-            "/api/v1/policies/decay-sweep",
-            post(policies::decay_sweep),
-        )
+        .route("/api/v1/policies/decay-sweep", post(policies::decay_sweep))
         .route(
             "/api/v1/policy-challenges",
             post(policies::create_challenge),

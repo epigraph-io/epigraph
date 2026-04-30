@@ -399,24 +399,28 @@ async fn fetch_subgraph_edges(
         return Ok((Vec::new(), 0));
     }
     let rows: Vec<(Uuid, Uuid, String, bool)> = match rel_list {
-        Some(allowlist) => sqlx::query_as(
-            "SELECT source_id, target_id, relationship, \
+        Some(allowlist) => {
+            sqlx::query_as(
+                "SELECT source_id, target_id, relationship, \
                     (relationship = ANY($2)) AS is_allowed \
              FROM edges \
              WHERE source_id = ANY($1) AND target_id = ANY($1)",
-        )
-        .bind(node_ids)
-        .bind(allowlist)
-        .fetch_all(pool)
-        .await,
-        None => sqlx::query_as(
-            "SELECT source_id, target_id, relationship, true AS is_allowed \
+            )
+            .bind(node_ids)
+            .bind(allowlist)
+            .fetch_all(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT source_id, target_id, relationship, true AS is_allowed \
              FROM edges \
              WHERE source_id = ANY($1) AND target_id = ANY($1)",
-        )
-        .bind(node_ids)
-        .fetch_all(pool)
-        .await,
+            )
+            .bind(node_ids)
+            .fetch_all(pool)
+            .await
+        }
     }
     .map_err(internal)?;
 
@@ -569,8 +573,16 @@ mod tests {
 
     #[test]
     fn resolve_filter_comma_separated_trims_and_filters_empty() {
-        let result = resolve_relationship_filter(Some("produced, same_source ,  ,CONTAINS")).unwrap();
-        assert_eq!(result, vec!["produced".to_string(), "same_source".to_string(), "CONTAINS".to_string()]);
+        let result =
+            resolve_relationship_filter(Some("produced, same_source ,  ,CONTAINS")).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                "produced".to_string(),
+                "same_source".to_string(),
+                "CONTAINS".to_string()
+            ]
+        );
     }
 }
 
@@ -605,13 +617,12 @@ mod integration_tests {
     /// Insert a system agent for tests (mirrors the pattern in policies.rs).
     async fn ensure_test_agent(pool: &PgPool) -> Uuid {
         let pub_key = vec![1u8; 32];
-        if let Some(id) = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM agents WHERE public_key = $1",
-        )
-        .bind(&pub_key)
-        .fetch_optional(pool)
-        .await
-        .unwrap()
+        if let Some(id) =
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE public_key = $1")
+                .bind(&pub_key)
+                .fetch_optional(pool)
+                .await
+                .unwrap()
         {
             return id;
         }
@@ -673,13 +684,13 @@ mod integration_tests {
     /// with optional `?relationships=` override.
     fn neighborhood_request(node_id: Uuid, relationships: Option<&str>) -> Request<Body> {
         let uri = match relationships {
-            Some(r) => format!("/api/v1/graph/neighborhood?node_id={}&relationships={}", node_id, r),
+            Some(r) => format!(
+                "/api/v1/graph/neighborhood?node_id={}&relationships={}",
+                node_id, r
+            ),
             None => format!("/api/v1/graph/neighborhood?node_id={}", node_id),
         };
-        Request::builder()
-            .uri(uri)
-            .body(Body::empty())
-            .unwrap()
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -691,7 +702,8 @@ mod integration_tests {
         let router = graph_router(state);
 
         // Without relationships override: edge is filtered.
-        let response = router.clone()
+        let response = router
+            .clone()
             .oneshot(neighborhood_request(a, None))
             .await
             .unwrap();

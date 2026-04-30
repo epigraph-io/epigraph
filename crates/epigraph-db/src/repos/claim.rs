@@ -1590,11 +1590,12 @@ mod tests {
             .await
             .unwrap();
 
-        let row: (serde_json::Value,) = sqlx::query_as("SELECT properties FROM claims WHERE id = $1")
-            .bind(Uuid::from(persisted.id))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let row: (serde_json::Value,) =
+            sqlx::query_as("SELECT properties FROM claims WHERE id = $1")
+                .bind(Uuid::from(persisted.id))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(row.0, props);
     }
 

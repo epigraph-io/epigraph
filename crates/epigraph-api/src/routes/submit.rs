@@ -711,22 +711,21 @@ async fn validate_packet(
         #[cfg(feature = "db")]
         {
             let agent_id: Uuid = packet.claim.agent_id;
-            let pub_key_row: Option<(Vec<u8>,)> = sqlx::query_as(
-                "SELECT public_key FROM agents WHERE id = $1",
-            )
-            .bind(agent_id)
-            .fetch_optional(&state.db_pool)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::with_details(
-                        "InternalError",
-                        "Failed to look up agent public key",
-                        serde_json::json!({ "error": e.to_string() }),
-                    ),
-                )
-            })?;
+            let pub_key_row: Option<(Vec<u8>,)> =
+                sqlx::query_as("SELECT public_key FROM agents WHERE id = $1")
+                    .bind(agent_id)
+                    .fetch_optional(&state.db_pool)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            ErrorResponse::with_details(
+                                "InternalError",
+                                "Failed to look up agent public key",
+                                serde_json::json!({ "error": e.to_string() }),
+                            ),
+                        )
+                    })?;
 
             let pub_key_bytes: [u8; 32] = pub_key_row
                 .ok_or_else(|| {
@@ -780,11 +779,8 @@ async fn validate_packet(
             })?;
 
             // 4. Verify.
-            match epigraph_crypto::SignatureVerifier::verify(
-                &pub_key_bytes,
-                &canonical,
-                &sig_bytes,
-            ) {
+            match epigraph_crypto::SignatureVerifier::verify(&pub_key_bytes, &canonical, &sig_bytes)
+            {
                 Ok(true) => { /* fall through */ }
                 Ok(false) => {
                     return Err((
