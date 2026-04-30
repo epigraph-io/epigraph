@@ -374,6 +374,123 @@ mod tests {
             .await
             .expect("second ingest");
         assert!(r2.already_ingested, "second ingest should be a no-op");
+
+        // After re-ingest, edge count should be unchanged.
+        let exec_edges_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'executes'",
+        )
+        .bind(Uuid::parse_str(&r1.workflow_id).expect("valid uuid"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            exec_edges_after,
+            r1.executes_edges as i64,
+            "re-ingest must not duplicate executes edges"
+        );
+
+        let claim_count_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM claims WHERE id IN \
+             (SELECT target_id FROM edges WHERE source_id = $1 AND relationship = 'executes')",
+        )
+        .bind(Uuid::parse_str(&r1.workflow_id).expect("valid uuid"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            claim_count_after,
+            r1.executes_edges as i64,
+            "re-ingest must not duplicate claims"
+        );
+    }
+
+    /// Cross-source convergence: same atom text in a document and a workflow → same claim id.
+    #[tokio::test]
+    async fn ingest_workflow_atom_converges_with_document_atom() {
+        let pool = test_pool_or_skip!();
+
+        // Build the document's plan deterministically and manually persist its atom claim.
+        let doc_extraction: epigraph_ingest::document::DocumentExtraction = serde_json::from_str(
+            r#"{
+                "source": {"title": "Test Paper", "source_type": "Paper", "authors": []},
+                "thesis": "Doc thesis",
+                "sections": [{
+                    "title": "Body", "summary": "Body summary",
+                    "paragraphs": [{
+                        "compound": "P1",
+                        "atoms": ["text-embedding-3-large produces 3072-dimensional vectors."],
+                        "generality": [1], "confidence": 0.9
+                    }]
+                }],
+                "relationships": []
+            }"#,
+        )
+        .unwrap();
+
+        let doc_plan = epigraph_ingest::document::build_ingest_plan(&doc_extraction);
+        let atom_text = "text-embedding-3-large produces 3072-dimensional vectors.";
+        let hash = blake3::hash(atom_text.as_bytes());
+        let expected_atom_id = Uuid::new_v5(
+            &epigraph_ingest::common::ids::ATOM_NAMESPACE,
+            hash.as_bytes(),
+        );
+
+        // Manually insert the document atom (mirrors what do_ingest_document would do).
+        let sys_agent_id = get_or_create_system_agent(&pool).await.unwrap();
+        let doc_atom = doc_plan.claims.iter().find(|c| c.level == 3).unwrap();
+        assert_eq!(doc_atom.id, expected_atom_id);
+        epigraph_db::ClaimRepository::create_with_id_if_absent(
+            &pool,
+            doc_atom.id,
+            &doc_atom.content,
+            &doc_atom.content_hash,
+            sys_agent_id,
+            epigraph_core::TruthValue::clamped(0.5),
+            &["paper_atom".to_string()],
+        )
+        .await
+        .unwrap();
+
+        // Now ingest a workflow that uses the same atom text as one of its operations.
+        let wf_extraction: epigraph_ingest::workflow::WorkflowExtraction = serde_json::from_str(
+            r#"{
+                "source": {"canonical_name": "embed-pipeline-convergence-test", "goal": "G", "generation": 0, "authors": []},
+                "thesis": "Workflow thesis",
+                "phases": [{
+                    "title": "Embed", "summary": "Embed step",
+                    "steps": [{
+                        "compound": "Run embedding",
+                        "operations": ["text-embedding-3-large produces 3072-dimensional vectors."],
+                        "generality": [1], "confidence": 0.9
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let wf_result = do_ingest_workflow_via_pool(&pool, &wf_extraction)
+            .await
+            .unwrap();
+
+        // Exactly one row in claims with this id (no duplicate from ingest).
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = $1")
+            .bind(expected_atom_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "atom must converge to one claim node, not two");
+
+        // The workflow has an `executes` edge to the same atom.
+        let wf_id = Uuid::parse_str(&wf_result.workflow_id).expect("valid uuid");
+        let wf_edge: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges \
+             WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes'",
+        )
+        .bind(wf_id)
+        .bind(expected_atom_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(wf_edge, 1);
     }
 
     /// executes-edges test: the workflow row is linked to every planned claim.
