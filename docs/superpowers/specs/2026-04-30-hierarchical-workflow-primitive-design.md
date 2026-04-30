@@ -59,6 +59,13 @@ CREATE INDEX workflows_goal_trgm_idx ON workflows USING gin (goal gin_trgm_ops);
 
 Root ID derivation: `uuid_v5(WORKFLOW_NAMESPACE, blake3(canonical_name || ":" || generation))`. The `(canonical_name, generation)` UNIQUE constraint is belt-and-suspenders against deterministic-ID drift.
 
+The same migration **must also** expand the existing `edges_entity_types_valid` CHECK constraint and the `validate_edge_reference` trigger function to recognize `'workflow'` as a valid entity type. Today `migrations/005_task_event_edge_types.sql` enumerates allowed source/target types as a closed list (`'claim', 'agent', 'evidence', 'trace', 'node', 'activity', 'paper', 'perspective', 'community', 'context', 'frame', 'analysis', 'source_artifact', 'span', 'entity', 'task', 'event'`) — `'workflow'` is not in it, so any `INSERT INTO edges (source_type='workflow', ...)` fails the CHECK before reaching the workflows table. Steps for the new migration:
+
+1. `ALTER TABLE edges DROP CONSTRAINT IF EXISTS edges_entity_types_valid; ALTER TABLE edges ADD CONSTRAINT edges_entity_types_valid CHECK (... ARRAY[..., 'workflow'] ...)` — append `'workflow'` to both the `source_type` and `target_type` ARRAYs, preserving the existing entries verbatim.
+2. `CREATE OR REPLACE FUNCTION validate_edge_reference(entity_type TEXT, entity_id UUID) ...` — add a `WHEN 'workflow' THEN EXISTS (SELECT 1 FROM workflows WHERE id = entity_id)` branch. Both overloads (`(text, uuid)` and `(uuid, varchar)`) must be updated; the trigger calls the second.
+
+This sequencing matters: the migration creates the `workflows` table first, then expands the constraints and trigger function (the trigger references `workflows`, which must exist first).
+
 ### Claim labels
 
 | Level | Content | Labels |
@@ -91,7 +98,9 @@ ALTER TABLE behavioral_executions
     ADD COLUMN step_claim_id uuid REFERENCES claims(id);  -- nullable for back-compat
 ```
 
-Each row becomes per-(execution, step). An execution with N steps writes N rows, with execution-level fields (`goal_text`, `success`, `tool_pattern`) denormalized across them. Existing rows have NULL `step_claim_id`. Existing affinity-lookup queries that aggregate by `workflow_id` keep working unchanged; new analyses can `JOIN` to `claims` via `step_claim_id` for per-step rates.
+Each row becomes per-(execution, step). An execution with N steps writes N rows, with execution-level fields (`goal_text`, `success`, `tool_pattern`) denormalized across them. Existing rows have NULL `step_claim_id`.
+
+**Aggregation semantics under mixed rows.** Old rows are 1:1 with executions; new rows are N:1 with executions. So `SELECT COUNT(*) FROM behavioral_executions WHERE workflow_id = $1` is no longer "execution count" once any hierarchical workflow is written — it's an over-count. Queries that need per-execution counts must `COUNT(DISTINCT (workflow_id, created_at))` (or some equivalent execution-key tuple). Queries that aggregate by `(workflow_id, success)` continue to work for legacy-flat workflows because `step_claim_id` is NULL and `created_at` is unique per row. New per-step analytics use `WHERE step_claim_id IS NOT NULL` to scope to hierarchical executions only. Existing `behavioral_affinity_lineage` and `rolling_success_rate` query paths in `epigraph-db` will be reviewed at writing-plans time and updated to use the DISTINCT-tuple pattern where they need execution-count semantics.
 
 ---
 
@@ -125,10 +134,12 @@ The walker takes a small `WalkerConfig`: a new `WORKFLOW_NAMESPACE`, `ATOM_NAMES
 - New module `crates/epigraph-mcp/src/tools/workflow_ingest.rs` adds tool `ingest_workflow`. Mirrors `ingest_document` exactly: takes a `WorkflowExtraction` JSON, runs `epigraph_ingest::workflow::build_ingest_plan`, persists claims and edges, plus inserts the `workflows` row and the `workflow —executes→ claim` edges for every claim in the plan.
 - Existing `crates/epigraph-mcp/src/tools/workflows.rs` (which holds `store_workflow`, `find_workflow`, `improve_workflow`, etc.) is untouched.
 
-### HTTP endpoint
+### HTTP endpoints
 
 - New handler `ingest_workflow` registered at `POST /api/v1/workflows/ingest` in `crates/epigraph-api/src/routes/workflows.rs`.
-- Existing handlers in that file are untouched.
+- New handler `report_hierarchical_outcome` registered at `POST /api/v1/workflows/hierarchical/:id/outcome`. The existing `report_outcome` (flat-JSON path) looks up `claims WHERE id=$1 AND 'workflow' = ANY(labels)` and 404s on hierarchical roots; rather than overload it with table-dispatch logic, the hierarchical path gets its own endpoint. The new handler resolves `:id` against the `workflows` table, updates `workflows.metadata` counters (`use_count`, `success_count`, `failure_count`, `avg_variance`) the same way `report_outcome` updates `claims.properties` today, and writes per-step `behavioral_executions` rows with `step_claim_id` populated for each step in the request's `step_executions` array (using the workflow's `executes` edges to resolve step indices to claim IDs). Returns the same response shape as `report_outcome` so callers can switch endpoints with minimal changes.
+- New handler `find_workflow_hierarchical` registered at `GET /api/v1/workflows/hierarchical/search` (used in tests; future unification work will fold it into a single tool).
+- All existing handlers in `workflows.rs` are untouched.
 
 ### Migration CLI
 
@@ -261,7 +272,7 @@ Compound nodes (thesis, phase, step) are scoped by `canonical_name` instead of `
    - `source.canonical_name`: by default, `slugify(goal)`. With `--canonical-from tag`, use the first tag if present (fallback to slugified goal). Collisions (two flat workflows with the same canonical_name) are resolved by appending generation: the first-seen becomes generation=0, subsequent ones become generation=1, 2, … with `parent_canonical_name` pointing to the first.
    - `source.goal`: copied verbatim.
    - `source.generation`: read from old `properties.generation`, default 0; collision-incremented if needed.
-   - `source.parent_canonical_name`: derived from old `properties.parent_id` if present (look up that claim, slugify its goal).
+   - `source.parent_canonical_name`: derived from old `properties.parent_id` if present. Migration tool reads `properties.parent_id` (a claim UUID set by the existing `improve_workflow` handler at `crates/epigraph-api/src/routes/workflows.rs:666`), looks up that claim's content, slugifies its `goal`, and uses the result as `parent_canonical_name`. After `ingest_workflow` runs, the new `workflows.parent_id` FK is populated by resolving `parent_canonical_name + (parent_generation := 0)` to a `workflows.id`. If the parent claim itself isn't yet migrated when the child runs, the migration tool processes the parent first (sort by `properties.generation ASC` within a canonical_name group). Lineage chains are reconstructed in topological order.
    - `source.authors`: empty (old flat-JSON has no author info beyond `agent_id`).
    - `source.expected_outcome`, `source.tags`: copied.
    - `thesis`: `Some(goal.clone())`.
@@ -277,7 +288,7 @@ Compound nodes (thesis, phase, step) are scoped by `canonical_name` instead of `
 
 **Idempotence:** the `WHERE NOT 'legacy_flat' = ANY(labels)` filter at step 1 makes re-runs safe.
 
-**Step-claim convergence during migration:** because operation atoms use the global `ATOM_NAMESPACE`, two old workflows whose `steps[i]` text is identical share the same operation claim after migration — the migrate-pass realizes the cross-workflow convergence retroactively. Each migration uses `INSERT ... ON CONFLICT DO NOTHING` on claim creation, so concurrent or repeat migrations are safe.
+**Step-claim convergence during migration:** because operation atoms use the global `ATOM_NAMESPACE`, two old workflows whose `steps[i]` text is identical produce the same `Uuid::new_v5(&ATOM_NAMESPACE, &blake3(text))` and share one operation claim after migration. The migrate-pass realizes the cross-workflow convergence retroactively. Claim writes use `INSERT ... ON CONFLICT (id) DO NOTHING` (the existing primary-key constraint on `claims.id`); the deterministic UUIDs from `epigraph-ingest` make this idempotent across concurrent migrations and re-runs without a separate UNIQUE on `content_hash`.
 
 ---
 
@@ -320,6 +331,9 @@ The PR is purely additive. Nothing existing breaks.
 - `ingest_workflow_variant_lineage`: ingest workflow X (generation=0). Then ingest a "v2" with `parent_canonical_name=X.canonical_name, generation=1`. Assert `workflows.parent_id` FK is set, plus a `workflow —variant_of→ workflow` edge exists.
 - `ingest_workflow_does_not_disturb_old_path`: pre-seed a flat-JSON workflow via `store_workflow`. Ingest a hierarchical workflow with the same `goal`. Assert `find_workflow` (old path) still returns the flat one; `find_workflow_hierarchical` returns the new one. Both are independent.
 - `behavioral_execution_with_step_claim_id`: write a `behavioral_executions` row with a populated `step_claim_id`. Assert it persists and is queryable. Verify a backward-compatible NULL row also persists. Verify existing `behavioral_affinity_lineage` aggregation queries still return the same shape on a mix of NULL and populated rows.
+- `report_hierarchical_outcome_updates_workflows_metadata`: `POST /api/v1/workflows/hierarchical/:id/outcome` with `{success: true, step_executions: [...]}` against a hierarchical workflow. Assert (a) `workflows.metadata.use_count` incremented, (b) one `behavioral_executions` row written per step with the matching `step_claim_id`, (c) the response shape matches the existing `report_outcome` shape so callers can swap.
+- `report_hierarchical_outcome_404s_on_flat_id`: same endpoint with a flat-JSON `claim.id` returns 404 (the flat path is on the original endpoint).
+- `edges_constraint_admits_workflow_source_type`: after the new migration runs, `INSERT INTO edges (source_type, target_type, ...) VALUES ('workflow', 'claim', ...)` succeeds. A pre-migration rollback (or against an unmigrated DB) would fail with `edges_entity_types_valid` — this test guards against the migration being merged without the constraint expansion.
 - **Cross-source convergence DB test.** Ingest a `DocumentExtraction` with one atom `"text-embedding-3-large produces 3072-dimensional vectors"`. Ingest a `WorkflowExtraction` whose operation list contains the same string. Query `claims WHERE id = $deterministic_uuid_v5`. Assert exactly one row. Assert it has both a `paper —asserts→` (or `author_placeholder` resolved) edge AND a `workflow —executes→` edge pointing at it.
 
 ### Migration tool tests (in the bin's own test module)
