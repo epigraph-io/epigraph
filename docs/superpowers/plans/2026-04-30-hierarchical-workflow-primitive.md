@@ -4,7 +4,7 @@
 
 **Goal:** Land issue #34 — hierarchical workflows isomorphic to `DocumentExtraction`, with a dedicated `workflows` table, parameterized hierarchy walker shared with documents, atomic operations that converge across workflows and documents at level 3, and a one-shot migration tool that brings existing flat-JSON workflows into the new tables without disturbing the old `find_workflow` / `store_workflow` paths.
 
-**Architecture:** Eight phases inside one feature branch. Phase 1 lands the schema (workflows table + edges constraint expansion + validate_edge_reference trigger update). Phase 2 refactors `epigraph-ingest` from a monolithic builder to `common`/`document`/`workflow` modules with a parameterized walker, preserving back-compat for all current `ingest_document` callers. Phase 3 adds `WorkflowExtraction` and the workflow walker config. Phase 4 ships `ingest_workflow` (MCP tool + HTTP endpoint). Phase 5 ALTERs `behavioral_executions` and adds `report_hierarchical_outcome`. Phase 6 adds `find_workflow_hierarchical` HTTP search. Phase 7 ships the migration CLI. Phase 8 runs the full workspace test suite + manual smoke. Each phase ends in a commit and can be reviewed/cherry-picked independently.
+**Architecture:** Eight phases inside one feature branch. Phase 1 lands the schema as TWO migrations: `019_experiment_edge_type_fix.sql` (bugfix for issue #38 — admits the pre-existing `experiment` / `experiment_result` edge entity types that the kernel's CHECK and trigger function never formally listed) and `020_workflows_table.sql` (workflows table + extends the constraint with `'workflow'`). Phase 2 refactors `epigraph-ingest` from a monolithic builder to `common`/`document`/`workflow` modules with a parameterized walker, preserving back-compat for all current `ingest_document` callers. Phase 3 adds `WorkflowExtraction` and the workflow walker config. Phase 4 ships `ingest_workflow` (MCP tool + HTTP endpoint). Phase 5 ALTERs `behavioral_executions` (migration 021) and adds `report_hierarchical_outcome`. Phase 6 adds `find_workflow_hierarchical` HTTP search. Phase 7 ships the migration CLI. Phase 8 runs the full workspace test suite + manual smoke. Each phase ends in a commit and can be reviewed/cherry-picked independently.
 
 **Tech Stack:** Rust 1.75+, Axum, sqlx, PostgreSQL 16, blake3, uuid (v5).
 
@@ -45,7 +45,7 @@ Expected: four rows, one per table.
 ls /home/jeremy/epigraph-wt-issue-34/migrations/ | grep -E '^[0-9]' | tail -3
 ```
 
-Expected: ends in `018_drop_edges_triple_unique_constraint.sql`. New migrations in this plan are 019 and 020.
+Expected: ends in `018_drop_edges_triple_unique_constraint.sql`. New migrations added by this plan are 019 (bugfix for #38), 020 (workflows table for #34), and 021 (behavioral_executions step_claim_id ALTER for #34).
 
 - [ ] **Step 0.5: Run existing `epigraph-ingest` tests as baseline**
 
@@ -57,18 +57,31 @@ Expected: all pass. This baseline is what the Phase 2 refactor must preserve.
 
 ---
 
-## Phase 1 — Migration: `workflows` table + edges constraint + trigger
+## Phase 1 — Migrations: experiment edge-type bugfix (#38) + workflows table (#34)
 
-**Why first:** Every later phase that inserts a `workflow —executes→ claim` edge or queries the `workflows` table assumes this migration has run. Land the schema, expand the edges constraint to admit `'workflow'` as a valid `source_type`/`target_type`, and update both `validate_edge_reference` overloads to verify FKs against the new table. Without all three, the `EdgeRepository::create` path fails the CHECK before reaching any workflow-aware code.
+**Why first:** Every later phase that inserts a `workflow —executes→ claim` edge assumes the `workflows` table exists and the edges CHECK constraint admits `'workflow'`. Land the schema, expand the edges constraint, and update both `validate_edge_reference` overloads to verify FKs against the new table. Without all three, the `EdgeRepository::create` path fails the CHECK before reaching any workflow-aware code.
 
-### Task 1.1: Write migration `019_workflows_table.sql`
+**Two migrations:** Migration 019 is a bugfix predating #34 — the experiment-tracking feature added tables (`experiments`, `experiment_results`) and edges referencing them, but never updated `edges_entity_types_valid` or `validate_edge_reference` to admit those types. The DROP-and-readd pattern needed for #34 exposed the gap. 019 fixes it independently of 020. 020 then extends the now-correct allow-list with `'workflow'`.
+
+### Task 1.1: Migration 019 — admit `experiment` / `experiment_result` to edges constraints (#38)
 
 **Files:**
-- Create: `migrations/019_workflows_table.sql`
+- Create: `migrations/019_experiment_edge_type_fix.sql`
+
+**STATUS: ✅ Complete (commit `5ef0bfea`).**
+
+The committed file extends both `edges_entity_types_valid` source/target allow-lists with `'experiment'` and `'experiment_result'`, and adds matching `WHEN 'experiment' THEN EXISTS (SELECT 1 FROM experiments WHERE id = entity_id)` plus the `experiment_result` analog to both `validate_edge_reference` overloads. Pure schema-formalization — no data changes.
+
+### Task 1.2: Migration 020 — workflows table + extend constraint with `'workflow'` (#34)
+
+**Files:**
+- Create: `migrations/020_workflows_table.sql`
+
+**STATUS: ✅ Complete (commit `2e6b1c6d`).**
 
 - [ ] **Step 1.1.1: Write the migration**
 
-Create `migrations/019_workflows_table.sql` with this exact content:
+Create `migrations/020_workflows_table.sql` with this exact content:
 
 ```sql
 -- Migration 019: workflows table + edges constraint expansion + trigger update for #34
@@ -161,7 +174,7 @@ $$;
 - [ ] **Step 1.1.2: Apply the migration to the dev DB**
 
 ```bash
-psql "$DATABASE_URL" -f migrations/019_workflows_table.sql 2>&1 | tail -10
+psql "$DATABASE_URL" -f migrations/020_workflows_table.sql 2>&1 | tail -10
 ```
 
 Expected: `CREATE TABLE`, `CREATE INDEX`, `CREATE INDEX`, `ALTER TABLE`, `ALTER TABLE`, `CREATE FUNCTION`, `CREATE FUNCTION`. No errors.
@@ -190,7 +203,7 @@ Expected: the INSERT into `edges` succeeds (no `edges_entity_types_valid` violat
 - [ ] **Step 1.1.5: Commit**
 
 ```bash
-git add migrations/019_workflows_table.sql
+git add migrations/020_workflows_table.sql
 git commit -m "feat(db): workflows table + edges constraint expansion + trigger update (#34)"
 ```
 
@@ -2466,14 +2479,14 @@ git commit -m "feat(api): POST /api/v1/workflows/ingest (#34)"
 
 **Why fifth:** Phase 4 ingests workflows but doesn't yet record executions for them. The existing `report_outcome` looks up flat-JSON workflows by `claims WHERE 'workflow' = ANY(labels)` and 404s on hierarchical roots — they live in `workflows`, not `claims`. Add `step_claim_id` to `behavioral_executions` and a sibling endpoint that resolves `:id` against `workflows`.
 
-### Task 5.1: Migration `020_behavioral_executions_step_claim_id.sql`
+### Task 5.1: Migration `021_behavioral_executions_step_claim_id.sql`
 
 **Files:**
-- Create: `migrations/020_behavioral_executions_step_claim_id.sql`
+- Create: `migrations/021_behavioral_executions_step_claim_id.sql`
 
 - [ ] **Step 5.1.1: Write the migration**
 
-Create `migrations/020_behavioral_executions_step_claim_id.sql`:
+Create `migrations/021_behavioral_executions_step_claim_id.sql`:
 
 ```sql
 -- Migration 020: per-(execution, step) granularity for behavioral_executions (#34).
@@ -2492,7 +2505,7 @@ CREATE INDEX behavioral_executions_step_claim_id_idx
 - [ ] **Step 5.1.2: Apply and verify**
 
 ```bash
-psql "$DATABASE_URL" -f migrations/020_behavioral_executions_step_claim_id.sql
+psql "$DATABASE_URL" -f migrations/021_behavioral_executions_step_claim_id.sql
 psql "$DATABASE_URL" -c '\d behavioral_executions' | grep step_claim_id
 ```
 
@@ -2501,7 +2514,7 @@ Expected: column shows in the `\d` output as `uuid`, nullable, FK to claims(id).
 - [ ] **Step 5.1.3: Commit**
 
 ```bash
-git add migrations/020_behavioral_executions_step_claim_id.sql
+git add migrations/021_behavioral_executions_step_claim_id.sql
 git commit -m "feat(db): step_claim_id column on behavioral_executions (#34)"
 ```
 
@@ -3550,14 +3563,15 @@ Expected: every test passes. If any test fails, treat it as a regression and fix
 
 ### Task 8.2: Manual smoke against the dev DB
 
-- [ ] **Step 8.2.1: Apply both new migrations to dev DB if not already**
+- [ ] **Step 8.2.1: Apply all three new migrations to dev DB if not already**
 
 ```bash
-psql "$DATABASE_URL" -f migrations/019_workflows_table.sql
-psql "$DATABASE_URL" -f migrations/020_behavioral_executions_step_claim_id.sql
+psql "$DATABASE_URL" -f migrations/019_experiment_edge_type_fix.sql
+psql "$DATABASE_URL" -f migrations/020_workflows_table.sql
+psql "$DATABASE_URL" -f migrations/021_behavioral_executions_step_claim_id.sql
 ```
 
-(Both should be no-ops if already applied during phase development; the `IF EXISTS`/`IF NOT EXISTS` guards in the SQL handle this.)
+(All three should be no-ops if already applied during phase development; the `IF EXISTS`/`IF NOT EXISTS` guards in the SQL handle this.)
 
 - [ ] **Step 8.2.2: Spin up the API**
 
