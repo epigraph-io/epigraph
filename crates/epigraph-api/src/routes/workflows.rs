@@ -1072,8 +1072,9 @@ pub async fn ingest_workflow(
 
 #[cfg(feature = "db")]
 async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, ApiError> {
-    let pub_key = [0u8; 32];
-    if let Some(a) = epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key)
+    let (_did, pub_key_bytes) =
+        epigraph_crypto::did_key::did_key_for_author(None, "workflow-ingest-system");
+    if let Some(a) = epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key_bytes)
         .await
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
@@ -1081,7 +1082,10 @@ async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, ApiErro
     {
         Ok(a.id.as_uuid())
     } else {
-        let agent = epigraph_core::Agent::new(pub_key, Some("api-system".to_string()));
+        let agent = epigraph_core::Agent::new(
+            pub_key_bytes,
+            Some("workflow-ingest-system".to_string()),
+        );
         let created = epigraph_db::AgentRepository::create(pool, &agent)
             .await
             .map_err(|e| ApiError::InternalError {
