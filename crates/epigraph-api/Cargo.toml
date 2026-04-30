@@ -29,6 +29,9 @@ path = "src/bin/server.rs"
 epigraph-interfaces = { workspace = true }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
 epigraph-ingest = { workspace = true }  # Workflow/document extraction schemas and ingest planners
 epigraph-ingest-executor = { workspace = true, optional = true }  # Plan-application (couples ingest schemas with DB repos)
+linfa = { workspace = true }  # k-means for /api/v1/themes/build-from-corpus
+linfa-clustering = { workspace = true }
+ndarray = { workspace = true }
 epigraph-jobs = { workspace = true }  # Background job runner + ClusterGraph handler
 epigraph-core = { workspace = true }
 epigraph-crypto = { workspace = true }

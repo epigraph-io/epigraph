@@ -178,6 +178,10 @@ pub fn create_router(state: AppState) -> Router {
             post(crud::create_theme_with_centroid),
         )
         .route(
+            "/api/v1/themes/build-from-corpus",
+            post(crud::build_themes_from_corpus),
+        )
+        .route(
             "/api/v1/frames/:id/assign-claim",
             post(crud::assign_claim_to_frame),
         )
@@ -763,6 +767,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/themes/create-with-centroid",
             post(crud::create_theme_with_centroid),
+        )
+        .route(
+            "/api/v1/themes/build-from-corpus",
+            post(crud::build_themes_from_corpus),
         )
         .route(
             "/api/v1/frames/:id/assign-claim",
