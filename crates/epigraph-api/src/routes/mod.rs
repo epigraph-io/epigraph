@@ -585,6 +585,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/workflows", get(workflows::list_workflows))
         .route("/api/v1/workflows/search", get(workflows::search_workflows))
+        .route("/api/v1/workflows/:id", get(workflows::get_workflow))
         .route("/api/v1/methods/search", get(experiments::find_methods))
         .route(
             "/api/v1/methods/gap-analysis",
