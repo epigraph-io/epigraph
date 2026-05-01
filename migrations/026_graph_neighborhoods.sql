@@ -1,4 +1,4 @@
--- migrations/024_graph_neighborhoods.sql
+-- migrations/026_graph_neighborhoods.sql
 -- Per-theme Louvain communities for the graph visualizer drilldown.
 --
 -- NUMBERING NOTE (2026-04-30): the live production DB tracks migrations
