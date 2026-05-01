@@ -53,7 +53,7 @@ async fn themes_expand_returns_neighborhoods_for_seeded_theme() {
     let agent_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
     sqlx::query(
         "INSERT INTO agents (id, public_key, display_name, agent_type) \
-         VALUES ($1, decode(repeat('00', 32), 'hex'), 'themes-expand-test', 'system') \
+         VALUES ($1, decode(repeat('BB', 32), 'hex'), 'themes-expand-test', 'system') \
          ON CONFLICT (id) DO NOTHING"
     ).bind(agent_id).execute(&pool).await.unwrap();
 
