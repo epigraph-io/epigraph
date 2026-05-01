@@ -21,9 +21,15 @@ enum Cmd {
     /// Discover tables and crates; print a JSON listing.
     Discover,
     /// Build dossiers + run LLM extraction; write staging files.
-    Extract { #[arg(long)] only: Option<String> },
+    Extract {
+        #[arg(long)]
+        only: Option<String>,
+    },
     /// Ingest staged narratives via extract-claims + ingest_document.
-    Ingest { #[arg(long)] dry_run: bool },
+    Ingest {
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Verification queries.
     Verify,
 }
