@@ -14,3 +14,13 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+sha2 = { workspace = true }
+walkdir = { workspace = true }
+regex = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+
+[[example]]
+name = "table_graph"
+path = "examples/table_graph/main.rs"
