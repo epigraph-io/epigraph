@@ -1201,9 +1201,7 @@ pub async fn build_themes_from_corpus(
     let k_max = request.k_max.unwrap_or(16);
     let min_claims = request.min_claims_per_theme.unwrap_or(5);
     let limit = request.limit.unwrap_or(500).max(1);
-    let label_prefix = request
-        .label_prefix
-        .unwrap_or_else(|| "auto".to_string());
+    let label_prefix = request.label_prefix.unwrap_or_else(|| "auto".to_string());
     let wipe_first = request.wipe_first.unwrap_or(false);
 
     if k_min == 0 || k_max < k_min {
@@ -1250,7 +1248,9 @@ pub async fn build_themes_from_corpus(
             return Err(ApiError::InternalError {
                 message: format!(
                     "embedding dim mismatch at claim {}: got {}, expected {}",
-                    rows[i].0, emb.len(), dim,
+                    rows[i].0,
+                    emb.len(),
+                    dim,
                 ),
             });
         }
@@ -1353,12 +1353,8 @@ pub async fn build_themes_from_corpus(
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        epigraph_db::ClaimThemeRepository::set_centroid(
-            &state.db_pool,
-            theme.id,
-            &centroid_str,
-        )
-        .await?;
+        epigraph_db::ClaimThemeRepository::set_centroid(&state.db_pool, theme.id, &centroid_str)
+            .await?;
 
         let assigned = epigraph_db::ClaimThemeRepository::bulk_assign(
             &state.db_pool,
@@ -1366,12 +1362,8 @@ pub async fn build_themes_from_corpus(
             theme.id,
         )
         .await?;
-        epigraph_db::ClaimThemeRepository::update_count(
-            &state.db_pool,
-            theme.id,
-            assigned as i32,
-        )
-        .await?;
+        epigraph_db::ClaimThemeRepository::update_count(&state.db_pool, theme.id, assigned as i32)
+            .await?;
 
         themes_created += 1;
         claims_assigned += assigned as usize;
@@ -1787,7 +1779,7 @@ pub async fn create_theme_with_centroid(
 #[cfg(all(test, feature = "db"))]
 mod tests {
     use super::*;
-    use crate::state::{AppState, ApiConfig};
+    use crate::state::{ApiConfig, AppState};
 
     async fn try_test_pool() -> Option<sqlx::PgPool> {
         let url = std::env::var("DATABASE_URL").ok()?;
