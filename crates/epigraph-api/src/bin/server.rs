@@ -3,11 +3,9 @@ use epigraph_api::routes::webhooks::{start_webhook_dispatcher, WebhookDeliveryCo
 use epigraph_api::{create_router, ApiConfig, AppState};
 #[cfg(feature = "db")]
 use epigraph_jobs::{
-    cluster_graph::ClusterGraphHandler, EpiGraphJob, JobQueue, JobRunner, PostgresJobQueue,
+    cluster_graph::ClusterGraphHandler, JobQueue, JobRunner, PostgresJobQueue,
 };
 use std::sync::Arc;
-#[cfg(feature = "db")]
-use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Create the embedding service based on environment configuration.
@@ -205,13 +203,13 @@ async fn main() {
     };
 
     // Start background job runner with ClusterGraph handler (db feature only).
-    // The runner uses PostgresJobQueue for durable persistence.  The cron loop
-    // fires 60 s after startup then every 24 h thereafter.
+    // ClusterGraph jobs must be enqueued explicitly. The automatic startup +
+    // nightly cron was removed: louvain on the sparse production graph
+    // (~391k claims, ~11k SUPPORTS/CONTRADICTS edges) produces ~391k singleton
+    // clusters and stalls for hours on the cluster_edges aggregation.
     #[cfg(feature = "db")]
     {
         let queue: Arc<dyn JobQueue> = Arc::new(PostgresJobQueue::new(job_pool.clone()));
-        let queue_for_cron = Arc::clone(&queue);
-
         let handler_pool = Arc::new(job_pool);
         let mut runner = JobRunner::new(2, queue);
         runner.register_handler(Arc::new(ClusterGraphHandler::new(handler_pool)));
@@ -220,37 +218,7 @@ async fn main() {
             runner.start().await;
         });
 
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            loop {
-                match (EpiGraphJob::ClusterGraph {
-                    resolution: 1.0,
-                    retain_runs: 3,
-                })
-                .into_job()
-                {
-                    Ok(job) => {
-                        if let Err(e) = queue_for_cron.enqueue(job).await {
-                            tracing::error!(
-                                error = %e,
-                                "failed to enqueue nightly ClusterGraph job"
-                            );
-                        } else {
-                            tracing::info!("Enqueued nightly ClusterGraph job");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "failed to serialize ClusterGraph job payload"
-                        );
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(86_400)).await;
-            }
-        });
-
-        tracing::info!("Job runner started (2 workers); nightly ClusterGraph job scheduled");
+        tracing::info!("Job runner started (2 workers); ClusterGraph cron disabled");
     }
 
     // Start webhook dispatcher (subscribes to event bus for delivery)
