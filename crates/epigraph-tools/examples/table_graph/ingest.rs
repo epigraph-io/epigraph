@@ -15,22 +15,26 @@ pub fn run(dry_run: bool) -> Result<()> {
     let mut count_ok = 0usize;
     let mut count_fail = 0usize;
 
-    for entry in fs::read_dir(narratives_dir)
-        .with_context(|| format!("read {}", narratives_dir))?
-    {
+    for entry in fs::read_dir(narratives_dir).with_context(|| format!("read {}", narratives_dir))? {
         let p = entry?.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("md") { continue; }
+        if p.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
 
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let parts: Vec<&str> = stem.splitn(2, '.').collect();
-        if parts.len() != 2 { continue; }
+        if parts.len() != 2 {
+            continue;
+        }
         let (repo, table) = (parts[0], parts[1]);
         let doi = format!("urn:epigraph-table:{}:{}", repo, table);
         let md_abs = std::fs::canonicalize(&p)?;
         let extraction_json = p.with_extension("extraction.json");
         // Compute the absolute path BEFORE the file exists by canonicalizing the parent
         let extraction_abs = {
-            let parent = extraction_json.parent().unwrap_or(std::path::Path::new("."));
+            let parent = extraction_json
+                .parent()
+                .unwrap_or(std::path::Path::new("."));
             let parent_abs = std::fs::canonicalize(parent)?;
             parent_abs.join(extraction_json.file_name().unwrap())
         };
@@ -43,7 +47,7 @@ pub fn run(dry_run: bool) -> Result<()> {
         }
 
         let prompt = format!(
-"You have one task. Do not deviate.
+            "You have one task. Do not deviate.
 
 1. Use the `extract-claims` skill on the markdown file at:
      {md}
@@ -57,10 +61,18 @@ pub fn run(dry_run: bool) -> Result<()> {
    Use synthetic DOI `{doi}` for the source.
 
 Report only the ingest_document tool result.",
-            md = md_abs.display(), json = extraction_abs.display(), doi = doi);
+            md = md_abs.display(),
+            json = extraction_abs.display(),
+            doi = doi
+        );
 
         let status = Command::new("claude")
-            .args(["-p", "--output-format", "json", "--dangerously-skip-permissions"])
+            .args([
+                "-p",
+                "--output-format",
+                "json",
+                "--dangerously-skip-permissions",
+            ])
             .arg(&prompt)
             .status()?;
         if !status.success() {
@@ -72,12 +84,18 @@ Report only the ingest_document tool result.",
         count_ok += 1;
     }
 
-    eprintln!("ingestion complete: {} ok, {} failed (see {})", count_ok, count_fail, failed_path);
+    eprintln!(
+        "ingestion complete: {} ok, {} failed (see {})",
+        count_ok, count_fail, failed_path
+    );
     Ok(())
 }
 
 fn log_fail(path: &str, table: &str, stage: &str) -> Result<()> {
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     writeln!(f, r#"{{"table": "{}", "stage": "{}"}}"#, table, stage)?;
     Ok(())
 }
@@ -86,29 +104,47 @@ pub fn verify() -> Result<()> {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://epigraph:epigraph@localhost:5432/epigraph".into());
 
-    let papers = run_psql(&url,
-        "SELECT count(*) FROM papers WHERE doi LIKE 'urn:epigraph-table:%'")?;
-    eprintln!("Coverage: {} papers ingested with DOI prefix urn:epigraph-table: (expected ~85)",
-        papers.trim());
+    let papers = run_psql(
+        &url,
+        "SELECT count(*) FROM papers WHERE doi LIKE 'urn:epigraph-table:%'",
+    )?;
+    eprintln!(
+        "Coverage: {} papers ingested with DOI prefix urn:epigraph-table: (expected ~85)",
+        papers.trim()
+    );
 
-    let total_claims = run_psql(&url, "
+    let total_claims = run_psql(
+        &url,
+        "
         SELECT count(DISTINCT e.target_id) FROM edges e
         JOIN papers p ON p.id = e.source_id
         WHERE p.doi LIKE 'urn:epigraph-table:%' AND e.relationship = 'asserts'
-    ")?;
-    eprintln!("Total claims linked from per-table papers: {}", total_claims.trim());
+    ",
+    )?;
+    eprintln!(
+        "Total claims linked from per-table papers: {}",
+        total_claims.trim()
+    );
 
-    let zero = run_psql(&url, "
+    let zero = run_psql(
+        &url,
+        "
         SELECT p.doi FROM papers p
         WHERE p.doi LIKE 'urn:epigraph-table:%'
           AND NOT EXISTS (
               SELECT 1 FROM edges e WHERE e.source_id = p.id AND e.relationship = 'asserts'
           )
-    ")?;
+    ",
+    )?;
     let zero_lines: Vec<&str> = zero.lines().filter(|l| !l.trim().is_empty()).collect();
     if !zero_lines.is_empty() {
-        eprintln!("WARNING: {} per-table papers have no asserts edges:", zero_lines.len());
-        for l in &zero_lines { eprintln!("  {}", l); }
+        eprintln!(
+            "WARNING: {} per-table papers have no asserts edges:",
+            zero_lines.len()
+        );
+        for l in &zero_lines {
+            eprintln!("  {}", l);
+        }
     }
 
     eprintln!();
@@ -121,12 +157,16 @@ pub fn verify() -> Result<()> {
 
 fn run_psql(url: &str, sql: &str) -> Result<String> {
     let out = std::process::Command::new("psql")
-        .arg(url).arg("-tAc").arg(sql)
+        .arg(url)
+        .arg("-tAc")
+        .arg(sql)
         .output()
         .with_context(|| "psql invocation failed")?;
     if !out.status.success() {
-        return Err(anyhow::anyhow!("psql failed: {}",
-            String::from_utf8_lossy(&out.stderr)));
+        return Err(anyhow::anyhow!(
+            "psql failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     Ok(String::from_utf8(out.stdout)?)
 }

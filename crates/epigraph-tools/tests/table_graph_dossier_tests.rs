@@ -3,9 +3,9 @@ mod dossier;
 #[path = "../examples/table_graph/types.rs"]
 mod types;
 
+use dossier::collect_call_sites;
 use dossier::collect_ddl;
 use dossier::collect_git_context;
-use dossier::collect_call_sites;
 use dossier::extract_fk_targets;
 
 /// Workspace root, computed at compile time.
@@ -16,14 +16,20 @@ const REPO_MIGRATIONS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrat
 #[test]
 fn ddl_for_claims_includes_create_table() {
     let ddl = collect_ddl(REPO_MIGRATIONS, "claims").unwrap();
-    assert!(ddl.contains("CREATE TABLE"), "missing CREATE TABLE for claims");
+    assert!(
+        ddl.contains("CREATE TABLE"),
+        "missing CREATE TABLE for claims"
+    );
     assert!(ddl.contains("claims"), "DDL should mention 'claims'");
 }
 
 #[test]
 fn git_context_for_claims_returns_some_commits() {
     let commits = collect_git_context(REPO_ROOT, "001_initial_schema.sql", "claims").unwrap();
-    assert!(!commits.is_empty(), "expected at least one commit touching claims");
+    assert!(
+        !commits.is_empty(),
+        "expected at least one commit touching claims"
+    );
     let mut shas: Vec<&str> = commits.iter().map(|c| c.sha.as_str()).collect();
     shas.sort();
     let n = shas.len();
@@ -36,12 +42,17 @@ fn finds_claim_repo_call_sites() {
     let sites = collect_call_sites(REPO_ROOT, "claims").unwrap();
     assert!(!sites.is_empty(), "claims should have many call sites");
     assert!(
-        sites.iter().any(|s| s.crate_name == "epigraph-db" || s.crate_name == "epigraph-api"),
+        sites
+            .iter()
+            .any(|s| s.crate_name == "epigraph-db" || s.crate_name == "epigraph-api"),
         "expected db or api crate among call sites"
     );
     for s in &sites {
         assert!(!s.function.is_empty(), "function name must be filled");
-        assert!(!s.function.contains(':'), "function should be ident, not file:line");
+        assert!(
+            !s.function.contains(':'),
+            "function should be ident, not file:line"
+        );
     }
 }
 
@@ -66,14 +77,23 @@ mod llm;
 fn build_prompt_includes_dossier_sections() {
     use crate::types::*;
     let d = Dossier {
-        table: TableRef { repo: "epigraph".into(), name: "claims".into(),
-                          migration: "001_initial_schema.sql".into() },
+        table: TableRef {
+            repo: "epigraph".into(),
+            name: "claims".into(),
+            migration: "001_initial_schema.sql".into(),
+        },
         ddl: "CREATE TABLE claims (id uuid);".into(),
-        commits: vec![GitCommit { sha: "abc12345".into(), date: "2025-01-01T00:00:00Z".into(),
-                                   subject: "init".into(), body: "".into() }],
+        commits: vec![GitCommit {
+            sha: "abc12345".into(),
+            date: "2025-01-01T00:00:00Z".into(),
+            subject: "init".into(),
+            body: "".into(),
+        }],
         call_sites: vec![CallSite {
-            crate_name: "epigraph-api".into(), function: "submit_claim_route".into(),
-            snippet: "INSERT INTO claims (id".into(), kind: CallKind::WritesTo,
+            crate_name: "epigraph-api".into(),
+            function: "submit_claim_route".into(),
+            snippet: "INSERT INTO claims (id".into(),
+            kind: CallKind::WritesTo,
         }],
         fk_targets: vec!["agents".into()],
     };

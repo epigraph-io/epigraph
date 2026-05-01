@@ -45,21 +45,30 @@ Notes:
 
 pub fn build_prompt(d: &Dossier) -> String {
     let mut p = String::new();
-    p.push_str(&format!("Build a Tier-1 hierarchical narrative for database table `{}` in repo `{}`.\n\n",
-        d.table.name, d.table.repo));
+    p.push_str(&format!(
+        "Build a Tier-1 hierarchical narrative for database table `{}` in repo `{}`.\n\n",
+        d.table.name, d.table.repo
+    ));
     p.push_str("# Dossier\n\n## DDL\n```sql\n");
     p.push_str(&d.ddl);
     p.push_str("\n```\n\n## Git context\n");
     for c in &d.commits {
-        p.push_str(&format!("- {} {}: {}\n", &c.sha[..8.min(c.sha.len())], c.date, c.subject));
+        p.push_str(&format!(
+            "- {} {}: {}\n",
+            &c.sha[..8.min(c.sha.len())],
+            c.date,
+            c.subject
+        ));
         if !c.body.is_empty() {
             p.push_str(&format!("  {}\n", c.body.lines().next().unwrap_or("")));
         }
     }
     p.push_str("\n## Call sites (deterministically extracted)\n");
     for s in &d.call_sites {
-        p.push_str(&format!("- crate=`{}` fn=`{}` kind={:?}\n  snippet: `{}`\n",
-            s.crate_name, s.function, s.kind, s.snippet));
+        p.push_str(&format!(
+            "- crate=`{}` fn=`{}` kind={:?}\n  snippet: `{}`\n",
+            s.crate_name, s.function, s.kind, s.snippet
+        ));
     }
     p.push_str("\n## FK targets (deterministically extracted)\n");
     for t in &d.fk_targets {
@@ -74,7 +83,9 @@ pub fn build_prompt(d: &Dossier) -> String {
 pub fn extract_md(text: &str) -> Result<String> {
     if let Some(start) = text.find("```markdown") {
         let after = &text[start + "```markdown".len()..];
-        let end = after.find("```").ok_or_else(|| anyhow!("unterminated code fence"))?;
+        let end = after
+            .find("```")
+            .ok_or_else(|| anyhow!("unterminated code fence"))?;
         return Ok(after[..end].trim().to_string());
     }
     // Check for # Table header before generic fence (avoids matching inner ```sql blocks)
@@ -84,7 +95,9 @@ pub fn extract_md(text: &str) -> Result<String> {
     // Fallback: bare fence (only if no # Table header found)
     if let Some(start) = text.find("```") {
         let after = &text[start + 3..];
-        let end = after.find("```").ok_or_else(|| anyhow!("unterminated code fence"))?;
+        let end = after
+            .find("```")
+            .ok_or_else(|| anyhow!("unterminated code fence"))?;
         return Ok(after[..end].trim().to_string());
     }
     Err(anyhow!("no '# Table' header or code fence"))
@@ -92,21 +105,36 @@ pub fn extract_md(text: &str) -> Result<String> {
 
 pub fn invoke_claude(prompt: &str) -> Result<String> {
     let mut child = Command::new("claude")
-        .args(["-p", "--output-format", "json", "--model", "claude-sonnet-4-6"])
+        .args([
+            "-p",
+            "--output-format",
+            "json",
+            "--model",
+            "claude-sonnet-4-6",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("spawn claude CLI")?;
-    child.stdin.as_mut().expect("stdin").write_all(prompt.as_bytes())?;
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(prompt.as_bytes())?;
     let out = child.wait_with_output()?;
     if !out.status.success() {
-        return Err(anyhow!("claude CLI failed: {}", String::from_utf8_lossy(&out.stderr)));
+        return Err(anyhow!(
+            "claude CLI failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     let stdout = String::from_utf8(out.stdout)?;
-    let envelope: serde_json::Value = serde_json::from_str(&stdout)
-        .context("claude CLI stdout not JSON")?;
-    let text = envelope.get("result").and_then(|v| v.as_str())
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).context("claude CLI stdout not JSON")?;
+    let text = envelope
+        .get("result")
+        .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("empty result; stdout: {}", stdout))?;
     Ok(text.to_string())
@@ -115,8 +143,13 @@ pub fn invoke_claude(prompt: &str) -> Result<String> {
 pub fn extract(d: &Dossier) -> Result<String> {
     let prompt = build_prompt(d);
     let raw = invoke_claude(&prompt)?;
-    if let Ok(md) = extract_md(&raw) { return Ok(md); }
-    let strict = format!("Respond with ONLY the Markdown document (no prose, no fences).\n\n{}", prompt);
+    if let Ok(md) = extract_md(&raw) {
+        return Ok(md);
+    }
+    let strict = format!(
+        "Respond with ONLY the Markdown document (no prose, no fences).\n\n{}",
+        prompt
+    );
     let raw = invoke_claude(&strict)?;
     extract_md(&raw)
 }

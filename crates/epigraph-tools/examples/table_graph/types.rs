@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableRef {
-    pub repo: String,        // "epigraph" | "episcience"
-    pub name: String,        // table name
-    pub migration: String,   // relative path of the migration that created it
+    pub repo: String,      // "epigraph" | "episcience"
+    pub name: String,      // table name
+    pub migration: String, // relative path of the migration that created it
 }
 
 impl TableRef {
@@ -57,5 +57,5 @@ pub struct Dossier {
 pub struct StagingFile {
     pub dossier: Dossier,
     pub narrative_md: String,
-    pub content_hash: String,         // sha256 of dossier + narrative
+    pub content_hash: String, // sha256 of dossier + narrative
 }

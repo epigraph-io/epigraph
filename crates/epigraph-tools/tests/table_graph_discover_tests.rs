@@ -14,7 +14,9 @@ const EPIGRAPH_MIGRATIONS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../mi
 fn finds_claims_table_in_epigraph_initial_schema() {
     let tables = scan_migrations(&[("epigraph", EPIGRAPH_MIGRATIONS, &[])]).unwrap();
     assert!(
-        tables.iter().any(|t| t.name == "claims" && t.repo == "epigraph"),
+        tables
+            .iter()
+            .any(|t| t.name == "claims" && t.repo == "epigraph"),
         "expected to find epigraph.claims"
     );
 }
