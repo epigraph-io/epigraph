@@ -1505,14 +1505,20 @@ dependencies = [
 name = "epigraph-tools"
 version = "0.3.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
+ "clap",
  "epigraph-core",
+ "hex",
+ "regex",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
