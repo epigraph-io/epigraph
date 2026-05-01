@@ -47,6 +47,22 @@ pub struct CompoundResponse {
     pub nodes: Vec<CompoundNode>,
     pub induced_edges: Vec<InducedEdge>,
     pub direct_edges: Vec<DirectEdge>,
+    /// Structural edges between compound nodes that don't have direct or
+    /// induced epistemic edges but ARE connected through the decomposes_to
+    /// hierarchy: either by sharing an atom child (atoms are many-to-many
+    /// parented in this data — 47k atoms have ≥2 parents) or by sharing a
+    /// common decomposes_to ancestor.
+    pub structural_edges: Vec<StructuralEdge>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StructuralEdge {
+    pub source: Uuid,
+    pub target: Uuid,
+    /// "shared_atom" — both compounds parent the same atom (within this neighborhood).
+    /// "shared_ancestor" — both compounds are decomposes_to children of the same parent.
+    pub kind: String,
+    pub atom_count: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,12 +278,77 @@ async fn compound_response(
     .map(|(source, target, relationship)| DirectEdge { source, target, relationship })
     .collect();
 
+    // Structural edges: surface decomposes_to-chain connections between
+    // compound nodes that lack direct/induced epistemic edges. Two compounds
+    // are connected if they parent the same atom (multi-parent atoms exist
+    // in this data) OR if they share a common decomposes_to ancestor.
+    let structural_edges: Vec<StructuralEdge> = sqlx::query_as::<_, (Uuid, Uuid, String, i64)>(
+        r#"
+        WITH nbhd_atoms AS (
+            SELECT m.claim_id FROM claim_neighborhood_membership m
+            WHERE m.neighborhood_id = $1
+        ),
+        parent_of_atom AS (
+            -- For each atom in the neighborhood: its parent compounds
+            SELECT e.source_id AS parent_id, e.target_id AS atom_id
+            FROM edges e
+            JOIN nbhd_atoms a ON a.claim_id = e.target_id
+            WHERE e.relationship = 'decomposes_to'
+        ),
+        nbhd_compounds AS (
+            SELECT DISTINCT parent_id AS id FROM parent_of_atom
+        ),
+        shared_atom_pairs AS (
+            -- Compounds A,B that both parent the same atom in this neighborhood
+            SELECT
+                LEAST(p1.parent_id, p2.parent_id)    AS source,
+                GREATEST(p1.parent_id, p2.parent_id) AS target,
+                'shared_atom'::text                  AS kind,
+                COUNT(*)::bigint                     AS atom_count
+            FROM parent_of_atom p1
+            JOIN parent_of_atom p2
+              ON p1.atom_id = p2.atom_id AND p1.parent_id < p2.parent_id
+            GROUP BY 1, 2, 3
+        ),
+        shared_ancestor_pairs AS (
+            -- Compounds A,B in the neighborhood with a common decomposes_to ancestor
+            SELECT
+                LEAST(c1.id, c2.id)    AS source,
+                GREATEST(c1.id, c2.id) AS target,
+                'shared_ancestor'::text AS kind,
+                COUNT(DISTINCT pa1.source_id)::bigint AS atom_count
+            FROM nbhd_compounds c1
+            JOIN nbhd_compounds c2 ON c1.id < c2.id
+            JOIN edges pa1 ON pa1.target_id = c1.id AND pa1.relationship = 'decomposes_to'
+            JOIN edges pa2 ON pa2.target_id = c2.id AND pa2.relationship = 'decomposes_to'
+                          AND pa1.source_id = pa2.source_id
+            GROUP BY 1, 2, 3
+        )
+        SELECT * FROM shared_atom_pairs
+        UNION ALL
+        SELECT * FROM shared_ancestor_pairs
+        "#,
+    )
+    .bind(neighborhood_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .into_iter()
+    .map(|(source, target, kind, atom_count)| StructuralEdge {
+        source,
+        target,
+        kind,
+        atom_count: atom_count as i32,
+    })
+    .collect();
+
     Ok(CompoundResponse {
         neighborhood_id,
         truncated: false,
         nodes,
         induced_edges,
         direct_edges,
+        structural_edges,
     })
 }
 
