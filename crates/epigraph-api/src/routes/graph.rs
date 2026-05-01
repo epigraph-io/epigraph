@@ -444,14 +444,19 @@ pub async fn themes_expand(
     let pool: &PgPool = &state.db_pool;
 
     let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM claim_themes WHERE id = $1")
-        .bind(theme_id).fetch_optional(pool).await.map_err(internal)?;
+        .bind(theme_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(internal)?;
     if exists.is_none() {
         return Err((StatusCode::NOT_FOUND, "theme not found".into()));
     }
 
-    let latest_run: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1"
-    ).fetch_optional(pool).await.map_err(internal)?;
+    let latest_run: Option<(Uuid,)> =
+        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .map_err(internal)?;
     let Some((run_id,)) = latest_run else {
         return Ok(Json(synthesize_pre_run_response(theme_id)));
     };
@@ -461,9 +466,14 @@ pub async fn themes_expand(
         "SELECT id, label, size, mean_betp, dominant_frame_id \
          FROM graph_neighborhoods \
          WHERE run_id = $1 AND theme_id = $2 \
-         ORDER BY size DESC LIMIT $3"
+         ORDER BY size DESC LIMIT $3",
     )
-    .bind(run_id).bind(theme_id).bind(budget).fetch_all(pool).await.map_err(internal)?;
+    .bind(run_id)
+    .bind(theme_id)
+    .bind(budget)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
 
     if neighborhoods.is_empty() {
         return Ok(Json(synthesize_pre_run_response(theme_id)));
@@ -472,19 +482,29 @@ pub async fn themes_expand(
     let nbr_id_set: Vec<Uuid> = neighborhoods.iter().map(|n| n.id).collect();
     let edges: Vec<NeighborhoodEdgeOut> = sqlx::query_as::<_, (Uuid, Uuid, f64)>(
         "SELECT neighborhood_a, neighborhood_b, weight FROM neighborhood_edges \
-         WHERE run_id = $1 AND neighborhood_a = ANY($2) AND neighborhood_b = ANY($2)"
+         WHERE run_id = $1 AND neighborhood_a = ANY($2) AND neighborhood_b = ANY($2)",
     )
-    .bind(run_id).bind(&nbr_id_set).fetch_all(pool).await.map_err(internal)?
-    .into_iter().map(|(a, b, w)| NeighborhoodEdgeOut { a, b, weight: w }).collect();
+    .bind(run_id)
+    .bind(&nbr_id_set)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?
+    .into_iter()
+    .map(|(a, b, w)| NeighborhoodEdgeOut { a, b, weight: w })
+    .collect();
 
     Ok(Json(ThemeExpandResponse {
-        theme_id, truncated: false, neighborhoods, neighborhood_edges: edges,
+        theme_id,
+        truncated: false,
+        neighborhoods,
+        neighborhood_edges: edges,
     }))
 }
 
 fn synthesize_pre_run_response(theme_id: Uuid) -> ThemeExpandResponse {
     ThemeExpandResponse {
-        theme_id, truncated: false,
+        theme_id,
+        truncated: false,
         neighborhoods: vec![NeighborhoodOut {
             id: theme_id,
             label: "synthetic".into(),
@@ -641,4 +661,3 @@ mod tests {
         );
     }
 }
-

@@ -115,7 +115,9 @@ pub async fn run_clustering(pool: &PgPool, cfg: &RunConfig) -> Result<RunSummary
         run_id,
         &super::neighborhood::Config::default(),
         None,
-    ).await {
+    )
+    .await
+    {
         tracing::warn!(run_id = %run_id, error = ?e, "neighborhood pass failed; communities still persisted");
     }
 
