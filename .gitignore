@@ -8,3 +8,7 @@ backups/
 *.pkl
 *.pyc
 __pycache__/
+
+# Table-graph generated artifacts (regenerable from source repos)
+docs/superpowers/artifacts/2026-04-30-table-graph/staging/
+docs/superpowers/artifacts/2026-04-30-table-graph/narratives/
