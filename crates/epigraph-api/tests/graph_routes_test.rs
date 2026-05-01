@@ -34,7 +34,7 @@ async fn overview_with_no_runs_returns_no_clusters_computed() {
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("http://{addr}/api/v1/graph/overview"))
+        .get(format!("http://{addr}/api/v1/graph/communities/overview"))
         .header(
             "Authorization",
             format!("Bearer {}", common::test_bearer_token()),
@@ -98,7 +98,7 @@ async fn overview_returns_seeded_supernodes() {
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let resp = reqwest::Client::new()
-        .get(format!("http://{addr}/api/v1/graph/overview"))
+        .get(format!("http://{addr}/api/v1/graph/communities/overview"))
         .header(
             "Authorization",
             format!("Bearer {}", common::test_bearer_token()),
@@ -127,7 +127,7 @@ async fn expand_returns_cluster_members_with_induced_edges() {
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let resp = reqwest::Client::new()
         .get(format!(
-            "http://{addr}/api/v1/graph/clusters/{cluster_id}/expand?budget=10"
+            "http://{addr}/api/v1/graph/communities/{cluster_id}/expand?budget=10"
         ))
         .header(
             "Authorization",
@@ -158,7 +158,7 @@ async fn expand_returns_404_for_unknown_cluster() {
     let bogus = uuid::Uuid::new_v4();
     let resp = reqwest::Client::new()
         .get(format!(
-            "http://{addr}/api/v1/graph/clusters/{bogus}/expand"
+            "http://{addr}/api/v1/graph/communities/{bogus}/expand"
         ))
         .header(
             "Authorization",
@@ -202,8 +202,8 @@ async fn graph_endpoints_require_bearer() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let (addr, _shutdown) = common::spawn_app(&url).await;
     for path in [
-        "/api/v1/graph/overview".to_string(),
-        format!("/api/v1/graph/clusters/{}/expand", uuid::Uuid::new_v4()),
+        "/api/v1/graph/communities/overview".to_string(),
+        format!("/api/v1/graph/communities/{}/expand", uuid::Uuid::new_v4()),
         format!(
             "/api/v1/graph/neighborhood?node_id={}",
             uuid::Uuid::new_v4()
