@@ -239,12 +239,62 @@ async fn compound_response(pool: &PgPool, neighborhood_id: Uuid, _budget: i64)
     Ok(CompoundResponse { neighborhood_id, truncated: false, nodes, induced_edges, direct_edges })
 }
 
-async fn atomic_response(_pool: &PgPool, neighborhood_id: Uuid, _budget: i64)
+async fn atomic_response(pool: &PgPool, neighborhood_id: Uuid, _budget: i64)
     -> Result<AtomicResponse, (axum::http::StatusCode, String)>
 {
-    // Implemented in Task 8.
-    Ok(AtomicResponse {
-        neighborhood_id, truncated: false,
-        nodes: vec![], edges: vec![], compound_groups: vec![],
-    })
+    let nodes: Vec<AtomicNode> = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<f64>, Option<Uuid>)>(
+        r#"
+        SELECT c.id,
+               COALESCE(c.content, c.id::text) AS label,
+               (SELECT e.source_id FROM edges e
+                WHERE e.target_id = c.id AND e.relationship = 'decomposes_to' LIMIT 1) AS compound_id,
+               c.pignistic_prob,
+               (SELECT cf.frame_id FROM claim_frames cf WHERE cf.claim_id = c.id LIMIT 1) AS frame_id
+        FROM claim_neighborhood_membership m
+        JOIN claims c ON c.id = m.claim_id
+        WHERE m.neighborhood_id = $1
+        "#,
+    )
+    .bind(neighborhood_id).fetch_all(pool).await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .into_iter()
+    .map(|(id, label, compound_id, pp, fid)| AtomicNode { id, label, compound_id, pignistic_prob: pp, frame_id: fid })
+    .collect();
+
+    let edges: Vec<AtomicEdge> = sqlx::query_as::<_, (Uuid, Uuid, String)>(
+        r#"
+        SELECT e.source_id, e.target_id, e.relationship
+        FROM edges e
+        JOIN claim_neighborhood_membership ms ON ms.claim_id = e.source_id AND ms.neighborhood_id = $1
+        JOIN claim_neighborhood_membership mt ON mt.claim_id = e.target_id AND mt.neighborhood_id = $1
+        LEFT JOIN LATERAL edge_to_factor_type(e.relationship) ft ON true
+        WHERE e.relationship <> 'decomposes_to'
+          AND ft.forward_strength > 0
+        "#,
+    )
+    .bind(neighborhood_id).fetch_all(pool).await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .into_iter()
+    .map(|(source, target, relationship)| AtomicEdge { source, target, relationship })
+    .collect();
+
+    let compound_groups: Vec<CompoundGroup> = sqlx::query_as::<_, (Uuid, String, Vec<Uuid>)>(
+        r#"
+        SELECT e.source_id AS compound_id,
+               COALESCE(c.content, c.id::text) AS label,
+               array_agg(e.target_id ORDER BY e.target_id) AS member_atom_ids
+        FROM edges e
+        JOIN claims c ON c.id = e.source_id
+        JOIN claim_neighborhood_membership m ON m.claim_id = e.target_id AND m.neighborhood_id = $1
+        WHERE e.relationship = 'decomposes_to'
+        GROUP BY 1, 2
+        "#,
+    )
+    .bind(neighborhood_id).fetch_all(pool).await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .into_iter()
+    .map(|(compound_id, label, member_atom_ids)| CompoundGroup { compound_id, label, member_atom_ids })
+    .collect();
+
+    Ok(AtomicResponse { neighborhood_id, truncated: false, nodes, edges, compound_groups })
 }
