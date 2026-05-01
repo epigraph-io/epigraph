@@ -83,15 +83,50 @@ fn log_fail(path: &str, table: &str, stage: &str) -> Result<()> {
 }
 
 pub fn verify() -> Result<()> {
-    eprintln!("Verification — manual queries to run against EpiGraph:");
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://epigraph:epigraph@localhost:5432/epigraph".into());
+
+    let papers = run_psql(&url,
+        "SELECT count(*) FROM papers WHERE doi LIKE 'urn:epigraph-table:%'")?;
+    eprintln!("Coverage: {} papers ingested with DOI prefix urn:epigraph-table: (expected ~85)",
+        papers.trim());
+
+    let total_claims = run_psql(&url, "
+        SELECT count(DISTINCT e.target_id) FROM edges e
+        JOIN papers p ON p.id = e.source_id
+        WHERE p.doi LIKE 'urn:epigraph-table:%' AND e.relationship = 'asserts'
+    ")?;
+    eprintln!("Total claims linked from per-table papers: {}", total_claims.trim());
+
+    let zero = run_psql(&url, "
+        SELECT p.doi FROM papers p
+        WHERE p.doi LIKE 'urn:epigraph-table:%'
+          AND NOT EXISTS (
+              SELECT 1 FROM edges e WHERE e.source_id = p.id AND e.relationship = 'asserts'
+          )
+    ")?;
+    let zero_lines: Vec<&str> = zero.lines().filter(|l| !l.trim().is_empty()).collect();
+    if !zero_lines.is_empty() {
+        eprintln!("WARNING: {} per-table papers have no asserts edges:", zero_lines.len());
+        for l in &zero_lines { eprintln!("  {}", l); }
+    }
+
     eprintln!();
-    eprintln!("1. Coverage — count purpose claims:");
-    eprintln!("   recall query (filter labels = ['code-shape', 'table-purpose']):");
-    eprintln!("   expected: ~85 purpose claims");
-    eprintln!();
-    eprintln!("2. Recall — semantic queries should surface the right table:");
-    eprintln!("   recall \"what stores DST mass functions\"  → mass_functions purpose claim");
-    eprintln!("   recall \"belief frame definition\"         → frames purpose claim");
-    eprintln!("   recall \"harvester audit reports\"         → harvester_audit_reports");
+    eprintln!("Manual recall checks (run separately):");
+    eprintln!("  recall \"what stores DST mass functions\"  → mass_functions");
+    eprintln!("  recall \"belief frame definition\"         → frames");
+    eprintln!("  recall \"harvester audit reports\"         → harvester_audit_reports");
     Ok(())
+}
+
+fn run_psql(url: &str, sql: &str) -> Result<String> {
+    let out = std::process::Command::new("psql")
+        .arg(url).arg("-tAc").arg(sql)
+        .output()
+        .with_context(|| "psql invocation failed")?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!("psql failed: {}",
+            String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(String::from_utf8(out.stdout)?)
 }
