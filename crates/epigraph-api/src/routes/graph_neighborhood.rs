@@ -266,9 +266,8 @@ async fn compound_response(
         FROM edges e
         JOIN compound_universe a ON a.id = e.source_id
         JOIN compound_universe b ON b.id = e.target_id
-        LEFT JOIN LATERAL edge_to_factor_type(e.relationship) ft ON true
-        WHERE e.relationship <> 'decomposes_to'
-          AND ft.forward_strength > 0
+        -- No relationship filter: if both endpoints are displayed, the edge
+        -- is displayed. Users hide unwanted types via GraphControls toggles.
         "#,
     )
     .bind(neighborhood_id)
