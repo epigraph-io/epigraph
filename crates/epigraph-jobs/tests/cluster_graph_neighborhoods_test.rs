@@ -102,5 +102,10 @@ async fn run_clustering_populates_neighborhoods_when_themes_exist() {
 
     let n_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM graph_neighborhoods WHERE run_id = $1")
         .bind(summary.run_id).fetch_one(&pool).await.unwrap();
-    assert!(n_count.0 >= 2, "neighborhood phase should populate >=2 neighborhoods");
+    // The runner uses Config::default() (thresholds 50/10). With our seed of 7 atoms in
+    // the test theme, this hits the synthetic-single-neighborhood path: one neighborhood
+    // covering the whole theme. The point of this test is to verify the runner *calls*
+    // the neighborhood pass — exact community count is exercised by the
+    // run_theme_neighborhoods test above with thresholds=0.
+    assert!(n_count.0 >= 1, "runner should populate at least one neighborhood for the seeded theme");
 }
