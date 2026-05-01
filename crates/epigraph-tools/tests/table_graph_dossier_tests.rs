@@ -8,20 +8,21 @@ use dossier::collect_git_context;
 use dossier::collect_call_sites;
 use dossier::extract_fk_targets;
 
+/// Workspace root, computed at compile time.
+/// `CARGO_MANIFEST_DIR` is `crates/epigraph-tools/`; root is two levels up.
+const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+const REPO_MIGRATIONS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
+
 #[test]
 fn ddl_for_claims_includes_create_table() {
-    let ddl = collect_ddl("/home/jeremy/epigraph/migrations", "claims").unwrap();
+    let ddl = collect_ddl(REPO_MIGRATIONS, "claims").unwrap();
     assert!(ddl.contains("CREATE TABLE"), "missing CREATE TABLE for claims");
     assert!(ddl.contains("claims"), "DDL should mention 'claims'");
 }
 
 #[test]
 fn git_context_for_claims_returns_some_commits() {
-    let commits = collect_git_context(
-        "/home/jeremy/epigraph",
-        "001_initial_schema.sql",
-        "claims",
-    ).unwrap();
+    let commits = collect_git_context(REPO_ROOT, "001_initial_schema.sql", "claims").unwrap();
     assert!(!commits.is_empty(), "expected at least one commit touching claims");
     let mut shas: Vec<&str> = commits.iter().map(|c| c.sha.as_str()).collect();
     shas.sort();
@@ -32,7 +33,7 @@ fn git_context_for_claims_returns_some_commits() {
 
 #[test]
 fn finds_claim_repo_call_sites() {
-    let sites = collect_call_sites("/home/jeremy/epigraph", "claims").unwrap();
+    let sites = collect_call_sites(REPO_ROOT, "claims").unwrap();
     assert!(!sites.is_empty(), "claims should have many call sites");
     assert!(
         sites.iter().any(|s| s.crate_name == "epigraph-db" || s.crate_name == "epigraph-api"),
