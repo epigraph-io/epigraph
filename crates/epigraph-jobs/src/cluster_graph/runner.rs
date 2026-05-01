@@ -108,6 +108,19 @@ pub async fn run_clustering(pool: &PgPool, cfg: &RunConfig) -> Result<RunSummary
     .execute(pool)
     .await?;
 
+    // Per-theme neighborhood pass (additive; does not affect community clustering).
+    // Uses the production-default skip thresholds; passes None to walk every theme.
+    if let Err(e) = super::neighborhood::run_theme_neighborhoods(
+        pool,
+        run_id,
+        &super::neighborhood::Config::default(),
+        None,
+    )
+    .await
+    {
+        tracing::warn!(run_id = %run_id, error = ?e, "neighborhood pass failed; communities still persisted");
+    }
+
     gc_old_runs(pool, cfg.retain_runs).await?;
 
     Ok(RunSummary {

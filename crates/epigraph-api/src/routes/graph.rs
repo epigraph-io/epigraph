@@ -321,67 +321,13 @@ pub async fn expand(
 }
 
 pub async fn neighborhood(
-    State(state): State<AppState>,
-    Query(params): Query<NeighborhoodParams>,
-) -> Result<Json<ExpandResponse>, (axum::http::StatusCode, String)> {
-    use axum::http::StatusCode;
-    let pool: &PgPool = &state.db_pool;
-    let hops = params.hops.clamp(1, 2);
-    let budget = params.budget.max(1);
-    let allowlist = resolve_relationship_filter(params.relationships.as_deref());
-
-    // BFS traverses via *all* edge types so that the response can report
-    // `filtered_edge_count` for nodes whose only edges are design-excluded
-    // (e.g. `produced`, `same_source`). The render filter applies in
-    // `fetch_subgraph_edges` below; the BFS only bounds the neighborhood by
-    // hop depth and the overall `budget`.
-    let nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
-        r#"
-        WITH RECURSIVE bfs(id, depth) AS (
-            SELECT $1::uuid, 0
-            UNION
-            SELECT CASE WHEN e.source_id = b.id THEN e.target_id ELSE e.source_id END,
-                   b.depth + 1
-            FROM bfs b
-            JOIN edges e
-              ON (e.source_id = b.id OR e.target_id = b.id)
-            WHERE b.depth < $2
-        )
-        SELECT DISTINCT
-               c.id,
-               COALESCE(c.content, c.id::text) AS label,
-               'claim'::text AS entity_type,
-               c.pignistic_prob,
-               (SELECT cf.frame_id FROM claim_frames cf WHERE cf.claim_id = c.id LIMIT 1) AS frame_id,
-               NULL::uuid AS cluster_id,
-               NULL::float8 AS conflict_k
-        FROM bfs b JOIN claims c ON c.id = b.id
-        LIMIT $3
-        "#,
-    )
-    .bind(params.node_id)
-    .bind(hops)
-    .bind(budget)
-    .fetch_all(pool)
-    .await
-    .map_err(internal)?;
-
-    if nodes.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "seed node not found".into()));
-    }
-
-    let ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
-    let (edges, filtered_edge_count) =
-        fetch_subgraph_edges(pool, &ids, allowlist.as_deref()).await?;
-
-    Ok(Json(ExpandResponse {
-        cluster_id: Uuid::nil(),
-        truncated: false,
-        total_size: nodes.len() as i64,
-        nodes,
-        edges,
-        filtered_edge_count,
-    }))
+    State(_state): State<AppState>,
+    Query(_params): Query<NeighborhoodParams>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    Err((
+        axum::http::StatusCode::GONE,
+        "GET /api/v1/graph/neighborhood is deprecated; use /graph/themes/{theme_id}/expand and /graph/neighborhoods/{neighborhood_id}/expand".into(),
+    ))
 }
 
 /// Fetch edges *between* the given node ids, partitioned into:
@@ -438,6 +384,136 @@ async fn fetch_subgraph_edges(
         }
     }
     Ok((edges, filtered))
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct ThemeOut {
+    pub id: Uuid,
+    pub label: String,
+    pub claim_count: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThemesOverviewResponse {
+    pub themes: Vec<ThemeOut>,
+}
+
+pub async fn themes_overview(
+    State(state): State<AppState>,
+) -> Result<Json<ThemesOverviewResponse>, (axum::http::StatusCode, String)> {
+    let pool: &PgPool = &state.db_pool;
+    let themes: Vec<ThemeOut> = sqlx::query_as::<_, ThemeOut>(
+        "SELECT id, label, claim_count FROM claim_themes ORDER BY claim_count DESC, label ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(ThemesOverviewResponse { themes }))
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct NeighborhoodOut {
+    pub id: Uuid,
+    pub label: String,
+    pub size: i32,
+    pub mean_betp: Option<f64>,
+    pub dominant_frame_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NeighborhoodEdgeOut {
+    pub a: Uuid,
+    pub b: Uuid,
+    pub weight: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThemeExpandResponse {
+    pub theme_id: Uuid,
+    pub truncated: bool,
+    pub neighborhoods: Vec<NeighborhoodOut>,
+    pub neighborhood_edges: Vec<NeighborhoodEdgeOut>,
+}
+
+pub async fn themes_expand(
+    State(state): State<AppState>,
+    Path(theme_id): Path<Uuid>,
+    Query(params): Query<ExpandParams>,
+) -> Result<Json<ThemeExpandResponse>, (axum::http::StatusCode, String)> {
+    use axum::http::StatusCode;
+    let pool: &PgPool = &state.db_pool;
+
+    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM claim_themes WHERE id = $1")
+        .bind(theme_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(internal)?;
+    if exists.is_none() {
+        return Err((StatusCode::NOT_FOUND, "theme not found".into()));
+    }
+
+    let latest_run: Option<(Uuid,)> =
+        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .map_err(internal)?;
+    let Some((run_id,)) = latest_run else {
+        return Ok(Json(synthesize_pre_run_response(theme_id)));
+    };
+
+    let budget = params.budget.max(1);
+    let neighborhoods: Vec<NeighborhoodOut> = sqlx::query_as::<_, NeighborhoodOut>(
+        "SELECT id, label, size, mean_betp, dominant_frame_id \
+         FROM graph_neighborhoods \
+         WHERE run_id = $1 AND theme_id = $2 \
+         ORDER BY size DESC LIMIT $3",
+    )
+    .bind(run_id)
+    .bind(theme_id)
+    .bind(budget)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+
+    if neighborhoods.is_empty() {
+        return Ok(Json(synthesize_pre_run_response(theme_id)));
+    }
+
+    let nbr_id_set: Vec<Uuid> = neighborhoods.iter().map(|n| n.id).collect();
+    let edges: Vec<NeighborhoodEdgeOut> = sqlx::query_as::<_, (Uuid, Uuid, f64)>(
+        "SELECT neighborhood_a, neighborhood_b, weight FROM neighborhood_edges \
+         WHERE run_id = $1 AND neighborhood_a = ANY($2) AND neighborhood_b = ANY($2)",
+    )
+    .bind(run_id)
+    .bind(&nbr_id_set)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?
+    .into_iter()
+    .map(|(a, b, w)| NeighborhoodEdgeOut { a, b, weight: w })
+    .collect();
+
+    Ok(Json(ThemeExpandResponse {
+        theme_id,
+        truncated: false,
+        neighborhoods,
+        neighborhood_edges: edges,
+    }))
+}
+
+fn synthesize_pre_run_response(theme_id: Uuid) -> ThemeExpandResponse {
+    ThemeExpandResponse {
+        theme_id,
+        truncated: false,
+        neighborhoods: vec![NeighborhoodOut {
+            id: theme_id,
+            label: "synthetic".into(),
+            size: 0,
+            mean_betp: None,
+            dominant_frame_id: None,
+        }],
+        neighborhood_edges: vec![],
+    }
 }
 
 fn internal(e: sqlx::Error) -> (axum::http::StatusCode, String) {
@@ -583,141 +659,5 @@ mod tests {
                 "CONTAINS".to_string()
             ]
         );
-    }
-}
-
-#[cfg(all(test, feature = "db"))]
-mod integration_tests {
-    use super::*;
-    use crate::state::{ApiConfig, AppState};
-    use axum::body::Body;
-    use axum::http::Request;
-    use axum::routing::get;
-    use axum::Router;
-    use http_body_util::BodyExt;
-    use sqlx::PgPool;
-    use tower::ServiceExt;
-
-    fn test_state(pool: PgPool) -> AppState {
-        AppState::with_db(pool, ApiConfig::default())
-    }
-
-    fn graph_router(state: AppState) -> Router {
-        Router::new()
-            .route("/api/v1/graph/neighborhood", get(neighborhood))
-            .route("/api/v1/graph/clusters/:id/expand", get(expand))
-            .with_state(state)
-    }
-
-    async fn parse_body(response: axum::response::Response) -> serde_json::Value {
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-
-    /// Insert a system agent for tests (mirrors the pattern in policies.rs).
-    async fn ensure_test_agent(pool: &PgPool) -> Uuid {
-        let pub_key = vec![1u8; 32];
-        if let Some(id) =
-            sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE public_key = $1")
-                .bind(&pub_key)
-                .fetch_optional(pool)
-                .await
-                .unwrap()
-        {
-            return id;
-        }
-        sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(&pub_key)
-        .bind("graph-test-agent")
-        .fetch_one(pool)
-        .await
-        .unwrap()
-    }
-
-    /// Seed two claims and return their ids.
-    async fn seed_two_claims(pool: &PgPool) -> (Uuid, Uuid) {
-        let agent_id = ensure_test_agent(pool).await;
-        let a_content = format!("graph-test-claim-a-{}", Uuid::new_v4());
-        let b_content = format!("graph-test-claim-b-{}", Uuid::new_v4());
-        let a_hash = epigraph_crypto::ContentHasher::hash(a_content.as_bytes());
-        let b_hash = epigraph_crypto::ContentHasher::hash(b_content.as_bytes());
-        let a = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
-             VALUES ($1, $2, $3, 0.5) RETURNING id",
-        )
-        .bind(&a_content)
-        .bind(a_hash.as_slice())
-        .bind(agent_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        let b = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
-             VALUES ($1, $2, $3, 0.5) RETURNING id",
-        )
-        .bind(&b_content)
-        .bind(b_hash.as_slice())
-        .bind(agent_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        (a, b)
-    }
-
-    /// Seed a claim->claim edge with the given relationship.
-    async fn seed_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
-        sqlx::query(
-            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
-             VALUES ($1, 'claim', $2, 'claim', $3)",
-        )
-        .bind(source)
-        .bind(target)
-        .bind(relationship)
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    /// Build a `GET /api/v1/graph/neighborhood` request scoped to `node_id`,
-    /// with optional `?relationships=` override.
-    fn neighborhood_request(node_id: Uuid, relationships: Option<&str>) -> Request<Body> {
-        let uri = match relationships {
-            Some(r) => format!(
-                "/api/v1/graph/neighborhood?node_id={}&relationships={}",
-                node_id, r
-            ),
-            None => format!("/api/v1/graph/neighborhood?node_id={}", node_id),
-        };
-        Request::builder().uri(uri).body(Body::empty()).unwrap()
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn neighborhood_relationships_param_overrides_allowlist(pool: PgPool) {
-        let (a, b) = seed_two_claims(&pool).await;
-        seed_edge(&pool, a, b, "produced").await; // NOT in default allowlist
-
-        let state = test_state(pool.clone());
-        let router = graph_router(state);
-
-        // Without relationships override: edge is filtered.
-        let response = router
-            .clone()
-            .oneshot(neighborhood_request(a, None))
-            .await
-            .unwrap();
-        let body: serde_json::Value = parse_body(response).await;
-        assert_eq!(body["edges"].as_array().unwrap().len(), 0);
-        assert_eq!(body["filtered_edge_count"], 1);
-
-        // With relationships=produced: edge is returned.
-        let response = router
-            .oneshot(neighborhood_request(a, Some("produced")))
-            .await
-            .unwrap();
-        let body: serde_json::Value = parse_body(response).await;
-        assert_eq!(body["edges"].as_array().unwrap().len(), 1);
-        assert_eq!(body["edges"][0]["relationship"], "produced");
     }
 }
