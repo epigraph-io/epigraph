@@ -87,3 +87,20 @@ async fn run_theme_neighborhoods_seeds_two_neighborhoods_per_theme() {
         edges[0].0
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_clustering_populates_neighborhoods_when_themes_exist() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+    common::reset_neighborhood_tables(&pool).await;
+    common::seed_two_clique_theme(&pool).await; // claims+theme exist; runner allocates its own run_id
+
+    let summary = epigraph_jobs::cluster_graph::runner::run_clustering(
+        &pool,
+        &epigraph_jobs::cluster_graph::runner::RunConfig { resolution: 1.0, retain_runs: 3 }
+    ).await.unwrap();
+
+    let n_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM graph_neighborhoods WHERE run_id = $1")
+        .bind(summary.run_id).fetch_one(&pool).await.unwrap();
+    assert!(n_count.0 >= 2, "neighborhood phase should populate >=2 neighborhoods");
+}
