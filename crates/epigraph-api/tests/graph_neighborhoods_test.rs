@@ -20,7 +20,7 @@ async fn neighborhoods_expand_compound_returns_compound_nodes_with_induced_edges
     let agent_id = Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
     sqlx::query(
         "INSERT INTO agents (id, public_key, display_name, agent_type) \
-         VALUES ($1, decode(repeat('00', 32), 'hex'), 'compound-test', 'system') \
+         VALUES ($1, decode(repeat('CC', 32), 'hex'), 'compound-test', 'system') \
          ON CONFLICT (id) DO NOTHING"
     ).bind(agent_id).execute(&pool).await.unwrap();
 
@@ -114,7 +114,7 @@ async fn neighborhoods_expand_atomic_returns_atoms_and_compound_groups() {
     let agent_id = Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
     sqlx::query(
         "INSERT INTO agents (id, public_key, display_name, agent_type) \
-         VALUES ($1, decode(repeat('00', 32), 'hex'), 'atomic-test', 'system') \
+         VALUES ($1, decode(repeat('CC', 32), 'hex'), 'atomic-test', 'system') \
          ON CONFLICT (id) DO NOTHING"
     ).bind(agent_id).execute(&pool).await.unwrap();
 

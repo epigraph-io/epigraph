@@ -58,9 +58,12 @@ pub async fn seed_one_cluster(pool: &PgPool, size: usize) -> uuid::Uuid {
         .unwrap();
 
     let test_agent_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000aa").unwrap();
+    // public_key is unique across all agents — must differ per test binary.
+    // 00...AA distinguishes graph_routes_test from graph_themes_test (00...BB)
+    // and graph_neighborhoods_test (00...CC).
     sqlx::query(
         "INSERT INTO agents (id, public_key, display_name, agent_type)
-         VALUES ($1, decode(repeat('00', 32), 'hex'), 'graph-routes-test', 'system')
+         VALUES ($1, decode(repeat('AA', 32), 'hex'), 'graph-routes-test', 'system')
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(test_agent_id)
