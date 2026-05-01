@@ -547,6 +547,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/claims/:id/neighborhood",
             get(edges::claim_neighborhood),
         )
+        .route(
+            "/api/v1/claims/:id/compound_neighborhood",
+            get(graph_neighborhood::claim_compound_neighborhood),
+        )
         .route("/api/v1/admin/stats", get(admin::system_stats))
         .route(
             "/api/v1/clusters/boundary-claims",
@@ -1032,6 +1036,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/claims/:id/neighborhood",
             get(edges::claim_neighborhood),
+        )
+        .route(
+            "/api/v1/claims/:id/compound_neighborhood",
+            get(graph_neighborhood::claim_compound_neighborhood),
         )
         .route("/api/v1/admin/stats", get(admin::system_stats))
         .route(

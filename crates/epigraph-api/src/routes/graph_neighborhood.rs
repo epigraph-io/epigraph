@@ -344,3 +344,216 @@ async fn atomic_response(
         compound_groups,
     })
 }
+
+// ---------------------------------------------------------------------------
+// /api/v1/claims/:id/compound_neighborhood
+//
+// Given a clicked claim X, surface its 1-hop neighborhood projected onto the
+// compound layer: walk through atoms (X's children, or X itself if X is an
+// atom) following positive-weight epistemic edges, then resolve each
+// connected atom to its parent compound (or to itself for standalones).
+// Aggregate by parent compound, count contributing atom-edges, return the
+// merged set.
+//
+// Used by the GUI when "Collapse equivalents" mode is on — instead of a raw
+// 1-hop claim neighborhood (which surfaces atomic siblings), this surfaces
+// the next-hop compound claims as if intervening atoms weren't visible.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CompoundNeighborhoodParams {
+    #[serde(default = "default_compound_budget")]
+    pub budget: i64,
+}
+fn default_compound_budget() -> i64 {
+    50
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompoundNeighborhoodResponse {
+    pub center_id: Uuid,
+    pub nodes: Vec<CompoundNeighborNode>,
+    pub edges: Vec<CompoundNeighborEdge>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompoundNeighborNode {
+    pub id: Uuid,
+    pub label: String,
+    pub kind: String, // "self" | "compound" | "standalone" | "atom"
+    pub atom_link_count: i32,
+    pub pignistic_prob: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompoundNeighborEdge {
+    pub source: Uuid,
+    pub target: Uuid,
+    pub relationship: String,
+    pub atom_edge_count: i32,
+    pub total_strength: f64,
+}
+
+pub async fn claim_compound_neighborhood(
+    State(state): State<AppState>,
+    Path(claim_id): Path<Uuid>,
+    Query(params): Query<CompoundNeighborhoodParams>,
+) -> Result<Json<CompoundNeighborhoodResponse>, (axum::http::StatusCode, String)> {
+    use axum::http::StatusCode;
+    let pool: &PgPool = &state.db_pool;
+    let budget = params.budget.clamp(1, 200);
+
+    // Fetch center claim content + verify it exists.
+    let center: Option<(String,)> =
+        sqlx::query_as("SELECT content FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(internal)?;
+    let Some((center_content,)) = center else {
+        return Err((StatusCode::NOT_FOUND, "claim not found".into()));
+    };
+
+    // Aggregate (other_compound, relationship) -> (atom_edge_count, sum(forward_strength)).
+    // Both endpoints of every epistemic edge are projected to their parent
+    // compound (or themselves if standalone). The center claim's projection
+    // is filtered out so we don't return self-loops.
+    let rows: Vec<(Uuid, String, String, i64, f64, Option<f64>)> = sqlx::query_as(
+        r#"
+        WITH seed AS (
+            SELECT $1::uuid AS center
+        ),
+        center_atoms AS (
+            -- Atoms of the center compound (if it has children)
+            SELECT e.target_id AS atom_id
+            FROM edges e, seed
+            WHERE e.source_id = seed.center AND e.relationship = 'decomposes_to'
+            UNION
+            -- Or the center itself if it's atomic / standalone (no children)
+            SELECT seed.center FROM seed
+            WHERE NOT EXISTS (
+                SELECT 1 FROM edges WHERE source_id = (SELECT center FROM seed)
+                AND relationship = 'decomposes_to'
+            )
+        ),
+        epistemic_edges AS (
+            -- Positive-weight epistemic edges with one endpoint in center_atoms.
+            SELECT
+                CASE WHEN ca.atom_id = e.source_id THEN e.target_id ELSE e.source_id END AS other_atom_id,
+                e.relationship,
+                ft.forward_strength
+            FROM edges e
+            JOIN edge_to_factor_type(e.relationship) ft ON ft.forward_strength > 0
+            JOIN center_atoms ca
+                ON ca.atom_id = e.source_id OR ca.atom_id = e.target_id
+            WHERE e.source_id != e.target_id
+        ),
+        projected AS (
+            -- Resolve each "other_atom" to its parent compound (or itself).
+            SELECT
+                COALESCE(d.source_id, ee.other_atom_id) AS compound_id,
+                ee.relationship,
+                ee.forward_strength
+            FROM epistemic_edges ee
+            LEFT JOIN edges d
+                ON d.target_id = ee.other_atom_id
+                AND d.relationship = 'decomposes_to'
+        )
+        SELECT
+            c.id,
+            c.content,
+            p.relationship,
+            COUNT(*)::bigint AS atom_edge_count,
+            SUM(p.forward_strength)::double precision AS total_strength,
+            c.pignistic_prob
+        FROM projected p
+        JOIN claims c ON c.id = p.compound_id
+        WHERE p.compound_id != $1::uuid
+        GROUP BY c.id, c.content, p.relationship, c.pignistic_prob
+        ORDER BY atom_edge_count DESC, c.id
+        LIMIT $2
+        "#,
+    )
+    .bind(claim_id)
+    .bind(budget + 1) // +1 so we can detect truncation
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+
+    let truncated = rows.len() as i64 > budget;
+    let kept = rows.into_iter().take(budget as usize);
+
+    // Determine the kind of the center: compound if it has children;
+    // standalone if no decomposes_to in either direction; else atom.
+    let has_children: bool = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM edges WHERE source_id = $1 AND relationship = 'decomposes_to'",
+    )
+    .bind(claim_id)
+    .fetch_one(pool)
+    .await
+    .map_err(internal)?
+        > 0;
+    let has_parent: bool = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM edges WHERE target_id = $1 AND relationship = 'decomposes_to'",
+    )
+    .bind(claim_id)
+    .fetch_one(pool)
+    .await
+    .map_err(internal)?
+        > 0;
+    let center_kind = match (has_children, has_parent) {
+        (true, _) => "compound",
+        (false, true) => "atom",
+        (false, false) => "standalone",
+    };
+
+    let mut nodes_by_id: std::collections::HashMap<Uuid, CompoundNeighborNode> =
+        std::collections::HashMap::new();
+    let mut edges: Vec<CompoundNeighborEdge> = Vec::new();
+    for (id, content, relationship, atom_edge_count, total_strength, pignistic_prob) in kept {
+        let entry = nodes_by_id
+            .entry(id)
+            .or_insert_with(|| CompoundNeighborNode {
+                id,
+                label: content,
+                kind: "compound_or_standalone".to_string(),
+                atom_link_count: 0,
+                pignistic_prob,
+            });
+        entry.atom_link_count += atom_edge_count as i32;
+        edges.push(CompoundNeighborEdge {
+            source: claim_id,
+            target: id,
+            relationship,
+            atom_edge_count: atom_edge_count as i32,
+            total_strength,
+        });
+    }
+    let mut nodes: Vec<CompoundNeighborNode> = nodes_by_id.into_values().collect();
+    nodes.sort_by(|a, b| b.atom_link_count.cmp(&a.atom_link_count));
+
+    // Push the center node first
+    nodes.insert(
+        0,
+        CompoundNeighborNode {
+            id: claim_id,
+            label: center_content,
+            kind: center_kind.to_string(),
+            atom_link_count: edges.iter().map(|e| e.atom_edge_count).sum(),
+            pignistic_prob: None,
+        },
+    );
+
+    Ok(Json(CompoundNeighborhoodResponse {
+        center_id: claim_id,
+        nodes,
+        edges,
+        truncated,
+    }))
+}
+
+fn internal<E: std::fmt::Display>(e: E) -> (axum::http::StatusCode, String) {
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
