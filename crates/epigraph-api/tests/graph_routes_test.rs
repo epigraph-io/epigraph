@@ -171,30 +171,21 @@ async fn expand_returns_404_for_unknown_cluster() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn neighborhood_returns_one_hop_seed_and_neighbors() {
+async fn legacy_neighborhood_endpoint_returns_410_gone() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
-    let seed = common::seed_three_node_chain(&pool).await;
+    let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+    // We don't need to seed anything — handler returns 410 unconditionally.
+    let _ = pool;
+
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let resp = reqwest::Client::new()
         .get(format!(
-            "http://{addr}/api/v1/graph/neighborhood?node_id={seed}&hops=1&budget=20"
+            "http://{addr}/api/v1/graph/neighborhood?node_id={}&hops=1&budget=20",
+            uuid::Uuid::new_v4()
         ))
-        .header(
-            "Authorization",
-            format!("Bearer {}", common::test_bearer_token()),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
-    let body: Value = resp.json().await.unwrap();
-    let nodes = body["nodes"].as_array().unwrap();
-    assert!(nodes.len() >= 2, "seed + at least one neighbor");
+        .header("Authorization", format!("Bearer {}", common::test_bearer_token()))
+        .send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 410, "legacy /graph/neighborhood must return 410 Gone");
 }
 
 #[tokio::test(flavor = "multi_thread")]
