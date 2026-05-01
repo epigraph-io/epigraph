@@ -420,10 +420,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/graph/communities/overview", get(graph::overview))
         .route("/api/v1/graph/communities/:id/expand", get(graph::expand))
         .route("/api/v1/graph/neighborhood", get(graph::neighborhood))
-        .route(
-            "/api/v1/graph/themes/overview",
-            get(graph::themes_overview),
-        )
+        .route("/api/v1/graph/themes/overview", get(graph::themes_overview))
         .route(
             "/api/v1/graph/themes/:theme_id/expand",
             get(graph::themes_expand),

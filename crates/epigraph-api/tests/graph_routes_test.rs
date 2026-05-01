@@ -173,7 +173,11 @@ async fn expand_returns_404_for_unknown_cluster() {
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_neighborhood_endpoint_returns_410_gone() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
     // We don't need to seed anything — handler returns 410 unconditionally.
     let _ = pool;
 
@@ -183,9 +187,18 @@ async fn legacy_neighborhood_endpoint_returns_410_gone() {
             "http://{addr}/api/v1/graph/neighborhood?node_id={}&hops=1&budget=20",
             uuid::Uuid::new_v4()
         ))
-        .header("Authorization", format!("Bearer {}", common::test_bearer_token()))
-        .send().await.unwrap();
-    assert_eq!(resp.status().as_u16(), 410, "legacy /graph/neighborhood must return 410 Gone");
+        .header(
+            "Authorization",
+            format!("Bearer {}", common::test_bearer_token()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        410,
+        "legacy /graph/neighborhood must return 410 Gone"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

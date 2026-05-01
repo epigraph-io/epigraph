@@ -9,7 +9,10 @@
 //! Atomic mode is implemented in Task 8 — for now `atomic_response` returns
 //! an empty placeholder.
 
-use axum::{extract::{Path, Query, State}, Json};
+use axum::{
+    extract::{Path, Query, State},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -18,11 +21,17 @@ use crate::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct ExpandParams {
-    #[serde(default = "default_budget")] pub budget: i64,
-    #[serde(default = "default_mode")] pub mode: String,
+    #[serde(default = "default_budget")]
+    pub budget: i64,
+    #[serde(default = "default_mode")]
+    pub mode: String,
 }
-fn default_budget() -> i64 { 200 }
-fn default_mode() -> String { "compound".to_string() }
+fn default_budget() -> i64 {
+    200
+}
+fn default_mode() -> String {
+    "compound".to_string()
+}
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
@@ -44,7 +53,7 @@ pub struct CompoundResponse {
 pub struct CompoundNode {
     pub id: Uuid,
     pub label: String,
-    pub kind: String,           // "compound" | "standalone"
+    pub kind: String, // "compound" | "standalone"
     pub atom_count: i32,
     pub pignistic_prob: Option<f64>,
     pub frame_id: Option<Uuid>,
@@ -107,26 +116,34 @@ pub async fn expand(
     let pool: &PgPool = &state.db_pool;
     let exists: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM graph_neighborhoods WHERE id = $1 \
-         AND run_id = (SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1)"
-    ).bind(neighborhood_id).fetch_optional(pool).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+         AND run_id = (SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1)",
+    )
+    .bind(neighborhood_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if exists.is_none() {
-        return Err((StatusCode::NOT_FOUND, "neighborhood not found in latest run".into()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "neighborhood not found in latest run".into(),
+        ));
     }
 
     match params.mode.as_str() {
         "atomic" => Ok(Json(NeighborhoodExpandResponse::Atomic(
-            atomic_response(pool, neighborhood_id, params.budget).await?
+            atomic_response(pool, neighborhood_id, params.budget).await?,
         ))),
         _ => Ok(Json(NeighborhoodExpandResponse::Compound(
-            compound_response(pool, neighborhood_id, params.budget).await?
+            compound_response(pool, neighborhood_id, params.budget).await?,
         ))),
     }
 }
 
-async fn compound_response(pool: &PgPool, neighborhood_id: Uuid, _budget: i64)
-    -> Result<CompoundResponse, (axum::http::StatusCode, String)>
-{
+async fn compound_response(
+    pool: &PgPool,
+    neighborhood_id: Uuid,
+    _budget: i64,
+) -> Result<CompoundResponse, (axum::http::StatusCode, String)> {
     let nodes: Vec<CompoundNode> = sqlx::query_as::<_, (Uuid, String, String, i32, Option<f64>, Option<Uuid>)>(
         r#"
         WITH atoms AS (
@@ -196,10 +213,19 @@ async fn compound_response(pool: &PgPool, neighborhood_id: Uuid, _budget: i64)
         "#,
     )
     .bind(neighborhood_id)
-    .fetch_all(pool).await
+    .fetch_all(pool)
+    .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
-    .map(|(source, target, relationship, strength, atom_edge_count)| InducedEdge { source, target, relationship, strength, atom_edge_count })
+    .map(
+        |(source, target, relationship, strength, atom_edge_count)| InducedEdge {
+            source,
+            target,
+            relationship,
+            strength,
+            atom_edge_count,
+        },
+    )
     .collect();
 
     let direct_edges: Vec<DirectEdge> = sqlx::query_as::<_, (Uuid, Uuid, String)>(
@@ -236,12 +262,20 @@ async fn compound_response(pool: &PgPool, neighborhood_id: Uuid, _budget: i64)
     .map(|(source, target, relationship)| DirectEdge { source, target, relationship })
     .collect();
 
-    Ok(CompoundResponse { neighborhood_id, truncated: false, nodes, induced_edges, direct_edges })
+    Ok(CompoundResponse {
+        neighborhood_id,
+        truncated: false,
+        nodes,
+        induced_edges,
+        direct_edges,
+    })
 }
 
-async fn atomic_response(pool: &PgPool, neighborhood_id: Uuid, _budget: i64)
-    -> Result<AtomicResponse, (axum::http::StatusCode, String)>
-{
+async fn atomic_response(
+    pool: &PgPool,
+    neighborhood_id: Uuid,
+    _budget: i64,
+) -> Result<AtomicResponse, (axum::http::StatusCode, String)> {
     let nodes: Vec<AtomicNode> = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<f64>, Option<Uuid>)>(
         r#"
         SELECT c.id,
@@ -290,11 +324,23 @@ async fn atomic_response(pool: &PgPool, neighborhood_id: Uuid, _budget: i64)
         GROUP BY 1, 2
         "#,
     )
-    .bind(neighborhood_id).fetch_all(pool).await
+    .bind(neighborhood_id)
+    .fetch_all(pool)
+    .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
-    .map(|(compound_id, label, member_atom_ids)| CompoundGroup { compound_id, label, member_atom_ids })
+    .map(|(compound_id, label, member_atom_ids)| CompoundGroup {
+        compound_id,
+        label,
+        member_atom_ids,
+    })
     .collect();
 
-    Ok(AtomicResponse { neighborhood_id, truncated: false, nodes, edges, compound_groups })
+    Ok(AtomicResponse {
+        neighborhood_id,
+        truncated: false,
+        nodes,
+        edges,
+        compound_groups,
+    })
 }

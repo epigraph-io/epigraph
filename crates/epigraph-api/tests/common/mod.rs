@@ -110,4 +110,3 @@ pub async fn seed_one_cluster(pool: &PgPool, size: usize) -> uuid::Uuid {
     }
     cluster_id
 }
-

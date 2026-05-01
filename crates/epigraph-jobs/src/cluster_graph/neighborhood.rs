@@ -110,13 +110,17 @@ pub async fn run_theme_neighborhoods(
     theme_ids: Option<&[Uuid]>,
 ) -> Result<(), sqlx::Error> {
     let themes: Vec<ThemeRow> = match theme_ids {
-        None => sqlx::query_as("SELECT id FROM claim_themes")
-            .fetch_all(pool)
-            .await?,
-        Some(ids) => sqlx::query_as("SELECT id FROM claim_themes WHERE id = ANY($1)")
-            .bind(ids)
-            .fetch_all(pool)
-            .await?,
+        None => {
+            sqlx::query_as("SELECT id FROM claim_themes")
+                .fetch_all(pool)
+                .await?
+        }
+        Some(ids) => {
+            sqlx::query_as("SELECT id FROM claim_themes WHERE id = ANY($1)")
+                .bind(ids)
+                .fetch_all(pool)
+                .await?
+        }
     };
 
     for theme in themes {
@@ -274,8 +278,7 @@ async fn write_neighborhoods(
     let mut tx = pool.begin().await?;
     for (n_idx, (comm, members)) in groups.iter().enumerate() {
         let neighborhood_id = Uuid::new_v4();
-        let (mean_betp, dominant_frame) =
-            aggregate_neighborhood(atoms, |i| members.contains(&i));
+        let (mean_betp, dominant_frame) = aggregate_neighborhood(atoms, |i| members.contains(&i));
         let label = dominant_frame
             .map(|f| f.to_string())
             .unwrap_or_else(|| format!("neighborhood-{}", n_idx + 1));

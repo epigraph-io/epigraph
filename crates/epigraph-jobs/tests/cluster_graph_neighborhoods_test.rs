@@ -26,8 +26,7 @@ async fn run_theme_neighborhoods_seeds_two_neighborhoods_per_theme() {
     // cliques (a-b-c, d-e-f), one weak cross-edge a→d, and one truly-standalone
     // claim s with no edges in either direction (forms its own singleton).
     // See common::seed_two_clique_theme for the full topology comment.
-    let (run_id, theme_id, _atoms, _standalone) =
-        common::seed_two_clique_theme(&pool).await;
+    let (run_id, theme_id, _atoms, _standalone) = common::seed_two_clique_theme(&pool).await;
 
     // Pass Some(&[theme_id]) to scope the run to just this test theme.
     // This avoids processing the ~68 real themes already in the live DB,
@@ -60,9 +59,16 @@ async fn run_theme_neighborhoods_seeds_two_neighborhoods_per_theme() {
     .await
     .unwrap();
 
-    assert_eq!(neighborhoods.len(), 3, "expected 3 neighborhoods: two cliques + singleton");
+    assert_eq!(
+        neighborhoods.len(),
+        3,
+        "expected 3 neighborhoods: two cliques + singleton"
+    );
     let total_size: i32 = neighborhoods.iter().map(|(_, s)| *s).sum();
-    assert_eq!(total_size, 7, "all 6 atoms + 1 standalone in some neighborhood");
+    assert_eq!(
+        total_size, 7,
+        "all 6 atoms + 1 standalone in some neighborhood"
+    );
 
     // The cross-clique edge a→d (SUPPORTS, forward_strength=0.7) should
     // produce exactly one neighborhood_edge for this theme's run.
@@ -80,7 +86,11 @@ async fn run_theme_neighborhoods_seeds_two_neighborhoods_per_theme() {
     .await
     .unwrap();
 
-    assert_eq!(edges.len(), 1, "cross-clique edge should produce exactly one neighborhood_edge");
+    assert_eq!(
+        edges.len(),
+        1,
+        "cross-clique edge should produce exactly one neighborhood_edge"
+    );
     assert!(
         (edges[0].0 - 0.7).abs() < 1e-9,
         "weight should equal forward_strength (0.7) of the single cross-clique SUPPORTS edge, got {}",
@@ -91,21 +101,37 @@ async fn run_theme_neighborhoods_seeds_two_neighborhoods_per_theme() {
 #[tokio::test(flavor = "multi_thread")]
 async fn run_clustering_populates_neighborhoods_when_themes_exist() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
     common::reset_neighborhood_tables(&pool).await;
     common::seed_two_clique_theme(&pool).await; // claims+theme exist; runner allocates its own run_id
 
     let summary = epigraph_jobs::cluster_graph::runner::run_clustering(
         &pool,
-        &epigraph_jobs::cluster_graph::runner::RunConfig { resolution: 1.0, retain_runs: 3 }
-    ).await.unwrap();
+        &epigraph_jobs::cluster_graph::runner::RunConfig {
+            resolution: 1.0,
+            retain_runs: 3,
+        },
+    )
+    .await
+    .unwrap();
 
-    let n_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM graph_neighborhoods WHERE run_id = $1")
-        .bind(summary.run_id).fetch_one(&pool).await.unwrap();
+    let n_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM graph_neighborhoods WHERE run_id = $1")
+            .bind(summary.run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     // The runner uses Config::default() (thresholds 50/10). With our seed of 7 atoms in
     // the test theme, this hits the synthetic-single-neighborhood path: one neighborhood
     // covering the whole theme. The point of this test is to verify the runner *calls*
     // the neighborhood pass — exact community count is exercised by the
     // run_theme_neighborhoods test above with thresholds=0.
-    assert!(n_count.0 >= 1, "runner should populate at least one neighborhood for the seeded theme");
+    assert!(
+        n_count.0 >= 1,
+        "runner should populate at least one neighborhood for the seeded theme"
+    );
 }
