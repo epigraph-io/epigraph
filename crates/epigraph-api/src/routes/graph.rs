@@ -605,7 +605,7 @@ mod integration_tests {
     fn graph_router(state: AppState) -> Router {
         Router::new()
             .route("/api/v1/graph/neighborhood", get(neighborhood))
-            .route("/api/v1/graph/clusters/:id/expand", get(expand))
+            .route("/api/v1/graph/communities/:id/expand", get(expand))
             .with_state(state)
     }
 
