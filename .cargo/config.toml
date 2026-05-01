@@ -1,0 +1,3 @@
+[env]
+# Integration tests share a single test database and must run serially.
+RUST_TEST_THREADS = "1"
