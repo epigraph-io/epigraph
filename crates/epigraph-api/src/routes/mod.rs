@@ -42,6 +42,8 @@ pub mod gaps;
 #[cfg(feature = "db")]
 pub mod graph;
 #[cfg(feature = "db")]
+pub mod graph_neighborhood;
+#[cfg(feature = "db")]
 pub mod graph_query;
 #[cfg(feature = "db")]
 pub mod graph_query_utils;
@@ -421,6 +423,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/graph/themes/:theme_id/expand",
             get(graph::themes_expand),
+        )
+        .route(
+            "/api/v1/graph/neighborhoods/:id/expand",
+            get(graph_neighborhood::expand),
         );
 
     // Auth middleware stack (outermost runs first):
