@@ -440,6 +440,31 @@ async fn fetch_subgraph_edges(
     Ok((edges, filtered))
 }
 
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct ThemeOut {
+    pub id: Uuid,
+    pub label: String,
+    pub claim_count: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThemesOverviewResponse {
+    pub themes: Vec<ThemeOut>,
+}
+
+pub async fn themes_overview(
+    State(state): State<AppState>,
+) -> Result<Json<ThemesOverviewResponse>, (axum::http::StatusCode, String)> {
+    let pool: &PgPool = &state.db_pool;
+    let themes: Vec<ThemeOut> = sqlx::query_as::<_, ThemeOut>(
+        "SELECT id, label, claim_count FROM claim_themes ORDER BY claim_count DESC, label ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(ThemesOverviewResponse { themes }))
+}
+
 fn internal(e: sqlx::Error) -> (axum::http::StatusCode, String) {
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
@@ -606,6 +631,7 @@ mod integration_tests {
         Router::new()
             .route("/api/v1/graph/neighborhood", get(neighborhood))
             .route("/api/v1/graph/communities/:id/expand", get(expand))
+            .route("/api/v1/graph/themes/overview", get(themes_overview))
             .with_state(state)
     }
 
