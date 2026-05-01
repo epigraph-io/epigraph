@@ -465,6 +465,91 @@ pub async fn themes_overview(
     Ok(Json(ThemesOverviewResponse { themes }))
 }
 
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct NeighborhoodOut {
+    pub id: Uuid,
+    pub label: String,
+    pub size: i32,
+    pub mean_betp: Option<f64>,
+    pub dominant_frame_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NeighborhoodEdgeOut {
+    pub a: Uuid,
+    pub b: Uuid,
+    pub weight: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThemeExpandResponse {
+    pub theme_id: Uuid,
+    pub truncated: bool,
+    pub neighborhoods: Vec<NeighborhoodOut>,
+    pub neighborhood_edges: Vec<NeighborhoodEdgeOut>,
+}
+
+pub async fn themes_expand(
+    State(state): State<AppState>,
+    Path(theme_id): Path<Uuid>,
+    Query(params): Query<ExpandParams>,
+) -> Result<Json<ThemeExpandResponse>, (axum::http::StatusCode, String)> {
+    use axum::http::StatusCode;
+    let pool: &PgPool = &state.db_pool;
+
+    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM claim_themes WHERE id = $1")
+        .bind(theme_id).fetch_optional(pool).await.map_err(internal)?;
+    if exists.is_none() {
+        return Err((StatusCode::NOT_FOUND, "theme not found".into()));
+    }
+
+    let latest_run: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1"
+    ).fetch_optional(pool).await.map_err(internal)?;
+    let Some((run_id,)) = latest_run else {
+        return Ok(Json(synthesize_pre_run_response(theme_id)));
+    };
+
+    let budget = params.budget.max(1);
+    let neighborhoods: Vec<NeighborhoodOut> = sqlx::query_as::<_, NeighborhoodOut>(
+        "SELECT id, label, size, mean_betp, dominant_frame_id \
+         FROM graph_neighborhoods \
+         WHERE run_id = $1 AND theme_id = $2 \
+         ORDER BY size DESC LIMIT $3"
+    )
+    .bind(run_id).bind(theme_id).bind(budget).fetch_all(pool).await.map_err(internal)?;
+
+    if neighborhoods.is_empty() {
+        return Ok(Json(synthesize_pre_run_response(theme_id)));
+    }
+
+    let nbr_id_set: Vec<Uuid> = neighborhoods.iter().map(|n| n.id).collect();
+    let edges: Vec<NeighborhoodEdgeOut> = sqlx::query_as::<_, (Uuid, Uuid, f64)>(
+        "SELECT neighborhood_a, neighborhood_b, weight FROM neighborhood_edges \
+         WHERE run_id = $1 AND neighborhood_a = ANY($2) AND neighborhood_b = ANY($2)"
+    )
+    .bind(run_id).bind(&nbr_id_set).fetch_all(pool).await.map_err(internal)?
+    .into_iter().map(|(a, b, w)| NeighborhoodEdgeOut { a, b, weight: w }).collect();
+
+    Ok(Json(ThemeExpandResponse {
+        theme_id, truncated: false, neighborhoods, neighborhood_edges: edges,
+    }))
+}
+
+fn synthesize_pre_run_response(theme_id: Uuid) -> ThemeExpandResponse {
+    ThemeExpandResponse {
+        theme_id, truncated: false,
+        neighborhoods: vec![NeighborhoodOut {
+            id: theme_id,
+            label: "synthetic".into(),
+            size: 0,
+            mean_betp: None,
+            dominant_frame_id: None,
+        }],
+        neighborhood_edges: vec![],
+    }
+}
+
 fn internal(e: sqlx::Error) -> (axum::http::StatusCode, String) {
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
@@ -632,6 +717,7 @@ mod integration_tests {
             .route("/api/v1/graph/neighborhood", get(neighborhood))
             .route("/api/v1/graph/communities/:id/expand", get(expand))
             .route("/api/v1/graph/themes/overview", get(themes_overview))
+            .route("/api/v1/graph/themes/:theme_id/expand", get(themes_expand))
             .with_state(state)
     }
 
