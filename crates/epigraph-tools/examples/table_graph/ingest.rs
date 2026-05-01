@@ -60,7 +60,7 @@ Report only the ingest_document tool result.",
             md = md_abs.display(), json = extraction_abs.display(), doi = doi);
 
         let status = Command::new("claude")
-            .args(["-p", "--output-format", "json"])
+            .args(["-p", "--output-format", "json", "--dangerously-skip-permissions"])
             .arg(&prompt)
             .status()?;
         if !status.success() {
