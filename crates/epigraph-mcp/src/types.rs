@@ -367,6 +367,83 @@ pub struct DeprecateWorkflowParams {
     pub cascade: Option<bool>,
 }
 
+// ── Hierarchical Workflows ──
+//
+// The flat `StoreWorkflowParams` above models steps as plain strings on a
+// single root claim. The hierarchical primitive (issue #34) lands every
+// step as its own claim node connected to a `workflows` row via `executes`
+// edges, so each step accrues evidence and Darwinian variants independently.
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IngestWorkflowParams {
+    #[schemars(
+        description = "Hierarchical workflow extraction: source (canonical_name, goal, generation, authors, tags, metadata), thesis, thesis_derivation, phases (each with title/summary/steps where each step has compound, rationale, operations, generality, confidence), and relationships."
+    )]
+    pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindWorkflowHierarchicalParams {
+    #[schemars(
+        description = "Free-text search over hierarchical workflow goal and canonical_name (ILIKE)."
+    )]
+    pub query: String,
+
+    #[schemars(description = "Maximum number of workflows to return (default 10, max 50).")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct HierarchicalStepExecution {
+    #[schemars(
+        description = "Zero-based index of the step in the workflow's plan order (matches `executes`-edge ordering at level=2)."
+    )]
+    pub step_index: usize,
+
+    #[schemars(description = "What the workflow plan said to do for this step.")]
+    pub planned: String,
+
+    #[schemars(description = "What you actually did.")]
+    pub actual: String,
+
+    #[schemars(description = "true if the actual execution differed from the plan.")]
+    pub deviated: bool,
+
+    #[schemars(description = "Reason for deviation (if deviated is true).")]
+    pub deviation_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReportHierarchicalOutcomeParams {
+    #[schemars(
+        description = "UUID of the hierarchical workflow root (a row in the `workflows` table, not a flat workflow claim)."
+    )]
+    pub workflow_id: String,
+
+    #[schemars(description = "true if the workflow succeeded, false if it failed.")]
+    pub success: bool,
+
+    #[schemars(
+        description = "Per-step execution log. Each step_index is resolved to the step's claim node via `executes` edges so per-step evidence accrues."
+    )]
+    pub step_executions: Vec<HierarchicalStepExecution>,
+
+    #[schemars(
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed')."
+    )]
+    pub outcome_details: String,
+
+    #[schemars(
+        description = "Execution quality 0.0-1.0 (default: 1.0 if success, 0.0 if failure)."
+    )]
+    pub quality: Option<f64>,
+
+    #[schemars(
+        description = "Your specific goal for this run. More specific goal text improves future affinity matching."
+    )]
+    pub goal_text: Option<String>,
+}
+
 // ── Graph ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
