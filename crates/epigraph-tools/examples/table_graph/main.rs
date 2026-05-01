@@ -2,6 +2,7 @@
 
 mod discover;
 mod dossier;
+mod extract;
 mod ingest;
 mod llm;
 mod types;
@@ -31,7 +32,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Discover => discover::run(),
-        Cmd::Extract { only } => dossier::run(only.as_deref()),
+        Cmd::Extract { only } => extract::run(only.as_deref()),
         Cmd::Ingest { dry_run } => ingest::run(dry_run),
         Cmd::Verify => ingest::verify(),
     }
