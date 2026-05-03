@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use epigraph_db::{FrameRepository, MassFunctionRepository};
+use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository};
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
 /// Probability value in [0.0, 1.0]. Currently f64 for codebase consistency.
@@ -246,6 +246,16 @@ pub async fn auto_wire_ds_update(
     FrameRepository::assign_claim(pool, claim_id, frame_id, Some(0))
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
+
+    // Materialize a synthetic perspective with id=evidence_id so the
+    // mass_functions.perspective_id FK is satisfied. Without this, every
+    // multi-evidence update path (report_workflow_outcome, update_with_evidence)
+    // failed with mass_functions_perspective_id_fkey since C-1 (355cf4f).
+    if let Some(persp_id) = evidence_id {
+        PerspectiveRepository::ensure_evidence_perspective(pool, persp_id, Some(agent_id))
+            .await
+            .map_err(|e| format!("ensure_evidence_perspective: {e}"))?;
+    }
 
     // Store BBA — use evidence_id as perspective_id so each evidence submission
     // gets its own row instead of upsert-overwriting on (claim, frame, agent, NULL).
