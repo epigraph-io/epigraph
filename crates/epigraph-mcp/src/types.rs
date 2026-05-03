@@ -166,19 +166,6 @@ pub struct IngestPaperParams {
     pub file_path: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct IngestPaperUrlParams {
-    #[schemars(
-        description = "Paper source: arXiv ID like '2508.16798', DOI like '10.48550/arXiv.2508.16798', or absolute path to a local PDF"
-    )]
-    pub source: String,
-
-    #[schemars(
-        description = "Directory for intermediate extraction files (default: /tmp/epigraph-extractions)"
-    )]
-    pub output_dir: Option<String>,
-}
-
 // ── Paper Queries ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
