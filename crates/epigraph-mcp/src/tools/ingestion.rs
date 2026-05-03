@@ -1,7 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use rmcp::model::*;
 use uuid::Uuid;
@@ -72,81 +71,6 @@ pub async fn ingest_paper(
         serde_json::from_str(&data).map_err(|e| invalid_params(format!("invalid JSON: {e}")))?;
 
     do_ingest(server, &extraction).await
-}
-
-pub async fn ingest_paper_url(
-    server: &EpiGraphMcpFull,
-    params: IngestPaperUrlParams,
-) -> Result<CallToolResult, McpError> {
-    let output_dir = params
-        .output_dir
-        .unwrap_or_else(|| "/tmp/epigraph-extractions".to_string());
-    tokio::fs::create_dir_all(&output_dir)
-        .await
-        .map_err(|e| internal_error(format!("cannot create output dir: {e}")))?;
-
-    let source = params.source.trim();
-
-    // Determine if it's an arXiv ID, DOI, or file path
-    let pdf_path = if Path::new(source).exists() {
-        source.to_string()
-    } else if source.starts_with("10.") {
-        // DOI — try arXiv
-        let arxiv_id = source.rsplit('/').next().unwrap_or(source);
-        let url = format!("https://arxiv.org/pdf/{arxiv_id}");
-        download_pdf(&url, &output_dir, arxiv_id).await?
-    } else {
-        // Assume arXiv ID
-        let url = format!("https://arxiv.org/pdf/{source}");
-        download_pdf(&url, &output_dir, source).await?
-    };
-
-    // Run extraction pipeline
-    let output_json = format!("{output_dir}/claims.json");
-    let status = tokio::process::Command::new("python3")
-        .arg("scripts/extract_and_enrich.py")
-        .arg(&pdf_path)
-        .arg("--output")
-        .arg(&output_json)
-        .status()
-        .await
-        .map_err(|e| internal_error(format!("extraction pipeline failed: {e}")))?;
-
-    if !status.success() {
-        return Err(internal_error("extraction pipeline exited with error"));
-    }
-
-    let data = tokio::fs::read_to_string(&output_json)
-        .await
-        .map_err(|e| internal_error(format!("cannot read extraction output: {e}")))?;
-
-    let extraction: LiteratureExtraction =
-        serde_json::from_str(&data).map_err(|e| invalid_params(format!("invalid JSON: {e}")))?;
-
-    do_ingest(server, &extraction).await
-}
-
-async fn download_pdf(url: &str, output_dir: &str, name: &str) -> Result<String, McpError> {
-    let resp = reqwest::get(url)
-        .await
-        .map_err(|e| internal_error(format!("download failed: {e}")))?;
-
-    if !resp.status().is_success() {
-        return Err(internal_error(format!(
-            "download returned {}",
-            resp.status()
-        )));
-    }
-
-    let pdf_path = format!("{output_dir}/{name}.pdf");
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| internal_error(format!("read bytes: {e}")))?;
-    tokio::fs::write(&pdf_path, &bytes)
-        .await
-        .map_err(|e| internal_error(format!("write pdf: {e}")))?;
-    Ok(pdf_path)
 }
 
 #[allow(clippy::too_many_lines)]

@@ -204,17 +204,6 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Extract and ingest a paper from an arXiv ID, DOI, or local PDF path. Runs the extraction pipeline, then ingests."
-    )]
-    async fn ingest_paper_url(
-        &self,
-        Parameters(params): Parameters<IngestPaperUrlParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.reject_if_read_only()?;
-        tools::ingestion::ingest_paper_url(self, params).await
-    }
-
-    #[tool(
         description = "Ingest a hierarchical DocumentExtraction JSON file (thesis -> sections -> paragraphs -> atoms). Creates a paper node, claims at each level, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent for re-runs at the same pipeline version."
     )]
     async fn ingest_document(
