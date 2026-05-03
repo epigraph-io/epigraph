@@ -158,27 +158,6 @@ pub struct RecallParams {
 
 // ── Ingestion ──
 
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct IngestPaperParams {
-    #[schemars(
-        description = "Absolute file path to the claims JSON (e.g. '/data/extractions/paper_claims.json')"
-    )]
-    pub file_path: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct IngestPaperUrlParams {
-    #[schemars(
-        description = "Paper source: arXiv ID like '2508.16798', DOI like '10.48550/arXiv.2508.16798', or absolute path to a local PDF"
-    )]
-    pub source: String,
-
-    #[schemars(
-        description = "Directory for intermediate extraction files (default: /tmp/epigraph-extractions)"
-    )]
-    pub output_dir: Option<String>,
-}
-
 // ── Paper Queries ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -670,20 +649,6 @@ pub struct RecallResult {
 }
 
 #[derive(Debug, Serialize)]
-pub struct IngestPaperResponse {
-    pub paper_title: String,
-    pub doi: String,
-    pub claims_ingested: usize,
-    pub claims_embedded: usize,
-    pub relationships_created: usize,
-    pub claim_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub claims_ds_wired: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ds_frame_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
 pub struct AuthorResponse {
     pub agent_id: String,
     pub name: String,
@@ -908,47 +873,6 @@ pub struct DivergenceResponse {
     pub bayesian_posterior: f64,
     pub kl_divergence: f64,
     pub computed_at: String,
-}
-
-// ── Literature JSON types (matching EpiGraph ingest_literature format) ──
-
-#[derive(Debug, Deserialize)]
-pub struct LiteratureExtraction {
-    pub source: LiteratureSource,
-    pub claims: Vec<LiteratureClaim>,
-    #[serde(default)]
-    pub relationships: Vec<ClaimRelationship>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LiteratureSource {
-    pub doi: String,
-    pub title: String,
-    pub authors: Vec<serde_json::Value>,
-    #[serde(default)]
-    pub journal: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LiteratureClaim {
-    pub statement: String,
-    pub page: Option<u32>,
-    pub section: Option<String>,
-    pub confidence: f64,
-    pub supporting_text: String,
-    #[serde(default)]
-    pub methodology: Option<String>,
-    #[serde(default)]
-    pub evidence_type: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ClaimRelationship {
-    pub source_index: usize,
-    pub target_index: usize,
-    pub relationship: String,
-    #[serde(default)]
-    pub strength: Option<f64>,
 }
 
 // ── Challenges ──
