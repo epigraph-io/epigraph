@@ -37,6 +37,12 @@ pub struct CalibrationConfig {
     /// Evidence type → weight multiplier.
     pub evidence_type_weights: HashMap<String, f64>,
 
+    /// Alias → canonical evidence-type key. Bridges the DB's
+    /// `evidence.evidence_type` vocabulary onto the SciFact-calibrated
+    /// canonical keys in `evidence_type_weights`.
+    #[serde(default)]
+    pub evidence_type_aliases: HashMap<String, String>,
+
     /// Section tier → retention fraction (rest shifted to theta).
     pub section_tier_weights: HashMap<String, f64>,
 
@@ -123,9 +129,22 @@ impl CalibrationConfig {
     }
 
     /// Look up evidence type weight. Returns 0.5 for unknown types.
+    ///
+    /// Resolution order:
+    /// 1. Direct match against `evidence_type_weights` (canonical keys)
+    /// 2. Alias lookup → canonical → `evidence_type_weights`
+    /// 3. Fallback to 0.5
     pub fn get_evidence_type_weight(&self, evidence_type: &str) -> f64 {
         let key = evidence_type.to_lowercase();
-        self.evidence_type_weights.get(&key).copied().unwrap_or(0.5)
+        if let Some(&w) = self.evidence_type_weights.get(&key) {
+            return w;
+        }
+        if let Some(canonical) = self.evidence_type_aliases.get(&key) {
+            if let Some(&w) = self.evidence_type_weights.get(canonical) {
+                return w;
+            }
+        }
+        0.5
     }
 
     /// Look up section tier weight. Returns 1.0 for unknown sections (no discount).
@@ -278,6 +297,40 @@ mod tests {
 
         // Unknown type → 0.5
         assert!((cfg.get_evidence_type_weight("alien_telepathy") - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_evidence_type_aliases_resolve_to_canonical_weights() {
+        let cfg = load_config();
+
+        // DB-vocab values that should resolve via the alias table.
+        assert!(
+            (cfg.get_evidence_type_weight("observation") - 1.0).abs() < f64::EPSILON,
+            "observation → empirical (1.0)"
+        );
+        assert!(
+            (cfg.get_evidence_type_weight("computation") - 0.9).abs() < f64::EPSILON,
+            "computation → statistical (0.9)"
+        );
+        assert!(
+            (cfg.get_evidence_type_weight("document") - 0.85).abs() < f64::EPSILON,
+            "document → logical (0.85)"
+        );
+        assert!(
+            (cfg.get_evidence_type_weight("reference") - 0.85).abs() < f64::EPSILON,
+            "reference → logical (0.85)"
+        );
+        assert!(
+            (cfg.get_evidence_type_weight("testimony") - 0.6).abs() < f64::EPSILON,
+            "testimony → testimonial (0.6)"
+        );
+    }
+
+    #[test]
+    fn test_evidence_type_alias_is_case_insensitive() {
+        let cfg = load_config();
+        assert!((cfg.get_evidence_type_weight("OBSERVATION") - 1.0).abs() < f64::EPSILON);
+        assert!((cfg.get_evidence_type_weight("Reference") - 0.85).abs() < f64::EPSILON);
     }
 
     #[test]
