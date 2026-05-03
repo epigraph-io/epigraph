@@ -32,7 +32,7 @@ pub struct DsAutoResult {
     pub frame_id: Uuid,
 }
 
-/// Entry for batch DS wiring (used by `do_ingest`).
+/// Entry for batch DS wiring (used by `do_ingest_document`).
 pub struct BatchDsEntry {
     pub claim_id: Uuid,
     pub confidence: f64,
