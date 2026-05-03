@@ -139,7 +139,7 @@ pub async fn submit_claim(
 
     // Verb-edges: every submission references its own Evidence + Trace.
     // Emitted on both branches per the architecture doc's "re-occurrence
-    // = new edge" rule. Matches ingest_paper's hoist (S3a Task 6, fix #1).
+    // = new edge" rule (S3a Task 6, fix #1).
     // The was_created marker on properties lets queries distinguish
     // first-create from resubmit edges.
     //
