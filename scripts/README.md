@@ -61,3 +61,29 @@ nothing on the consumer side needs to change.
 
 Throughput is ~20 claims/sec at HNSW defaults — full 389k corpus runs
 in 5–6 h. Read-only against the database.
+
+## backfill_source_strength.py
+
+One-shot backfill for `mass_functions.source_strength` rows that
+predate the evidence-type-weighted writer (PR #76). The discount
+path treats NULL as 1.0 (no discount), which is what produced the
+runaway hubs at BetP≈1.0 in bug #6.
+
+For each NULL row:
+- If the claim has ≥1 evidence row: take the **highest** evidence-type
+  weight from `calibration.toml` (single source of truth, with PR #75's
+  DB-vocab aliases applied — and a hardcoded fallback if the alias
+  section is absent). Best-evidence wins.
+- Otherwise: fall back to the agent-only / `conversational` tier (0.3).
+
+```bash
+# Preview the resolved weight distribution:
+python3 scripts/backfill_source_strength.py
+
+# Commit:
+python3 scripts/backfill_source_strength.py --execute
+```
+
+After --execute, run `reconcile_sheaf` (or wait for the next nightly
+graph-integrity task) so beliefs re-aggregate against the new
+discount weights. Idempotent — re-runs only touch rows still NULL.
