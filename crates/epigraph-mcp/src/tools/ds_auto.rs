@@ -183,7 +183,7 @@ pub async fn auto_wire_ds_for_claim(
         &masses_json,
         None,
         Some("auto_wire"),
-        Some(weight), // source_strength = evidence-type reliability
+        Some(weight),  // source_strength = evidence-type reliability
         evidence_type, // evidence_type
     )
     .await
