@@ -169,7 +169,11 @@ pub async fn auto_wire_ds_for_claim(
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
 
-    // Store BBA (perspective_id=NULL for auto-wired)
+    // Store BBA (perspective_id=NULL for auto-wired). source_strength is the
+    // evidence-type reliability weight (used as Shafer's reliability discount
+    // at combination time). Agent confidence is already encoded in the BBA's
+    // mass shape (mass = confidence * weight, clamped); using `confidence`
+    // here would double-discount.
     MassFunctionRepository::store_with_perspective(
         pool,
         claim_id,
@@ -179,8 +183,8 @@ pub async fn auto_wire_ds_for_claim(
         &masses_json,
         None,
         Some("auto_wire"),
-        Some(confidence), // source_strength
-        evidence_type,    // evidence_type
+        Some(weight), // source_strength = evidence-type reliability
+        evidence_type, // evidence_type
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
@@ -259,6 +263,9 @@ pub async fn auto_wire_ds_update(
 
     // Store BBA — use evidence_id as perspective_id so each evidence submission
     // gets its own row instead of upsert-overwriting on (claim, frame, agent, NULL).
+    // source_strength = evidence-type reliability weight (used for Shafer
+    // discount at combination time); agent confidence is already in the
+    // BBA mass shape, storing it here too would double-discount.
     MassFunctionRepository::store_with_perspective(
         pool,
         claim_id,
@@ -268,7 +275,7 @@ pub async fn auto_wire_ds_update(
         &masses_json,
         None,
         Some("auto_wire"),
-        Some(confidence),  // source_strength
+        Some(weight),      // source_strength = evidence-type reliability
         evidence_type_str, // evidence_type
     )
     .await
@@ -383,8 +390,8 @@ async fn wire_single_batch_entry(
         &masses_json,
         None,
         Some("auto_wire"),
-        Some(entry.confidence), // source_strength
-        None,                   // evidence_type (not available in batch)
+        Some(entry.weight), // source_strength = evidence-type reliability
+        None,               // evidence_type (not threaded through batch yet)
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
