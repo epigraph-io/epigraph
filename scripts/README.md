@@ -1,8 +1,8 @@
 # scripts/
 
 Operational scripts for the live EpiGraph deployment. Not part of the
-build; invoked by maintenance tasks (see `epiclaw-host`'s `schedules.toml`)
-or run manually on the host.
+build; invoked manually or by maintenance tasks (see `epiclaw-host`'s
+`schedules.toml`).
 
 ## fuzzy_dedup_claims.py
 
@@ -31,3 +31,33 @@ python3 scripts/fuzzy_dedup_claims.py --input semantic-dedup.json --execute
 
 Each cluster runs in its own transaction. A failing cluster is rolled
 back and reported in the summary; the rest of the run continues.
+
+## compute_semantic_dedup.py
+
+Regenerates `epigraph-gui/public/semantic-dedup.json` — the offline
+embedding-similarity snapshot the GUI uses to collapse semantically
+equivalent claims at viz time, and that `fuzzy_dedup_claims.py`
+consumes for backend dedup.
+
+Walks every embedded claim, pulls its top-k nearest neighbours via the
+`idx_claims_embedding_hnsw_cosine` HNSW index, filters to cosine
+similarity ≥ threshold, builds connected components via union-find,
+and writes the snapshot atomically.
+
+```bash
+# Full refresh (writes to GUI's public/ by default):
+python3 scripts/compute_semantic_dedup.py
+
+# Tighter threshold + larger k:
+python3 scripts/compute_semantic_dedup.py --threshold 0.92 --top-k 10
+
+# Smoke test on a slice, alternative output:
+python3 scripts/compute_semantic_dedup.py --limit 5000 --output /tmp/quick.json
+```
+
+Reproduces the exact JSON shape (`threshold`, `top_k`, `computed_at`,
+`n_claims`, `n_groups_with_dupes`, `n_dup_claims`, `groups[]`) so
+nothing on the consumer side needs to change.
+
+Throughput is ~20 claims/sec at HNSW defaults — full 389k corpus runs
+in 5–6 h. Read-only against the database.
