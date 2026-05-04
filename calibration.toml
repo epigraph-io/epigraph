@@ -61,8 +61,8 @@ conversational  = 0.3
 # Maps the DB's `evidence.evidence_type` enum values to the canonical
 # SciFact-calibration keys above. Without these aliases every lookup against
 # DB-stored evidence falls through to the 0.5 unknown-type default —
-# leaving the 295k+ NULL-source_strength BBAs effectively undiscounted
-# under the auto_wire_ds path. See bug #6 (sheaf stuck) for the symptom.
+# leaves any legacy NULL-source_strength BBAs effectively undiscounted under
+# the auto_wire_ds path.
 
 [evidence_type_aliases]
 observation = "empirical"      # direct empirical observation

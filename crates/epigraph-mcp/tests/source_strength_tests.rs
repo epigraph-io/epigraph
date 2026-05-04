@@ -3,7 +3,8 @@
 //! as Shafer's reliability multiplier; conflating it with agent confidence
 //! double-discounts the BBA (the mass shape already encodes confidence).
 //!
-//! Bug #6 (sheaf stuck) was the user-visible symptom of the prior conflation.
+//! Sheaf cohomology stagnation (h1 frozen at the obstruction-rich extreme)
+//! is the visible symptom of the prior conflation.
 
 #[macro_use]
 mod common;

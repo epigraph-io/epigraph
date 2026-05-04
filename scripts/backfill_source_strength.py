@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """Backfill `mass_functions.source_strength` for legacy NULL rows.
 
-The 295k pre-2026-04-08 mass-function rows have NULL `source_strength`,
-which the discount path treats as 1.0 (no discount) — undiscounted Dempster
-combination then runs away to BetP≈1.0 with even mid-confidence sources.
-This is bug #6 (sheaf stuck), explained at length in PR #75 and PR #76.
-
-This is **piece 3 of 3**: backfill the legacy NULLs by inferring each row's
-source_strength from its claim's evidence rows.
+Mass-function rows written before the evidence-type-weighted writer landed
+carry NULL `source_strength`. The discount path treats NULL as 1.0
+(no discount), so undiscounted Dempster combination runs away to BetP≈1.0
+with even mid-confidence supporting sources. Backfilling source_strength
+restores Shafer's reliability discount on the legacy rows.
 
 Policy:
   - For each NULL row with ≥1 attached evidence row: take the highest
     evidence-type weight (best-evidence wins) using the calibration map
-    + DB-vocab aliases shipped in PR #75.
-  - For each NULL row with no attached evidence (~82% of NULLs):
+    + DB-vocab aliases.
+  - For each NULL row with no attached evidence on the claim:
     use the conversational / agent-only tier (0.3).
 
 The mapping is loaded from `calibration.toml` at the repo root (single
@@ -24,8 +22,8 @@ Usage:
     python3 scripts/backfill_source_strength.py --execute  # commit
 
 After --execute, run reconcile_sheaf (or wait for the next nightly
-graph-integrity task) to re-aggregate beliefs. Most legacy hubs should
-move down from BetP≈1.0 to a value matching their support distribution.
+graph-integrity task) to re-aggregate beliefs against the new discount
+weights.
 """
 
 from __future__ import annotations
