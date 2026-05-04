@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Write;
 use std::process::Command;
 
-pub fn run(dry_run: bool) -> Result<()> {
+pub fn run(dry_run: bool, only: Option<&str>) -> Result<()> {
     let narratives_dir = "docs/superpowers/artifacts/2026-04-30-table-graph/narratives";
     let staging_dir = "docs/superpowers/artifacts/2026-04-30-table-graph/staging";
     let failed_path = format!("{}/failed-ingest.jsonl", staging_dir);
@@ -27,6 +27,11 @@ pub fn run(dry_run: bool) -> Result<()> {
             continue;
         }
         let (repo, table) = (parts[0], parts[1]);
+        if let Some(filter) = only {
+            if table != filter {
+                continue;
+            }
+        }
         let doi = format!("urn:epigraph-table:{}:{}", repo, table);
         let md_abs = std::fs::canonicalize(&p)?;
         let extraction_json = p.with_extension("extraction.json");
