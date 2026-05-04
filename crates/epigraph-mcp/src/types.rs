@@ -679,6 +679,25 @@ pub struct IngestDocumentResponse {
     pub already_ingested: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CheckAlreadyIngestedParams {
+    #[schemars(description = "DOI of the paper to check.")]
+    pub doi: String,
+    #[schemars(
+        description = "Pipeline version. Omit to use the current hierarchical extraction pipeline."
+    )]
+    pub pipeline_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckAlreadyIngestedResponse {
+    pub already_ingested: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paper_id: Option<String>,
+    pub doi: String,
+    pub pipeline_version: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PaperResponse {
     pub doi: String,

@@ -56,6 +56,55 @@ pub async fn ingest_document(
     do_ingest_document(server, &extraction).await
 }
 
+/// Pool-only gate check: returns `Some(paper_id)` iff a paper with `doi`
+/// exists AND has a `processed_by` edge whose `properties.pipeline` equals
+/// `pipeline_version`. Mirrors the inline gate used by `do_ingest_document`.
+pub async fn paper_already_ingested(
+    pool: &sqlx::PgPool,
+    doi: &str,
+    pipeline_version: &str,
+) -> Result<Option<Uuid>, McpError> {
+    let Some(prior) = PaperRepository::find_by_doi(pool, doi)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Ok(None);
+    };
+    if PaperRepository::has_processed_by_edge(pool, prior.id, pipeline_version)
+        .await
+        .map_err(internal_error)?
+    {
+        Ok(Some(prior.id))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Pre-flight idempotency check exposing the same `(doi, pipeline)` gate that
+/// `do_ingest_document` runs internally. Lets callers (skills, orchestrators)
+/// short-circuit *before* paying for an `extract-claims` LLM call when a
+/// paper has already been processed at the requested pipeline version.
+///
+/// This tool only reads the gate; it does no extraction or ingestion. To
+/// actually save extraction cost on re-runs, callers must invoke this tool
+/// first and skip their own LLM call when `already_ingested` is true.
+pub async fn check_already_ingested(
+    server: &EpiGraphMcpFull,
+    params: CheckAlreadyIngestedParams,
+) -> Result<CallToolResult, McpError> {
+    let pipeline = params
+        .pipeline_version
+        .unwrap_or_else(|| PIPELINE_VERSION.to_string());
+    let paper_id = paper_already_ingested(&server.pool, &params.doi, &pipeline).await?;
+
+    success_json(&CheckAlreadyIngestedResponse {
+        already_ingested: paper_id.is_some(),
+        paper_id: paper_id.map(|id| id.to_string()),
+        doi: params.doi,
+        pipeline_version: pipeline,
+    })
+}
+
 /// Core ingestion logic factored out so integration tests can drive a parsed
 /// `DocumentExtraction` without round-tripping through the file-path validation
 /// in `ingest_document`.
@@ -479,5 +528,86 @@ const fn level_label(level: u8) -> &'static str {
         2 => "paragraph",
         3 => "atom",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gate returns false when the DOI is unknown, false when the paper exists
+    /// but has no `processed_by` edge at this pipeline version, and true once
+    /// the edge is present.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn paper_already_ingested_gate(pool: sqlx::PgPool) {
+        let doi = "urn:test:check-gate";
+
+        // Unknown DOI → not ingested.
+        assert!(paper_already_ingested(&pool, doi, PIPELINE_VERSION)
+            .await
+            .expect("gate query")
+            .is_none());
+
+        // Create the paper without a processed_by edge → still not ingested.
+        let paper_id = PaperRepository::get_or_create(&pool, doi, Some("test"), None)
+            .await
+            .expect("create paper");
+        assert!(paper_already_ingested(&pool, doi, PIPELINE_VERSION)
+            .await
+            .expect("gate query")
+            .is_none());
+
+        // Insert a `processed_by` edge with a *different* pipeline → still not
+        // ingested under PIPELINE_VERSION. Edges enforce target existence, so
+        // create a real agent first.
+        let agent_a = epigraph_core::Agent::new([7u8; 32], Some("test-agent-a".to_string()));
+        let agent_a_id: Uuid = AgentRepository::create(&pool, &agent_a)
+            .await
+            .expect("create agent a")
+            .id
+            .into();
+        EdgeRepository::create_if_not_exists(
+            &pool,
+            paper_id,
+            "paper",
+            agent_a_id,
+            "agent",
+            "processed_by",
+            Some(serde_json::json!({ "pipeline": "some-other-pipeline" })),
+            None,
+            None,
+        )
+        .await
+        .expect("create edge with other pipeline");
+        assert!(paper_already_ingested(&pool, doi, PIPELINE_VERSION)
+            .await
+            .expect("gate query")
+            .is_none());
+
+        // Insert a `processed_by` edge with the matching pipeline (different
+        // target so it isn't deduped by the (source,target,relationship) key).
+        let agent_b = epigraph_core::Agent::new([8u8; 32], Some("test-agent-b".to_string()));
+        let agent_b_id: Uuid = AgentRepository::create(&pool, &agent_b)
+            .await
+            .expect("create agent b")
+            .id
+            .into();
+        EdgeRepository::create_if_not_exists(
+            &pool,
+            paper_id,
+            "paper",
+            agent_b_id,
+            "agent",
+            "processed_by",
+            Some(serde_json::json!({ "pipeline": PIPELINE_VERSION })),
+            None,
+            None,
+        )
+        .await
+        .expect("create edge with matching pipeline");
+        let hit = paper_already_ingested(&pool, doi, PIPELINE_VERSION)
+            .await
+            .expect("gate query");
+        assert_eq!(hit, Some(paper_id));
     }
 }

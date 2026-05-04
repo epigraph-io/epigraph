@@ -203,6 +203,16 @@ impl EpiGraphMcpFull {
         tools::ingestion::ingest_document(self, params).await
     }
 
+    #[tool(
+        description = "Check whether a paper with the given DOI has already been ingested at the specified pipeline version. Returns {already_ingested, paper_id?, doi, pipeline_version}. Use as a pre-flight before invoking expensive extract-claims work — `ingest_document` runs the same gate internally, but only after the LLM call. Read-only."
+    )]
+    async fn check_already_ingested(
+        &self,
+        Parameters(params): Parameters<CheckAlreadyIngestedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ingestion::check_already_ingested(self, params).await
+    }
+
     // ── Paper Queries (3 tools) ──
 
     #[tool(description = "Look up a paper by its DOI, returning title, authors, and claims.")]
