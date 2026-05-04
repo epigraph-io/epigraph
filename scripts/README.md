@@ -65,13 +65,13 @@ in 5–6 h. Read-only against the database.
 ## backfill_source_strength.py
 
 One-shot backfill for `mass_functions.source_strength` rows that
-predate the evidence-type-weighted writer (PR #76). The discount
-path treats NULL as 1.0 (no discount), which is what produced the
-runaway hubs at BetP≈1.0 in bug #6.
+predate the evidence-type-weighted writer. The discount path treats
+NULL as 1.0 (no discount); under undiscounted Dempster combination
+even mid-confidence supporters can drive a target's BetP toward 1.0.
 
 For each NULL row:
 - If the claim has ≥1 evidence row: take the **highest** evidence-type
-  weight from `calibration.toml` (single source of truth, with PR #75's
+  weight from `calibration.toml` (single source of truth, with the
   DB-vocab aliases applied — and a hardcoded fallback if the alias
   section is absent). Best-evidence wins.
 - Otherwise: fall back to the agent-only / `conversational` tier (0.3).
