@@ -10,6 +10,7 @@ pub mod memory;
 pub mod paper_queries;
 pub mod perspectives;
 pub mod provenance;
+pub mod recall;
 pub mod rdf;
 pub mod sheaf;
 pub mod workflow_hierarchical;
