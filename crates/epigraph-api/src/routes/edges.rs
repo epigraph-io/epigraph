@@ -531,6 +531,14 @@ pub struct CreateEdgeRequest {
     pub labels: Option<Vec<String>>,
     pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
     pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    /// When true, the server checks for an existing edge by
+    /// `(source_id, target_id, relationship)` and returns the existing edge's
+    /// id without inserting a duplicate. Idempotent for drainer / outbox-style
+    /// retry use cases. Defaults to false (raw INSERT semantics; per
+    /// migration 018 every relationship may multi-emit by default, so
+    /// callers needing dedup must opt in via this flag).
+    #[serde(default)]
+    pub if_not_exists: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -649,18 +657,36 @@ pub async fn create_edge(
         });
     }
 
-    let edge_id = EdgeRepository::create(
-        pool,
-        request.source_id,
-        &request.source_type,
-        request.target_id,
-        &request.target_type,
-        &request.relationship,
-        request.properties.clone(),
-        request.valid_from,
-        request.valid_to,
-    )
-    .await?;
+    // Branch on if_not_exists: drainer / outbox callers opt in to
+    // (source_id, target_id, relationship) idempotency; the default path
+    // preserves the post-migration-018 multi-emit semantics.
+    let edge_id = if request.if_not_exists {
+        EdgeRepository::create_if_not_exists(
+            pool,
+            request.source_id,
+            &request.source_type,
+            request.target_id,
+            &request.target_type,
+            &request.relationship,
+            request.properties.clone(),
+            request.valid_from,
+            request.valid_to,
+        )
+        .await?
+    } else {
+        EdgeRepository::create(
+            pool,
+            request.source_id,
+            &request.source_type,
+            request.target_id,
+            &request.target_type,
+            &request.relationship,
+            request.properties.clone(),
+            request.valid_from,
+            request.valid_to,
+        )
+        .await?
+    };
 
     // Record provenance when OAuth2-authenticated
     if let Some(axum::Extension(ref auth)) = auth_ctx {
@@ -2324,5 +2350,158 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json["evidence_content"].is_null());
+    }
+}
+
+// =============================================================================
+// DB-BACKED INTEGRATION TESTS
+// =============================================================================
+
+#[cfg(all(test, feature = "db"))]
+mod db_tests {
+    use super::*;
+    use crate::state::{ApiConfig, AppState};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    // ── Test scaffolding ──
+
+    fn test_state(pool: PgPool) -> AppState {
+        AppState::with_db(pool, ApiConfig::default())
+    }
+
+    /// Router exposing the edges write/read routes under test.
+    fn edges_router(state: AppState) -> Router {
+        Router::new()
+            .route("/api/v1/edges", post(create_edge).get(list_edges))
+            .with_state(state)
+    }
+
+    async fn parse_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Insert a system agent (mirrors `policies.rs::ensure_system_agent`) and
+    /// return its id. Each call uses a fresh random pubkey so tests don't
+    /// collide on the unique constraint.
+    async fn ensure_system_agent(pool: &PgPool) -> Uuid {
+        let mut pub_key = vec![0u8; 32];
+        for b in pub_key.iter_mut() {
+            *b = rand::random();
+        }
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(&pub_key)
+        .bind("api-edges-test")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Insert a plain claim and return its id. Used as source/target for
+    /// edge-creation tests so the entity-existence check passes.
+    async fn seed_claim(pool: &PgPool, agent_id: Uuid, content: &str) -> Uuid {
+        let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties) \
+             VALUES ($1, $2, $3, 0.5, ARRAY[]::text[], '{}'::jsonb) RETURNING id",
+        )
+        .bind(content)
+        .bind(content_hash.as_slice())
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn create_edge_body(
+        source_id: Uuid,
+        target_id: Uuid,
+        relationship: &str,
+        if_not_exists: bool,
+    ) -> Body {
+        Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "source_id": source_id,
+                "target_id": target_id,
+                "source_type": "claim",
+                "target_type": "claim",
+                "relationship": relationship,
+                "if_not_exists": if_not_exists,
+            }))
+            .unwrap(),
+        )
+    }
+
+    // ── Tests ──
+
+    /// 0.A — POST /edges with `if_not_exists: true` is idempotent on the
+    /// (source_id, target_id, relationship) triple.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_if_not_exists_returns_existing(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source_id = seed_claim(&pool, agent_id, "edge-test source").await;
+        let target_id = seed_claim(&pool, agent_id, "edge-test target").await;
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        // First POST creates the edge.
+        let resp1 = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(create_edge_body(source_id, target_id, "supports", true))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::CREATED);
+        let body1: serde_json::Value = parse_body(resp1).await;
+        let id1 = Uuid::parse_str(body1["id"].as_str().unwrap()).unwrap();
+
+        // Second POST with the same (source, target, relationship) and
+        // if_not_exists=true must return the same edge id, not a new one.
+        let resp2 = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(create_edge_body(source_id, target_id, "supports", true))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::CREATED);
+        let body2: serde_json::Value = parse_body(resp2).await;
+        let id2 = Uuid::parse_str(body2["id"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            id1, id2,
+            "second if_not_exists POST must return existing edge id"
+        );
+
+        // Confirm exactly one edge row exists for the triple.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM edges WHERE source_id = $1 AND target_id = $2 AND relationship = $3",
+        )
+        .bind(source_id)
+        .bind(target_id)
+        .bind("supports")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
     }
 }
