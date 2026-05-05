@@ -433,6 +433,60 @@ impl EdgeRepository {
             .collect())
     }
 
+    /// Patch an edge's lifecycle fields.
+    ///
+    /// Sets `valid_to` (when `Some`) and shallow-merges `properties_merge`
+    /// (when `Some`) via JSONB `||`. Both arguments are optional but at least
+    /// one must be `Some` to do useful work — the route layer enforces that.
+    ///
+    /// Returns the updated row. Returns `DbError::NotFound` if `id` doesn't
+    /// exist (the underlying query returns no row).
+    ///
+    /// # Errors
+    /// - `DbError::NotFound` if the edge doesn't exist
+    /// - `DbError::QueryFailed` if the database query fails
+    #[instrument(skip(pool, properties_merge))]
+    pub async fn update_valid_to_and_properties(
+        pool: &PgPool,
+        id: Uuid,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+        properties_merge: Option<serde_json::Value>,
+    ) -> Result<EdgeRow, DbError> {
+        let row = sqlx::query!(
+            r#"
+            UPDATE edges
+            SET valid_to = COALESCE($2, valid_to),
+                properties = CASE
+                    WHEN $3::jsonb IS NULL THEN properties
+                    ELSE properties || $3::jsonb
+                END
+            WHERE id = $1
+            RETURNING id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            "#,
+            id,
+            valid_to,
+            properties_merge,
+        )
+        .fetch_optional(pool)
+        .await?
+        .ok_or(DbError::NotFound {
+            entity: "edge".to_string(),
+            id,
+        })?;
+
+        Ok(EdgeRow {
+            id: row.id,
+            source_id: row.source_id,
+            source_type: row.source_type,
+            target_id: row.target_id,
+            target_type: row.target_type,
+            relationship: row.relationship,
+            properties: row.properties,
+            valid_from: row.valid_from,
+            valid_to: row.valid_to,
+        })
+    }
+
     /// Delete an edge by ID
     ///
     /// # Returns

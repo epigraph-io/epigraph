@@ -159,7 +159,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/claims/:id/confirm-delete",
             post(claims::confirm_delete_claim),
         )
-        .route("/api/v1/edges/:id", delete(edges::delete_edge))
+        .route(
+            "/api/v1/edges/:id",
+            delete(edges::delete_edge).patch(edges::patch_edge),
+        )
         .route("/api/v1/evidence", post(crud::create_evidence))
         .route("/api/v1/evidence/:id", put(crud::update_evidence))
         .route(
@@ -778,7 +781,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/claims/:id/confirm-delete",
             post(claims::confirm_delete_claim),
         )
-        .route("/api/v1/edges/:id", delete(edges::delete_edge))
+        .route(
+            "/api/v1/edges/:id",
+            delete(edges::delete_edge).patch(edges::patch_edge),
+        )
         .route("/api/v1/evidence", post(crud::create_evidence))
         .route("/api/v1/evidence/:id", put(crud::update_evidence))
         .route(

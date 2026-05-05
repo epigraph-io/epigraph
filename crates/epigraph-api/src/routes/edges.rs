@@ -554,6 +554,26 @@ pub struct EdgeResponse {
     pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Request body for `PATCH /api/v1/edges/:id`.
+///
+/// Both fields are optional but at least one must be provided. `valid_to`
+/// sets the edge's lifecycle end time (use this to retire an edge without
+/// losing audit history). `properties` shallow-merges into the existing
+/// JSONB properties via `||`: existing keys not in the patch are preserved,
+/// overlapping keys are overwritten, new keys are added.
+#[derive(Debug, Deserialize)]
+pub struct PatchEdgeRequest {
+    pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    pub properties: Option<serde_json::Value>,
+}
+
+impl PatchEdgeRequest {
+    /// Returns true if there is nothing to patch.
+    pub fn is_empty(&self) -> bool {
+        self.valid_to.is_none() && self.properties.is_none()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct EdgeQueryParams {
     pub source_id: Option<Uuid>,
@@ -897,6 +917,95 @@ pub async fn delete_edge(
 ) -> Result<StatusCode, ApiError> {
     Err(ApiError::ServiceUnavailable {
         service: "Edge deletion requires database".to_string(),
+    })
+}
+
+// =============================================================================
+// PATCH EDGE
+// =============================================================================
+
+/// Partial update of an edge's lifecycle fields.
+///
+/// `PATCH /api/v1/edges/:id`
+///
+/// Accepts an optional `valid_to` and an optional `properties` JSON object.
+/// At least one must be provided (empty body → 400). `properties` is
+/// shallow-merged via JSONB `||`: existing keys are preserved unless
+/// overwritten by the patch, new keys are added.
+///
+/// Edges previously had no in-place lifecycle update path — retiring an
+/// edge required DELETE + POST, which loses audit. PATCH closes that gap.
+#[cfg(feature = "db")]
+pub async fn patch_edge(
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<PatchEdgeRequest>,
+) -> Result<Json<EdgeResponse>, ApiError> {
+    // Enforce scope when OAuth2-authenticated (mirrors create_edge / delete_edge).
+    if let Some(axum::Extension(ref auth)) = auth_ctx {
+        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
+    }
+
+    if request.is_empty() {
+        return Err(ApiError::ValidationError {
+            field: "body".to_string(),
+            reason: "PATCH requires at least one of valid_to or properties".to_string(),
+        });
+    }
+
+    let pool = &state.db_pool;
+    // `?` maps DbError::NotFound → ApiError::NotFound via the From impl in
+    // crates/epigraph-api/src/errors.rs (entity is propagated as "edge").
+    let updated = EdgeRepository::update_valid_to_and_properties(
+        pool,
+        id,
+        request.valid_to,
+        request.properties,
+    )
+    .await?;
+
+    // Record provenance when OAuth2-authenticated.
+    if let Some(axum::Extension(ref auth)) = auth_ctx {
+        let content_hash = blake3::hash(id.as_bytes());
+        if let Err(e) = crate::middleware::provenance::record_provenance(
+            pool,
+            auth,
+            "edge",
+            id,
+            "patch",
+            content_hash.as_bytes(),
+            &[],
+            None,
+        )
+        .await
+        {
+            tracing::warn!(edge_id = %id, error = %e, "Failed to record edge patch provenance");
+        }
+    }
+
+    Ok(Json(EdgeResponse {
+        id: updated.id,
+        source_id: updated.source_id,
+        target_id: updated.target_id,
+        source_type: updated.source_type,
+        target_type: updated.target_type,
+        relationship: updated.relationship,
+        properties: updated.properties,
+        valid_from: updated.valid_from,
+        valid_to: updated.valid_to,
+    }))
+}
+
+/// PATCH edge stub — non-db builds.
+#[cfg(not(feature = "db"))]
+pub async fn patch_edge(
+    State(_state): State<AppState>,
+    Path(_id): Path<Uuid>,
+    Json(_request): Json<PatchEdgeRequest>,
+) -> Result<Json<EdgeResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Edge patches require database".to_string(),
     })
 }
 
@@ -2381,6 +2490,7 @@ mod db_tests {
     fn edges_router(state: AppState) -> Router {
         Router::new()
             .route("/api/v1/edges", post(create_edge).get(list_edges))
+            .route("/api/v1/edges/:id", axum::routing::patch(patch_edge))
             .with_state(state)
     }
 
@@ -2571,5 +2681,148 @@ mod db_tests {
         assert_eq!(edges[0]["source_id"], serde_json::json!(a));
         assert_eq!(edges[0]["target_id"], serde_json::json!(b));
         assert_eq!(edges[0]["relationship"], serde_json::json!("SUPPORTS"));
+    }
+
+    /// 0.C — PATCH /edges/:id sets `valid_to` on the targeted edge.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_sets_valid_to(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "valid-to source").await;
+        let target = seed_claim(&pool, agent_id, "valid-to target").await;
+        let edge_id = EdgeRepository::create(
+            &pool, source, "claim", target, "claim", "SUPPORTS", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let cutoff = chrono::Utc::now();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "valid_to": cutoff,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body: serde_json::Value = parse_body(response).await;
+        assert!(
+            !body["valid_to"].is_null(),
+            "valid_to must be set on response"
+        );
+
+        let stored: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT valid_to FROM edges WHERE id = $1")
+                .bind(edge_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(stored.is_some(), "valid_to must be persisted");
+    }
+
+    /// 0.C — PATCH /edges/:id shallow-merges `properties` (existing keys
+    /// preserved, new keys added, overlapping keys overwritten).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_merges_properties(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "merge-props source").await;
+        let target = seed_claim(&pool, agent_id, "merge-props target").await;
+        let edge_id = EdgeRepository::create(
+            &pool,
+            source,
+            "claim",
+            target,
+            "claim",
+            "SUPPORTS",
+            Some(serde_json::json!({"weight": 0.7, "source": "drainer"})),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "properties": {"weight": 0.9, "note": "rebalanced"},
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT properties FROM edges WHERE id = $1")
+                .bind(edge_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored["weight"],
+            serde_json::json!(0.9),
+            "overlapping key overwritten"
+        );
+        assert_eq!(
+            stored["source"],
+            serde_json::json!("drainer"),
+            "preexisting key preserved"
+        );
+        assert_eq!(
+            stored["note"],
+            serde_json::json!("rebalanced"),
+            "new key added"
+        );
+    }
+
+    /// 0.C — PATCH /edges/:id with empty body returns 400.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_rejects_empty_body(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "empty source").await;
+        let target = seed_claim(&pool, agent_id, "empty target").await;
+        let edge_id = EdgeRepository::create(
+            &pool, source, "claim", target, "claim", "SUPPORTS", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
