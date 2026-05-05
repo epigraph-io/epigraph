@@ -100,4 +100,81 @@ impl EventRepository {
             .await?;
         Ok(version.unwrap_or(0))
     }
+
+    /// Fire-and-forget event publish: insert and swallow + log on failure.
+    ///
+    /// Used at persistence-side hooks (claim/agent creation, tool dispatch)
+    /// where event emission must never roll back the underlying write.
+    /// Returns the inserted event id on success, `None` on failure (after
+    /// logging via `tracing::warn!`).
+    ///
+    /// This is the canonical sink for the MCP `list_events` surface and
+    /// must be used wherever durable event observability is required.
+    /// In-memory pushes to `EventStore::push` are NOT visible to MCP and
+    /// should be paired with — or replaced by — a call to this method
+    /// when MCP visibility is needed.
+    pub async fn publish_or_log(
+        pool: &PgPool,
+        event_type: &str,
+        actor_id: Option<Uuid>,
+        payload: &serde_json::Value,
+    ) -> Option<Uuid> {
+        match Self::insert(pool, event_type, actor_id, payload).await {
+            Ok(id) => Some(id),
+            Err(err) => {
+                tracing::warn!(
+                    event_type = event_type,
+                    actor_id = ?actor_id,
+                    error = %err,
+                    "EventRepository::publish_or_log: failed to persist event; \
+                     downstream write succeeded but observability is degraded"
+                );
+                None
+            }
+        }
+    }
+
+    /// Connection-scoped variant of `publish_or_log` for repository methods
+    /// that operate on `&mut PgConnection` (typically inside a caller's
+    /// transaction). Mirrors `publish_or_log` semantics: fire-and-forget,
+    /// errors are swallowed and logged.
+    ///
+    /// **Transactional semantics:** the event INSERT rides the caller's
+    /// transaction. If the caller rolls back, the event is rolled back too —
+    /// which is the correct behavior here, since we do not want to log
+    /// `claim.created` for a claim that never persisted.
+    ///
+    /// Uses runtime `sqlx::query` (not the compile-time macro) to avoid
+    /// adding offline-data churn for callers in transactional contexts.
+    pub async fn publish_or_log_conn(
+        conn: &mut sqlx::PgConnection,
+        event_type: &str,
+        actor_id: Option<Uuid>,
+        payload: &serde_json::Value,
+    ) -> Option<Uuid> {
+        let id = Uuid::new_v4();
+        match sqlx::query(
+            "INSERT INTO events (id, event_type, actor_id, payload, graph_version, created_at) \
+             VALUES ($1, $2, $3, $4, nextval('events_graph_version_seq'), NOW())",
+        )
+        .bind(id)
+        .bind(event_type)
+        .bind(actor_id)
+        .bind(payload)
+        .execute(&mut *conn)
+        .await
+        {
+            Ok(_) => Some(id),
+            Err(err) => {
+                tracing::warn!(
+                    event_type = event_type,
+                    actor_id = ?actor_id,
+                    error = %err,
+                    "EventRepository::publish_or_log_conn: failed to persist event; \
+                     downstream write may or may not commit (caller's tx)"
+                );
+                None
+            }
+        }
+    }
 }

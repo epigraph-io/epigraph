@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE events SET actor_id = NULL WHERE actor_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ce06a11a0a4471e4f90b70d2b9a4dbc043ddba0a7caa658b88098757fd2250b6"
+}

@@ -57,5 +57,14 @@ pub async fn create_claim_idempotent(
         );
     }
 
+    // Note: the durable `claim.created` event for this submission is emitted
+    // inside `ClaimRepository::create_strict` (which `create_or_get` calls on
+    // the success branch). Centralizing the emit at the repository boundary
+    // ensures all writers — submit_claim, ingest_paper, ingest_workflow,
+    // batch ingestion, API conventions — produce the event, not just the
+    // MCP submit_claim path. See claim.rs::create_strict for the emit site
+    // and crates/epigraph-db/src/repos/event.rs::publish_or_log_conn for
+    // the transactional sink.
+
     Ok((claim, was_created))
 }

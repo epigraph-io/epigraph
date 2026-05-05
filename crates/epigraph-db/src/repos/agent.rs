@@ -117,6 +117,22 @@ impl AgentRepository {
                 reason: "public_key is not 32 bytes".to_string(),
             })?;
 
+        // Fire-and-forget agent.registered event (closes #61).
+        // The downstream write has already committed (we hold `row`); the
+        // event log is a separate observability surface and must not roll
+        // back the agent on failure.
+        let _ = crate::repos::EventRepository::publish_or_log(
+            pool,
+            "agent.registered",
+            Some(row.id),
+            &serde_json::json!({
+                "agent_id": row.id,
+                "display_name": row.display_name,
+                "public_key": public_key.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            }),
+        )
+        .await;
+
         Ok(Agent::with_id(
             AgentId::from_uuid(row.id),
             public_key,
@@ -347,6 +363,12 @@ impl AgentRepository {
 
     /// Delete an agent by ID
     ///
+    /// Detaches any `events.actor_id` references first (sets them to NULL)
+    /// so the audit log outlives the deleted agent. Without this step the
+    /// `events_actor_id_fkey` FK would block agent deletion any time the
+    /// agent had logged a `tool.invoked`, `agent.registered`, or
+    /// `claim.created` event — see #61 wiring.
+    ///
     /// # Returns
     /// Returns `true` if the agent was deleted, `false` if it didn't exist.
     ///
@@ -356,6 +378,17 @@ impl AgentRepository {
     pub async fn delete(pool: &PgPool, id: AgentId) -> Result<bool, DbError> {
         let uuid: Uuid = id.into();
 
+        let mut tx = pool.begin().await?;
+
+        // Audit log outlives the agent: NULL out `actor_id` references
+        // before deleting, otherwise the FK fires.
+        sqlx::query!(
+            "UPDATE events SET actor_id = NULL WHERE actor_id = $1",
+            uuid
+        )
+        .execute(&mut *tx)
+        .await?;
+
         let result = sqlx::query!(
             r#"
             DELETE FROM agents
@@ -363,8 +396,10 @@ impl AgentRepository {
             "#,
             uuid
         )
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(result.rows_affected() > 0)
     }
