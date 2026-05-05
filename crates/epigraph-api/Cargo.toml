@@ -7,7 +7,7 @@ edition = "2021"
 
 [features]
 default = ["db"]
-db = ["dep:epigraph-db", "dep:sqlx"]
+db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-ingest-executor"]
 jina = ["epigraph-embeddings/jina"]
 genai = ["db", "dep:epigraph-cli"]  # LLM-dependent workflows; requires ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN)
 integration = []
@@ -33,6 +33,7 @@ required-features = ["db"]
 [dependencies]
 epigraph-interfaces = { workspace = true }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
 epigraph-ingest = { workspace = true }  # Workflow/document extraction schemas and ingest planners
+epigraph-ingest-executor = { workspace = true, optional = true }  # Persistence executor for workflow ingest (db feature)
 linfa = { workspace = true }  # k-means for /api/v1/themes/build-from-corpus
 linfa-clustering = { workspace = true }
 ndarray = { workspace = true }
