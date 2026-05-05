@@ -1,4 +1,4 @@
--- 027_graph_cluster_runs_algo.sql
+-- 028_graph_cluster_runs_algo.sql
 -- Adds an `algo` discriminator column to `graph_cluster_runs` so that we can
 -- have multiple parallel clustering algorithms (epistemic edges vs. structural
 -- bridges) co-existing without colliding on retention/GC.
