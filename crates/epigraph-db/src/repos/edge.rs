@@ -298,6 +298,68 @@ impl EdgeRepository {
             .collect())
     }
 
+    /// List edges with AND-composed filters.
+    ///
+    /// Each parameter is optional; null parameters are skipped via the
+    /// `($N::T IS NULL OR column = $N)` pattern, so callers can pass any
+    /// combination of source/target/relationship/type filters and the result
+    /// is the intersection. Ordered by `valid_from DESC NULLS LAST, id`
+    /// for stable pagination.
+    ///
+    /// This replaces the legacy first-non-null filter cascade in
+    /// `routes::edges::list_edges`. Drainer GET-then-POST guards rely on
+    /// composing multiple filters at the SQL layer.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn list_filtered(
+        pool: &PgPool,
+        source_id: Option<Uuid>,
+        target_id: Option<Uuid>,
+        relationship: Option<&str>,
+        source_type: Option<&str>,
+        target_type: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<EdgeRow>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            FROM edges
+            WHERE ($1::uuid IS NULL OR source_id = $1)
+              AND ($2::uuid IS NULL OR target_id = $2)
+              AND ($3::text IS NULL OR relationship = $3)
+              AND ($4::text IS NULL OR source_type = $4)
+              AND ($5::text IS NULL OR target_type = $5)
+            ORDER BY valid_from DESC NULLS LAST, id
+            LIMIT $6
+            "#,
+            source_id,
+            target_id,
+            relationship,
+            source_type,
+            target_type,
+            limit,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| EdgeRow {
+                id: row.id,
+                source_id: row.source_id,
+                source_type: row.source_type,
+                target_id: row.target_id,
+                target_type: row.target_type,
+                relationship: row.relationship,
+                properties: row.properties,
+                valid_from: row.valid_from,
+                valid_to: row.valid_to,
+            })
+            .collect())
+    }
+
     /// List all edges, optionally filtered by source_type and target_type
     ///
     /// # Errors

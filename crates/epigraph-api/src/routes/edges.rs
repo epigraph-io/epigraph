@@ -1111,18 +1111,20 @@ pub async fn list_edges(
 ) -> Result<Json<Vec<EdgeResponse>>, ApiError> {
     let pool = &state.db_pool;
 
-    let rows = if let Some(source_id) = params.source_id {
-        let source_type = params.source_type.as_deref().unwrap_or("claim");
-        EdgeRepository::get_by_source(pool, source_id, source_type).await?
-    } else if let Some(target_id) = params.target_id {
-        let target_type = params.target_type.as_deref().unwrap_or("claim");
-        EdgeRepository::get_by_target(pool, target_id, target_type).await?
-    } else if let Some(ref relationship) = params.relationship {
-        EdgeRepository::get_by_relationship(pool, relationship).await?
-    } else {
-        // No filter: return all edges (capped at 1000)
-        EdgeRepository::list_all(pool, 1000).await?
-    };
+    // AND-compose every non-null filter at the SQL layer so drainer
+    // GET-then-POST guards work. Replaces the legacy first-non-null
+    // cascade. Per #65: source_type defaults to None (not "claim") so
+    // callers querying non-claim sources don't get silently filtered.
+    let rows = EdgeRepository::list_filtered(
+        pool,
+        params.source_id,
+        params.target_id,
+        params.relationship.as_deref(),
+        params.source_type.as_deref(),
+        params.target_type.as_deref(),
+        1000,
+    )
+    .await?;
 
     // Filter edges where source or target has a redacted partition
     let mut edges = Vec::new();
@@ -2503,5 +2505,71 @@ mod db_tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// 0.B — GET /edges combines source_id, target_id, and relationship
+    /// filters at the SQL layer (AND-composed), not first-non-null cascade.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_edges_combines_source_target_relationship_filters(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "claim A").await;
+        let b = seed_claim(&pool, agent_id, "claim B").await;
+        let c = seed_claim(&pool, agent_id, "claim C").await;
+
+        // Three edges sharing source A:
+        //   A -SUPPORTS-> B  (the one we expect to match)
+        //   A -CORROBORATES-> B
+        //   A -SUPPORTS-> C
+        let _ab_supports = EdgeRepository::create(
+            &pool, a, "claim", b, "claim", "SUPPORTS", None, None, None,
+        )
+        .await
+        .unwrap();
+        let _ab_corroborates = EdgeRepository::create(
+            &pool,
+            a,
+            "claim",
+            b,
+            "claim",
+            "CORROBORATES",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let _ac_supports = EdgeRepository::create(
+            &pool, a, "claim", c, "claim", "SUPPORTS", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(&format!(
+                        "/api/v1/edges?source_id={a}&target_id={b}&relationship=SUPPORTS"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body: serde_json::Value = parse_body(response).await;
+        let edges = body.as_array().expect("response is an array");
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one edge matching all three filters; got {}",
+            edges.len()
+        );
+        assert_eq!(edges[0]["source_id"], serde_json::json!(a));
+        assert_eq!(edges[0]["target_id"], serde_json::json!(b));
+        assert_eq!(edges[0]["relationship"], serde_json::json!("SUPPORTS"));
     }
 }
