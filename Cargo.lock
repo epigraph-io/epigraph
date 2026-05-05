@@ -1502,6 +1502,7 @@ dependencies = [
  "epigraph-embeddings",
  "epigraph-engine",
  "epigraph-ingest",
+ "epigraph-ingest-executor",
  "hex",
  "openssl",
  "rand 0.8.5",

@@ -16,6 +16,7 @@ epigraph-ds = { workspace = true }
 epigraph-engine = { workspace = true }
 epigraph-embeddings = { workspace = true }
 epigraph-ingest = { workspace = true }
+epigraph-ingest-executor = { workspace = true }
 
 # MCP protocol (no sqlx dep — coexists with workspace sqlx 0.7)
 rmcp = { workspace = true }

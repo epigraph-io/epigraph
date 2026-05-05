@@ -5,19 +5,17 @@
 //! `workflow —executes→ claim` edges for every planned claim, resolves author
 //! placeholder edges, and returns a summary. Mirrors `do_ingest_document` in
 //! `ingestion.rs`.
-
-use std::collections::HashMap;
+//!
+//! The persistence body lives in [`epigraph_ingest_executor::execute_workflow_ingest_plan`];
+//! this module is now a thin wrapper that builds an ingest plan, invokes the
+//! executor, and maps the result into the MCP response shape.
 
 use rmcp::model::*;
-use uuid::Uuid;
 
 use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::IngestWorkflowParams;
 
-use epigraph_core::{AgentId, TruthValue};
-use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, WorkflowRepository};
-use epigraph_ingest::workflow::builder::root_workflow_id;
 use epigraph_ingest::workflow::WorkflowExtraction;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
@@ -45,209 +43,27 @@ pub struct IngestWorkflowResponse {
 /// Pool-only ingest logic. Callable from both the MCP entry point (which
 /// supplies `server.pool`) and from integration tests (which supply a
 /// `sqlx::test`-managed pool directly).
+///
+/// Thin wrapper over [`epigraph_ingest_executor::execute_workflow_ingest_plan`];
+/// see that function for the canonical persistence semantics.
 pub async fn do_ingest_workflow_via_pool(
     pool: &sqlx::PgPool,
     extraction: &WorkflowExtraction,
 ) -> Result<IngestWorkflowResponse, McpError> {
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
-
-    let canonical_name = &extraction.source.canonical_name;
-    let generation = extraction.source.generation as i32;
-    let goal = &extraction.source.goal;
-
-    let workflow_id = root_workflow_id(extraction);
-
-    // ── 1. Idempotency gate: skip if workflow row already processed ──────
-    if let Some(existing_id) =
-        WorkflowRepository::find_root_by_canonical(pool, canonical_name, generation)
-            .await
-            .map_err(internal_error)?
-    {
-        // Workflow row exists — check if any executes edges have been written.
-        let edge_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM edges \
-             WHERE source_id = $1 AND source_type = 'workflow' AND relationship = 'executes'",
-        )
-        .bind(existing_id)
-        .fetch_one(pool)
+    let result = epigraph_ingest_executor::execute_workflow_ingest_plan(pool, &plan, extraction)
         .await
-        .map_err(internal_error)?;
-
-        if edge_count > 0 {
-            return Ok(IngestWorkflowResponse {
-                workflow_id: existing_id.to_string(),
-                canonical_name: canonical_name.clone(),
-                generation,
-                claims_ingested: 0,
-                claims_skipped_dedup: 0,
-                executes_edges: edge_count as usize,
-                relationships_created: 0,
-                already_ingested: true,
-            });
-        }
-    }
-
-    // ── 2. Ensure system agent ───────────────────────────────────────────
-    let system_agent_id = get_or_create_system_agent(pool).await?;
-    let agent_id_typed = AgentId::from_uuid(system_agent_id);
-
-    // ── 3. Insert workflow row (idempotent) ──────────────────────────────
-    let parent_id = if let Some(ref pcn) = extraction.source.parent_canonical_name {
-        WorkflowRepository::find_root_by_canonical(pool, pcn, generation.saturating_sub(1))
-            .await
-            .map_err(internal_error)?
-    } else {
-        None
-    };
-
-    WorkflowRepository::insert_root(
-        pool,
-        workflow_id,
-        canonical_name,
-        generation,
-        goal,
-        parent_id,
-        extraction.source.metadata.clone(),
-    )
-    .await
-    .map_err(internal_error)?;
-
-    // ── 4. Ensure author agents ──────────────────────────────────────────
-    let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
-    for (idx, author) in extraction.source.authors.iter().enumerate() {
-        if author.name.is_empty() {
-            continue;
-        }
-        let (_did, pub_key_bytes) =
-            epigraph_crypto::did_key::did_key_for_author(None, &author.name);
-        let agent_uuid = if let Some(existing) =
-            AgentRepository::get_by_public_key(pool, &pub_key_bytes)
-                .await
-                .map_err(internal_error)?
-        {
-            existing.id.into()
-        } else {
-            let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
-            let created = AgentRepository::create(pool, &author_agent)
-                .await
-                .map_err(internal_error)?;
-            created.id.into()
-        };
-        author_agent_map.insert(idx, agent_uuid);
-    }
-
-    // ── 5. Walk planned claims: dedup-by-id ─────────────────────────────
-    let mut claims_ingested = 0_usize;
-    let mut claims_skipped_dedup = 0_usize;
-    let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
-
-    for planned in &plan.claims {
-        let confidence = planned.confidence.clamp(0.0, 1.0);
-        let raw_truth = confidence.clamp(0.01, 0.99);
-        let truth = TruthValue::clamped(raw_truth);
-
-        // Derive labels from kind property.
-        let kind = planned
-            .properties
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("workflow_claim");
-        let labels = vec!["claim".to_string(), kind.to_string()];
-
-        let was_new = ClaimRepository::create_with_id_if_absent(
-            pool,
-            planned.id,
-            &planned.content,
-            &planned.content_hash,
-            system_agent_id,
-            truth,
-            &labels,
-        )
-        .await
-        .map_err(internal_error)?;
-
-        if was_new {
-            // Set properties via raw SQL (no set_properties method on ClaimRepository).
-            sqlx::query("UPDATE claims SET properties = $1 WHERE id = $2")
-                .bind(&planned.properties)
-                .bind(planned.id)
-                .execute(pool)
-                .await
-                .map_err(internal_error)?;
-            claims_ingested += 1;
-        } else {
-            claims_skipped_dedup += 1;
-        }
-
-        id_map.insert(planned.id, planned.id);
-        let _ = agent_id_typed; // suppress unused warning
-    }
-
-    // ── 6. workflow —executes→ claim edges ──────────────────────────────
-    let mut executes_edges = 0_usize;
-    for planned in &plan.claims {
-        let (_row, _was_created) = EdgeRepository::create_if_not_exists(
-            pool,
-            workflow_id,
-            "workflow",
-            planned.id,
-            "claim",
-            "executes",
-            Some(serde_json::json!({"level": planned.level})),
-            None,
-            None,
-        )
-        .await
-        .map_err(internal_error)?;
-        executes_edges += 1;
-    }
-
-    // ── 7. Intra-claim plan edges (decomposes_to / step_follows / phase_follows / cross-refs) ──
-    let mut relationships_created = 0_usize;
-    for edge in &plan.edges {
-        let (src, src_type) = if edge.source_type == "author_placeholder" {
-            let idx = edge.properties["author_index"].as_u64().unwrap_or(0) as usize;
-            let Some(&agent_uuid) = author_agent_map.get(&idx) else {
-                continue;
-            };
-            (agent_uuid, "agent".to_string())
-        } else {
-            let mapped = id_map
-                .get(&edge.source_id)
-                .copied()
-                .unwrap_or(edge.source_id);
-            (mapped, edge.source_type.clone())
-        };
-        let tgt = id_map
-            .get(&edge.target_id)
-            .copied()
-            .unwrap_or(edge.target_id);
-
-        let (_row, _was_created) = EdgeRepository::create_if_not_exists(
-            pool,
-            src,
-            &src_type,
-            tgt,
-            &edge.target_type,
-            &edge.relationship,
-            Some(edge.properties.clone()),
-            None,
-            None,
-        )
-        .await
-        .map_err(internal_error)?;
-        relationships_created += 1;
-    }
+        .map_err(|e| internal_error(format!("workflow ingest: {e}")))?;
 
     Ok(IngestWorkflowResponse {
-        workflow_id: workflow_id.to_string(),
-        canonical_name: canonical_name.clone(),
-        generation,
-        claims_ingested,
-        claims_skipped_dedup,
-        executes_edges,
-        relationships_created,
-        already_ingested: false,
+        workflow_id: result.workflow_id.to_string(),
+        canonical_name: result.canonical_name,
+        generation: result.generation,
+        claims_ingested: result.claims_ingested,
+        claims_skipped_dedup: result.claims_skipped_dedup,
+        executes_edges: result.executes_edges_created,
+        relationships_created: result.relationship_edges_created,
+        already_ingested: result.already_ingested,
     })
 }
 
@@ -270,32 +86,13 @@ pub async fn ingest_workflow(
     do_ingest_workflow(server, &params.extraction).await
 }
 
-// ── Internal helper ────────────────────────────────────────────────────────
-
-async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, McpError> {
-    let (_did, pub_key_bytes) =
-        epigraph_crypto::did_key::did_key_for_author(None, "workflow-ingest-system");
-    if let Some(existing) = AgentRepository::get_by_public_key(pool, &pub_key_bytes)
-        .await
-        .map_err(internal_error)?
-    {
-        Ok(existing.id.into())
-    } else {
-        let agent =
-            epigraph_core::Agent::new(pub_key_bytes, Some("workflow-ingest-system".to_string()));
-        let created = AgentRepository::create(pool, &agent)
-            .await
-            .map_err(internal_error)?;
-        Ok(created.id.into())
-    }
-}
-
 // ── Integration tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
+    use uuid::Uuid;
 
     fn minimal_extraction() -> WorkflowExtraction {
         WorkflowExtraction {
@@ -421,7 +218,9 @@ mod tests {
         );
 
         // Manually insert the document atom (mirrors what do_ingest_document would do).
-        let sys_agent_id = get_or_create_system_agent(&pool).await.unwrap();
+        let sys_agent_id = epigraph_ingest_executor::get_or_create_system_agent(&pool)
+            .await
+            .unwrap();
         let doc_atom = doc_plan.claims.iter().find(|c| c.level == 3).unwrap();
         assert_eq!(doc_atom.id, expected_atom_id);
         epigraph_db::ClaimRepository::create_with_id_if_absent(
