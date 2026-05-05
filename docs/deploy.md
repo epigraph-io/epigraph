@@ -12,6 +12,18 @@ Applied automatically by the API binary on startup. The first deploy after
 
 Subsequent deploys: just restart; `sqlx::migrate!()` runs at boot.
 
+### If the reconcile goes wrong
+
+If a checksum mismatch surfaces on the next `epigraph-migrate` run (or at API
+startup), restore the pre-reconcile dump before retrying:
+
+1. `systemctl stop epigraph-api`
+2. `pg_restore --clean --if-exists -d "$DATABASE_URL" epigraph_pre_reconcile_*.dump`
+3. Investigate the diff between `sha384sum migrations/NNN_*.sql` and the values
+   recorded in `ops/reconcile_2026_05_05.sql` before retrying step 2 of the
+   runbook above.
+4. `systemctl start epigraph-api` only after the tracking table is consistent.
+
 ### Why the reconcile is needed
 
 Prior to 2026-05-05, prod's `_sqlx_migrations` table was tracking the
