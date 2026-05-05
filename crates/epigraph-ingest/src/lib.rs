@@ -585,4 +585,173 @@ mod tests {
             "compound nodes must NOT converge across workflows with different canonical_name"
         );
     }
+
+    #[test]
+    fn test_workflow_build_plan_no_thesis() {
+        // Symmetric to test_build_plan_no_thesis on the document side: a workflow
+        // with thesis: null should produce zero level-0 claims and zero
+        // thesis-derived decomposes_to edges (i.e. nothing at the thesis→phase
+        // step). All other phase/step structure should still be planned.
+        let json = r#"{
+            "source": {"canonical_name": "no-thesis-wf", "goal": "G", "authors": []},
+            "thesis": null,
+            "thesis_derivation": "BottomUp",
+            "phases": [{
+                "title": "P1",
+                "summary": "Phase summary",
+                "steps": [{
+                    "compound": "Compound step",
+                    "operations": ["op-text"],
+                    "generality": [1],
+                    "confidence": 0.8
+                }]
+            }],
+            "relationships": []
+        }"#;
+
+        let plan = crate::workflow::build_ingest_plan(&make_workflow(json));
+
+        let level0 = plan.claims.iter().filter(|c| c.level == 0).count();
+        assert_eq!(level0, 0, "no thesis → no level-0 claim");
+
+        // Phase/step/operation should still exist: 1 phase + 1 step + 1 op.
+        assert_eq!(
+            plan.claims.len(),
+            3,
+            "0 thesis + 1 phase + 1 step + 1 op = 3 claims"
+        );
+
+        // decomposes_to edges should NOT include thesis→phase: only
+        // phase→step and step→op.
+        let decompose_count = plan
+            .edges
+            .iter()
+            .filter(|e| e.relationship == "decomposes_to")
+            .count();
+        assert_eq!(decompose_count, 2, "phase->step, step->op (no thesis edge)");
+    }
+
+    #[test]
+    fn test_workflow_phases_without_steps() {
+        // A workflow with phases but each phase has zero steps. This exercises
+        // the empty-children path that the existing `phase_follows` test only
+        // touches incidentally. Asserts the planner emits L1 phase claims but
+        // no L2 step claims, no L3 operation claims, and no step_follows edges.
+        let json = r#"{
+            "source": {"canonical_name": "empty-phases", "goal": "G", "authors": []},
+            "thesis": "Top-level thesis",
+            "phases": [
+                {"title": "P1", "summary": "First phase", "steps": []},
+                {"title": "P2", "summary": "Second phase", "steps": []}
+            ],
+            "relationships": []
+        }"#;
+
+        let plan = crate::workflow::build_ingest_plan(&make_workflow(json));
+
+        let level1 = plan.claims.iter().filter(|c| c.level == 1).count();
+        let level2 = plan.claims.iter().filter(|c| c.level == 2).count();
+        let level3 = plan.claims.iter().filter(|c| c.level == 3).count();
+        assert_eq!(level1, 2, "two phases as level-1 claims");
+        assert_eq!(level2, 0, "no steps → no level-2 claims");
+        assert_eq!(level3, 0, "no operations → no level-3 claims");
+
+        let step_follows = plan
+            .edges
+            .iter()
+            .filter(|e| e.relationship == "step_follows")
+            .count();
+        assert_eq!(step_follows, 0, "no steps → no step_follows edges");
+    }
+
+    #[test]
+    fn test_workflow_with_parent_canonical_name() {
+        // The planner does NOT consume `parent_canonical_name` — the
+        // `variant_of` edge between this workflow and its parent is the
+        // executor's responsibility (emitted by epigraph-mcp::tools::workflow_ingest
+        // once the workflow row is created). This test pins that contract:
+        //   1. Plans built from the same variant with vs without
+        //      `parent_canonical_name` set produce identical hierarchical
+        //      claim IDs (proves the planner ignores parent for ID derivation).
+        //   2. No `variant_of` edge appears in the plan output.
+        let json_with_parent = r#"{
+            "source": {
+                "canonical_name": "variant_v2",
+                "goal": "G",
+                "parent_canonical_name": "parent_workflow_v1",
+                "authors": []
+            },
+            "thesis": "Variant thesis",
+            "phases": [{
+                "title": "P1",
+                "summary": "Phase summary",
+                "steps": []
+            }],
+            "relationships": []
+        }"#;
+
+        let json_without_parent = r#"{
+            "source": {
+                "canonical_name": "variant_v2",
+                "goal": "G",
+                "authors": []
+            },
+            "thesis": "Variant thesis",
+            "phases": [{
+                "title": "P1",
+                "summary": "Phase summary",
+                "steps": []
+            }],
+            "relationships": []
+        }"#;
+
+        let plan_with = crate::workflow::build_ingest_plan(&make_workflow(json_with_parent));
+        let plan_without =
+            crate::workflow::build_ingest_plan(&make_workflow(json_without_parent));
+
+        // Workflow root claim (the thesis, level 0) should exist and be
+        // derived from the variant's canonical_name, not the parent's.
+        let thesis_with = plan_with
+            .claims
+            .iter()
+            .find(|c| c.level == 0)
+            .expect("variant has thesis");
+        let thesis_without = plan_without
+            .claims
+            .iter()
+            .find(|c| c.level == 0)
+            .expect("variant has thesis");
+        assert_eq!(
+            thesis_with.id, thesis_without.id,
+            "thesis ID derives from variant canonical_name; parent_canonical_name must not affect it"
+        );
+
+        // L1 phase claim IDs should also match (further proof the parent is
+        // not folded into the compound seed).
+        let phase_with = plan_with
+            .claims
+            .iter()
+            .find(|c| c.level == 1)
+            .expect("variant has phase");
+        let phase_without = plan_without
+            .claims
+            .iter()
+            .find(|c| c.level == 1)
+            .expect("variant has phase");
+        assert_eq!(
+            phase_with.id, phase_without.id,
+            "phase ID derives from variant canonical_name; parent_canonical_name must not affect it"
+        );
+
+        // Planner must NOT emit a variant_of edge — that's the executor's job.
+        let variant_of_count = plan_with
+            .edges
+            .iter()
+            .filter(|e| e.relationship == "variant_of")
+            .count();
+        assert_eq!(
+            variant_of_count, 0,
+            "planner must not emit variant_of; that's the executor's responsibility"
+        );
+    }
 }
