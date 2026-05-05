@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n          (SELECT COUNT(*) FROM claims) AS claims_total,\n          (SELECT COUNT(*) FROM claims WHERE (properties->>'level')::int = 2) AS paragraph_total,\n          (SELECT COUNT(*) FROM papers) AS paper_total,\n          (SELECT COUNT(*) FROM claim_themes) AS themes_total\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "claims_total",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "paragraph_total",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "paper_total",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "themes_total",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "7f08b68525ecafa875014e7b22463ccdf8ad69e7e2714dd402139ef0a4963052"
+}
