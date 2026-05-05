@@ -1433,6 +1433,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "epigraph-ingest-executor"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "epigraph-core",
+ "epigraph-crypto",
+ "epigraph-db",
+ "epigraph-ingest",
+ "serde_json",
+ "sqlx 0.7.4",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "epigraph-interfaces"
 version = "0.3.0"
 dependencies = [

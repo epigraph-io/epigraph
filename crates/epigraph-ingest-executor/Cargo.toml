@@ -1,0 +1,41 @@
+[package]
+name = "epigraph-ingest-executor"
+description = "Persistence-layer executor for hierarchical workflow ingest plans"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Internal crates
+epigraph-core = { workspace = true }
+epigraph-crypto = { workspace = true }
+epigraph-db = { workspace = true }
+epigraph-ingest = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# Serialization
+serde_json = { workspace = true }
+
+# Identifiers & time
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+blake3 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
