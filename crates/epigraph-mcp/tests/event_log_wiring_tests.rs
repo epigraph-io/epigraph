@@ -83,9 +83,19 @@ async fn submit_claim_emits_claim_created_event() {
 
     let before = chrono::Utc::now();
 
-    tools::claims::submit_claim(&server, params)
+    let submit_result = tools::claims::submit_claim(&server, params)
         .await
         .expect("submit_claim succeeds");
+
+    // Pull the persisted claim_id out of the submit response so we can pin
+    // the event filter on it (matching the sibling I1-guard tests'
+    // specificity, and eliminating fragility under shared-pool concurrent
+    // test runs).
+    let submit_body = parse_list_events(&submit_result);
+    let persisted_id_str = submit_body["claim_id"]
+        .as_str()
+        .expect("submit_claim response includes claim_id")
+        .to_string();
 
     // Read back via the canonical surface — `list_events` MCP tool.
     let result = tools::events::list_events(
@@ -107,14 +117,16 @@ async fn submit_claim_emits_claim_created_event() {
     );
 
     // Stronger assertion: at least one of the events was emitted by the
-    // call we just made (created_at >= our marker). Without this guard, a
-    // stale row from a previous test run could mask a regression.
+    // call we just made (payload.claim_id matches, created_at >= marker).
+    // Without these guards, a stale row from a previous test run or a
+    // concurrent submit on a shared pool could mask a regression.
     let recent: Vec<&serde_json::Value> = body["events"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|e| {
             e["event_type"].as_str() == Some("claim.created")
+                && e["payload"]["claim_id"].as_str() == Some(persisted_id_str.as_str())
                 && e["created_at"]
                     .as_str()
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -125,7 +137,8 @@ async fn submit_claim_emits_claim_created_event() {
 
     assert!(
         !recent.is_empty(),
-        "expected at least one claim.created event with created_at >= {before}; got {body}"
+        "expected at least one claim.created event with payload.claim_id={persisted_id_str} \
+         and created_at >= {before}; got {body}"
     );
 }
 
