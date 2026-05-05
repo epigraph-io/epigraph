@@ -1006,6 +1006,14 @@ pub async fn patch_edge(
         }
     }
 
+    // Build the diff payload BEFORE handing `request.properties` to the repo
+    // (which moves the JSON value). The diff is what we hash and record in
+    // provenance — see I1 fix below for context.
+    let diff = serde_json::json!({
+        "valid_to": request.valid_to,
+        "properties": request.properties,
+    });
+
     let pool = &state.db_pool;
     // `?` maps DbError::NotFound → ApiError::NotFound via the From impl in
     // crates/epigraph-api/src/errors.rs (entity is propagated as "edge").
@@ -1018,8 +1026,15 @@ pub async fn patch_edge(
     .await?;
 
     // Record provenance when OAuth2-authenticated.
+    //
+    // Content-hash the DIFF (not the bare edge id). Pre-fix the hash was
+    // blake3(id.as_bytes()) and patch_payload was None — same edge always
+    // produced the same hash no matter what changed. The provenance log was
+    // reduced to "this edge was patched at some point," losing all diff
+    // information.
     if let Some(axum::Extension(ref auth)) = auth_ctx {
-        let content_hash = blake3::hash(id.as_bytes());
+        let diff_bytes = serde_json::to_vec(&diff).unwrap_or_default();
+        let content_hash = blake3::hash(&diff_bytes);
         if let Err(e) = crate::middleware::provenance::record_provenance(
             pool,
             auth,
@@ -1028,7 +1043,7 @@ pub async fn patch_edge(
             "patch",
             content_hash.as_bytes(),
             &[],
-            None,
+            Some(&diff),
         )
         .await
         {
@@ -3143,6 +3158,121 @@ mod db_tests {
         assert!(
             body_str.contains("properties") && body_str.contains("object"),
             "expected error to mention 'properties' and 'object'; got: {body_str}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // I1 — PATCH provenance must record a diff payload (not a degenerate
+    // hash of the bare edge id).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Two PATCHes with different bodies must produce provenance rows with
+    /// different `content_hash` values. Pre-fix, the hash was `blake3(id)`,
+    /// which is identical across patches — losing all diff information.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_records_diff_provenance(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "diff-prov source").await;
+        let target = seed_claim(&pool, agent_id, "diff-prov target").await;
+        let edge_id = EdgeRepository::create(
+            &pool,
+            source,
+            "claim",
+            target,
+            "claim",
+            "SUPPORTS",
+            Some(serde_json::json!({"weight": 0.5})),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let client_id = Uuid::new_v4();
+        insert_oauth_client(&pool, client_id).await;
+
+        let state = AppState::with_db(
+            pool.clone(),
+            ApiConfig {
+                require_signatures: false,
+                ..Default::default()
+            },
+        );
+        let router = edges_router_with_auth(state, auth_ctx(client_id));
+
+        // First PATCH: bumps weight.
+        let resp1 = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "properties": {"weight": 0.7},
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        // Second PATCH: different body — adds a tag.
+        let resp2 = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "properties": {"tag": "reviewed"},
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        // Two provenance rows, with different content_hash values.
+        let hashes: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT content_hash FROM provenance_log \
+             WHERE record_type = 'edge' AND record_id = $1 AND action = 'patch' \
+             ORDER BY created_at",
+        )
+        .bind(edge_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(hashes.len(), 2, "expected two patch provenance rows");
+        assert_ne!(
+            hashes[0], hashes[1],
+            "different patch bodies must produce different content_hash values"
+        );
+
+        // patch_payload column must be populated (not NULL) and reflect the
+        // diff that was applied.
+        let payloads: Vec<Option<serde_json::Value>> = sqlx::query_scalar(
+            "SELECT patch_payload FROM provenance_log \
+             WHERE record_type = 'edge' AND record_id = $1 AND action = 'patch' \
+             ORDER BY created_at",
+        )
+        .bind(edge_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            payloads[0].is_some() && payloads[1].is_some(),
+            "patch_payload must be recorded for both patches"
+        );
+        assert_ne!(
+            payloads[0], payloads[1],
+            "patch_payload must reflect the per-PATCH diff, not be a constant"
         );
     }
 }
