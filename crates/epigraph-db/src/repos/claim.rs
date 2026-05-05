@@ -121,6 +121,23 @@ impl ClaimRepository {
         .fetch_one(pool)
         .await?;
 
+        // Fire-and-forget claim.created event (closes #61). This is the
+        // central emit for ALL writers that go through ClaimRepository::create
+        // (MCP ingestion paths, API conventions, paper repo, tests). The
+        // dedup early-return above does NOT emit, so resubmissions of an
+        // existing content_hash do not pollute the audit log.
+        let _ = crate::repos::EventRepository::publish_or_log(
+            pool,
+            "claim.created",
+            Some(row.agent_id),
+            &serde_json::json!({
+                "claim_id": row.id,
+                "agent_id": row.agent_id,
+                "truth_value": row.truth_value,
+            }),
+        )
+        .await;
+
         let truth_value = TruthValue::new(row.truth_value)?;
 
         Ok(claim_from_row(
@@ -228,11 +245,31 @@ impl ClaimRepository {
         .fetch_one(&mut *conn)
         .await?;
 
-        let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
+        let row_id: Uuid = row.get("id");
+        let row_agent_id: Uuid = row.get("agent_id");
+        let row_truth_value: f64 = row.get("truth_value");
+
+        // Fire-and-forget claim.created event (closes #61). Same rationale
+        // as the create() method: emitted only on the post-INSERT branch
+        // (the dedup early-return above does not reach here). Uses
+        // publish_or_log_conn so the event rides the caller's transaction.
+        let _ = crate::repos::EventRepository::publish_or_log_conn(
+            &mut *conn,
+            "claim.created",
+            Some(row_agent_id),
+            &serde_json::json!({
+                "claim_id": row_id,
+                "agent_id": row_agent_id,
+                "truth_value": row_truth_value,
+            }),
+        )
+        .await;
+
+        let tv = TruthValue::new(row_truth_value)?;
         Ok(claim_from_row(
-            row.get("id"),
+            row_id,
             row.get("content"),
-            row.get("agent_id"),
+            row_agent_id,
             row.get("trace_id"),
             tv,
             row.get("created_at"),
@@ -1213,11 +1250,37 @@ impl ClaimRepository {
         .fetch_one(&mut *conn)
         .await?;
 
-        let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
+        let row_id: Uuid = row.get("id");
+        let row_agent_id: Uuid = row.get("agent_id");
+        let row_truth_value: f64 = row.get("truth_value");
+
+        // Fire-and-forget claim.created event (closes #61). Emitted from
+        // create_strict (not create_or_get) so:
+        //   (a) `claims.rs::create_strict(...)` direct callers also emit,
+        //   (b) create_or_get's success branch is exactly when create_strict
+        //       returned Ok — no duplicate emit needed there,
+        //   (c) the DuplicateKey/race branch in create_or_get correctly
+        //       does NOT emit (no row was actually inserted).
+        // Uses publish_or_log_conn so the event INSERT participates in the
+        // caller's transaction — if the caller rolls back, neither the claim
+        // nor the event lands.
+        let _ = crate::repos::EventRepository::publish_or_log_conn(
+            &mut *conn,
+            "claim.created",
+            Some(row_agent_id),
+            &serde_json::json!({
+                "claim_id": row_id,
+                "agent_id": row_agent_id,
+                "truth_value": row_truth_value,
+            }),
+        )
+        .await;
+
+        let tv = TruthValue::new(row_truth_value)?;
         Ok(claim_from_row(
-            row.get("id"),
+            row_id,
             row.get("content"),
-            row.get("agent_id"),
+            row_agent_id,
             row.get("trace_id"),
             tv,
             row.get("created_at"),
@@ -1318,7 +1381,28 @@ impl ClaimRepository {
         .fetch_optional(pool)
         .await?;
         // RETURNING is empty when the conflict path is taken, so None == not new.
-        Ok(row.map(|(b,)| b).unwrap_or(false))
+        let was_inserted = row.map(|(b,)| b).unwrap_or(false);
+
+        // Fire-and-forget claim.created event (closes #61), gated on actual
+        // insertion. ON CONFLICT (id) DO NOTHING swallows duplicate-id paths,
+        // and we rely on `was_inserted` (xmax=0 only on freshly-inserted rows)
+        // to skip emission for idempotent re-runs.
+        if was_inserted {
+            let truth_value = truth.value();
+            let _ = crate::repos::EventRepository::publish_or_log(
+                pool,
+                "claim.created",
+                Some(agent_id),
+                &serde_json::json!({
+                    "claim_id": id,
+                    "agent_id": agent_id,
+                    "truth_value": truth_value,
+                }),
+            )
+            .await;
+        }
+
+        Ok(was_inserted)
     }
 }
 

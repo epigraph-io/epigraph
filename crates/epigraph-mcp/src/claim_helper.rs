@@ -3,7 +3,7 @@
 //! docs/superpowers/specs/2026-04-26-s3a-epigraph-mcp-writer-migration-design.md.
 
 use epigraph_core::Claim;
-use epigraph_db::{ClaimRepository, EdgeRepository, EventRepository};
+use epigraph_db::{ClaimRepository, EdgeRepository};
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -57,24 +57,14 @@ pub async fn create_claim_idempotent(
         );
     }
 
-    // Emit a durable claim.created event on first-create only (closes #61).
-    // Resubmissions that hit the dedup path return was_created=false and
-    // must NOT generate a fresh event — otherwise idempotent re-runs would
-    // pollute the audit log with duplicate "create" rows.
-    if was_created {
-        let _ = EventRepository::publish_or_log(
-            pool,
-            "claim.created",
-            Some(claim.agent_id.as_uuid()),
-            &json!({
-                "claim_id": claim.id.as_uuid(),
-                "agent_id": claim.agent_id.as_uuid(),
-                "tool": tool_name,
-                "truth_value": claim.truth_value.value(),
-            }),
-        )
-        .await;
-    }
+    // Note: the durable `claim.created` event for this submission is emitted
+    // inside `ClaimRepository::create_strict` (which `create_or_get` calls on
+    // the success branch). Centralizing the emit at the repository boundary
+    // ensures all writers — submit_claim, ingest_paper, ingest_workflow,
+    // batch ingestion, API conventions — produce the event, not just the
+    // MCP submit_claim path. See claim.rs::create_strict for the emit site
+    // and crates/epigraph-db/src/repos/event.rs::publish_or_log_conn for
+    // the transactional sink.
 
     Ok((claim, was_created))
 }

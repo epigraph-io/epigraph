@@ -13,9 +13,9 @@ mod common;
 
 use common::*;
 
-use epigraph_core::Agent;
-use epigraph_crypto::AgentSigner;
-use epigraph_db::AgentRepository;
+use epigraph_core::{Agent, AgentId, Claim, TruthValue};
+use epigraph_crypto::{AgentSigner, ContentHasher};
+use epigraph_db::{AgentRepository, ClaimRepository};
 use epigraph_mcp::types::{ListEventsParams, SubmitClaimParams};
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
 use sqlx::PgPool;
@@ -206,6 +206,158 @@ async fn resubmit_does_not_emit_duplicate_claim_created() {
     );
 }
 
+/// Spec-review I1 regression guard: `ClaimRepository::create` is the
+/// boundary that `tools/ingestion.rs::ingest_paper` (line 204) and the
+/// API `routes/conventions.rs` paths call. Pre-fix the emit lived in
+/// `claim_helper.rs::create_claim_idempotent`, which `ingest_paper` and
+/// `ingest_paper_url` bypass entirely — so those paths never emitted
+/// `claim.created`. This test calls `ClaimRepository::create` directly
+/// (the smallest reproduction of the bug) and asserts the event surfaces.
+#[tokio::test]
+async fn claim_repo_create_emits_claim_created_event() {
+    let pool = test_pool_or_skip!();
+    let server = build_test_server(pool.clone(), [0xC5u8; 32]).await;
+
+    // Insert a fresh agent so the FK is satisfied.
+    let agent_id = Uuid::new_v4();
+    insert_test_agent(&pool, agent_id).await;
+
+    // Build a Claim with a unique content marker so we can pinpoint our
+    // event among any existing rows in the shared test DB.
+    let unique_marker = format!("ingest-path-emit-{}", Uuid::new_v4());
+    let mut claim = Claim::new(
+        unique_marker.clone(),
+        AgentId::from_uuid(agent_id),
+        [0u8; 32],
+        TruthValue::new(0.5).unwrap(),
+    );
+    claim.content_hash = ContentHasher::hash(unique_marker.as_bytes());
+
+    let before = chrono::Utc::now();
+
+    let persisted = ClaimRepository::create(&pool, &claim)
+        .await
+        .expect("ClaimRepository::create succeeds");
+    let persisted_id = persisted.id.as_uuid();
+
+    let result = tools::events::list_events(
+        &server,
+        ListEventsParams {
+            event_type: Some("claim.created".to_string()),
+            actor_id: Some(agent_id.to_string()),
+            limit: Some(50),
+        },
+    )
+    .await
+    .expect("list_events succeeds");
+
+    let body = parse_list_events(&result);
+    let recent: Vec<&serde_json::Value> = body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e["event_type"].as_str() == Some("claim.created")
+                && e["payload"]["claim_id"].as_str() == Some(persisted_id.to_string().as_str())
+                && e["created_at"]
+                    .as_str()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.with_timezone(&chrono::Utc) >= before)
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    assert_eq!(
+        recent.len(),
+        1,
+        "expected exactly one claim.created event for the claim we just \
+         created via ClaimRepository::create (the boundary used by \
+         tools/ingestion.rs::ingest_paper); got {body}"
+    );
+}
+
+/// Spec-review I1 regression guard, second flavor: `tools/workflow_ingest.rs`
+/// uses `ClaimRepository::create_with_id_if_absent`. Verify that path also
+/// emits exactly once, and that re-running with the same id does NOT
+/// double-emit (idempotent re-runs must not pollute the audit log).
+#[tokio::test]
+async fn claim_repo_create_with_id_if_absent_emits_once() {
+    let pool = test_pool_or_skip!();
+    let server = build_test_server(pool.clone(), [0xC6u8; 32]).await;
+
+    let agent_id = Uuid::new_v4();
+    insert_test_agent(&pool, agent_id).await;
+
+    let unique_marker = format!("workflow-ingest-emit-{}", Uuid::new_v4());
+    let claim_id = Uuid::new_v4();
+    let mut content_hash = [0u8; 32];
+    content_hash.copy_from_slice(&ContentHasher::hash(unique_marker.as_bytes()));
+
+    let before = chrono::Utc::now();
+
+    let was_new1 = ClaimRepository::create_with_id_if_absent(
+        &pool,
+        claim_id,
+        &unique_marker,
+        &content_hash,
+        agent_id,
+        TruthValue::new(0.5).unwrap(),
+        &["workflow_claim".to_string()],
+    )
+    .await
+    .expect("first create_with_id_if_absent");
+    assert!(was_new1, "first call must report was_inserted=true");
+
+    // Second call with the same id should NOT emit a second event.
+    let was_new2 = ClaimRepository::create_with_id_if_absent(
+        &pool,
+        claim_id,
+        &unique_marker,
+        &content_hash,
+        agent_id,
+        TruthValue::new(0.5).unwrap(),
+        &["workflow_claim".to_string()],
+    )
+    .await
+    .expect("second create_with_id_if_absent");
+    assert!(!was_new2, "second call must report was_inserted=false");
+
+    let result = tools::events::list_events(
+        &server,
+        ListEventsParams {
+            event_type: Some("claim.created".to_string()),
+            actor_id: Some(agent_id.to_string()),
+            limit: Some(50),
+        },
+    )
+    .await
+    .expect("list_events succeeds");
+
+    let body = parse_list_events(&result);
+    let recent: Vec<&serde_json::Value> = body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e["event_type"].as_str() == Some("claim.created")
+                && e["payload"]["claim_id"].as_str() == Some(claim_id.to_string().as_str())
+                && e["created_at"]
+                    .as_str()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.with_timezone(&chrono::Utc) >= before)
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    assert_eq!(
+        recent.len(),
+        1,
+        "expected exactly one claim.created event for the workflow ingest \
+         path (was_inserted gate must suppress the second call's emit); \
+         got {body}"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // agent.registered round-trip
 // ────────────────────────────────────────────────────────────────────────────
@@ -280,10 +432,21 @@ async fn create_agent_emits_agent_registered_event() {
 
 /// Invoking the MCP dispatch chokepoint (`emit_tool_invoked`, which
 /// `ServerHandler::call_tool` calls for every dispatch) must produce a
-/// `tool.invoked` event visible via `list_events`. We don't synthesize a
-/// full `RequestContext` here — that requires plumbing rmcp internals
-/// that aren't load-bearing for this fix. The chokepoint helper tests the
-/// same code path the dispatcher takes.
+/// `tool.invoked` event visible via `list_events`.
+///
+/// **Coverage gap (spec-review I2):** this test calls `emit_tool_invoked`
+/// directly rather than going through `ServerHandler::call_tool`. A
+/// future refactor that drops the `self.emit_tool_invoked(&request.name)`
+/// line at server.rs would pass this test silently. Synthesizing a full
+/// `rmcp::service::RequestContext` to drive `call_tool` end-to-end
+/// requires plumbing rmcp internals (mock service handle, peer info,
+/// cancellation token, etc.) that no other test in this crate constructs;
+/// the cost-benefit didn't justify the scaffolding for this PR.
+///
+/// Compensating safeguard: server.rs:`call_tool` carries a comment
+/// pointing at this test and noting the coupling, so a refactor that
+/// removes the line is at least visibly tied to its observability
+/// guarantee.
 #[tokio::test]
 async fn tool_dispatch_emits_tool_invoked_event() {
     let pool = test_pool_or_skip!();

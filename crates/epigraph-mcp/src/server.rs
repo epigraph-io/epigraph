@@ -698,10 +698,15 @@ impl ServerHandler for EpiGraphMcpFull {
         // macro-built dispatcher. Emission happens pre-dispatch on purpose
         // — failed/rejected invocations still land in the log, which
         // matches the "what agents did" auditability the issue asks for
-        // (closes #61). Round-trip is covered by
-        // `tests/event_log_wiring_tests.rs::tool_dispatch_emits_tool_invoked_event`,
-        // which exercises `emit_tool_invoked` directly to avoid synthesizing
-        // a full `RequestContext`.
+        // (closes #61).
+        //
+        // **DO NOT remove this line without updating
+        // `tests/event_log_wiring_tests.rs::tool_dispatch_emits_tool_invoked_event`.**
+        // That test exercises `emit_tool_invoked` directly (rather than
+        // synthesizing a full `rmcp::service::RequestContext` to drive
+        // `call_tool` end-to-end) and so cannot detect the regression of
+        // dropping this dispatch-side emit. The test docstring spells out
+        // the scaffolding cost; the coupling lives here.
         self.emit_tool_invoked(&request.name).await;
 
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
