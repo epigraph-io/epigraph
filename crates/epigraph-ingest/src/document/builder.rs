@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
+use crate::common::edges::{decomposes_edge, thesis_derivation_str};
 use crate::common::ids::{atom_id, compound_claim_id, content_hash};
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
-use crate::common::schema::ThesisDerivation;
 use crate::document::schema::{DocumentExtraction, Paragraph, SourceType};
 
 /// Convert slash-delimited paths from extraction ("sections/0/paragraphs/1/atoms/2")
@@ -47,24 +47,6 @@ const fn source_type_str(st: &SourceType) -> &'static str {
         SourceType::Transcript => "Transcript",
         SourceType::Legal => "Legal",
         SourceType::Tabular => "Tabular",
-    }
-}
-
-const fn thesis_derivation_str(td: &ThesisDerivation) -> &'static str {
-    match td {
-        ThesisDerivation::TopDown => "TopDown",
-        ThesisDerivation::BottomUp => "BottomUp",
-    }
-}
-
-fn decomposes_edge(source_id: Uuid, target_id: Uuid) -> PlannedEdge {
-    PlannedEdge {
-        source_id,
-        source_type: "claim".to_string(),
-        target_id,
-        target_type: "claim".to_string(),
-        relationship: "decomposes_to".to_string(),
-        properties: serde_json::json!({}),
     }
 }
 
