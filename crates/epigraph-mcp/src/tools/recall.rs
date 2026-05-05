@@ -94,7 +94,5 @@ pub async fn recall_with_context(
     _params: RecallWithContextParams,
 ) -> Result<CallToolResult, McpError> {
     // Filled in by later tasks. Stub keeps the file compilable.
-    Err(internal_error(
-        "recall_with_context not yet implemented",
-    ))
+    Err(internal_error("recall_with_context not yet implemented"))
 }
