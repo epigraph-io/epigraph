@@ -992,6 +992,20 @@ pub async fn patch_edge(
         });
     }
 
+    // PATCH body validation: `properties` MUST be a JSON object when present.
+    // Postgres `'{"a":1}'::jsonb || '5'::jsonb` silently produces `[{"a":1}, 5]`
+    // — the column changes from object to array with no error. The downstream
+    // SQL update relies on object-||-object shallow merge semantics; rejecting
+    // non-objects up front is the only safe option.
+    if let Some(ref props) = request.properties {
+        if !props.is_object() {
+            return Err(ApiError::ValidationError {
+                field: "properties".to_string(),
+                reason: "properties must be a JSON object".to_string(),
+            });
+        }
+    }
+
     let pool = &state.db_pool;
     // `?` maps DbError::NotFound → ApiError::NotFound via the From impl in
     // crates/epigraph-api/src/errors.rs (entity is propagated as "edge").
@@ -3085,4 +3099,50 @@ mod db_tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // C2 — PATCH /edges/:id must reject non-object `properties`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// PATCH with `properties` set to a JSON array (or any non-object)
+    /// must 400 — Postgres `'{"a":1}'::jsonb || '[1]'::jsonb` silently
+    /// produces an array, corrupting the column type.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_rejects_non_object_properties(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "non-object source").await;
+        let target = seed_claim(&pool, agent_id, "non-object target").await;
+        let edge_id = EdgeRepository::create(
+            &pool, source, "claim", target, "claim", "SUPPORTS", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "properties": [1, 2, 3],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = parse_body(response).await;
+        // ApiError::ValidationError serializes the field/reason in the body.
+        let body_str = body.to_string();
+        assert!(
+            body_str.contains("properties") && body_str.contains("object"),
+            "expected error to mention 'properties' and 'object'; got: {body_str}"
+        );
+    }
 }
