@@ -15,7 +15,7 @@
 //!     against the entity-type allowlist; paper-attribution uses
 //!     `'paper'` / `'claim'`, all other edges `'claim'` / `'claim'`.
 
-use epigraph_mcp::tools::recall::__test_only::fetch_batched_context;
+use epigraph_mcp::tools::recall::__test_only::{fetch_batched_context, paragraph_3072_population};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -335,4 +335,96 @@ async fn corroborates_includes_paper_doi(pool: PgPool) {
         .find(|e| e.claim_id == fx.corroborates_target)
         .expect("CORROBORATES target missing");
     assert_eq!(edge.paper_doi.as_deref(), Some("10.2/B"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn corroborates_appears_on_both_endpoints_when_both_in_result_set(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    // paragraphs[0] -[CORROBORATES]-> corroborates_target.
+    // Pass BOTH as paragraph_ids so each should see the other in its list.
+    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0], fx.corroborates_target], 8, 4)
+        .await
+        .unwrap();
+
+    // paragraphs[0] sees corroborates_target as a neighbor.
+    let p0_corr = ctx
+        .corroborates_by_paragraph
+        .get(&fx.paragraphs[0])
+        .expect("paragraphs[0] missing CORROBORATES entry");
+    assert!(
+        p0_corr.iter().any(|e| e.claim_id == fx.corroborates_target),
+        "paragraphs[0]'s CORROBORATES list must include corroborates_target",
+    );
+
+    // corroborates_target ALSO sees paragraphs[0] as a neighbor (the symmetric case).
+    let target_corr = ctx
+        .corroborates_by_paragraph
+        .get(&fx.corroborates_target)
+        .expect("corroborates_target missing CORROBORATES entry — bidirectional bug");
+    assert!(
+        target_corr.iter().any(|e| e.claim_id == fx.paragraphs[0]),
+        "corroborates_target's CORROBORATES list must include paragraphs[0]",
+    );
+
+    // Per-direction-per-paragraph total accounting.
+    let p0_total = ctx
+        .corroborates_total_by_paragraph
+        .get(&fx.paragraphs[0])
+        .copied()
+        .unwrap_or(0);
+    let target_total = ctx
+        .corroborates_total_by_paragraph
+        .get(&fx.corroborates_target)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        p0_total, 1,
+        "paragraphs[0] should have total=1 corroborates neighbor"
+    );
+    assert_eq!(
+        target_total, 1,
+        "corroborates_target should have total=1 corroborates neighbor"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
+    use epigraph_crypto::AgentSigner;
+    use epigraph_mcp::embed::McpEmbedder;
+    use epigraph_mcp::tools::recall::{recall_with_context, RecallWithContextParams};
+    use epigraph_mcp::EpiGraphMcpFull;
+
+    // Seed: paragraphs with 1536d embeddings only — embedding_3072 untouched.
+    let _fx = fixture::build(&pool).await;
+
+    // Sanity: helper reports 0.0 for the unpopulated 3072 column.
+    let frac = paragraph_3072_population(&pool)
+        .await
+        .expect("paragraph_3072_population helper");
+    assert_eq!(
+        frac, 0.0,
+        "fixture should leave embedding_3072 unpopulated on level=2 paragraphs"
+    );
+
+    let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
+    let embedder = McpEmbedder::new(pool.clone(), None); // mock — no API key
+    let server = EpiGraphMcpFull::new(pool.clone(), signer, embedder, /*read_only=*/ false);
+
+    let params = RecallWithContextParams {
+        query: "anything".to_string(),
+        limit: Some(10),
+        min_truth: None,
+        centroid_dim: Some(3072),
+        paper_doi_filter: None,
+        siblings_limit: None,
+        corroborates_limit: None,
+    };
+
+    let result = recall_with_context(&server, params).await;
+    let err = result.expect_err("expected an error for centroid_dim=3072 with no population");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("3072") && msg.contains("populated"),
+        "error message should mention 3072 and population; got: {msg}",
+    );
 }

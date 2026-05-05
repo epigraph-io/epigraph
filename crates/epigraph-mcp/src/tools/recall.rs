@@ -14,7 +14,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     )]))
 }
 
-async fn detect_centroid_dim(pool: &sqlx::PgPool) -> Result<u32, sqlx::Error> {
+pub async fn paragraph_3072_population(pool: &sqlx::PgPool) -> Result<f64, sqlx::Error> {
     let row = sqlx::query!(
         r#"
         SELECT
@@ -26,12 +26,12 @@ async fn detect_centroid_dim(pool: &sqlx::PgPool) -> Result<u32, sqlx::Error> {
     )
     .fetch_one(pool)
     .await?;
+    Ok(row.frac_3072.unwrap_or(0.0))
+}
 
-    Ok(if row.frac_3072.unwrap_or(0.0) >= 0.5 {
-        3072
-    } else {
-        1536
-    })
+async fn detect_centroid_dim(pool: &sqlx::PgPool) -> Result<u32, sqlx::Error> {
+    let frac = paragraph_3072_population(pool).await?;
+    Ok(if frac >= 0.5 { 3072 } else { 1536 })
 }
 
 async fn compute_corpus_scope(pool: &sqlx::PgPool) -> Result<CorpusScope, sqlx::Error> {
@@ -158,6 +158,20 @@ pub async fn recall_with_context(
             .await
             .map_err(|e| internal_error(format!("auto-detect centroid_dim: {e}")))?,
     };
+
+    // Spec §3.4: explicit 3072 against an unpopulated column must error
+    // (otherwise the empty kNN result is indistinguishable from "no relevant paragraphs").
+    if matches!(params.centroid_dim, Some(3072)) {
+        let frac = paragraph_3072_population(&server.pool)
+            .await
+            .map_err(|e| internal_error(format!("3072 population check: {e}")))?;
+        if frac == 0.0 {
+            return Err(invalid_params(
+                "centroid_dim=3072 requested but embedding_3072 has no populated rows on level=2 paragraphs; re-run with centroid_dim=1536 or omit to auto-detect"
+                    .to_string(),
+            ));
+        }
+    }
 
     // Stage 2: embed query at the right model (1536 -> -small, 3072 -> -large).
     let query_embedding = server
@@ -563,13 +577,15 @@ pub async fn fetch_batched_context(
         let rows = sqlx::query!(
             r#"
             WITH neighbors AS (
-                SELECT
-                    CASE WHEN e.source_id = ANY($1) THEN e.source_id ELSE e.target_id END AS paragraph_id,
-                    CASE WHEN e.source_id = ANY($1) THEN e.target_id ELSE e.source_id END AS neighbor_id,
-                    COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
+                SELECT e.source_id AS paragraph_id, e.target_id AS neighbor_id,
+                       COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
-                WHERE (e.source_id = ANY($1) OR e.target_id = ANY($1))
-                  AND e.relationship = 'CORROBORATES'
+                WHERE e.source_id = ANY($1) AND e.relationship = 'CORROBORATES'
+                UNION ALL
+                SELECT e.target_id AS paragraph_id, e.source_id AS neighbor_id,
+                       COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
+                FROM edges e
+                WHERE e.target_id = ANY($1) AND e.relationship = 'CORROBORATES'
             ),
             joined AS (
                 SELECT
@@ -638,5 +654,7 @@ pub async fn fetch_batched_context(
 
 #[doc(hidden)]
 pub mod __test_only {
-    pub use super::{fetch_batched_context, BatchedContext, ParagraphCore};
+    pub use super::{
+        fetch_batched_context, paragraph_3072_population, BatchedContext, ParagraphCore,
+    };
 }
