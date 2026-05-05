@@ -3,7 +3,8 @@ use epigraph_api::routes::webhooks::{start_webhook_dispatcher, WebhookDeliveryCo
 use epigraph_api::{create_router, ApiConfig, AppState};
 #[cfg(feature = "db")]
 use epigraph_jobs::{
-    cluster_graph::ClusterGraphHandler, EpiGraphJob, JobQueue, JobRunner, PostgresJobQueue,
+    cluster_graph::ClusterGraphHandler, theme_cluster_rebuild::ThemeClusterRebuildHandler,
+    EpiGraphJob, JobQueue, JobRunner, PostgresJobQueue,
 };
 use std::sync::Arc;
 #[cfg(feature = "db")]
@@ -210,17 +211,24 @@ async fn main() {
         state.with_providers(providers)
     };
 
-    // Start background job runner with ClusterGraph handler (db feature only).
-    // The runner uses PostgresJobQueue for durable persistence.  The cron loop
-    // fires 60 s after startup then every 24 h thereafter.
+    // Start background job runner with ClusterGraph + ThemeClusterRebuild
+    // handlers (db feature only).  The runner uses PostgresJobQueue for
+    // durable persistence.  Each cron loop fires 60 s after startup then
+    // every 24 h thereafter.
     #[cfg(feature = "db")]
     {
         let queue: Arc<dyn JobQueue> = Arc::new(PostgresJobQueue::new(job_pool.clone()));
-        let queue_for_cron = Arc::clone(&queue);
+        let queue_for_cluster_cron = Arc::clone(&queue);
+        let queue_for_theme_cron = Arc::clone(&queue);
 
         let handler_pool = Arc::new(job_pool);
         let mut runner = JobRunner::new(2, queue);
-        runner.register_handler(Arc::new(ClusterGraphHandler::new(handler_pool)));
+        runner.register_handler(Arc::new(ClusterGraphHandler::new(Arc::clone(
+            &handler_pool,
+        ))));
+        runner.register_handler(Arc::new(ThemeClusterRebuildHandler::new(Arc::clone(
+            &handler_pool,
+        ))));
 
         tokio::spawn(async move {
             runner.start().await;
@@ -236,7 +244,7 @@ async fn main() {
                 .into_job()
                 {
                     Ok(job) => {
-                        if let Err(e) = queue_for_cron.enqueue(job).await {
+                        if let Err(e) = queue_for_cluster_cron.enqueue(job).await {
                             tracing::error!(
                                 error = %e,
                                 "failed to enqueue nightly ClusterGraph job"
@@ -256,7 +264,43 @@ async fn main() {
             }
         });
 
-        tracing::info!("Job runner started (2 workers); nightly ClusterGraph job scheduled");
+        // Sibling cron: ThemeClusterRebuild — same 60 s warmup + 24 h
+        // interval as ClusterGraph.  `skip_if_unchanged: true` makes this
+        // a cheap no-op on idle days.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            loop {
+                match (EpiGraphJob::ThemeClusterRebuild {
+                    max_themes: 50,
+                    min_claims_per_theme: 5,
+                    skip_if_unchanged: true,
+                })
+                .into_job()
+                {
+                    Ok(job) => {
+                        if let Err(e) = queue_for_theme_cron.enqueue(job).await {
+                            tracing::error!(
+                                error = %e,
+                                "failed to enqueue nightly ThemeClusterRebuild job"
+                            );
+                        } else {
+                            tracing::info!("Enqueued nightly ThemeClusterRebuild job");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "failed to serialize ThemeClusterRebuild job payload"
+                        );
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(86_400)).await;
+            }
+        });
+
+        tracing::info!(
+            "Job runner started (2 workers); nightly ClusterGraph + ThemeClusterRebuild jobs scheduled"
+        );
     }
 
     // Start webhook dispatcher (subscribes to event bus for delivery)
