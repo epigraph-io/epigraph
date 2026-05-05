@@ -1,10 +1,8 @@
--- migrations/_reconcile_2026_05_05.sql
+-- ops/reconcile_2026_05_05.sql
 -- ONE-SHOT, run by hand against prod with `pg_dump -Fc` backup first.
+-- Lives outside migrations/ so sqlx::migrate! does not pick it up.
 -- Brings _sqlx_migrations into agreement with the public-repo numbering
 -- so future `sqlx migrate run --source ./migrations` is incremental.
---
--- This file's leading underscore prevents sqlx::migrate! from picking it up
--- as a regular migration; sqlx requires the form NNN_NAME.sql.
 --
 -- Checksums are sha384 of the raw migration SQL bytes (sqlx 0.7 stores
 -- BYTEA, not hex text). Generated via:
