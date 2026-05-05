@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::{tool, tool_router, ServerHandler};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
@@ -51,6 +51,38 @@ impl EpiGraphMcpFull {
         *cached = Some(id);
         drop(cached);
         Ok(id)
+    }
+
+    /// Emit a durable `tool.invoked` event for an MCP dispatch.
+    ///
+    /// Called from `ServerHandler::call_tool` for every tool invocation
+    /// (closes #61's tool.invoked requirement). Public so integration
+    /// tests can exercise the same wiring without having to synthesize a
+    /// full `rmcp::service::RequestContext`. Always best-effort: failure
+    /// to publish must not break dispatch.
+    pub async fn emit_tool_invoked(&self, tool_name: &str) {
+        let actor_id = match self.agent_id().await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(
+                    tool = tool_name,
+                    error = ?e,
+                    "tool.invoked: could not resolve MCP agent_id; recording event with NULL actor"
+                );
+                None
+            }
+        };
+
+        let _ = epigraph_db::EventRepository::publish_or_log(
+            &self.pool,
+            "tool.invoked",
+            actor_id,
+            &serde_json::json!({
+                "tool": tool_name,
+                "read_only": self.read_only,
+            }),
+        )
+        .await;
     }
 
     /// Return an error if the server is in read-only mode.
@@ -633,7 +665,16 @@ impl EpiGraphMcpFull {
     }
 }
 
-#[tool_handler]
+// Manual `ServerHandler` impl (in lieu of `#[tool_handler]`) so `call_tool`
+// can be wrapped with durable event emission. Mirrors the macro's expansion
+// for `list_tools` and `get_tool` verbatim — see
+// `rmcp-macros-0.15.0/src/tool_handler.rs` for the canonical body.
+//
+// `call_tool` is the single chokepoint for all 43 MCP tool invocations. We
+// emit one `tool.invoked` event per call (closes #61's tool.invoked
+// requirement) and forward to the macro-built dispatcher unchanged. Event
+// emission is fire-and-forget; a failed event publish must not break tool
+// dispatch.
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.read_only { "read-only" } else { "full" };
@@ -645,5 +686,41 @@ impl ServerHandler for EpiGraphMcpFull {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        // Single chokepoint for all 43 MCP tool invocations: emit a durable
+        // tool.invoked event before dispatch, then forward to the
+        // macro-built dispatcher. Emission happens pre-dispatch on purpose
+        // — failed/rejected invocations still land in the log, which
+        // matches the "what agents did" auditability the issue asks for
+        // (closes #61). Round-trip is covered by
+        // `tests/event_log_wiring_tests.rs::tool_dispatch_emits_tool_invoked_event`,
+        // which exercises `emit_tool_invoked` directly to avoid synthesizing
+        // a full `RequestContext`.
+        self.emit_tool_invoked(&request.name).await;
+
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        Ok(rmcp::model::ListToolsResult {
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        self.tool_router.get(name).cloned()
     }
 }

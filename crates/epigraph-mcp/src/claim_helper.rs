@@ -3,7 +3,7 @@
 //! docs/superpowers/specs/2026-04-26-s3a-epigraph-mcp-writer-migration-design.md.
 
 use epigraph_core::Claim;
-use epigraph_db::{ClaimRepository, EdgeRepository};
+use epigraph_db::{ClaimRepository, EdgeRepository, EventRepository};
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -55,6 +55,25 @@ pub async fn create_claim_idempotent(
             error = %e,
             "AUTHORED verb-edge emit failed; claim row persisted as orphan"
         );
+    }
+
+    // Emit a durable claim.created event on first-create only (closes #61).
+    // Resubmissions that hit the dedup path return was_created=false and
+    // must NOT generate a fresh event — otherwise idempotent re-runs would
+    // pollute the audit log with duplicate "create" rows.
+    if was_created {
+        let _ = EventRepository::publish_or_log(
+            pool,
+            "claim.created",
+            Some(claim.agent_id.as_uuid()),
+            &json!({
+                "claim_id": claim.id.as_uuid(),
+                "agent_id": claim.agent_id.as_uuid(),
+                "tool": tool_name,
+                "truth_value": claim.truth_value.value(),
+            }),
+        )
+        .await;
     }
 
     Ok((claim, was_created))

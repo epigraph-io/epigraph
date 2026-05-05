@@ -100,4 +100,37 @@ impl EventRepository {
             .await?;
         Ok(version.unwrap_or(0))
     }
+
+    /// Fire-and-forget event publish: insert and swallow + log on failure.
+    ///
+    /// Used at persistence-side hooks (claim/agent creation, tool dispatch)
+    /// where event emission must never roll back the underlying write.
+    /// Returns the inserted event id on success, `None` on failure (after
+    /// logging via `tracing::warn!`).
+    ///
+    /// This is the canonical sink for the MCP `list_events` surface and
+    /// must be used wherever durable event observability is required.
+    /// In-memory pushes to `EventStore::push` are NOT visible to MCP and
+    /// should be paired with — or replaced by — a call to this method
+    /// when MCP visibility is needed.
+    pub async fn publish_or_log(
+        pool: &PgPool,
+        event_type: &str,
+        actor_id: Option<Uuid>,
+        payload: &serde_json::Value,
+    ) -> Option<Uuid> {
+        match Self::insert(pool, event_type, actor_id, payload).await {
+            Ok(id) => Some(id),
+            Err(err) => {
+                tracing::warn!(
+                    event_type = event_type,
+                    actor_id = ?actor_id,
+                    error = %err,
+                    "EventRepository::publish_or_log: failed to persist event; \
+                     downstream write succeeded but observability is degraded"
+                );
+                None
+            }
+        }
+    }
 }
