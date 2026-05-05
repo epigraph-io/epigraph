@@ -27,9 +27,10 @@ pub struct WorkflowIngestExecutionResult {
     pub claims_ingested: usize,
     pub claims_skipped_dedup: usize,
     pub executes_edges_created: usize,
-    /// Reserved for Phase 4.3 (issue #51): the `variant_of` edge between
-    /// successive workflow generations is added in a follow-up PR. This
-    /// field is always `false` in the current phase.
+    /// `true` when this ingest inserted (or upserted) a `workflow → variant_of
+    /// → workflow` edge, i.e. when the extraction had `parent_canonical_name`
+    /// set. Idempotent re-ingests that hit the gate at step 1 return `false`
+    /// (no insertion attempted) even when the edge already exists in the DB.
     pub variant_of_edge_created: bool,
     pub relationship_edges_created: usize,
     /// `true` when the idempotency gate short-circuited (workflow already
@@ -103,6 +104,30 @@ pub async fn execute_workflow_ingest_plan(
     )
     .await
     .map_err(|e| IngestExecutorError::WorkflowInsert(e.to_string()))?;
+
+    // ── 3a. variant_of edge for hierarchical workflows (issue #51) ──────
+    // When a workflow is ingested with parent_canonical_name (generation > 0
+    // and the parent already exists), insert workflow → variant_of → parent
+    // so graph-traversal queries that don't know about workflows.parent_id
+    // can still see the lineage. Idempotent on re-ingest via
+    // create_if_not_exists.
+    let variant_of_edge_created = if let Some(parent_id_uuid) = parent_id {
+        EdgeRepository::create_if_not_exists(
+            pool,
+            workflow_id,
+            "workflow",
+            parent_id_uuid,
+            "workflow",
+            "variant_of",
+            Some(serde_json::json!({"generation": generation})),
+            None,
+            None,
+        )
+        .await?;
+        true
+    } else {
+        false
+    };
 
     // ── 4. Ensure author agents ──────────────────────────────────────────
     let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
@@ -233,7 +258,7 @@ pub async fn execute_workflow_ingest_plan(
         claims_ingested,
         claims_skipped_dedup,
         executes_edges_created: executes_edges,
-        variant_of_edge_created: false,
+        variant_of_edge_created,
         relationship_edges_created: relationships_created,
         already_ingested: false,
     })

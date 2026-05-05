@@ -42,6 +42,43 @@ fn build_minimal_workflow_extraction(canonical_name: &str) -> WorkflowExtraction
     }
 }
 
+/// Build a hierarchical (generation 1) workflow whose `parent_canonical_name`
+/// points at an already-ingested parent.
+fn build_workflow_with_parent(
+    canonical_name: &str,
+    parent_canonical_name: &str,
+) -> WorkflowExtraction {
+    WorkflowExtraction {
+        source: WorkflowSource {
+            canonical_name: canonical_name.to_string(),
+            goal: "Validate variant_of edge creation for hierarchical workflows".to_string(),
+            generation: 1,
+            parent_canonical_name: Some(parent_canonical_name.to_string()),
+            authors: vec![],
+            expected_outcome: None,
+            tags: vec![],
+            metadata: serde_json::json!({}),
+        },
+        thesis: Some("Hierarchical variants get a variant_of edge to their parent".to_string()),
+        thesis_derivation: ThesisDerivation::TopDown,
+        phases: vec![Phase {
+            title: "Phase 1".to_string(),
+            summary: "Run the executor on a hierarchical variant".to_string(),
+            steps: vec![Step {
+                compound: "Invoke executor with parent_canonical_name set".to_string(),
+                rationale: "variant_of edge contract".to_string(),
+                operations: vec![
+                    "Call execute_workflow_ingest_plan".to_string(),
+                    "Verify variant_of edge exists".to_string(),
+                ],
+                generality: vec![2, 1],
+                confidence: 0.9,
+            }],
+        }],
+        relationships: vec![],
+    }
+}
+
 /// Re-running the executor with the same plan must short-circuit on the
 /// idempotency gate: no new claims, no duplicated edges.
 #[sqlx::test(migrations = "../../migrations")]
@@ -113,7 +150,7 @@ async fn execute_smoke(pool: PgPool) {
     assert!(!r.already_ingested);
     assert!(
         !r.variant_of_edge_created,
-        "phase 4.2 leaves variant_of for phase 4.3"
+        "non-hierarchical workflow (no parent_canonical_name) must not create a variant_of edge"
     );
     assert!(r.claims_ingested > 0);
     assert!(r.executes_edges_created > 0);
@@ -130,4 +167,76 @@ async fn execute_smoke(pool: PgPool) {
     // workflow_id is deterministic from canonical_name + generation.
     let recomputed = epigraph_ingest::workflow::builder::root_workflow_id(&extraction);
     assert_eq!(r.workflow_id, recomputed);
+}
+
+/// Hierarchical workflows (those with `parent_canonical_name` set) must get a
+/// `variant_of` edge from the variant's workflow row to the parent's workflow
+/// row. Closes #51.
+#[sqlx::test(migrations = "../../migrations")]
+async fn execute_creates_variant_of_edge_for_hierarchical_workflow(pool: PgPool) {
+    // Step 1: ingest a parent workflow.
+    let parent_extraction = build_minimal_workflow_extraction("parent_workflow_v1");
+    let parent_plan = epigraph_ingest::workflow::builder::build_ingest_plan(&parent_extraction);
+    let parent = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &pool,
+        &parent_plan,
+        &parent_extraction,
+    )
+    .await
+    .expect("parent ingest");
+
+    // Step 2: ingest a variant whose parent_canonical_name points at the parent.
+    let variant_extraction = build_workflow_with_parent("variant_v1", "parent_workflow_v1");
+    let variant_plan = epigraph_ingest::workflow::builder::build_ingest_plan(&variant_extraction);
+    let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &pool,
+        &variant_plan,
+        &variant_extraction,
+    )
+    .await
+    .expect("variant ingest");
+
+    assert!(
+        result.variant_of_edge_created,
+        "variant_of_edge_created should be true for hierarchical workflows"
+    );
+
+    // Step 3: confirm the edge actually lives in the DB.
+    let row_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM edges
+           WHERE source_id = $1
+             AND target_id = $2
+             AND relationship = 'variant_of'"#,
+    )
+    .bind(result.workflow_id)
+    .bind(parent.workflow_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row_count, 1, "expected exactly one variant_of edge");
+
+    // Step 4: re-ingest must be idempotent — still exactly one edge.
+    let _result2 = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &pool,
+        &variant_plan,
+        &variant_extraction,
+    )
+    .await
+    .expect("variant re-ingest");
+
+    let row_count2: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM edges
+           WHERE source_id = $1
+             AND target_id = $2
+             AND relationship = 'variant_of'"#,
+    )
+    .bind(result.workflow_id)
+    .bind(parent.workflow_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row_count2, 1,
+        "re-ingest must not duplicate the variant_of edge"
+    );
 }
