@@ -35,6 +35,19 @@ pub fn _test_event_store() -> std::sync::Arc<crate::routes::events::EventStore> 
     crate::routes::events::global_event_store().clone()
 }
 
+/// Apply all pending SQL migrations from the workspace `migrations/` directory.
+///
+/// Migrations are embedded into the binary at compile time by `sqlx::migrate!()`.
+/// Calling this in `bin/server.rs` (and `bin/epigraph-migrate.rs`) before the
+/// HTTP listener binds ensures fresh deploys never serve traffic against a
+/// stale schema.
+#[cfg(feature = "db")]
+pub async fn run_migrations(
+    pool: &epigraph_db::PgPool,
+) -> Result<(), sqlx::migrate::MigrateError> {
+    sqlx::migrate!("../../migrations").run(pool).await
+}
+
 #[cfg(feature = "db")]
 pub async fn build_app_for_tests(database_url: &str) -> Result<axum::Router, sqlx::Error> {
     let pool = sqlx::postgres::PgPoolOptions::new()
