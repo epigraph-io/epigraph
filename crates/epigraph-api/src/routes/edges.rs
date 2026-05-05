@@ -2743,11 +2743,10 @@ mod db_tests {
         //   A -SUPPORTS-> B  (the one we expect to match)
         //   A -CORROBORATES-> B
         //   A -SUPPORTS-> C
-        let _ab_supports = EdgeRepository::create(
-            &pool, a, "claim", b, "claim", "SUPPORTS", None, None, None,
-        )
-        .await
-        .unwrap();
+        let _ab_supports =
+            EdgeRepository::create(&pool, a, "claim", b, "claim", "SUPPORTS", None, None, None)
+                .await
+                .unwrap();
         let _ab_corroborates = EdgeRepository::create(
             &pool,
             a,
@@ -2761,11 +2760,10 @@ mod db_tests {
         )
         .await
         .unwrap();
-        let _ac_supports = EdgeRepository::create(
-            &pool, a, "claim", c, "claim", "SUPPORTS", None, None, None,
-        )
-        .await
-        .unwrap();
+        let _ac_supports =
+            EdgeRepository::create(&pool, a, "claim", c, "claim", "SUPPORTS", None, None, None)
+                .await
+                .unwrap();
 
         let state = test_state(pool.clone());
         let router = edges_router(state);

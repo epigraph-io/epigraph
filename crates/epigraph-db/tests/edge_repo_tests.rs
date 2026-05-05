@@ -85,5 +85,8 @@ async fn create_if_not_exists_distinguishes_by_relationship(pool: PgPool) {
     .await
     .unwrap();
 
-    assert_ne!(row_a.id, row_b.id, "different relationship → different edge");
+    assert_ne!(
+        row_a.id, row_b.id,
+        "different relationship → different edge"
+    );
 }
