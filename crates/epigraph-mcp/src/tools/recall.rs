@@ -65,6 +65,7 @@ pub struct RecallWithContextParams {
     pub paper_doi_filter: Option<String>,
     pub siblings_limit: Option<u32>,
     pub corroborates_limit: Option<u32>,
+    pub neighbor_paragraphs_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,6 +92,9 @@ pub struct RecallHit {
     pub corroborates: Vec<CorroboratesEdge>,
     pub corroborates_total: usize,
     pub corroborates_truncated: bool,
+    pub neighbor_paragraphs: Vec<NeighborParagraph>,
+    pub neighbor_paragraphs_total: usize,
+    pub neighbor_paragraphs_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,6 +134,29 @@ pub struct CorroboratesEdge {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct NeighborParagraph {
+    pub paragraph_id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub paper: PaperMeta,
+    pub via: Vec<NeighborPath>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NeighborPath {
+    ContinuesArgument,
+    AtomBridge {
+        atom_id: Uuid,
+    },
+    AtomAtomBridge {
+        atom_a: Uuid,
+        atom_b: Uuid,
+        relationship: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CorpusScope {
     pub claims_total: usize,
     pub paragraph_total: usize,
@@ -145,6 +172,7 @@ pub async fn recall_with_context(
     let min_truth = params.min_truth.unwrap_or(0.3);
     let siblings_limit = params.siblings_limit.unwrap_or(8);
     let corroborates_limit = params.corroborates_limit.unwrap_or(4);
+    let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
 
     // Stage 1: pick centroid_dim (request hint OR auto-detect via population threshold).
     let centroid_dim = match params.centroid_dim {
@@ -267,6 +295,15 @@ pub async fn recall_with_context(
             .unwrap_or(corroborates.len());
         let corroborates_truncated = corroborates_total > corroborates.len();
 
+        let (neighbor_paragraphs, neighbor_paragraphs_total, neighbor_paragraphs_truncated) =
+            assemble_neighbor_paragraphs(
+                paragraph_id,
+                &atoms,
+                &siblings,
+                &ctx,
+                neighbor_paragraphs_limit,
+            );
+
         results.push(RecallHit {
             paragraph_id,
             paragraph_content: core.content.clone(),
@@ -283,6 +320,9 @@ pub async fn recall_with_context(
             corroborates,
             corroborates_total,
             corroborates_truncated,
+            neighbor_paragraphs,
+            neighbor_paragraphs_total,
+            neighbor_paragraphs_truncated,
         });
     }
 
@@ -313,6 +353,15 @@ pub struct BatchedContext {
     pub siblings_total_by_paragraph: std::collections::HashMap<Uuid, usize>,
     pub corroborates_by_paragraph: std::collections::HashMap<Uuid, Vec<CorroboratesEdge>>,
     pub corroborates_total_by_paragraph: std::collections::HashMap<Uuid, usize>,
+    /// continues_argument neighbors of each input paragraph (bidirectional).
+    pub continues_argument_by_paragraph: std::collections::HashMap<Uuid, Vec<Uuid>>,
+    /// atom_a -> [(atom_b, relationship)] where atom_a is one of "our" atoms
+    /// (a level=3 child of an input paragraph) and atom_b is on the OTHER end
+    /// of any non-decomposes_to edge between two level=3 atoms.
+    pub atom_atom_links_by_atom: std::collections::HashMap<Uuid, Vec<(Uuid, String)>>,
+    /// atom_b -> [parent paragraph IDs] (full parent list for atoms reached via
+    /// atom-atom-bridge). Used to resolve which paragraphs contain atom_b.
+    pub paragraphs_by_atom: std::collections::HashMap<Uuid, Vec<Uuid>>,
 }
 
 pub async fn fetch_batched_context(
@@ -336,6 +385,11 @@ pub async fn fetch_batched_context(
         Default::default();
     let mut corroborates_total_by_paragraph: std::collections::HashMap<Uuid, usize> =
         Default::default();
+    let mut continues_argument_by_paragraph: std::collections::HashMap<Uuid, Vec<Uuid>> =
+        Default::default();
+    let mut atom_atom_links_by_atom: std::collections::HashMap<Uuid, Vec<(Uuid, String)>> =
+        Default::default();
+    let mut paragraphs_by_atom: std::collections::HashMap<Uuid, Vec<Uuid>> = Default::default();
 
     if paragraph_ids.is_empty() {
         return Ok(BatchedContext {
@@ -349,57 +403,10 @@ pub async fn fetch_batched_context(
             siblings_total_by_paragraph,
             corroborates_by_paragraph,
             corroborates_total_by_paragraph,
+            continues_argument_by_paragraph,
+            atom_atom_links_by_atom,
+            paragraphs_by_atom,
         });
-    }
-
-    // 1. Paragraphs themselves (content + truth_value).
-    {
-        let rows = sqlx::query!(
-            "SELECT id, content, truth_value FROM claims WHERE id = ANY($1)",
-            paragraph_ids
-        )
-        .fetch_all(pool)
-        .await?;
-        for r in rows {
-            paragraph_meta.insert(
-                r.id,
-                ParagraphCore {
-                    content: r.content,
-                    truth_value: r.truth_value,
-                },
-            );
-        }
-    }
-
-    // 2. Papers via paper-attribution asserts edge.
-    {
-        let rows = sqlx::query!(
-            r#"
-            SELECT
-                e.target_id AS paragraph_id,
-                p.id AS paper_id,
-                p.doi,
-                COALESCE(p.title, '') AS "title!"
-            FROM edges e
-            JOIN papers p ON p.id = e.source_id
-            WHERE e.target_id = ANY($1)
-              AND e.relationship = 'asserts'
-              AND e.source_type = 'paper'
-            "#,
-            paragraph_ids
-        )
-        .fetch_all(pool)
-        .await?;
-        for r in rows {
-            paper_meta.insert(
-                r.paragraph_id,
-                PaperMeta {
-                    paper_id: r.paper_id,
-                    doi: Some(r.doi),
-                    title: r.title,
-                },
-            );
-        }
     }
 
     // 3. Section parents (level=1 via decomposes_to incoming).
@@ -638,6 +645,178 @@ pub async fn fetch_batched_context(
         }
     }
 
+    // 8. continues_argument neighbors (Query A) — bidirectional.
+    {
+        let rows = sqlx::query!(
+            r#"
+            SELECT e.source_id AS "paragraph_id!", e.target_id AS "neighbor_id!"
+            FROM edges e
+            WHERE e.source_id = ANY($1) AND e.relationship = 'continues_argument'
+            UNION ALL
+            SELECT e.target_id AS "paragraph_id!", e.source_id AS "neighbor_id!"
+            FROM edges e
+            WHERE e.target_id = ANY($1) AND e.relationship = 'continues_argument'
+            "#,
+            paragraph_ids
+        )
+        .fetch_all(pool)
+        .await?;
+        for r in rows {
+            continues_argument_by_paragraph
+                .entry(r.paragraph_id)
+                .or_default()
+                .push(r.neighbor_id);
+        }
+    }
+
+    // 9. Atom-atom edges (Query C) — both directions. Restricted to non-decomposes_to
+    //    edges between two level=3 atoms. atom_a is "ours" (a level=3 child of an
+    //    input paragraph); atom_b is on the other end.
+    {
+        let our_atom_ids: Vec<Uuid> = atoms_by_paragraph
+            .values()
+            .flat_map(|v| v.iter().map(|a| a.atom_id))
+            .collect();
+        if !our_atom_ids.is_empty() {
+            let rows = sqlx::query!(
+                r#"
+                WITH forward AS (
+                    SELECT e.source_id AS atom_a, e.target_id AS atom_b, e.relationship
+                    FROM edges e
+                    JOIN claims ca ON ca.id = e.source_id
+                    JOIN claims cb ON cb.id = e.target_id
+                    WHERE e.source_id = ANY($1)
+                      AND e.relationship != 'decomposes_to'
+                      AND (ca.properties->>'level')::int = 3
+                      AND (cb.properties->>'level')::int = 3
+                ),
+                backward AS (
+                    SELECT e.target_id AS atom_a, e.source_id AS atom_b, e.relationship
+                    FROM edges e
+                    JOIN claims ca ON ca.id = e.target_id
+                    JOIN claims cb ON cb.id = e.source_id
+                    WHERE e.target_id = ANY($1)
+                      AND e.relationship != 'decomposes_to'
+                      AND (ca.properties->>'level')::int = 3
+                      AND (cb.properties->>'level')::int = 3
+                )
+                SELECT atom_a AS "atom_a!", atom_b AS "atom_b!", relationship AS "relationship!"
+                FROM forward
+                UNION ALL
+                SELECT atom_a AS "atom_a!", atom_b AS "atom_b!", relationship AS "relationship!"
+                FROM backward
+                "#,
+                &our_atom_ids
+            )
+            .fetch_all(pool)
+            .await?;
+            for r in rows {
+                atom_atom_links_by_atom
+                    .entry(r.atom_a)
+                    .or_default()
+                    .push((r.atom_b, r.relationship));
+            }
+        }
+    }
+
+    // 10. atom_b -> parent paragraphs (Query D). atom_b is the "outside" atom in
+    //     atom-atom-bridge; we need to know which paragraph(s) decompose to it.
+    {
+        let atom_b_ids: Vec<Uuid> = atom_atom_links_by_atom
+            .values()
+            .flat_map(|v| v.iter().map(|(b, _)| *b))
+            .collect();
+        if !atom_b_ids.is_empty() {
+            let rows = sqlx::query!(
+                r#"
+                SELECT e.source_id AS "paragraph_id!", e.target_id AS "atom_id!"
+                FROM edges e
+                JOIN claims c ON c.id = e.source_id
+                WHERE e.target_id = ANY($1)
+                  AND e.relationship = 'decomposes_to'
+                  AND (c.properties->>'level')::int = 2
+                "#,
+                &atom_b_ids
+            )
+            .fetch_all(pool)
+            .await?;
+            for r in rows {
+                paragraphs_by_atom
+                    .entry(r.atom_id)
+                    .or_default()
+                    .push(r.paragraph_id);
+            }
+        }
+    }
+
+    // 11. Build the union of all paragraph IDs that paragraph_meta + paper_meta
+    //     must cover: input paragraphs ∪ continues_argument neighbors ∪
+    //     atom-bridge parents ∪ atom-atom-bridge parents.
+    let mut all_paragraph_ids: Vec<Uuid> = paragraph_ids.to_vec();
+    for v in continues_argument_by_paragraph.values() {
+        all_paragraph_ids.extend(v.iter().copied());
+    }
+    for atoms in atoms_by_paragraph.values() {
+        for atom in atoms {
+            all_paragraph_ids.extend(atom.bridge_to_paragraphs.iter().copied());
+        }
+    }
+    for v in paragraphs_by_atom.values() {
+        all_paragraph_ids.extend(v.iter().copied());
+    }
+    all_paragraph_ids.sort();
+    all_paragraph_ids.dedup();
+
+    // 1. Paragraphs themselves (content + truth_value) — extended to cover neighbor IDs.
+    {
+        let rows = sqlx::query!(
+            "SELECT id, content, truth_value FROM claims WHERE id = ANY($1)",
+            &all_paragraph_ids
+        )
+        .fetch_all(pool)
+        .await?;
+        for r in rows {
+            paragraph_meta.insert(
+                r.id,
+                ParagraphCore {
+                    content: r.content,
+                    truth_value: r.truth_value,
+                },
+            );
+        }
+    }
+
+    // 2. Papers via paper-attribution asserts edge — extended to cover neighbor IDs.
+    {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                e.target_id AS paragraph_id,
+                p.id AS paper_id,
+                p.doi,
+                COALESCE(p.title, '') AS "title!"
+            FROM edges e
+            JOIN papers p ON p.id = e.source_id
+            WHERE e.target_id = ANY($1)
+              AND e.relationship = 'asserts'
+              AND e.source_type = 'paper'
+            "#,
+            &all_paragraph_ids
+        )
+        .fetch_all(pool)
+        .await?;
+        for r in rows {
+            paper_meta.insert(
+                r.paragraph_id,
+                PaperMeta {
+                    paper_id: r.paper_id,
+                    doi: Some(r.doi),
+                    title: r.title,
+                },
+            );
+        }
+    }
+
     Ok(BatchedContext {
         paragraph_meta,
         paper_meta,
@@ -649,12 +828,161 @@ pub async fn fetch_batched_context(
         siblings_total_by_paragraph,
         corroborates_by_paragraph,
         corroborates_total_by_paragraph,
+        continues_argument_by_paragraph,
+        atom_atom_links_by_atom,
+        paragraphs_by_atom,
     })
+}
+
+#[derive(Default)]
+struct NeighborParagraphAccumulator {
+    via: Vec<NeighborPath>,
+}
+
+fn neighbor_path_priority(p: &NeighborPath) -> u8 {
+    match p {
+        NeighborPath::ContinuesArgument => 0,
+        NeighborPath::AtomBridge { .. } => 1,
+        NeighborPath::AtomAtomBridge { .. } => 2,
+    }
+}
+
+/// Build the per-hit `neighbor_paragraphs` list.
+///
+/// Aggregates three reachability paths (continues_argument, atom-bridge,
+/// atom-atom-bridge) across `ctx`, dedupes by paragraph_id, drops siblings
+/// plus the result paragraph itself plus paragraphs missing paper attribution,
+/// sorts by (min path priority asc, truth_value desc), and caps at
+/// `neighbor_paragraphs_limit`.
+///
+/// Returns `(materialized, total_pre_truncation, truncated_flag)`.
+pub fn assemble_neighbor_paragraphs(
+    paragraph_id: Uuid,
+    atoms: &[AtomChild],
+    siblings: &[SiblingParagraph],
+    ctx: &BatchedContext,
+    neighbor_paragraphs_limit: u32,
+) -> (Vec<NeighborParagraph>, usize, bool) {
+    let mut by_id: std::collections::HashMap<Uuid, NeighborParagraphAccumulator> =
+        Default::default();
+
+    // (1) continues_argument
+    if let Some(neighbors) = ctx.continues_argument_by_paragraph.get(&paragraph_id) {
+        for nbr in neighbors {
+            if *nbr == paragraph_id {
+                continue;
+            }
+            by_id
+                .entry(*nbr)
+                .or_default()
+                .via
+                .push(NeighborPath::ContinuesArgument);
+        }
+    }
+
+    // (2) atom-bridge
+    for atom in atoms.iter() {
+        for parent in &atom.bridge_to_paragraphs {
+            if *parent == paragraph_id {
+                continue;
+            }
+            by_id
+                .entry(*parent)
+                .or_default()
+                .via
+                .push(NeighborPath::AtomBridge {
+                    atom_id: atom.atom_id,
+                });
+        }
+    }
+
+    // (3) atom-atom-bridge
+    let atom_ids_under_p: std::collections::HashSet<Uuid> =
+        atoms.iter().map(|a| a.atom_id).collect();
+    for atom_a in atom_ids_under_p.iter() {
+        if let Some(links) = ctx.atom_atom_links_by_atom.get(atom_a) {
+            for (atom_b, relationship) in links {
+                if let Some(parent_paragraphs) = ctx.paragraphs_by_atom.get(atom_b) {
+                    for parent in parent_paragraphs {
+                        if *parent == paragraph_id {
+                            continue;
+                        }
+                        by_id
+                            .entry(*parent)
+                            .or_default()
+                            .via
+                            .push(NeighborPath::AtomAtomBridge {
+                                atom_a: *atom_a,
+                                atom_b: *atom_b,
+                                relationship: relationship.clone(),
+                            });
+                    }
+                }
+            }
+        }
+    }
+
+    // Drop siblings (avoid duplicate reporting per spec §3.8).
+    let sibling_ids: std::collections::HashSet<Uuid> =
+        siblings.iter().map(|s| s.paragraph_id).collect();
+    by_id.retain(|pid, _| !sibling_ids.contains(pid));
+
+    // Drop paragraphs with no paper meta.
+    by_id.retain(|pid, _| ctx.paper_meta.contains_key(pid));
+
+    let neighbor_paragraphs_total = by_id.len();
+
+    // Materialize.
+    let mut materialized: Vec<NeighborParagraph> = by_id
+        .into_iter()
+        .filter_map(|(pid, acc)| {
+            let core = ctx.paragraph_meta.get(&pid)?;
+            let paper = ctx.paper_meta.get(&pid)?.clone();
+            Some(NeighborParagraph {
+                paragraph_id: pid,
+                content: core.content.clone(),
+                truth_value: core.truth_value,
+                paper,
+                via: acc.via,
+            })
+        })
+        .collect();
+
+    materialized.sort_by(|a, b| {
+        let a_p = a
+            .via
+            .iter()
+            .map(neighbor_path_priority)
+            .min()
+            .unwrap_or(255);
+        let b_p = b
+            .via
+            .iter()
+            .map(neighbor_path_priority)
+            .min()
+            .unwrap_or(255);
+        a_p.cmp(&b_p).then(
+            b.truth_value
+                .partial_cmp(&a.truth_value)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+
+    let limit = neighbor_paragraphs_limit as usize;
+    let neighbor_paragraphs_truncated = materialized.len() > limit;
+    materialized.truncate(limit);
+
+    (
+        materialized,
+        neighbor_paragraphs_total,
+        neighbor_paragraphs_truncated,
+    )
 }
 
 #[doc(hidden)]
 pub mod __test_only {
     pub use super::{
-        fetch_batched_context, paragraph_3072_population, BatchedContext, ParagraphCore,
+        assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population,
+        BatchedContext, ParagraphCore,
     };
 }
