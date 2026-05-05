@@ -174,16 +174,14 @@ async fn resubmit_does_not_emit_duplicate_claim_created() {
 
     // Snapshot the events table for the agent before the second submit so
     // we can detect a duplicate emission specific to the resubmit.
-    let server_agent_uuid: Uuid = sqlx::query_scalar(
-        "SELECT id FROM agents WHERE public_key = $1",
-    )
-    .bind({
-        let s = AgentSigner::from_bytes(&signer_seed).unwrap();
-        s.public_key().to_vec()
-    })
-    .fetch_one(&pool)
-    .await
-    .expect("server agent must exist");
+    let server_agent_uuid: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE public_key = $1")
+        .bind({
+            let s = AgentSigner::from_bytes(&signer_seed).unwrap();
+            s.public_key().to_vec()
+        })
+        .fetch_one(&pool)
+        .await
+        .expect("server agent must exist");
 
     let before_second: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events \
