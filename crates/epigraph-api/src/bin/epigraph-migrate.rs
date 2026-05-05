@@ -4,8 +4,7 @@
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    let url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL environment variable required");
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL environment variable required");
     // Log the host but not credentials.
     let host_hint = url.split('@').nth(1).unwrap_or("<unknown>");
     tracing::info!(host = host_hint, "Connecting to PostgreSQL");

@@ -42,9 +42,7 @@ pub fn _test_event_store() -> std::sync::Arc<crate::routes::events::EventStore> 
 /// HTTP listener binds ensures fresh deploys never serve traffic against a
 /// stale schema.
 #[cfg(feature = "db")]
-pub async fn run_migrations(
-    pool: &epigraph_db::PgPool,
-) -> Result<(), sqlx::migrate::MigrateError> {
+pub async fn run_migrations(pool: &epigraph_db::PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     sqlx::migrate!("../../migrations").run(pool).await
 }
 
