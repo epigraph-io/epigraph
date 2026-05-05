@@ -20,6 +20,7 @@ pub mod belief;
 pub mod challenge;
 pub mod claims;
 pub mod claims_query;
+pub mod clusters;
 pub mod community;
 #[cfg(feature = "db")]
 pub mod computation;
@@ -187,6 +188,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/themes/build-from-corpus",
             post(crud::build_themes_from_corpus),
+        )
+        .route(
+            "/api/v1/clusters/build-from-bridges",
+            post(clusters::build_from_bridges),
         )
         .route(
             "/api/v1/frames/:id/assign-claim",
@@ -809,6 +814,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/themes/build-from-corpus",
             post(crud::build_themes_from_corpus),
+        )
+        .route(
+            "/api/v1/clusters/build-from-bridges",
+            post(clusters::build_from_bridges),
         )
         .route(
             "/api/v1/frames/:id/assign-claim",
