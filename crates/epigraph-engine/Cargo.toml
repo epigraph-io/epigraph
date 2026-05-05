@@ -23,13 +23,17 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+# Theme k-means helper (shared by the HTTP route and the scheduled job).
+linfa = { workspace = true }
+linfa-clustering = { workspace = true }
+ndarray = { workspace = true }
+sqlx = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 chrono = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
-sqlx = { workspace = true }  # Live integration tests against PostgreSQL
 uuid = { workspace = true }  # Test claim/edge ID generation
 epigraph-ds = { workspace = true }  # DS types for frame/mass/measures tests
 
