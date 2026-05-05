@@ -531,6 +531,14 @@ pub struct CreateEdgeRequest {
     pub labels: Option<Vec<String>>,
     pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
     pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    /// When true, the server checks for an existing edge by
+    /// `(source_id, target_id, relationship)` and returns the existing edge's
+    /// id without inserting a duplicate. Idempotent for drainer / outbox-style
+    /// retry use cases. Defaults to false (raw INSERT semantics; per
+    /// migration 018 every relationship may multi-emit by default, so
+    /// callers needing dedup must opt in via this flag).
+    #[serde(default)]
+    pub if_not_exists: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -544,6 +552,26 @@ pub struct EdgeResponse {
     pub properties: serde_json::Value,
     pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
     pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Request body for `PATCH /api/v1/edges/:id`.
+///
+/// Both fields are optional but at least one must be provided. `valid_to`
+/// sets the edge's lifecycle end time (use this to retire an edge without
+/// losing audit history). `properties` shallow-merges into the existing
+/// JSONB properties via `||`: existing keys not in the patch are preserved,
+/// overlapping keys are overwritten, new keys are added.
+#[derive(Debug, Deserialize)]
+pub struct PatchEdgeRequest {
+    pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    pub properties: Option<serde_json::Value>,
+}
+
+impl PatchEdgeRequest {
+    /// Returns true if there is nothing to patch.
+    pub fn is_empty(&self) -> bool {
+        self.valid_to.is_none() && self.properties.is_none()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -649,121 +677,172 @@ pub async fn create_edge(
         });
     }
 
-    let edge_id = EdgeRepository::create(
-        pool,
-        request.source_id,
-        &request.source_type,
-        request.target_id,
-        &request.target_type,
-        &request.relationship,
-        request.properties.clone(),
-        request.valid_from,
-        request.valid_to,
-    )
-    .await?;
-
-    // Record provenance when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        let hash_input = format!(
-            "{}:{}:{}",
-            request.source_id, request.relationship, request.target_id
-        );
-        let content_hash = blake3::hash(hash_input.as_bytes());
-        if let Err(e) = crate::middleware::provenance::record_provenance(
-            pool,
-            auth,
-            "edge",
-            edge_id,
-            "create",
-            content_hash.as_bytes(),
-            &[],
-            None,
-        )
-        .await
-        {
-            tracing::warn!(edge_id = %edge_id, error = %e, "Failed to record edge provenance");
-        }
-    }
-
-    // Edge-triggered DS recomputation: if this is an evidential edge between
-    // two claims, recompute the target claim's truth_value via DS combination.
-    if is_evidential_relationship(&request.relationship)
-        && request.source_type == "claim"
-        && request.target_type == "claim"
-    {
-        if let Err(e) = trigger_edge_ds_recomputation(
+    // Branch on if_not_exists: drainer / outbox callers opt in to
+    // (source_id, target_id, relationship) idempotency; the default path
+    // preserves the post-migration-018 multi-emit semantics.
+    //
+    // For the if_not_exists path, the repo returns `was_created=false` on
+    // a dedup hit. We then SKIP all post-create side effects (provenance,
+    // DS recomputation, factor INSERT, edge.added event) and return the
+    // STORED row with a 200 OK so retried drainer batches don't double-fire
+    // events or write redundant provenance entries. Mirrors the claims
+    // pattern in `routes/claims.rs::create_claim`.
+    let (edge_row, was_created) = if request.if_not_exists {
+        EdgeRepository::create_if_not_exists(
             pool,
             request.source_id,
+            &request.source_type,
             request.target_id,
+            &request.target_type,
             &request.relationship,
+            request.properties.clone(),
+            request.valid_from,
+            request.valid_to,
         )
-        .await
-        {
-            tracing::warn!(
-                edge_id = %edge_id,
-                source_id = %request.source_id,
-                target_id = %request.target_id,
-                relationship = %request.relationship,
-                error = %e,
-                "Edge-triggered DS recomputation failed; edge created successfully"
-            );
-        }
-    }
-
-    // P2a: Auto-create factor for epistemic edges
-    // Belt-and-suspenders: DB trigger (migration 044/049) also fires on INSERT,
-    // but this Rust path ensures factor creation even if the trigger is absent
-    // (e.g. dev environments that haven't run all migrations).
-    if matches!(
-        request.relationship.to_uppercase().as_str(),
-        "SUPPORTS" | "CONTRADICTS"
-    ) {
-        let factor_type = if request.relationship.to_uppercase() == "SUPPORTS" {
-            "evidential_support"
-        } else {
-            "mutual_exclusion"
-        };
-
-        let potential = if factor_type == "evidential_support" {
-            serde_json::json!({"source_weight": 0.7, "target_weight": 0.3})
-        } else {
-            serde_json::json!({"strength": 0.8})
-        };
-
-        let variable_ids = vec![request.source_id, request.target_id];
-        if let Err(e) = sqlx::query(
-            "INSERT INTO factors (factor_type, variable_ids, potential, description) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT DO NOTHING",
+        .await?
+    } else {
+        let id = EdgeRepository::create(
+            pool,
+            request.source_id,
+            &request.source_type,
+            request.target_id,
+            &request.target_type,
+            &request.relationship,
+            request.properties.clone(),
+            request.valid_from,
+            request.valid_to,
         )
-        .bind(factor_type)
-        .bind(&variable_ids)
-        .bind(&potential)
-        .bind(format!("Auto-created from {} edge", request.relationship))
-        .execute(&state.db_pool)
-        .await
-        {
-            tracing::warn!(
-                error = %e,
-                "Failed to auto-create factor for edge — BP will not include this relationship"
-            );
-        }
-    }
-
-    let response = EdgeResponse {
-        id: edge_id,
-        source_id: request.source_id,
-        target_id: request.target_id,
-        source_type: request.source_type,
-        target_type: request.target_type,
-        relationship: request.relationship,
-        properties: request.properties.unwrap_or(serde_json::json!({})),
-        valid_from: request.valid_from,
-        valid_to: request.valid_to,
+        .await?;
+        // Synthesize an EdgeRow from the request so the response shape
+        // matches the if_not_exists path. The default path always inserts,
+        // so the request fields ARE the stored fields (no read-back needed).
+        let row = epigraph_db::EdgeRow {
+            id,
+            source_id: request.source_id,
+            source_type: request.source_type.clone(),
+            target_id: request.target_id,
+            target_type: request.target_type.clone(),
+            relationship: request.relationship.clone(),
+            properties: request.properties.clone().unwrap_or(serde_json::json!({})),
+            valid_from: request.valid_from,
+            valid_to: request.valid_to,
+        };
+        (row, true)
     };
 
-    // Emit edge.added event (Task 0.3 / Phase 0 — staleness trigger)
-    {
+    let edge_id = edge_row.id;
+
+    // Build the response from the STORED row. On a dedup hit (was_created=false)
+    // the request.properties / valid_from / valid_to may differ from what's in
+    // the database; the response must reflect what's actually stored, not the
+    // request. The `create_if_not_exists` path now returns the existing row's
+    // fields verbatim.
+    let response = EdgeResponse {
+        id: edge_row.id,
+        source_id: edge_row.source_id,
+        target_id: edge_row.target_id,
+        source_type: edge_row.source_type.clone(),
+        target_type: edge_row.target_type.clone(),
+        relationship: edge_row.relationship.clone(),
+        properties: edge_row.properties,
+        valid_from: edge_row.valid_from,
+        valid_to: edge_row.valid_to,
+    };
+
+    // ── Side effects: only run when we actually created a new edge ──
+    // A dedup hit (was_created=false) is by design semantically idempotent;
+    // re-running provenance / DS / events would defeat the whole purpose of
+    // if_not_exists for drainer retries.
+    if was_created {
+        // Record provenance when OAuth2-authenticated
+        if let Some(axum::Extension(ref auth)) = auth_ctx {
+            let hash_input = format!(
+                "{}:{}:{}",
+                request.source_id, request.relationship, request.target_id
+            );
+            let content_hash = blake3::hash(hash_input.as_bytes());
+            if let Err(e) = crate::middleware::provenance::record_provenance(
+                pool,
+                auth,
+                "edge",
+                edge_id,
+                "create",
+                content_hash.as_bytes(),
+                &[],
+                None,
+            )
+            .await
+            {
+                tracing::warn!(edge_id = %edge_id, error = %e, "Failed to record edge provenance");
+            }
+        }
+
+        // Edge-triggered DS recomputation: if this is an evidential edge between
+        // two claims, recompute the target claim's truth_value via DS combination.
+        if is_evidential_relationship(&request.relationship)
+            && request.source_type == "claim"
+            && request.target_type == "claim"
+        {
+            if let Err(e) = trigger_edge_ds_recomputation(
+                pool,
+                request.source_id,
+                request.target_id,
+                &request.relationship,
+            )
+            .await
+            {
+                tracing::warn!(
+                    edge_id = %edge_id,
+                    source_id = %request.source_id,
+                    target_id = %request.target_id,
+                    relationship = %request.relationship,
+                    error = %e,
+                    "Edge-triggered DS recomputation failed; edge created successfully"
+                );
+            }
+        }
+
+        // P2a: Auto-create factor for epistemic edges
+        // Belt-and-suspenders: DB trigger (migration 044/049) also fires on INSERT,
+        // but this Rust path ensures factor creation even if the trigger is absent
+        // (e.g. dev environments that haven't run all migrations).
+        if matches!(
+            request.relationship.to_uppercase().as_str(),
+            "SUPPORTS" | "CONTRADICTS"
+        ) {
+            let factor_type = if request.relationship.to_uppercase() == "SUPPORTS" {
+                "evidential_support"
+            } else {
+                "mutual_exclusion"
+            };
+
+            let potential = if factor_type == "evidential_support" {
+                serde_json::json!({"source_weight": 0.7, "target_weight": 0.3})
+            } else {
+                serde_json::json!({"strength": 0.8})
+            };
+
+            let variable_ids = vec![request.source_id, request.target_id];
+            if let Err(e) = sqlx::query(
+                "INSERT INTO factors (factor_type, variable_ids, potential, description) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(factor_type)
+            .bind(&variable_ids)
+            .bind(&potential)
+            .bind(format!("Auto-created from {} edge", request.relationship))
+            .execute(&state.db_pool)
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to auto-create factor for edge — BP will not include this relationship"
+                );
+            }
+        }
+
+        // Emit edge.added event (Task 0.3 / Phase 0 — staleness trigger)
         let actor_id = auth_ctx.as_ref().and_then(|axum::Extension(a)| a.agent_id);
         let event_store = super::events::global_event_store();
         event_store
@@ -796,7 +875,12 @@ pub async fn create_edge(
         }
     }
 
-    Ok((StatusCode::CREATED, Json(response)))
+    let status = if was_created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(response)))
 }
 
 // =============================================================================
@@ -871,6 +955,165 @@ pub async fn delete_edge(
 ) -> Result<StatusCode, ApiError> {
     Err(ApiError::ServiceUnavailable {
         service: "Edge deletion requires database".to_string(),
+    })
+}
+
+// =============================================================================
+// PATCH EDGE
+// =============================================================================
+
+/// Partial update of an edge's lifecycle fields.
+///
+/// `PATCH /api/v1/edges/:id`
+///
+/// Accepts an optional `valid_to` and an optional `properties` JSON object.
+/// At least one must be provided (empty body → 400). `properties` is
+/// shallow-merged via JSONB `||`: existing keys are preserved unless
+/// overwritten by the patch, new keys are added.
+///
+/// Edges previously had no in-place lifecycle update path — retiring an
+/// edge required DELETE + POST, which loses audit. PATCH closes that gap.
+#[cfg(feature = "db")]
+pub async fn patch_edge(
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<PatchEdgeRequest>,
+) -> Result<Json<EdgeResponse>, ApiError> {
+    // Enforce scope when OAuth2-authenticated (mirrors create_edge / delete_edge).
+    if let Some(axum::Extension(ref auth)) = auth_ctx {
+        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
+    }
+
+    if request.is_empty() {
+        return Err(ApiError::ValidationError {
+            field: "body".to_string(),
+            reason: "PATCH requires at least one of valid_to or properties".to_string(),
+        });
+    }
+
+    // PATCH body validation: `properties` MUST be a JSON object when present.
+    // Postgres `'{"a":1}'::jsonb || '5'::jsonb` silently produces `[{"a":1}, 5]`
+    // — the column changes from object to array with no error. The downstream
+    // SQL update relies on object-||-object shallow merge semantics; rejecting
+    // non-objects up front is the only safe option.
+    if let Some(ref props) = request.properties {
+        if !props.is_object() {
+            return Err(ApiError::ValidationError {
+                field: "properties".to_string(),
+                reason: "properties must be a JSON object".to_string(),
+            });
+        }
+    }
+
+    // Build the diff payload BEFORE handing `request.properties` to the repo
+    // (which moves the JSON value). The diff is what we hash and record in
+    // provenance — see I1 fix below for context.
+    let diff = serde_json::json!({
+        "valid_to": request.valid_to,
+        "properties": request.properties,
+    });
+
+    let pool = &state.db_pool;
+    // `?` maps DbError::NotFound → ApiError::NotFound via the From impl in
+    // crates/epigraph-api/src/errors.rs (entity is propagated as "edge").
+    let updated = EdgeRepository::update_valid_to_and_properties(
+        pool,
+        id,
+        request.valid_to,
+        request.properties,
+    )
+    .await?;
+
+    // Record provenance when OAuth2-authenticated.
+    //
+    // Content-hash the DIFF (not the bare edge id). Pre-fix the hash was
+    // blake3(id.as_bytes()) and patch_payload was None — same edge always
+    // produced the same hash no matter what changed. The provenance log was
+    // reduced to "this edge was patched at some point," losing all diff
+    // information.
+    if let Some(axum::Extension(ref auth)) = auth_ctx {
+        let diff_bytes = serde_json::to_vec(&diff).unwrap_or_default();
+        let content_hash = blake3::hash(&diff_bytes);
+        if let Err(e) = crate::middleware::provenance::record_provenance(
+            pool,
+            auth,
+            "edge",
+            id,
+            "patch",
+            content_hash.as_bytes(),
+            &[],
+            Some(&diff),
+        )
+        .await
+        {
+            tracing::warn!(edge_id = %id, error = %e, "Failed to record edge patch provenance");
+        }
+    }
+
+    let response = EdgeResponse {
+        id: updated.id,
+        source_id: updated.source_id,
+        target_id: updated.target_id,
+        source_type: updated.source_type,
+        target_type: updated.target_type,
+        relationship: updated.relationship,
+        properties: updated.properties,
+        valid_from: updated.valid_from,
+        valid_to: updated.valid_to,
+    };
+
+    // Emit edge.updated (and edge.retired when valid_to is set). Mirrors
+    // the staleness-trigger pattern used by create_edge (edge.added) and
+    // delete_edge (edge.deleted) — Phase 0 / Task 0.3. Pre-fix, PATCH was
+    // a state change with no event emission, so downstream caches /
+    // staleness watchers never observed in-place lifecycle updates.
+    {
+        let actor_id = auth_ctx.as_ref().and_then(|axum::Extension(a)| a.agent_id);
+        let event_store = super::events::global_event_store();
+        event_store
+            .push(
+                "edge.updated".to_string(),
+                actor_id,
+                serde_json::json!({
+                    "edge_id": response.id,
+                    "source_type": response.source_type,
+                    "source_id": response.source_id,
+                    "target_type": response.target_type,
+                    "target_id": response.target_id,
+                    "relationship": response.relationship,
+                }),
+            )
+            .await;
+
+        // edge.retired is the more specific signal: the lifecycle window
+        // closed. Fires only when the patch sets `valid_to`.
+        if request.valid_to.is_some() {
+            event_store
+                .push(
+                    "edge.retired".to_string(),
+                    actor_id,
+                    serde_json::json!({
+                        "edge_id": response.id,
+                        "valid_to": response.valid_to,
+                    }),
+                )
+                .await;
+        }
+    }
+
+    Ok(Json(response))
+}
+
+/// PATCH edge stub — non-db builds.
+#[cfg(not(feature = "db"))]
+pub async fn patch_edge(
+    State(_state): State<AppState>,
+    Path(_id): Path<Uuid>,
+    Json(_request): Json<PatchEdgeRequest>,
+) -> Result<Json<EdgeResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Edge patches require database".to_string(),
     })
 }
 
@@ -1085,18 +1328,20 @@ pub async fn list_edges(
 ) -> Result<Json<Vec<EdgeResponse>>, ApiError> {
     let pool = &state.db_pool;
 
-    let rows = if let Some(source_id) = params.source_id {
-        let source_type = params.source_type.as_deref().unwrap_or("claim");
-        EdgeRepository::get_by_source(pool, source_id, source_type).await?
-    } else if let Some(target_id) = params.target_id {
-        let target_type = params.target_type.as_deref().unwrap_or("claim");
-        EdgeRepository::get_by_target(pool, target_id, target_type).await?
-    } else if let Some(ref relationship) = params.relationship {
-        EdgeRepository::get_by_relationship(pool, relationship).await?
-    } else {
-        // No filter: return all edges (capped at 1000)
-        EdgeRepository::list_all(pool, 1000).await?
-    };
+    // AND-compose every non-null filter at the SQL layer so drainer
+    // GET-then-POST guards work. Replaces the legacy first-non-null
+    // cascade. Per #65: source_type defaults to None (not "claim") so
+    // callers querying non-claim sources don't get silently filtered.
+    let rows = EdgeRepository::list_filtered(
+        pool,
+        params.source_id,
+        params.target_id,
+        params.relationship.as_deref(),
+        params.source_type.as_deref(),
+        params.target_type.as_deref(),
+        1000,
+    )
+    .await?;
 
     // Filter edges where source or target has a redacted partition
     let mut edges = Vec::new();
@@ -2324,5 +2569,898 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json["evidence_content"].is_null());
+    }
+}
+
+// =============================================================================
+// DB-BACKED INTEGRATION TESTS
+// =============================================================================
+
+#[cfg(all(test, feature = "db"))]
+mod db_tests {
+    use super::*;
+    use crate::state::{ApiConfig, AppState};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    // ── Test scaffolding ──
+
+    fn test_state(pool: PgPool) -> AppState {
+        AppState::with_db(pool, ApiConfig::default())
+    }
+
+    /// Router exposing the edges write/read routes under test.
+    fn edges_router(state: AppState) -> Router {
+        Router::new()
+            .route("/api/v1/edges", post(create_edge).get(list_edges))
+            .route("/api/v1/edges/:id", axum::routing::patch(patch_edge))
+            .with_state(state)
+    }
+
+    async fn parse_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Insert a system agent (mirrors `policies.rs::ensure_system_agent`) and
+    /// return its id. Each call uses a fresh random pubkey so tests don't
+    /// collide on the unique constraint.
+    async fn ensure_system_agent(pool: &PgPool) -> Uuid {
+        let mut pub_key = vec![0u8; 32];
+        for b in pub_key.iter_mut() {
+            *b = rand::random();
+        }
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(&pub_key)
+        .bind("api-edges-test")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Insert a plain claim and return its id. Used as source/target for
+    /// edge-creation tests so the entity-existence check passes.
+    async fn seed_claim(pool: &PgPool, agent_id: Uuid, content: &str) -> Uuid {
+        let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties) \
+             VALUES ($1, $2, $3, 0.5, ARRAY[]::text[], '{}'::jsonb) RETURNING id",
+        )
+        .bind(content)
+        .bind(content_hash.as_slice())
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn create_edge_body(
+        source_id: Uuid,
+        target_id: Uuid,
+        relationship: &str,
+        if_not_exists: bool,
+    ) -> Body {
+        Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "source_id": source_id,
+                "target_id": target_id,
+                "source_type": "claim",
+                "target_type": "claim",
+                "relationship": relationship,
+                "if_not_exists": if_not_exists,
+            }))
+            .unwrap(),
+        )
+    }
+
+    // ── Tests ──
+
+    /// 0.A — POST /edges with `if_not_exists: true` is idempotent on the
+    /// (source_id, target_id, relationship) triple.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_if_not_exists_returns_existing(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source_id = seed_claim(&pool, agent_id, "edge-test source").await;
+        let target_id = seed_claim(&pool, agent_id, "edge-test target").await;
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        // First POST creates the edge.
+        let resp1 = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(create_edge_body(source_id, target_id, "supports", true))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::CREATED);
+        let body1: serde_json::Value = parse_body(resp1).await;
+        let id1 = Uuid::parse_str(body1["id"].as_str().unwrap()).unwrap();
+
+        // Second POST with the same (source, target, relationship) and
+        // if_not_exists=true must return the same edge id with 200 OK
+        // (not 201 Created — the row already exists).
+        let resp2 = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(create_edge_body(source_id, target_id, "supports", true))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::OK,
+            "dedup hit must return 200, not 201"
+        );
+        let body2: serde_json::Value = parse_body(resp2).await;
+        let id2 = Uuid::parse_str(body2["id"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            id1, id2,
+            "second if_not_exists POST must return existing edge id"
+        );
+
+        // Confirm exactly one edge row exists for the triple.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM edges WHERE source_id = $1 AND target_id = $2 AND relationship = $3",
+        )
+        .bind(source_id)
+        .bind(target_id)
+        .bind("supports")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// 0.B — GET /edges combines source_id, target_id, and relationship
+    /// filters at the SQL layer (AND-composed), not first-non-null cascade.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_edges_combines_source_target_relationship_filters(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "claim A").await;
+        let b = seed_claim(&pool, agent_id, "claim B").await;
+        let c = seed_claim(&pool, agent_id, "claim C").await;
+
+        // Three edges sharing source A:
+        //   A -SUPPORTS-> B  (the one we expect to match)
+        //   A -CORROBORATES-> B
+        //   A -SUPPORTS-> C
+        let _ab_supports =
+            EdgeRepository::create(&pool, a, "claim", b, "claim", "SUPPORTS", None, None, None)
+                .await
+                .unwrap();
+        let _ab_corroborates = EdgeRepository::create(
+            &pool,
+            a,
+            "claim",
+            b,
+            "claim",
+            "CORROBORATES",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let _ac_supports =
+            EdgeRepository::create(&pool, a, "claim", c, "claim", "SUPPORTS", None, None, None)
+                .await
+                .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(&format!(
+                        "/api/v1/edges?source_id={a}&target_id={b}&relationship=SUPPORTS"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body: serde_json::Value = parse_body(response).await;
+        let edges = body.as_array().expect("response is an array");
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one edge matching all three filters; got {}",
+            edges.len()
+        );
+        assert_eq!(edges[0]["source_id"], serde_json::json!(a));
+        assert_eq!(edges[0]["target_id"], serde_json::json!(b));
+        assert_eq!(edges[0]["relationship"], serde_json::json!("SUPPORTS"));
+    }
+
+    /// 0.C — PATCH /edges/:id sets `valid_to` on the targeted edge.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_sets_valid_to(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "valid-to source").await;
+        let target = seed_claim(&pool, agent_id, "valid-to target").await;
+        let edge_id = EdgeRepository::create(
+            &pool, source, "claim", target, "claim", "SUPPORTS", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let cutoff = chrono::Utc::now();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "valid_to": cutoff,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body: serde_json::Value = parse_body(response).await;
+        assert!(
+            !body["valid_to"].is_null(),
+            "valid_to must be set on response"
+        );
+
+        let stored: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT valid_to FROM edges WHERE id = $1")
+                .bind(edge_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(stored.is_some(), "valid_to must be persisted");
+    }
+
+    /// 0.C — PATCH /edges/:id shallow-merges `properties` (existing keys
+    /// preserved, new keys added, overlapping keys overwritten).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_merges_properties(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "merge-props source").await;
+        let target = seed_claim(&pool, agent_id, "merge-props target").await;
+        let edge_id = EdgeRepository::create(
+            &pool,
+            source,
+            "claim",
+            target,
+            "claim",
+            "SUPPORTS",
+            Some(serde_json::json!({"weight": 0.7, "source": "drainer"})),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "properties": {"weight": 0.9, "note": "rebalanced"},
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT properties FROM edges WHERE id = $1")
+                .bind(edge_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored["weight"],
+            serde_json::json!(0.9),
+            "overlapping key overwritten"
+        );
+        assert_eq!(
+            stored["source"],
+            serde_json::json!("drainer"),
+            "preexisting key preserved"
+        );
+        assert_eq!(
+            stored["note"],
+            serde_json::json!("rebalanced"),
+            "new key added"
+        );
+    }
+
+    /// 0.C — PATCH /edges/:id with empty body returns 400.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_rejects_empty_body(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "empty source").await;
+        let target = seed_claim(&pool, agent_id, "empty target").await;
+        let edge_id = EdgeRepository::create(
+            &pool, source, "claim", target, "claim", "SUPPORTS", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Auth-backed test scaffolding (mirrors `routes/claims.rs` pattern).
+    // Used by review-followup tests that assert provenance writes and
+    // event emissions from create_edge / patch_edge handlers.
+    // ─────────────────────────────────────────────────────────────────────
+
+    use crate::middleware::bearer::{AuthContext, ClientType};
+    use axum::Extension;
+
+    /// Insert a real `oauth_clients` row so provenance_log FK succeeds.
+    /// Mirrors `routes/claims.rs::insert_oauth_client`.
+    async fn insert_oauth_client(pool: &PgPool, client_id: Uuid) {
+        sqlx::query(
+            r#"INSERT INTO oauth_clients
+               (id, client_id, client_name, client_type, allowed_scopes, granted_scopes, status, created_at, updated_at)
+               VALUES ($1, $2, 'edges-test-client', 'human',
+                       ARRAY['edges:write'], ARRAY['edges:write'], 'active', NOW(), NOW())
+               ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(client_id)
+        .bind(client_id.to_string())
+        .execute(pool)
+        .await
+        .expect("upsert oauth_client");
+    }
+
+    /// Build an AuthContext with `edges:write` scope.
+    fn auth_ctx(client_id: Uuid) -> AuthContext {
+        AuthContext {
+            client_id,
+            agent_id: Some(client_id),
+            owner_id: Some(client_id),
+            client_type: ClientType::Service,
+            scopes: vec!["edges:write".to_string()],
+            jti: Uuid::new_v4(),
+        }
+    }
+
+    /// Edges router with an injected AuthContext extension. Required for
+    /// tests that exercise the provenance / scope-check code path.
+    fn edges_router_with_auth(state: AppState, auth: AuthContext) -> Router {
+        Router::new()
+            .route("/api/v1/edges", post(create_edge).get(list_edges))
+            .route("/api/v1/edges/:id", axum::routing::patch(patch_edge))
+            .layer(Extension(auth))
+            .with_state(state)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C1 — `if_not_exists` dedup hit must NOT duplicate side effects.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Dedup hit must surface the STORED row (not the request fields), and
+    /// must respond 200 OK rather than 201 Created. Two POSTs with different
+    /// `properties` payloads at the same (source, target, relationship)
+    /// triple — the second response must reflect the first POST's stored
+    /// properties verbatim.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_if_not_exists_dedup_hit_returns_stored_row(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source_id = seed_claim(&pool, agent_id, "stored-row source").await;
+        let target_id = seed_claim(&pool, agent_id, "stored-row target").await;
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        // First POST stores properties = {"weight": 0.7, "from": "first"}.
+        let first_body = Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "source_id": source_id,
+                "target_id": target_id,
+                "source_type": "claim",
+                "target_type": "claim",
+                "relationship": "supports",
+                "properties": {"weight": 0.7, "from": "first"},
+                "if_not_exists": true,
+            }))
+            .unwrap(),
+        );
+        let resp1 = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(first_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::CREATED);
+
+        // Second POST attempts to store DIFFERENT properties at the same
+        // (source, target, relationship). The dedup hit MUST return the
+        // ORIGINAL stored properties — NOT the new request's properties.
+        let second_body = Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "source_id": source_id,
+                "target_id": target_id,
+                "source_type": "claim",
+                "target_type": "claim",
+                "relationship": "supports",
+                "properties": {"weight": 0.99, "from": "second"},
+                "if_not_exists": true,
+            }))
+            .unwrap(),
+        );
+        let resp2 = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(second_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::OK,
+            "dedup hit must respond 200 OK, not 201 Created"
+        );
+        let body2: serde_json::Value = parse_body(resp2).await;
+        assert_eq!(
+            body2["properties"]["weight"],
+            serde_json::json!(0.7),
+            "response must surface STORED properties (0.7), not the request's (0.99)"
+        );
+        assert_eq!(
+            body2["properties"]["from"],
+            serde_json::json!("first"),
+            "response must surface STORED properties (\"first\"), not the request's (\"second\")"
+        );
+    }
+
+    /// Dedup hit must SKIP provenance recording — second POST should not
+    /// add a provenance_log row (only one row per edge_id, from the first
+    /// POST). Requires AuthContext to drive the provenance code path.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_if_not_exists_dedup_hit_skips_provenance(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source_id = seed_claim(&pool, agent_id, "prov-skip source").await;
+        let target_id = seed_claim(&pool, agent_id, "prov-skip target").await;
+
+        let client_id = Uuid::new_v4();
+        insert_oauth_client(&pool, client_id).await;
+
+        let state = AppState::with_db(
+            pool.clone(),
+            ApiConfig {
+                require_signatures: false,
+                ..Default::default()
+            },
+        );
+        let router = edges_router_with_auth(state, auth_ctx(client_id));
+
+        let make_body = || {
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "source_type": "claim",
+                    "target_type": "claim",
+                    "relationship": "supports",
+                    "if_not_exists": true,
+                }))
+                .unwrap(),
+            )
+        };
+
+        // First POST: create + provenance row.
+        let resp1 = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(make_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::CREATED);
+        let body1: serde_json::Value = parse_body(resp1).await;
+        let edge_id = Uuid::parse_str(body1["id"].as_str().unwrap()).unwrap();
+
+        // Second POST: dedup hit, must NOT add a second provenance row.
+        let resp2 = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(make_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        let prov_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provenance_log WHERE record_type = 'edge' AND record_id = $1",
+        )
+        .bind(edge_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            prov_count, 1,
+            "expected exactly one provenance row across two if_not_exists POSTs (dedup hit must skip)"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C2 — PATCH /edges/:id must reject non-object `properties`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// PATCH with `properties` set to a JSON array (or any non-object)
+    /// must 400 — Postgres `'{"a":1}'::jsonb || '[1]'::jsonb` silently
+    /// produces an array, corrupting the column type.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_rejects_non_object_properties(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "non-object source").await;
+        let target = seed_claim(&pool, agent_id, "non-object target").await;
+        let edge_id = EdgeRepository::create(
+            &pool, source, "claim", target, "claim", "SUPPORTS", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "properties": [1, 2, 3],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = parse_body(response).await;
+        // ApiError::ValidationError serializes the field/reason in the body.
+        let body_str = body.to_string();
+        assert!(
+            body_str.contains("properties") && body_str.contains("object"),
+            "expected error to mention 'properties' and 'object'; got: {body_str}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // I1 — PATCH provenance must record a diff payload (not a degenerate
+    // hash of the bare edge id).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Two PATCHes with different bodies must produce provenance rows with
+    /// different `content_hash` values. Pre-fix, the hash was `blake3(id)`,
+    /// which is identical across patches — losing all diff information.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_records_diff_provenance(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "diff-prov source").await;
+        let target = seed_claim(&pool, agent_id, "diff-prov target").await;
+        let edge_id = EdgeRepository::create(
+            &pool,
+            source,
+            "claim",
+            target,
+            "claim",
+            "SUPPORTS",
+            Some(serde_json::json!({"weight": 0.5})),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let client_id = Uuid::new_v4();
+        insert_oauth_client(&pool, client_id).await;
+
+        let state = AppState::with_db(
+            pool.clone(),
+            ApiConfig {
+                require_signatures: false,
+                ..Default::default()
+            },
+        );
+        let router = edges_router_with_auth(state, auth_ctx(client_id));
+
+        // First PATCH: bumps weight.
+        let resp1 = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "properties": {"weight": 0.7},
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        // Second PATCH: different body — adds a tag.
+        let resp2 = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "properties": {"tag": "reviewed"},
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        // Two provenance rows, with different content_hash values.
+        let hashes: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT content_hash FROM provenance_log \
+             WHERE record_type = 'edge' AND record_id = $1 AND action = 'patch' \
+             ORDER BY created_at",
+        )
+        .bind(edge_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(hashes.len(), 2, "expected two patch provenance rows");
+        assert_ne!(
+            hashes[0], hashes[1],
+            "different patch bodies must produce different content_hash values"
+        );
+
+        // patch_payload column must be populated (not NULL) and reflect the
+        // diff that was applied.
+        let payloads: Vec<Option<serde_json::Value>> = sqlx::query_scalar(
+            "SELECT patch_payload FROM provenance_log \
+             WHERE record_type = 'edge' AND record_id = $1 AND action = 'patch' \
+             ORDER BY created_at",
+        )
+        .bind(edge_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            payloads[0].is_some() && payloads[1].is_some(),
+            "patch_payload must be recorded for both patches"
+        );
+        assert_ne!(
+            payloads[0], payloads[1],
+            "patch_payload must reflect the per-PATCH diff, not be a constant"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // I2 — PATCH must emit `edge.updated`, and `edge.retired` when
+    // `valid_to` is set. Mirrors create_edge / delete_edge event semantics.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// PATCH that sets only `properties` (no valid_to) emits `edge.updated`
+    /// but NOT `edge.retired`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_emits_updated_event(pool: PgPool) {
+        use crate::routes::events::{global_event_store, EventFilter};
+
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "evt-updated source").await;
+        let target = seed_claim(&pool, agent_id, "evt-updated target").await;
+        let edge_id = EdgeRepository::create(
+            &pool,
+            source,
+            "claim",
+            target,
+            "claim",
+            "SUPPORTS",
+            Some(serde_json::json!({"weight": 0.5})),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "properties": {"weight": 0.9},
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The store is process-wide across the whole test binary, so other
+        // tests may have pushed `edge.updated` events. Filter by edge_id in
+        // the payload to scope the assertion to this test's edge.
+        let store = global_event_store();
+        let (events, _) = store
+            .list(&EventFilter {
+                since: None,
+                event_type: Some("edge.updated".to_string()),
+                limit: Some(1000),
+                offset: None,
+            })
+            .await;
+        let matching: Vec<_> = events
+            .iter()
+            .filter(|e| e.payload["edge_id"] == serde_json::json!(edge_id))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one edge.updated event for this edge_id"
+        );
+
+        let (retired_events, _) = store
+            .list(&EventFilter {
+                since: None,
+                event_type: Some("edge.retired".to_string()),
+                limit: Some(1000),
+                offset: None,
+            })
+            .await;
+        let matching_retired: Vec<_> = retired_events
+            .iter()
+            .filter(|e| e.payload["edge_id"] == serde_json::json!(edge_id))
+            .collect();
+        assert_eq!(
+            matching_retired.len(),
+            0,
+            "edge.retired must NOT fire when valid_to is not set"
+        );
+    }
+
+    /// PATCH that sets `valid_to` emits BOTH `edge.updated` and
+    /// `edge.retired`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_emits_retired_event_when_valid_to_set(pool: PgPool) {
+        use crate::routes::events::{global_event_store, EventFilter};
+
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "evt-retired source").await;
+        let target = seed_claim(&pool, agent_id, "evt-retired target").await;
+        let edge_id = EdgeRepository::create(
+            &pool, source, "claim", target, "claim", "SUPPORTS", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let cutoff = chrono::Utc::now();
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "valid_to": cutoff,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let store = global_event_store();
+        for event_type in ["edge.updated", "edge.retired"] {
+            let (events, _) = store
+                .list(&EventFilter {
+                    since: None,
+                    event_type: Some(event_type.to_string()),
+                    limit: Some(1000),
+                    offset: None,
+                })
+                .await;
+            let matching: Vec<_> = events
+                .iter()
+                .filter(|e| e.payload["edge_id"] == serde_json::json!(edge_id))
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "expected exactly one {event_type} event for this edge_id"
+            );
+        }
     }
 }

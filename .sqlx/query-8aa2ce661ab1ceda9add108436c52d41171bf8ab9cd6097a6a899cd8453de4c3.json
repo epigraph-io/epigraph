@@ -1,0 +1,72 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE edges\n            SET valid_to = COALESCE($2, valid_to),\n                properties = CASE\n                    WHEN $3::jsonb IS NULL THEN properties\n                    ELSE properties || $3::jsonb\n                END\n            WHERE id = $1\n            RETURNING id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "source_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "source_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "target_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "relationship",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "properties",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "valid_from",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "valid_to",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "8aa2ce661ab1ceda9add108436c52d41171bf8ab9cd6097a6a899cd8453de4c3"
+}

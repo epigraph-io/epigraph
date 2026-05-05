@@ -74,7 +74,13 @@ impl EdgeRepository {
 
     /// Like [`create`], but if an edge with the same
     /// `(source_id, target_id, relationship)` triple already exists, returns
-    /// that edge's id without inserting a duplicate. Idempotent.
+    /// that edge's row without inserting a duplicate. Idempotent.
+    ///
+    /// Returns `(EdgeRow, was_created)` where `was_created` is `true` when a
+    /// new row was inserted and `false` when an existing row was returned.
+    /// Mirrors `ClaimRepository::create_or_get`. Callers in API handlers gate
+    /// side effects (provenance, events, DS recomputation) on `was_created`
+    /// so dedup hits don't double-fire — see `routes/edges.rs::create_edge`.
     ///
     /// Uses check-then-insert in a transaction. The `edges` table has no
     /// unique index on this triple (multiple parallel edges with different
@@ -96,12 +102,13 @@ impl EdgeRepository {
         properties: Option<serde_json::Value>,
         valid_from: Option<chrono::DateTime<chrono::Utc>>,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<Uuid, DbError> {
+    ) -> Result<(EdgeRow, bool), DbError> {
         let mut tx = pool.begin().await?;
 
         let existing = sqlx::query!(
             r#"
-            SELECT id FROM edges
+            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            FROM edges
             WHERE source_id = $1 AND target_id = $2 AND relationship = $3
             LIMIT 1
             "#,
@@ -114,7 +121,20 @@ impl EdgeRepository {
 
         if let Some(row) = existing {
             tx.commit().await?;
-            return Ok(row.id);
+            return Ok((
+                EdgeRow {
+                    id: row.id,
+                    source_id: row.source_id,
+                    source_type: row.source_type,
+                    target_id: row.target_id,
+                    target_type: row.target_type,
+                    relationship: row.relationship,
+                    properties: row.properties,
+                    valid_from: row.valid_from,
+                    valid_to: row.valid_to,
+                },
+                false,
+            ));
         }
 
         let properties = properties.unwrap_or(serde_json::json!({}));
@@ -122,7 +142,7 @@ impl EdgeRepository {
             r#"
             INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            RETURNING id
+            RETURNING id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             "#,
             source_id,
             source_type,
@@ -136,7 +156,20 @@ impl EdgeRepository {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(row.id)
+        Ok((
+            EdgeRow {
+                id: row.id,
+                source_id: row.source_id,
+                source_type: row.source_type,
+                target_id: row.target_id,
+                target_type: row.target_type,
+                relationship: row.relationship,
+                properties: row.properties,
+                valid_from: row.valid_from,
+                valid_to: row.valid_to,
+            },
+            true,
+        ))
     }
 
     /// Get edges by source entity
@@ -298,6 +331,68 @@ impl EdgeRepository {
             .collect())
     }
 
+    /// List edges with AND-composed filters.
+    ///
+    /// Each parameter is optional; null parameters are skipped via the
+    /// `($N::T IS NULL OR column = $N)` pattern, so callers can pass any
+    /// combination of source/target/relationship/type filters and the result
+    /// is the intersection. Ordered by `valid_from DESC NULLS LAST, id`
+    /// for stable pagination.
+    ///
+    /// This replaces the legacy first-non-null filter cascade in
+    /// `routes::edges::list_edges`. Drainer GET-then-POST guards rely on
+    /// composing multiple filters at the SQL layer.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn list_filtered(
+        pool: &PgPool,
+        source_id: Option<Uuid>,
+        target_id: Option<Uuid>,
+        relationship: Option<&str>,
+        source_type: Option<&str>,
+        target_type: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<EdgeRow>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            FROM edges
+            WHERE ($1::uuid IS NULL OR source_id = $1)
+              AND ($2::uuid IS NULL OR target_id = $2)
+              AND ($3::text IS NULL OR relationship = $3)
+              AND ($4::text IS NULL OR source_type = $4)
+              AND ($5::text IS NULL OR target_type = $5)
+            ORDER BY valid_from DESC NULLS LAST, id
+            LIMIT $6
+            "#,
+            source_id,
+            target_id,
+            relationship,
+            source_type,
+            target_type,
+            limit,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| EdgeRow {
+                id: row.id,
+                source_id: row.source_id,
+                source_type: row.source_type,
+                target_id: row.target_id,
+                target_type: row.target_type,
+                relationship: row.relationship,
+                properties: row.properties,
+                valid_from: row.valid_from,
+                valid_to: row.valid_to,
+            })
+            .collect())
+    }
+
     /// List all edges, optionally filtered by source_type and target_type
     ///
     /// # Errors
@@ -369,6 +464,60 @@ impl EdgeRepository {
                 valid_to: row.valid_to,
             })
             .collect())
+    }
+
+    /// Patch an edge's lifecycle fields.
+    ///
+    /// Sets `valid_to` (when `Some`) and shallow-merges `properties_merge`
+    /// (when `Some`) via JSONB `||`. Both arguments are optional but at least
+    /// one must be `Some` to do useful work — the route layer enforces that.
+    ///
+    /// Returns the updated row. Returns `DbError::NotFound` if `id` doesn't
+    /// exist (the underlying query returns no row).
+    ///
+    /// # Errors
+    /// - `DbError::NotFound` if the edge doesn't exist
+    /// - `DbError::QueryFailed` if the database query fails
+    #[instrument(skip(pool, properties_merge))]
+    pub async fn update_valid_to_and_properties(
+        pool: &PgPool,
+        id: Uuid,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+        properties_merge: Option<serde_json::Value>,
+    ) -> Result<EdgeRow, DbError> {
+        let row = sqlx::query!(
+            r#"
+            UPDATE edges
+            SET valid_to = COALESCE($2, valid_to),
+                properties = CASE
+                    WHEN $3::jsonb IS NULL THEN properties
+                    ELSE properties || $3::jsonb
+                END
+            WHERE id = $1
+            RETURNING id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            "#,
+            id,
+            valid_to,
+            properties_merge,
+        )
+        .fetch_optional(pool)
+        .await?
+        .ok_or(DbError::NotFound {
+            entity: "edge".to_string(),
+            id,
+        })?;
+
+        Ok(EdgeRow {
+            id: row.id,
+            source_id: row.source_id,
+            source_type: row.source_type,
+            target_id: row.target_id,
+            target_type: row.target_type,
+            relationship: row.relationship,
+            properties: row.properties,
+            valid_from: row.valid_from,
+            valid_to: row.valid_to,
+        })
     }
 
     /// Delete an edge by ID

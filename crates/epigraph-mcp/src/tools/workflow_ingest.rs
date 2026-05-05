@@ -186,7 +186,7 @@ pub async fn do_ingest_workflow_via_pool(
     // ── 6. workflow —executes→ claim edges ──────────────────────────────
     let mut executes_edges = 0_usize;
     for planned in &plan.claims {
-        EdgeRepository::create_if_not_exists(
+        let (_row, _was_created) = EdgeRepository::create_if_not_exists(
             pool,
             workflow_id,
             "workflow",
@@ -223,7 +223,7 @@ pub async fn do_ingest_workflow_via_pool(
             .copied()
             .unwrap_or(edge.target_id);
 
-        EdgeRepository::create_if_not_exists(
+        let (_row, _was_created) = EdgeRepository::create_if_not_exists(
             pool,
             src,
             &src_type,

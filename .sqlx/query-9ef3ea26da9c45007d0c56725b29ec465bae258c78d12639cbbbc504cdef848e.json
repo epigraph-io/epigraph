@@ -1,0 +1,75 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to\n            FROM edges\n            WHERE ($1::uuid IS NULL OR source_id = $1)\n              AND ($2::uuid IS NULL OR target_id = $2)\n              AND ($3::text IS NULL OR relationship = $3)\n              AND ($4::text IS NULL OR source_type = $4)\n              AND ($5::text IS NULL OR target_type = $5)\n            ORDER BY valid_from DESC NULLS LAST, id\n            LIMIT $6\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "source_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "source_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "target_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "relationship",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "properties",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "valid_from",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "valid_to",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "9ef3ea26da9c45007d0c56725b29ec465bae258c78d12639cbbbc504cdef848e"
+}
