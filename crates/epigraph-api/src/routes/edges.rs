@@ -1051,7 +1051,7 @@ pub async fn patch_edge(
         }
     }
 
-    Ok(Json(EdgeResponse {
+    let response = EdgeResponse {
         id: updated.id,
         source_id: updated.source_id,
         target_id: updated.target_id,
@@ -1061,7 +1061,48 @@ pub async fn patch_edge(
         properties: updated.properties,
         valid_from: updated.valid_from,
         valid_to: updated.valid_to,
-    }))
+    };
+
+    // Emit edge.updated (and edge.retired when valid_to is set). Mirrors
+    // the staleness-trigger pattern used by create_edge (edge.added) and
+    // delete_edge (edge.deleted) — Phase 0 / Task 0.3. Pre-fix, PATCH was
+    // a state change with no event emission, so downstream caches /
+    // staleness watchers never observed in-place lifecycle updates.
+    {
+        let actor_id = auth_ctx.as_ref().and_then(|axum::Extension(a)| a.agent_id);
+        let event_store = super::events::global_event_store();
+        event_store
+            .push(
+                "edge.updated".to_string(),
+                actor_id,
+                serde_json::json!({
+                    "edge_id": response.id,
+                    "source_type": response.source_type,
+                    "source_id": response.source_id,
+                    "target_type": response.target_type,
+                    "target_id": response.target_id,
+                    "relationship": response.relationship,
+                }),
+            )
+            .await;
+
+        // edge.retired is the more specific signal: the lifecycle window
+        // closed. Fires only when the patch sets `valid_to`.
+        if request.valid_to.is_some() {
+            event_store
+                .push(
+                    "edge.retired".to_string(),
+                    actor_id,
+                    serde_json::json!({
+                        "edge_id": response.id,
+                        "valid_to": response.valid_to,
+                    }),
+                )
+                .await;
+        }
+    }
+
+    Ok(Json(response))
 }
 
 /// PATCH edge stub — non-db builds.
@@ -3274,5 +3315,154 @@ mod db_tests {
             payloads[0], payloads[1],
             "patch_payload must reflect the per-PATCH diff, not be a constant"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // I2 — PATCH must emit `edge.updated`, and `edge.retired` when
+    // `valid_to` is set. Mirrors create_edge / delete_edge event semantics.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// PATCH that sets only `properties` (no valid_to) emits `edge.updated`
+    /// but NOT `edge.retired`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_emits_updated_event(pool: PgPool) {
+        use crate::routes::events::{global_event_store, EventFilter};
+
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "evt-updated source").await;
+        let target = seed_claim(&pool, agent_id, "evt-updated target").await;
+        let edge_id = EdgeRepository::create(
+            &pool,
+            source,
+            "claim",
+            target,
+            "claim",
+            "SUPPORTS",
+            Some(serde_json::json!({"weight": 0.5})),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "properties": {"weight": 0.9},
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The store is process-wide across the whole test binary, so other
+        // tests may have pushed `edge.updated` events. Filter by edge_id in
+        // the payload to scope the assertion to this test's edge.
+        let store = global_event_store();
+        let (events, _) = store
+            .list(&EventFilter {
+                since: None,
+                event_type: Some("edge.updated".to_string()),
+                limit: Some(1000),
+                offset: None,
+            })
+            .await;
+        let matching: Vec<_> = events
+            .iter()
+            .filter(|e| e.payload["edge_id"] == serde_json::json!(edge_id))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one edge.updated event for this edge_id"
+        );
+
+        let (retired_events, _) = store
+            .list(&EventFilter {
+                since: None,
+                event_type: Some("edge.retired".to_string()),
+                limit: Some(1000),
+                offset: None,
+            })
+            .await;
+        let matching_retired: Vec<_> = retired_events
+            .iter()
+            .filter(|e| e.payload["edge_id"] == serde_json::json!(edge_id))
+            .collect();
+        assert_eq!(
+            matching_retired.len(),
+            0,
+            "edge.retired must NOT fire when valid_to is not set"
+        );
+    }
+
+    /// PATCH that sets `valid_to` emits BOTH `edge.updated` and
+    /// `edge.retired`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_edge_emits_retired_event_when_valid_to_set(pool: PgPool) {
+        use crate::routes::events::{global_event_store, EventFilter};
+
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "evt-retired source").await;
+        let target = seed_claim(&pool, agent_id, "evt-retired target").await;
+        let edge_id = EdgeRepository::create(
+            &pool, source, "claim", target, "claim", "SUPPORTS", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        let cutoff = chrono::Utc::now();
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "valid_to": cutoff,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let store = global_event_store();
+        for event_type in ["edge.updated", "edge.retired"] {
+            let (events, _) = store
+                .list(&EventFilter {
+                    since: None,
+                    event_type: Some(event_type.to_string()),
+                    limit: Some(1000),
+                    offset: None,
+                })
+                .await;
+            let matching: Vec<_> = events
+                .iter()
+                .filter(|e| e.payload["edge_id"] == serde_json::json!(edge_id))
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "expected exactly one {event_type} event for this edge_id"
+            );
+        }
     }
 }
