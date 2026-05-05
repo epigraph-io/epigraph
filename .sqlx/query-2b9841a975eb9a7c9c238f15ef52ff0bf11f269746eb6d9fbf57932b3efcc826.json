@@ -1,0 +1,59 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH neighbors AS (\n                SELECT\n                    CASE WHEN e.source_id = ANY($1) THEN e.source_id ELSE e.target_id END AS paragraph_id,\n                    CASE WHEN e.source_id = ANY($1) THEN e.target_id ELSE e.source_id END AS neighbor_id,\n                    COALESCE((e.properties->>'strength')::float8, 0.0) AS strength\n                FROM edges e\n                WHERE (e.source_id = ANY($1) OR e.target_id = ANY($1))\n                  AND e.relationship = 'CORROBORATES'\n            ),\n            joined AS (\n                SELECT\n                    n.paragraph_id, n.neighbor_id, n.strength,\n                    c.content, c.truth_value,\n                    p.doi AS paper_doi\n                FROM neighbors n\n                JOIN claims c ON c.id = n.neighbor_id\n                LEFT JOIN edges asserts_e\n                  ON asserts_e.target_id = c.id\n                  AND asserts_e.relationship = 'asserts'\n                  AND asserts_e.source_type = 'paper'\n                LEFT JOIN papers p ON p.id = asserts_e.source_id\n            ),\n            ranked AS (\n                SELECT *,\n                    ROW_NUMBER() OVER (PARTITION BY paragraph_id ORDER BY strength DESC, truth_value DESC) AS rn,\n                    COUNT(*) OVER (PARTITION BY paragraph_id) AS total\n                FROM joined\n            )\n            SELECT\n                paragraph_id AS \"paragraph_id!\",\n                neighbor_id AS \"neighbor_id!\",\n                content AS \"content!\",\n                strength AS \"strength!\",\n                truth_value AS \"truth_value!\",\n                paper_doi AS \"paper_doi?\",\n                total AS \"total!\"\n            FROM ranked\n            WHERE rn <= $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "paragraph_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "neighbor_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "content!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "strength!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 4,
+        "name": "truth_value!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "paper_doi?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "total!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      false,
+      null,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "2b9841a975eb9a7c9c238f15ef52ff0bf11f269746eb6d9fbf57932b3efcc826"
+}
