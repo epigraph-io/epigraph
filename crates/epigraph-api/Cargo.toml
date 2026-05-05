@@ -24,6 +24,11 @@ episcience = []
 name = "server"
 path = "src/bin/server.rs"
 
+[[bin]]
+name = "epigraph-migrate"
+path = "src/bin/epigraph-migrate.rs"
+required-features = ["db"]
+
 
 [dependencies]
 epigraph-interfaces = { workspace = true }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
