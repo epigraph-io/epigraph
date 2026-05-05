@@ -4,6 +4,7 @@
 
 pub mod edges;
 pub mod ids;
+pub mod paths;
 pub mod plan;
 pub mod schema;
 pub mod walker;

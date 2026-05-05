@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use crate::common::edges::{decomposes_edge, thesis_derivation_str};
 use crate::common::ids::{atom_id, compound_claim_id, content_hash, workflow_root_id};
+use crate::common::paths::normalize_claim_path;
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
-use crate::document::builder::normalize_claim_path;
 use crate::workflow::schema::WorkflowExtraction;
 
 /// Walk a `WorkflowExtraction` tree and produce a flat list of operations.

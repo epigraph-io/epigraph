@@ -7,36 +7,9 @@ use uuid::Uuid;
 
 use crate::common::edges::{decomposes_edge, thesis_derivation_str};
 use crate::common::ids::{atom_id, compound_claim_id, content_hash};
+use crate::common::paths::normalize_claim_path;
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
 use crate::document::schema::{DocumentExtraction, Paragraph, SourceType};
-
-/// Convert slash-delimited paths from extraction ("sections/0/paragraphs/1/atoms/2")
-/// to the bracket-dot notation used by path_index ("sections[0].paragraphs[1].atoms[2]").
-/// Passes through paths that are already in bracket-dot format unchanged.
-#[must_use]
-pub fn normalize_claim_path(path: &str) -> String {
-    if path.contains('[') {
-        return path.to_string();
-    }
-    let parts: Vec<&str> = path.split('/').collect();
-    let mut result = String::new();
-    let mut i = 0;
-    while i < parts.len() {
-        if i > 0 {
-            result.push('.');
-        }
-        result.push_str(parts[i]);
-        if i + 1 < parts.len() && parts[i + 1].parse::<usize>().is_ok() {
-            result.push('[');
-            result.push_str(parts[i + 1]);
-            result.push(']');
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-    result
-}
 
 const fn source_type_str(st: &SourceType) -> &'static str {
     match st {
