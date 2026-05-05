@@ -60,6 +60,11 @@ name = "experiment"
 path = "src/bin/experiment.rs"
 required-features = ["db"]
 
+[[bin]]
+name = "reembed"
+path = "src/bin/reembed.rs"
+required-features = ["db"]
+
 [dependencies]
 epigraph-core = { workspace = true }
 epigraph-engine = { workspace = true }
@@ -86,6 +91,9 @@ base64 = "0.22"
 linfa = { workspace = true }
 linfa-clustering = { workspace = true }
 ndarray = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true }
 
 [lints]
 workspace = true

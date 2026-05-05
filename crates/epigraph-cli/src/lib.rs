@@ -1,4 +1,6 @@
 pub mod enrichment;
+#[cfg(feature = "db")]
+pub mod reembed;
 
 #[cfg(feature = "db")]
 use sqlx::PgPool;
