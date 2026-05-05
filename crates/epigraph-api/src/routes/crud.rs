@@ -1165,6 +1165,12 @@ pub struct BuildThemesFromCorpusRequest {
     /// If true, `DELETE FROM claim_themes` before building. Default false —
     /// callers that want a clean slate must opt in explicitly.
     pub wipe_first: Option<bool>,
+    /// Embedding dimension to source. `None` or `Some(1536)` uses the legacy
+    /// `claims.embedding` column and writes to `claim_themes.centroid`.
+    /// `Some(3072)` uses `claims.embedding_3072` and writes to
+    /// `claim_themes.centroid_3072` (operator must run `epigraph-cli reembed`
+    /// first, otherwise this returns 412 Precondition Failed).
+    pub centroid_dim: Option<u32>,
 }
 
 /// k-means bootstrap of `claim_themes` from the existing corpus. Required
@@ -1203,6 +1209,13 @@ pub async fn build_themes_from_corpus(
     let limit = request.limit.unwrap_or(500).max(1);
     let label_prefix = request.label_prefix.unwrap_or_else(|| "auto".to_string());
     let wipe_first = request.wipe_first.unwrap_or(false);
+    let centroid_dim = request.centroid_dim.unwrap_or(1536);
+
+    if !matches!(centroid_dim, 1536 | 3072) {
+        return Err(ApiError::BadRequest {
+            message: format!("centroid_dim must be 1536 or 3072 (got {centroid_dim})"),
+        });
+    }
 
     if k_min == 0 || k_max < k_min {
         return Err(ApiError::BadRequest {
@@ -1214,20 +1227,38 @@ pub async fn build_themes_from_corpus(
         epigraph_db::ClaimThemeRepository::delete_all(&state.db_pool).await?;
     }
 
-    // 1. Pull claims with embeddings.
-    let rows: Vec<(Uuid, Vec<f32>)> = sqlx::query_as(
-        "SELECT id, embedding::text::float4[] \
+    // 1. Pull claims with embeddings. Branch on centroid_dim: 1536 reads
+    //    `claims.embedding`; 3072 reads `claims.embedding_3072` (operator must
+    //    have run `epigraph-cli reembed --target claims` first).
+    let source_col = if centroid_dim == 3072 {
+        "embedding_3072"
+    } else {
+        "embedding"
+    };
+    let select_sql = format!(
+        "SELECT id, {source_col}::real[] \
          FROM claims \
-         WHERE embedding IS NOT NULL \
+         WHERE {source_col} IS NOT NULL \
          ORDER BY id \
-         LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch claim embeddings: {e}"),
-    })?;
+         LIMIT $1"
+    );
+    let rows: Vec<(Uuid, Vec<f32>)> = sqlx::query_as(&select_sql)
+        .bind(limit)
+        .fetch_all(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to fetch claim embeddings: {e}"),
+        })?;
+
+    // Reject when 3072d was requested but no claims have it populated.
+    // This is the operator-misordering guard: they need to run reembed first.
+    if centroid_dim == 3072 && rows.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "centroid_dim=3072 requires populated claims.embedding_3072; \
+                      run `epigraph-cli reembed --target claims` first"
+                .to_string(),
+        });
+    }
 
     let n_claims = rows.len();
     if n_claims < k_min {
@@ -1236,6 +1267,7 @@ pub async fn build_themes_from_corpus(
             "claims_assigned": 0,
             "k_used": null,
             "claims_with_embeddings": n_claims,
+            "centroid_dim": centroid_dim,
             "skipped_reason": format!("only {} claims with embeddings (need ≥ k_min={})", n_claims, k_min),
         })));
     }
@@ -1333,9 +1365,10 @@ pub async fn build_themes_from_corpus(
 
         let theme_label = format!("{label_prefix}-{cluster_idx:02}");
         let theme_description = format!(
-            "Auto-built from {} claims by k-means at k={} (1536d embedding)",
+            "Auto-built from {} claims by k-means at k={} ({}d embedding)",
             cluster_claim_ids.len(),
             chosen_k,
+            centroid_dim,
         );
         let theme = epigraph_db::ClaimThemeRepository::create(
             &state.db_pool,
@@ -1353,8 +1386,27 @@ pub async fn build_themes_from_corpus(
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        epigraph_db::ClaimThemeRepository::set_centroid(&state.db_pool, theme.id, &centroid_str)
+        if centroid_dim == 3072 {
+            // Direct UPDATE to claim_themes.centroid_3072 (no repo helper yet —
+            // the existing set_centroid targets the legacy centroid column).
+            sqlx::query(
+                "UPDATE claim_themes SET centroid_3072 = $2::vector, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(theme.id)
+            .bind(&centroid_str)
+            .execute(&state.db_pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to write 3072d centroid: {e}"),
+            })?;
+        } else {
+            epigraph_db::ClaimThemeRepository::set_centroid(
+                &state.db_pool,
+                theme.id,
+                &centroid_str,
+            )
             .await?;
+        }
 
         let assigned = epigraph_db::ClaimThemeRepository::bulk_assign(
             &state.db_pool,
@@ -1828,6 +1880,7 @@ mod tests {
                 limit: Some(100),
                 label_prefix: None,
                 wipe_first: Some(false),
+                centroid_dim: None,
             }),
         )
         .await
@@ -1837,5 +1890,101 @@ mod tests {
         assert_eq!(body["themes_created"], serde_json::json!(0));
         assert_eq!(body["claims_assigned"], serde_json::json!(0));
         assert!(body.get("skipped_reason").is_some());
+    }
+
+    /// 3072d path: when `centroid_dim=3072` is requested AND the
+    /// `claims.embedding_3072` column is populated, build-from-corpus
+    /// k-means against 3072d vectors and writes to
+    /// `claim_themes.centroid_3072`.
+    #[tokio::test]
+    async fn build_from_corpus_writes_3072d_centroids_when_requested() {
+        let pool = test_pool_or_skip!();
+
+        // Clear and seed: insert 50 claims with embedding_3072 populated.
+        let _ = sqlx::query("UPDATE claims SET embedding = NULL, embedding_3072 = NULL")
+            .execute(&pool)
+            .await;
+        // Drop any prior auto-themes from this scenario so themes_created is
+        // bounded only by what THIS call writes.
+        let _ = sqlx::query("UPDATE claims SET theme_id = NULL")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM claim_themes WHERE label LIKE 'auto3072-%'")
+            .execute(&pool)
+            .await;
+
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels) \
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'build-3072-test', 'system', ARRAY['test']) \
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed agent");
+
+        // Build 3 distinct 3072d vectors (3 clusters of ~17 claims each, with
+        // small jitter so k-means actually has work to do).
+        for cluster in 0..3 {
+            let base = cluster as f32 * 0.1;
+            for i in 0..17 {
+                let inner: Vec<String> = (0..3072)
+                    .map(|j| {
+                        // Cluster-specific bias on the first 3 dims, jitter
+                        // elsewhere so claims in the same cluster are similar.
+                        let bias = if j == cluster { 1.0 } else { 0.0 };
+                        let jitter = ((i + j) as f32) * 1e-7;
+                        format!("{}", base + bias + jitter)
+                    })
+                    .collect();
+                let pgvec = format!("[{}]", inner.join(","));
+                let content = format!("3072-test-c{}-i{}-{}", cluster, i, Uuid::new_v4());
+                sqlx::query(
+                    "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding_3072) \
+                     VALUES ($1, sha256($1::bytea), 0.5, $2, $3::vector)",
+                )
+                .bind(&content)
+                .bind(agent_id)
+                .bind(&pgvec)
+                .execute(&pool)
+                .await
+                .expect("seed 3072d claim");
+            }
+        }
+
+        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let result = build_themes_from_corpus(
+            axum::extract::State(state),
+            None,
+            axum::Json(BuildThemesFromCorpusRequest {
+                k: Some(3),
+                k_min: Some(2),
+                k_max: Some(4),
+                min_claims_per_theme: Some(2),
+                limit: Some(100),
+                label_prefix: Some("auto3072".to_string()),
+                wipe_first: Some(false),
+                centroid_dim: Some(3072),
+            }),
+        )
+        .await
+        .expect("3072d build-from-corpus must succeed");
+
+        let body = result.0;
+        assert_eq!(body["centroid_dim"], serde_json::json!(3072));
+        assert!(
+            body["themes_created"].as_i64().unwrap_or(0) > 0,
+            "themes_created should be > 0; body={body}"
+        );
+
+        let centroid_3072_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM claim_themes WHERE centroid_3072 IS NOT NULL AND label LIKE 'auto3072-%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            centroid_3072_count > 0,
+            "at least one claim_themes row should have centroid_3072 written"
+        );
     }
 }
