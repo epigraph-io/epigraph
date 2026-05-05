@@ -226,9 +226,10 @@ async fn main() {
         runner.register_handler(Arc::new(ClusterGraphHandler::new(Arc::clone(
             &handler_pool,
         ))));
-        runner.register_handler(Arc::new(ThemeClusterRebuildHandler::new(Arc::clone(
-            &handler_pool,
-        ))));
+        runner.register_handler(Arc::new(ThemeClusterRebuildHandler::with_followup_queue(
+            Arc::clone(&handler_pool),
+            Arc::clone(&queue_for_theme_cron),
+        )));
 
         tokio::spawn(async move {
             runner.start().await;
@@ -264,11 +265,14 @@ async fn main() {
             }
         });
 
-        // Sibling cron: ThemeClusterRebuild — same 60 s warmup + 24 h
-        // interval as ClusterGraph.  `skip_if_unchanged: true` makes this
-        // a cheap no-op on idle days.
+        // Sibling cron: ThemeClusterRebuild — staggered 30-minute warmup
+        // (vs ClusterGraph's 60 s) so ClusterGraph finishes its first run
+        // before ThemeClusterRebuild's `wipe_first` cascades into
+        // `graph_neighborhoods.theme_id` (ON DELETE CASCADE, migration
+        // 026).  Subsequent daily runs preserve the same offset.
+        // `skip_if_unchanged: true` makes this a cheap no-op on idle days.
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_secs(1800)).await;
             loop {
                 match (EpiGraphJob::ThemeClusterRebuild {
                     max_themes: 50,

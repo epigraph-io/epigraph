@@ -10,11 +10,18 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::sync::Arc;
 
-use crate::{EpiGraphJob, Job, JobError, JobHandler, JobResult, JobResultMetadata};
+use crate::{EpiGraphJob, Job, JobError, JobHandler, JobQueue, JobResult, JobResultMetadata};
 
 /// Job handler for the scheduled theme rebuild.
 pub struct ThemeClusterRebuildHandler {
     pool: Arc<PgPool>,
+    /// Optional queue used to enqueue a follow-up `ClusterGraph` job after
+    /// a non-skipped rebuild.  `wipe_first` cascades into
+    /// `graph_neighborhoods.theme_id` (ON DELETE CASCADE), so we re-run
+    /// `ClusterGraph` immediately to refill the table rather than wait up
+    /// to 24 h for the next scheduled run.  `None` in tests (the test
+    /// path uses [`Self::handle_direct`] which bypasses the queue).
+    followup_queue: Option<Arc<dyn JobQueue>>,
 }
 
 /// Summary returned by [`ThemeClusterRebuildHandler::handle_direct`].
@@ -30,10 +37,29 @@ pub struct HandleSummary {
 }
 
 impl ThemeClusterRebuildHandler {
-    /// Construct a handler bound to a connection pool.
+    /// Construct a handler bound to a connection pool.  No follow-up
+    /// `ClusterGraph` enqueue happens in this configuration (used by
+    /// tests and library callers that don't care about
+    /// `graph_neighborhoods` self-healing).
     #[must_use]
     pub const fn new(pool: Arc<PgPool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            followup_queue: None,
+        }
+    }
+
+    /// Construct a handler that re-enqueues a `ClusterGraph` job after
+    /// every non-skipped rebuild.  Used by the API server so a daily
+    /// `theme_cluster_rebuild` cron immediately repopulates
+    /// `graph_neighborhoods` (which `wipe_first` cascades through) rather
+    /// than waiting up to 24 h for the next ClusterGraph cron tick.
+    #[must_use]
+    pub const fn with_followup_queue(pool: Arc<PgPool>, queue: Arc<dyn JobQueue>) -> Self {
+        Self {
+            pool,
+            followup_queue: Some(queue),
+        }
     }
 
     /// Direct-call entry point for tests and library callers that don't
@@ -124,6 +150,39 @@ impl JobHandler for ThemeClusterRebuildHandler {
             skip_if_unchanged,
         )
         .await?;
+
+        // Self-heal `graph_neighborhoods` after a `wipe_first` cascade.
+        // The skip path leaves the row set intact, so we only need to
+        // re-run ClusterGraph when the rebuild actually wiped rows.
+        if !summary.skipped {
+            if let Some(queue) = self.followup_queue.as_ref() {
+                match (EpiGraphJob::ClusterGraph {
+                    resolution: 1.0,
+                    retain_runs: 3,
+                })
+                .into_job()
+                {
+                    Ok(followup) => match queue.enqueue(followup).await {
+                        Ok(_) => tracing::info!(
+                            "theme_cluster_rebuild: enqueued follow-up ClusterGraph to refill graph_neighborhoods"
+                        ),
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "theme_cluster_rebuild: failed to enqueue follow-up ClusterGraph job"
+                        ),
+                    },
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "theme_cluster_rebuild: failed to serialize follow-up ClusterGraph job"
+                    ),
+                }
+            } else {
+                tracing::debug!(
+                    "theme_cluster_rebuild: no follow-up queue registered; \
+                     graph_neighborhoods will be repopulated on next ClusterGraph cron"
+                );
+            }
+        }
 
         Ok(JobResult {
             output: serde_json::json!({
