@@ -187,8 +187,9 @@ fn read_checkpoint(path: Option<&PathBuf>) -> Result<Option<Uuid>, ReembedError>
     if trimmed.is_empty() {
         return Ok(None);
     }
-    let id = Uuid::parse_str(trimmed)
-        .map_err(|e| ReembedError::InvalidCheckpoint(format!("expected UUID, got {trimmed}: {e}")))?;
+    let id = Uuid::parse_str(trimmed).map_err(|e| {
+        ReembedError::InvalidCheckpoint(format!("expected UUID, got {trimmed}: {e}"))
+    })?;
     Ok(Some(id))
 }
 
@@ -202,4 +203,3 @@ fn write_checkpoint(path: Option<&PathBuf>, id: Uuid) -> Result<(), ReembedError
     std::fs::write(path, id.to_string())?;
     Ok(())
 }
-

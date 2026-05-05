@@ -94,7 +94,9 @@ async fn seed_claims_with_1536_embeddings(pool: &PgPool, n: usize) -> Vec<Uuid> 
     .expect("seed agent");
 
     // Build a length-1536 zero-ish vector as a pgvector literal.
-    let inner: Vec<String> = (0..1536).map(|i| format!("{}", (i as f32) * 0.0001)).collect();
+    let inner: Vec<String> = (0..1536)
+        .map(|i| format!("{}", (i as f32) * 0.0001))
+        .collect();
     let pgvec = format!("[{}]", inner.join(","));
 
     let mut ids = Vec::with_capacity(n);
@@ -135,7 +137,10 @@ async fn reembed_is_idempotent(pool: PgPool) {
     assert_eq!(summary1.rows_written, 3, "first run writes 3 rows");
 
     let calls_after_first = provider.batch_call_count();
-    assert!(calls_after_first >= 1, "first run made at least one batch call");
+    assert!(
+        calls_after_first >= 1,
+        "first run made at least one batch call"
+    );
 
     let summary2 = run(
         &pool,
@@ -161,5 +166,8 @@ async fn reembed_is_idempotent(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(count, 3, "all 3 seeded claims have embedding_3072 populated");
+    assert_eq!(
+        count, 3,
+        "all 3 seeded claims have embedding_3072 populated"
+    );
 }
