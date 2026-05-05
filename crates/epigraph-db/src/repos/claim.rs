@@ -10,6 +10,16 @@ use uuid::Uuid;
 /// Repository for Claim operations
 pub struct ClaimRepository;
 
+/// Result row for [`ClaimRepository::search_by_embedding`].
+///
+/// `similarity` is `1 - cosine_distance`, in `[0, 1]` for non-degenerate
+/// vectors (and matching the convention used by callers in `epigraph-mcp`).
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct ClaimEmbeddingHit {
+    pub claim_id: Uuid,
+    pub similarity: f64,
+}
+
 /// Build a Claim from database row data.
 ///
 /// This helper function handles the crypto fields that may not exist in
@@ -312,6 +322,88 @@ impl ClaimRepository {
             }
             None => Ok(None),
         }
+    }
+
+    /// kNN search over `claims.embedding` (1536d) or `claims.embedding_3072`,
+    /// restricted to paragraph-level (level=2) claims, optionally filtered by
+    /// the paper that asserts the claim. Results are ordered by cosine
+    /// similarity descending (= cosine distance ascending), and rows whose
+    /// chosen embedding column is NULL are excluded.
+    ///
+    /// `query_embedding_pgvector` is a pgvector text literal, e.g. `"[0.1,0.2,...]"`.
+    /// `paper_doi_filter`, when set, restricts results to claims that have an
+    /// incoming `'asserts'` edge from a `papers` row with the given DOI.
+    ///
+    /// The `dim=1536` path is index-aligned with the partial HNSW
+    /// `idx_claims_paragraph_embedding` introduced in migration 029. The
+    /// `dim=3072` path is intentionally seq-scan (paragraph counts ≤ 10⁴; see
+    /// the `recall_with_context` design doc).
+    ///
+    /// # Errors
+    /// * [`DbError::InvalidData`] if `dim` is neither 1536 nor 3072.
+    /// * [`DbError::QueryFailed`] on database errors.
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn search_by_embedding(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        dim: u32,
+        limit: i64,
+        paper_doi_filter: Option<&str>,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        let column = match dim {
+            1536 => "embedding",
+            3072 => "embedding_3072",
+            _ => {
+                return Err(DbError::InvalidData {
+                    reason: format!("unsupported centroid_dim: {dim} (must be 1536 or 3072)"),
+                });
+            }
+        };
+
+        // Two query shapes — paper-filter vs no-filter — to keep both
+        // index-friendly. The shared WHERE predicate matches the partial
+        // HNSW index from migration 029 for the 1536d path.
+        let sql = if paper_doi_filter.is_some() {
+            format!(
+                r#"
+                SELECT c.id AS claim_id,
+                       1 - (c.{column} <=> $1::vector) AS similarity
+                FROM claims c
+                WHERE (c.properties->>'level')::int = 2
+                  AND c.{column} IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM edges e
+                      JOIN papers p ON p.id = e.source_id
+                      WHERE e.target_id = c.id
+                        AND e.relationship = 'asserts'
+                        AND p.doi = $3
+                  )
+                ORDER BY c.{column} <=> $1::vector
+                LIMIT $2
+                "#
+            )
+        } else {
+            format!(
+                r#"
+                SELECT c.id AS claim_id,
+                       1 - (c.{column} <=> $1::vector) AS similarity
+                FROM claims c
+                WHERE (c.properties->>'level')::int = 2
+                  AND c.{column} IS NOT NULL
+                ORDER BY c.{column} <=> $1::vector
+                LIMIT $2
+                "#
+            )
+        };
+
+        let mut q = sqlx::query_as::<_, ClaimEmbeddingHit>(&sql)
+            .bind(query_embedding_pgvector)
+            .bind(limit);
+        if let Some(doi) = paper_doi_filter {
+            q = q.bind(doi);
+        }
+
+        Ok(q.fetch_all(pool).await?)
     }
 
     /// Get all claims by an agent

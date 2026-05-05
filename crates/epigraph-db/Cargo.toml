@@ -41,3 +41,7 @@ path = "tests/cascade_delete_tests.rs"
 [[test]]
 name = "edge_validation_tests"
 path = "tests/edge_validation_tests.rs"
+
+[[test]]
+name = "claim_search_by_embedding"
+path = "tests/claim_search_by_embedding.rs"
