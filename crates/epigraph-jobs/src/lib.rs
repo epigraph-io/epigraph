@@ -61,6 +61,7 @@ mod db_reputation_service;
 pub use db_reputation_service::DbReputationService;
 
 pub mod cluster_graph;
+pub mod theme_cluster_rebuild;
 
 // ============================================================================
 // Job Identifier
@@ -708,6 +709,22 @@ pub enum EpiGraphJob {
         /// Maximum number of historical runs to retain.
         retain_runs: u32,
     },
+
+    /// Rebuild `claim_themes` from scratch via k-means over `claims.embedding`.
+    ///
+    /// Sibling cron to `ClusterGraph`. The handler calls
+    /// `epigraph_engine::theme_kmeans::run_theme_kmeans` with `wipe_first=true`,
+    /// so each successful run replaces the existing theme set wholesale.
+    ThemeClusterRebuild {
+        /// Wired through to `RunThemeKmeansConfig::k_max`.
+        max_themes: u32,
+        /// Drop clusters smaller than this (no theme created).
+        min_claims_per_theme: u32,
+        /// When `true`, skip the run if `MAX(claim_themes.updated_at) >=
+        /// MAX(claims.{created_at,updated_at})`. The cron caller sets this
+        /// to `true` to avoid redoing work on idle days.
+        skip_if_unchanged: bool,
+    },
 }
 
 impl EpiGraphJob {
@@ -721,6 +738,7 @@ impl EpiGraphJob {
             Self::WebhookNotification { .. } => "webhook_notification",
             Self::DataCleanup { .. } => "data_cleanup",
             Self::ClusterGraph { .. } => "cluster_graph",
+            Self::ThemeClusterRebuild { .. } => "theme_cluster_rebuild",
         }
     }
 

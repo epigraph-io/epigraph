@@ -46,6 +46,7 @@ pub mod service;
 pub mod sheaf;
 pub mod silence_alarm;
 pub mod theme_cluster;
+pub mod theme_kmeans;
 pub mod uncertainty;
 pub mod unified_bp;
 pub mod voi;

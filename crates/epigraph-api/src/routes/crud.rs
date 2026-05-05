@@ -1195,239 +1195,73 @@ pub async fn build_themes_from_corpus(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<BuildThemesFromCorpusRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use linfa::prelude::*;
-    use linfa_clustering::KMeans;
-    use ndarray::Array2;
+    use epigraph_engine::theme_kmeans::{run_theme_kmeans, RunThemeKmeansConfig, ThemeKmeansError};
 
     if let Some(axum::Extension(ref auth)) = auth_ctx {
         crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
     }
 
-    let k_min = request.k_min.unwrap_or(4);
-    let k_max = request.k_max.unwrap_or(16);
-    let min_claims = request.min_claims_per_theme.unwrap_or(5);
-    let limit = request.limit.unwrap_or(500).max(1);
-    let label_prefix = request.label_prefix.unwrap_or_else(|| "auto".to_string());
-    let wipe_first = request.wipe_first.unwrap_or(false);
-    let centroid_dim = request.centroid_dim.unwrap_or(1536);
-
-    if !matches!(centroid_dim, 1536 | 3072) {
-        return Err(ApiError::BadRequest {
-            message: format!("centroid_dim must be 1536 or 3072 (got {centroid_dim})"),
-        });
-    }
-
-    if k_min == 0 || k_max < k_min {
-        return Err(ApiError::BadRequest {
-            message: "k_min must be ≥1 and k_max ≥ k_min".to_string(),
-        });
-    }
-
-    if wipe_first {
-        epigraph_db::ClaimThemeRepository::delete_all(&state.db_pool).await?;
-    }
-
-    // 1. Pull claims with embeddings. Branch on centroid_dim: 1536 reads
-    //    `claims.embedding`; 3072 reads `claims.embedding_3072` (operator must
-    //    have run `epigraph-cli reembed --target claims` first).
-    let source_col = if centroid_dim == 3072 {
-        "embedding_3072"
-    } else {
-        "embedding"
+    let config = RunThemeKmeansConfig {
+        k: request.k.map(|k| u32::try_from(k).unwrap_or(u32::MAX)),
+        k_min: request
+            .k_min
+            .map_or(4, |v| u32::try_from(v).unwrap_or(u32::MAX)),
+        k_max: request
+            .k_max
+            .map_or(16, |v| u32::try_from(v).unwrap_or(u32::MAX)),
+        min_claims_per_theme: request
+            .min_claims_per_theme
+            .map_or(5, |v| u32::try_from(v).unwrap_or(u32::MAX)),
+        limit: request
+            .limit
+            .map_or(500, |v| u32::try_from(v.max(1)).unwrap_or(u32::MAX))
+            .max(1),
+        label_prefix: request.label_prefix.unwrap_or_else(|| "auto".to_string()),
+        wipe_first: request.wipe_first.unwrap_or(false),
+        centroid_dim: request.centroid_dim.unwrap_or(1536),
     };
-    let select_sql = format!(
-        "SELECT id, {source_col}::real[] \
-         FROM claims \
-         WHERE {source_col} IS NOT NULL \
-         ORDER BY id \
-         LIMIT $1"
-    );
-    let rows: Vec<(Uuid, Vec<f32>)> = sqlx::query_as(&select_sql)
-        .bind(limit)
-        .fetch_all(&state.db_pool)
+
+    let summary = run_theme_kmeans(&state.db_pool, &config)
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to fetch claim embeddings: {e}"),
+        .map_err(|e| match e {
+            ThemeKmeansError::BadRequest(msg) => ApiError::BadRequest { message: msg },
+            ThemeKmeansError::Centroid3072Empty => ApiError::BadRequest {
+                message: e.to_string(),
+            },
+            ThemeKmeansError::Repo(repo_err) => ApiError::from(repo_err),
+            other => ApiError::InternalError {
+                message: other.to_string(),
+            },
         })?;
 
-    // Reject when 3072d was requested but no claims have it populated.
-    // This is the operator-misordering guard: they need to run reembed first.
-    if centroid_dim == 3072 && rows.is_empty() {
-        return Err(ApiError::BadRequest {
-            message: "centroid_dim=3072 requires populated claims.embedding_3072; \
-                      run `epigraph-cli reembed --target claims` first"
-                .to_string(),
-        });
-    }
-
-    let n_claims = rows.len();
-    if n_claims < k_min {
-        return Ok(Json(serde_json::json!({
-            "themes_created": 0,
-            "claims_assigned": 0,
-            "k_used": null,
-            "claims_with_embeddings": n_claims,
-            "centroid_dim": centroid_dim,
-            "skipped_reason": format!("only {} claims with embeddings (need ≥ k_min={})", n_claims, k_min),
-        })));
-    }
-
-    // 2. Build the dense matrix.
-    let dim = rows[0].1.len();
-    let mut data = Array2::<f64>::zeros((n_claims, dim));
-    for (i, (_, emb)) in rows.iter().enumerate() {
-        if emb.len() != dim {
-            return Err(ApiError::InternalError {
-                message: format!(
-                    "embedding dim mismatch at claim {}: got {}, expected {}",
-                    rows[i].0,
-                    emb.len(),
-                    dim,
-                ),
-            });
-        }
-        for (j, &v) in emb.iter().enumerate() {
-            data[[i, j]] = f64::from(v);
-        }
-    }
-    let dataset = linfa::DatasetBase::from(data.view());
-
-    // 3. Pick k. Either explicit or elbow-penalized search.
-    let actual_k_max = k_max.min(n_claims);
-    let chosen_k = if let Some(k) = request.k {
-        if k == 0 || k > n_claims {
-            return Err(ApiError::BadRequest {
-                message: format!("k must be in 1..={n_claims}"),
-            });
-        }
-        k
+    // Preserve byte-identical legacy JSON shape.
+    //
+    // - Skip path: `k_used` is JSON null and a `skipped_reason` field is
+    //   emitted; `centroid_dim` is the *requested* config dim
+    //   (`summary.centroid_dim` already reflects this on skip).
+    // - Success path: `k_used` is the chosen integer; `centroid_dim` is
+    //   the *measured* dim from the first row.  The original handler also
+    //   omitted `skipped_reason` on this path — we do the same.
+    let body = if let Some(k_used) = summary.k_used {
+        serde_json::json!({
+            "themes_created": summary.themes_created,
+            "claims_assigned": summary.claims_assigned,
+            "k_used": k_used,
+            "claims_with_embeddings": summary.claims_with_embeddings,
+            "centroid_dim": summary.centroid_dim,
+        })
     } else {
-        let mut best_k = k_min;
-        let mut best_score = f64::NEG_INFINITY;
-        for k in k_min..=actual_k_max {
-            let model = KMeans::params(k)
-                .max_n_iterations(100)
-                .tolerance(1e-4)
-                .fit(&dataset)
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("k-means fit failed at k={k}: {e}"),
-                })?;
-            let labels: Vec<usize> = model.predict(&dataset).iter().copied().collect();
-            let centroids = model.centroids();
-            let mut total_dist = 0.0;
-            for (i, label) in labels.iter().enumerate() {
-                let centroid = centroids.row(*label);
-                let point = data.row(i);
-                let dist: f64 = point
-                    .iter()
-                    .zip(centroid.iter())
-                    .map(|(a, b)| (a - b).powi(2))
-                    .sum();
-                total_dist += dist;
-            }
-            let inertia = -total_dist / n_claims as f64;
-            // Elbow penalty: discourage runaway k.
-            let penalized = inertia * (1.0 - 0.05 * k as f64);
-            if penalized > best_score {
-                best_score = penalized;
-                best_k = k;
-            }
-        }
-        best_k
+        serde_json::json!({
+            "themes_created": summary.themes_created,
+            "claims_assigned": summary.claims_assigned,
+            "k_used": serde_json::Value::Null,
+            "claims_with_embeddings": summary.claims_with_embeddings,
+            "centroid_dim": summary.centroid_dim,
+            "skipped_reason": summary.skipped_reason.unwrap_or_default(),
+        })
     };
 
-    // 4. Final fit at chosen_k.
-    let model = KMeans::params(chosen_k)
-        .max_n_iterations(200)
-        .tolerance(1e-5)
-        .fit(&dataset)
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Final k-means fit failed at k={chosen_k}: {e}"),
-        })?;
-    let labels: Vec<usize> = model.predict(&dataset).iter().copied().collect();
-    let centroids = model.centroids();
-
-    // 5. Persist: theme per cluster, then bulk-assign claim_ids.
-    let mut themes_created = 0_usize;
-    let mut claims_assigned = 0_usize;
-
-    for cluster_idx in 0..chosen_k {
-        let cluster_claim_ids: Vec<Uuid> = labels
-            .iter()
-            .enumerate()
-            .filter(|(_, &l)| l == cluster_idx)
-            .map(|(i, _)| rows[i].0)
-            .collect();
-
-        if cluster_claim_ids.len() < min_claims {
-            continue;
-        }
-
-        let theme_label = format!("{label_prefix}-{cluster_idx:02}");
-        let theme_description = format!(
-            "Auto-built from {} claims by k-means at k={} ({}d embedding)",
-            cluster_claim_ids.len(),
-            chosen_k,
-            centroid_dim,
-        );
-        let theme = epigraph_db::ClaimThemeRepository::create(
-            &state.db_pool,
-            &theme_label,
-            &theme_description,
-        )
-        .await?;
-
-        let centroid_row = centroids.row(cluster_idx);
-        let centroid_str = format!(
-            "[{}]",
-            centroid_row
-                .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        if centroid_dim == 3072 {
-            // Direct UPDATE to claim_themes.centroid_3072 (no repo helper yet —
-            // the existing set_centroid targets the legacy centroid column).
-            sqlx::query(
-                "UPDATE claim_themes SET centroid_3072 = $2::vector, updated_at = NOW() WHERE id = $1",
-            )
-            .bind(theme.id)
-            .bind(&centroid_str)
-            .execute(&state.db_pool)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to write 3072d centroid: {e}"),
-            })?;
-        } else {
-            epigraph_db::ClaimThemeRepository::set_centroid(
-                &state.db_pool,
-                theme.id,
-                &centroid_str,
-            )
-            .await?;
-        }
-
-        let assigned = epigraph_db::ClaimThemeRepository::bulk_assign(
-            &state.db_pool,
-            &cluster_claim_ids,
-            theme.id,
-        )
-        .await?;
-        epigraph_db::ClaimThemeRepository::update_count(&state.db_pool, theme.id, assigned as i32)
-            .await?;
-
-        themes_created += 1;
-        claims_assigned += assigned as usize;
-    }
-
-    Ok(Json(serde_json::json!({
-        "themes_created": themes_created,
-        "claims_assigned": claims_assigned,
-        "k_used": chosen_k,
-        "claims_with_embeddings": n_claims,
-        "centroid_dim": dim,
-    })))
+    Ok(Json(body))
 }
 
 #[cfg(not(feature = "db"))]
