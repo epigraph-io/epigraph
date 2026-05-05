@@ -1,6 +1,11 @@
 //! Apply pending SQL migrations and exit. Suitable for ExecStartPre= in
 //! systemd units, or for ops dry-runs (with sqlx-cli for plan visibility).
+//!
+//! The bin requires the `db` feature (see Cargo.toml `required-features`).
+//! When `cargo clippy --workspace` runs without `db` activated, this body
+//! compiles out and `main` becomes a no-op so the build still succeeds.
 
+#[cfg(feature = "db")]
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -17,4 +22,10 @@ async fn main() {
         .expect("sqlx::migrate failed — refusing to leave DB in a half-migrated state");
     tracing::info!("migrations: ok");
     println!("migrations: ok"); // keep stdout marker for ops scripts that grep for it
+}
+
+#[cfg(not(feature = "db"))]
+fn main() {
+    eprintln!("epigraph-migrate requires the `db` feature");
+    std::process::exit(1);
 }
