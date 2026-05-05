@@ -19,13 +19,14 @@ async fn create_if_not_exists_is_idempotent(pool: PgPool) {
     let claim_row = ClaimRepository::create(&pool, &claim).await.unwrap();
     let claim_id: uuid::Uuid = claim_row.id.into();
 
-    let id1 = EdgeRepository::create_if_not_exists(
+    let (row1, was_created1) = EdgeRepository::create_if_not_exists(
         &pool, paper_id, "paper", claim_id, "claim", "asserts", None, None, None,
     )
     .await
     .expect("first call inserts");
+    assert!(was_created1, "first call must report was_created=true");
 
-    let id2 = EdgeRepository::create_if_not_exists(
+    let (row2, was_created2) = EdgeRepository::create_if_not_exists(
         &pool,
         paper_id,
         "paper",
@@ -39,7 +40,17 @@ async fn create_if_not_exists_is_idempotent(pool: PgPool) {
     .await
     .expect("second call returns existing");
 
-    assert_eq!(id1, id2, "second call must return existing edge id");
+    assert_eq!(row1.id, row2.id, "second call must return existing edge id");
+    assert!(
+        !was_created2,
+        "second call must report was_created=false on dedup hit"
+    );
+    // Dedup hit must return the STORED properties, not the new request's.
+    assert_eq!(
+        row2.properties,
+        serde_json::json!({}),
+        "dedup hit must surface stored properties (empty), not the second call's"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -54,13 +65,13 @@ async fn create_if_not_exists_distinguishes_by_relationship(pool: PgPool) {
     let claim_row = ClaimRepository::create(&pool, &claim).await.unwrap();
     let claim_id: uuid::Uuid = claim_row.id.into();
 
-    let id_a = EdgeRepository::create_if_not_exists(
+    let (row_a, _) = EdgeRepository::create_if_not_exists(
         &pool, paper_id, "paper", claim_id, "claim", "asserts", None, None, None,
     )
     .await
     .unwrap();
 
-    let id_b = EdgeRepository::create_if_not_exists(
+    let (row_b, _) = EdgeRepository::create_if_not_exists(
         &pool,
         paper_id,
         "paper",
@@ -74,5 +85,5 @@ async fn create_if_not_exists_distinguishes_by_relationship(pool: PgPool) {
     .await
     .unwrap();
 
-    assert_ne!(id_a, id_b, "different relationship → different edge");
+    assert_ne!(row_a.id, row_b.id, "different relationship → different edge");
 }

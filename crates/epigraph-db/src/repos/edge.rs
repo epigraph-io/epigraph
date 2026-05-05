@@ -74,7 +74,13 @@ impl EdgeRepository {
 
     /// Like [`create`], but if an edge with the same
     /// `(source_id, target_id, relationship)` triple already exists, returns
-    /// that edge's id without inserting a duplicate. Idempotent.
+    /// that edge's row without inserting a duplicate. Idempotent.
+    ///
+    /// Returns `(EdgeRow, was_created)` where `was_created` is `true` when a
+    /// new row was inserted and `false` when an existing row was returned.
+    /// Mirrors `ClaimRepository::create_or_get`. Callers in API handlers gate
+    /// side effects (provenance, events, DS recomputation) on `was_created`
+    /// so dedup hits don't double-fire — see `routes/edges.rs::create_edge`.
     ///
     /// Uses check-then-insert in a transaction. The `edges` table has no
     /// unique index on this triple (multiple parallel edges with different
@@ -96,12 +102,13 @@ impl EdgeRepository {
         properties: Option<serde_json::Value>,
         valid_from: Option<chrono::DateTime<chrono::Utc>>,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<Uuid, DbError> {
+    ) -> Result<(EdgeRow, bool), DbError> {
         let mut tx = pool.begin().await?;
 
         let existing = sqlx::query!(
             r#"
-            SELECT id FROM edges
+            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            FROM edges
             WHERE source_id = $1 AND target_id = $2 AND relationship = $3
             LIMIT 1
             "#,
@@ -114,7 +121,20 @@ impl EdgeRepository {
 
         if let Some(row) = existing {
             tx.commit().await?;
-            return Ok(row.id);
+            return Ok((
+                EdgeRow {
+                    id: row.id,
+                    source_id: row.source_id,
+                    source_type: row.source_type,
+                    target_id: row.target_id,
+                    target_type: row.target_type,
+                    relationship: row.relationship,
+                    properties: row.properties,
+                    valid_from: row.valid_from,
+                    valid_to: row.valid_to,
+                },
+                false,
+            ));
         }
 
         let properties = properties.unwrap_or(serde_json::json!({}));
@@ -122,7 +142,7 @@ impl EdgeRepository {
             r#"
             INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            RETURNING id
+            RETURNING id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             "#,
             source_id,
             source_type,
@@ -136,7 +156,20 @@ impl EdgeRepository {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(row.id)
+        Ok((
+            EdgeRow {
+                id: row.id,
+                source_id: row.source_id,
+                source_type: row.source_type,
+                target_id: row.target_id,
+                target_type: row.target_type,
+                relationship: row.relationship,
+                properties: row.properties,
+                valid_from: row.valid_from,
+                valid_to: row.valid_to,
+            },
+            true,
+        ))
     }
 
     /// Get edges by source entity

@@ -136,7 +136,7 @@ pub async fn do_ingest_document(
                 .map_err(internal_error)?;
             created.id.into()
         };
-        EdgeRepository::create_if_not_exists(
+        let (_row, _was_created) = EdgeRepository::create_if_not_exists(
             pool,
             agent_uuid,
             "agent",
@@ -207,7 +207,7 @@ pub async fn do_ingest_document(
         let persisted_id: Uuid = persisted.id.into();
         let already_had_trace = persisted.trace_id.is_some();
         if persisted_id != planned.id || already_had_trace {
-            EdgeRepository::create_if_not_exists(
+            let (_row, _was_created) = EdgeRepository::create_if_not_exists(
                 pool,
                 paper_id,
                 "paper",
@@ -281,7 +281,7 @@ pub async fn do_ingest_document(
             .await
             .map_err(internal_error)?;
 
-        EdgeRepository::create_if_not_exists(
+        let (_row, _was_created) = EdgeRepository::create_if_not_exists(
             pool,
             paper_id,
             "paper",
@@ -350,7 +350,7 @@ pub async fn do_ingest_document(
             continue;
         }
 
-        EdgeRepository::create_if_not_exists(
+        let (_row, _was_created) = EdgeRepository::create_if_not_exists(
             pool,
             src,
             &src_type,
@@ -384,7 +384,7 @@ pub async fn do_ingest_document(
     // models "this paper was processed by this agent at this pipeline
     // version". (Self-loops on paper are blocked by the edges_no_self_loop
     // check constraint, so we cannot point the edge back at the paper.)
-    EdgeRepository::create_if_not_exists(
+    let (_row, _was_created) = EdgeRepository::create_if_not_exists(
         pool,
         paper_id,
         "paper",
