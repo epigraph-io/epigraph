@@ -706,8 +706,7 @@ mod tests {
         }"#;
 
         let plan_with = crate::workflow::build_ingest_plan(&make_workflow(json_with_parent));
-        let plan_without =
-            crate::workflow::build_ingest_plan(&make_workflow(json_without_parent));
+        let plan_without = crate::workflow::build_ingest_plan(&make_workflow(json_without_parent));
 
         // Workflow root claim (the thesis, level 0) should exist and be
         // derived from the variant's canonical_name, not the parent's.
