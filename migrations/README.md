@@ -2,6 +2,16 @@
 
 PostgreSQL schema migrations for the EpiGraph epistemic knowledge graph system.
 
+## Migrations are append-only
+
+Once a migration has been applied (in any environment), its file is **frozen**:
+the SHA-384 checksum is recorded in `_sqlx_migrations.checksum` and verified on
+every API startup. Editing an applied migration file — even whitespace, comments,
+or a typo fix — will cause the next deploy to fail with a checksum mismatch and
+refuse to start.
+
+Add a NEW migration (`NNN+1_fix_typo.sql`) instead of editing an existing one.
+
 ## Migration Order
 
 Migrations must be applied in numerical order:

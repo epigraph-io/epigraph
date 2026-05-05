@@ -184,6 +184,12 @@ async fn main() {
             .await
             .expect("Failed to connect to PostgreSQL");
         tracing::info!("PostgreSQL connected");
+
+        epigraph_api::run_migrations(&pool)
+            .await
+            .expect("Failed to apply pending migrations");
+        tracing::info!("Migrations up to date");
+
         let job_pool = pool.clone();
         let state = AppState::with_db(pool, config).with_embedding_service(embedding_service);
         (state, job_pool)
