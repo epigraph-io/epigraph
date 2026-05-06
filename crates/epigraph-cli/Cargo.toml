@@ -37,6 +37,16 @@ path = "src/bin/rerank_bridges.rs"
 required-features = ["genai"]
 
 [[bin]]
+name = "bridge_component"
+path = "src/bin/bridge_component.rs"
+required-features = ["genai"]
+
+[[bin]]
+name = "bridge_sweep"
+path = "src/bin/bridge_sweep.rs"
+required-features = ["genai"]
+
+[[bin]]
 name = "dekg"
 path = "src/bin/dekg.rs"
 
