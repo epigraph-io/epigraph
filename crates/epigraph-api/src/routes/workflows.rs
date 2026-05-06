@@ -997,12 +997,19 @@ pub async fn deprecate_workflow(
         ids_to_deprecate.extend(descendants);
     }
 
-    // Set truth to near-zero for all
+    // Set truth to near-zero AND mark not-current for all.
+    //
+    // `is_current = false` is required so the deprecated workflow disappears
+    // from `WorkflowRepository::list` regardless of the caller's `min_truth`
+    // parameter. Before this fix, callers passing `min_truth = 0.0` (the
+    // common default) still saw deprecated workflows because 0.05 > 0.0.
+    // See epigraph-io/epigraph#36.
     for id in &ids_to_deprecate {
-        let _ = sqlx::query("UPDATE claims SET truth_value = 0.05 WHERE id = $1")
-            .bind(id)
-            .execute(&state.db_pool)
-            .await;
+        let _ =
+            sqlx::query("UPDATE claims SET truth_value = 0.05, is_current = false WHERE id = $1")
+                .bind(id)
+                .execute(&state.db_pool)
+                .await;
     }
 
     // Emit event
