@@ -162,11 +162,14 @@ IMPORTANT: Return ONLY the JSON object. No markdown wrapping, no explanation."##
         )?,
     );
 
-    // 5. Call Claude via Anthropic API
+    // 5. Call the LLM via the shared `epigraph` provider auto-detect.
     use epigraph_cli::enrichment::llm_client::create_llm_client;
 
-    let client = create_llm_client("anthropic").map_err(|e| e.to_string())?;
-    tracing::info!("Calling Anthropic API for protocol generation...");
+    let client = create_llm_client("epigraph").map_err(|e| e.to_string())?;
+    tracing::info!(
+        "Calling LLM ({}) for protocol generation...",
+        client.model_name()
+    );
 
     let response = client
         .complete_json(&prompt)

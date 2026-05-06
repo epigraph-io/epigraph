@@ -10,7 +10,7 @@
 //! - `anthropic` (default) — direct API, requires `ANTHROPIC_API_KEY` or OAuth token
 //! - `mock` — returns empty results (for testing)
 
-use epigraph_cli::enrichment::llm_client::{create_llm_client, LlmClient};
+use epigraph_cli::enrichment::llm_client::{create_llm_client, LlmProvider};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -269,7 +269,7 @@ Return ONLY the JSON array. If no genuine relationships exist, return []."#
 
 /// Call the LLM to classify relationships, using the shared `LlmClient` trait.
 async fn call_llm(
-    client: &dyn LlmClient,
+    client: &dyn LlmProvider,
     prompt: &str,
 ) -> Result<Vec<LlmRelationship>, Box<dyn std::error::Error>> {
     let json_value = client
@@ -339,19 +339,21 @@ async fn main() {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let dry_run = std::env::args().any(|a| a == "--dry-run");
 
-    // Parse --provider (default: anthropic)
+    // Parse --provider (default: epigraph auto-detect)
     let args: Vec<String> = std::env::args().collect();
     let provider = args
         .windows(2)
         .find(|w| w[0] == "--provider")
         .map(|w| w[1].as_str())
-        .unwrap_or("anthropic");
+        .unwrap_or("epigraph");
 
-    // Create LLM client via shared factory
-    let llm: Box<dyn LlmClient> = match create_llm_client(provider) {
+    // Resolve LLM provider via the kernel registry (interfaces). Built-ins
+    // are installed once from `register_builtin_llm_providers`; private
+    // extensions register themselves earlier in `main`.
+    let llm: std::sync::Arc<dyn LlmProvider> = match create_llm_client(provider) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("ERROR: Failed to create LLM client: {e}");
+            eprintln!("ERROR: Failed to resolve LLM provider: {e}");
             std::process::exit(1);
         }
     };
