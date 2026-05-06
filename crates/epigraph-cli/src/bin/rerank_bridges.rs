@@ -50,7 +50,7 @@ OPTIONS:
   --candidates-table <NAME>  Read pairs from a caller-supplied table with
                              (source_id, target_id) columns. Mutually exclusive
                              with --source-filter / --target-filter.
-  --provider <NAME>          LLM provider: anthropic or mock [default: anthropic]
+  --provider <NAME>          LLM provider [default: epigraph (auto-detect)]
   --model <NAME>             Model override [default: ENRICHMENT_MODEL or claude-haiku-4-5-20251001]
   -n, --dry-run              Evaluate and report, don't create edges
   -h, --help                 Show this message
@@ -104,7 +104,7 @@ impl Args {
         let mut source_filter = None;
         let mut target_filter = None;
         let mut candidates_table = None;
-        let mut provider = "anthropic".to_string();
+        let mut provider = "epigraph".to_string();
         let mut model = None;
         let mut dry_run = false;
 
@@ -169,7 +169,7 @@ impl Args {
                     i += 1;
                     provider = args
                         .get(i)
-                        .ok_or("--provider requires a name (anthropic or mock)")?
+                        .ok_or("--provider requires a name (epigraph, anthropic, mock, or any registered extension)")?
                         .clone();
                 }
                 "--model" => {
@@ -242,6 +242,7 @@ async fn main() {
     // the library (see rerank::core::rerank_inner).
 
     let auth_label = match args.provider.as_str() {
+        "epigraph" => "auto-detect",
         "anthropic" => {
             if std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok_and(|t| !t.is_empty()) {
                 "OAuth token (Max plan)"
@@ -375,7 +376,7 @@ mod tests {
         let args = parse_args(&[]).unwrap();
         assert!((args.min_similarity - 0.40).abs() < f64::EPSILON);
         assert_eq!(args.batch_size, 10);
-        assert_eq!(args.provider, "anthropic");
+        assert_eq!(args.provider, "epigraph");
         assert!(!args.dry_run);
         assert!(args.limit.is_none());
         assert!(args.source_filter.is_none());

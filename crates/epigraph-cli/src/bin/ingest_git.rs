@@ -380,13 +380,13 @@ impl CommitEnricher for NoopEnricher {
 /// between consecutive windows, so that relationships spanning window boundaries
 /// are still detected.
 struct LlmEnricher {
-    client: Box<dyn epigraph_cli::enrichment::llm_client::LlmClient>,
+    client: std::sync::Arc<dyn epigraph_cli::enrichment::llm_client::LlmProvider>,
     window_size: usize,
     overlap: usize,
 }
 
 impl LlmEnricher {
-    fn new(client: Box<dyn epigraph_cli::enrichment::llm_client::LlmClient>) -> Self {
+    fn new(client: std::sync::Arc<dyn epigraph_cli::enrichment::llm_client::LlmProvider>) -> Self {
         let window_size = std::env::var("ENRICHMENT_WINDOW_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -405,7 +405,7 @@ impl LlmEnricher {
 
     #[cfg(test)]
     fn with_config(
-        client: Box<dyn epigraph_cli::enrichment::llm_client::LlmClient>,
+        client: std::sync::Arc<dyn epigraph_cli::enrichment::llm_client::LlmProvider>,
         window_size: usize,
         overlap: usize,
     ) -> Self {
@@ -1553,7 +1553,7 @@ async fn main() {
         EnricherMode::Noop => Box::new(NoopEnricher),
         EnricherMode::Llm => {
             let client = epigraph_cli::enrichment::llm_client::create_llm_client(
-                &std::env::var("ENRICHMENT_LLM_PROVIDER").unwrap_or_else(|_| "anthropic".into()),
+                &std::env::var("ENRICHMENT_LLM_PROVIDER").unwrap_or_else(|_| "epigraph".into()),
             )
             .unwrap_or_else(|e| {
                 eprintln!("Failed to create LLM client: {e}");
@@ -3709,7 +3709,7 @@ crates/epigraph-core/src/domain/mod.rs",
         ]);
 
         let client = MockLlmClient::with_responses(vec![mock_response]);
-        let enricher = LlmEnricher::with_config(Box::new(client), 20, 5);
+        let enricher = LlmEnricher::with_config(std::sync::Arc::new(client), 20, 5);
 
         let commits = vec![
             make_commit("aaa", CommitType::Feat, "core", vec![]),
@@ -3752,7 +3752,7 @@ crates/epigraph-core/src/domain/mod.rs",
         ]);
 
         let client = MockLlmClient::with_responses(vec![window1_response, window2_response]);
-        let enricher = LlmEnricher::with_config(Box::new(client), 3, 1);
+        let enricher = LlmEnricher::with_config(std::sync::Arc::new(client), 3, 1);
 
         let commits = vec![
             make_commit("a", CommitType::Feat, "core", vec![]),
@@ -3779,7 +3779,7 @@ crates/epigraph-core/src/domain/mod.rs",
         use epigraph_cli::enrichment::llm_client::MockLlmClient;
 
         let client = MockLlmClient::new();
-        let enricher = LlmEnricher::with_config(Box::new(client), 20, 5);
+        let enricher = LlmEnricher::with_config(std::sync::Arc::new(client), 20, 5);
 
         let result = enricher.enrich(&[]).await.unwrap();
         assert!(result.is_empty());
@@ -3792,7 +3792,7 @@ crates/epigraph-core/src/domain/mod.rs",
         // Simulate malformed response — enricher should not fail, just skip that window
         let client = MockLlmClient::new();
         client.set_malformed(true);
-        let enricher = LlmEnricher::with_config(Box::new(client), 20, 5);
+        let enricher = LlmEnricher::with_config(std::sync::Arc::new(client), 20, 5);
 
         let commits = vec![
             make_commit("aaa", CommitType::Feat, "core", vec![]),
@@ -3837,7 +3837,7 @@ crates/epigraph-core/src/domain/mod.rs",
         ]);
 
         let client = MockLlmClient::with_responses(vec![mock_response]);
-        let enricher = LlmEnricher::with_config(Box::new(client), 20, 5);
+        let enricher = LlmEnricher::with_config(std::sync::Arc::new(client), 20, 5);
 
         let commits = vec![
             make_commit("aaa", CommitType::Feat, "core", vec![]),
@@ -3855,7 +3855,7 @@ crates/epigraph-core/src/domain/mod.rs",
         use epigraph_cli::enrichment::llm_client::MockLlmClient;
 
         let client = MockLlmClient::new();
-        let enricher = LlmEnricher::new(Box::new(client));
+        let enricher = LlmEnricher::new(std::sync::Arc::new(client));
         assert_eq!(enricher.name(), "mock");
     }
 
@@ -4261,7 +4261,7 @@ crates/epigraph-core/src/domain/mod.rs",
         ])];
 
         let client = MockLlmClient::with_responses(mock_responses);
-        let enricher = LlmEnricher::with_config(Box::new(client), 20, 5);
+        let enricher = LlmEnricher::with_config(std::sync::Arc::new(client), 20, 5);
         let enrichments = enricher.enrich(&commits).await.unwrap();
         assert_eq!(enrichments.len(), 10);
 
@@ -4374,7 +4374,7 @@ crates/epigraph-core/src/domain/mod.rs",
         ])];
 
         let client = MockLlmClient::with_responses(mock_responses);
-        let enricher = LlmEnricher::with_config(Box::new(client), 20, 5);
+        let enricher = LlmEnricher::with_config(std::sync::Arc::new(client), 20, 5);
         let enrichments = enricher.enrich(&commits).await.unwrap();
 
         // Also count deterministic edges from parser (parent chains + fix-challenges-feat)
@@ -4464,7 +4464,7 @@ crates/epigraph-core/src/domain/mod.rs",
             { "source_index": 2, "target_index": 0, "relationship": "challenges", "strength": 0.8, "rationale": "r" },
         ])];
         let client = MockLlmClient::with_responses(mock_responses);
-        let enricher = LlmEnricher::with_config(Box::new(client), 20, 5);
+        let enricher = LlmEnricher::with_config(std::sync::Arc::new(client), 20, 5);
         let llm_enrichments = enricher.enrich(&commits).await.unwrap();
         let llm_edges: usize = llm_enrichments.iter().map(|e| e.semantic_edges.len()).sum();
 

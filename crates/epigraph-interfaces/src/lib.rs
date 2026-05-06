@@ -1,17 +1,25 @@
 //! Extension point traits for the `EpiGraph` kernel.
 //!
-//! This crate defines the three interface boundaries that separate the open
-//! kernel from enterprise features:
+//! This crate defines the four interface boundaries that separate the open
+//! kernel from enterprise / private features:
 //!
-//! | Trait | Kernel default | Enterprise implementation |
+//! | Trait | Kernel default | Enterprise / private implementation |
 //! |---|---|---|
 //! | [`EncryptionProvider`] | [`NoOpEncryptionProvider`] — pass-through | AES-256-GCM group-keyed subgraphs |
 //! | [`PolicyGate`] | [`NoOpPolicyGate`] — allow all | RBAC/ABAC enforcement |
 //! | [`OrchestrationBackend`] | [`NoOpOrchestrationBackend`] — silent drop | Durable task queue |
+//! | [`LlmProvider`] | [`NoOpLlmProvider`] — error on use | Anthropic API, OpenAI, vLLM, private extensions, … |
 //!
-//! The kernel holds each as `Arc<dyn Trait>` in `AppState`, initialised to
-//! the no-op at startup. Enterprise deployments replace them at startup with
-//! their own implementations before calling `create_router`.
+//! The kernel holds each as `Arc<dyn Trait>`, initialised to the no-op at
+//! startup. Enterprise / private deployments replace them at startup with
+//! their own implementations.
+//!
+//! For [`LlmProvider`] specifically, multiple concrete impls can be
+//! registered simultaneously via [`register_llm_provider`]; the kernel-side
+//! [`default_llm_provider`] helper walks the registry and returns the first
+//! provider whose `is_active()` is `true`. Newer registrations outrank
+//! built-ins, so a private/enterprise extension always wins auto-detect
+//! when present.
 //!
 //! # Design principles
 //!
@@ -24,10 +32,15 @@
 //!   backend.
 
 pub mod encryption;
+pub mod llm;
 pub mod orchestration;
 pub mod policy;
 
 pub use encryption::{EncryptionError, EncryptionProvider, NoOpEncryptionProvider};
+pub use llm::{
+    default_llm_provider, llm_provider_by_name, register_llm_provider, registered_llm_providers,
+    LlmError, LlmProvider, NoOpLlmProvider,
+};
 pub use orchestration::{
     NoOpOrchestrationBackend, OrchestrationBackend, OrchestrationError, TaskStatus,
 };

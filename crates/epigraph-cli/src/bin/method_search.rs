@@ -99,7 +99,7 @@ async fn run(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
     // 3. Search for each gap
     use epigraph_cli::enrichment::llm_client::create_llm_client;
 
-    let client = create_llm_client("anthropic").map_err(|e| e.to_string())?;
+    let client = create_llm_client("epigraph").map_err(|e| e.to_string())?;
 
     let mut all_filled = true;
 

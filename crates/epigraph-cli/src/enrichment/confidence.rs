@@ -7,7 +7,7 @@
 //!
 //! The final confidence is always ≤ the parser's value — LLM can only lower, never raise.
 
-use super::llm_client::LlmClient;
+use super::llm_client::LlmProvider;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -97,7 +97,7 @@ Example: {{"rating": "STRONG_SUPPORT"}}"#
 
 /// Run the skeptic probe to assess evidence quality
 pub async fn skeptic_probe(
-    client: &dyn LlmClient,
+    client: &dyn LlmProvider,
     claim: &str,
     evidence: &[String],
 ) -> EvidenceSupport {
@@ -167,7 +167,7 @@ Example: {{"rating": "CONSISTENT"}}"#
 
 /// Run the coherence probe to check cross-claim consistency
 pub async fn coherence_probe(
-    client: &dyn LlmClient,
+    client: &dyn LlmProvider,
     claim: &str,
     scope: &str,
     prior_claims: &[(String, f64)],
