@@ -21,7 +21,7 @@ OPTIONS:
   --min-similarity <FLOAT>   Cosine threshold [default: 0.50]
   --top-k <N>                Per-source-atom [default: 50]
   --batch-size <N>           Pairs per LLM call [default: 10]
-  --provider <NAME>          LLM provider [default: claude-cli]
+  --provider <NAME>          LLM provider [default: epigraph (auto-detect)]
   --model <NAME>             Model override
   --dry-run                  Default. Reports candidates + LLM eval; creates no edges.
   --apply                    Commit edges (overrides --dry-run).
@@ -54,7 +54,7 @@ impl Args {
         let mut min_similarity = 0.50;
         let mut top_k = 50_u32;
         let mut batch_size = 10_usize;
-        let mut provider = "claude-cli".to_string();
+        let mut provider = "epigraph".to_string();
         let mut model = None;
         let mut apply = false;
         let mut keep_tables = false;

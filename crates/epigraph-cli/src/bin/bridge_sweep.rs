@@ -29,7 +29,7 @@ OPTIONS:
   --min-similarity <FLOAT>   [default: 0.50]
   --top-k <N>                Per-source-atom [default: 50]
   --batch-size <N>           [default: 10]
-  --provider <NAME>          [default: claude-cli]
+  --provider <NAME>          [default: epigraph (auto-detect)]
   --model <NAME>             Model override
   --dry-run                  Default.
   --apply                    Commit edges (overrides --dry-run).
@@ -69,7 +69,7 @@ impl Args {
         let mut min_similarity = 0.50_f64;
         let mut top_k = 50_u32;
         let mut batch_size = 10_usize;
-        let mut provider = "claude-cli".to_string();
+        let mut provider = "epigraph".to_string();
         let mut model: Option<String> = None;
         let mut apply = false;
         let mut keep_tables = false;

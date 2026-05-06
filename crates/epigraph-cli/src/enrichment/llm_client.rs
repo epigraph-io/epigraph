@@ -1,44 +1,32 @@
-//! LLM client abstraction for enrichment
+//! Built-in LLM provider impls (Anthropic + Mock) and registration helper.
 //!
-//! Provides a trait-based abstraction over LLM APIs so the enrichment
-//! pipeline can swap between mock, Anthropic, and other providers.
+//! The canonical [`LlmProvider`] trait, registry, and `default_llm_provider`
+//! helper live in [`epigraph_interfaces::llm`] — see the table at the top of
+//! `epigraph-interfaces`'s `lib.rs` for the kernel/enterprise extension-point
+//! contract this slots into.
+//!
+//! This module supplies the open-kernel built-ins:
+//!
+//! - [`AnthropicClient`] — direct HTTPS to `api.anthropic.com`, prefers
+//!   `CLAUDE_CODE_OAUTH_TOKEN` (Max plan, `Authorization: Bearer`) and falls
+//!   back to `ANTHROPIC_API_KEY` (`x-api-key`).
+//! - [`MockLlmClient`] — pre-configured or empty responses, used by tests.
+//!
+//! Both impl `epigraph_interfaces::LlmProvider`. Call
+//! [`register_builtin_llm_providers`] from each binary's `main` to install
+//! them into the kernel's process-wide registry. Private extensions
+//! (notably the Claude CLI subprocess provider that lives in a separate
+//! private crate) register themselves the same way and outrank built-ins
+//! in `default_llm_provider`'s walk.
+//!
+//! [`LlmProvider`]: epigraph_interfaces::LlmProvider
 
 use async_trait::async_trait;
-use std::fmt;
-use thiserror::Error;
+use std::sync::Arc;
 
-// =============================================================================
-// ERROR TYPES
-// =============================================================================
-
-#[derive(Error, Debug)]
-pub enum LlmError {
-    #[error("LLM API request failed: {message}")]
-    RequestFailed { message: String },
-
-    #[error("LLM returned malformed JSON: {message}")]
-    MalformedResponse { message: String },
-
-    #[error("LLM rate limited, retry after {retry_after_secs}s")]
-    RateLimited { retry_after_secs: u64 },
-
-    #[error("LLM API key not configured for provider: {provider}")]
-    MissingApiKey { provider: String },
-}
-
-// =============================================================================
-// LLM CLIENT TRAIT
-// =============================================================================
-
-/// Abstraction over LLM providers for structured JSON completion
-#[async_trait]
-pub trait LlmClient: Send + Sync + fmt::Debug {
-    /// Send a prompt and get back a parsed JSON value
-    async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError>;
-
-    /// Name of the model being used
-    fn model_name(&self) -> &str;
-}
+// Re-exports so existing call sites keep compiling without an import-path
+// churn pass: the canonical home is `epigraph_interfaces::llm`.
+pub use epigraph_interfaces::{LlmError, LlmProvider};
 
 // =============================================================================
 // MOCK CLIENT (for tests)
@@ -94,7 +82,21 @@ impl MockLlmClient {
 }
 
 #[async_trait]
-impl LlmClient for MockLlmClient {
+impl LlmProvider for MockLlmClient {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn model_name(&self) -> &str {
+        "mock"
+    }
+
+    fn is_active(&self) -> bool {
+        // Mock is always available, but `default_llm_provider` skips `mock`
+        // by name so it never wins auto-detect.
+        true
+    }
+
     async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
         // Check for simulated errors
         if self
@@ -126,10 +128,6 @@ impl LlmClient for MockLlmClient {
         };
 
         Ok(value)
-    }
-
-    fn model_name(&self) -> &str {
-        "mock"
     }
 }
 
@@ -218,7 +216,21 @@ impl AnthropicClient {
 }
 
 #[async_trait]
-impl LlmClient for AnthropicClient {
+impl LlmProvider for AnthropicClient {
+    fn name(&self) -> &str {
+        "anthropic"
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    fn is_active(&self) -> bool {
+        // If the client was constructed, credentials passed validation —
+        // it can serve requests (subject to network availability).
+        true
+    }
+
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
         let body = self.build_request_body(prompt);
 
@@ -283,10 +295,6 @@ impl LlmClient for AnthropicClient {
             message: format!("Failed to parse JSON from LLM response: {e}. Raw text: {json_str}"),
         })
     }
-
-    fn model_name(&self) -> &str {
-        &self.model
-    }
 }
 
 // =============================================================================
@@ -322,34 +330,88 @@ fn extract_json_from_text(text: &str) -> String {
 }
 
 // =============================================================================
-// FACTORY
+// REGISTRATION + FACTORY (thin shims over `epigraph_interfaces::llm`)
 // =============================================================================
 
-/// Create an LLM client based on the provider configuration.
-///
-/// Providers:
-/// - `"anthropic"` — direct HTTP to `api.anthropic.com`. Prefers `CLAUDE_CODE_OAUTH_TOKEN`
-///   (Max plan, `Authorization: Bearer`) and falls back to `ANTHROPIC_API_KEY` (`x-api-key`).
-/// - `"mock"` — returns pre-configured or empty responses (for tests).
-pub fn create_llm_client(provider: &str) -> Result<Box<dyn LlmClient>, LlmError> {
-    match provider {
-        "mock" => Ok(Box::new(MockLlmClient::new())),
-        "anthropic" => {
-            let model = std::env::var("ENRICHMENT_MODEL").ok();
-            // Prefer OAuth token (Max plan — uses subscription, not pay-per-token)
-            if let Ok(oauth_token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
-                if !oauth_token.is_empty() {
-                    return Ok(Box::new(AnthropicClient::with_oauth(oauth_token, model)?));
-                }
-            }
-            // Fall back to API key
-            let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-            Ok(Box::new(AnthropicClient::new(api_key, model)?))
+/// Construct an [`AnthropicClient`] from the process environment, returning:
+/// - `None` if neither `CLAUDE_CODE_OAUTH_TOKEN` nor `ANTHROPIC_API_KEY` is
+///   set (call site can decide whether absent credentials are an error);
+/// - `Some(Err(_))` if a credential is set but client construction failed;
+/// - `Some(Ok(client))` with OAuth-preferred-over-API-key on success.
+pub fn build_anthropic_from_env() -> Option<Result<AnthropicClient, LlmError>> {
+    let model = std::env::var("ENRICHMENT_MODEL").ok();
+    if let Ok(oauth) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+        if !oauth.is_empty() {
+            return Some(AnthropicClient::with_oauth(oauth, model));
         }
-        other => Err(LlmError::RequestFailed {
-            message: format!("Unknown LLM provider: {other}. Use 'anthropic' or 'mock'."),
-        }),
     }
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if !key.is_empty() {
+            return Some(AnthropicClient::new(key, model));
+        }
+    }
+    None
+}
+
+/// Install the open-kernel built-ins (Anthropic from env when credentials are
+/// present + Mock) into [`epigraph_interfaces::register_llm_provider`].
+/// Idempotent — internal `Once` guard means repeat calls are a no-op.
+///
+/// Each binary that wants the built-ins available calls this from `main`
+/// before invoking `default_llm_provider` or `create_llm_client`. Private
+/// extensions register themselves the same way and outrank the built-ins.
+pub fn register_builtin_llm_providers() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Mock first so it sits behind Anthropic (which is registered next
+        // and thus prepended to the front). Both are below any private
+        // extension that registers later.
+        epigraph_interfaces::register_llm_provider(Arc::new(MockLlmClient::new()));
+        if let Some(Ok(c)) = build_anthropic_from_env() {
+            epigraph_interfaces::register_llm_provider(Arc::new(c));
+        }
+    });
+}
+
+/// Convenience selector over [`epigraph_interfaces::default_llm_provider`]
+/// and [`epigraph_interfaces::llm_provider_by_name`].
+///
+/// Selectors:
+/// - `"epigraph"` — kernel auto-detect. Returns the first registered
+///   active provider, skipping `mock`. Calls
+///   [`register_builtin_llm_providers`] first so the built-ins are present.
+/// - `"anthropic"` — built-in direct selector.
+/// - `"mock"` — built-in test selector (skipped by auto-detect).
+/// - any registered extension name — selects that provider directly.
+pub fn create_llm_client(provider: &str) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    register_builtin_llm_providers();
+
+    if provider == "epigraph" {
+        let p = epigraph_interfaces::default_llm_provider();
+        if !p.is_active() {
+            let known = epigraph_interfaces::registered_llm_providers();
+            return Err(LlmError::NotAvailable(format!(
+                "No active LLM provider for `epigraph` auto-detect. \
+                 Registered: [{}]. Set CLAUDE_CODE_OAUTH_TOKEN or \
+                 ANTHROPIC_API_KEY, register a private provider via \
+                 `epigraph_interfaces::register_llm_provider`, or pass \
+                 `--provider mock`.",
+                known.join(", ")
+            )));
+        }
+        return Ok(p);
+    }
+
+    epigraph_interfaces::llm_provider_by_name(provider).ok_or_else(|| {
+        let known = epigraph_interfaces::registered_llm_providers();
+        LlmError::RequestFailed {
+            message: format!(
+                "Unknown LLM provider: {provider}. Use 'epigraph' (auto), \
+                 or one of: {}.",
+                known.join(", ")
+            ),
+        }
+    })
 }
 
 // =============================================================================
@@ -543,7 +605,39 @@ mod tests {
 
     #[test]
     fn test_create_llm_client_unknown_provider() {
-        let result = create_llm_client("invalid_provider");
-        assert!(result.is_err());
+        // `Arc<dyn LlmProvider>` doesn't impl `Debug`, so we can't use
+        // `unwrap_err()` (which requires `T: Debug`). Match instead.
+        let err = match create_llm_client("invalid_provider") {
+            Ok(_) => panic!("create_llm_client must reject unknown providers"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("epigraph"),
+            "error must mention 'epigraph': {msg}"
+        );
+    }
+
+    // The trait + registry semantics live in `epigraph_interfaces::llm`
+    // and are tested there. These cli-side tests cover only the
+    // `register_builtin_llm_providers` + `create_llm_client` thin shims.
+
+    #[test]
+    fn test_register_builtin_llm_providers_installs_mock() {
+        // Built-in mock is registered regardless of env credentials so the
+        // `--provider mock` selector always works in tests.
+        register_builtin_llm_providers();
+        let names = epigraph_interfaces::registered_llm_providers();
+        assert!(
+            names.iter().any(|n| n == "mock"),
+            "mock must be registered; full list: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_llm_client_mock_via_shim() {
+        let client = create_llm_client("mock").unwrap();
+        assert_eq!(client.model_name(), "mock");
+        assert_eq!(client.name(), "mock");
     }
 }

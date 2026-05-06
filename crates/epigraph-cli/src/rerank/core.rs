@@ -11,7 +11,7 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::enrichment::llm_client::{create_llm_client, LlmClient, LlmError};
+use crate::enrichment::llm_client::{create_llm_client, LlmProvider, LlmError};
 use crate::rerank::candidates::{CandidatePair, ValidationResult};
 use crate::rerank::errors::RerankError;
 use crate::rerank::prompt::{build_validation_prompt, parse_validation_response};
@@ -38,7 +38,7 @@ impl Default for RerankConfig {
         Self {
             min_similarity: 0.40,
             batch_size: 10,
-            provider: "anthropic".to_string(),
+            provider: "epigraph".to_string(),
             model: None,
             dry_run: false,
             limit: None,
@@ -473,7 +473,7 @@ pub(crate) async fn create_edge(
 
 /// Call the LLM with one retry on rate limit.
 async fn call_llm_with_retry(
-    llm: &dyn LlmClient,
+    llm: &dyn LlmProvider,
     prompt: &str,
 ) -> Result<serde_json::Value, LlmError> {
     match llm.complete_json(prompt).await {

@@ -1272,6 +1272,7 @@ dependencies = [
  "epigraph-db",
  "epigraph-embeddings",
  "epigraph-engine",
+ "epigraph-interfaces",
  "futures",
  "hex",
  "linfa",
