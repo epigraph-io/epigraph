@@ -94,6 +94,7 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "EQUIVALENT_TO",         // claim → claim (semantic equivalence)
     "CONTRADICTS",           // claim → claim (contradiction)
     "supersedes",            // claim → claim (version chain)
+    "revises",               // claim → claim (concurrent branch from common ancestor)
     "enables",               // claim → claim (enablement)
     "has_method_capability", // method → capability (method graph)
     "interpreted_by",        // claim → agent (interpretation provenance)
