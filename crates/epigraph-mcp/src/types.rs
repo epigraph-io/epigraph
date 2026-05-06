@@ -370,6 +370,11 @@ pub struct FindWorkflowHierarchicalParams {
 
     #[schemars(description = "Maximum number of workflows to return (default 10, max 50).")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`. Defaults to false (frozen step references)."
+    )]
+    pub resolve_to_latest: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

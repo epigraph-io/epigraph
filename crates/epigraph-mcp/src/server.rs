@@ -232,6 +232,17 @@ impl EpiGraphMcpFull {
         crate::tools::recall::recall_with_context(self, params).await
     }
 
+    #[tool(
+        description = "Evolve a versioned step or operation by atomically creating a new claim that supersedes or revises an existing one. Use 'supersedes' for linear refinement; 'revises' for a concurrent branch from a common ancestor. The new claim shares the same step_lineage_id as the parent."
+    )]
+    async fn evolve_step(
+        &self,
+        Parameters(params): Parameters<crate::tools::evolve_step::EvolveStepParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::evolve_step::evolve_step(self, params).await
+    }
+
     // ── Ingestion ──
 
     #[tool(

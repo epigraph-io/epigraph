@@ -183,9 +183,36 @@ pub async fn execute_workflow_ingest_plan(
         .await?;
 
         if was_new {
-            // Set properties via raw SQL (no set_properties method on ClaimRepository).
-            sqlx::query("UPDATE claims SET properties = $1 WHERE id = $2")
-                .bind(&planned.properties)
+            // For level=2 (steps) and level=3 (operations), assign a
+            // `step_lineage_id` UUID — see spec
+            // `2026-05-05-step-level-versioning-design.md` §6.1, §6.2, §9.6, §9.7.
+            // If the caller supplied one in `properties.step_lineage_id`, preserve it;
+            // otherwise generate `Uuid::new_v4()`. Level=0/1 (thesis/phase) leave the
+            // column NULL — workflow-level `variant_of` covers their evolution (§9.8).
+            let mut properties = planned.properties.clone();
+            let lineage_uuid: Option<Uuid> = if planned.level == 2 || planned.level == 3 {
+                let existing = properties
+                    .get("step_lineage_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok());
+                let chosen = existing.unwrap_or_else(Uuid::new_v4);
+                properties
+                    .as_object_mut()
+                    .expect("PlannedClaim.properties must be a JSON object")
+                    .insert(
+                        "step_lineage_id".to_string(),
+                        serde_json::Value::String(chosen.to_string()),
+                    );
+                Some(chosen)
+            } else {
+                None
+            };
+
+            // Set properties + step_lineage_id via raw SQL (no set_properties
+            // method on ClaimRepository).
+            sqlx::query("UPDATE claims SET properties = $1, step_lineage_id = $2 WHERE id = $3")
+                .bind(&properties)
+                .bind(lineage_uuid)
                 .bind(planned.id)
                 .execute(pool)
                 .await?;
