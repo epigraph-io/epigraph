@@ -101,6 +101,7 @@ base64 = "0.22"
 linfa = { workspace = true }
 linfa-clustering = { workspace = true }
 ndarray = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 sqlx = { workspace = true }
