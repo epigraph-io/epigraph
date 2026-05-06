@@ -3,6 +3,8 @@ pub mod bridge;
 pub mod enrichment;
 #[cfg(feature = "db")]
 pub mod reembed;
+#[cfg(feature = "genai")]
+pub mod rerank;
 
 #[cfg(feature = "db")]
 use sqlx::PgPool;
