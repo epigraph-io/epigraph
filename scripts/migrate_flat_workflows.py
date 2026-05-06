@@ -560,7 +560,7 @@ def _build_edge_body(
         "source_type": "claim",
         "target_id": flat_claim_id,
         "target_type": "claim",
-        "relationship": "variant_of",
+        "relationship": "supersedes",
         "properties": {
             "reason": "flat-to-hierarchical migration",
             "migrated_at": migrated_at,
