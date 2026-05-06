@@ -4,4 +4,5 @@
 //!
 //! See docs/superpowers/specs/2026-05-05-cross-component-bridge-sweep-design.md.
 
+pub mod candidates;
 pub mod components;
