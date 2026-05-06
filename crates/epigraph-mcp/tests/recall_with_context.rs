@@ -15,9 +15,9 @@
 //!     against the entity-type allowlist; paper-attribution uses
 //!     `'paper'` / `'claim'`, all other edges `'claim'` / `'claim'`.
 
-use epigraph_mcp::tools::recall::NeighborPath;
-use epigraph_mcp::tools::recall::__test_only::{
-    assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population,
+use epigraph_mcp::tools::recall::{
+    NeighborPath,
+    __test_only::{assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population},
 };
 use sqlx::PgPool;
 use uuid::Uuid;
