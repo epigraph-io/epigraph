@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT e.source_id AS \"paragraph_id!\", e.target_id AS \"neighbor_id!\"\n            FROM edges e\n            WHERE e.source_id = ANY($1) AND e.relationship = 'continues_argument'\n            UNION ALL\n            SELECT e.target_id AS \"paragraph_id!\", e.source_id AS \"neighbor_id!\"\n            FROM edges e\n            WHERE e.target_id = ANY($1) AND e.relationship = 'continues_argument'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "paragraph_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "neighbor_id!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "93ba7658c7768f8b1c5907d3bb9d2f733d561ede1eafbe14752fe22f38b1823a"
+}

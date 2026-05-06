@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT e.target_id AS atom_id, e.source_id AS parent_paragraph_id\n                FROM edges e\n                WHERE e.target_id = ANY($1)\n                  AND e.relationship = 'decomposes_to'\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "atom_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "parent_paragraph_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "419d9478adb799d5aaf25df082d2ee6cf5d0a087ff29ac5ad311395efff8fe47"
+}

@@ -11,6 +11,17 @@ pub struct McpEmbedder {
     http: reqwest::Client,
 }
 
+/// Map a centroid dimension to the OpenAI model that produces it.
+/// Returns None for unsupported dims (caller treats as InvalidParams).
+#[must_use]
+pub const fn model_for_dim(dim: u32) -> Option<&'static str> {
+    match dim {
+        1536 => Some("text-embedding-3-small"),
+        3072 => Some("text-embedding-3-large"),
+        _ => None,
+    }
+}
+
 impl McpEmbedder {
     #[must_use]
     pub fn new(pool: PgPool, api_key: Option<String>) -> Self {
@@ -37,7 +48,23 @@ impl McpEmbedder {
             .filter(|k| !k.is_empty() && *k != "mock")
             .ok_or_else(|| "embeddings disabled (no API key)".to_string())?;
 
-        generate_openai_embedding(&self.http, api_key, text).await
+        generate_openai_embedding_with_model(&self.http, api_key, text, "text-embedding-3-small")
+            .await
+    }
+
+    /// Generate an embedding at the requested dimension by selecting the right
+    /// OpenAI model. Returns the raw `Vec<f32>`; caller formats with format_pgvector.
+    pub async fn generate_at_dim(&self, text: &str, dim: u32) -> Result<Vec<f32>, String> {
+        let api_key = self
+            .api_key
+            .as_deref()
+            .filter(|k| !k.is_empty() && *k != "mock")
+            .ok_or_else(|| "embeddings disabled (no API key)".to_string())?;
+
+        let model = model_for_dim(dim)
+            .ok_or_else(|| format!("unsupported centroid_dim: {dim} (must be 1536 or 3072)"))?;
+
+        generate_openai_embedding_with_model(&self.http, api_key, text, model).await
     }
 
     /// Generate embedding and store it for a claim. Returns true if embedding succeeded.
@@ -198,16 +225,17 @@ pub fn format_pgvector(vec: &[f32]) -> String {
     format!("[{}]", inner.join(","))
 }
 
-async fn generate_openai_embedding(
+async fn generate_openai_embedding_with_model(
     http: &reqwest::Client,
     api_key: &str,
     text: &str,
+    model: &str,
 ) -> Result<Vec<f32>, String> {
     let resp = http
         .post("https://api.openai.com/v1/embeddings")
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "text-embedding-3-small",
+            "model": model,
             "input": text,
         }))
         .send()
@@ -228,4 +256,25 @@ async fn generate_openai_embedding(
         .map(|v| v.as_f64().unwrap_or(0.0) as f32)
         .collect();
     Ok(embedding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_for_dim;
+
+    #[test]
+    fn model_for_dim_picks_small_at_1536() {
+        assert_eq!(model_for_dim(1536), Some("text-embedding-3-small"));
+    }
+
+    #[test]
+    fn model_for_dim_picks_large_at_3072() {
+        assert_eq!(model_for_dim(3072), Some("text-embedding-3-large"));
+    }
+
+    #[test]
+    fn model_for_dim_rejects_unknown_dim() {
+        assert!(model_for_dim(1024).is_none());
+        assert!(model_for_dim(0).is_none());
+    }
 }

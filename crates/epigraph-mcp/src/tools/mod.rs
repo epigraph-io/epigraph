@@ -11,6 +11,7 @@ pub mod paper_queries;
 pub mod perspectives;
 pub mod provenance;
 pub mod rdf;
+pub mod recall;
 pub mod sheaf;
 pub mod workflow_hierarchical;
 pub mod workflow_ingest;

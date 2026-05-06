@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT e.source_id AS \"paragraph_id!\", e.target_id AS \"atom_id!\"\n                FROM edges e\n                JOIN claims c ON c.id = e.source_id\n                WHERE e.target_id = ANY($1)\n                  AND e.relationship = 'decomposes_to'\n                  AND (c.properties->>'level')::int = 2\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "paragraph_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "atom_id!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "29783c9036153c93c88f748dba35abd637ca51ce0bb630be0fcac9996406a2c2"
+}

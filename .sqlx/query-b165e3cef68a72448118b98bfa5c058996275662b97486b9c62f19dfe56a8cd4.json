@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                WITH forward AS (\n                    SELECT e.source_id AS atom_a, e.target_id AS atom_b, e.relationship\n                    FROM edges e\n                    JOIN claims ca ON ca.id = e.source_id\n                    JOIN claims cb ON cb.id = e.target_id\n                    WHERE e.source_id = ANY($1)\n                      AND e.relationship != 'decomposes_to'\n                      AND (ca.properties->>'level')::int = 3\n                      AND (cb.properties->>'level')::int = 3\n                ),\n                backward AS (\n                    SELECT e.target_id AS atom_a, e.source_id AS atom_b, e.relationship\n                    FROM edges e\n                    JOIN claims ca ON ca.id = e.target_id\n                    JOIN claims cb ON cb.id = e.source_id\n                    WHERE e.target_id = ANY($1)\n                      AND e.relationship != 'decomposes_to'\n                      AND (ca.properties->>'level')::int = 3\n                      AND (cb.properties->>'level')::int = 3\n                )\n                SELECT atom_a AS \"atom_a!\", atom_b AS \"atom_b!\", relationship AS \"relationship!\"\n                FROM forward\n                UNION ALL\n                SELECT atom_a AS \"atom_a!\", atom_b AS \"atom_b!\", relationship AS \"relationship!\"\n                FROM backward\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "atom_a!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "atom_b!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "relationship!",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "b165e3cef68a72448118b98bfa5c058996275662b97486b9c62f19dfe56a8cd4"
+}

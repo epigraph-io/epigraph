@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT e.target_id AS paragraph_id, c.id AS section_id, c.content\n            FROM edges e\n            JOIN claims c ON c.id = e.source_id\n            WHERE e.target_id = ANY($1)\n              AND e.relationship = 'decomposes_to'\n              AND (c.properties->>'level')::int = 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "paragraph_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "section_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "content",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3f902600c73561f874614e5b7a1843b047469e31eb05077d88f2c9ff875d2c74"
+}

@@ -222,6 +222,16 @@ impl EpiGraphMcpFull {
         tools::memory::recall(self, params).await
     }
 
+    #[tool(
+        description = "Paragraph-primary semantic search over the claim graph with batched structural context: parent paper, parent section, child atoms (with cross-paragraph bridges), sibling paragraphs, neighbor paragraphs reachable via continues_argument / atom-bridge / atom-atom-bridge, and CORROBORATES neighbors. Auto-detects centroid_dim (1536 vs 3072) by default."
+    )]
+    async fn recall_with_context(
+        &self,
+        Parameters(params): Parameters<crate::tools::recall::RecallWithContextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::tools::recall::recall_with_context(self, params).await
+    }
+
     // ── Ingestion ──
 
     #[tool(
