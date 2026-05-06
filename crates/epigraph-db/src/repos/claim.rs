@@ -20,6 +20,19 @@ pub struct ClaimEmbeddingHit {
     pub similarity: f64,
 }
 
+/// Result row for [`ClaimRepository::latest_in_lineage`].
+///
+/// Represents a head of a step lineage: a claim with `step_lineage_id = $1`
+/// and no incoming `supersedes` edge. See spec §3.1 in
+/// `docs/superpowers/specs/2026-05-05-step-level-versioning-design.md`.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct LineageHead {
+    pub id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Build a Claim from database row data.
 ///
 /// This helper function handles the crypto fields that may not exist in
@@ -1495,6 +1508,40 @@ impl ClaimRepository {
         }
 
         Ok(was_inserted)
+    }
+
+    /// Walks `supersedes` edges on a step lineage. Returns one row per head:
+    /// claims with `step_lineage_id = $1` and NO incoming `supersedes` edge.
+    /// Multiple heads = unmerged concurrent branches (created via `revises`).
+    /// Empty = no claims have this `step_lineage_id`.
+    ///
+    /// `revises` does NOT remove head status — only `supersedes` does. See
+    /// `docs/superpowers/specs/2026-05-05-step-level-versioning-design.md` §3.1.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn latest_in_lineage(
+        pool: &PgPool,
+        lineage_id: Uuid,
+    ) -> Result<Vec<LineageHead>, DbError> {
+        let rows = sqlx::query_as::<_, LineageHead>(
+            r#"
+            SELECT c.id, c.content, c.truth_value, c.created_at
+            FROM claims c
+            WHERE c.step_lineage_id = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM edges e
+                  WHERE e.target_id = c.id
+                    AND e.relationship = 'supersedes'
+              )
+            ORDER BY c.created_at DESC
+            "#,
+        )
+        .bind(lineage_id)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
     }
 }
 
