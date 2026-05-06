@@ -13,6 +13,7 @@
 //! `GET /api/v1/workflows/hierarchical/search` and
 //! `POST /api/v1/workflows/hierarchical/:id/outcome`.
 
+use epigraph_db::{ClaimRepository, LineageHead};
 use rmcp::model::*;
 use uuid::Uuid;
 
@@ -53,6 +54,8 @@ pub async fn find_workflow_hierarchical(
     params: FindWorkflowHierarchicalParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
+    let resolve_to_latest = params.resolve_to_latest.unwrap_or(false);
+
     let rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
         &server.pool,
         &params.query,
@@ -61,25 +64,88 @@ pub async fn find_workflow_hierarchical(
     .await
     .map_err(internal_error)?;
 
-    let workflows: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|r| {
-            serde_json::json!({
-                "workflow_id": r.id,
-                "canonical_name": r.canonical_name,
-                "generation": r.generation,
-                "goal": r.goal,
-                "parent_id": r.parent_id,
-                "metadata": r.metadata,
-                "created_at": r.created_at,
-            })
-        })
-        .collect();
+    let mut workflows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+    for r in rows {
+        let mut entry = serde_json::json!({
+            "workflow_id": r.id,
+            "canonical_name": r.canonical_name,
+            "generation": r.generation,
+            "goal": r.goal,
+            "parent_id": r.parent_id,
+            "metadata": r.metadata,
+            "created_at": r.created_at,
+        });
+
+        if resolve_to_latest {
+            let resolved = build_resolved_steps(&server.pool, r.id).await?;
+            entry["resolved_steps"] = serde_json::to_value(resolved).map_err(internal_error)?;
+        }
+
+        workflows.push(entry);
+    }
 
     success_json(&serde_json::json!({
         "workflows": workflows,
         "total": workflows.len(),
+        "resolve_to_latest": resolve_to_latest,
     }))
+}
+
+/// Per-step resolution result for `find_workflow_hierarchical(resolve_to_latest=true)`.
+///
+/// `frozen_claim_id` is the original step claim attached to the workflow via
+/// the `executes` edge. `heads` lists the current head(s) of the step's
+/// lineage (claims with `step_lineage_id = $lineage` and no incoming
+/// `supersedes` edge); empty when the step has no `step_lineage_id` (legacy)
+/// or when the lineage has been pruned. `pending_resolution` is true when
+/// the lineage has more than one head — caller must reconcile before reuse.
+#[derive(serde::Serialize)]
+struct ResolvedStep {
+    step_index: usize,
+    frozen_claim_id: Uuid,
+    step_lineage_id: Option<Uuid>,
+    heads: Vec<LineageHead>,
+    pending_resolution: bool,
+}
+
+async fn build_resolved_steps(
+    pool: &sqlx::PgPool,
+    workflow_id: Uuid,
+) -> Result<Vec<ResolvedStep>, McpError> {
+    // Pull all level=2 step claims under this workflow with their
+    // step_lineage_id, ordered by edge created_at + claim id (matches
+    // do_report_hierarchical_outcome_via_pool).
+    let step_rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT c.id, c.step_lineage_id \
+         FROM edges e \
+         JOIN claims c ON c.id = e.target_id \
+         WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
+         ORDER BY e.created_at ASC, c.id ASC",
+    )
+    .bind(workflow_id)
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+
+    let mut resolved = Vec::with_capacity(step_rows.len());
+    for (step_index, (frozen_claim_id, step_lineage_id)) in step_rows.into_iter().enumerate() {
+        let heads = if let Some(lineage_id) = step_lineage_id {
+            ClaimRepository::latest_in_lineage(pool, lineage_id)
+                .await
+                .map_err(internal_error)?
+        } else {
+            Vec::new()
+        };
+        let pending_resolution = heads.len() > 1;
+        resolved.push(ResolvedStep {
+            step_index,
+            frozen_claim_id,
+            step_lineage_id,
+            heads,
+            pending_resolution,
+        });
+    }
+    Ok(resolved)
 }
 
 // ── report_hierarchical_outcome ────────────────────────────────────────────
