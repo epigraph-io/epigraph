@@ -1,3 +1,5 @@
+#[cfg(feature = "db")]
+pub mod bridge;
 pub mod enrichment;
 #[cfg(feature = "db")]
 pub mod reembed;
