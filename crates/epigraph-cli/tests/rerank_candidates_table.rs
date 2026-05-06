@@ -91,6 +91,16 @@ async fn candidates_table_with_mock_provider_returns_summary(pool: PgPool) {
         "dry_run + mock empty response must not create edges"
     );
     assert_eq!(summary.llm_accepted, 0);
+    assert_eq!(summary.llm_rejected, 0);
+    // The mock LLM returns `[]` for every call. The batch loop counts each
+    // missing per-pair entry as an error — so for 1 pair we expect errors=1.
+    // This is the "missing pair" warning branch in `rerank_inner`, not an
+    // actual failure mode; documenting it here so future refactors don't
+    // silently change the meaning of `errors`.
+    assert_eq!(
+        summary.errors, 1,
+        "mock LLM returns [] → missing-pair branch increments errors once"
+    );
     // duration_ms is `u128`; just make sure the field is populated as expected (>= 0 always true).
     let _ = summary.duration_ms;
 }

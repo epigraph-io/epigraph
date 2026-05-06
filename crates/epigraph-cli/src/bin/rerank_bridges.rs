@@ -238,11 +238,8 @@ async fn main() {
         }
     };
 
-    // If --model was specified, set ENRICHMENT_MODEL for the LLM client factory.
-    // (The factory reads from env, not parameters — keep the indirection at the bin layer.)
-    if let Some(ref model) = args.model {
-        std::env::set_var("ENRICHMENT_MODEL", model);
-    }
+    // `--model` is propagated to the LLM client via `ENRICHMENT_MODEL` inside
+    // the library (see rerank::core::rerank_inner).
 
     let auth_label = match args.provider.as_str() {
         "anthropic" => {

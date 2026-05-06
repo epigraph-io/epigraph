@@ -91,6 +91,14 @@ pub async fn rerank_global_join(
 /// Introduced for issue #53 (cross-component bridge sweep). The caller —
 /// e.g. `bridge_component` — populates the table via a per-source kNN insert
 /// before calling this function.
+///
+/// Caveats for callers (Tasks 4/5):
+/// - `config.min_similarity` is **ignored** in this path — selection is the
+///   caller's responsibility.
+/// - The caller should deduplicate pairs ordered consistently (e.g. always
+///   `min(a,b), max(a,b)`); duplicate `(A,B)` and `(B,A)` rows would burn LLM
+///   tokens twice before the post-hoc `edge_exists` check skips the second
+///   insert.
 pub async fn rerank_candidates_table(
     pool: &PgPool,
     candidates_table: &str,
@@ -285,6 +293,14 @@ async fn rerank_inner(
     if candidates.is_empty() {
         summary.duration_ms = started.elapsed().as_millis();
         return Ok(summary);
+    }
+
+    // The LLM client factory reads `ENRICHMENT_MODEL` from env. If the caller
+    // supplied an override via `config.model`, propagate it before constructing
+    // the client. (Process-global mutation; library callers in async contexts
+    // should be aware, but the rerank loop is single-shot per process today.)
+    if let Some(ref model) = config.model {
+        std::env::set_var("ENRICHMENT_MODEL", model);
     }
 
     let llm = create_llm_client(&config.provider).map_err(|e| RerankError::Llm(e.to_string()))?;
