@@ -15,9 +15,12 @@
 //!     against the entity-type allowlist; paper-attribution uses
 //!     `'paper'` / `'claim'`, all other edges `'claim'` / `'claim'`.
 
+// rustfmt 1.8 sorts `NeighborPath` before `__test_only`; older CI rustfmt sorts
+// the reverse. #[rustfmt::skip] keeps both happy by opting out of the sort.
+#[rustfmt::skip]
 use epigraph_mcp::tools::recall::{
-    NeighborPath,
     __test_only::{assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population},
+    NeighborPath,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
