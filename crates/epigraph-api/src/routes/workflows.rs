@@ -909,10 +909,13 @@ pub async fn improve_workflow(
         message: format!("Failed to create variant: {e}"),
     })?;
 
-    // Create variant_of edge
+    // Create supersedes edge: the new improved variant supersedes the parent.
+    // (Was 'variant_of' historically; switched to 'supersedes' so the relationship
+    // is in the edges API allowlist and matches the flat-to-hierarchical
+    // migration's back-edge convention.)
     let _ = sqlx::query(
         "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship, properties) \
-         VALUES ($1, $2, 'claim', 'claim', 'variant_of', $3)",
+         VALUES ($1, $2, 'claim', 'claim', 'supersedes', $3)",
     )
     .bind(variant_id)
     .bind(parent_id)
