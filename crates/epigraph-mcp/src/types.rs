@@ -68,6 +68,10 @@ pub struct SubmitClaimParams {
         description = "Why does the evidence support this claim? Explicit reasoning produces richer provenance."
     )]
     pub reasoning: Option<String>,
+
+    #[schemars(description = "Optional labels to attach to the new claim (e.g. ['backlog','bug'])")]
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

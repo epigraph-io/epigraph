@@ -96,6 +96,17 @@ pub async fn submit_claim(
         crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "submit_claim").await?;
     let claim_uuid = claim.id.as_uuid();
 
+    if !params.labels.is_empty() {
+        ClaimRepository::update_labels(
+            &server.pool,
+            claim_uuid,
+            &params.labels,
+            &[],
+        )
+        .await
+        .map_err(internal_error)?;
+    }
+
     // Build Evidence + Trace from this submission. Both are noun-claims with
     // their own UUIDs and signatures regardless of was_created.
     let evidence_hash = ContentHasher::hash(params.evidence_data.as_bytes());

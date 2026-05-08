@@ -31,6 +31,7 @@ pub async fn batch_submit_claims(
             confidence: entry.confidence.unwrap_or(0.5),
             source_url: None,
             reasoning: None,
+            labels: vec![],
         };
 
         match crate::tools::claims::submit_claim(server, claim_params).await {
