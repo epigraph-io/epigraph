@@ -68,6 +68,12 @@ pub struct SubmitClaimParams {
         description = "Why does the evidence support this claim? Explicit reasoning produces richer provenance."
     )]
     pub reasoning: Option<String>,
+
+    #[schemars(
+        description = "Optional labels to attach to the new claim (e.g. ['backlog','bug'])"
+    )]
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -878,6 +884,58 @@ pub struct DivergenceResponse {
     pub bayesian_posterior: f64,
     pub kl_divergence: f64,
     pub computed_at: String,
+}
+
+// ── Claim mutation ──
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MarkDuplicateParams {
+    #[schemars(description = "UUID of the duplicate claim")]
+    pub claim_id: String,
+    #[schemars(description = "UUID of the canonical claim")]
+    pub canonical_id: String,
+    #[schemars(description = "Reason for marking duplicate")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SupersedeClaimParams {
+    #[schemars(description = "UUID of the claim being superseded")]
+    pub claim_id: String,
+    #[schemars(description = "Content of the new superseding claim")]
+    pub content: String,
+    #[schemars(description = "Truth value of the new claim (0.0–1.0)")]
+    pub truth_value: f64,
+    #[schemars(description = "Why the previous claim is being superseded")]
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateLabelsParams {
+    #[schemars(description = "UUID of the claim to label")]
+    pub claim_id: String,
+    #[schemars(description = "Labels to add (idempotent)")]
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[schemars(description = "Labels to remove (idempotent)")]
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PatchClaimParams {
+    #[schemars(description = "UUID of the claim to patch")]
+    pub claim_id: String,
+    #[schemars(description = "New trace_id (must reference an existing reasoning_traces row)")]
+    pub trace_id: Option<String>,
+    #[schemars(description = "JSONB to merge into properties")]
+    pub properties: Option<serde_json::Value>,
+    #[schemars(description = "Labels to add")]
+    #[serde(default)]
+    pub add_labels: Vec<String>,
+    #[schemars(description = "Labels to remove")]
+    #[serde(default)]
+    pub remove_labels: Vec<String>,
 }
 
 // ── Challenges ──

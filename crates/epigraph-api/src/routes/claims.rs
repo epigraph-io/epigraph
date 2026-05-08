@@ -84,7 +84,7 @@ pub struct CreateClaimRequest {
 }
 
 /// Claim response structure
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, utoipa::ToSchema)]
 pub struct ClaimResponse {
     pub id: Uuid,
     pub content: String,
@@ -1098,7 +1098,7 @@ pub struct UpdateClaimRequest {
 /// All fields are optional. Only provided fields are updated.
 /// `properties` is merged (JSONB `||`) — existing keys not in the patch are preserved.
 /// `add_labels` / `remove_labels` follow the same semantics as PATCH /labels.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, utoipa::ToSchema)]
 pub struct PatchClaimRequest {
     /// New trace_id to link to this claim.
     pub trace_id: Option<Uuid>,
@@ -1242,6 +1242,20 @@ pub async fn update_claim(
 /// Auth is required: returns 401 if no bearer token is present.
 /// All mutations and the provenance record are committed atomically.
 #[cfg(feature = "db")]
+#[utoipa::path(
+    patch,
+    path = "/api/v1/claims/{id}",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the claim to patch")),
+    request_body = PatchClaimRequest,
+    responses(
+        (status = 200, body = ClaimResponse),
+        (status = 400),
+        (status = 401),
+        (status = 404),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "claims"
+)]
 pub async fn patch_claim(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -1282,82 +1296,33 @@ pub async fn patch_claim(
             message: format!("Failed to begin transaction: {e}"),
         })?;
 
-    // ── 6. Fetch before-state INSIDE the transaction with FOR UPDATE ──────────
-    // Single query covers all fields needed for the diff; FOR UPDATE locks the
-    // row for the duration of the transaction, preventing cross-field skew and
-    // concurrent mutation races.
-    use sqlx::Row as _;
-    let before_row = sqlx::query(
-        "SELECT trace_id, \
-                COALESCE(labels, ARRAY[]::text[]) AS labels, \
-                COALESCE(properties, '{}'::jsonb) AS properties \
-         FROM claims WHERE id = $1 FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| ApiError::DatabaseError {
-        message: e.to_string(),
-    })?
-    .ok_or_else(|| ApiError::NotFound {
-        entity: "Claim".to_string(),
-        id: id.to_string(),
-    })?;
+    // ── 6 & 7. Fetch before-state and apply mutations atomically ─────────────
+    let patch_input = epigraph_db::PatchClaimInput {
+        trace_id: request.trace_id,
+        properties: request.properties.clone(),
+        add_labels: request.add_labels.clone().unwrap_or_default(),
+        remove_labels: request.remove_labels.clone().unwrap_or_default(),
+    };
 
-    let before_labels: Vec<String> = before_row.get("labels");
-    let before_props: serde_json::Value = before_row.get("properties");
-    let before_trace: Option<Uuid> = before_row.get("trace_id");
-
-    // ── 7. Apply mutations ───────────────────────────────────────────────────
-    let mut after_trace = before_trace;
-    if let Some(trace_uuid) = request.trace_id {
-        let trace_id = TraceId::from_uuid(trace_uuid);
-        ClaimRepository::update_trace_id_conn(&mut tx, claim_id, trace_id)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: e.to_string(),
-            })?;
-        after_trace = Some(trace_uuid);
-    }
-
-    let mut after_props = before_props.clone();
-    if let Some(ref patch_props) = request.properties {
-        sqlx::query(
-            "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || $1 WHERE id = $2",
-        )
-        .bind(patch_props)
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to merge properties: {e}"),
-        })?;
-        // Compute merged value in memory for diff
-        if let (Some(merged), Some(patch_obj)) =
-            (after_props.as_object_mut(), patch_props.as_object())
-        {
-            for (k, v) in patch_obj {
-                merged.insert(k.clone(), v.clone());
-            }
-        }
-    }
-
-    let add_labels = request.add_labels.as_deref().unwrap_or(&[]);
-    let remove_labels = request.remove_labels.as_deref().unwrap_or(&[]);
-    let mut after_labels = before_labels.clone();
-    if !add_labels.is_empty() || !remove_labels.is_empty() {
-        after_labels = ClaimRepository::update_labels_conn(&mut tx, id, add_labels, remove_labels)
+    let diff =
+        epigraph_db::ClaimRepository::patch_claim_atomic_conn(&mut tx, claim_id, &patch_input)
             .await
             .map_err(|e| match e {
-                epigraph_db::DbError::NotFound { .. } => ApiError::NotFound {
+                epigraph_db::DbError::NotFound { id: eid, .. } => ApiError::NotFound {
                     entity: "Claim".to_string(),
-                    id: id.to_string(),
+                    id: eid.to_string(),
                 },
                 other => ApiError::DatabaseError {
                     message: other.to_string(),
                 },
             })?;
-    }
+
+    let before_labels = diff.before_labels;
+    let after_labels = diff.after_labels;
+    let before_props = diff.before_props;
+    let after_props = diff.after_props;
+    let before_trace = diff.before_trace;
+    let after_trace = diff.after_trace;
 
     // ── 8. Re-fetch updated claim (for response) ─────────────────────────────
     let updated_claim = ClaimRepository::get_by_id_conn(&mut tx, claim_id)
@@ -1456,7 +1421,7 @@ pub async fn patch_claim(
 // ── Label Mutation ──
 
 /// Request body for PATCH /api/v1/claims/:id/labels
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateLabelsRequest {
     #[serde(default)]
     pub add: Vec<String>,
@@ -1465,7 +1430,7 @@ pub struct UpdateLabelsRequest {
 }
 
 /// Response body for label update
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct UpdateLabelsResponse {
     pub id: Uuid,
     pub labels: Vec<String>,
@@ -1476,6 +1441,19 @@ pub struct UpdateLabelsResponse {
 /// Add and/or remove labels on an existing claim atomically.
 /// Idempotent: adding a duplicate is a no-op, removing a nonexistent label is a no-op.
 #[cfg(feature = "db")]
+#[utoipa::path(
+    patch,
+    path = "/api/v1/claims/{id}/labels",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the claim")),
+    request_body = UpdateLabelsRequest,
+    responses(
+        (status = 200, body = UpdateLabelsResponse),
+        (status = 400),
+        (status = 404),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "claims"
+)]
 pub async fn update_labels(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

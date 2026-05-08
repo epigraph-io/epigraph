@@ -6,6 +6,9 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::errors::DbError;
+use crate::repos::claim::{ClaimRepository, LineageHead};
+
 /// Workflow recall result (semantic or text search).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkflowRecallResult {
@@ -51,6 +54,23 @@ pub struct HierarchicalWorkflowRow {
     pub parent_id: Option<Uuid>,
     pub metadata: serde_json::Value,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Per-step resolution result for `find_workflow_hierarchical(resolve_to_latest=true)`.
+///
+/// `frozen_claim_id` is the original step claim attached to the workflow via
+/// the `executes` edge. `heads` lists the current head(s) of the step's
+/// lineage (claims with `step_lineage_id = $lineage` and no incoming
+/// `supersedes` edge); empty when the step has no `step_lineage_id` (legacy)
+/// or when the lineage has been pruned. `pending_resolution` is true when
+/// the lineage has more than one head — caller must reconcile before reuse.
+#[derive(Debug, serde::Serialize)]
+pub struct ResolvedStep {
+    pub step_index: usize,
+    pub frozen_claim_id: Uuid,
+    pub step_lineage_id: Option<Uuid>,
+    pub heads: Vec<LineageHead>,
+    pub pending_resolution: bool,
 }
 
 pub struct WorkflowRepository;
@@ -139,7 +159,7 @@ impl WorkflowRepository {
              SELECT b.id, b.content, b.truth_value, b.similarity, b.edge_count, b.properties, \
                     b.similarity * 0.6 + b.truth_value * 0.2 + LEAST(b.edge_count::float / 10.0, 1.0) * 0.2 AS hybrid_score, \
                     (SELECT e2.source_id::text FROM edges e2 \
-                     WHERE e2.target_id = b.id AND e2.relationship = 'variant_of' LIMIT 1) AS parent_id \
+                     WHERE e2.target_id = b.id AND e2.relationship IN ('variant_of', 'supersedes') LIMIT 1) AS parent_id \
              FROM base b \
              ORDER BY hybrid_score DESC \
              LIMIT $3",
@@ -190,7 +210,7 @@ impl WorkflowRepository {
              SELECT b.id, b.content, b.truth_value, b.similarity, b.edge_count, b.properties, \
                     b.truth_value * 0.5 + LEAST(b.edge_count::float / 10.0, 1.0) * 0.5 AS hybrid_score, \
                     (SELECT e2.source_id::text FROM edges e2 \
-                     WHERE e2.target_id = b.id AND e2.relationship = 'variant_of' LIMIT 1) AS parent_id \
+                     WHERE e2.target_id = b.id AND e2.relationship IN ('variant_of', 'supersedes') LIMIT 1) AS parent_id \
              FROM base b \
              ORDER BY hybrid_score DESC \
              LIMIT $3",
@@ -256,7 +276,8 @@ impl WorkflowRepository {
         }
     }
 
-    /// Find all descendants of a workflow via `variant_of` edges (for cascade deprecation).
+    /// Find all descendants of a workflow via `variant_of` or `supersedes` edges
+    /// (for cascade deprecation).
     pub async fn find_descendants(
         pool: &PgPool,
         workflow_id: Uuid,
@@ -264,11 +285,11 @@ impl WorkflowRepository {
         let rows: Vec<(Uuid,)> = sqlx::query_as(
             "WITH RECURSIVE descendants AS ( \
                  SELECT source_id AS id FROM edges \
-                 WHERE target_id = $1 AND relationship = 'variant_of' \
+                 WHERE target_id = $1 AND relationship IN ('variant_of', 'supersedes') \
                  UNION ALL \
                  SELECT e.source_id FROM edges e \
                  JOIN descendants d ON e.target_id = d.id \
-                 WHERE e.relationship = 'variant_of' \
+                 WHERE e.relationship IN ('variant_of', 'supersedes') \
              ) \
              SELECT id FROM descendants",
         )
@@ -279,10 +300,10 @@ impl WorkflowRepository {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
-    /// Walk up `variant_of` edges to find the lineage root ancestor.
+    /// Walk up `variant_of` or `supersedes` edges to find the lineage root ancestor.
     ///
     /// Returns `workflow_id` itself if it has no parent (is already a root).
-    /// The root is the ancestor with no outgoing `variant_of` edge.
+    /// The root is the ancestor with no outgoing `variant_of` or `supersedes` edge.
     pub async fn find_lineage_root(pool: &PgPool, workflow_id: Uuid) -> Result<Uuid, sqlx::Error> {
         let root: Option<(Uuid,)> = sqlx::query_as(
             r#"
@@ -292,14 +313,14 @@ impl WorkflowRepository {
                 SELECT e.target_id AS id
                 FROM ancestors a
                 JOIN edges e ON e.source_id = a.id
-                    AND e.relationship = 'variant_of'
+                    AND e.relationship IN ('variant_of', 'supersedes')
                     AND e.source_type = 'claim' AND e.target_type = 'claim'
             )
             SELECT a.id FROM ancestors a
             WHERE NOT EXISTS (
                 SELECT 1 FROM edges e
                 WHERE e.source_id = a.id
-                  AND e.relationship = 'variant_of'
+                  AND e.relationship IN ('variant_of', 'supersedes')
                   AND e.source_type = 'claim' AND e.target_type = 'claim'
             )
             LIMIT 1
@@ -310,6 +331,50 @@ impl WorkflowRepository {
         .await?;
 
         Ok(root.map(|(id,)| id).unwrap_or(workflow_id))
+    }
+
+    /// For each `executes`-edge from the workflow root, walk supersedes/revises
+    /// edges to the latest head claim. Mirrors the resolution logic that
+    /// previously lived in `epigraph-mcp::tools::workflow_hierarchical::build_resolved_steps`.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the database query fails.
+    pub async fn resolve_steps_to_heads(
+        pool: &PgPool,
+        workflow_id: Uuid,
+    ) -> Result<Vec<ResolvedStep>, DbError> {
+        // Pull all level=2 step claims under this workflow with their
+        // step_lineage_id, ordered by edge created_at + claim id (matches
+        // do_report_hierarchical_outcome_via_pool).
+        let step_rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT c.id, c.step_lineage_id \
+             FROM edges e \
+             JOIN claims c ON c.id = e.target_id \
+             WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
+             ORDER BY e.created_at ASC, c.id ASC",
+        )
+        .bind(workflow_id)
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::from)?;
+
+        let mut resolved = Vec::with_capacity(step_rows.len());
+        for (step_index, (frozen_claim_id, step_lineage_id)) in step_rows.into_iter().enumerate() {
+            let heads: Vec<LineageHead> = if let Some(lineage_id) = step_lineage_id {
+                ClaimRepository::latest_in_lineage(pool, lineage_id).await?
+            } else {
+                Vec::new()
+            };
+            let pending_resolution = heads.len() > 1;
+            resolved.push(ResolvedStep {
+                step_index,
+                frozen_claim_id,
+                step_lineage_id,
+                heads,
+                pending_resolution,
+            });
+        }
+        Ok(resolved)
     }
 
     /// Search hierarchical workflows by free-text query against `goal` and

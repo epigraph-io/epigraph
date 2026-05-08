@@ -1222,6 +1222,7 @@ dependencies = [
  "epigraph-ingest-executor",
  "epigraph-interfaces",
  "epigraph-jobs",
+ "epigraph-mcp",
  "futures",
  "hex",
  "hmac",

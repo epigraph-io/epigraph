@@ -278,21 +278,21 @@ impl BehavioralExecutionRepository {
                 WHERE be.success = TRUE
                   AND be.goal_embedding IS NOT NULL
                 UNION ALL
-                -- Walk up: if current root has a variant_of parent, adopt the parent
+                -- Walk up: if current root has a variant_of or supersedes parent, adopt the parent
                 SELECT l.exec_id, e.target_id AS root_id
                 FROM lineage l
                 JOIN edges e ON e.source_id = l.root_id
-                    AND e.relationship = 'variant_of'
+                    AND e.relationship IN ('variant_of', 'supersedes')
                     AND e.source_type = 'claim' AND e.target_type = 'claim'
             ),
-            -- The true root per execution: the ancestor with no outgoing variant_of
+            -- The true root per execution: the ancestor with no outgoing variant_of or supersedes
             roots AS (
                 SELECT l.exec_id, l.root_id
                 FROM lineage l
                 WHERE NOT EXISTS (
                     SELECT 1 FROM edges e
                     WHERE e.source_id = l.root_id
-                      AND e.relationship = 'variant_of'
+                      AND e.relationship IN ('variant_of', 'supersedes')
                       AND e.source_type = 'claim' AND e.target_type = 'claim'
                 )
             ),

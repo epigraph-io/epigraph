@@ -1,6 +1,7 @@
 use sqlx::PgPool;
 use std::net::SocketAddr;
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 pub async fn spawn_app(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) {
     let app = epigraph_api::build_app_for_tests(database_url)
@@ -109,4 +110,111 @@ pub async fn seed_one_cluster(pool: &PgPool, size: usize) -> uuid::Uuid {
             .execute(pool).await.unwrap();
     }
     cluster_id
+}
+
+/// Issue a JWT with caller-specified scopes. evolve_step / dedup / patch_claim
+/// require `claims:write`; the existing test_bearer_token() issues only graph:read.
+pub fn test_bearer_token_with_scopes(scopes: &[&str]) -> String {
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (token, _jti) = cfg
+        .issue_access_token(
+            Uuid::new_v4(),
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+            "service",
+            None,
+            None,
+            chrono::Duration::minutes(60),
+        )
+        .expect("test JWT issued");
+    token
+}
+
+/// Insert a system agent with a unique 32-byte public_key.
+pub async fn seed_system_agent(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    let pk: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, agent_type) \
+         VALUES ($1, $2, 'system') ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(id)
+    .bind(&pk)
+    .execute(pool)
+    .await
+    .expect("seed system agent");
+    id
+}
+
+/// Insert a minimal claim with per-call unique content_hash.
+pub async fn seed_claim(pool: &PgPool, content: &str) -> Uuid {
+    let agent = seed_system_agent(pool).await;
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels) \
+         VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[])",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(&hash)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("seed claim");
+    id
+}
+
+/// Insert a claim with explicit labels.
+pub async fn seed_claim_with_labels(pool: &PgPool, content: &str, labels: &[&str]) -> Uuid {
+    let id = seed_claim(pool, content).await;
+    let labels_owned: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
+    sqlx::query("UPDATE claims SET labels = $1 WHERE id = $2")
+        .bind(&labels_owned)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("set labels");
+    id
+}
+
+/// Seed an oauth_clients row matching client_id (provenance_log.submitted_by FK).
+/// Real schema: id, client_id varchar(64), client_secret_hash bytea (nullable),
+/// client_name, client_type, allowed_scopes text[], granted_scopes text[], status.
+pub async fn seed_oauth_client(pool: &PgPool, client_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO oauth_clients (id, client_id, client_name, client_type, legal_entity_name, legal_contact_email, allowed_scopes, granted_scopes, status) \
+         VALUES ($1, $2, 'test', 'service', 'Test Entity', 'test@example.com', ARRAY['claims:write','claims:read','graph:read','edges:write']::text[], ARRAY['claims:write','claims:read','graph:read','edges:write']::text[], 'active') \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(client_id)
+    .bind(client_id.to_string())
+    .execute(pool)
+    .await
+    .expect("seed oauth_client");
+}
+
+/// Issue a JWT bound to a real seeded oauth_clients row so provenance writes
+/// don't violate the FK. Returns (token, client_id).
+pub async fn test_bearer_token_with_seeded_client(
+    pool: &PgPool,
+    scopes: &[&str],
+) -> (String, Uuid) {
+    let client_id = Uuid::new_v4();
+    seed_oauth_client(pool, client_id).await;
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (token, _jti) = cfg
+        .issue_access_token(
+            client_id,
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+            "service",
+            None,
+            None,
+            chrono::Duration::minutes(60),
+        )
+        .expect("test JWT issued");
+    (token, client_id)
 }

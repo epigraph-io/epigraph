@@ -12,6 +12,7 @@ use epigraph_core::{
     TruthValue,
 };
 use epigraph_crypto::ContentHasher;
+use epigraph_db::PatchClaimInput;
 use epigraph_db::{ClaimRepository, EdgeRepository, EvidenceRepository, ReasoningTraceRepository};
 
 fn parse_methodology(s: &str) -> Result<Methodology, String> {
@@ -94,6 +95,12 @@ pub async fn submit_claim(
     let (claim, was_created) =
         crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "submit_claim").await?;
     let claim_uuid = claim.id.as_uuid();
+
+    if !params.labels.is_empty() {
+        ClaimRepository::update_labels(&server.pool, claim_uuid, &params.labels, &[])
+            .await
+            .map_err(internal_error)?;
+    }
 
     // Build Evidence + Trace from this submission. Both are noun-claims with
     // their own UUIDs and signatures regardless of was_created.
@@ -392,4 +399,58 @@ pub async fn update_with_evidence(
         plausibility: Some(ds.plausibility),
         pignistic_prob: Some(ds.pignistic_prob),
     })
+}
+
+pub async fn update_labels(
+    server: &EpiGraphMcpFull,
+    params: crate::types::UpdateLabelsParams,
+) -> Result<CallToolResult, McpError> {
+    if params.add.is_empty() && params.remove.is_empty() {
+        return Err(invalid_params("must specify at least one of add/remove"));
+    }
+    let id = parse_uuid(&params.claim_id)?;
+    let labels = ClaimRepository::update_labels(&server.pool, id, &params.add, &params.remove)
+        .await
+        .map_err(internal_error)?;
+    success_json(&serde_json::json!({ "claim_id": id, "labels": labels }))
+}
+
+pub async fn patch_claim(
+    server: &EpiGraphMcpFull,
+    params: crate::types::PatchClaimParams,
+) -> Result<CallToolResult, McpError> {
+    let id = parse_uuid(&params.claim_id)?;
+    let trace = match &params.trace_id {
+        Some(s) => Some(parse_uuid(s)?),
+        None => None,
+    };
+    if trace.is_none()
+        && params.properties.is_none()
+        && params.add_labels.is_empty()
+        && params.remove_labels.is_empty()
+    {
+        return Err(invalid_params(
+            "at least one of trace_id/properties/add_labels/remove_labels required",
+        ));
+    }
+    let mut tx = server.pool.begin().await.map_err(internal_error)?;
+    let diff = ClaimRepository::patch_claim_atomic_conn(
+        &mut tx,
+        ClaimId::from_uuid(id),
+        &PatchClaimInput {
+            trace_id: trace,
+            properties: params.properties.clone(),
+            add_labels: params.add_labels.clone(),
+            remove_labels: params.remove_labels.clone(),
+        },
+    )
+    .await
+    .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+    success_json(&serde_json::json!({
+        "claim_id": id,
+        "after_labels": diff.after_labels,
+        "after_properties": diff.after_props,
+        "after_trace": diff.after_trace,
+    }))
 }

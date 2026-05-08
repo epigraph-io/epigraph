@@ -61,6 +61,8 @@ pub mod isomorphism;
 #[cfg(feature = "db")]
 pub mod lineage;
 #[cfg(feature = "db")]
+pub mod mcp_tools;
+#[cfg(feature = "db")]
 pub mod methods;
 #[cfg(feature = "enterprise")]
 pub mod mpc;
@@ -210,6 +212,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/claims/:id/supersede",
             post(versioning::supersede_claim),
         )
+        .route("/api/v1/claims/:id/dedup", post(versioning::mark_duplicate))
         .route(
             "/api/v1/claims/:id/revoke-signature",
             post(revoke_signature::revoke_claim_signature),
@@ -309,6 +312,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/workflows/:id/behavioral-executions",
             post(workflows::record_behavioral_execution),
+        )
+        .route(
+            "/api/v1/workflows/steps/:id/evolve",
+            post(workflows::evolve_step),
         )
         .route(
             "/api/v1/experiments/hypothesize",
@@ -726,7 +733,9 @@ pub fn create_router(state: AppState) -> Router {
         // /api/v1/isomorphism/patterns — episcience feature
         // Task management — read endpoints
         .route("/api/v1/tasks", get(tasks::list_tasks))
-        .route("/api/v1/tasks/:id", get(tasks::get_task));
+        .route("/api/v1/tasks/:id", get(tasks::get_task))
+        // MCP tool discovery — no auth required
+        .route("/api/v1/mcp/tools", get(mcp_tools::list_mcp_tools));
 
     // OAuth2 endpoints (public, no auth required)
     let oauth = Router::new()

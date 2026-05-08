@@ -617,7 +617,7 @@ pub async fn improve_workflow(
             "claim",
             parent_id,
             "claim",
-            "variant_of",
+            "supersedes",
             Some(serde_json::json!({"generation": generation})),
             None,
             None,
@@ -625,14 +625,23 @@ pub async fn improve_workflow(
         .await
         .map_err(internal_error)?;
 
+        // Tag the variant as a workflow so cascade walkers can find it.
+        let _ = epigraph_db::ClaimRepository::update_labels(
+            &server.pool,
+            claim_uuid,
+            &["workflow".to_string()],
+            &[],
+        )
+        .await;
+
         let embed_text = workflow_embed_text(&goal, &steps, &prereqs);
         server
             .embedder
             .embed_and_store(claim_uuid, &embed_text)
             .await
     } else {
-        // Option A + idempotent variant_of: skip everything including the
-        // variant_of edge (already created on first variant insert).
+        // Option A + idempotent supersedes: skip everything including the
+        // supersedes edge (already created on first variant insert).
         false
     };
 
@@ -656,18 +665,22 @@ pub async fn deprecate_workflow(
 
     let mut deprecated_ids = Vec::new();
 
-    // Deprecate the target workflow
-    ClaimRepository::update_truth_value(
-        &server.pool,
-        epigraph_core::ClaimId::from_uuid(workflow_id),
-        TruthValue::clamped(0.05),
+    // Deprecate the target workflow (A4: also set is_current = false)
+    sqlx::query(
+        "UPDATE claims SET truth_value = 0.05, is_current = false, updated_at = NOW() WHERE id = $1",
     )
+    .bind(workflow_id)
+    .execute(&server.pool)
     .await
     .map_err(internal_error)?;
     deprecated_ids.push(workflow_id.to_string());
 
     if cascade {
-        // Find all descendants via variant_of edges
+        // A5: Walk both 'supersedes' and 'variant_of' edges, but only
+        // deprecate workflow-labeled claims to avoid corrupting regular
+        // claim-version supersedes chains.
+        const DESCENDANT_REL: &[&str] = &["variant_of", "supersedes"];
+
         let mut queue = vec![workflow_id];
         while let Some(current) = queue.pop() {
             let edges = EdgeRepository::get_by_target(&server.pool, current, "claim")
@@ -675,18 +688,31 @@ pub async fn deprecate_workflow(
                 .unwrap_or_default();
 
             for edge in edges {
-                if edge.relationship == "variant_of" {
-                    let child_id = edge.source_id;
-                    ClaimRepository::update_truth_value(
-                        &server.pool,
-                        epigraph_core::ClaimId::from_uuid(child_id),
-                        TruthValue::clamped(0.05),
-                    )
-                    .await
-                    .map_err(internal_error)?;
-                    deprecated_ids.push(child_id.to_string());
-                    queue.push(child_id);
+                if !DESCENDANT_REL.contains(&edge.relationship.as_str()) {
+                    continue;
                 }
+                let child_id = edge.source_id;
+                // Filter to workflow-labeled claims only.
+                let is_workflow: bool =
+                    sqlx::query_scalar("SELECT 'workflow' = ANY(labels) FROM claims WHERE id = $1")
+                        .bind(child_id)
+                        .fetch_optional(&server.pool)
+                        .await
+                        .map_err(internal_error)?
+                        .unwrap_or(false);
+                if !is_workflow {
+                    continue;
+                }
+
+                sqlx::query(
+                    "UPDATE claims SET truth_value = 0.05, is_current = false, updated_at = NOW() WHERE id = $1",
+                )
+                .bind(child_id)
+                .execute(&server.pool)
+                .await
+                .map_err(internal_error)?;
+                deprecated_ids.push(child_id.to_string());
+                queue.push(child_id);
             }
         }
     }

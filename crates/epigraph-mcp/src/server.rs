@@ -85,6 +85,16 @@ impl EpiGraphMcpFull {
         .await;
     }
 
+    /// Return a JSON array of all registered MCP tools (name, description, schema).
+    ///
+    /// This is a static operation — no database access required. Used by the REST
+    /// discovery endpoint so agents can introspect available tools at runtime.
+    #[must_use]
+    pub fn all_tools_json() -> serde_json::Value {
+        let tools = Self::tool_router().list_all();
+        serde_json::to_value(tools).unwrap_or(serde_json::Value::Array(vec![]))
+    }
+
     /// Return an error if the server is in read-only mode.
     pub(crate) fn reject_if_read_only(&self) -> Result<(), McpError> {
         if self.read_only {
@@ -185,6 +195,48 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
         tools::claims::update_with_evidence(self, params).await
+    }
+
+    #[tool(
+        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
+    )]
+    async fn supersede_claim(
+        &self,
+        Parameters(params): Parameters<crate::types::SupersedeClaimParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::supersede::supersede_claim(self, params).await
+    }
+
+    #[tool(
+        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical untouched. Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
+    )]
+    async fn mark_duplicate(
+        &self,
+        Parameters(params): Parameters<crate::types::MarkDuplicateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::supersede::mark_duplicate(self, params).await
+    }
+
+    #[tool(description = "Atomically add and/or remove labels on an existing claim. Idempotent.")]
+    async fn update_labels(
+        &self,
+        Parameters(params): Parameters<crate::types::UpdateLabelsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::claims::update_labels(self, params).await
+    }
+
+    #[tool(
+        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required."
+    )]
+    async fn patch_claim(
+        &self,
+        Parameters(params): Parameters<crate::types::PatchClaimParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::claims::patch_claim(self, params).await
     }
 
     // ── Provenance (1 tool) ──
@@ -683,6 +735,18 @@ impl EpiGraphMcpFull {
         Parameters(params): Parameters<SearchTriplesParams>,
     ) -> Result<CallToolResult, McpError> {
         tools::rdf::search_triples(self, params).await
+    }
+
+    // ── Meta (1 tool) ──
+
+    #[tool(
+        description = "List all MCP tools available on this server. Returns the name, description, and JSON Schema for every registered tool. Use this for runtime tool discovery — the list reflects the live server state, including newly deployed tools not yet stored in the knowledge graph."
+    )]
+    async fn list_mcp_tools(&self) -> Result<CallToolResult, McpError> {
+        let tools = self.tool_router.list_all();
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&tools).map_err(crate::errors::internal_error)?,
+        )]))
     }
 }
 

@@ -43,6 +43,7 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         confidence: 0.8,
         source_url: None,
         reasoning: None,
+        labels: vec![],
     };
     let params2 = SubmitClaimParams {
         content: content.clone(),
@@ -52,6 +53,7 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         confidence: 0.9,
         source_url: None,
         reasoning: None,
+        labels: vec![],
     };
 
     tools::claims::submit_claim(&server, params1)
@@ -434,7 +436,7 @@ async fn improve_workflow_resubmit_option_a_skip() {
 
     assert_option_a_skip(&pool, agent_id, variant_hash.as_slice()).await;
 
-    // Extra invariant: exactly one variant_of edge (idempotent on resubmit).
+    // Extra invariant: exactly one supersedes edge (idempotent on resubmit).
     let variant_id: (Uuid,) =
         sqlx::query_as("SELECT id FROM claims WHERE content_hash = $1 AND agent_id = $2")
             .bind(variant_hash.as_slice())
@@ -443,9 +445,9 @@ async fn improve_workflow_resubmit_option_a_skip() {
             .await
             .unwrap();
 
-    let variant_of_count: (i64,) = sqlx::query_as(
+    let supersedes_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM edges
-         WHERE source_id = $1 AND target_id = $2 AND relationship = 'variant_of'",
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'supersedes'",
     )
     .bind(variant_id.0)
     .bind(parent_id)
@@ -453,7 +455,7 @@ async fn improve_workflow_resubmit_option_a_skip() {
     .await
     .unwrap();
     assert_eq!(
-        variant_of_count.0, 1,
-        "variant_of edge created exactly once (Option A + idempotent variant_of)"
+        supersedes_count.0, 1,
+        "supersedes edge created exactly once (Option A + idempotent supersedes)"
     );
 }
