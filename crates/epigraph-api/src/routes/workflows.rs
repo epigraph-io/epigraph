@@ -95,7 +95,7 @@ pub struct DeprecateQuery {
 }
 
 #[cfg(feature = "db")]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct HierarchicalSearchQuery {
     pub q: String,
     pub limit: Option<i64>,
@@ -633,6 +633,17 @@ pub async fn report_outcome(
 ///
 /// Use `GET /api/v1/workflows/search` for flat-JSON workflows.
 #[cfg(feature = "db")]
+#[utoipa::path(
+    get,
+    path = "/api/v1/workflows/hierarchical/search",
+    params(HierarchicalSearchQuery),
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 500),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "workflows"
+)]
 pub async fn find_workflow_hierarchical(
     State(state): State<AppState>,
     Query(params): Query<HierarchicalSearchQuery>,
@@ -690,6 +701,19 @@ pub async fn find_workflow_hierarchical(
 /// Returns 404 if the id does not correspond to a `workflows` row. Use
 /// `POST /api/v1/workflows/:id/outcome` for flat-JSON workflows.
 #[cfg(feature = "db")]
+#[utoipa::path(
+    post,
+    path = "/api/v1/workflows/hierarchical/{id}/outcome",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the hierarchical workflow")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404),
+        (status = 500),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "workflows"
+)]
 pub async fn report_hierarchical_outcome(
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
@@ -835,10 +859,9 @@ pub async fn report_hierarchical_outcome(
 }
 
 /// POST /api/v1/workflows/steps/:id/evolve — atomically evolve a step claim.
-#[cfg(feature = "db")]
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct EvolveStepRequest {
-    pub parent_id: Uuid,
+    pub parent_id: uuid::Uuid,
     pub content: String,
     /// "supersedes" (linear; flips is_current) or "revises" (parallel branch).
     pub edge_type: String,
@@ -847,16 +870,29 @@ pub struct EvolveStepRequest {
     pub level: Option<u32>,
 }
 
-#[cfg(feature = "db")]
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct EvolveStepResponse {
-    pub claim_id: Uuid,
-    pub step_lineage_id: Uuid,
+    pub claim_id: uuid::Uuid,
+    pub step_lineage_id: uuid::Uuid,
     pub edge_type: String,
-    pub edge_id: Uuid,
+    pub edge_id: uuid::Uuid,
 }
 
 #[cfg(feature = "db")]
+#[utoipa::path(
+    post,
+    path = "/api/v1/workflows/steps/{id}/evolve",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the parent step claim")),
+    request_body = EvolveStepRequest,
+    responses(
+        (status = 200, body = EvolveStepResponse),
+        (status = 400),
+        (status = 401),
+        (status = 404),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "workflows"
+)]
 pub async fn evolve_step(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -910,6 +946,19 @@ pub async fn evolve_step(
 
 /// POST /api/v1/workflows/:id/improve - Create an improved variant.
 #[cfg(feature = "db")]
+#[utoipa::path(
+    post,
+    path = "/api/v1/workflows/{id}/improve",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the workflow to improve")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404),
+        (status = 500),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "workflows"
+)]
 pub async fn improve_workflow(
     State(state): State<AppState>,
     Path(parent_id): Path<Uuid>,
@@ -1057,6 +1106,22 @@ pub async fn improve_workflow(
 
 /// DELETE /api/v1/workflows/:id - Deprecate a workflow.
 #[cfg(feature = "db")]
+#[utoipa::path(
+    delete,
+    path = "/api/v1/workflows/{id}",
+    params(
+        ("id" = uuid::Uuid, Path, description = "UUID of the workflow to deprecate"),
+        ("reason" = String, Query, description = "Reason for deprecation"),
+        ("cascade" = Option<bool>, Query, description = "Whether to cascade deprecation to descendants"),
+    ),
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404),
+        (status = 500),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "workflows"
+)]
 pub async fn deprecate_workflow(
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
@@ -1201,6 +1266,17 @@ pub async fn record_behavioral_execution(
 /// if the workflow row already has `executes` edges, returns `already_ingested: true`
 /// without touching the DB further.
 #[cfg(feature = "db")]
+#[utoipa::path(
+    post,
+    path = "/api/v1/workflows/ingest",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 500),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "workflows"
+)]
 pub async fn ingest_workflow(
     State(state): State<AppState>,
     Json(extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,

@@ -16,12 +16,15 @@ use crate::routes::admin::{
     SystemStats, WebhookStats,
 };
 use crate::routes::challenge::{ChallengeResponse, SubmitChallengeRequest};
+use crate::routes::claims::{ClaimResponse, PatchClaimRequest, UpdateLabelsRequest, UpdateLabelsResponse};
 use crate::routes::health::HealthResponse;
 use crate::routes::rag::{RagContextResponse, RagContextResult, RagQueryParams};
 use crate::routes::submit::{
     ClaimSubmission, EpistemicPacket, EvidenceSubmission, EvidenceTypeSubmission,
     MethodologySubmission, ReasoningTraceSubmission, SubmitPacketResponse, TraceInputSubmission,
 };
+use crate::routes::versioning::{DedupRequest, DedupResponse, SupersedeRequest, SupersessionResponse};
+use crate::routes::workflows::{EvolveStepRequest, EvolveStepResponse};
 
 /// EpiGraph API OpenAPI specification
 ///
@@ -48,6 +51,16 @@ use crate::routes::submit::{
         system_stats,
         submit_challenge,
         list_challenges,
+        supersede_claim_doc,
+        mark_duplicate_doc,
+        patch_claim_doc,
+        update_labels_doc,
+        evolve_step_doc,
+        find_workflow_hierarchical_doc,
+        report_hierarchical_outcome_doc,
+        improve_workflow_doc,
+        deprecate_workflow_doc,
+        ingest_workflow_doc,
     ),
     components(
         schemas(
@@ -74,6 +87,16 @@ use crate::routes::submit::{
             WebhookStats,
             ConfigSummary,
             ErrorResponse,
+            SupersedeRequest,
+            SupersessionResponse,
+            DedupRequest,
+            DedupResponse,
+            PatchClaimRequest,
+            ClaimResponse,
+            UpdateLabelsRequest,
+            UpdateLabelsResponse,
+            EvolveStepRequest,
+            EvolveStepResponse,
         )
     ),
     modifiers(&SecurityAddon),
@@ -83,6 +106,8 @@ use crate::routes::submit::{
         (name = "query", description = "Query and search endpoints"),
         (name = "challenge", description = "Claim challenge endpoints"),
         (name = "admin", description = "Administrative endpoints"),
+        (name = "claims", description = "Claim management endpoints"),
+        (name = "workflows", description = "Workflow management endpoints"),
     )
 )]
 pub struct ApiDoc;
@@ -246,6 +271,173 @@ async fn submit_challenge() {}
     )
 )]
 async fn list_challenges() {}
+
+/// Supersede an existing claim (doc stub)
+#[utoipa::path(
+    post,
+    path = "/api/v1/claims/{id}/supersede",
+    tag = "claims",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the claim to supersede")),
+    request_body = SupersedeRequest,
+    responses(
+        (status = 201, body = SupersessionResponse),
+        (status = 400),
+        (status = 404),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn supersede_claim_doc() {}
+
+/// Mark a claim as a duplicate (doc stub)
+#[utoipa::path(
+    post,
+    path = "/api/v1/claims/{id}/dedup",
+    tag = "claims",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the duplicate claim")),
+    request_body = DedupRequest,
+    responses(
+        (status = 200, body = DedupResponse),
+        (status = 400),
+        (status = 401),
+        (status = 404),
+        (status = 409),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn mark_duplicate_doc() {}
+
+/// Partial update of a claim (doc stub)
+#[utoipa::path(
+    patch,
+    path = "/api/v1/claims/{id}",
+    tag = "claims",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the claim to patch")),
+    request_body = PatchClaimRequest,
+    responses(
+        (status = 200, body = ClaimResponse),
+        (status = 400),
+        (status = 401),
+        (status = 404),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn patch_claim_doc() {}
+
+/// Update labels on a claim (doc stub)
+#[utoipa::path(
+    patch,
+    path = "/api/v1/claims/{id}/labels",
+    tag = "claims",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the claim")),
+    request_body = UpdateLabelsRequest,
+    responses(
+        (status = 200, body = UpdateLabelsResponse),
+        (status = 400),
+        (status = 404),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn update_labels_doc() {}
+
+/// Evolve a workflow step (doc stub)
+#[utoipa::path(
+    post,
+    path = "/api/v1/workflows/steps/{id}/evolve",
+    tag = "workflows",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the parent step claim")),
+    request_body = EvolveStepRequest,
+    responses(
+        (status = 200, body = EvolveStepResponse),
+        (status = 400),
+        (status = 401),
+        (status = 404),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn evolve_step_doc() {}
+
+/// Search hierarchical workflows (doc stub)
+#[utoipa::path(
+    get,
+    path = "/api/v1/workflows/hierarchical/search",
+    tag = "workflows",
+    params(
+        ("q" = String, Query, description = "Search query"),
+        ("limit" = Option<i64>, Query, description = "Maximum results (default: 10, max: 50)"),
+        ("resolve_to_latest" = Option<bool>, Query, description = "Whether to resolve steps to latest versions"),
+    ),
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 500),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn find_workflow_hierarchical_doc() {}
+
+/// Report hierarchical workflow outcome (doc stub)
+#[utoipa::path(
+    post,
+    path = "/api/v1/workflows/hierarchical/{id}/outcome",
+    tag = "workflows",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the hierarchical workflow")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404),
+        (status = 500),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn report_hierarchical_outcome_doc() {}
+
+/// Improve a workflow (doc stub)
+#[utoipa::path(
+    post,
+    path = "/api/v1/workflows/{id}/improve",
+    tag = "workflows",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the workflow to improve")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404),
+        (status = 500),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn improve_workflow_doc() {}
+
+/// Deprecate a workflow (doc stub)
+#[utoipa::path(
+    delete,
+    path = "/api/v1/workflows/{id}",
+    tag = "workflows",
+    params(
+        ("id" = uuid::Uuid, Path, description = "UUID of the workflow to deprecate"),
+        ("reason" = String, Query, description = "Reason for deprecation"),
+        ("cascade" = Option<bool>, Query, description = "Whether to cascade deprecation to descendants"),
+    ),
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 404),
+        (status = 500),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn deprecate_workflow_doc() {}
+
+/// Ingest a workflow extraction (doc stub)
+#[utoipa::path(
+    post,
+    path = "/api/v1/workflows/ingest",
+    tag = "workflows",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 500),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn ingest_workflow_doc() {}
 
 /// Generate the OpenAPI JSON specification.
 ///

@@ -84,7 +84,7 @@ pub struct CreateClaimRequest {
 }
 
 /// Claim response structure
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, utoipa::ToSchema)]
 pub struct ClaimResponse {
     pub id: Uuid,
     pub content: String,
@@ -1098,7 +1098,7 @@ pub struct UpdateClaimRequest {
 /// All fields are optional. Only provided fields are updated.
 /// `properties` is merged (JSONB `||`) — existing keys not in the patch are preserved.
 /// `add_labels` / `remove_labels` follow the same semantics as PATCH /labels.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, utoipa::ToSchema)]
 pub struct PatchClaimRequest {
     /// New trace_id to link to this claim.
     pub trace_id: Option<Uuid>,
@@ -1242,6 +1242,20 @@ pub async fn update_claim(
 /// Auth is required: returns 401 if no bearer token is present.
 /// All mutations and the provenance record are committed atomically.
 #[cfg(feature = "db")]
+#[utoipa::path(
+    patch,
+    path = "/api/v1/claims/{id}",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the claim to patch")),
+    request_body = PatchClaimRequest,
+    responses(
+        (status = 200, body = ClaimResponse),
+        (status = 400),
+        (status = 401),
+        (status = 404),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "claims"
+)]
 pub async fn patch_claim(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -1410,7 +1424,7 @@ pub async fn patch_claim(
 // ── Label Mutation ──
 
 /// Request body for PATCH /api/v1/claims/:id/labels
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateLabelsRequest {
     #[serde(default)]
     pub add: Vec<String>,
@@ -1419,7 +1433,7 @@ pub struct UpdateLabelsRequest {
 }
 
 /// Response body for label update
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct UpdateLabelsResponse {
     pub id: Uuid,
     pub labels: Vec<String>,
@@ -1430,6 +1444,19 @@ pub struct UpdateLabelsResponse {
 /// Add and/or remove labels on an existing claim atomically.
 /// Idempotent: adding a duplicate is a no-op, removing a nonexistent label is a no-op.
 #[cfg(feature = "db")]
+#[utoipa::path(
+    patch,
+    path = "/api/v1/claims/{id}/labels",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the claim")),
+    request_body = UpdateLabelsRequest,
+    responses(
+        (status = 200, body = UpdateLabelsResponse),
+        (status = 400),
+        (status = 404),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "claims"
+)]
 pub async fn update_labels(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

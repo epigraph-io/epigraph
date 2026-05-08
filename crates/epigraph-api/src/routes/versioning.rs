@@ -29,14 +29,14 @@ use epigraph_events::EpiGraphEvent;
 // =============================================================================
 
 /// Request body for marking a claim as a duplicate.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct DedupRequest {
     pub canonical_id: Uuid,
     pub reason: Option<String>,
 }
 
 /// Response for a successful dedup operation.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DedupResponse {
     pub duplicate_id: Uuid,
     pub canonical_id: Uuid,
@@ -60,7 +60,7 @@ const MAX_CONTENT_LENGTH: usize = 65_536;
 // =============================================================================
 
 /// Request body for superseding a claim
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SupersedeRequest {
     /// New claim content
     pub content: String,
@@ -71,7 +71,7 @@ pub struct SupersedeRequest {
 }
 
 /// Response for a successful supersession
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SupersessionResponse {
     /// The ID of the newly created claim
     pub new_claim_id: Uuid,
@@ -142,6 +142,19 @@ pub struct VersionHistoryResponse {
 /// - 400 Bad Request: Validation failures or claim already superseded
 /// - 404 Not Found: Claim does not exist
 /// - 201 Created: New claim created successfully
+#[utoipa::path(
+    post,
+    path = "/api/v1/claims/{id}/supersede",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the claim to supersede")),
+    request_body = SupersedeRequest,
+    responses(
+        (status = 201, body = SupersessionResponse),
+        (status = 400),
+        (status = 404),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "claims"
+)]
 pub async fn supersede_claim(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
@@ -350,6 +363,21 @@ pub async fn supersede_claim(
 /// - 404 Not Found: claim or canonical does not exist
 /// - 200 OK: duplicate marked successfully
 #[cfg(feature = "db")]
+#[utoipa::path(
+    post,
+    path = "/api/v1/claims/{id}/dedup",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the duplicate claim")),
+    request_body = DedupRequest,
+    responses(
+        (status = 200, body = DedupResponse),
+        (status = 400),
+        (status = 401),
+        (status = 404),
+        (status = 409),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "claims"
+)]
 pub async fn mark_duplicate(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
