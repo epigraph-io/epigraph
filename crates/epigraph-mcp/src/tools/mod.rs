@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod challenges;
 pub mod claims;
+pub mod supersede;
 pub mod ds;
 pub mod ds_auto;
 pub mod events;

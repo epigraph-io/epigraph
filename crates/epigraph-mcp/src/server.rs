@@ -187,6 +187,39 @@ impl EpiGraphMcpFull {
         tools::claims::update_with_evidence(self, params).await
     }
 
+    #[tool(
+        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
+    )]
+    async fn supersede_claim(
+        &self,
+        Parameters(params): Parameters<crate::types::SupersedeClaimParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::supersede::supersede_claim(self, params).await
+    }
+
+    #[tool(
+        description = "Atomically add and/or remove labels on an existing claim. Idempotent."
+    )]
+    async fn update_labels(
+        &self,
+        Parameters(params): Parameters<crate::types::UpdateLabelsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::claims::update_labels(self, params).await
+    }
+
+    #[tool(
+        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required."
+    )]
+    async fn patch_claim(
+        &self,
+        Parameters(params): Parameters<crate::types::PatchClaimParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::claims::patch_claim(self, params).await
+    }
+
     // ── Provenance (1 tool) ──
 
     #[tool(
