@@ -819,6 +819,80 @@ pub async fn report_hierarchical_outcome(
     })))
 }
 
+/// POST /api/v1/workflows/steps/:id/evolve — atomically evolve a step claim.
+#[cfg(feature = "db")]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct EvolveStepRequest {
+    pub parent_id: Uuid,
+    pub content: String,
+    /// "supersedes" (linear; flips is_current) or "revises" (parallel branch).
+    pub edge_type: String,
+    pub reason: Option<String>,
+    /// 2 (step) or 3 (operation). Default 2.
+    pub level: Option<u32>,
+}
+
+#[cfg(feature = "db")]
+#[derive(Debug, serde::Serialize)]
+pub struct EvolveStepResponse {
+    pub claim_id: Uuid,
+    pub step_lineage_id: Uuid,
+    pub edge_type: String,
+    pub edge_id: Uuid,
+}
+
+#[cfg(feature = "db")]
+pub async fn evolve_step(
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(parent_id): Path<Uuid>,
+    Json(req): Json<EvolveStepRequest>,
+) -> Result<Json<EvolveStepResponse>, ApiError> {
+    let auth = match auth_ctx {
+        Some(axum::Extension(ref a)) => a.clone(),
+        None => {
+            return Err(ApiError::Unauthorized {
+                reason: "evolve_step requires authentication".into(),
+            });
+        }
+    };
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
+    if req.parent_id != parent_id {
+        return Err(ApiError::BadRequest {
+            message: "parent_id in path and body must match".into(),
+        });
+    }
+    let agent = auth.owner_id.unwrap_or(auth.client_id);
+    let level = req.level.unwrap_or(2);
+    let result = epigraph_db::ClaimRepository::evolve_step(
+        &state.db_pool,
+        epigraph_core::ClaimId::from_uuid(parent_id),
+        &req.content,
+        &req.edge_type,
+        req.reason.as_deref(),
+        level,
+        agent,
+    )
+    .await
+    .map_err(|e| match e {
+        epigraph_db::DbError::NotFound { id, .. } => ApiError::NotFound {
+            entity: "Claim".into(),
+            id: id.to_string(),
+        },
+        other => ApiError::InternalError {
+            message: other.to_string(),
+        },
+    })?;
+
+    Ok(Json(EvolveStepResponse {
+        claim_id: result.new_claim_id,
+        step_lineage_id: result.step_lineage_id,
+        edge_type: result.edge_type,
+        edge_id: result.edge_id,
+    }))
+}
+
 /// POST /api/v1/workflows/:id/improve - Create an improved variant.
 #[cfg(feature = "db")]
 pub async fn improve_workflow(

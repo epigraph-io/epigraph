@@ -311,6 +311,10 @@ pub fn create_router(state: AppState) -> Router {
             post(workflows::record_behavioral_execution),
         )
         .route(
+            "/api/v1/workflows/steps/:id/evolve",
+            post(workflows::evolve_step),
+        )
+        .route(
             "/api/v1/experiments/hypothesize",
             post(experiments::hypothesize),
         )
