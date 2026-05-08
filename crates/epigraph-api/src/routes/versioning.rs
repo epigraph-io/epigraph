@@ -382,6 +382,7 @@ pub async fn supersede_claim(
         (status = 200, body = DedupResponse),
         (status = 400),
         (status = 401),
+        (status = 403),
         (status = 404),
         (status = 409),
     ),
@@ -399,7 +400,16 @@ pub async fn mark_duplicate(
             reason: "dedup requires authentication".into(),
         })?
         .0;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+
+    let principal = auth.owner_id.unwrap_or(auth.client_id);
+    tracing::info!(
+        principal = %principal,
+        dup_id = %dup_id,
+        canonical_id = %req.canonical_id,
+        reason = req.reason.as_deref().unwrap_or(""),
+        "mark_duplicate"
+    );
 
     if dup_id == req.canonical_id {
         return Err(ApiError::BadRequest {
@@ -427,7 +437,6 @@ pub async fn mark_duplicate(
     })?;
 
     // Provenance: best-effort (.ok() swallow). content_hash is zero-bytes for mark_duplicate.
-    let principal = auth.owner_id.unwrap_or(auth.client_id);
     if let Ok(mut tx) = state.db_pool.begin().await {
         let _ = epigraph_db::ProvenanceRepository::append_conn(
             &mut tx,
