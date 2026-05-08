@@ -101,7 +101,7 @@ pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
 pub use trace::ReasoningTraceRepository;
 pub use triple::{MentionRow, TripleRepository, TripleRow};
 pub use workflow::{
-    HierarchicalWorkflowRow, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    HierarchicalWorkflowRow, ResolvedStep, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
 };
 
 // Privacy / encryption repositories
