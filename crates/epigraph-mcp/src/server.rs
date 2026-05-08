@@ -199,6 +199,17 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical untouched. Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
+    )]
+    async fn mark_duplicate(
+        &self,
+        Parameters(params): Parameters<crate::types::MarkDuplicateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::supersede::mark_duplicate(self, params).await
+    }
+
+    #[tool(
         description = "Atomically add and/or remove labels on an existing claim. Idempotent."
     )]
     async fn update_labels(

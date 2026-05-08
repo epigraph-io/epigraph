@@ -887,6 +887,16 @@ pub struct DivergenceResponse {
 // ── Claim mutation ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct MarkDuplicateParams {
+    #[schemars(description = "UUID of the duplicate claim")]
+    pub claim_id: String,
+    #[schemars(description = "UUID of the canonical claim")]
+    pub canonical_id: String,
+    #[schemars(description = "Reason for marking duplicate")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SupersedeClaimParams {
     #[schemars(description = "UUID of the claim being superseded")]
     pub claim_id: String,

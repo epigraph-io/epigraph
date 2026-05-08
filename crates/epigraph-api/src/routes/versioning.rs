@@ -25,6 +25,25 @@ use epigraph_db::ClaimRepository;
 use epigraph_events::EpiGraphEvent;
 
 // =============================================================================
+// DEDUP TYPES
+// =============================================================================
+
+/// Request body for marking a claim as a duplicate.
+#[derive(Debug, Deserialize)]
+pub struct DedupRequest {
+    pub canonical_id: Uuid,
+    pub reason: Option<String>,
+}
+
+/// Response for a successful dedup operation.
+#[derive(Debug, Serialize)]
+pub struct DedupResponse {
+    pub duplicate_id: Uuid,
+    pub canonical_id: Uuid,
+    pub mode: &'static str,
+}
+
+// =============================================================================
 // SECURITY CONSTANTS
 // =============================================================================
 
@@ -315,6 +334,91 @@ pub async fn supersede_claim(
             created_at: now,
         }),
     ))
+}
+
+/// Mark a claim as a duplicate of a canonical claim without creating a new claim.
+///
+/// POST /api/v1/claims/:id/dedup
+///
+/// Sets `supersedes = canonical_id` and `is_current = false` on the duplicate claim.
+/// The canonical claim is left untouched. Writes best-effort provenance.
+///
+/// # Errors
+///
+/// - 400 Bad Request: duplicate_id == canonical_id, or claim already superseded
+/// - 401 Unauthorized: no bearer token
+/// - 404 Not Found: claim or canonical does not exist
+/// - 200 OK: duplicate marked successfully
+#[cfg(feature = "db")]
+pub async fn mark_duplicate(
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(dup_id): Path<Uuid>,
+    Json(req): Json<DedupRequest>,
+) -> Result<Json<DedupResponse>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "dedup requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
+    if dup_id == req.canonical_id {
+        return Err(ApiError::BadRequest {
+            message: "canonical_id cannot equal duplicate id".into(),
+        });
+    }
+
+    epigraph_db::ClaimRepository::mark_duplicate(
+        &state.db_pool,
+        epigraph_core::ClaimId::from_uuid(dup_id),
+        epigraph_core::ClaimId::from_uuid(req.canonical_id),
+    )
+    .await
+    .map_err(|e| match e {
+        epigraph_db::DbError::NotFound { id, .. } => ApiError::NotFound {
+            entity: "Claim".into(),
+            id: id.to_string(),
+        },
+        epigraph_db::DbError::QueryFailed { .. } => ApiError::Conflict {
+            reason: "claim already superseded or invalid input".into(),
+        },
+        other => ApiError::DatabaseError {
+            message: other.to_string(),
+        },
+    })?;
+
+    // Provenance: best-effort (.ok() swallow). content_hash is zero-bytes for mark_duplicate.
+    let principal = auth.owner_id.unwrap_or(auth.client_id);
+    if let Ok(mut tx) = state.db_pool.begin().await {
+        let _ = epigraph_db::ProvenanceRepository::append_conn(
+            &mut tx,
+            "claim",
+            dup_id,
+            "mark_duplicate",
+            auth.client_id,
+            principal,
+            &[epigraph_db::repos::provenance::AUTO_POLICY_AUTHORIZER_ID],
+            "auto_policy",
+            &[0u8; 32],
+            &[],
+            auth.jti,
+            &auth.scopes,
+            Some(&serde_json::json!({
+                "canonical_id": req.canonical_id,
+                "mode": "mark_duplicate",
+                "reason": req.reason.clone().unwrap_or_default(),
+            })),
+        )
+        .await;
+        let _ = tx.commit().await;
+    }
+
+    Ok(Json(DedupResponse {
+        duplicate_id: dup_id,
+        canonical_id: req.canonical_id,
+        mode: "mark_duplicate",
+    }))
 }
 
 /// Get the full version history for a claim
