@@ -61,6 +61,8 @@ pub mod isomorphism;
 #[cfg(feature = "db")]
 pub mod lineage;
 #[cfg(feature = "db")]
+pub mod mcp_tools;
+#[cfg(feature = "db")]
 pub mod methods;
 #[cfg(feature = "enterprise")]
 pub mod mpc;
@@ -734,7 +736,9 @@ pub fn create_router(state: AppState) -> Router {
         // /api/v1/isomorphism/patterns — episcience feature
         // Task management — read endpoints
         .route("/api/v1/tasks", get(tasks::list_tasks))
-        .route("/api/v1/tasks/:id", get(tasks::get_task));
+        .route("/api/v1/tasks/:id", get(tasks::get_task))
+        // MCP tool discovery — no auth required
+        .route("/api/v1/mcp/tools", get(mcp_tools::list_mcp_tools));
 
     // OAuth2 endpoints (public, no auth required)
     let oauth = Router::new()

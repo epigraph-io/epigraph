@@ -7,7 +7,7 @@ edition = "2021"
 
 [features]
 default = ["db"]
-db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-ingest-executor"]
+db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-ingest-executor", "dep:epigraph-mcp"]
 jina = ["epigraph-embeddings/jina"]
 genai = ["db", "dep:epigraph-cli"]  # LLM-dependent workflows; requires ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN)
 integration = []
@@ -42,6 +42,7 @@ epigraph-crypto = { workspace = true }
 epigraph-engine = { workspace = true }
 epigraph-embeddings = { workspace = true }
 epigraph-db = { workspace = true, optional = true }
+epigraph-mcp = { workspace = true, optional = true }
 epigraph-ds = { workspace = true }  # Dempster-Shafer math for belief endpoints
 epigraph-events = { workspace = true }  # Event bus for pub/sub messaging
 epigraph-cli = { workspace = true, optional = true }  # LlmClient trait + AnthropicClient (genai feature)

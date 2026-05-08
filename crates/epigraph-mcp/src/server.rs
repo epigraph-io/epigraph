@@ -85,6 +85,16 @@ impl EpiGraphMcpFull {
         .await;
     }
 
+    /// Return a JSON array of all registered MCP tools (name, description, schema).
+    ///
+    /// This is a static operation — no database access required. Used by the REST
+    /// discovery endpoint so agents can introspect available tools at runtime.
+    #[must_use]
+    pub fn all_tools_json() -> serde_json::Value {
+        let tools = Self::tool_router().list_all();
+        serde_json::to_value(tools).unwrap_or(serde_json::Value::Array(vec![]))
+    }
+
     /// Return an error if the server is in read-only mode.
     pub(crate) fn reject_if_read_only(&self) -> Result<(), McpError> {
         if self.read_only {
@@ -727,6 +737,18 @@ impl EpiGraphMcpFull {
         Parameters(params): Parameters<SearchTriplesParams>,
     ) -> Result<CallToolResult, McpError> {
         tools::rdf::search_triples(self, params).await
+    }
+
+    // ── Meta (1 tool) ──
+
+    #[tool(
+        description = "List all MCP tools available on this server. Returns the name, description, and JSON Schema for every registered tool. Use this for runtime tool discovery — the list reflects the live server state, including newly deployed tools not yet stored in the knowledge graph."
+    )]
+    async fn list_mcp_tools(&self) -> Result<CallToolResult, McpError> {
+        let tools = self.tool_router.list_all();
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&tools).map_err(crate::errors::internal_error)?,
+        )]))
     }
 }
 
