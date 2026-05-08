@@ -27,6 +27,7 @@
 //! - [`domain::Evidence`]: Supporting material for claims
 //! - [`domain::ReasoningTrace`]: Logical derivation path
 
+pub mod canonical_scopes;
 pub mod challenge;
 pub mod domain;
 pub mod edge;
