@@ -61,7 +61,7 @@ pub use agent::{AgentCapabilitiesRow, AgentIdentityRow, AgentRepository, Capabil
 pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
-pub use claim::{ClaimEmbeddingHit, ClaimPairDistance, ClaimRepository, EvolveStepResult, LineageHead};
+pub use claim::{ClaimEmbeddingHit, ClaimPairDistance, ClaimRepository, EvolveStepResult, LineageHead, PatchClaimDiff, PatchClaimInput};
 pub use claim_theme::{
     BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow, DistantClaimsRow, RecomputedThemeRow,
     SplitCandidateRow,

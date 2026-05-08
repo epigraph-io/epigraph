@@ -42,6 +42,26 @@ pub struct EvolveStepResult {
     pub edge_id: Uuid,
 }
 
+/// Input for [`ClaimRepository::patch_claim_atomic_conn`].
+#[derive(Debug, Clone, Default)]
+pub struct PatchClaimInput {
+    pub trace_id: Option<Uuid>,
+    pub properties: Option<serde_json::Value>,
+    pub add_labels: Vec<String>,
+    pub remove_labels: Vec<String>,
+}
+
+/// Diff produced by [`ClaimRepository::patch_claim_atomic_conn`].
+#[derive(Debug)]
+pub struct PatchClaimDiff {
+    pub before_labels: Vec<String>,
+    pub after_labels: Vec<String>,
+    pub before_props: serde_json::Value,
+    pub after_props: serde_json::Value,
+    pub before_trace: Option<Uuid>,
+    pub after_trace: Option<Uuid>,
+}
+
 /// Build a Claim from database row data.
 ///
 /// This helper function handles the crypto fields that may not exist in
@@ -1939,6 +1959,55 @@ impl ClaimRepository {
         .bind(canon_uuid).bind(dup_uuid).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Apply a patch atomically inside the supplied transaction. Returns a diff so
+    /// callers can build provenance or HTTP responses. No provenance writing here.
+    pub async fn patch_claim_atomic_conn<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
+        id: ClaimId,
+        patch: &PatchClaimInput,
+    ) -> Result<PatchClaimDiff, DbError> {
+        use sqlx::Row as _;
+        let id_uuid: Uuid = id.into();
+        let row = sqlx::query(
+            "SELECT trace_id, COALESCE(labels, ARRAY[]::text[]) AS labels, COALESCE(properties, '{}'::jsonb) AS properties \
+             FROM claims WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id_uuid).fetch_optional(&mut **tx).await?
+        .ok_or(DbError::NotFound { entity: "Claim".into(), id: id_uuid })?;
+        let before_labels: Vec<String> = row.get("labels");
+        let before_props: serde_json::Value = row.get("properties");
+        let before_trace: Option<Uuid> = row.get("trace_id");
+
+        let mut after_trace = before_trace;
+        if let Some(t) = patch.trace_id {
+            sqlx::query("UPDATE claims SET trace_id = $1 WHERE id = $2")
+                .bind(t).bind(id_uuid).execute(&mut **tx).await?;
+            after_trace = Some(t);
+        }
+
+        let mut after_props = before_props.clone();
+        if let Some(p) = &patch.properties {
+            sqlx::query(
+                "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || $1 WHERE id = $2"
+            )
+            .bind(p).bind(id_uuid).execute(&mut **tx).await?;
+            if let (Some(merged), Some(po)) = (after_props.as_object_mut(), p.as_object()) {
+                for (k, v) in po { merged.insert(k.clone(), v.clone()); }
+            }
+        }
+
+        let mut after_labels = before_labels.clone();
+        if !patch.add_labels.is_empty() || !patch.remove_labels.is_empty() {
+            after_labels = Self::update_labels_conn(&mut **tx, id_uuid, &patch.add_labels, &patch.remove_labels).await?;
+        }
+
+        Ok(PatchClaimDiff {
+            before_labels, after_labels,
+            before_props, after_props,
+            before_trace, after_trace,
+        })
     }
 }
 

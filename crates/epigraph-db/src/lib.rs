@@ -62,6 +62,7 @@ pub use repos::{
     AnalysisRepository, BehavioralExecutionRepository, BehavioralExecutionRow, ChallengeRepository,
     ChallengeRow, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow,
     ClaimNeighborBetpRow, ClaimRepository, ClaimSummary, ClaimThemeRepository, ClaimThemeRow,
+    PatchClaimDiff, PatchClaimInput,
     ClaimVersionRepository, ClaimVersionRow, CommunityRepository, ContextRepository,
     CounterfactualRepository, CounterfactualRow, DivergenceRepository, EdgeEncryptionRepository,
     EdgeEncryptionRow, EdgeRepository, EmbeddingShareRepository, EmbeddingShareRow,
