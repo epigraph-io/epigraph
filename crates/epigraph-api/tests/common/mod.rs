@@ -181,8 +181,8 @@ pub async fn seed_claim_with_labels(pool: &PgPool, content: &str, labels: &[&str
 /// client_name, client_type, allowed_scopes text[], granted_scopes text[], status.
 pub async fn seed_oauth_client(pool: &PgPool, client_id: Uuid) {
     sqlx::query(
-        "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, granted_scopes, status) \
-         VALUES ($1, $2, 'test', 'service', ARRAY['claims:write','graph:read']::text[], ARRAY['claims:write','graph:read']::text[], 'active') \
+        "INSERT INTO oauth_clients (id, client_id, client_name, client_type, legal_entity_name, legal_contact_email, allowed_scopes, granted_scopes, status) \
+         VALUES ($1, $2, 'test', 'service', 'Test Entity', 'test@example.com', ARRAY['claims:write','claims:read','graph:read','edges:write']::text[], ARRAY['claims:write','claims:read','graph:read','edges:write']::text[], 'active') \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(client_id)
