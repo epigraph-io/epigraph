@@ -159,7 +159,7 @@ impl WorkflowRepository {
              SELECT b.id, b.content, b.truth_value, b.similarity, b.edge_count, b.properties, \
                     b.similarity * 0.6 + b.truth_value * 0.2 + LEAST(b.edge_count::float / 10.0, 1.0) * 0.2 AS hybrid_score, \
                     (SELECT e2.source_id::text FROM edges e2 \
-                     WHERE e2.target_id = b.id AND e2.relationship = 'variant_of' LIMIT 1) AS parent_id \
+                     WHERE e2.target_id = b.id AND e2.relationship IN ('variant_of', 'supersedes') LIMIT 1) AS parent_id \
              FROM base b \
              ORDER BY hybrid_score DESC \
              LIMIT $3",
@@ -210,7 +210,7 @@ impl WorkflowRepository {
              SELECT b.id, b.content, b.truth_value, b.similarity, b.edge_count, b.properties, \
                     b.truth_value * 0.5 + LEAST(b.edge_count::float / 10.0, 1.0) * 0.5 AS hybrid_score, \
                     (SELECT e2.source_id::text FROM edges e2 \
-                     WHERE e2.target_id = b.id AND e2.relationship = 'variant_of' LIMIT 1) AS parent_id \
+                     WHERE e2.target_id = b.id AND e2.relationship IN ('variant_of', 'supersedes') LIMIT 1) AS parent_id \
              FROM base b \
              ORDER BY hybrid_score DESC \
              LIMIT $3",
@@ -276,7 +276,8 @@ impl WorkflowRepository {
         }
     }
 
-    /// Find all descendants of a workflow via `variant_of` edges (for cascade deprecation).
+    /// Find all descendants of a workflow via `variant_of` or `supersedes` edges
+    /// (for cascade deprecation).
     pub async fn find_descendants(
         pool: &PgPool,
         workflow_id: Uuid,
@@ -284,11 +285,11 @@ impl WorkflowRepository {
         let rows: Vec<(Uuid,)> = sqlx::query_as(
             "WITH RECURSIVE descendants AS ( \
                  SELECT source_id AS id FROM edges \
-                 WHERE target_id = $1 AND relationship = 'variant_of' \
+                 WHERE target_id = $1 AND relationship IN ('variant_of', 'supersedes') \
                  UNION ALL \
                  SELECT e.source_id FROM edges e \
                  JOIN descendants d ON e.target_id = d.id \
-                 WHERE e.relationship = 'variant_of' \
+                 WHERE e.relationship IN ('variant_of', 'supersedes') \
              ) \
              SELECT id FROM descendants",
         )
@@ -299,10 +300,10 @@ impl WorkflowRepository {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
-    /// Walk up `variant_of` edges to find the lineage root ancestor.
+    /// Walk up `variant_of` or `supersedes` edges to find the lineage root ancestor.
     ///
     /// Returns `workflow_id` itself if it has no parent (is already a root).
-    /// The root is the ancestor with no outgoing `variant_of` edge.
+    /// The root is the ancestor with no outgoing `variant_of` or `supersedes` edge.
     pub async fn find_lineage_root(pool: &PgPool, workflow_id: Uuid) -> Result<Uuid, sqlx::Error> {
         let root: Option<(Uuid,)> = sqlx::query_as(
             r#"
@@ -312,14 +313,14 @@ impl WorkflowRepository {
                 SELECT e.target_id AS id
                 FROM ancestors a
                 JOIN edges e ON e.source_id = a.id
-                    AND e.relationship = 'variant_of'
+                    AND e.relationship IN ('variant_of', 'supersedes')
                     AND e.source_type = 'claim' AND e.target_type = 'claim'
             )
             SELECT a.id FROM ancestors a
             WHERE NOT EXISTS (
                 SELECT 1 FROM edges e
                 WHERE e.source_id = a.id
-                  AND e.relationship = 'variant_of'
+                  AND e.relationship IN ('variant_of', 'supersedes')
                   AND e.source_type = 'claim' AND e.target_type = 'claim'
             )
             LIMIT 1
