@@ -65,7 +65,7 @@ pub use repos::{
     ClaimVersionRepository, ClaimVersionRow, CommunityRepository, ContextRepository,
     CounterfactualRepository, CounterfactualRow, DivergenceRepository, EdgeEncryptionRepository,
     EdgeEncryptionRow, EdgeRepository, EmbeddingShareRepository, EmbeddingShareRow,
-    EntityRepository, EntityRow, EpistemicEdgePairRow, EventRepository, EventRow,
+    EntityRepository, EntityRow, EpistemicEdgePairRow, EvolveStepResult, EventRepository, EventRow,
     EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceRepository, EvidenceSearchResult,
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
     FactorRepository, FrameRepository, GapAnalysisResult, GapChallengeRow, GapRecord,

@@ -33,6 +33,15 @@ pub struct LineageHead {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Result of a successful [`ClaimRepository::evolve_step`] call.
+#[derive(Debug)]
+pub struct EvolveStepResult {
+    pub new_claim_id: Uuid,
+    pub step_lineage_id: Uuid,
+    pub edge_type: String,
+    pub edge_id: Uuid,
+}
+
 /// Build a Claim from database row data.
 ///
 /// This helper function handles the crypto fields that may not exist in
@@ -1782,6 +1791,111 @@ impl ClaimRepository {
         .await?;
 
         Ok(rows)
+    }
+}
+
+// ── Step Evolution ──
+
+impl ClaimRepository {
+    /// Atomically create a new step claim that supersedes or revises a parent.
+    ///
+    /// `edge_type` must be `"supersedes"` (linear; flips parent.is_current=false)
+    /// or `"revises"` (parallel branch; both heads stay current).
+    ///
+    /// The new claim inherits the parent's `step_lineage_id`. If the parent has
+    /// no lineage id yet, one is generated and back-filled onto the parent first.
+    /// `level` defaults to 2 (step). The `properties` JSONB on the new claim
+    /// includes `level` and `step_lineage_id` so existing find_workflow_hierarchical
+    /// queries (which filter on `properties->>'level' = '2'`) still work.
+    #[instrument(skip(pool))]
+    pub async fn evolve_step(
+        pool: &PgPool,
+        parent: ClaimId,
+        new_content: &str,
+        edge_type: &str,
+        reason: Option<&str>,
+        level: u32,
+        agent_id: Uuid,
+    ) -> Result<EvolveStepResult, DbError> {
+        if !matches!(edge_type, "supersedes" | "revises") {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "evolve_step: edge_type must be 'supersedes' or 'revises', got {edge_type}"
+                )),
+            });
+        }
+        let parent_uuid: Uuid = parent.into();
+        let mut tx = pool.begin().await?;
+
+        let row: Option<(Option<Uuid>,)> = sqlx::query_as(
+            "SELECT step_lineage_id FROM claims WHERE id = $1 FOR UPDATE",
+        )
+        .bind(parent_uuid)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (existing_lineage,) = row.ok_or(DbError::NotFound {
+            entity: "Claim".into(),
+            id: parent_uuid,
+        })?;
+        let lineage_id = match existing_lineage {
+            Some(l) => l,
+            None => {
+                let new_lineage = Uuid::new_v4();
+                sqlx::query("UPDATE claims SET step_lineage_id = $1 WHERE id = $2")
+                    .bind(new_lineage)
+                    .bind(parent_uuid)
+                    .execute(&mut *tx)
+                    .await?;
+                new_lineage
+            }
+        };
+
+        let new_uuid = Uuid::new_v4();
+        let hash = ContentHasher::hash(new_content.as_bytes());
+        let properties = serde_json::json!({
+            "level": level,
+            "step_lineage_id": lineage_id.to_string(),
+        });
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels, properties, step_lineage_id) \
+             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6)",
+        )
+        .bind(new_uuid)
+        .bind(new_content)
+        .bind(hash.as_slice())
+        .bind(agent_id)
+        .bind(&properties)
+        .bind(lineage_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let edge_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES ($1, $2, 'claim', $3, 'claim', $4, jsonb_build_object('reason', $5))",
+        )
+        .bind(edge_id)
+        .bind(new_uuid)
+        .bind(parent_uuid)
+        .bind(edge_type)
+        .bind(reason.unwrap_or(""))
+        .execute(&mut *tx)
+        .await?;
+
+        if edge_type == "supersedes" {
+            sqlx::query("UPDATE claims SET is_current = false, updated_at = NOW() WHERE id = $1")
+                .bind(parent_uuid)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(EvolveStepResult {
+            new_claim_id: new_uuid,
+            step_lineage_id: lineage_id,
+            edge_type: edge_type.to_string(),
+            edge_id,
+        })
     }
 }
 
