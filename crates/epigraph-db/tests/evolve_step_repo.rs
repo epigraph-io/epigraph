@@ -107,3 +107,44 @@ async fn evolve_step_rejects_bad_edge_type(pool: PgPool) {
     .unwrap();
     assert!(format!("{err:?}").contains("supersedes"), "{err:?}");
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_rejects_non_current_parent(pool: PgPool) {
+    // Build agent + v1 step using existing seed helpers.
+    let agent_id = seed_agent(&pool).await;
+    let v1 = seed_claim(&pool, agent_id, "v1 content", 0.7).await;
+
+    // First supersedes succeeds, flips v1.is_current = false.
+    ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(v1),
+        "v2 content",
+        "supersedes",
+        Some("first"),
+        2,
+        agent_id,
+    )
+    .await
+    .expect("first supersedes");
+
+    // Second supersedes against the same now-non-current v1 must error.
+    // Note: 'revises' against a non-current parent is allowed by design — only
+    // 'supersedes' is forbidden to prevent forking the lineage chain.
+    let err = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(v1),
+        "v2 fork",
+        "supersedes",
+        Some("attempted fork"),
+        2,
+        agent_id,
+    )
+    .await
+    .expect_err("second supersedes against non-current parent must error");
+
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("non-current step") || msg.contains("cannot supersede"),
+        "expected non-current-step error message, got: {msg}"
+    );
+}

@@ -626,13 +626,23 @@ pub async fn improve_workflow(
         .map_err(internal_error)?;
 
         // Tag the variant as a workflow so cascade walkers can find it.
-        let _ = epigraph_db::ClaimRepository::update_labels(
+        match epigraph_db::ClaimRepository::update_labels(
             &server.pool,
             claim_uuid,
             &["workflow".to_string()],
             &[],
         )
-        .await;
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    variant_id = %claim_uuid,
+                    error = %e,
+                    "failed to apply 'workflow' label to improve_workflow variant; cascade may miss this variant"
+                );
+            }
+        }
 
         let embed_text = workflow_embed_text(&goal, &steps, &prereqs);
         server
@@ -681,6 +691,8 @@ pub async fn deprecate_workflow(
         // claim-version supersedes chains.
         const DESCENDANT_REL: &[&str] = &["variant_of", "supersedes"];
 
+        let mut visited: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+        visited.insert(workflow_id);
         let mut queue = vec![workflow_id];
         while let Some(current) = queue.pop() {
             let edges = EdgeRepository::get_by_target(&server.pool, current, "claim")
@@ -701,6 +713,10 @@ pub async fn deprecate_workflow(
                         .map_err(internal_error)?
                         .unwrap_or(false);
                 if !is_workflow {
+                    continue;
+                }
+
+                if !visited.insert(child_id) {
                     continue;
                 }
 

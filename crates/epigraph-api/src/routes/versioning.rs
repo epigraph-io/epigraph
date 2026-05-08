@@ -150,6 +150,8 @@ pub struct VersionHistoryResponse {
     responses(
         (status = 201, body = SupersessionResponse),
         (status = 400),
+        (status = 401),
+        (status = 403),
         (status = 404),
     ),
     security(("ed25519_signature" = [])),
@@ -157,9 +159,17 @@ pub struct VersionHistoryResponse {
 )]
 pub async fn supersede_claim(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
     Json(request): Json<SupersedeRequest>,
 ) -> Result<(StatusCode, Json<SupersessionResponse>), ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "supersede requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     // 1. Validate content is not empty
     if request.content.trim().is_empty() {
         return Err(ApiError::ValidationError {
@@ -372,6 +382,7 @@ pub async fn supersede_claim(
         (status = 200, body = DedupResponse),
         (status = 400),
         (status = 401),
+        (status = 403),
         (status = 404),
         (status = 409),
     ),
@@ -389,7 +400,16 @@ pub async fn mark_duplicate(
             reason: "dedup requires authentication".into(),
         })?
         .0;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+
+    let principal = auth.owner_id.unwrap_or(auth.client_id);
+    tracing::info!(
+        principal = %principal,
+        dup_id = %dup_id,
+        canonical_id = %req.canonical_id,
+        reason = req.reason.as_deref().unwrap_or(""),
+        "mark_duplicate"
+    );
 
     if dup_id == req.canonical_id {
         return Err(ApiError::BadRequest {
@@ -417,7 +437,6 @@ pub async fn mark_duplicate(
     })?;
 
     // Provenance: best-effort (.ok() swallow). content_hash is zero-bytes for mark_duplicate.
-    let principal = auth.owner_id.unwrap_or(auth.client_id);
     if let Ok(mut tx) = state.db_pool.begin().await {
         let _ = epigraph_db::ProvenanceRepository::append_conn(
             &mut tx,

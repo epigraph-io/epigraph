@@ -1847,15 +1847,22 @@ impl ClaimRepository {
         let parent_uuid: Uuid = parent.into();
         let mut tx = pool.begin().await?;
 
-        let row: Option<(Option<Uuid>,)> =
-            sqlx::query_as("SELECT step_lineage_id FROM claims WHERE id = $1 FOR UPDATE")
+        let row: Option<(Option<Uuid>, bool)> =
+            sqlx::query_as("SELECT step_lineage_id, COALESCE(is_current, true) FROM claims WHERE id = $1 FOR UPDATE")
                 .bind(parent_uuid)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let (existing_lineage,) = row.ok_or(DbError::NotFound {
+        let (existing_lineage, parent_current) = row.ok_or(DbError::NotFound {
             entity: "Claim".into(),
             id: parent_uuid,
         })?;
+        if edge_type == "supersedes" && !parent_current {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "evolve_step: cannot supersede a non-current step {parent_uuid}"
+                )),
+            });
+        }
         let lineage_id = match existing_lineage {
             Some(l) => l,
             None => {
