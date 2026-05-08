@@ -11,8 +11,8 @@ use epigraph_core::{
     AgentId, Claim, ClaimId, Evidence, EvidenceType, Methodology, ReasoningTrace, TraceInput,
     TruthValue,
 };
-use epigraph_db::PatchClaimInput;
 use epigraph_crypto::ContentHasher;
+use epigraph_db::PatchClaimInput;
 use epigraph_db::{ClaimRepository, EdgeRepository, EvidenceRepository, ReasoningTraceRepository};
 
 fn parse_methodology(s: &str) -> Result<Methodology, String> {
@@ -97,14 +97,9 @@ pub async fn submit_claim(
     let claim_uuid = claim.id.as_uuid();
 
     if !params.labels.is_empty() {
-        ClaimRepository::update_labels(
-            &server.pool,
-            claim_uuid,
-            &params.labels,
-            &[],
-        )
-        .await
-        .map_err(internal_error)?;
+        ClaimRepository::update_labels(&server.pool, claim_uuid, &params.labels, &[])
+            .await
+            .map_err(internal_error)?;
     }
 
     // Build Evidence + Trace from this submission. Both are noun-claims with

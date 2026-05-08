@@ -693,14 +693,13 @@ pub async fn deprecate_workflow(
                 }
                 let child_id = edge.source_id;
                 // Filter to workflow-labeled claims only.
-                let is_workflow: bool = sqlx::query_scalar(
-                    "SELECT 'workflow' = ANY(labels) FROM claims WHERE id = $1",
-                )
-                .bind(child_id)
-                .fetch_optional(&server.pool)
-                .await
-                .map_err(internal_error)?
-                .unwrap_or(false);
+                let is_workflow: bool =
+                    sqlx::query_scalar("SELECT 'workflow' = ANY(labels) FROM claims WHERE id = $1")
+                        .bind(child_id)
+                        .fetch_optional(&server.pool)
+                        .await
+                        .map_err(internal_error)?
+                        .unwrap_or(false);
                 if !is_workflow {
                     continue;
                 }

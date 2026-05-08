@@ -1847,12 +1847,11 @@ impl ClaimRepository {
         let parent_uuid: Uuid = parent.into();
         let mut tx = pool.begin().await?;
 
-        let row: Option<(Option<Uuid>,)> = sqlx::query_as(
-            "SELECT step_lineage_id FROM claims WHERE id = $1 FOR UPDATE",
-        )
-        .bind(parent_uuid)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let row: Option<(Option<Uuid>,)> =
+            sqlx::query_as("SELECT step_lineage_id FROM claims WHERE id = $1 FOR UPDATE")
+                .bind(parent_uuid)
+                .fetch_optional(&mut *tx)
+                .await?;
         let (existing_lineage,) = row.ok_or(DbError::NotFound {
             entity: "Claim".into(),
             id: parent_uuid,
@@ -1935,16 +1934,27 @@ impl ClaimRepository {
             });
         }
         let mut tx = pool.begin().await?;
-        let canon_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)")
-            .bind(canon_uuid).fetch_one(&mut *tx).await?;
+        let canon_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)")
+                .bind(canon_uuid)
+                .fetch_one(&mut *tx)
+                .await?;
         if !canon_exists {
-            return Err(DbError::NotFound { entity: "Claim".into(), id: canon_uuid });
+            return Err(DbError::NotFound {
+                entity: "Claim".into(),
+                id: canon_uuid,
+            });
         }
         let row: Option<(Option<Uuid>,)> =
             sqlx::query_as("SELECT supersedes FROM claims WHERE id = $1 FOR UPDATE")
-                .bind(dup_uuid).fetch_optional(&mut *tx).await?;
+                .bind(dup_uuid)
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some((existing,)) = row else {
-            return Err(DbError::NotFound { entity: "Claim".into(), id: dup_uuid });
+            return Err(DbError::NotFound {
+                entity: "Claim".into(),
+                id: dup_uuid,
+            });
         };
         if existing.is_some() {
             return Err(DbError::QueryFailed {
@@ -1983,7 +1993,10 @@ impl ClaimRepository {
         let mut after_trace = before_trace;
         if let Some(t) = patch.trace_id {
             sqlx::query("UPDATE claims SET trace_id = $1 WHERE id = $2")
-                .bind(t).bind(id_uuid).execute(&mut **tx).await?;
+                .bind(t)
+                .bind(id_uuid)
+                .execute(&mut **tx)
+                .await?;
             after_trace = Some(t);
         }
 
@@ -1994,19 +2007,30 @@ impl ClaimRepository {
             )
             .bind(p).bind(id_uuid).execute(&mut **tx).await?;
             if let (Some(merged), Some(po)) = (after_props.as_object_mut(), p.as_object()) {
-                for (k, v) in po { merged.insert(k.clone(), v.clone()); }
+                for (k, v) in po {
+                    merged.insert(k.clone(), v.clone());
+                }
             }
         }
 
         let mut after_labels = before_labels.clone();
         if !patch.add_labels.is_empty() || !patch.remove_labels.is_empty() {
-            after_labels = Self::update_labels_conn(&mut **tx, id_uuid, &patch.add_labels, &patch.remove_labels).await?;
+            after_labels = Self::update_labels_conn(
+                &mut **tx,
+                id_uuid,
+                &patch.add_labels,
+                &patch.remove_labels,
+            )
+            .await?;
         }
 
         Ok(PatchClaimDiff {
-            before_labels, after_labels,
-            before_props, after_props,
-            before_trace, after_trace,
+            before_labels,
+            after_labels,
+            before_props,
+            after_props,
+            before_trace,
+            after_trace,
         })
     }
 }

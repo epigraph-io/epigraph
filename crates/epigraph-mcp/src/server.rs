@@ -219,9 +219,7 @@ impl EpiGraphMcpFull {
         crate::tools::supersede::mark_duplicate(self, params).await
     }
 
-    #[tool(
-        description = "Atomically add and/or remove labels on an existing claim. Idempotent."
-    )]
+    #[tool(description = "Atomically add and/or remove labels on an existing claim. Idempotent.")]
     async fn update_labels(
         &self,
         Parameters(params): Parameters<crate::types::UpdateLabelsParams>,

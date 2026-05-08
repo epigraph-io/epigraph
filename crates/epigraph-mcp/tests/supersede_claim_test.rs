@@ -21,12 +21,11 @@ async fn supersede_claim_marks_old_and_links_new(pool: PgPool) {
     let json = first_text(&result);
     let new_id = parse_uuid_field(&json, "new_claim_id");
 
-    let (old_current,): (bool,) =
-        sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
-            .bind(old)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (old_current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(!old_current);
 
     let (sup,): (Option<uuid::Uuid>,) =

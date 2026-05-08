@@ -43,11 +43,10 @@ async fn dedup_marks_duplicate_without_creating_new_claim() {
     assert!(!is_current);
 
     // Canonical untouched.
-    let (canon_current,): (bool,) =
-        sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
-            .bind(canonical)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (canon_current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+        .bind(canonical)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(canon_current);
 }

@@ -28,11 +28,10 @@ async fn mark_duplicate_marks_dup_only(pool: PgPool) {
     assert_eq!(sup, Some(canonical));
     assert!(!is_current);
 
-    let (canon_current,): (bool,) =
-        sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
-            .bind(canonical)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (canon_current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+        .bind(canonical)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(canon_current);
 }

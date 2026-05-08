@@ -49,12 +49,11 @@ async fn evolve_step_supersedes_flips_parent(pool: PgPool) {
     .await
     .unwrap();
 
-    let (parent_current,): (bool,) =
-        sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
-            .bind(parent)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (parent_current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(!parent_current);
 
     let (child_lineage, child_props): (Option<Uuid>, serde_json::Value) =
@@ -82,12 +81,11 @@ async fn evolve_step_revises_keeps_parent_current(pool: PgPool) {
     )
     .await
     .unwrap();
-    let (parent_current,): (bool,) =
-        sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
-            .bind(parent)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (parent_current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(parent_current);
 }
 

@@ -16,14 +16,18 @@ use crate::routes::admin::{
     SystemStats, WebhookStats,
 };
 use crate::routes::challenge::{ChallengeResponse, SubmitChallengeRequest};
-use crate::routes::claims::{ClaimResponse, PatchClaimRequest, UpdateLabelsRequest, UpdateLabelsResponse};
+use crate::routes::claims::{
+    ClaimResponse, PatchClaimRequest, UpdateLabelsRequest, UpdateLabelsResponse,
+};
 use crate::routes::health::HealthResponse;
 use crate::routes::rag::{RagContextResponse, RagContextResult, RagQueryParams};
 use crate::routes::submit::{
     ClaimSubmission, EpistemicPacket, EvidenceSubmission, EvidenceTypeSubmission,
     MethodologySubmission, ReasoningTraceSubmission, SubmitPacketResponse, TraceInputSubmission,
 };
-use crate::routes::versioning::{DedupRequest, DedupResponse, SupersedeRequest, SupersessionResponse};
+use crate::routes::versioning::{
+    DedupRequest, DedupResponse, SupersedeRequest, SupersessionResponse,
+};
 use crate::routes::workflows::{EvolveStepRequest, EvolveStepResponse};
 
 /// EpiGraph API OpenAPI specification

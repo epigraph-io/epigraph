@@ -18,14 +18,16 @@ async fn mcp_deprecate_workflow_sets_is_current_false(pool: PgPool) {
     .await
     .unwrap();
 
-    let (truth, is_current): (f64, bool) = sqlx::query_as(
-        "SELECT truth_value, is_current FROM claims WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!((truth - 0.05).abs() < 1e-9, "truth should be 0.05, got {truth}");
+    let (truth, is_current): (f64, bool) =
+        sqlx::query_as("SELECT truth_value, is_current FROM claims WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        (truth - 0.05).abs() < 1e-9,
+        "truth should be 0.05, got {truth}"
+    );
     assert!(!is_current, "is_current must be false");
 }
 
@@ -55,27 +57,31 @@ async fn deprecate_workflow_cascade_walks_supersedes_and_variant_of(pool: PgPool
     .unwrap();
 
     for id in [root, child_old, child_new] {
-        let (truth, is_current): (f64, bool) = sqlx::query_as(
-            "SELECT truth_value, is_current FROM claims WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!((truth - 0.05).abs() < 1e-9, "{id} not deprecated, truth={truth}");
+        let (truth, is_current): (f64, bool) =
+            sqlx::query_as("SELECT truth_value, is_current FROM claims WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            (truth - 0.05).abs() < 1e-9,
+            "{id} not deprecated, truth={truth}"
+        );
         assert!(!is_current, "{id} not is_current=false");
     }
 
-    let (utt_truth, utt_current): (f64, bool) = sqlx::query_as(
-        "SELECT truth_value, is_current FROM claims WHERE id = $1",
-    )
-    .bind(unrelated)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (utt_truth, utt_current): (f64, bool) =
+        sqlx::query_as("SELECT truth_value, is_current FROM claims WHERE id = $1")
+            .bind(unrelated)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(
         (utt_truth - 0.5).abs() < 1e-9,
         "unrelated non-workflow claim was deprecated, truth={utt_truth}"
     );
-    assert!(utt_current, "unrelated non-workflow claim flipped is_current");
+    assert!(
+        utt_current,
+        "unrelated non-workflow claim flipped is_current"
+    );
 }

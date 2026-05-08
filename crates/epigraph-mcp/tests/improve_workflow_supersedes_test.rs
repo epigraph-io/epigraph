@@ -37,12 +37,11 @@ async fn improve_workflow_writes_supersedes_edge_and_labels_variant(pool: PgPool
     assert_eq!(rel.as_deref(), Some("supersedes"));
 
     // Variant must carry the 'workflow' label so cascade can find it.
-    let (labels,): (Vec<String>,) =
-        sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
-            .bind(variant_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (labels,): (Vec<String>,) = sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
+        .bind(variant_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(
         labels.contains(&"workflow".into()),
         "improve_workflow variants must carry the 'workflow' label"

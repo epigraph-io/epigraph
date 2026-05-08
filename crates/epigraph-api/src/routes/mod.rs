@@ -212,10 +212,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/claims/:id/supersede",
             post(versioning::supersede_claim),
         )
-        .route(
-            "/api/v1/claims/:id/dedup",
-            post(versioning::mark_duplicate),
-        )
+        .route("/api/v1/claims/:id/dedup", post(versioning::mark_duplicate))
         .route(
             "/api/v1/claims/:id/revoke-signature",
             post(revoke_signature::revoke_claim_signature),

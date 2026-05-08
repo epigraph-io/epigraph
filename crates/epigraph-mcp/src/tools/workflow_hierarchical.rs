@@ -76,9 +76,10 @@ pub async fn find_workflow_hierarchical(
         });
 
         if resolve_to_latest {
-            let resolved = epigraph_db::WorkflowRepository::resolve_steps_to_heads(&server.pool, r.id)
-                .await
-                .map_err(internal_error)?;
+            let resolved =
+                epigraph_db::WorkflowRepository::resolve_steps_to_heads(&server.pool, r.id)
+                    .await
+                    .map_err(internal_error)?;
             entry["resolved_steps"] = serde_json::to_value(resolved).map_err(internal_error)?;
         }
 

@@ -123,7 +123,8 @@ pub fn test_bearer_token_with_scopes(scopes: &[&str]) -> String {
             Uuid::new_v4(),
             scopes.iter().map(|s| (*s).to_string()).collect(),
             "service",
-            None, None,
+            None,
+            None,
             chrono::Duration::minutes(60),
         )
         .expect("test JWT issued");
@@ -172,7 +173,9 @@ pub async fn seed_claim_with_labels(pool: &PgPool, content: &str, labels: &[&str
     sqlx::query("UPDATE claims SET labels = $1 WHERE id = $2")
         .bind(&labels_owned)
         .bind(id)
-        .execute(pool).await.expect("set labels");
+        .execute(pool)
+        .await
+        .expect("set labels");
     id
 }
 
@@ -208,7 +211,8 @@ pub async fn test_bearer_token_with_seeded_client(
             client_id,
             scopes.iter().map(|s| (*s).to_string()).collect(),
             "service",
-            None, None,
+            None,
+            None,
             chrono::Duration::minutes(60),
         )
         .expect("test JWT issued");

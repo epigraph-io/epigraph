@@ -675,11 +675,19 @@ pub async fn find_workflow_hierarchical(
     if params.resolve_to_latest {
         for w in &mut workflows {
             let workflow_id: Uuid = w["workflow_id"].as_str().unwrap().parse().unwrap();
-            let resolved = epigraph_db::WorkflowRepository::resolve_steps_to_heads(&state.db_pool, workflow_id)
-                .await
-                .map_err(|e| ApiError::InternalError { message: format!("resolve_to_latest failed: {e}") })?;
+            let resolved = epigraph_db::WorkflowRepository::resolve_steps_to_heads(
+                &state.db_pool,
+                workflow_id,
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("resolve_to_latest failed: {e}"),
+            })?;
             if let Some(obj) = w.as_object_mut() {
-                obj.insert("resolved_steps".to_string(), serde_json::to_value(resolved).unwrap());
+                obj.insert(
+                    "resolved_steps".to_string(),
+                    serde_json::to_value(resolved).unwrap(),
+                );
             }
         }
     }

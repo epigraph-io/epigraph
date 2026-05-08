@@ -18,12 +18,11 @@ async fn update_labels_adds_and_removes(pool: PgPool) {
     .await
     .unwrap();
 
-    let (labels,): (Vec<String>,) =
-        sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (labels,): (Vec<String>,) = sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(labels.contains(&"new1".into()) && labels.contains(&"new2".into()));
     assert!(!labels.contains(&"existing".into()));
 }

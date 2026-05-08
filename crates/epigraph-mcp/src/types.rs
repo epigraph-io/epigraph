@@ -69,7 +69,9 @@ pub struct SubmitClaimParams {
     )]
     pub reasoning: Option<String>,
 
-    #[schemars(description = "Optional labels to attach to the new claim (e.g. ['backlog','bug'])")]
+    #[schemars(
+        description = "Optional labels to attach to the new claim (e.g. ['backlog','bug'])"
+    )]
     #[serde(default)]
     pub labels: Vec<String>,
 }

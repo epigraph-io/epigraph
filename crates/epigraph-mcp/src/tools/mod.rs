@@ -1,7 +1,6 @@
 pub mod batch;
 pub mod challenges;
 pub mod claims;
-pub mod supersede;
 pub mod ds;
 pub mod ds_auto;
 pub mod events;
@@ -15,6 +14,7 @@ pub mod provenance;
 pub mod rdf;
 pub mod recall;
 pub mod sheaf;
+pub mod supersede;
 pub mod workflow_hierarchical;
 pub mod workflow_ingest;
 pub mod workflows;

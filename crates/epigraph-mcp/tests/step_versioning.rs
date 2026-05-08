@@ -110,8 +110,14 @@ async fn evolve_step_supersedes_flips_head(pool: PgPool) {
     assert!(!head_content.contains(&"step v1 content"));
 
     let (parent_current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
-        .bind(v1).fetch_one(&pool).await.unwrap();
-    assert!(!parent_current, "supersedes must flip parent.is_current=false");
+        .bind(v1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !parent_current,
+        "supersedes must flip parent.is_current=false"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

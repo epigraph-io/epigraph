@@ -1304,21 +1304,18 @@ pub async fn patch_claim(
         remove_labels: request.remove_labels.clone().unwrap_or_default(),
     };
 
-    let diff = epigraph_db::ClaimRepository::patch_claim_atomic_conn(
-        &mut tx,
-        claim_id,
-        &patch_input,
-    )
-    .await
-    .map_err(|e| match e {
-        epigraph_db::DbError::NotFound { id: eid, .. } => ApiError::NotFound {
-            entity: "Claim".to_string(),
-            id: eid.to_string(),
-        },
-        other => ApiError::DatabaseError {
-            message: other.to_string(),
-        },
-    })?;
+    let diff =
+        epigraph_db::ClaimRepository::patch_claim_atomic_conn(&mut tx, claim_id, &patch_input)
+            .await
+            .map_err(|e| match e {
+                epigraph_db::DbError::NotFound { id: eid, .. } => ApiError::NotFound {
+                    entity: "Claim".to_string(),
+                    id: eid.to_string(),
+                },
+                other => ApiError::DatabaseError {
+                    message: other.to_string(),
+                },
+            })?;
 
     let before_labels = diff.before_labels;
     let after_labels = diff.after_labels;
