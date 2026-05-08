@@ -2015,13 +2015,9 @@ impl ClaimRepository {
 
         let mut after_labels = before_labels.clone();
         if !patch.add_labels.is_empty() || !patch.remove_labels.is_empty() {
-            after_labels = Self::update_labels_conn(
-                &mut **tx,
-                id_uuid,
-                &patch.add_labels,
-                &patch.remove_labels,
-            )
-            .await?;
+            after_labels =
+                Self::update_labels_conn(tx, id_uuid, &patch.add_labels, &patch.remove_labels)
+                    .await?;
         }
 
         Ok(PatchClaimDiff {

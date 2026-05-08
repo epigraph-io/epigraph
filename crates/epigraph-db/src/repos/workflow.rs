@@ -360,9 +360,7 @@ impl WorkflowRepository {
         let mut resolved = Vec::with_capacity(step_rows.len());
         for (step_index, (frozen_claim_id, step_lineage_id)) in step_rows.into_iter().enumerate() {
             let heads: Vec<LineageHead> = if let Some(lineage_id) = step_lineage_id {
-                ClaimRepository::latest_in_lineage(pool, lineage_id)
-                    .await
-                    .map_err(DbError::from)?
+                ClaimRepository::latest_in_lineage(pool, lineage_id).await?
             } else {
                 Vec::new()
             };
