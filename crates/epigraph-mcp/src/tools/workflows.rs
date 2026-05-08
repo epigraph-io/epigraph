@@ -617,7 +617,7 @@ pub async fn improve_workflow(
             "claim",
             parent_id,
             "claim",
-            "variant_of",
+            "supersedes",
             Some(serde_json::json!({"generation": generation})),
             None,
             None,
@@ -625,14 +625,23 @@ pub async fn improve_workflow(
         .await
         .map_err(internal_error)?;
 
+        // Tag the variant as a workflow so cascade walkers can find it.
+        let _ = epigraph_db::ClaimRepository::update_labels(
+            &server.pool,
+            claim_uuid,
+            &["workflow".to_string()],
+            &[],
+        )
+        .await;
+
         let embed_text = workflow_embed_text(&goal, &steps, &prereqs);
         server
             .embedder
             .embed_and_store(claim_uuid, &embed_text)
             .await
     } else {
-        // Option A + idempotent variant_of: skip everything including the
-        // variant_of edge (already created on first variant insert).
+        // Option A + idempotent supersedes: skip everything including the
+        // supersedes edge (already created on first variant insert).
         false
     };
 
