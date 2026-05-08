@@ -286,6 +286,8 @@ async fn list_challenges() {}
     responses(
         (status = 201, body = SupersessionResponse),
         (status = 400),
+        (status = 401),
+        (status = 403),
         (status = 404),
     ),
     security(("ed25519_signature" = []))
