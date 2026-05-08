@@ -99,6 +99,8 @@ pub struct DeprecateQuery {
 pub struct HierarchicalSearchQuery {
     pub q: String,
     pub limit: Option<i64>,
+    #[serde(default)]
+    pub resolve_to_latest: bool,
 }
 
 #[cfg(feature = "db")]
@@ -645,7 +647,7 @@ pub async fn find_workflow_hierarchical(
     .map_err(|e| ApiError::InternalError {
         message: format!("hierarchical search failed: {e}"),
     })?;
-    let workflows: Vec<serde_json::Value> = rows
+    let mut workflows: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| {
             serde_json::json!({
@@ -659,9 +661,22 @@ pub async fn find_workflow_hierarchical(
             })
         })
         .collect();
+    if params.resolve_to_latest {
+        for w in &mut workflows {
+            let workflow_id: Uuid = w["workflow_id"].as_str().unwrap().parse().unwrap();
+            let resolved = epigraph_db::WorkflowRepository::resolve_steps_to_heads(&state.db_pool, workflow_id)
+                .await
+                .map_err(|e| ApiError::InternalError { message: format!("resolve_to_latest failed: {e}") })?;
+            if let Some(obj) = w.as_object_mut() {
+                obj.insert("resolved_steps".to_string(), serde_json::to_value(resolved).unwrap());
+            }
+        }
+    }
+
     Ok(Json(serde_json::json!({
         "workflows": workflows,
         "total": workflows.len(),
+        "resolve_to_latest": params.resolve_to_latest,
     })))
 }
 
