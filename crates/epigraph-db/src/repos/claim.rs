@@ -1897,6 +1897,49 @@ impl ClaimRepository {
             edge_id,
         })
     }
+
+    /// Mark `dup` as a duplicate of `canonical` without creating a new claim.
+    /// Sets `supersedes = canonical, is_current = false` on `dup` only.
+    /// Refuses if `dup.supersedes` is already set.
+    #[instrument(skip(pool))]
+    pub async fn mark_duplicate(
+        pool: &PgPool,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<(), DbError> {
+        let dup_uuid: Uuid = dup.into();
+        let canon_uuid: Uuid = canonical.into();
+        if dup_uuid == canon_uuid {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
+            });
+        }
+        let mut tx = pool.begin().await?;
+        let canon_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)")
+            .bind(canon_uuid).fetch_one(&mut *tx).await?;
+        if !canon_exists {
+            return Err(DbError::NotFound { entity: "Claim".into(), id: canon_uuid });
+        }
+        let row: Option<(Option<Uuid>,)> =
+            sqlx::query_as("SELECT supersedes FROM claims WHERE id = $1 FOR UPDATE")
+                .bind(dup_uuid).fetch_optional(&mut *tx).await?;
+        let Some((existing,)) = row else {
+            return Err(DbError::NotFound { entity: "Claim".into(), id: dup_uuid });
+        };
+        if existing.is_some() {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "Claim {dup_uuid} already superseded; refusing to overwrite"
+                )),
+            });
+        }
+        sqlx::query(
+            "UPDATE claims SET supersedes = $1, is_current = false, updated_at = NOW() WHERE id = $2",
+        )
+        .bind(canon_uuid).bind(dup_uuid).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
