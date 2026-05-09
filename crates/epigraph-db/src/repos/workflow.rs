@@ -3,6 +3,7 @@
 //! Workflows are claims labeled with 'workflow' that represent
 //! reusable research procedures with variant lineages.
 
+use futures::future::try_join_all;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -358,22 +359,32 @@ impl WorkflowRepository {
         .await
         .map_err(DbError::from)?;
 
-        let mut resolved = Vec::with_capacity(step_rows.len());
-        for (step_index, (frozen_claim_id, step_lineage_id)) in step_rows.into_iter().enumerate() {
-            let heads: Vec<LineageHead> = if let Some(lineage_id) = step_lineage_id {
-                ClaimRepository::latest_in_lineage(pool, lineage_id).await?
+        let head_futures = step_rows.iter().map(|(_, step_lineage_id)| async move {
+            if let Some(lineage_id) = *step_lineage_id {
+                ClaimRepository::latest_in_lineage(pool, lineage_id).await
             } else {
-                Vec::new()
-            };
-            let pending_resolution = heads.len() > 1;
-            resolved.push(ResolvedStep {
-                step_index,
-                frozen_claim_id,
-                step_lineage_id,
-                heads,
-                pending_resolution,
-            });
-        }
+                Ok(Vec::new())
+            }
+        });
+        let heads_per_step: Vec<Vec<LineageHead>> = try_join_all(head_futures).await?;
+
+        let resolved = step_rows
+            .into_iter()
+            .enumerate()
+            .zip(heads_per_step)
+            .map(
+                |((step_index, (frozen_claim_id, step_lineage_id)), heads)| {
+                    let pending_resolution = heads.len() > 1;
+                    ResolvedStep {
+                        step_index,
+                        frozen_claim_id,
+                        step_lineage_id,
+                        heads,
+                        pending_resolution,
+                    }
+                },
+            )
+            .collect();
         Ok(resolved)
     }
 

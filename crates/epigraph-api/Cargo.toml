@@ -82,6 +82,7 @@ opentelemetry = { version = "0.27", optional = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.27", optional = true }
 tracing-opentelemetry = { version = "0.28", optional = true }
+futures = "0.3"  # For try_join_all in concurrent workflow resolution
 nom = "8.0.0"
 jsonwebtoken = "9"        # JWT creation and validation
 rand = { workspace = true }  # Token generation, nonce generation
@@ -91,7 +92,7 @@ ed25519-dalek = { workspace = true }  # Ed25519 agent assertion verification
 [dev-dependencies]
 axum-test = "14"  # Testing utilities for Axum
 tokio-test = "0.4"  # Async test utilities
-futures = "0.3"  # For concurrent test execution
+# futures moved to [dependencies] (used in handler, not just tests)
 hex = "0.4"  # Hex decoding for signature tests
 http-body-util = "0.1"  # HTTP body utilities for collecting response bodies in tests
 epigraph-embeddings = { workspace = true }  # For embedding integration tests
