@@ -30,7 +30,7 @@ use epigraph_mcp::EpiGraphMcpFull;
 #[derive(Parser)]
 #[command(
     name = "epigraph-mcp-full",
-    about = "EpiGraph full-framework MCP server — 27 epistemic tools"
+    about = "EpiGraph full-framework MCP server — 57 epistemic tools"
 )]
 struct Cli {
     /// PostgreSQL connection URL
@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = if cli.read_only {
         "read-only (23 tools)"
     } else {
-        "full (40 tools)"
+        "full (57 tools)"
     };
     tracing::info!("EpiGraph MCP server running in {mode} mode");
 

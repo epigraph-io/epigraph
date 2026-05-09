@@ -15,6 +15,7 @@ pub mod rdf;
 pub mod recall;
 pub mod sheaf;
 pub mod supersede;
+pub mod themes;
 pub mod workflow_hierarchical;
 pub mod workflow_ingest;
 pub mod workflows;
