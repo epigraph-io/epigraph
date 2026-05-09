@@ -90,6 +90,11 @@ pub struct WebhookSubscription {
     /// HMAC-SHA256 secret for payload signing (redacted in API responses)
     #[serde(skip_serializing, default)]
     pub secret: String,
+    /// The principal that created this subscription (client_id or owner_id from auth).
+    /// Used for ownership enforcement on delete.
+    /// None only for subscriptions created before auth was enforced.
+    #[serde(skip_serializing, default)]
+    pub owner_id: Option<Uuid>,
 }
 
 /// Thread-safe in-memory webhook subscription store
