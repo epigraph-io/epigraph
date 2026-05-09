@@ -258,78 +258,18 @@ pub async fn find_workflow(
         )
         .await
         {
-            if claim.truth_value.value() < min_truth {
-                continue;
+            if let Some(r) = enrich_workflow_result(
+                &server.pool,
+                hit.claim_id,
+                &claim,
+                hit.similarity,
+                min_truth,
+                &affinity_map,
+            )
+            .await
+            {
+                results.push(r);
             }
-            let (goal, steps, _prereqs, _expected) = parse_workflow_content(&claim.content);
-            if goal.is_empty() && steps.is_empty() {
-                continue;
-            }
-
-            let val: serde_json::Value = serde_json::from_str(&claim.content).unwrap_or_default();
-            let use_count = val
-                .get("use_count")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let success_count = val
-                .get("success_count")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let generation = val
-                .get("generation")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let parent_id = val
-                .get("parent_id")
-                .and_then(serde_json::Value::as_str)
-                .map(String::from);
-
-            // Look up behavioral data via lineage root
-            let lineage_root = WorkflowRepository::find_lineage_root(&server.pool, hit.claim_id)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(workflow_id = %hit.claim_id, "find_lineage_root failed: {e}");
-                    hit.claim_id
-                });
-
-            let (behavioral_affinity, behavioral_execution_count) =
-                match affinity_map.get(&lineage_root) {
-                    Some(&(sim, count)) => (Some(sim), Some(count)),
-                    None => (None, None),
-                };
-
-            // Success rate is per-workflow (not per-lineage). Only report if
-            // this specific workflow has executions — variants with zero
-            // executions show None, not Some(0.0).
-            let behavioral_success_rate = if behavioral_execution_count.is_some() {
-                match BehavioralExecutionRepository::rolling_success_rate(
-                    &server.pool,
-                    hit.claim_id,
-                    20,
-                )
-                .await
-                {
-                    Ok(rate) if rate > 0.0 => Some(rate),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            results.push(FindWorkflowResult {
-                workflow_id: hit.claim_id.to_string(),
-                goal,
-                steps,
-                truth_value: claim.truth_value.value(),
-                similarity: hit.similarity,
-                use_count,
-                success_count,
-                generation,
-                parent_id,
-                behavioral_affinity,
-                behavioral_success_rate,
-                behavioral_execution_count,
-            });
         }
         if results.len() >= limit as usize {
             break;
@@ -373,78 +313,104 @@ pub async fn find_workflow(
             else {
                 continue;
             };
-            if claim.truth_value.value() < min_truth {
-                continue;
+            if let Some(r) = enrich_workflow_result(
+                &server.pool,
+                wf.id,
+                &claim,
+                0.0, // text-fallback hit; no semantic similarity score
+                min_truth,
+                &affinity_map,
+            )
+            .await
+            {
+                results.push(r);
             }
-            let (goal, steps, _prereqs, _expected) = parse_workflow_content(&claim.content);
-            if goal.is_empty() && steps.is_empty() {
-                continue;
-            }
-
-            let val: serde_json::Value = serde_json::from_str(&claim.content).unwrap_or_default();
-            let use_count = val
-                .get("use_count")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let success_count = val
-                .get("success_count")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let generation = val
-                .get("generation")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let parent_id = val
-                .get("parent_id")
-                .and_then(serde_json::Value::as_str)
-                .map(String::from);
-
-            // Look up behavioral data via lineage root (best-effort; reuse the
-            // affinity_map already built from the original embedding query).
-            let lineage_root = WorkflowRepository::find_lineage_root(&server.pool, wf.id)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(workflow_id = %wf.id, "find_lineage_root failed: {e}");
-                    wf.id
-                });
-            let (behavioral_affinity, behavioral_execution_count) =
-                match affinity_map.get(&lineage_root) {
-                    Some(&(sim, count)) => (Some(sim), Some(count)),
-                    None => (None, None),
-                };
-            let behavioral_success_rate = if behavioral_execution_count.is_some() {
-                match BehavioralExecutionRepository::rolling_success_rate(
-                    &server.pool,
-                    wf.id,
-                    20,
-                )
-                .await
-                {
-                    Ok(rate) if rate > 0.0 => Some(rate),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            results.push(FindWorkflowResult {
-                workflow_id: wf.id.to_string(),
-                goal,
-                steps,
-                truth_value: claim.truth_value.value(),
-                similarity: 0.0, // text-fallback hit; no semantic similarity score
-                use_count,
-                success_count,
-                generation,
-                parent_id,
-                behavioral_affinity,
-                behavioral_success_rate,
-                behavioral_execution_count,
-            });
         }
     }
 
     success_json(&results)
+}
+
+/// Build a `FindWorkflowResult` from a workflow claim, applying the shared
+/// filters (min_truth, non-empty goal/steps) and behavioral enrichment.
+///
+/// Returns `None` when the claim fails the truth-value floor or has neither
+/// a goal nor steps. Used by both the semantic and text-fallback loops in
+/// `find_workflow` to keep enrichment behavior identical.
+async fn enrich_workflow_result(
+    pool: &sqlx::PgPool,
+    workflow_id: uuid::Uuid,
+    claim: &Claim,
+    similarity: f64,
+    min_truth: f64,
+    affinity_map: &std::collections::HashMap<uuid::Uuid, (f64, i64)>,
+) -> Option<FindWorkflowResult> {
+    if claim.truth_value.value() < min_truth {
+        return None;
+    }
+    let (goal, steps, _prereqs, _expected) = parse_workflow_content(&claim.content);
+    if goal.is_empty() && steps.is_empty() {
+        return None;
+    }
+
+    let val: serde_json::Value = serde_json::from_str(&claim.content).unwrap_or_default();
+    let use_count = val
+        .get("use_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let success_count = val
+        .get("success_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let generation = val
+        .get("generation")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let parent_id = val
+        .get("parent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+
+    // Look up behavioral data via lineage root (best-effort; reuse the
+    // affinity_map already built from the original embedding query).
+    let lineage_root = WorkflowRepository::find_lineage_root(pool, workflow_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(workflow_id = %workflow_id, "find_lineage_root failed: {e}");
+            workflow_id
+        });
+
+    let (behavioral_affinity, behavioral_execution_count) = match affinity_map.get(&lineage_root) {
+        Some(&(sim, count)) => (Some(sim), Some(count)),
+        None => (None, None),
+    };
+
+    // Success rate is per-workflow (not per-lineage). Only report if
+    // this specific workflow has executions — variants with zero
+    // executions show None, not Some(0.0).
+    let behavioral_success_rate = if behavioral_execution_count.is_some() {
+        match BehavioralExecutionRepository::rolling_success_rate(pool, workflow_id, 20).await {
+            Ok(rate) if rate > 0.0 => Some(rate),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Some(FindWorkflowResult {
+        workflow_id: workflow_id.to_string(),
+        goal,
+        steps,
+        truth_value: claim.truth_value.value(),
+        similarity,
+        use_count,
+        success_count,
+        generation,
+        parent_id,
+        behavioral_affinity,
+        behavioral_success_rate,
+        behavioral_execution_count,
+    })
 }
 
 pub async fn report_workflow_outcome(
