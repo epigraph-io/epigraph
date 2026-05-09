@@ -715,19 +715,20 @@ pub async fn find_workflow_hierarchical(
         .collect();
 
     if params.resolve_to_latest {
-        let resolution_futures = workflows.iter().map(|w| {
-            let pool = state.db_pool.clone();
-            let workflow_id = w.workflow_id;
-            async move {
-                epigraph_db::WorkflowRepository::resolve_steps_to_heads(&pool, workflow_id)
-                    .await
-                    .map_err(|e| ApiError::InternalError {
-                        message: format!("resolve_to_latest failed: {e}"),
-                    })
-            }
-        });
-        let resolved_per_workflow = futures::future::try_join_all(resolution_futures).await?;
-        for (w, resolved) in workflows.iter_mut().zip(resolved_per_workflow) {
+        let workflow_ids: Vec<uuid::Uuid> = workflows.iter().map(|w| w.workflow_id).collect();
+        let mut resolved_by_workflow =
+            epigraph_db::WorkflowRepository::resolve_steps_to_heads_batched(
+                &state.db_pool,
+                &workflow_ids,
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("resolve_to_latest failed: {e}"),
+            })?;
+        for w in &mut workflows {
+            let resolved = resolved_by_workflow
+                .remove(&w.workflow_id)
+                .unwrap_or_default();
             w.resolved_steps = Some(
                 resolved
                     .into_iter()
