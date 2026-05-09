@@ -3,6 +3,8 @@
 //! Workflows are claims labeled with 'workflow' that represent
 //! reusable research procedures with variant lineages.
 
+use std::collections::HashMap;
+
 use futures::future::try_join_all;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -386,6 +388,165 @@ impl WorkflowRepository {
             )
             .collect();
         Ok(resolved)
+    }
+
+    /// Batched variant of [`resolve_steps_to_heads`] — resolves all workflows
+    /// in a single pair of round-trips (one seed query + one head query)
+    /// instead of O(N × M) calls.
+    ///
+    /// Returns a `HashMap` keyed by workflow_id. Each value is the same
+    /// `Vec<ResolvedStep>` that `resolve_steps_to_heads` would return for
+    /// that workflow. Workflows with no steps map to an empty Vec; workflows
+    /// not in the input do not appear in the result.
+    ///
+    /// # Errors
+    /// Returns `DbError` if either database query fails.
+    pub async fn resolve_steps_to_heads_batched(
+        pool: &PgPool,
+        workflow_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<ResolvedStep>>, DbError> {
+        // Short-circuit: nothing to do.
+        if workflow_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // ── Round-trip 1: fetch all step seeds (level=2) for all workflow IDs. ──
+        // Order matches the single-workflow function: (e.created_at ASC, c.id ASC).
+        #[derive(sqlx::FromRow)]
+        struct StepSeedRow {
+            workflow_id: Uuid,
+            frozen_claim_id: Uuid,
+            step_lineage_id: Option<Uuid>,
+        }
+
+        let seed_rows: Vec<StepSeedRow> = sqlx::query_as(
+            "SELECT \
+               e.source_id AS workflow_id, \
+               c.id        AS frozen_claim_id, \
+               c.step_lineage_id \
+             FROM edges e \
+             JOIN claims c ON c.id = e.target_id \
+             WHERE e.source_id = ANY($1) \
+               AND e.relationship = 'executes' \
+               AND (c.properties->>'level')::int = 2 \
+             ORDER BY e.source_id, e.created_at ASC, c.id ASC",
+        )
+        .bind(workflow_ids)
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::from)?;
+
+        // Initialise the result map with an empty Vec for every requested workflow
+        // so callers get a deterministic entry even for step-less workflows.
+        let mut result: HashMap<Uuid, Vec<ResolvedStep>> =
+            workflow_ids.iter().map(|id| (*id, Vec::new())).collect();
+
+        if seed_rows.is_empty() {
+            return Ok(result);
+        }
+
+        // Build per-workflow step lists and collect the set of lineage_ids to query.
+        // Preserve ordering: seeds are already in (workflow_id, e.created_at, c.id) order.
+        // We need per-workflow sequential step_index, so we track a counter per workflow.
+        let mut step_index_counter: HashMap<Uuid, usize> = HashMap::new();
+
+        // Intermediate structure before heads are filled in.
+        struct PartialStep {
+            step_index: usize,
+            frozen_claim_id: Uuid,
+            step_lineage_id: Option<Uuid>,
+        }
+
+        let mut partial_by_workflow: HashMap<Uuid, Vec<PartialStep>> = HashMap::new();
+        let mut all_lineage_ids: Vec<Uuid> = Vec::new();
+
+        for row in seed_rows {
+            let idx = step_index_counter.entry(row.workflow_id).or_insert(0);
+            let step_index = *idx;
+            *idx += 1;
+
+            if let Some(lid) = row.step_lineage_id {
+                all_lineage_ids.push(lid);
+            }
+
+            partial_by_workflow
+                .entry(row.workflow_id)
+                .or_default()
+                .push(PartialStep {
+                    step_index,
+                    frozen_claim_id: row.frozen_claim_id,
+                    step_lineage_id: row.step_lineage_id,
+                });
+        }
+
+        // ── Round-trip 2: fetch all heads for all non-null lineage_ids at once. ──
+        // Mirrors `latest_in_lineage`: claims with step_lineage_id in the set
+        // and no incoming `supersedes` edge.  ORDER BY c.created_at DESC (same
+        // as the single-lineage function).
+        let mut heads_by_lineage: HashMap<Uuid, Vec<LineageHead>> = HashMap::new();
+
+        if !all_lineage_ids.is_empty() {
+            #[derive(sqlx::FromRow)]
+            struct HeadRow {
+                lineage_id: Uuid,
+                id: Uuid,
+                content: String,
+                truth_value: f64,
+                created_at: chrono::DateTime<chrono::Utc>,
+            }
+
+            let head_rows: Vec<HeadRow> = sqlx::query_as(
+                "SELECT c.step_lineage_id AS lineage_id, c.id, c.content, c.truth_value, c.created_at \
+                 FROM claims c \
+                 WHERE c.step_lineage_id = ANY($1) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM edges e \
+                       WHERE e.target_id = c.id \
+                         AND e.relationship = 'supersedes' \
+                   ) \
+                 ORDER BY c.step_lineage_id, c.created_at DESC",
+            )
+            .bind(&all_lineage_ids)
+            .fetch_all(pool)
+            .await
+            .map_err(DbError::from)?;
+
+            for row in head_rows {
+                heads_by_lineage
+                    .entry(row.lineage_id)
+                    .or_default()
+                    .push(LineageHead {
+                        id: row.id,
+                        content: row.content,
+                        truth_value: row.truth_value,
+                        created_at: row.created_at,
+                    });
+            }
+        }
+
+        // ── Regroup into the final HashMap. ──
+        for (workflow_id, partials) in partial_by_workflow {
+            let steps: Vec<ResolvedStep> = partials
+                .into_iter()
+                .map(|p| {
+                    let heads: Vec<LineageHead> = p
+                        .step_lineage_id
+                        .and_then(|lid| heads_by_lineage.get(&lid).cloned())
+                        .unwrap_or_default();
+                    let pending_resolution = heads.len() > 1;
+                    ResolvedStep {
+                        step_index: p.step_index,
+                        frozen_claim_id: p.frozen_claim_id,
+                        step_lineage_id: p.step_lineage_id,
+                        heads,
+                        pending_resolution,
+                    }
+                })
+                .collect();
+            result.insert(workflow_id, steps);
+        }
+
+        Ok(result)
     }
 
     /// Search hierarchical workflows by free-text query against `goal` and
