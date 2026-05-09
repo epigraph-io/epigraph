@@ -75,6 +75,11 @@ name = "reembed"
 path = "src/bin/reembed.rs"
 required-features = ["db"]
 
+[[bin]]
+name = "bootstrap_clients"
+path = "src/bin/bootstrap_clients.rs"
+required-features = ["db"]
+
 [dependencies]
 epigraph-core = { workspace = true }
 epigraph-engine = { workspace = true }
@@ -99,6 +104,8 @@ thiserror = { workspace = true }
 hex = "0.4"
 dotenvy = "0.15"
 base64 = "0.22"
+blake3 = { workspace = true }
+rand = { workspace = true }
 linfa = { workspace = true }
 linfa-clustering = { workspace = true }
 ndarray = { workspace = true }

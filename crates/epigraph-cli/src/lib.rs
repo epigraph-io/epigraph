@@ -1,4 +1,6 @@
 #[cfg(feature = "db")]
+pub mod bootstrap;
+#[cfg(feature = "db")]
 pub mod bridge;
 pub mod enrichment;
 #[cfg(feature = "db")]
