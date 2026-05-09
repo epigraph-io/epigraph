@@ -344,6 +344,7 @@ async fn mark_duplicate_doc() {}
         (status = 200, body = ClaimResponse),
         (status = 400),
         (status = 401),
+        (status = 403),
         (status = 404),
     ),
     security(("ed25519_signature" = []))
@@ -360,6 +361,8 @@ async fn patch_claim_doc() {}
     responses(
         (status = 200, body = UpdateLabelsResponse),
         (status = 400),
+        (status = 401),
+        (status = 403),
         (status = 404),
     ),
     security(("ed25519_signature" = []))

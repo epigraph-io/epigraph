@@ -1136,10 +1136,13 @@ pub async fn update_claim(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateClaimRequest>,
 ) -> Result<Json<ClaimResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    // Require authentication
+    let auth = auth_ctx
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "PUT /api/v1/claims/:id requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     let claim_id = ClaimId::from_uuid(id);
 
@@ -1150,6 +1153,10 @@ pub async fn update_claim(
             entity: "Claim".to_string(),
             id: id.to_string(),
         })?;
+
+    // Ownership / admin gate (after 404 check to avoid leaking existence)
+    let claim_agent_id: Uuid = current.agent_id.into();
+    crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
 
     // Update truth value if provided
     if let Some(tv) = request.truth_value {
@@ -1196,12 +1203,12 @@ pub async fn update_claim(
             })?;
     }
 
-    // Record provenance when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    // Record provenance
+    {
         let content_hash = blake3::hash(id.as_bytes());
         if let Err(e) = crate::middleware::provenance::record_provenance(
             &state.db_pool,
-            auth,
+            &auth,
             "claim",
             id,
             "update",
@@ -1251,6 +1258,7 @@ pub async fn update_claim(
         (status = 200, body = ClaimResponse),
         (status = 400),
         (status = 401),
+        (status = 403),
         (status = 404),
     ),
     security(("ed25519_signature" = [])),
@@ -1286,6 +1294,21 @@ pub async fn patch_claim(
     }
 
     let claim_id = ClaimId::from_uuid(id);
+
+    // ── 4. Ownership / admin gate ────────────────────────────────────────────
+    // Fetch agent_id before opening the transaction so 404 fires before 403.
+    let claim_agent_id: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("DB error fetching claim owner: {e}"),
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: id.to_string(),
+        })?;
+    crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
 
     // ── 5. Open transaction — all mutations + provenance are atomic ──────────
     let mut tx = state
@@ -1449,6 +1472,8 @@ pub struct UpdateLabelsResponse {
     responses(
         (status = 200, body = UpdateLabelsResponse),
         (status = 400),
+        (status = 401),
+        (status = 403),
         (status = 404),
     ),
     security(("ed25519_signature" = [])),
@@ -1456,14 +1481,37 @@ pub struct UpdateLabelsResponse {
 )]
 pub async fn update_labels(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateLabelsRequest>,
 ) -> Result<Json<UpdateLabelsResponse>, ApiError> {
+    // Require authentication
+    let auth = auth_ctx
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "PATCH /api/v1/claims/:id/labels requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     if body.add.is_empty() && body.remove.is_empty() {
         return Err(ApiError::BadRequest {
             message: "At least one of 'add' or 'remove' must be non-empty".to_string(),
         });
     }
+
+    // Fetch agent_id — 404 before 403 (don't leak existence via ownership check)
+    let claim_agent_id: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("DB error fetching claim owner: {e}"),
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: id.to_string(),
+        })?;
+    crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
 
     let labels = ClaimRepository::update_labels(&state.db_pool, id, &body.add, &body.remove)
         .await
@@ -1919,25 +1967,29 @@ mod db_tests {
     }
 
     /// Insert a minimal agent + claim directly for test setup.
+    ///
+    /// `owner_id` is used as the claim's `agent_id` so that ownership checks
+    /// pass when the caller's AuthContext carries the same id as `owner_id`.
     async fn insert_test_claim(
         pool: &epigraph_db::PgPool,
         claim_id: Uuid,
+        owner_id: Uuid,
         truth: f64,
         properties: serde_json::Value,
         labels: &[&str],
     ) {
-        // Upsert agent (reuse claim_id as agent_id for simplicity; unique public_key via hash)
+        // Upsert agent for the owner (unique public_key via hash)
         sqlx::query(
             r#"INSERT INTO agents (id, public_key, created_at, updated_at)
                VALUES ($1, sha256($1::text::bytea), NOW(), NOW())
                ON CONFLICT (id) DO NOTHING"#,
         )
-        .bind(claim_id)
+        .bind(owner_id)
         .execute(pool)
         .await
         .expect("upsert agent");
 
-        // Insert claim
+        // Insert claim with agent_id = owner_id so ownership checks pass
         let labels_arr: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
         sqlx::query(
             r#"INSERT INTO claims
@@ -1949,7 +2001,7 @@ mod db_tests {
         )
         .bind(claim_id)
         .bind(format!("test claim {claim_id}"))
-        .bind(claim_id)
+        .bind(owner_id)
         .bind(truth)
         .bind(&properties)
         .bind(&labels_arr)
@@ -2013,7 +2065,15 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({"a": 1}), &[]).await;
+        insert_test_claim(
+            &pool,
+            claim_id,
+            client_id,
+            0.7,
+            serde_json::json!({"a": 1}),
+            &[],
+        )
+        .await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2057,6 +2117,7 @@ mod db_tests {
         insert_test_claim(
             &pool,
             claim_id,
+            client_id,
             0.7,
             serde_json::json!({"status": "pending", "x": 99}),
             &[],
@@ -2105,7 +2166,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.5, serde_json::json!({}), &[]).await;
+        insert_test_claim(&pool, claim_id, client_id, 0.5, serde_json::json!({}), &[]).await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2164,7 +2225,15 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({}), &["existing"]).await;
+        insert_test_claim(
+            &pool,
+            claim_id,
+            client_id,
+            0.7,
+            serde_json::json!({}),
+            &["existing"],
+        )
+        .await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2209,7 +2278,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.5, serde_json::json!({}), &[]).await;
+        insert_test_claim(&pool, claim_id, client_id, 0.5, serde_json::json!({}), &[]).await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2254,7 +2323,15 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({"k": 1}), &[]).await;
+        insert_test_claim(
+            &pool,
+            claim_id,
+            client_id,
+            0.7,
+            serde_json::json!({"k": 1}),
+            &[],
+        )
+        .await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2298,7 +2375,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({}), &[]).await;
+        insert_test_claim(&pool, claim_id, client_id, 0.7, serde_json::json!({}), &[]).await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2357,7 +2434,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({}), &[]).await;
+        insert_test_claim(&pool, claim_id, client_id, 0.7, serde_json::json!({}), &[]).await;
 
         // Auth is present but lacks claims:write
         let auth = AuthContext {
@@ -2398,7 +2475,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({}), &[]).await;
+        insert_test_claim(&pool, claim_id, client_id, 0.7, serde_json::json!({}), &[]).await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2462,6 +2539,7 @@ mod db_tests {
         insert_test_claim(
             &pool,
             claim_id,
+            bad_client_id,
             0.5,
             serde_json::json!({"original": true}),
             &[],

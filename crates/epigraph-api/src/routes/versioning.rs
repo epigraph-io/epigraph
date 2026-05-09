@@ -237,6 +237,9 @@ pub async fn supersede_claim(
             id: claim_id.to_string(),
         })?;
 
+    // 6b. Ownership / admin gate
+    crate::middleware::scopes::require_owner_or_admin(&auth, agent_uuid)?;
+
     // 7. Perform supersession in the database (atomic transaction)
     let old_claim_id = ClaimId::from_uuid(claim_id);
     let (new_uuid, _old_uuid) = ClaimRepository::supersede(
