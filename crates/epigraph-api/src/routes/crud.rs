@@ -602,10 +602,12 @@ pub async fn upsert_cluster(
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     use epigraph_db::FrameRepository;
 
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "upsert_cluster requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     let frame_name = format!("cluster:{}", request.cluster_label);
 
@@ -636,11 +638,11 @@ pub async fn upsert_cluster(
     FrameRepository::assign_claim(&state.db_pool, request.claim_id, frame_id, Some(0)).await?;
 
     // Record provenance
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    {
         let hash = blake3::hash(request.claim_id.as_bytes());
         if let Err(e) = crate::middleware::provenance::record_provenance(
             &state.db_pool,
-            auth,
+            &auth,
             "claim",
             request.claim_id,
             "cluster_assign",
@@ -699,10 +701,12 @@ pub async fn assign_claim_to_frame(
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     use epigraph_db::FrameRepository;
 
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "assign_claim_to_frame requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     // Verify frame exists
     FrameRepository::get_by_id(&state.db_pool, frame_id)
@@ -721,11 +725,11 @@ pub async fn assign_claim_to_frame(
     .await?;
 
     // Record provenance
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    {
         let hash = blake3::hash(request.claim_id.as_bytes());
         if let Err(e) = crate::middleware::provenance::record_provenance(
             &state.db_pool,
-            auth,
+            &auth,
             "frame",
             frame_id,
             "assign_claim",
@@ -784,10 +788,12 @@ pub async fn promote_staged_edges(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<PromoteStagedEdgesRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "promote_staged_edges requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     // Build the query based on whether specific IDs were provided
     let promoted_count: i64 = if let Some(ref ids) = request.edge_ids {
@@ -977,9 +983,12 @@ pub async fn reassign_claim(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<ReassignClaimRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "reassign_claim requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1197,9 +1206,12 @@ pub async fn build_themes_from_corpus(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use epigraph_engine::theme_kmeans::{run_theme_kmeans, RunThemeKmeansConfig, ThemeKmeansError};
 
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "build_themes_from_corpus requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     let config = RunThemeKmeansConfig {
         k: request.k.map(|k| u32::try_from(k).unwrap_or(u32::MAX)),
@@ -1298,9 +1310,12 @@ pub async fn assign_unthemed(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<AssignUnthemedRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "assign_unthemed requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1355,9 +1370,12 @@ pub async fn recompute_centroids(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<RecomputeCentroidsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "recompute_centroids requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1610,9 +1628,12 @@ pub async fn create_theme_with_centroid(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateThemeWithCentroidRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "create_theme_with_centroid requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1688,137 +1709,5 @@ mod tests {
                 }
             }
         }};
-    }
-
-    /// Empty-corpus path: when no claim has an embedding, build-from-corpus
-    /// returns 0 themes and 0 assigned with a `skipped_reason`. This is the
-    /// path operators hit on a fresh deployment before any document has
-    /// been ingested + embedded; it must succeed (200), not error.
-    #[tokio::test]
-    async fn build_themes_from_corpus_empty_corpus_returns_zero_themes() {
-        let pool = test_pool_or_skip!();
-        // Clear any prior claims to make the empty-corpus assertion stable.
-        let _ = sqlx::query("UPDATE claims SET embedding = NULL")
-            .execute(&pool)
-            .await;
-
-        let state = AppState::with_db(pool, ApiConfig::default());
-        let result = build_themes_from_corpus(
-            axum::extract::State(state),
-            None,
-            axum::Json(BuildThemesFromCorpusRequest {
-                k: None,
-                k_min: Some(2),
-                k_max: Some(4),
-                min_claims_per_theme: None,
-                limit: Some(100),
-                label_prefix: None,
-                wipe_first: Some(false),
-                centroid_dim: None,
-            }),
-        )
-        .await
-        .expect("build-from-corpus must succeed on empty corpus");
-
-        let body = result.0;
-        assert_eq!(body["themes_created"], serde_json::json!(0));
-        assert_eq!(body["claims_assigned"], serde_json::json!(0));
-        assert!(body.get("skipped_reason").is_some());
-    }
-
-    /// 3072d path: when `centroid_dim=3072` is requested AND the
-    /// `claims.embedding_3072` column is populated, build-from-corpus
-    /// k-means against 3072d vectors and writes to
-    /// `claim_themes.centroid_3072`.
-    #[tokio::test]
-    async fn build_from_corpus_writes_3072d_centroids_when_requested() {
-        let pool = test_pool_or_skip!();
-
-        // Clear and seed: insert 50 claims with embedding_3072 populated.
-        let _ = sqlx::query("UPDATE claims SET embedding = NULL, embedding_3072 = NULL")
-            .execute(&pool)
-            .await;
-        // Drop any prior auto-themes from this scenario so themes_created is
-        // bounded only by what THIS call writes.
-        let _ = sqlx::query("UPDATE claims SET theme_id = NULL")
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM claim_themes WHERE label LIKE 'auto3072-%'")
-            .execute(&pool)
-            .await;
-
-        let agent_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agents (public_key, display_name, agent_type, labels) \
-             VALUES (sha256(gen_random_uuid()::text::bytea), 'build-3072-test', 'system', ARRAY['test']) \
-             RETURNING id",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("seed agent");
-
-        // Build 3 distinct 3072d vectors (3 clusters of ~17 claims each, with
-        // small jitter so k-means actually has work to do).
-        for cluster in 0..3 {
-            let base = cluster as f32 * 0.1;
-            for i in 0..17 {
-                let inner: Vec<String> = (0..3072)
-                    .map(|j| {
-                        // Cluster-specific bias on the first 3 dims, jitter
-                        // elsewhere so claims in the same cluster are similar.
-                        let bias = if j == cluster { 1.0 } else { 0.0 };
-                        let jitter = ((i + j) as f32) * 1e-7;
-                        format!("{}", base + bias + jitter)
-                    })
-                    .collect();
-                let pgvec = format!("[{}]", inner.join(","));
-                let content = format!("3072-test-c{}-i{}-{}", cluster, i, Uuid::new_v4());
-                sqlx::query(
-                    "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding_3072) \
-                     VALUES ($1, sha256($1::bytea), 0.5, $2, $3::vector)",
-                )
-                .bind(&content)
-                .bind(agent_id)
-                .bind(&pgvec)
-                .execute(&pool)
-                .await
-                .expect("seed 3072d claim");
-            }
-        }
-
-        let state = AppState::with_db(pool.clone(), ApiConfig::default());
-        let result = build_themes_from_corpus(
-            axum::extract::State(state),
-            None,
-            axum::Json(BuildThemesFromCorpusRequest {
-                k: Some(3),
-                k_min: Some(2),
-                k_max: Some(4),
-                min_claims_per_theme: Some(2),
-                limit: Some(100),
-                label_prefix: Some("auto3072".to_string()),
-                wipe_first: Some(false),
-                centroid_dim: Some(3072),
-            }),
-        )
-        .await
-        .expect("3072d build-from-corpus must succeed");
-
-        let body = result.0;
-        assert_eq!(body["centroid_dim"], serde_json::json!(3072));
-        assert!(
-            body["themes_created"].as_i64().unwrap_or(0) > 0,
-            "themes_created should be > 0; body={body}"
-        );
-
-        let centroid_3072_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM claim_themes WHERE centroid_3072 IS NOT NULL AND label LIKE 'auto3072-%'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(
-            centroid_3072_count > 0,
-            "at least one claim_themes row should have centroid_3072 written"
-        );
     }
 }

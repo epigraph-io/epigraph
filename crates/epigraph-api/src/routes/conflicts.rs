@@ -221,9 +221,16 @@ pub async fn classify_conflict(
 #[cfg(feature = "db")]
 pub async fn resolve_conflict(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path((claim_a_id, claim_b_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<ResolveConflictRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "resolve_conflict requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
     // Create a challenge record for the resolution
     let challenge_id = epigraph_db::ChallengeRepository::create(
         &state.db_pool,

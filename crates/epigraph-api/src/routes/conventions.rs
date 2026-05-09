@@ -101,8 +101,15 @@ pub struct SkillResponse {
 /// `POST /api/v1/conventions`
 pub async fn learn_convention(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<LearnConventionRequest>,
 ) -> Result<(StatusCode, Json<ConventionResponse>), ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "learn_convention requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
     if request.content.trim().is_empty() {
         return Err(ApiError::ValidationError {
             field: "content".to_string(),
@@ -234,8 +241,16 @@ pub async fn learn_convention(
 /// `DELETE /api/v1/conventions/:id`
 pub async fn forget_convention(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<ConventionResponse>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "forget_convention requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+
     let pool = &state.db_pool;
     let claim_id_typed = epigraph_core::ClaimId::from_uuid(claim_id);
 
@@ -246,17 +261,32 @@ pub async fn forget_convention(
             id: claim_id.to_string(),
         })?;
 
-    // Add strong counter-evidence using system agent
-    let pub_key = [0u8; 32];
-    let system_agent = epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })?
-        .ok_or(ApiError::InternalError {
-            message: "System agent not found — learn a convention first".to_string(),
-        })?;
-    let agent_id = epigraph_core::AgentId::from_uuid(system_agent.id.as_uuid());
+    // Derive a deterministic public key from the calling principal so that
+    // refutation evidence is attributed to the caller, not a zero-byte system agent.
+    let principal_id = auth.owner_id.unwrap_or(auth.client_id);
+    let principal_bytes = principal_id.as_bytes();
+    // Repeat the 16-byte UUID to fill a 32-byte key (deterministic, unique per principal).
+    let mut pub_key = [0u8; 32];
+    pub_key[..16].copy_from_slice(principal_bytes);
+    pub_key[16..].copy_from_slice(principal_bytes);
+
+    // Get-or-create an agent row for this principal.
+    let principal_agent = if let Some(a) =
+        epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })? {
+        a
+    } else {
+        let agent = epigraph_core::Agent::new(pub_key, Some(format!("principal:{principal_id}")));
+        epigraph_db::AgentRepository::create(pool, &agent)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?
+    };
+    let agent_id = epigraph_core::AgentId::from_uuid(principal_agent.id.as_uuid());
     let evidence_text = "Convention explicitly forgotten/deprecated";
     let evidence_hash = epigraph_crypto::ContentHasher::hash(evidence_text.as_bytes());
     let evidence = epigraph_core::Evidence::new(
