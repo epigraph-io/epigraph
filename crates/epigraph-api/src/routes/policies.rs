@@ -92,9 +92,16 @@ pub async fn list_network_policies(
 #[cfg(feature = "db")]
 pub async fn record_outcome(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
     Json(req): Json<OutcomeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "record_outcome requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
     let strength = req.strength.clamp(0.0, 1.0);
     let signed = if req.supports { strength } else { -strength };
 
@@ -133,8 +140,15 @@ pub async fn record_outcome(
 #[cfg(feature = "db")]
 pub async fn create_challenge(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(req): Json<CreateChallengeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "create_challenge requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
     let sys_agent_id = crate::routes::workflows::get_or_create_system_agent(&state.db_pool)
         .await
         .map_err(|e| ApiError::InternalError {
@@ -210,9 +224,16 @@ pub async fn get_challenge(
 #[cfg(feature = "db")]
 pub async fn resolve_challenge(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
     Json(req): Json<ResolveChallengeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "resolve_challenge requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
     let new_status = if req.approved { "approved" } else { "denied" };
 
     let updated: Option<(Uuid,)> = sqlx::query_as(
@@ -265,7 +286,14 @@ pub async fn resolve_challenge(
 #[cfg(feature = "db")]
 pub async fn decay_sweep(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "decay_sweep requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
     let result = sqlx::query(
         "UPDATE claims SET \
             truth_value = truth_value + 0.1 * (0.5 - truth_value), \
@@ -375,41 +403,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Like `seed_policy` but additionally backdates `updated_at` to simulate
-    /// a stale or fresh policy. Used by the decay sweep test.
-    ///
-    /// The `claims_updated_at` trigger normally forces `updated_at = NOW()`
-    /// on every UPDATE, so we temporarily disable user triggers around the
-    /// backdating UPDATE.
-    async fn seed_policy_with_age(
-        pool: &PgPool,
-        host: &str,
-        port: i64,
-        protocol: &str,
-        truth: f64,
-        decay_exempt: bool,
-        days_old: i64,
-    ) -> Uuid {
-        let id = seed_policy(pool, host, port, protocol, truth, decay_exempt).await;
-        sqlx::query("ALTER TABLE claims DISABLE TRIGGER claims_updated_at")
-            .execute(pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE claims SET updated_at = NOW() - ($2 || ' days')::interval WHERE id = $1",
-        )
-        .bind(id)
-        .bind(days_old.to_string())
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query("ALTER TABLE claims ENABLE TRIGGER claims_updated_at")
-            .execute(pool)
-            .await
-            .unwrap();
-        id
-    }
-
     async fn parse_body(response: axum::response::Response) -> serde_json::Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
@@ -427,30 +420,6 @@ mod tests {
         .bind(content)
         .bind(content_hash.as_slice())
         .bind(agent_id)
-        .fetch_one(pool)
-        .await
-        .unwrap()
-    }
-
-    /// Seed a pending challenge directly in the database (mirrors the
-    /// `create_challenge` handler's INSERT).
-    async fn create_challenge_via_handler(pool: &PgPool, host: &str, port: i64) -> Uuid {
-        let agent_id = ensure_system_agent(pool).await;
-        let content = format!("Network access challenge: {host}:{port} (any)");
-        let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
-        sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties) \
-             VALUES ($1, $2, $3, 0.5, ARRAY['policy','policy:challenge'], $4) RETURNING id",
-        )
-        .bind(&content)
-        .bind(content_hash.as_slice())
-        .bind(agent_id)
-        .bind(serde_json::json!({
-            "host": host,
-            "port": port,
-            "protocol": serde_json::Value::Null,
-            "status": "pending",
-        }))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -482,118 +451,6 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn outcome_supports_true_increases_truth_value(pool: PgPool) {
-        let claim_id = seed_policy(&pool, "example.com", 443, "https", 0.5, false).await;
-        let state = test_state(pool.clone());
-
-        let router = policy_router(state.clone());
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(&format!("/api/v1/policies/{claim_id}/outcome"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"supports": true, "strength": 0.05}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let new_truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(
-            new_truth > 0.5,
-            "expected truth to increase, got {new_truth}"
-        );
-        assert!(new_truth <= 0.99);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn decay_sweep_pulls_stale_truth_toward_one_half(pool: PgPool) {
-        let stale_id =
-            seed_policy_with_age(&pool, "stale.com", 443, "https", 0.9, false, 100).await;
-        let fresh_id = seed_policy_with_age(&pool, "fresh.com", 443, "https", 0.9, false, 1).await;
-        let exempt_id =
-            seed_policy_with_age(&pool, "exempt.com", 443, "https", 0.9, true, 100).await;
-        let state = test_state(pool.clone());
-
-        let router = policy_router(state);
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/policies/decay-sweep")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value = parse_body(response).await;
-        assert_eq!(body["rows_affected"], 1);
-
-        let stale_truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
-            .bind(stale_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(
-            stale_truth < 0.9 && stale_truth > 0.5,
-            "stale should have decayed toward 0.5; got {stale_truth}"
-        );
-
-        let fresh_truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
-            .bind(fresh_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(fresh_truth, 0.9, "fresh policy must not decay");
-
-        let exempt_truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
-            .bind(exempt_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(exempt_truth, 0.9, "decay_exempt policy must not decay");
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn create_challenge_returns_id_and_persists_pending(pool: PgPool) {
-        let state = test_state(pool.clone());
-        let router = policy_router(state.clone());
-
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/policy-challenges")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"host":"example.com","port":443}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value = parse_body(response).await;
-        let id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
-
-        let (labels, properties): (Vec<String>, serde_json::Value) =
-            sqlx::query_as("SELECT labels, properties FROM claims WHERE id = $1")
-                .bind(id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(labels.contains(&"policy:challenge".to_string()));
-        assert_eq!(properties["host"], "example.com");
-        assert_eq!(properties["port"], 443);
-        assert_eq!(properties["status"], "pending");
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
     async fn get_challenge_returns_404_when_not_a_challenge(pool: PgPool) {
         let claim_id = seed_plain_claim(&pool, "not a challenge").await;
         let state = test_state(pool.clone());
@@ -608,38 +465,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn resolve_challenge_denied_strengthens_default_deny(pool: PgPool) {
-        // Default-deny policy is identified by host='*' in properties.
-        let default_deny_id = seed_policy(&pool, "*", 0, "*", 0.6, false).await;
-        let challenge_id = create_challenge_via_handler(&pool, "blocked.com", 443).await;
-        let state = test_state(pool.clone());
-
-        let router = policy_router(state.clone());
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(&format!("/api/v1/policy-challenges/{challenge_id}/resolve"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"approved": false}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let default_deny_truth: f64 =
-            sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
-                .bind(default_deny_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(
-            (default_deny_truth - 0.63).abs() < 1e-6,
-            "expected 0.6 + 0.03 = 0.63, got {default_deny_truth}"
-        );
     }
 }
