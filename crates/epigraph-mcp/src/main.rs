@@ -11,8 +11,9 @@
 //! # Stdio transport (default — for Claude Code / .mcp.json integration)
 //! epigraph-mcp-full --database-url postgres://user:pass@host/db
 //!
-//! # HTTP transport (for curl / remote agents)
-//! epigraph-mcp-full --database-url postgres://user:pass@host/db --listen 127.0.0.1:8080
+//! # HTTP transport (for curl / remote agents — requires explicit opt-in)
+//! # WARNING: exposes all mutation tools without auth; see issue #122 for proper fix.
+//! epigraph-mcp-full --database-url postgres://user:pass@host/db --listen 127.0.0.1:8080 --allow-unauthenticated-http
 //! ```
 
 use std::fmt::Write;
@@ -48,6 +49,16 @@ struct Cli {
     #[arg(long)]
     listen: Option<String>,
 
+    /// Acknowledge that HTTP transport exposes all MCP tools without authentication.
+    ///
+    /// Required when --listen is used. The stdio process boundary is the trust gate for MCP
+    /// tools; HTTP removes that boundary with no replacement auth check. Until proper Bearer
+    /// token + scope wiring lands, you must explicitly opt in with this flag.
+    ///
+    /// See: https://github.com/epigraph-io/epigraph/issues/122
+    #[arg(long)]
+    allow_unauthenticated_http: bool,
+
     /// Start in read-only mode (query tools only, write operations return errors)
     #[arg(long)]
     read_only: bool,
@@ -65,6 +76,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+
+    // Safety gate: HTTP transport removes the stdio process-boundary trust gate.
+    // Require an explicit opt-in to prevent accidental network exposure of mutation tools.
+    if cli.listen.is_some() && !cli.allow_unauthenticated_http {
+        eprintln!(
+            "ERROR: --listen exposes all MCP tools (including mutations) over HTTP without authentication.\n\
+             \n\
+             The stdio process boundary is the trust gate for MCP tools. HTTP removes that\n\
+             boundary with no replacement auth check, making mutation tools like mark_duplicate,\n\
+             supersede_claim, patch_claim, update_partition, and evolve_step reachable network-wide.\n\
+             \n\
+             Re-run with --allow-unauthenticated-http if this is intentional (e.g., local dev only).\n\
+             For production: see https://github.com/epigraph-io/epigraph/issues/122 for the proper auth fix."
+        );
+        std::process::exit(1);
+    }
 
     // Connect to database
     tracing::info!("Connecting to database...");
@@ -109,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(addr) = &cli.listen {
         // ── HTTP transport ──────────────────────────────────────────────
+        // (auth gate already enforced above at startup; --allow-unauthenticated-http was checked)
         use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
         use rmcp::transport::streamable_http_server::{
             StreamableHttpServerConfig, StreamableHttpService,
