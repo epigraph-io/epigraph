@@ -11,6 +11,7 @@ use crate::document::schema::default_confidence;
 
 /// Top-level extraction result from a workflow.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WorkflowExtraction {
     pub source: WorkflowSource,
     #[serde(default)]
@@ -25,6 +26,7 @@ pub struct WorkflowExtraction {
 
 /// Metadata about the workflow.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WorkflowSource {
     /// Required slug; drives the deterministic root ID.
     pub canonical_name: String,
@@ -46,6 +48,7 @@ pub struct WorkflowSource {
 
 /// A phase within a workflow (analog of `document::schema::Section`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Phase {
     pub title: String,
     #[serde(default)]
@@ -58,6 +61,7 @@ pub struct Phase {
 /// Paper-specific fields (methodology, evidence_type, page, instruments_used,
 /// reagents_involved, conditions) are intentionally absent.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Step {
     pub compound: String,
     #[serde(default)]

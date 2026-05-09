@@ -32,7 +32,7 @@ required-features = ["db"]
 
 [dependencies]
 epigraph-interfaces = { workspace = true }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
-epigraph-ingest = { workspace = true }  # Workflow/document extraction schemas and ingest planners
+epigraph-ingest = { workspace = true, features = ["openapi"] }  # Workflow/document extraction schemas and ingest planners
 epigraph-ingest-executor = { workspace = true, optional = true }  # Persistence executor for workflow ingest (db feature)
 # k-means for /api/v1/themes/build-from-corpus lives in epigraph-engine
 # (theme_kmeans::run_theme_kmeans) — no direct linfa/ndarray dep needed here.

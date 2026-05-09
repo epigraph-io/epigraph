@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+openapi = ["dep:utoipa"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -11,6 +14,7 @@ schemars = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v5"] }
 thiserror = { workspace = true }
 blake3 = "1"  # High-performance hashing for content-addressed atom IDs
+utoipa = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -28,7 +28,13 @@ use crate::routes::submit::{
 use crate::routes::versioning::{
     DedupRequest, DedupResponse, SupersedeRequest, SupersessionResponse,
 };
-use crate::routes::workflows::{EvolveStepRequest, EvolveStepResponse};
+use crate::routes::workflows::{
+    EvolveStepRequest, EvolveStepResponse, HierarchicalSearchResponse, HierarchicalWorkflowResult,
+    ImproveWorkflowRequest, LineageHeadResult, ReportOutcomeRequest, ResolvedStepResult,
+    StepExecution,
+};
+use epigraph_ingest::common::schema::{AuthorEntry, ClaimRelationship, ThesisDerivation};
+use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowExtraction, WorkflowSource};
 
 /// EpiGraph API OpenAPI specification
 ///
@@ -101,6 +107,20 @@ use crate::routes::workflows::{EvolveStepRequest, EvolveStepResponse};
             UpdateLabelsResponse,
             EvolveStepRequest,
             EvolveStepResponse,
+            ImproveWorkflowRequest,
+            ReportOutcomeRequest,
+            StepExecution,
+            WorkflowExtraction,
+            WorkflowSource,
+            Phase,
+            Step,
+            AuthorEntry,
+            ClaimRelationship,
+            ThesisDerivation,
+            HierarchicalSearchResponse,
+            HierarchicalWorkflowResult,
+            ResolvedStepResult,
+            LineageHeadResult,
         )
     ),
     modifiers(&SecurityAddon),
@@ -374,7 +394,7 @@ async fn evolve_step_doc() {}
         ("resolve_to_latest" = Option<bool>, Query, description = "Whether to resolve steps to latest versions"),
     ),
     responses(
-        (status = 200, body = serde_json::Value),
+        (status = 200, body = HierarchicalSearchResponse),
         (status = 500),
     ),
     security(("ed25519_signature" = []))
@@ -387,7 +407,7 @@ async fn find_workflow_hierarchical_doc() {}
     path = "/api/v1/workflows/hierarchical/{id}/outcome",
     tag = "workflows",
     params(("id" = uuid::Uuid, Path, description = "UUID of the hierarchical workflow")),
-    request_body = serde_json::Value,
+    request_body = ReportOutcomeRequest,
     responses(
         (status = 200, body = serde_json::Value),
         (status = 404),
@@ -403,7 +423,7 @@ async fn report_hierarchical_outcome_doc() {}
     path = "/api/v1/workflows/{id}/improve",
     tag = "workflows",
     params(("id" = uuid::Uuid, Path, description = "UUID of the workflow to improve")),
-    request_body = serde_json::Value,
+    request_body = ImproveWorkflowRequest,
     responses(
         (status = 200, body = serde_json::Value),
         (status = 404),
@@ -437,7 +457,7 @@ async fn deprecate_workflow_doc() {}
     post,
     path = "/api/v1/workflows/ingest",
     tag = "workflows",
-    request_body = serde_json::Value,
+    request_body = WorkflowExtraction,
     responses(
         (status = 200, body = serde_json::Value),
         (status = 500),
