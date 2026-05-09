@@ -278,44 +278,41 @@ pub async fn find_workflow(
 
     // Fallback: workflows usually have no associated evidence with embeddings,
     // so the semantic path above frequently returns empty even when a perfectly
-    // good ILIKE match exists in the `workflows` table. When semantic hits
-    // came in below half the requested limit, augment with the same
-    // hierarchical text search the API layer uses. Resolves claim 903e5120.
+    // good ILIKE match exists. The 144 production workflows live as claims
+    // labeled `workflow` (the legacy `workflows` table has only 3 test rows),
+    // so we search claims directly. When semantic hits came in below half the
+    // requested limit, augment with an ILIKE pass on workflow-labeled claims.
+    // Resolves claim 903e5120.
     let limit_usize = limit as usize;
     let half = (limit_usize / 2).max(1);
     if results.len() < half {
-        let text_hits = WorkflowRepository::search_hierarchical_by_text(
+        let text_hits = ClaimRepository::search_by_label_and_text(
             &server.pool,
+            &["workflow".to_string()],
             &params.goal,
-            limit * 2,
+            min_truth,
+            (limit * 2) as i64,
         )
         .await
         .unwrap_or_else(|e| {
-            tracing::warn!("search_hierarchical_by_text fallback failed: {e}");
+            tracing::warn!("search_by_label_and_text fallback failed: {e}");
             Vec::new()
         });
 
         let already_seen: std::collections::HashSet<String> =
             results.iter().map(|r| r.workflow_id.clone()).collect();
 
-        for wf in text_hits {
+        for claim in text_hits {
             if results.len() >= limit_usize {
                 break;
             }
-            if already_seen.contains(&wf.id.to_string()) {
+            let claim_uuid = claim.id.as_uuid();
+            if already_seen.contains(&claim_uuid.to_string()) {
                 continue;
             }
-            let Ok(Some(claim)) = ClaimRepository::get_by_id(
-                &server.pool,
-                epigraph_core::ClaimId::from_uuid(wf.id),
-            )
-            .await
-            else {
-                continue;
-            };
             if let Some(r) = enrich_workflow_result(
                 &server.pool,
-                wf.id,
+                claim_uuid,
                 &claim,
                 0.0, // text-fallback hit; no semantic similarity score
                 min_truth,

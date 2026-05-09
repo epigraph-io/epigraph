@@ -1,10 +1,11 @@
 //! Verifies that `find_workflow` falls back to ILIKE text search on the
-//! `workflows` table when semantic search (over evidence embeddings) returns
-//! fewer than `limit / 2` hits. Workflows usually have no associated evidence
-//! with embeddings, so without this fallback every scheduled-agent first
-//! action returned an empty list. Resolves claim 903e5120.
+//! `claims` table (filtered by `labels @> ['workflow']`) when semantic search
+//! over evidence embeddings returns fewer than `limit / 2` hits. Workflow
+//! claims are the canonical storage; the legacy `workflows` table holds only
+//! a handful of test rows in production. Without this fallback every
+//! scheduled-agent first action returned an empty list. Resolves claim 903e5120.
 
-use epigraph_db::WorkflowRepository;
+use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -16,8 +17,9 @@ async fn find_workflow_falls_back_to_text_search_when_semantic_empty(pool: PgPoo
     // Unique phrase guarantees no other seeded data interferes.
     let unique_phrase = format!("test-find-fallback-{}", Uuid::new_v4());
 
-    // Seed the claims half (workflow shape, JSON content with goal/steps so
-    // `parse_workflow_content` can extract them inside the fallback loop).
+    // Seed a workflow claim. seed_workflow_claim sets labels=['workflow'],
+    // truth_value=0.5 (above the test's min_truth=0.0), and content that
+    // begins with the unique phrase, so ILIKE '%phrase%' matches it.
     let workflow_id = seed_workflow_claim(
         &pool,
         &unique_phrase,
@@ -25,26 +27,19 @@ async fn find_workflow_falls_back_to_text_search_when_semantic_empty(pool: PgPoo
     )
     .await;
 
-    // Seed the workflows-table half with the same id. The fallback queries
-    // `workflows` via ILIKE, then resolves the matching id back to the claim.
-    sqlx::query(
-        "INSERT INTO workflows (id, canonical_name, generation, goal, metadata) \
-         VALUES ($1, $2, 0, $3, '{}'::jsonb)",
+    // Sanity: DB-level ILIKE on workflow-labeled claims finds it.
+    let direct = ClaimRepository::search_by_label_and_text(
+        &pool,
+        &["workflow".to_string()],
+        &unique_phrase,
+        0.0,
+        5,
     )
-    .bind(workflow_id)
-    .bind(&unique_phrase)
-    .bind(&unique_phrase)
-    .execute(&pool)
     .await
-    .expect("seed workflows row");
-
-    // Sanity: DB-level ILIKE finds it.
-    let direct = WorkflowRepository::search_hierarchical_by_text(&pool, &unique_phrase, 5)
-        .await
-        .expect("search_hierarchical_by_text");
+    .expect("search_by_label_and_text");
     assert!(
         !direct.is_empty(),
-        "DB-level ILIKE must find the seeded workflow"
+        "DB-level ILIKE on workflow-labeled claims must find the seeded workflow"
     );
 
     // Drive the MCP find_workflow path. Semantic search will return zero
