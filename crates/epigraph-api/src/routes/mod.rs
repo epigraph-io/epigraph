@@ -443,6 +443,20 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/graph/neighborhoods/:id/expand",
             get(graph_neighborhood::expand),
+        )
+        // Policies write endpoints — require auth + scope
+        .route(
+            "/api/v1/policies/:claim_id/outcome",
+            post(policies::record_outcome),
+        )
+        .route("/api/v1/policies/decay-sweep", post(policies::decay_sweep))
+        .route(
+            "/api/v1/policy-challenges",
+            post(policies::create_challenge),
+        )
+        .route(
+            "/api/v1/policy-challenges/:id/resolve",
+            post(policies::resolve_challenge),
         );
 
     // Auth middleware stack (outermost runs first):
@@ -632,21 +646,8 @@ pub fn create_router(state: AppState) -> Router {
             get(policies::list_network_policies),
         )
         .route(
-            "/api/v1/policies/:claim_id/outcome",
-            post(policies::record_outcome),
-        )
-        .route("/api/v1/policies/decay-sweep", post(policies::decay_sweep))
-        .route(
-            "/api/v1/policy-challenges",
-            post(policies::create_challenge),
-        )
-        .route(
             "/api/v1/policy-challenges/:id",
             get(policies::get_challenge),
-        )
-        .route(
-            "/api/v1/policy-challenges/:id/resolve",
-            post(policies::resolve_challenge),
         )
         .route("/api/v1/methods/search", get(experiments::find_methods))
         .route(
