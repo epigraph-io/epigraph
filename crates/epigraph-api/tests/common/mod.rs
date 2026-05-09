@@ -166,6 +166,43 @@ pub async fn seed_claim(pool: &PgPool, content: &str) -> Uuid {
     id
 }
 
+/// Insert a claim whose `agent_id` is the given UUID.
+/// Also inserts an `agents` row for that UUID so the FK is satisfied.
+pub async fn seed_claim_with_agent(pool: &PgPool, content: &str, agent_id: Uuid) -> Uuid {
+    // Ensure the agent row exists (may already exist from a previous call).
+    let pk: Vec<u8> = agent_id
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(32)
+        .collect();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, agent_type) \
+         VALUES ($1, $2, 'system') ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(agent_id)
+    .bind(&pk)
+    .execute(pool)
+    .await
+    .expect("seed agent for claim");
+
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels) \
+         VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[])",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(&hash)
+    .bind(agent_id)
+    .execute(pool)
+    .await
+    .expect("seed claim with agent");
+    id
+}
+
 /// Insert a claim with explicit labels.
 pub async fn seed_claim_with_labels(pool: &PgPool, content: &str, labels: &[&str]) -> Uuid {
     let id = seed_claim(pool, content).await;

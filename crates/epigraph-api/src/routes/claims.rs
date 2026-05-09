@@ -1136,10 +1136,13 @@ pub async fn update_claim(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateClaimRequest>,
 ) -> Result<Json<ClaimResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    // Require authentication
+    let auth = auth_ctx
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "PUT /api/v1/claims/:id requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     let claim_id = ClaimId::from_uuid(id);
 
@@ -1150,6 +1153,10 @@ pub async fn update_claim(
             entity: "Claim".to_string(),
             id: id.to_string(),
         })?;
+
+    // Ownership / admin gate (after 404 check to avoid leaking existence)
+    let claim_agent_id: Uuid = current.agent_id.into();
+    crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
 
     // Update truth value if provided
     if let Some(tv) = request.truth_value {
@@ -1196,12 +1203,12 @@ pub async fn update_claim(
             })?;
     }
 
-    // Record provenance when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    // Record provenance
+    {
         let content_hash = blake3::hash(id.as_bytes());
         if let Err(e) = crate::middleware::provenance::record_provenance(
             &state.db_pool,
-            auth,
+            &auth,
             "claim",
             id,
             "update",
@@ -1251,6 +1258,7 @@ pub async fn update_claim(
         (status = 200, body = ClaimResponse),
         (status = 400),
         (status = 401),
+        (status = 403),
         (status = 404),
     ),
     security(("ed25519_signature" = [])),
@@ -1286,6 +1294,21 @@ pub async fn patch_claim(
     }
 
     let claim_id = ClaimId::from_uuid(id);
+
+    // ── 4. Ownership / admin gate ────────────────────────────────────────────
+    // Fetch agent_id before opening the transaction so 404 fires before 403.
+    let claim_agent_id: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("DB error fetching claim owner: {e}"),
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: id.to_string(),
+        })?;
+    crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
 
     // ── 5. Open transaction — all mutations + provenance are atomic ──────────
     let mut tx = state
@@ -1449,6 +1472,8 @@ pub struct UpdateLabelsResponse {
     responses(
         (status = 200, body = UpdateLabelsResponse),
         (status = 400),
+        (status = 401),
+        (status = 403),
         (status = 404),
     ),
     security(("ed25519_signature" = [])),
@@ -1456,14 +1481,37 @@ pub struct UpdateLabelsResponse {
 )]
 pub async fn update_labels(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateLabelsRequest>,
 ) -> Result<Json<UpdateLabelsResponse>, ApiError> {
+    // Require authentication
+    let auth = auth_ctx
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "PATCH /api/v1/claims/:id/labels requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     if body.add.is_empty() && body.remove.is_empty() {
         return Err(ApiError::BadRequest {
             message: "At least one of 'add' or 'remove' must be non-empty".to_string(),
         });
     }
+
+    // Fetch agent_id — 404 before 403 (don't leak existence via ownership check)
+    let claim_agent_id: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("DB error fetching claim owner: {e}"),
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: id.to_string(),
+        })?;
+    crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
 
     let labels = ClaimRepository::update_labels(&state.db_pool, id, &body.add, &body.remove)
         .await
