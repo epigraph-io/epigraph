@@ -203,38 +203,50 @@ pub async fn find_workflow(
     let limit = params.limit.unwrap_or(5).clamp(1, 20);
     let min_truth = params.min_truth.unwrap_or(0.3);
 
-    // Generate embedding once — reused for both semantic search and behavioral affinity
-    let query_vec = match server.embedder.generate(&params.goal).await {
-        Ok(v) => v,
-        Err(_) => return success_json(&Vec::<FindWorkflowResult>::new()),
+    // Generate embedding once — reused for both semantic search and behavioral
+    // affinity. Failure here is non-fatal: we still want the ILIKE fallback to
+    // run (workflows commonly lack evidence embeddings, and offline embedders
+    // shouldn't blank the whole tool).
+    let pgvec_opt = match server.embedder.generate(&params.goal).await {
+        Ok(v) => Some(format_pgvector(&v)),
+        Err(e) => {
+            tracing::warn!("embedder failed in find_workflow; relying on text fallback: {e}");
+            None
+        }
     };
-    let pgvec = format_pgvector(&query_vec);
 
-    // Semantic search via evidence embeddings
-    let semantic_hits =
-        epigraph_db::EvidenceRepository::search_by_embedding(&server.pool, &pgvec, limit * 3)
+    // Semantic search via evidence embeddings (only when embedding is available).
+    let semantic_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
+        epigraph_db::EvidenceRepository::search_by_embedding(&server.pool, pgvec, limit * 3)
             .await
-            .map_err(internal_error)?;
+            .map_err(internal_error)?
+    } else {
+        Vec::new()
+    };
 
-    // Behavioral affinity lookup (best-effort)
+    // Behavioral affinity lookup (best-effort; only when embedding is available).
     let affinity_map: std::collections::HashMap<uuid::Uuid, (f64, i64)> =
-        match BehavioralExecutionRepository::behavioral_affinity_lineage(
-            &server.pool,
-            &pgvec,
-            0.5, // min_similarity
-            1,   // min_executions
-            20,  // limit
-        )
-        .await
-        {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|(id, sim, count)| (id, (sim, count)))
-                .collect(),
-            Err(e) => {
-                tracing::warn!("behavioral affinity lookup failed: {e}");
-                std::collections::HashMap::new()
+        if let Some(pgvec) = pgvec_opt.as_deref() {
+            match BehavioralExecutionRepository::behavioral_affinity_lineage(
+                &server.pool,
+                pgvec,
+                0.5, // min_similarity
+                1,   // min_executions
+                20,  // limit
+            )
+            .await
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|(id, sim, count)| (id, (sim, count)))
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!("behavioral affinity lookup failed: {e}");
+                    std::collections::HashMap::new()
+                }
             }
+        } else {
+            std::collections::HashMap::new()
         };
 
     // Build results, enriching with behavioral data
@@ -321,6 +333,114 @@ pub async fn find_workflow(
         }
         if results.len() >= limit as usize {
             break;
+        }
+    }
+
+    // Fallback: workflows usually have no associated evidence with embeddings,
+    // so the semantic path above frequently returns empty even when a perfectly
+    // good ILIKE match exists in the `workflows` table. When semantic hits
+    // came in below half the requested limit, augment with the same
+    // hierarchical text search the API layer uses. Resolves claim 903e5120.
+    let limit_usize = limit as usize;
+    let half = (limit_usize / 2).max(1);
+    if results.len() < half {
+        let text_hits = WorkflowRepository::search_hierarchical_by_text(
+            &server.pool,
+            &params.goal,
+            limit * 2,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("search_hierarchical_by_text fallback failed: {e}");
+            Vec::new()
+        });
+
+        let already_seen: std::collections::HashSet<String> =
+            results.iter().map(|r| r.workflow_id.clone()).collect();
+
+        for wf in text_hits {
+            if results.len() >= limit_usize {
+                break;
+            }
+            if already_seen.contains(&wf.id.to_string()) {
+                continue;
+            }
+            let Ok(Some(claim)) = ClaimRepository::get_by_id(
+                &server.pool,
+                epigraph_core::ClaimId::from_uuid(wf.id),
+            )
+            .await
+            else {
+                continue;
+            };
+            if claim.truth_value.value() < min_truth {
+                continue;
+            }
+            let (goal, steps, _prereqs, _expected) = parse_workflow_content(&claim.content);
+            if goal.is_empty() && steps.is_empty() {
+                continue;
+            }
+
+            let val: serde_json::Value = serde_json::from_str(&claim.content).unwrap_or_default();
+            let use_count = val
+                .get("use_count")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let success_count = val
+                .get("success_count")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let generation = val
+                .get("generation")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let parent_id = val
+                .get("parent_id")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+
+            // Look up behavioral data via lineage root (best-effort; reuse the
+            // affinity_map already built from the original embedding query).
+            let lineage_root = WorkflowRepository::find_lineage_root(&server.pool, wf.id)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(workflow_id = %wf.id, "find_lineage_root failed: {e}");
+                    wf.id
+                });
+            let (behavioral_affinity, behavioral_execution_count) =
+                match affinity_map.get(&lineage_root) {
+                    Some(&(sim, count)) => (Some(sim), Some(count)),
+                    None => (None, None),
+                };
+            let behavioral_success_rate = if behavioral_execution_count.is_some() {
+                match BehavioralExecutionRepository::rolling_success_rate(
+                    &server.pool,
+                    wf.id,
+                    20,
+                )
+                .await
+                {
+                    Ok(rate) if rate > 0.0 => Some(rate),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            results.push(FindWorkflowResult {
+                workflow_id: wf.id.to_string(),
+                goal,
+                steps,
+                truth_value: claim.truth_value.value(),
+                similarity: 0.0, // text-fallback hit; no semantic similarity score
+                use_count,
+                success_count,
+                generation,
+                parent_id,
+                behavioral_affinity,
+                behavioral_success_rate,
+                behavioral_execution_count,
+            });
         }
     }
 
