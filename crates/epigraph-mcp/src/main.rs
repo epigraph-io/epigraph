@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let embedder = McpEmbedder::new(pool.clone(), cli.openai_api_key);
 
     let mode = if cli.read_only {
-        "read-only (23 tools)"
+        "read-only (33 tools)"
     } else {
         "full (57 tools)"
     };

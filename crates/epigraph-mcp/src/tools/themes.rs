@@ -8,10 +8,16 @@
 //! ## Safety
 //! - `limit` is capped at 500 (per `feedback_memory_limits.md`: VM OOMs at
 //!   ~2000 embeddings).
-//! - `wipe_first` is **forced to `false`**: the HTTP path gates wipes on
-//!   `claims:admin`; the MCP layer has no scope-check pattern, so the
-//!   destructive option is disabled here. Operators that need a wipe should
-//!   continue to use the HTTP route.
+//! - `wipe_first` defaults to `true`. Rationale: the `claim_themes` table
+//!   currently has no `UNIQUE(label)` constraint and `ClaimThemeRepository::create`
+//!   has no `ON CONFLICT` clause, so the additive path (`wipe_first=false`)
+//!   silently accumulates duplicate `auto-00`, `auto-01`, ... rows on every
+//!   call. Because this MCP tool is invoked by automated scheduled tasks, the
+//!   safe-by-default behaviour is a clean rebuild on each call. Callers that
+//!   genuinely want additive runs (e.g. with a unique `label_prefix` per call)
+//!   can pass `wipe_first=false` and will receive a warning in the response
+//!   when new themes are created. See backlog: missing UNIQUE constraint on
+//!   `claim_themes.label`.
 
 #![allow(clippy::wildcard_imports)]
 
@@ -41,6 +47,12 @@ pub struct ThemeClusterParams {
     pub label_prefix: Option<String>,
     /// Embedding dimensionality. Must be 1536 or 3072. Default 1536.
     pub centroid_dim: Option<u32>,
+    /// Whether to wipe existing themes with this `label_prefix` before
+    /// clustering. **Default `true`** — see module docstring. Pass `false`
+    /// only for additive runs with a unique `label_prefix`; otherwise
+    /// duplicate themes accumulate (no UNIQUE constraint on
+    /// `claim_themes.label`).
+    pub wipe_first: Option<bool>,
 }
 
 const MCP_LIMIT_CAP: u32 = 500;
@@ -49,6 +61,8 @@ pub async fn theme_cluster(
     server: &EpiGraphMcpFull,
     params: ThemeClusterParams,
 ) -> Result<CallToolResult, McpError> {
+    let wipe_first = params.wipe_first.unwrap_or(true);
+
     let config = RunThemeKmeansConfig {
         k: params.k,
         k_min: params.k_min.unwrap_or(4),
@@ -56,8 +70,7 @@ pub async fn theme_cluster(
         min_claims_per_theme: params.min_claims_per_theme.unwrap_or(5),
         limit: params.limit.unwrap_or(500).min(MCP_LIMIT_CAP).max(1),
         label_prefix: params.label_prefix.unwrap_or_else(|| "auto".to_string()),
-        // Forced false at the MCP layer — see module docstring.
-        wipe_first: false,
+        wipe_first,
         centroid_dim: params.centroid_dim.unwrap_or(1536),
     };
 
@@ -71,7 +84,7 @@ pub async fn theme_cluster(
 
     // Mirror the HTTP handler's JSON shape so EpiClaw and the route share a
     // single observable contract.
-    let body = if let Some(k_used) = summary.k_used {
+    let mut body = if let Some(k_used) = summary.k_used {
         serde_json::json!({
             "themes_created": summary.themes_created,
             "claims_assigned": summary.claims_assigned,
@@ -89,6 +102,15 @@ pub async fn theme_cluster(
             "skipped_reason": summary.skipped_reason.unwrap_or_default(),
         })
     };
+
+    // Warn callers that opted out of `wipe_first`: with no DB-level UNIQUE
+    // constraint on `claim_themes.label`, repeated calls with the same
+    // `label_prefix` proliferate duplicate rows.
+    if !wipe_first && summary.themes_created > 0 {
+        body["warning"] = serde_json::json!(
+            "wipe_first=false: created themes are additive. Repeated calls with the same label_prefix will produce duplicate rows. See claim_themes UNIQUE constraint backlog."
+        );
+    }
 
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&body).map_err(internal_error)?,
