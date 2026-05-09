@@ -576,6 +576,13 @@ pub struct UpdateAgentRequest {
 /// PUT /api/v1/agents/:id
 ///
 /// Updates mutable fields on an agent. The public key is immutable.
+/// Caller must be the target agent (auth.agent_id == :id) or have `claims:admin`.
+///
+/// # Errors
+///
+/// - 401 Unauthorized: Missing or invalid Bearer token
+/// - 403 Forbidden: Missing scope or caller is not the target agent
+/// - 404 Not Found: Agent does not exist
 #[cfg(feature = "db")]
 pub async fn update_agent(
     State(state): State<AppState>,
@@ -586,6 +593,12 @@ pub async fn update_agent(
     // Enforce scope when OAuth2-authenticated
     if let Some(axum::Extension(ref auth)) = auth_ctx {
         crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
+        // Caller must be the target agent OR have claims:admin
+        if !auth.has_scope("claims:admin") && auth.agent_id != Some(id) {
+            return Err(ApiError::Forbidden {
+                reason: "can only mutate your own agent record".into(),
+            });
+        }
     }
 
     let agent_id = AgentId::from_uuid(id);

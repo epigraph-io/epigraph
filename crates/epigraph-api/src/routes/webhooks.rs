@@ -76,19 +76,26 @@ pub fn sign_webhook_payload(secret: &str, payload: &[u8]) -> String {
 ///
 /// POST /api/v1/webhooks
 ///
-/// This is a protected endpoint requiring Ed25519 signature verification.
-/// The caller must provide a valid URL, event type filters, and a secret
-/// of at least 32 characters for HMAC-SHA256 payload signing.
+/// Requires `webhooks:write` scope. The caller must provide a valid URL,
+/// event type filters, and a secret of at least 32 characters for
+/// HMAC-SHA256 payload signing.
 ///
 /// # Errors
 ///
 /// - 400 Bad Request: Empty URL or secret shorter than 32 characters
-/// - 401 Unauthorized: Missing or invalid signature (handled by middleware)
+/// - 401 Unauthorized: Missing or invalid Bearer token
+/// - 403 Forbidden: Missing `webhooks:write` scope
 /// - 201 Created: Webhook subscription registered successfully
 pub async fn register_webhook(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(registration): Json<WebhookRegistration>,
 ) -> Result<(StatusCode, Json<WebhookSubscription>), ApiError> {
+    // Enforce scope when OAuth2-authenticated
+    if let Some(axum::Extension(ref auth)) = auth_ctx {
+        crate::middleware::scopes::check_scopes(auth, &["webhooks:write"])?;
+    }
+
     // 1. Validate URL is not empty
     if registration.url.trim().is_empty() {
         return Err(ApiError::BadRequest {
@@ -107,7 +114,12 @@ pub async fn register_webhook(
         });
     }
 
-    // 3. Create the subscription
+    // 3. Determine owner principal from auth context
+    let owner_id = auth_ctx
+        .as_ref()
+        .map(|axum::Extension(auth)| auth.owner_id.unwrap_or(auth.client_id));
+
+    // 4. Create the subscription
     let subscription = WebhookSubscription {
         id: Uuid::new_v4(),
         url: registration.url,
@@ -115,9 +127,10 @@ pub async fn register_webhook(
         created_at: Utc::now(),
         active: true,
         secret: registration.secret,
+        owner_id,
     };
 
-    // 4. Store the subscription
+    // 5. Store the subscription
     {
         let mut store = state.webhook_store.write().await;
         store.insert(subscription.id, subscription.clone());
@@ -164,25 +177,44 @@ pub async fn get_webhook(
 ///
 /// DELETE /api/v1/webhooks/:id
 ///
-/// This is a protected endpoint requiring Ed25519 signature verification.
-/// Removes the subscription entirely from the store.
+/// Requires `webhooks:write` scope. The caller must own the webhook
+/// or have `claims:admin` scope.
 ///
 /// # Errors
 ///
+/// - 401 Unauthorized: Missing or invalid Bearer token
+/// - 403 Forbidden: Missing scope or caller is not the webhook owner
 /// - 404 Not Found: No subscription with the given ID
 pub async fn delete_webhook(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let mut store = state.webhook_store.write().await;
-    if store.remove(&id).is_some() {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::NotFound {
-            entity: "Webhook".to_string(),
-            id: id.to_string(),
-        })
+    // Enforce scope when OAuth2-authenticated
+    if let Some(axum::Extension(ref auth)) = auth_ctx {
+        crate::middleware::scopes::check_scopes(auth, &["webhooks:write"])?;
     }
+
+    let mut store = state.webhook_store.write().await;
+    let webhook = store.get(&id).ok_or_else(|| ApiError::NotFound {
+        entity: "Webhook".to_string(),
+        id: id.to_string(),
+    })?;
+
+    // Ownership check: caller must be the owner OR have claims:admin
+    if let Some(axum::Extension(ref auth)) = auth_ctx {
+        if !auth.has_scope("claims:admin") {
+            let principal = auth.owner_id.unwrap_or(auth.client_id);
+            if webhook.owner_id != Some(principal) {
+                return Err(ApiError::Forbidden {
+                    reason: "webhook is owned by another principal".into(),
+                });
+            }
+        }
+    }
+
+    store.remove(&id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // =============================================================================
@@ -449,6 +481,7 @@ mod tests {
             created_at: Utc::now(),
             active: true,
             secret: "this-should-not-appear-in-json-output-ever".to_string(),
+            owner_id: None,
         };
 
         let json = serde_json::to_string(&sub).unwrap();
@@ -502,6 +535,7 @@ mod tests {
             created_at: Utc::now(),
             active: true,
             secret: "x".repeat(32),
+            owner_id: None,
         };
 
         let sub_filtered = WebhookSubscription {
@@ -511,6 +545,7 @@ mod tests {
             created_at: Utc::now(),
             active: true,
             secret: "x".repeat(32),
+            owner_id: None,
         };
 
         // Empty event_types matches all
@@ -611,6 +646,7 @@ mod tests {
                     created_at: Utc::now(),
                     active: true,
                     secret: "x".repeat(32),
+                    owner_id: None,
                 },
             );
         }
@@ -651,6 +687,7 @@ mod tests {
                     created_at: Utc::now(),
                     active: true,
                     secret: "x".repeat(32),
+                    owner_id: None,
                 },
             );
         }
@@ -690,6 +727,7 @@ mod tests {
                     created_at: Utc::now(),
                     active: false, // INACTIVE
                     secret: "x".repeat(32),
+                    owner_id: None,
                 },
             );
         }

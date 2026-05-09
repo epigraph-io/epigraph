@@ -46,6 +46,7 @@ pub const WRITE_SCOPES: &[&str] = &[
     "tasks:write",
     "ingest:write",
     "policy:challenge",
+    "webhooks:write",
 ];
 
 /// `epigraph-admin`: admin-superset.
@@ -135,5 +136,25 @@ mod tests {
             assert!(scopes_for(name).is_some(), "{name} should resolve");
         }
         assert!(scopes_for("not-a-canonical-name").is_none());
+    }
+
+    #[test]
+    fn webhooks_write_scope_role_membership() {
+        let ro: HashSet<String> = read_only_scopes().into_iter().collect();
+        let wo: HashSet<String> = read_write_scopes().into_iter().collect();
+        let admin: HashSet<String> = admin_scopes().into_iter().collect();
+
+        assert!(
+            !ro.contains("webhooks:write"),
+            "ro must NOT include webhooks:write"
+        );
+        assert!(
+            wo.contains("webhooks:write"),
+            "wo must include webhooks:write"
+        );
+        assert!(
+            admin.contains("webhooks:write"),
+            "admin must include webhooks:write"
+        );
     }
 }
