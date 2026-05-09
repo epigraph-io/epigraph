@@ -1967,25 +1967,29 @@ mod db_tests {
     }
 
     /// Insert a minimal agent + claim directly for test setup.
+    ///
+    /// `owner_id` is used as the claim's `agent_id` so that ownership checks
+    /// pass when the caller's AuthContext carries the same id as `owner_id`.
     async fn insert_test_claim(
         pool: &epigraph_db::PgPool,
         claim_id: Uuid,
+        owner_id: Uuid,
         truth: f64,
         properties: serde_json::Value,
         labels: &[&str],
     ) {
-        // Upsert agent (reuse claim_id as agent_id for simplicity; unique public_key via hash)
+        // Upsert agent for the owner (unique public_key via hash)
         sqlx::query(
             r#"INSERT INTO agents (id, public_key, created_at, updated_at)
                VALUES ($1, sha256($1::text::bytea), NOW(), NOW())
                ON CONFLICT (id) DO NOTHING"#,
         )
-        .bind(claim_id)
+        .bind(owner_id)
         .execute(pool)
         .await
         .expect("upsert agent");
 
-        // Insert claim
+        // Insert claim with agent_id = owner_id so ownership checks pass
         let labels_arr: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
         sqlx::query(
             r#"INSERT INTO claims
@@ -1997,7 +2001,7 @@ mod db_tests {
         )
         .bind(claim_id)
         .bind(format!("test claim {claim_id}"))
-        .bind(claim_id)
+        .bind(owner_id)
         .bind(truth)
         .bind(&properties)
         .bind(&labels_arr)
@@ -2061,7 +2065,15 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({"a": 1}), &[]).await;
+        insert_test_claim(
+            &pool,
+            claim_id,
+            client_id,
+            0.7,
+            serde_json::json!({"a": 1}),
+            &[],
+        )
+        .await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2105,6 +2117,7 @@ mod db_tests {
         insert_test_claim(
             &pool,
             claim_id,
+            client_id,
             0.7,
             serde_json::json!({"status": "pending", "x": 99}),
             &[],
@@ -2153,7 +2166,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.5, serde_json::json!({}), &[]).await;
+        insert_test_claim(&pool, claim_id, client_id, 0.5, serde_json::json!({}), &[]).await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2212,7 +2225,15 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({}), &["existing"]).await;
+        insert_test_claim(
+            &pool,
+            claim_id,
+            client_id,
+            0.7,
+            serde_json::json!({}),
+            &["existing"],
+        )
+        .await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2257,7 +2278,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.5, serde_json::json!({}), &[]).await;
+        insert_test_claim(&pool, claim_id, client_id, 0.5, serde_json::json!({}), &[]).await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2302,7 +2323,15 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({"k": 1}), &[]).await;
+        insert_test_claim(
+            &pool,
+            claim_id,
+            client_id,
+            0.7,
+            serde_json::json!({"k": 1}),
+            &[],
+        )
+        .await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2346,7 +2375,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({}), &[]).await;
+        insert_test_claim(&pool, claim_id, client_id, 0.7, serde_json::json!({}), &[]).await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2405,7 +2434,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({}), &[]).await;
+        insert_test_claim(&pool, claim_id, client_id, 0.7, serde_json::json!({}), &[]).await;
 
         // Auth is present but lacks claims:write
         let auth = AuthContext {
@@ -2446,7 +2475,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
         let claim_id = Uuid::new_v4();
-        insert_test_claim(&pool, claim_id, 0.7, serde_json::json!({}), &[]).await;
+        insert_test_claim(&pool, claim_id, client_id, 0.7, serde_json::json!({}), &[]).await;
 
         let state = AppState::with_db(
             pool.clone(),
@@ -2510,6 +2539,7 @@ mod db_tests {
         insert_test_claim(
             &pool,
             claim_id,
+            bad_client_id,
             0.5,
             serde_json::json!({"original": true}),
             &[],
