@@ -602,10 +602,12 @@ pub async fn upsert_cluster(
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     use epigraph_db::FrameRepository;
 
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "upsert_cluster requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     let frame_name = format!("cluster:{}", request.cluster_label);
 
@@ -636,11 +638,11 @@ pub async fn upsert_cluster(
     FrameRepository::assign_claim(&state.db_pool, request.claim_id, frame_id, Some(0)).await?;
 
     // Record provenance
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    {
         let hash = blake3::hash(request.claim_id.as_bytes());
         if let Err(e) = crate::middleware::provenance::record_provenance(
             &state.db_pool,
-            auth,
+            &auth,
             "claim",
             request.claim_id,
             "cluster_assign",
@@ -699,10 +701,12 @@ pub async fn assign_claim_to_frame(
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     use epigraph_db::FrameRepository;
 
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "assign_claim_to_frame requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     // Verify frame exists
     FrameRepository::get_by_id(&state.db_pool, frame_id)
@@ -721,11 +725,11 @@ pub async fn assign_claim_to_frame(
     .await?;
 
     // Record provenance
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    {
         let hash = blake3::hash(request.claim_id.as_bytes());
         if let Err(e) = crate::middleware::provenance::record_provenance(
             &state.db_pool,
-            auth,
+            &auth,
             "frame",
             frame_id,
             "assign_claim",
@@ -784,10 +788,12 @@ pub async fn promote_staged_edges(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<PromoteStagedEdgesRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "promote_staged_edges requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     // Build the query based on whether specific IDs were provided
     let promoted_count: i64 = if let Some(ref ids) = request.edge_ids {
@@ -977,9 +983,12 @@ pub async fn reassign_claim(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<ReassignClaimRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "reassign_claim requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1197,9 +1206,12 @@ pub async fn build_themes_from_corpus(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use epigraph_engine::theme_kmeans::{run_theme_kmeans, RunThemeKmeansConfig, ThemeKmeansError};
 
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "build_themes_from_corpus requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     let config = RunThemeKmeansConfig {
         k: request.k.map(|k| u32::try_from(k).unwrap_or(u32::MAX)),
@@ -1298,9 +1310,12 @@ pub async fn assign_unthemed(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<AssignUnthemedRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "assign_unthemed requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1355,9 +1370,12 @@ pub async fn recompute_centroids(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<RecomputeCentroidsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "recompute_centroids requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1610,9 +1628,12 @@ pub async fn create_theme_with_centroid(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateThemeWithCentroidRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "create_theme_with_centroid requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     use epigraph_db::ClaimThemeRepository;
 

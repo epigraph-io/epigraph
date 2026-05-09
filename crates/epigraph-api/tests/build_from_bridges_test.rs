@@ -163,12 +163,10 @@ async fn build_from_bridges_clusters_paragraphs() {
         "resolution": 1.0,
         "retain_runs": 5
     });
+    let token = common::test_bearer_token_with_scopes(&["claims:admin"]);
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/v1/clusters/build-from-bridges"))
-        .header(
-            "Authorization",
-            format!("Bearer {}", common::test_bearer_token()),
-        )
+        .bearer_auth(&token)
         .json(&body)
         .send()
         .await

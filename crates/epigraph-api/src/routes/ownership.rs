@@ -86,8 +86,16 @@ fn default_limit() -> i64 {
 #[cfg(feature = "db")]
 pub async fn assign_ownership(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<AssignOwnershipRequest>,
 ) -> Result<(StatusCode, Json<OwnershipResponse>), ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "assign_ownership requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+
     let pool = &state.db_pool;
 
     let row = epigraph_db::OwnershipRepository::assign_with_community(
@@ -152,9 +160,17 @@ pub async fn owned_nodes(
 #[cfg(feature = "db")]
 pub async fn update_partition(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(node_id): Path<Uuid>,
     Json(request): Json<UpdatePartitionRequest>,
 ) -> Result<Json<OwnershipResponse>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "update_partition requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+
     let pool = &state.db_pool;
 
     let row =

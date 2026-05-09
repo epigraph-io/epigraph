@@ -50,8 +50,15 @@ const ALGO_LOUVAIN_BRIDGE: &str = "louvain_bridge";
 #[cfg(feature = "db")]
 pub async fn build_from_bridges(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(req): Json<BuildFromBridgesRequest>,
 ) -> Result<Json<BuildFromBridgesResponse>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(crate::errors::ApiError::Unauthorized {
+            reason: "build_from_bridges requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
     use epigraph_jobs::cluster_graph::louvain::{louvain, LouvainInput};
     use std::collections::HashMap;
 
