@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// An author with affiliations and roles. Workflows can be authored by humans,
 /// LLMs, or external systems — same shape as document authors.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AuthorEntry {
     pub name: String,
     #[serde(default)]
@@ -18,6 +19,7 @@ pub struct AuthorEntry {
 /// support / contradict / refute each other across phases just like document
 /// atoms can across paragraphs.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ClaimRelationship {
     pub source_path: String,
     pub target_path: String,
@@ -30,6 +32,7 @@ pub struct ClaimRelationship {
 
 /// Whether the thesis was derived top-down or bottom-up.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum ThesisDerivation {
     #[default]
     TopDown,

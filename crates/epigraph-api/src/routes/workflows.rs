@@ -57,7 +57,7 @@ pub struct ListWorkflowsQuery {
 }
 
 #[cfg(feature = "db")]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ReportOutcomeRequest {
     pub success: bool,
     pub outcome_details: String,
@@ -67,7 +67,7 @@ pub struct ReportOutcomeRequest {
 }
 
 #[cfg(feature = "db")]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct StepExecution {
     pub step_index: usize,
     pub planned: String,
@@ -77,7 +77,7 @@ pub struct StepExecution {
 }
 
 #[cfg(feature = "db")]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ImproveWorkflowRequest {
     pub goal: Option<String>,
     pub steps: Option<Vec<String>>,
@@ -113,6 +113,47 @@ pub struct RecordBehavioralExecutionRequest {
     pub quality: Option<f64>,
     pub deviation_count: i32,
     pub total_steps: i32,
+}
+
+/// Response body for `GET /api/v1/workflows/hierarchical/search`.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct HierarchicalSearchResponse {
+    pub workflows: Vec<HierarchicalWorkflowResult>,
+    pub total: usize,
+    pub resolve_to_latest: bool,
+}
+
+/// A single workflow entry within [`HierarchicalSearchResponse`].
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct HierarchicalWorkflowResult {
+    pub workflow_id: uuid::Uuid,
+    pub canonical_name: String,
+    pub generation: i32,
+    pub goal: String,
+    pub parent_id: Option<uuid::Uuid>,
+    pub metadata: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_steps: Option<Vec<ResolvedStepResult>>,
+}
+
+/// Per-step resolution result within [`HierarchicalWorkflowResult`].
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ResolvedStepResult {
+    pub step_index: usize,
+    pub frozen_claim_id: uuid::Uuid,
+    pub step_lineage_id: Option<uuid::Uuid>,
+    pub heads: Vec<LineageHeadResult>,
+    pub pending_resolution: bool,
+}
+
+/// A lineage head within [`ResolvedStepResult`].
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct LineageHeadResult {
+    pub id: uuid::Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 // ── Handlers ──
@@ -638,7 +679,7 @@ pub async fn report_outcome(
     path = "/api/v1/workflows/hierarchical/search",
     params(HierarchicalSearchQuery),
     responses(
-        (status = 200, body = serde_json::Value),
+        (status = 200, body = HierarchicalSearchResponse),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -647,7 +688,7 @@ pub async fn report_outcome(
 pub async fn find_workflow_hierarchical(
     State(state): State<AppState>,
     Query(params): Query<HierarchicalSearchQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<HierarchicalSearchResponse>, ApiError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
         &state.db_pool,
@@ -658,45 +699,61 @@ pub async fn find_workflow_hierarchical(
     .map_err(|e| ApiError::InternalError {
         message: format!("hierarchical search failed: {e}"),
     })?;
-    let mut workflows: Vec<serde_json::Value> = rows
+
+    let mut workflows: Vec<HierarchicalWorkflowResult> = rows
         .into_iter()
-        .map(|r| {
-            serde_json::json!({
-                "workflow_id": r.id,
-                "canonical_name": r.canonical_name,
-                "generation": r.generation,
-                "goal": r.goal,
-                "parent_id": r.parent_id,
-                "metadata": r.metadata,
-                "created_at": r.created_at,
-            })
+        .map(|r| HierarchicalWorkflowResult {
+            workflow_id: r.id,
+            canonical_name: r.canonical_name,
+            generation: r.generation,
+            goal: r.goal,
+            parent_id: r.parent_id,
+            metadata: r.metadata,
+            created_at: r.created_at,
+            resolved_steps: None,
         })
         .collect();
+
     if params.resolve_to_latest {
         for w in &mut workflows {
-            let workflow_id: Uuid = w["workflow_id"].as_str().unwrap().parse().unwrap();
             let resolved = epigraph_db::WorkflowRepository::resolve_steps_to_heads(
                 &state.db_pool,
-                workflow_id,
+                w.workflow_id,
             )
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("resolve_to_latest failed: {e}"),
             })?;
-            if let Some(obj) = w.as_object_mut() {
-                obj.insert(
-                    "resolved_steps".to_string(),
-                    serde_json::to_value(resolved).unwrap(),
-                );
-            }
+            w.resolved_steps = Some(
+                resolved
+                    .into_iter()
+                    .map(|s| ResolvedStepResult {
+                        step_index: s.step_index,
+                        frozen_claim_id: s.frozen_claim_id,
+                        step_lineage_id: s.step_lineage_id,
+                        heads: s
+                            .heads
+                            .into_iter()
+                            .map(|h| LineageHeadResult {
+                                id: h.id,
+                                content: h.content,
+                                truth_value: h.truth_value,
+                                created_at: h.created_at,
+                            })
+                            .collect(),
+                        pending_resolution: s.pending_resolution,
+                    })
+                    .collect(),
+            );
         }
     }
 
-    Ok(Json(serde_json::json!({
-        "workflows": workflows,
-        "total": workflows.len(),
-        "resolve_to_latest": params.resolve_to_latest,
-    })))
+    let total = workflows.len();
+    Ok(Json(HierarchicalSearchResponse {
+        workflows,
+        total,
+        resolve_to_latest: params.resolve_to_latest,
+    }))
 }
 
 /// POST /api/v1/workflows/hierarchical/:id/outcome - Report execution outcome
