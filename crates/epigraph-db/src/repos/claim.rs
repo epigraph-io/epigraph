@@ -900,6 +900,58 @@ impl ClaimRepository {
         Ok(claims)
     }
 
+    /// Search workflow-tagged claims by content text match.
+    ///
+    /// Used by find_workflow MCP tool as a fallback when semantic search via
+    /// evidence embeddings returns insufficient results. Workflow claims are
+    /// the canonical storage; the legacy `workflows` table is mostly empty.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn search_by_label_and_text(
+        pool: &PgPool,
+        labels: &[String],
+        text: &str,
+        min_truth: f64,
+        limit: i64,
+    ) -> Result<Vec<Claim>, DbError> {
+        let limit = limit.clamp(1, 1000);
+        let pattern = format!("%{}%", text);
+        let rows = sqlx::query_as::<_, ClaimRow>(
+            r#"
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            FROM claims
+            WHERE labels @> $1
+              AND content ILIKE $2
+              AND truth_value >= $3
+            ORDER BY truth_value DESC, created_at DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(labels)
+        .bind(&pattern)
+        .bind(min_truth)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        let mut claims = Vec::with_capacity(rows.len());
+        for row in rows {
+            let truth_value = TruthValue::new(row.truth_value)?;
+            claims.push(claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            ));
+        }
+        Ok(claims)
+    }
+
     /// Count total number of claims
     ///
     /// # Errors
