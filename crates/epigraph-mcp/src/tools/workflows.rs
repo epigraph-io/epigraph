@@ -291,7 +291,7 @@ pub async fn find_workflow(
             &["workflow".to_string()],
             &params.goal,
             min_truth,
-            (limit * 2) as i64,
+            limit * 2,
         )
         .await
         .unwrap_or_else(|e| {
