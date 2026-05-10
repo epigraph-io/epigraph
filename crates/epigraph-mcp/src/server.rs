@@ -705,6 +705,19 @@ impl EpiGraphMcpFull {
         tools::sheaf::reconcile_sheaf(self, params).await
     }
 
+    // ── Themes (1 tool) ──
+
+    #[tool(
+        description = "Trigger server-side theme clustering via k-means over the claim corpus. Mirrors POST /api/v1/themes/build-from-corpus. Defaults: k_min=4, k_max=16, min_claims_per_theme=5, limit=500 (hard-capped at 500 here for OOM safety), label_prefix=\"auto\", centroid_dim=1536. Default `wipe_first=true` ensures clean rebuilds on each call. Pass `false` only for additive runs with a unique `label_prefix` (otherwise duplicate themes accumulate — see backlog: missing UNIQUE constraint on claim_themes.label)."
+    )]
+    async fn theme_cluster(
+        &self,
+        Parameters(params): Parameters<crate::tools::themes::ThemeClusterParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::themes::theme_cluster(self, params).await
+    }
+
     // ── RDF Triple Layer (3 tools) ──
 
     #[tool(
@@ -755,7 +768,7 @@ impl EpiGraphMcpFull {
 // for `list_tools` and `get_tool` verbatim — see
 // `rmcp-macros-0.15.0/src/tool_handler.rs` for the canonical body.
 //
-// `call_tool` is the single chokepoint for all 43 MCP tool invocations. We
+// `call_tool` is the single chokepoint for every MCP tool invocation. We
 // emit one `tool.invoked` event per call (closes #61's tool.invoked
 // requirement) and forward to the macro-built dispatcher unchanged. Event
 // emission is fire-and-forget; a failed event publish must not break tool
@@ -763,7 +776,7 @@ impl EpiGraphMcpFull {
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.read_only { "read-only" } else { "full" };
-        let tool_count = if self.read_only { 23 } else { 43 };
+        let tool_count = if self.read_only { 33 } else { 57 };
         ServerInfo {
             instructions: Some(format!(
                 "EpiGraph {mode} MCP server with {tool_count} epistemic tools."
@@ -778,7 +791,7 @@ impl ServerHandler for EpiGraphMcpFull {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        // Single chokepoint for all 43 MCP tool invocations: emit a durable
+        // Single chokepoint for every MCP tool invocation: emit a durable
         // tool.invoked event before dispatch, then forward to the
         // macro-built dispatcher. Emission happens pre-dispatch on purpose
         // — failed/rejected invocations still land in the log, which
