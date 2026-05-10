@@ -68,7 +68,7 @@ pub async fn theme_cluster(
         k_min: params.k_min.unwrap_or(4),
         k_max: params.k_max.unwrap_or(16),
         min_claims_per_theme: params.min_claims_per_theme.unwrap_or(5),
-        limit: params.limit.unwrap_or(500).min(MCP_LIMIT_CAP).max(1),
+        limit: params.limit.unwrap_or(500).clamp(1, MCP_LIMIT_CAP),
         label_prefix: params.label_prefix.unwrap_or_else(|| "auto".to_string()),
         wipe_first,
         centroid_dim: params.centroid_dim.unwrap_or(1536),
