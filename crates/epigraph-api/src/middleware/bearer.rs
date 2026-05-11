@@ -122,13 +122,11 @@ macro_rules! require_scope_extractor {
                 parts: &mut axum::http::request::Parts,
                 _state: &S,
             ) -> Result<Self, Self::Rejection> {
-                let auth = parts
-                    .extensions
-                    .get::<AuthContext>()
-                    .cloned()
-                    .ok_or(ApiError::Unauthorized {
+                let auth = parts.extensions.get::<AuthContext>().cloned().ok_or(
+                    ApiError::Unauthorized {
                         reason: "authentication required".into(),
-                    })?;
+                    },
+                )?;
                 if !auth.has_scope($scope) {
                     return Err(ApiError::Forbidden {
                         reason: format!("Missing required scope: {}", $scope),

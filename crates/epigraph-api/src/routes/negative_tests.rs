@@ -1426,10 +1426,7 @@ mod wrong_scope_with_malformed_body_tests {
     async fn record_outcome_wrong_scope_with_malformed_body_returns_403_not_422() {
         let claim_id = Uuid::new_v4();
         let router = Router::new()
-            .route(
-                "/api/v1/policies/:claim_id/outcome",
-                post(record_outcome),
-            )
+            .route("/api/v1/policies/:claim_id/outcome", post(record_outcome))
             .layer(Extension(read_only_auth()))
             .with_state(test_state());
 
