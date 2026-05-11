@@ -1236,3 +1236,200 @@ mod concurrency_tests {
         );
     }
 }
+
+// ============================================================================
+// Suite 3.4: Wrong-scope + malformed-body must return 403 (issue #128)
+//
+// Five handlers historically called `check_scopes` *inside* the handler body,
+// AFTER axum's `Json` extractor had already parsed (and possibly rejected)
+// the request body. With a malformed body, `Json` rejected with 422 before
+// the scope check could run, so wrong-scope callers saw 422 instead of 403.
+//
+// The fix is to use scope-aware `FromRequestParts` extractors that run BEFORE
+// any body extractor. These tests inject a wrong-scope `AuthContext` via an
+// `Extension` layer and send a malformed JSON body — they must return 403.
+//
+// The handlers under test are db-feature-gated, so these tests are too.
+// They use a lazy pg pool that never actually connects: the scope gate
+// returns 403 before any DB query fires.
+// ============================================================================
+
+#[cfg(all(test, feature = "db"))]
+mod wrong_scope_with_malformed_body_tests {
+    use crate::middleware::bearer::{AuthContext, ClientType};
+    use crate::routes::crud::reassign_claim;
+    use crate::routes::ownership::{assign_ownership, update_partition};
+    use crate::routes::policies::record_outcome;
+    use crate::routes::webhooks::register_webhook;
+    use crate::state::{ApiConfig, AppState};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::{post, put};
+    use axum::{Extension, Router};
+    use sqlx::postgres::PgPoolOptions;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    /// Build an AuthContext that has `claims:read` but lacks any write/admin
+    /// scopes, so it must be rejected with 403 by every handler under test.
+    fn read_only_auth() -> AuthContext {
+        AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: None,
+            owner_id: None,
+            client_type: ClientType::Service,
+            scopes: vec!["claims:read".to_string()],
+            jti: Uuid::new_v4(),
+        }
+    }
+
+    /// Lazy pg pool that never connects. Safe because the scope gate must
+    /// reject before any DB query fires — if a query *does* fire, the test
+    /// will hang or fail with a connection error, which is itself a regression
+    /// signal.
+    fn lazy_pool() -> epigraph_db::PgPool {
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nobody")
+            .expect("lazy pool construction must succeed")
+    }
+
+    fn test_state() -> AppState {
+        AppState::with_db(lazy_pool(), ApiConfig::default())
+    }
+
+    /// Build a POST request with a body that fails `Json` extraction.
+    ///
+    /// We use `{}` — valid JSON syntax but missing required fields — so axum's
+    /// `Json` extractor rejects with **422 Unprocessable Entity** (matching the
+    /// status described in issue #128). A syntactically-malformed body would
+    /// give 400, which is also a body-parse-before-scope-check failure but is
+    /// not the case the issue is titled after.
+    fn post_malformed(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap()
+    }
+
+    /// Build a PUT request with a body that fails `Json` extraction (see
+    /// [`post_malformed`] for rationale).
+    fn put_malformed(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // assign_ownership: claims:admin required → wrong-scope must 403
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "fails until #128 fix lands"]
+    async fn assign_ownership_wrong_scope_with_malformed_body_returns_403_not_422() {
+        let router = Router::new()
+            .route("/api/v1/ownership", post(assign_ownership))
+            .layer(Extension(read_only_auth()))
+            .with_state(test_state());
+
+        let resp = router
+            .oneshot(post_malformed("/api/v1/ownership"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "wrong-scope token + malformed body must be rejected at the scope gate (403), not at JSON parsing (422)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // update_partition: claims:admin required → wrong-scope must 403
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "fails until #128 fix lands"]
+    async fn update_partition_wrong_scope_with_malformed_body_returns_403_not_422() {
+        let node_id = Uuid::new_v4();
+        let router = Router::new()
+            .route("/api/v1/ownership/:node_id", put(update_partition))
+            .layer(Extension(read_only_auth()))
+            .with_state(test_state());
+
+        let resp = router
+            .oneshot(put_malformed(&format!("/api/v1/ownership/{node_id}")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "wrong-scope token + malformed body must return 403, not 422"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // reassign_claim: claims:admin required → wrong-scope must 403
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "fails until #128 fix lands"]
+    async fn reassign_claim_wrong_scope_with_malformed_body_returns_403_not_422() {
+        let router = Router::new()
+            .route("/api/v1/themes/reassign", post(reassign_claim))
+            .layer(Extension(read_only_auth()))
+            .with_state(test_state());
+
+        let resp = router
+            .oneshot(post_malformed("/api/v1/themes/reassign"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "wrong-scope token + malformed body must return 403, not 422"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // register_webhook: webhooks:write required → wrong-scope must 403
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "fails until #128 fix lands"]
+    async fn register_webhook_wrong_scope_with_malformed_body_returns_403_not_422() {
+        let router = Router::new()
+            .route("/api/v1/webhooks", post(register_webhook))
+            .layer(Extension(read_only_auth()))
+            .with_state(test_state());
+
+        let resp = router
+            .oneshot(post_malformed("/api/v1/webhooks"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "wrong-scope token + malformed body must return 403, not 422"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // record_outcome: scope mismatch flagged — see NEEDS_CONTEXT.
+    //
+    // The plan lists `claims:write` as the required scope for record_outcome,
+    // but the current handler enforces `claims:admin`. Per instructions, this
+    // mismatch is flagged and the handler is *not* converted in this change.
+    // A repro test is intentionally omitted here pending owner clarification.
+    // ------------------------------------------------------------------
+    #[allow(dead_code)]
+    fn _record_outcome_skip_marker() {
+        // Intentionally empty. Marker preserved so future readers see this
+        // wasn't an oversight.
+        let _ = record_outcome;
+    }
+}
