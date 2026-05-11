@@ -67,6 +67,7 @@ http = "1"
 
 [dev-dependencies]
 epigraph-ingest = { workspace = true }
+reqwest = { workspace = true }
 blake3 = { workspace = true }
 tower = "0.5"
 # `no-env-filter` is REQUIRED for integration tests in tests/* to capture
