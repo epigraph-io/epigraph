@@ -23,10 +23,7 @@ async fn mcp_listen_on_unix_socket_binds_and_accepts_connection() {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let sock_path = format!(
-        "/tmp/epigraph-mcp-test-{}-{nanos}.sock",
-        std::process::id()
-    );
+    let sock_path = format!("/tmp/epigraph-mcp-test-{}-{nanos}.sock", std::process::id());
     let _ = std::fs::remove_file(&sock_path);
 
     let listen_arg = format!("unix:{sock_path}");
@@ -34,9 +31,10 @@ async fn mcp_listen_on_unix_socket_binds_and_accepts_connection() {
 
     // Spawn the helper. It awaits forever (until aborted) once bound.
     let listen_arg_clone = listen_arg.clone();
-    let handle = tokio::spawn(async move {
-        epigraph_mcp::serve_with_listener(&listen_arg_clone, router).await
-    });
+    let handle =
+        tokio::spawn(
+            async move { epigraph_mcp::serve_with_listener(&listen_arg_clone, router).await },
+        );
 
     // Poll for the socket file to appear (up to 2s).
     let mut appeared = false;
