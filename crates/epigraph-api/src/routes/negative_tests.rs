@@ -1415,17 +1415,34 @@ mod wrong_scope_with_malformed_body_tests {
     }
 
     // ------------------------------------------------------------------
-    // record_outcome: scope mismatch flagged — see NEEDS_CONTEXT.
+    // record_outcome: claims:admin required → wrong-scope must 403
     //
-    // The plan lists `claims:write` as the required scope for record_outcome,
-    // but the current handler enforces `claims:admin`. Per instructions, this
-    // mismatch is flagged and the handler is *not* converted in this change.
-    // A repro test is intentionally omitted here pending owner clarification.
+    // The plan originally listed `claims:write` for this endpoint, but the
+    // existing handler enforces `claims:admin` (line 104 pre-fix). Plan
+    // was wrong; current scope preserved.
     // ------------------------------------------------------------------
-    #[allow(dead_code)]
-    fn _record_outcome_skip_marker() {
-        // Intentionally empty. Marker preserved so future readers see this
-        // wasn't an oversight.
-        let _ = record_outcome;
+
+    #[tokio::test]
+    async fn record_outcome_wrong_scope_with_malformed_body_returns_403_not_422() {
+        let claim_id = Uuid::new_v4();
+        let router = Router::new()
+            .route(
+                "/api/v1/policies/:claim_id/outcome",
+                post(record_outcome),
+            )
+            .layer(Extension(read_only_auth()))
+            .with_state(test_state());
+
+        let resp = router
+            .oneshot(post_malformed(&format!(
+                "/api/v1/policies/{claim_id}/outcome"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "wrong-scope token + malformed body must return 403, not 422"
+        );
     }
 }
