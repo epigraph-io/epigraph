@@ -48,11 +48,7 @@ pub async fn bearer_auth_middleware(
                     req.extensions_mut().insert(auth);
                     next.run(req).await
                 }
-                Err(e) => (
-                    StatusCode::UNAUTHORIZED,
-                    format!("Invalid token: {e}"),
-                )
-                    .into_response(),
+                Err(e) => (StatusCode::UNAUTHORIZED, format!("Invalid token: {e}")).into_response(),
             }
         }
         _ => (

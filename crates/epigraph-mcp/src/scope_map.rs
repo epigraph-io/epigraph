@@ -53,7 +53,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("sheaf_cohomology", "claims:read"),
     ("system_stats", "claims:read"),
     ("traverse", "claims:read"),
-
     // ─── claims:write ──────────────────────────────────────────────────
     ("assign_ownership", "claims:write"),
     ("batch_submit_claims", "claims:write"),
@@ -80,7 +79,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("update_labels", "claims:write"),
     ("update_with_evidence", "claims:write"),
     ("verify_claim", "claims:write"),
-
     // ─── claims:admin ──────────────────────────────────────────────────
     ("mark_duplicate", "claims:admin"),
     ("supersede_claim", "claims:admin"),
@@ -129,9 +127,8 @@ mod tests {
     /// exist anymore (catches deletions / renames).
     #[test]
     fn scope_map_has_no_stale_entries() {
-        let registered: std::collections::HashSet<String> = registered_tool_names()
-            .into_iter()
-            .collect();
+        let registered: std::collections::HashSet<String> =
+            registered_tool_names().into_iter().collect();
         let stale: Vec<&str> = SCOPE_MAP
             .iter()
             .map(|(name, _)| *name)

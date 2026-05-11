@@ -181,7 +181,14 @@ mod tests {
         let a = JwtConfig::from_secret(b"secret-one-at-least-32-bytes!!!");
         let b = JwtConfig::from_secret(b"secret-two-at-least-32-bytes!!!");
         let (token, _) = a
-            .issue_access_token(Uuid::new_v4(), vec![], "agent", None, None, Duration::minutes(5))
+            .issue_access_token(
+                Uuid::new_v4(),
+                vec![],
+                "agent",
+                None,
+                None,
+                Duration::minutes(5),
+            )
             .unwrap();
         assert!(b.validate_token(&token).is_err());
     }

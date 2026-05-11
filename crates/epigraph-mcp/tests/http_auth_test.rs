@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use chrono::Duration as ChronoDuration;
 use epigraph_auth::JwtConfig;
-use epigraph_mcp::auth::{McpAuthState, bearer_auth_middleware};
+use epigraph_mcp::auth::{bearer_auth_middleware, McpAuthState};
 use uuid::Uuid;
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -112,17 +112,12 @@ async fn spawn_server() -> std::net::SocketAddr {
 /// Build a reqwest client WITHOUT a global timeout (we manage timeouts per-read).
 /// A global timeout would abort before we can read incremental SSE chunks.
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .build()
-        .unwrap()
+    reqwest::Client::builder().build().unwrap()
 }
 
 /// Read SSE chunks until a non-empty `data:` line appears (the actual
 /// JSON-RPC payload) or until the deadline elapses.
-async fn read_sse_data(
-    resp: &mut reqwest::Response,
-    deadline: tokio::time::Instant,
-) -> String {
+async fn read_sse_data(resp: &mut reqwest::Response, deadline: tokio::time::Instant) -> String {
     let mut accumulated = String::new();
     loop {
         match tokio::time::timeout_at(deadline, resp.chunk()).await {
@@ -148,11 +143,7 @@ async fn read_sse_data(
 
 /// Perform the full MCP handshake (initialize + notifications/initialized) and
 /// return the session ID. Panics on unexpected failures.
-async fn mcp_handshake(
-    client: &reqwest::Client,
-    url: &str,
-    token: &str,
-) -> String {
+async fn mcp_handshake(client: &reqwest::Client, url: &str, token: &str) -> String {
     let init_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -406,7 +397,7 @@ async fn right_scope_passes_auth() {
         "Forbidden",
         "Missing Authorization",
         "Invalid token",
-        "claims:read",   // scope guard reports the *required* scope on failure
+        "claims:read", // scope guard reports the *required* scope on failure
         "auth context",
     ];
     for s in &auth_strings {
