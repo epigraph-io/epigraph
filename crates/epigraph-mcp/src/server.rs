@@ -421,7 +421,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Idempotent."
+        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Same-lineage improvement only: the new variant's canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param; cross-lineage variants are not supported. Each call produces a new generation."
     )]
     async fn improve_workflow_hierarchy(
         &self,

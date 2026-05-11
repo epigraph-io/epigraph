@@ -138,13 +138,16 @@ impl WorkflowRepository {
         pool: &PgPool,
         canonical_name: &str,
     ) -> Result<Option<i32>, sqlx::Error> {
-        let row: Option<(Option<i32>,)> = sqlx::query_as(
+        // `SELECT MAX(...)` always returns exactly one row in PostgreSQL —
+        // `NULL` when no source rows match. `fetch_one` matches that contract;
+        // the inner `Option<i32>` carries the "no matching rows" signal.
+        let (max_gen,): (Option<i32>,) = sqlx::query_as(
             "SELECT MAX(generation) FROM workflows WHERE canonical_name = $1",
         )
         .bind(canonical_name)
-        .fetch_optional(pool)
+        .fetch_one(pool)
         .await?;
-        Ok(row.and_then(|(g,)| g))
+        Ok(max_gen)
     }
 
     /// Semantic search for workflows by embedding with hybrid scoring.
