@@ -37,11 +37,17 @@ pub async fn serve_with_listener(listen: &str, router: axum::Router) -> std::io:
     #[cfg(unix)]
     if let Some(path) = listen.strip_prefix("unix:") {
         // Best-effort cleanup of a stale socket from a previous run.
+        //
+        // NOTE: AF_UNIX has no SO_REUSEADDR equivalent. If two MCP processes
+        // start concurrently against the same path, the second's remove_file
+        // unlinks the first's just-bound inode and the first listener is
+        // silently orphaned. We rely on systemd (single-instance unit) to
+        // ensure this race never fires in production.
         let _ = std::fs::remove_file(path);
         let listener = tokio::net::UnixListener::bind(path)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
-        tracing::info!("EpiGraph MCP server listening on unix:{path}/mcp");
+        tracing::info!("EpiGraph MCP server listening on unix:{path} (HTTP path: /mcp)");
         return axum::serve(listener, router).await;
     }
 
