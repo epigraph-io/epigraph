@@ -126,17 +126,15 @@ pub async fn improve_workflow_hierarchy_via_pool(
     parent_canonical_name: &str,
     mut extraction: WorkflowExtraction,
 ) -> Result<ImproveWorkflowHierarchyResponse, McpError> {
-    let parent_max = epigraph_db::WorkflowRepository::max_generation_by_canonical(
-        pool,
-        parent_canonical_name,
-    )
-    .await
-    .map_err(internal_error)?
-    .ok_or_else(|| {
-        invalid_params(format!(
-            "no workflow with canonical_name={parent_canonical_name}"
-        ))
-    })?;
+    let parent_max =
+        epigraph_db::WorkflowRepository::max_generation_by_canonical(pool, parent_canonical_name)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "no workflow with canonical_name={parent_canonical_name}"
+                ))
+            })?;
 
     let new_generation = parent_max + 1;
 
