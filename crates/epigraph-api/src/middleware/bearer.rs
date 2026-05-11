@@ -9,7 +9,7 @@ use axum::{extract::State, http::Request, middleware::Next, response::Response};
 use crate::errors::ApiError;
 use crate::state::AppState;
 
-pub use epigraph_auth::AuthContext;
+pub use epigraph_auth::{AuthContext, ClientType};
 
 /// Middleware: extract Bearer token, validate JWT, inject AuthContext.
 ///
