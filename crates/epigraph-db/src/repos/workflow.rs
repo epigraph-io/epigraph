@@ -128,6 +128,25 @@ impl WorkflowRepository {
         Ok(row.map(|(id,)| id))
     }
 
+    /// Return the highest existing `generation` for the given `canonical_name`,
+    /// or `None` if no rows exist. Used by `improve_workflow_hierarchy` to
+    /// pick the next generation for a variant.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the underlying query fails.
+    pub async fn max_generation_by_canonical(
+        pool: &PgPool,
+        canonical_name: &str,
+    ) -> Result<Option<i32>, sqlx::Error> {
+        let row: Option<(Option<i32>,)> = sqlx::query_as(
+            "SELECT MAX(generation) FROM workflows WHERE canonical_name = $1",
+        )
+        .bind(canonical_name)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.and_then(|(g,)| g))
+    }
+
     /// Semantic search for workflows by embedding with hybrid scoring.
     pub async fn find_by_embedding(
         pool: &PgPool,
@@ -650,6 +669,45 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn max_generation_by_canonical_returns_highest(pool: sqlx::PgPool) {
+        // Insert two generations of the same canonical_name.
+        WorkflowRepository::insert_root(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "max-gen-test",
+            1,
+            "first",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        WorkflowRepository::insert_root(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "max-gen-test",
+            3,
+            "third",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        let max = WorkflowRepository::max_generation_by_canonical(&pool, "max-gen-test")
+            .await
+            .unwrap();
+        assert_eq!(max, Some(3));
+
+        // Missing canonical_name returns None.
+        let missing =
+            WorkflowRepository::max_generation_by_canonical(&pool, "does-not-exist-at-all")
+                .await
+                .unwrap();
+        assert_eq!(missing, None);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

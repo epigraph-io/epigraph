@@ -12,9 +12,9 @@
 
 use rmcp::model::*;
 
-use crate::errors::{internal_error, McpError};
+use crate::errors::{internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
-use crate::types::IngestWorkflowParams;
+use crate::types::{ImproveWorkflowHierarchyParams, IngestWorkflowParams};
 
 use epigraph_ingest::workflow::WorkflowExtraction;
 
@@ -84,6 +84,91 @@ pub async fn ingest_workflow(
     params: IngestWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
     do_ingest_workflow(server, &params.extraction).await
+}
+
+// ── improve_workflow_hierarchy ─────────────────────────────────────────────
+//
+// Creates a generation-incremented variant of an existing hierarchical
+// workflow lineage. Idempotent on `(canonical_name, generation)` via the
+// underlying executor's gate: a fully-formed variant at the resolved
+// generation is detected and reported as `already_ingested`. Note that the
+// resolved generation is always `max(generation) + 1` for the canonical
+// lineage, so back-to-back calls each produce a fresh generation rather
+// than no-oping the second call.
+//
+// We do NOT add the `'workflow'` label to the thesis claim. That label is
+// reserved for FLAT workflow claims (the `store_workflow` / `improve_workflow`
+// lineage). Hierarchical workflows live in the `workflows` table and use
+// `kind: workflow_thesis` on the root claim, matching `do_ingest_workflow`'s
+// behavior.
+
+#[derive(Debug, serde::Serialize)]
+pub struct ImproveWorkflowHierarchyResponse {
+    pub parent_canonical_name: String,
+    pub parent_generation: i32,
+    pub new_generation: i32,
+    pub workflow_id: String,
+    pub claims_ingested: usize,
+    pub already_ingested: bool,
+}
+
+/// Pool-only logic for `improve_workflow_hierarchy`. Resolves the max
+/// generation for `parent_canonical_name`, overwrites the caller-supplied
+/// extraction source fields with the resolved variant identity, then calls
+/// `do_ingest_workflow_via_pool` to perform the actual hierarchical ingest.
+///
+/// Caller-supplied values for `extraction.source.canonical_name`,
+/// `extraction.source.generation`, and `extraction.source.parent_canonical_name`
+/// are intentionally OVERWRITTEN so that the variant's identity is dictated
+/// by the resolver, not the caller.
+pub async fn improve_workflow_hierarchy_via_pool(
+    pool: &sqlx::PgPool,
+    parent_canonical_name: &str,
+    mut extraction: WorkflowExtraction,
+) -> Result<ImproveWorkflowHierarchyResponse, McpError> {
+    let parent_max = epigraph_db::WorkflowRepository::max_generation_by_canonical(
+        pool,
+        parent_canonical_name,
+    )
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| {
+        invalid_params(format!(
+            "no workflow with canonical_name={parent_canonical_name}"
+        ))
+    })?;
+
+    let new_generation = parent_max + 1;
+
+    extraction.source.canonical_name = parent_canonical_name.to_string();
+    extraction.source.generation = u32::try_from(new_generation)
+        .map_err(|e| internal_error(format!("new_generation does not fit in u32: {e}")))?;
+    extraction.source.parent_canonical_name = Some(parent_canonical_name.to_string());
+
+    let response = do_ingest_workflow_via_pool(pool, &extraction).await?;
+
+    Ok(ImproveWorkflowHierarchyResponse {
+        parent_canonical_name: parent_canonical_name.to_string(),
+        parent_generation: parent_max,
+        new_generation,
+        workflow_id: response.workflow_id,
+        claims_ingested: response.claims_ingested,
+        already_ingested: response.already_ingested,
+    })
+}
+
+/// MCP tool entry point for `improve_workflow_hierarchy`.
+pub async fn improve_workflow_hierarchy(
+    server: &EpiGraphMcpFull,
+    params: ImproveWorkflowHierarchyParams,
+) -> Result<CallToolResult, McpError> {
+    let response = improve_workflow_hierarchy_via_pool(
+        &server.pool,
+        &params.parent_canonical_name,
+        params.extraction,
+    )
+    .await?;
+    success_json(&response)
 }
 
 // ── Integration tests ──────────────────────────────────────────────────────

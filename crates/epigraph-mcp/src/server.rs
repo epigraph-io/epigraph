@@ -402,7 +402,7 @@ impl EpiGraphMcpFull {
         tools::workflows::deprecate_workflow(self, params).await
     }
 
-    // ── Hierarchical Workflows (3 tools) ──
+    // ── Hierarchical Workflows (4 tools) ──
     //
     // Counterparts to the flat `store_workflow` family above. These operate
     // on the `workflows` table where every step is a claim node connected
@@ -418,6 +418,17 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
         tools::workflow_ingest::ingest_workflow(self, params).await
+    }
+
+    #[tool(
+        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Idempotent."
+    )]
+    async fn improve_workflow_hierarchy(
+        &self,
+        Parameters(params): Parameters<ImproveWorkflowHierarchyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::workflow_ingest::improve_workflow_hierarchy(self, params).await
     }
 
     #[tool(
@@ -776,7 +787,7 @@ impl EpiGraphMcpFull {
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.read_only { "read-only" } else { "full" };
-        let tool_count = if self.read_only { 33 } else { 57 };
+        let tool_count = if self.read_only { 33 } else { 58 };
         ServerInfo {
             instructions: Some(format!(
                 "EpiGraph {mode} MCP server with {tool_count} epistemic tools."
