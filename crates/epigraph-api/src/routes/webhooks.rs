@@ -88,13 +88,12 @@ pub fn sign_webhook_payload(secret: &str, payload: &[u8]) -> String {
 /// - 201 Created: Webhook subscription registered successfully
 pub async fn register_webhook(
     State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    scope: crate::middleware::bearer::RequireScopeWebhooksWrite,
     Json(registration): Json<WebhookRegistration>,
 ) -> Result<(StatusCode, Json<WebhookSubscription>), ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["webhooks:write"])?;
-    }
+    // Scope gate ran in the extractor; if we reach the body, the caller has
+    // `webhooks:write`. See `RequireScopeWebhooksWrite` in `middleware::bearer`.
+    let auth = &scope.0;
 
     // 1. Validate URL is not empty
     if registration.url.trim().is_empty() {
@@ -115,9 +114,7 @@ pub async fn register_webhook(
     }
 
     // 3. Determine owner principal from auth context
-    let owner_id = auth_ctx
-        .as_ref()
-        .map(|axum::Extension(auth)| auth.owner_id.unwrap_or(auth.client_id));
+    let owner_id = Some(auth.owner_id.unwrap_or(auth.client_id));
 
     // 4. Create the subscription
     let subscription = WebhookSubscription {

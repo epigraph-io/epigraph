@@ -92,16 +92,12 @@ pub async fn list_network_policies(
 #[cfg(feature = "db")]
 pub async fn record_outcome(
     State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    _scope: crate::middleware::bearer::RequireScopeAdmin,
     Path(claim_id): Path<Uuid>,
     Json(req): Json<OutcomeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = auth_ctx
-        .ok_or(ApiError::Unauthorized {
-            reason: "record_outcome requires authentication".into(),
-        })?
-        .0;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+    // Scope already verified by extractor: caller has `claims:admin`.
+    // See `RequireScopeAdmin` in `middleware::bearer`.
     let strength = req.strength.clamp(0.0, 1.0);
     let signed = if req.supports { strength } else { -strength };
 

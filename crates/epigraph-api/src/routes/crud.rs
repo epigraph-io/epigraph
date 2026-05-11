@@ -980,15 +980,11 @@ pub struct ReassignClaimRequest {
 #[cfg(feature = "db")]
 pub async fn reassign_claim(
     State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    _scope: crate::middleware::bearer::RequireScopeAdmin,
     Json(request): Json<ReassignClaimRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = auth_ctx
-        .ok_or(ApiError::Unauthorized {
-            reason: "reassign_claim requires authentication".into(),
-        })?
-        .0;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+    // Scope gate ran in the extractor; if we reach the body, the caller has
+    // `claims:admin`. See `RequireScopeAdmin` in `middleware::bearer`.
 
     use epigraph_db::ClaimThemeRepository;
 
