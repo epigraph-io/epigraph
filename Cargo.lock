@@ -1210,6 +1210,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "ed25519-dalek",
+ "epigraph-auth",
  "epigraph-cli",
  "epigraph-core",
  "epigraph-crypto",
@@ -1255,6 +1256,16 @@ dependencies = [
  "utoipa",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "epigraph-auth"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "jsonwebtoken",
+ "serde",
+ "uuid",
 ]
 
 [[package]]

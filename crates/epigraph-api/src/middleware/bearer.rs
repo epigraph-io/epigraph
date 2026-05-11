@@ -5,36 +5,11 @@
 //! into request extensions.
 
 use axum::{extract::State, http::Request, middleware::Next, response::Response};
-use uuid::Uuid;
 
 use crate::errors::ApiError;
 use crate::state::AppState;
 
-/// Authorization context injected into request extensions.
-/// Replaces `VerifiedAgent` for OAuth2-authenticated requests.
-#[derive(Debug, Clone)]
-pub struct AuthContext {
-    pub client_id: Uuid,
-    pub agent_id: Option<Uuid>,
-    pub owner_id: Option<Uuid>,
-    pub client_type: ClientType,
-    pub scopes: Vec<String>,
-    pub jti: Uuid,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ClientType {
-    Agent,
-    Human,
-    Service,
-}
-
-impl AuthContext {
-    /// Check if the context has a specific scope.
-    pub fn has_scope(&self, scope: &str) -> bool {
-        self.scopes.iter().any(|s| s == scope)
-    }
-}
+pub use epigraph_auth::AuthContext;
 
 /// Middleware: extract Bearer token, validate JWT, inject AuthContext.
 ///
@@ -71,21 +46,7 @@ pub async fn bearer_auth_middleware(
                     })?;
 
             // Build AuthContext
-            let client_type = match claims.client_type.as_str() {
-                "agent" => ClientType::Agent,
-                "human" => ClientType::Human,
-                "service" => ClientType::Service,
-                _ => ClientType::Service,
-            };
-
-            let auth_ctx = AuthContext {
-                client_id: claims.sub,
-                agent_id: claims.agent_id,
-                owner_id: claims.owner_id,
-                client_type,
-                scopes: claims.scopes,
-                jti: claims.jti,
-            };
+            let auth_ctx: AuthContext = claims.into();
 
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
