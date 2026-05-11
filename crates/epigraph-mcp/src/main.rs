@@ -14,6 +14,11 @@
 //! # HTTP transport (for curl / remote agents — requires explicit opt-in)
 //! # WARNING: exposes all mutation tools without auth; see issue #122 for proper fix.
 //! epigraph-mcp-full --database-url postgres://user:pass@host/db --listen 127.0.0.1:8080 --allow-unauthenticated-http
+//!
+//! # Unix socket transport (Caddy proxies via reverse_proxy unix://...; eliminates
+//! # the 127.0.0.1 localhost-bypass surface — only processes with filesystem access
+//! # can connect; socket is created with 0660 perms)
+//! epigraph-mcp-full --database-url postgres://user:pass@host/db --listen unix:/run/epigraph/mcp.sock --allow-unauthenticated-http
 //! ```
 
 use std::fmt::Write;
@@ -45,7 +50,9 @@ struct Cli {
     #[arg(long, env = "OPENAI_API_KEY")]
     openai_api_key: Option<String>,
 
-    /// Listen on HTTP address (e.g., 127.0.0.1:8080). If omitted, uses stdio transport.
+    /// Listen on HTTP. Accepts either `host:port` (TCP) or `unix:/abs/path` (Unix socket).
+    /// Unix sockets close the localhost-bypass surface: only processes with filesystem
+    /// access can connect. If omitted, uses stdio transport.
     #[arg(long)]
     listen: Option<String>,
 
@@ -135,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("EpiGraph MCP server running in {mode} mode");
 
     if let Some(addr) = &cli.listen {
-        // ── HTTP transport ──────────────────────────────────────────────
+        // ── HTTP transport (TCP or Unix socket) ────────────────────────
         // (auth gate already enforced above at startup; --allow-unauthenticated-http was checked)
         use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
         use rmcp::transport::streamable_http_server::{
@@ -160,9 +167,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let router = axum::Router::new().nest_service("/mcp", service);
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!("EpiGraph MCP server listening on http://{addr}/mcp ({mode})");
-        axum::serve(listener, router).await?;
+        tracing::info!("Starting EpiGraph MCP server in {mode} mode on {addr}");
+        epigraph_mcp::serve_with_listener(addr, router).await?;
     } else {
         // ── Stdio transport (default) ───────────────────────────────────
         let server = EpiGraphMcpFull::new(pool, signer, embedder, cli.read_only);
