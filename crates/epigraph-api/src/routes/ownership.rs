@@ -86,15 +86,11 @@ fn default_limit() -> i64 {
 #[cfg(feature = "db")]
 pub async fn assign_ownership(
     State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    _scope: crate::middleware::bearer::RequireScopeAdmin,
     Json(request): Json<AssignOwnershipRequest>,
 ) -> Result<(StatusCode, Json<OwnershipResponse>), ApiError> {
-    let auth = auth_ctx
-        .ok_or(ApiError::Unauthorized {
-            reason: "assign_ownership requires authentication".into(),
-        })?
-        .0;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+    // Scope gate ran in the extractor; if we reach the body, the caller has
+    // `claims:admin`. See `RequireScopeAdmin` in `middleware::bearer`.
 
     let pool = &state.db_pool;
 
@@ -160,16 +156,12 @@ pub async fn owned_nodes(
 #[cfg(feature = "db")]
 pub async fn update_partition(
     State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    _scope: crate::middleware::bearer::RequireScopeAdmin,
     Path(node_id): Path<Uuid>,
     Json(request): Json<UpdatePartitionRequest>,
 ) -> Result<Json<OwnershipResponse>, ApiError> {
-    let auth = auth_ctx
-        .ok_or(ApiError::Unauthorized {
-            reason: "update_partition requires authentication".into(),
-        })?
-        .0;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+    // Scope gate ran in the extractor; if we reach the body, the caller has
+    // `claims:admin`. See `RequireScopeAdmin` in `middleware::bearer`.
 
     let pool = &state.db_pool;
 

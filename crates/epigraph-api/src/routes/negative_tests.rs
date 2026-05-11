@@ -1330,7 +1330,6 @@ mod wrong_scope_with_malformed_body_tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "fails until #128 fix lands"]
     async fn assign_ownership_wrong_scope_with_malformed_body_returns_403_not_422() {
         let router = Router::new()
             .route("/api/v1/ownership", post(assign_ownership))
@@ -1353,7 +1352,6 @@ mod wrong_scope_with_malformed_body_tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "fails until #128 fix lands"]
     async fn update_partition_wrong_scope_with_malformed_body_returns_403_not_422() {
         let node_id = Uuid::new_v4();
         let router = Router::new()
@@ -1377,7 +1375,6 @@ mod wrong_scope_with_malformed_body_tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "fails until #128 fix lands"]
     async fn reassign_claim_wrong_scope_with_malformed_body_returns_403_not_422() {
         let router = Router::new()
             .route("/api/v1/themes/reassign", post(reassign_claim))
@@ -1400,7 +1397,6 @@ mod wrong_scope_with_malformed_body_tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "fails until #128 fix lands"]
     async fn register_webhook_wrong_scope_with_malformed_body_returns_403_not_422() {
         let router = Router::new()
             .route("/api/v1/webhooks", post(register_webhook))
