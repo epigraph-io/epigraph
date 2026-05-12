@@ -9,7 +9,6 @@
 //! - `GET    /api/v1/workflows/search`        - Search workflows by goal
 //! - `GET    /api/v1/workflows`               - List workflows
 //! - `POST   /api/v1/workflows/:id/outcome`   - Report execution outcome
-//! - `POST   /api/v1/workflows/:id/improve`   - Create improved variant
 //! - `DELETE /api/v1/workflows/:id`            - Deprecate workflow
 //! - `POST   /api/v1/workflows/:id/behavioral-executions` - Record behavioral execution
 
@@ -74,17 +73,6 @@ pub struct StepExecution {
     pub actual: String,
     pub deviated: bool,
     pub deviation_reason: Option<String>,
-}
-
-#[cfg(feature = "db")]
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct ImproveWorkflowRequest {
-    pub goal: Option<String>,
-    pub steps: Option<Vec<String>>,
-    pub prerequisites: Option<Vec<String>>,
-    pub expected_outcome: Option<String>,
-    pub change_rationale: String,
-    pub tags: Option<Vec<String>>,
 }
 
 #[cfg(feature = "db")]
@@ -1024,166 +1012,6 @@ pub async fn evolve_step(
         edge_type: result.edge_type,
         edge_id: result.edge_id,
     }))
-}
-
-/// POST /api/v1/workflows/:id/improve - Create an improved variant.
-#[cfg(feature = "db")]
-#[utoipa::path(
-    post,
-    path = "/api/v1/workflows/{id}/improve",
-    params(("id" = uuid::Uuid, Path, description = "UUID of the workflow to improve")),
-    request_body = serde_json::Value,
-    responses(
-        (status = 200, body = serde_json::Value),
-        (status = 404),
-        (status = 500),
-    ),
-    security(("ed25519_signature" = [])),
-    tag = "workflows"
-)]
-pub async fn improve_workflow(
-    State(state): State<AppState>,
-    Path(parent_id): Path<Uuid>,
-    Json(request): Json<ImproveWorkflowRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    // Fetch parent workflow
-    let parent = sqlx::query_as::<_, WorkflowContentRow>(
-        "SELECT id, content, truth_value, properties FROM claims \
-         WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(parent_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch parent workflow: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".into(),
-        id: parent_id.to_string(),
-    })?;
-
-    // Parse parent content
-    let parent_content: serde_json::Value =
-        serde_json::from_str(&parent.content).unwrap_or(serde_json::json!({}));
-
-    let parent_gen = parent
-        .properties
-        .as_ref()
-        .and_then(|p| p.get("generation"))
-        .and_then(|g| g.as_i64())
-        .unwrap_or(0);
-
-    // Build variant content (inherit from parent where not overridden)
-    let goal = request
-        .goal
-        .unwrap_or_else(|| parent_content["goal"].as_str().unwrap_or("").to_string());
-    let steps: Vec<String> = request.steps.unwrap_or_else(|| {
-        parent_content["steps"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
-    });
-
-    let content = serde_json::json!({
-        "goal": goal,
-        "steps": steps,
-        "prerequisites": request.prerequisites.as_deref()
-            .unwrap_or(parent_content["prerequisites"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
-                .unwrap_or_default()
-                .as_slice()),
-        "expected_outcome": request.expected_outcome
-            .as_deref()
-            .unwrap_or(parent_content["expected_outcome"].as_str().unwrap_or("")),
-        "tags": request.tags.as_deref().unwrap_or(&[]),
-        "change_rationale": request.change_rationale,
-    });
-
-    // Create variant claim
-    let sys_agent_id = get_or_create_system_agent(&state.db_pool).await?;
-    let variant_content_str = content.to_string();
-    let variant_hash = epigraph_crypto::ContentHasher::hash(variant_content_str.as_bytes());
-    let variant_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties) \
-         VALUES ($1, $2, $3, 0.5, ARRAY['workflow'], $4) \
-         RETURNING id",
-    )
-    .bind(&variant_content_str)
-    .bind(variant_hash.as_slice())
-    .bind(sys_agent_id)
-    .bind(serde_json::json!({
-        "generation": parent_gen + 1,
-        "use_count": 0,
-        "success_count": 0,
-        "failure_count": 0,
-        "avg_variance": 0.0,
-        "parent_id": parent_id,
-    }))
-    .fetch_one(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to create variant: {e}"),
-    })?;
-
-    // Create supersedes edge: the new improved variant supersedes the parent.
-    // (Was 'variant_of' historically; switched to 'supersedes' so the relationship
-    // is in the edges API allowlist and matches the flat-to-hierarchical
-    // migration's back-edge convention.)
-    let _ = sqlx::query(
-        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship, properties) \
-         VALUES ($1, $2, 'claim', 'claim', 'supersedes', $3)",
-    )
-    .bind(variant_id)
-    .bind(parent_id)
-    .bind(serde_json::json!({
-        "change_rationale": request.change_rationale,
-        "parent_truth_at_fork": parent.truth_value,
-    }))
-    .execute(&state.db_pool)
-    .await;
-
-    // Materialize agent --AUTHORED--> variant edge
-    let _ = epigraph_db::EdgeRepository::create(
-        &state.db_pool,
-        sys_agent_id,
-        "agent",
-        variant_id,
-        "claim",
-        "AUTHORED",
-        None,
-        None,
-        None,
-    )
-    .await;
-
-    // Embed variant
-    let mut embedded = false;
-    if let Some(embedder) = state.embedding_service() {
-        let embed_text = format!("{}\n{}", goal, steps.join("\n"));
-        if let Ok(vec) = embedder.generate(&embed_text).await {
-            let emb_str = format_embedding(&vec);
-            let _ = sqlx::query("UPDATE claims SET embedding = $2::vector WHERE id = $1")
-                .bind(variant_id)
-                .bind(&emb_str)
-                .execute(&state.db_pool)
-                .await;
-            embedded = true;
-        }
-    }
-
-    Ok(Json(serde_json::json!({
-        "variant_id": variant_id,
-        "parent_id": parent_id,
-        "goal": goal,
-        "step_count": steps.len(),
-        "generation": parent_gen + 1,
-        "truth_value": 0.5,
-        "embedded": embedded,
-    })))
 }
 
 /// DELETE /api/v1/workflows/:id - Deprecate a workflow.

@@ -1,7 +1,5 @@
 #![allow(clippy::wildcard_imports)]
 
-use std::fmt::Write;
-
 use rmcp::model::*;
 
 use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
@@ -9,13 +7,11 @@ use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto;
 use crate::types::*;
 
-use epigraph_core::{
-    AgentId, Claim, Evidence, EvidenceType, Methodology, ReasoningTrace, TraceInput, TruthValue,
-};
+use epigraph_core::{AgentId, Claim, Evidence, EvidenceType, TruthValue};
 use epigraph_crypto::ContentHasher;
 use epigraph_db::{
     BehavioralExecutionRepository, ClaimRepository, EdgeRepository, EvidenceRepository,
-    ReasoningTraceRepository, WorkflowRepository,
+    WorkflowRepository,
 };
 
 use crate::embed::format_pgvector;
@@ -36,21 +32,6 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
-}
-
-fn workflow_embed_text(goal: &str, steps: &[String], prereqs: &[String]) -> String {
-    let mut text = format!("Workflow: {goal}. Steps: ");
-    for (i, step) in steps.iter().enumerate() {
-        if i > 0 {
-            text.push_str(", ");
-        }
-        let _ = write!(text, "{}. {}", i + 1, step);
-    }
-    if !prereqs.is_empty() {
-        text.push_str(". Prerequisites: ");
-        text.push_str(&prereqs.join(", "));
-    }
-    text
 }
 
 fn parse_workflow_content(content: &str) -> (String, Vec<String>, Vec<String>, Option<String>) {
@@ -79,6 +60,18 @@ fn parse_workflow_content(content: &str) -> (String, Vec<String>, Vec<String>, O
     )
 }
 
+/// Lowercase ASCII slug; non-alnum -> `-`; collapse runs; trim.
+fn slugify_workflow_goal(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// Store a new hierarchical workflow.
 ///
 /// Input shape stays simple (`goal` + `steps[]`); internally builds a
@@ -90,18 +83,53 @@ pub async fn store_workflow(
     server: &EpiGraphMcpFull,
     params: StoreWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
-    let canonical_name = crate::migrate_flat::slugify(&params.goal);
+    use epigraph_ingest::common::schema::ThesisDerivation;
+    use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
+    use epigraph_ingest::workflow::WorkflowExtraction;
+
+    let canonical_name = slugify_workflow_goal(&params.goal);
     let prereqs = params.prerequisites.unwrap_or_default();
     let tags = params.tags.unwrap_or_default();
 
-    let parsed = crate::migrate_flat::FlatContent {
-        goal: params.goal.clone(),
-        steps: params.steps.clone(),
-        prerequisites: prereqs,
-        expected_outcome: params.expected_outcome.clone(),
-        tags,
+    let phases = if params.steps.is_empty() {
+        vec![]
+    } else {
+        vec![Phase {
+            title: "Body".to_string(),
+            // `summary = "Body"` (not goal) avoids a `compound_claim_id`
+            // collision with the thesis claim — both would hash the same
+            // (content_hash, canonical_name) tuple if both used the goal.
+            summary: "Body".to_string(),
+            steps: params
+                .steps
+                .iter()
+                .map(|t| Step {
+                    compound: t.clone(),
+                    rationale: String::new(),
+                    operations: vec![],
+                    generality: vec![],
+                    confidence: 0.8,
+                })
+                .collect(),
+        }]
     };
-    let extraction = crate::migrate_flat::build_extraction(&parsed, canonical_name, 0, None);
+
+    let extraction = WorkflowExtraction {
+        source: WorkflowSource {
+            canonical_name: canonical_name.clone(),
+            goal: params.goal.clone(),
+            generation: 0,
+            parent_canonical_name: None,
+            authors: vec![],
+            expected_outcome: params.expected_outcome.clone(),
+            tags,
+            metadata: serde_json::json!({ "prerequisites": prereqs }),
+        },
+        thesis: Some(params.goal.clone()),
+        thesis_derivation: ThesisDerivation::default(),
+        phases,
+        relationships: vec![],
+    };
 
     let response =
         crate::tools::workflow_ingest::do_ingest_workflow_via_pool(&server.pool, &extraction)
@@ -494,180 +522,6 @@ pub async fn report_workflow_outcome(
         } else {
             0.0
         },
-    })
-}
-
-pub async fn improve_workflow(
-    server: &EpiGraphMcpFull,
-    params: ImproveWorkflowParams,
-) -> Result<CallToolResult, McpError> {
-    let parent_id = parse_uuid(&params.parent_workflow_id)?;
-    let parent =
-        ClaimRepository::get_by_id(&server.pool, epigraph_core::ClaimId::from_uuid(parent_id))
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| invalid_params(format!("parent workflow {parent_id} not found")))?;
-
-    let (parent_goal, parent_steps, parent_prereqs, parent_outcome) =
-        parse_workflow_content(&parent.content);
-    let parent_val: serde_json::Value = serde_json::from_str(&parent.content).unwrap_or_default();
-    let parent_gen = parent_val
-        .get("generation")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-    let parent_tags: Vec<String> = parent_val
-        .get("tags")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    let goal = params.goal.unwrap_or(parent_goal);
-    let steps = params.steps.unwrap_or(parent_steps);
-    let prereqs = params.prerequisites.unwrap_or(parent_prereqs);
-    let expected_outcome = params.expected_outcome.or(parent_outcome);
-    let generation = parent_gen + 1;
-
-    let mut tags = parent_tags;
-    if let Some(extra) = params.tags {
-        tags.extend(extra);
-    }
-    tags.sort();
-    tags.dedup();
-
-    let content = serde_json::json!({
-        "goal": goal,
-        "steps": steps,
-        "prerequisites": prereqs,
-        "expected_outcome": expected_outcome,
-        "tags": tags,
-        "type": "workflow",
-        "generation": generation,
-        "parent_id": parent_id.to_string(),
-        "change_rationale": params.change_rationale,
-        "use_count": 0,
-        "success_count": 0,
-        "failure_count": 0,
-        "avg_variance": 1.0,
-    });
-    let content_str = serde_json::to_string(&content).map_err(internal_error)?;
-
-    let agent_id = server.agent_id().await?;
-    let agent_id_typed = AgentId::from_uuid(agent_id);
-    let pub_key = server.signer.public_key();
-
-    let mut claim = Claim::new(
-        content_str.clone(),
-        agent_id_typed,
-        pub_key,
-        TruthValue::clamped(0.5),
-    );
-    claim.content_hash = ContentHasher::hash(content_str.as_bytes());
-    claim.signature = Some(server.signer.sign(&claim.content_hash));
-
-    let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "improve_workflow")
-            .await?;
-    let claim_uuid = claim.id.as_uuid();
-
-    let embedded = if was_created {
-        let evidence_text = format!(
-            "Improved variant of workflow {}. Rationale: {}",
-            parent_id, params.change_rationale
-        );
-        let evidence_hash = ContentHasher::hash(evidence_text.as_bytes());
-        let mut evidence = Evidence::new(
-            agent_id_typed,
-            pub_key,
-            evidence_hash,
-            EvidenceType::Testimony {
-                source: "mcp-workflow-improve".to_string(),
-                testified_at: chrono::Utc::now(),
-                verification: None,
-            },
-            Some(evidence_text),
-            claim.id,
-        );
-        evidence.signature = Some(server.signer.sign(&evidence_hash));
-
-        let trace = ReasoningTrace::new(
-            agent_id_typed,
-            pub_key,
-            Methodology::Heuristic,
-            vec![
-                TraceInput::Evidence { id: evidence.id },
-                TraceInput::Claim {
-                    id: epigraph_core::ClaimId::from_uuid(parent_id),
-                },
-            ],
-            0.5,
-            format!(
-                "Workflow variant of {}. {}",
-                parent_id, params.change_rationale
-            ),
-        );
-
-        ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
-            .await
-            .map_err(internal_error)?;
-        EvidenceRepository::create(&server.pool, &evidence)
-            .await
-            .map_err(internal_error)?;
-        ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
-            .await
-            .map_err(internal_error)?;
-
-        // First-create only: the parent → variant relationship.
-        EdgeRepository::create(
-            &server.pool,
-            claim_uuid,
-            "claim",
-            parent_id,
-            "claim",
-            "supersedes",
-            Some(serde_json::json!({"generation": generation})),
-            None,
-            None,
-        )
-        .await
-        .map_err(internal_error)?;
-
-        // Tag the variant as a workflow so cascade walkers can find it.
-        match epigraph_db::ClaimRepository::update_labels(
-            &server.pool,
-            claim_uuid,
-            &["workflow".to_string()],
-            &[],
-        )
-        .await
-        {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    variant_id = %claim_uuid,
-                    error = %e,
-                    "failed to apply 'workflow' label to improve_workflow variant; cascade may miss this variant"
-                );
-            }
-        }
-
-        let embed_text = workflow_embed_text(&goal, &steps, &prereqs);
-        server
-            .embedder
-            .embed_and_store(claim_uuid, &embed_text)
-            .await
-    } else {
-        // Option A + idempotent supersedes: skip everything including the
-        // supersedes edge (already created on first variant insert).
-        false
-    };
-
-    success_json(&ImproveWorkflowResponse {
-        variant_id: claim_uuid.to_string(),
-        parent_id: parent_id.to_string(),
-        goal,
-        step_count: steps.len(),
-        generation,
-        truth_value: claim.truth_value.value(),
-        embedded,
     })
 }
 

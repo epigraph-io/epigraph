@@ -63,7 +63,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("delete_step", "claims:write"),
     ("deprecate_workflow", "claims:write"),
     ("evolve_step", "claims:write"),
-    ("improve_workflow", "claims:write"),
     ("improve_workflow_hierarchy", "claims:write"),
     ("ingest_document", "claims:write"),
     ("ingest_workflow", "claims:write"),
