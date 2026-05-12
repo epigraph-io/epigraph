@@ -103,11 +103,9 @@ pub async fn store_workflow(
     };
     let extraction = crate::migrate_flat::build_extraction(&parsed, canonical_name, 0, None);
 
-    let response = crate::tools::workflow_ingest::do_ingest_workflow_via_pool(
-        &server.pool,
-        &extraction,
-    )
-    .await?;
+    let response =
+        crate::tools::workflow_ingest::do_ingest_workflow_via_pool(&server.pool, &extraction)
+            .await?;
 
     success_json(&StoreWorkflowResponse {
         workflow_id: response.workflow_id,

@@ -85,10 +85,9 @@ pub async fn delete_step(
     params: DeleteStepParams,
 ) -> Result<CallToolResult, McpError> {
     let lineage = parse_uuid(&params.step_lineage_id)?;
-    let r =
-        epigraph_ingest_executor::delete_step(&server.pool, &params.canonical_name, lineage)
-            .await
-            .map_err(map_step_err)?;
+    let r = epigraph_ingest_executor::delete_step(&server.pool, &params.canonical_name, lineage)
+        .await
+        .map_err(map_step_err)?;
     success_json(&DeleteStepResponse {
         workflow_id: r.workflow_id,
         step_claim_id: r.step_claim_id,
