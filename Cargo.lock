@@ -1210,6 +1210,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "ed25519-dalek",
+ "epigraph-auth",
  "epigraph-cli",
  "epigraph-core",
  "epigraph-crypto",
@@ -1255,6 +1256,16 @@ dependencies = [
  "utoipa",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "epigraph-auth"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "jsonwebtoken",
+ "serde",
+ "uuid",
 ]
 
 [[package]]
@@ -1503,6 +1514,7 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "epigraph-auth",
  "epigraph-core",
  "epigraph-crypto",
  "epigraph-db",
@@ -1512,6 +1524,7 @@ dependencies = [
  "epigraph-ingest",
  "epigraph-ingest-executor",
  "hex",
+ "http 1.4.0",
  "openssl",
  "rand 0.8.5",
  "reqwest",
@@ -1522,6 +1535,7 @@ dependencies = [
  "sqlx 0.7.4",
  "thiserror 1.0.69",
  "tokio",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "tracing-test",

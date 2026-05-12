@@ -66,7 +66,7 @@ pub mod mcp_tools;
 pub mod methods;
 #[cfg(feature = "enterprise")]
 pub mod mpc;
-#[cfg(all(test, not(feature = "db")))]
+#[cfg(test)]
 mod negative_tests;
 pub mod ownership;
 pub mod papers;

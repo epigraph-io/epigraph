@@ -368,6 +368,19 @@ pub struct IngestWorkflowParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ImproveWorkflowHierarchyParams {
+    #[schemars(
+        description = "Canonical name of the existing workflow lineage to variant. The tool resolves the current max generation under this name and creates the new variant at generation = max + 1."
+    )]
+    pub parent_canonical_name: String,
+
+    #[schemars(
+        description = "Hierarchical extraction for the new variant. The tool overwrites `extraction.source.canonical_name`, `generation`, and `parent_canonical_name`: canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param (same-lineage improvement only — cross-lineage variants are not supported by this tool), and generation is set to the parent's current max + 1. Caller-supplied values for those three fields are ignored."
+    )]
+    pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindWorkflowHierarchicalParams {
     #[schemars(
         description = "Free-text search over hierarchical workflow goal and canonical_name (ILIKE)."

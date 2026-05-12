@@ -2,7 +2,7 @@
 
 //! EpiGraph Full-Framework MCP Server — exposes all workspace crates as MCP tools.
 //!
-//! Connects to the EpiGraph PostgreSQL backend and provides 57 MCP tools including
+//! Connects to the EpiGraph PostgreSQL backend and provides 58 MCP tools including
 //! full CDST support (6 combination methods), scoped beliefs, and DS-vs-Bayesian divergence.
 //!
 //! ## Usage
@@ -11,9 +11,13 @@
 //! # Stdio transport (default — for Claude Code / .mcp.json integration)
 //! epigraph-mcp-full --database-url postgres://user:pass@host/db
 //!
-//! # HTTP transport (for curl / remote agents — requires explicit opt-in)
-//! # WARNING: exposes all mutation tools without auth; see issue #122 for proper fix.
-//! epigraph-mcp-full --database-url postgres://user:pass@host/db --listen 127.0.0.1:8080 --allow-unauthenticated-http
+//! # HTTP transport with Bearer auth (production)
+//! epigraph-mcp-full --database-url postgres://... --listen 127.0.0.1:8080 \
+//!   --jwt-secret "<HMAC secret matching epigraph-api's JWT_SECRET>"
+//!
+//! # Unauthenticated HTTP (unix socket behind filesystem perms, or local dev)
+//! epigraph-mcp-full --database-url postgres://... --listen unix:/run/mcp.sock \
+//!   --allow-unauthenticated-http
 //! ```
 
 use std::fmt::Write;
@@ -30,7 +34,7 @@ use epigraph_mcp::EpiGraphMcpFull;
 #[derive(Parser)]
 #[command(
     name = "epigraph-mcp-full",
-    about = "EpiGraph full-framework MCP server — 57 epistemic tools"
+    about = "EpiGraph full-framework MCP server — 58 epistemic tools"
 )]
 struct Cli {
     /// PostgreSQL connection URL
@@ -45,15 +49,30 @@ struct Cli {
     #[arg(long, env = "OPENAI_API_KEY")]
     openai_api_key: Option<String>,
 
-    /// Listen on HTTP address (e.g., 127.0.0.1:8080). If omitted, uses stdio transport.
+    /// Listen on HTTP. Accepts either `host:port` (TCP) or `unix:/abs/path` (Unix socket).
+    /// Unix sockets close the localhost-bypass surface: only processes with filesystem
+    /// access can connect. If omitted, uses stdio transport.
+    ///
+    /// Requires either `--jwt-secret` (Bearer auth, recommended for production) or
+    /// `--allow-unauthenticated-http` (for unix-socket listeners behind filesystem
+    /// permissions, or local dev).
     #[arg(long)]
     listen: Option<String>,
 
+    /// HMAC-SHA256 secret used to validate Bearer tokens on the HTTP transport.
+    ///
+    /// Required when `--listen` is used unless `--allow-unauthenticated-http` is
+    /// set. Must be at least 32 bytes. The same secret signs and verifies tokens
+    /// across both `epigraph-api` and `epigraph-mcp` — when rotating, restart
+    /// both processes with the new value.
+    #[arg(long, env = "EPIGRAPH_JWT_SECRET")]
+    jwt_secret: Option<String>,
+
     /// Acknowledge that HTTP transport exposes all MCP tools without authentication.
     ///
-    /// Required when --listen is used. The stdio process boundary is the trust gate for MCP
-    /// tools; HTTP removes that boundary with no replacement auth check. Until proper Bearer
-    /// token + scope wiring lands, you must explicitly opt in with this flag.
+    /// One of two accepted modes when `--listen` is used. Use this for unix-socket
+    /// listeners behind filesystem permissions, or for local dev. For network-exposed
+    /// HTTP, use `--jwt-secret` instead. Mutually exclusive with `--jwt-secret`.
     ///
     /// See: https://github.com/epigraph-io/epigraph/issues/122
     #[arg(long)]
@@ -77,20 +96,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    // Safety gate: HTTP transport removes the stdio process-boundary trust gate.
-    // Require an explicit opt-in to prevent accidental network exposure of mutation tools.
-    if cli.listen.is_some() && !cli.allow_unauthenticated_http {
-        eprintln!(
-            "ERROR: --listen exposes all MCP tools (including mutations) over HTTP without authentication.\n\
-             \n\
-             The stdio process boundary is the trust gate for MCP tools. HTTP removes that\n\
-             boundary with no replacement auth check, making mutation tools like mark_duplicate,\n\
-             supersede_claim, patch_claim, update_partition, and evolve_step reachable network-wide.\n\
-             \n\
-             Re-run with --allow-unauthenticated-http if this is intentional (e.g., local dev only).\n\
-             For production: see https://github.com/epigraph-io/epigraph/issues/122 for the proper auth fix."
-        );
-        std::process::exit(1);
+    // Safety gate for the HTTP transport. The stdio process boundary is the
+    // default trust gate; HTTP removes it. To start with --listen, the operator
+    // must either supply a JWT secret (Bearer auth) or explicitly opt out of
+    // auth (e.g., a unix-socket listener behind filesystem permissions).
+    if cli.listen.is_some() {
+        match (cli.jwt_secret.as_deref(), cli.allow_unauthenticated_http) {
+            (Some(secret), false) if secret.len() < 32 => {
+                eprintln!(
+                    "ERROR: --jwt-secret must be at least 32 bytes (got {}).",
+                    secret.len()
+                );
+                std::process::exit(1);
+            }
+            (Some(_), false) => {} // authenticated path
+            (None, true) => {}     // operator-acknowledged unauthenticated path
+            (Some(_), true) => {
+                eprintln!(
+                    "ERROR: --jwt-secret and --allow-unauthenticated-http are mutually exclusive."
+                );
+                std::process::exit(1);
+            }
+            (None, false) => {
+                eprintln!(
+                    "ERROR: --listen requires either --jwt-secret <SECRET> (Bearer auth) or\n\
+                     --allow-unauthenticated-http (e.g., for a unix-socket listener behind\n\
+                     filesystem permissions). See https://github.com/epigraph-io/epigraph/issues/122."
+                );
+                std::process::exit(1);
+            }
+        }
     }
 
     // Connect to database
@@ -130,12 +165,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = if cli.read_only {
         "read-only (33 tools)"
     } else {
-        "full (57 tools)"
+        "full (58 tools)"
     };
     tracing::info!("EpiGraph MCP server running in {mode} mode");
 
     if let Some(addr) = &cli.listen {
-        // ── HTTP transport ──────────────────────────────────────────────
+        // ── HTTP transport (TCP or Unix socket) ────────────────────────
         // (auth gate already enforced above at startup; --allow-unauthenticated-http was checked)
         use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
         use rmcp::transport::streamable_http_server::{
@@ -160,9 +195,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let router = axum::Router::new().nest_service("/mcp", service);
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!("EpiGraph MCP server listening on http://{addr}/mcp ({mode})");
-        axum::serve(listener, router).await?;
+
+        let router = if let Some(secret) = cli.jwt_secret.as_deref() {
+            use epigraph_auth::JwtConfig;
+            use epigraph_mcp::auth::{bearer_auth_middleware, McpAuthState};
+
+            let state = McpAuthState {
+                jwt_config: Arc::new(JwtConfig::from_secret(secret.as_bytes())),
+            };
+            router.layer(axum::middleware::from_fn_with_state(
+                state,
+                bearer_auth_middleware,
+            ))
+        } else {
+            router
+        };
+
+        tracing::info!("Starting EpiGraph MCP server in {mode} mode on {addr}");
+        epigraph_mcp::serve_with_listener(addr, router).await?;
     } else {
         // ── Stdio transport (default) ───────────────────────────────────
         let server = EpiGraphMcpFull::new(pool, signer, embedder, cli.read_only);

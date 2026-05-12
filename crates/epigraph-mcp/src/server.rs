@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use http::request::Parts;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -93,6 +94,46 @@ impl EpiGraphMcpFull {
     pub fn all_tools_json() -> serde_json::Value {
         let tools = Self::tool_router().list_all();
         serde_json::to_value(tools).unwrap_or(serde_json::Value::Array(vec![]))
+    }
+
+    /// Look up the required scope for `tool_name` and verify the
+    /// caller has it. Returns `Err` with a JSON-RPC-style error if:
+    /// - no `AuthContext` is attached (token validation never ran or
+    ///   middleware was bypassed), or
+    /// - the tool is not in `scope_map::SCOPE_MAP` (deny by default), or
+    /// - the caller's token is missing the required scope.
+    pub fn enforce_tool_scope(
+        auth: Option<&epigraph_auth::AuthContext>,
+        tool_name: &str,
+    ) -> Result<(), McpError> {
+        let Some(auth) = auth else {
+            return Err(McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::Borrowed(
+                    "Unauthorized: no auth context (Bearer token required)",
+                ),
+                data: None,
+            });
+        };
+        let Some(required) = crate::scope_map::required_scope(tool_name) else {
+            return Err(McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::Owned(format!(
+                    "Forbidden: tool '{tool_name}' is not authorized (no scope mapping)"
+                )),
+                data: None,
+            });
+        };
+        if !auth.has_scope(required) {
+            return Err(McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::Owned(format!(
+                    "Forbidden: tool '{tool_name}' requires scope '{required}'"
+                )),
+                data: None,
+            });
+        }
+        Ok(())
     }
 
     /// Return an error if the server is in read-only mode.
@@ -402,7 +443,7 @@ impl EpiGraphMcpFull {
         tools::workflows::deprecate_workflow(self, params).await
     }
 
-    // ── Hierarchical Workflows (3 tools) ──
+    // ── Hierarchical Workflows (4 tools) ──
     //
     // Counterparts to the flat `store_workflow` family above. These operate
     // on the `workflows` table where every step is a claim node connected
@@ -418,6 +459,17 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
         tools::workflow_ingest::ingest_workflow(self, params).await
+    }
+
+    #[tool(
+        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Same-lineage improvement only: the new variant's canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param; cross-lineage variants are not supported. Each call produces a new generation."
+    )]
+    async fn improve_workflow_hierarchy(
+        &self,
+        Parameters(params): Parameters<ImproveWorkflowHierarchyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::workflow_ingest::improve_workflow_hierarchy(self, params).await
     }
 
     #[tool(
@@ -798,7 +850,7 @@ impl EpiGraphMcpFull {
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.read_only { "read-only" } else { "full" };
-        let tool_count = if self.read_only { 33 } else { 59 };
+        let tool_count = if self.read_only { 33 } else { 60 };
         ServerInfo {
             instructions: Some(format!(
                 "EpiGraph {mode} MCP server with {tool_count} epistemic tools."
@@ -813,20 +865,30 @@ impl ServerHandler for EpiGraphMcpFull {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        // For HTTP requests, the Bearer middleware (`auth::bearer_auth_middleware`)
+        // inserts an `AuthContext` into request.extensions; rmcp's
+        // `StreamableHttpService` forwards those into `context.extensions` via
+        // `http::request::Parts` (see rmcp/src/transport/streamable_http_server/
+        // tower.rs:326/384/463). For stdio transport there is no `Parts` attached —
+        // the stdio process boundary is the trust gate and no auth check applies.
+        let http_parts = context.extensions.get::<Parts>();
+        let auth = http_parts.and_then(|p| p.extensions.get::<epigraph_auth::AuthContext>());
+
+        if http_parts.is_some() {
+            if let Err(err) = Self::enforce_tool_scope(auth, &request.name) {
+                // Emit a denial audit event so 403s show up alongside successes.
+                self.emit_tool_invoked(&format!("denied:{}", request.name))
+                    .await;
+                return Err(err);
+            }
+        }
+
         // Single chokepoint for every MCP tool invocation: emit a durable
         // tool.invoked event before dispatch, then forward to the
-        // macro-built dispatcher. Emission happens pre-dispatch on purpose
-        // — failed/rejected invocations still land in the log, which
-        // matches the "what agents did" auditability the issue asks for
-        // (closes #61).
+        // macro-built dispatcher.
         //
         // **DO NOT remove this line without updating
         // `tests/event_log_wiring_tests.rs::tool_dispatch_emits_tool_invoked_event`.**
-        // That test exercises `emit_tool_invoked` directly (rather than
-        // synthesizing a full `rmcp::service::RequestContext` to drive
-        // `call_tool` end-to-end) and so cannot detect the regression of
-        // dropping this dispatch-side emit. The test docstring spells out
-        // the scaffolding cost; the coupling lives here.
         self.emit_tool_invoked(&request.name).await;
 
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
@@ -847,5 +909,67 @@ impl ServerHandler for EpiGraphMcpFull {
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
         self.tool_router.get(name).cloned()
+    }
+}
+
+#[cfg(test)]
+mod scope_guard_tests {
+    use super::*;
+    use epigraph_auth::{AuthContext, ClientType};
+    use uuid::Uuid;
+
+    fn auth_with_scopes(scopes: &[&str]) -> AuthContext {
+        AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: None,
+            owner_id: None,
+            client_type: ClientType::Service,
+            scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            jti: Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn scope_guard_allows_matching_scope() {
+        let auth = auth_with_scopes(&["claims:admin"]);
+        assert!(EpiGraphMcpFull::enforce_tool_scope(Some(&auth), "mark_duplicate").is_ok());
+    }
+
+    #[test]
+    fn scope_guard_rejects_missing_scope() {
+        let auth = auth_with_scopes(&["claims:read"]);
+        let err = EpiGraphMcpFull::enforce_tool_scope(Some(&auth), "mark_duplicate")
+            .expect_err("read-only token must NOT be allowed to mark_duplicate");
+        // Error message should mention the required scope name so callers can
+        // debug a 403 without reading the source.
+        assert!(
+            err.message.contains("claims:admin"),
+            "error should cite the required scope; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn scope_guard_rejects_missing_auth_context() {
+        let err = EpiGraphMcpFull::enforce_tool_scope(None, "query_claims")
+            .expect_err("no AuthContext must yield 401-style rejection");
+        assert!(
+            err.message.to_lowercase().contains("auth"),
+            "error should mention auth; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn scope_guard_rejects_unmapped_tool_by_default() {
+        let auth = auth_with_scopes(&["claims:admin"]);
+        let err = EpiGraphMcpFull::enforce_tool_scope(Some(&auth), "tool_that_does_not_exist")
+            .expect_err("unmapped tool must fail closed");
+        assert!(
+            err.message.to_lowercase().contains("not authorized")
+                || err.message.to_lowercase().contains("no scope mapping"),
+            "error should indicate the tool isn't authorized; got: {}",
+            err.message
+        );
     }
 }
