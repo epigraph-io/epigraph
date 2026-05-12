@@ -20,7 +20,6 @@ async fn openapi_documents_in_scope_paths() {
         "/api/v1/workflows/steps/{id}/evolve",
         "/api/v1/workflows/hierarchical/search",
         "/api/v1/workflows/hierarchical/{id}/outcome",
-        "/api/v1/workflows/{id}/improve",
         "/api/v1/workflows/{id}",
         "/api/v1/workflows/ingest",
     ] {

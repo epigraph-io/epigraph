@@ -302,10 +302,6 @@ pub fn create_router(state: AppState) -> Router {
             post(workflows::report_outcome),
         )
         .route(
-            "/api/v1/workflows/:id/improve",
-            post(workflows::improve_workflow),
-        )
-        .route(
             "/api/v1/workflows/:id",
             delete(workflows::deprecate_workflow),
         )

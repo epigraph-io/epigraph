@@ -30,8 +30,7 @@ use crate::routes::versioning::{
 };
 use crate::routes::workflows::{
     EvolveStepRequest, EvolveStepResponse, HierarchicalSearchResponse, HierarchicalWorkflowResult,
-    ImproveWorkflowRequest, LineageHeadResult, ReportOutcomeRequest, ResolvedStepResult,
-    StepExecution,
+    LineageHeadResult, ReportOutcomeRequest, ResolvedStepResult, StepExecution,
 };
 use epigraph_ingest::common::schema::{AuthorEntry, ClaimRelationship, ThesisDerivation};
 use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowExtraction, WorkflowSource};
@@ -68,7 +67,6 @@ use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowExtraction, Workflo
         evolve_step_doc,
         find_workflow_hierarchical_doc,
         report_hierarchical_outcome_doc,
-        improve_workflow_doc,
         deprecate_workflow_doc,
         ingest_workflow_doc,
     ),
@@ -107,7 +105,6 @@ use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowExtraction, Workflo
             UpdateLabelsResponse,
             EvolveStepRequest,
             EvolveStepResponse,
-            ImproveWorkflowRequest,
             ReportOutcomeRequest,
             StepExecution,
             WorkflowExtraction,
@@ -419,22 +416,6 @@ async fn find_workflow_hierarchical_doc() {}
     security(("ed25519_signature" = []))
 )]
 async fn report_hierarchical_outcome_doc() {}
-
-/// Improve a workflow (doc stub)
-#[utoipa::path(
-    post,
-    path = "/api/v1/workflows/{id}/improve",
-    tag = "workflows",
-    params(("id" = uuid::Uuid, Path, description = "UUID of the workflow to improve")),
-    request_body = ImproveWorkflowRequest,
-    responses(
-        (status = 200, body = serde_json::Value),
-        (status = 404),
-        (status = 500),
-    ),
-    security(("ed25519_signature" = []))
-)]
-async fn improve_workflow_doc() {}
 
 /// Deprecate a workflow (doc stub)
 #[utoipa::path(

@@ -330,8 +330,17 @@ async fn store_workflow_resubmit_is_idempotent_at_workflow_row() {
         .await
         .expect("second store_workflow");
 
-    // Recompute slug the same way `store_workflow` does (via migrate_flat::slugify).
-    let canonical_name = epigraph_mcp::migrate_flat::slugify(&goal);
+    // Recompute the slug the same way `store_workflow` does (lowercase ASCII
+    // alnum, non-alnum -> '-', collapse runs, trim).
+    let canonical_name: String = goal
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
 
     let row_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM workflows WHERE canonical_name = $1 AND generation = 0",
@@ -344,130 +353,5 @@ async fn store_workflow_resubmit_is_idempotent_at_workflow_row() {
         row_count.0, 1,
         "two store_workflow calls must produce exactly one workflows row \
          (canonical_name={canonical_name:?})"
-    );
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// improve_workflow_resubmit_option_a_skip
-// ────────────────────────────────────────────────────────────────────────────
-
-use epigraph_mcp::types::ImproveWorkflowParams;
-
-/// `improve_workflow` operates on flat workflow claims (the legacy code
-/// path). The setup here used `store_workflow` to seed a flat parent
-/// claim, but `store_workflow` now emits hierarchical workflows — there is
-/// no flat parent for `improve_workflow` to find by content_hash. Once the
-/// 145 historical flat workflows are backfilled and the legacy code is
-/// retired (tracked in the migration cleanup), `improve_workflow` and this
-/// test go away. Until then, ignore.
-#[ignore = "improve_workflow operates on legacy flat claims; setup no longer produces them"]
-#[tokio::test]
-async fn improve_workflow_resubmit_option_a_skip() {
-    let pool = test_pool_or_skip!();
-    drop_unique_constraint(&pool).await;
-
-    let signer_seed = [0x55u8; 32];
-    let server = build_test_server(pool.clone(), signer_seed).await;
-
-    // 1. Seed a parent workflow via store_workflow.
-    let parent_goal = format!("parent goal {}", Uuid::new_v4());
-    let parent_params = StoreWorkflowParams {
-        goal: parent_goal.clone(),
-        steps: vec!["s1".to_string()],
-        prerequisites: None,
-        expected_outcome: None,
-        confidence: Some(0.5),
-        tags: None,
-    };
-    tools::workflows::store_workflow(&server, parent_params)
-        .await
-        .expect("seed parent workflow");
-
-    // Look up the parent's claim_id by content_hash.
-    let parent_canonical = serde_json::json!({
-        "goal": parent_goal,
-        "steps": vec!["s1"],
-        "prerequisites": Vec::<String>::new(),
-        "expected_outcome": Option::<String>::None,
-        "tags": Vec::<String>::new(),
-        "type": "workflow",
-        "generation": 0,
-        "use_count": 0,
-        "success_count": 0,
-        "failure_count": 0,
-        "avg_variance": 1.0,
-    });
-    let parent_content_str = serde_json::to_string(&parent_canonical).unwrap();
-    let parent_hash = ContentHasher::hash(parent_content_str.as_bytes());
-    let agent_id = server_agent_uuid(&pool, signer_seed).await;
-    let parent_id: (Uuid,) =
-        sqlx::query_as("SELECT id FROM claims WHERE content_hash = $1 AND agent_id = $2")
-            .bind(parent_hash.as_slice())
-            .bind(agent_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    let parent_id = parent_id.0;
-
-    // 2. Submit the same improve_workflow request twice.
-    let make_params = || ImproveWorkflowParams {
-        parent_workflow_id: parent_id.to_string(),
-        change_rationale: "test rationale".to_string(),
-        goal: Some("improved goal".to_string()),
-        steps: Some(vec!["s1-improved".to_string()]),
-        prerequisites: Some(vec!["new-prereq".to_string()]),
-        expected_outcome: Some("improved outcome".to_string()),
-        tags: Some(vec!["s3a-test".to_string()]),
-    };
-
-    tools::workflows::improve_workflow(&server, make_params())
-        .await
-        .expect("first improve_workflow");
-    tools::workflows::improve_workflow(&server, make_params())
-        .await
-        .expect("second improve_workflow");
-
-    // 3. Recompute the variant's canonical content_hash.
-    let variant_canonical = serde_json::json!({
-        "goal": "improved goal",
-        "steps": vec!["s1-improved"],
-        "prerequisites": vec!["new-prereq"],
-        "expected_outcome": "improved outcome",
-        "tags": vec!["s3a-test"],
-        "type": "workflow",
-        "generation": 1,
-        "parent_id": parent_id.to_string(),
-        "change_rationale": "test rationale",
-        "use_count": 0,
-        "success_count": 0,
-        "failure_count": 0,
-        "avg_variance": 1.0,
-    });
-    let variant_content_str = serde_json::to_string(&variant_canonical).unwrap();
-    let variant_hash = ContentHasher::hash(variant_content_str.as_bytes());
-
-    assert_option_a_skip(&pool, agent_id, variant_hash.as_slice()).await;
-
-    // Extra invariant: exactly one supersedes edge (idempotent on resubmit).
-    let variant_id: (Uuid,) =
-        sqlx::query_as("SELECT id FROM claims WHERE content_hash = $1 AND agent_id = $2")
-            .bind(variant_hash.as_slice())
-            .bind(agent_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-    let supersedes_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM edges
-         WHERE source_id = $1 AND target_id = $2 AND relationship = 'supersedes'",
-    )
-    .bind(variant_id.0)
-    .bind(parent_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        supersedes_count.0, 1,
-        "supersedes edge created exactly once (Option A + idempotent supersedes)"
     );
 }

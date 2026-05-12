@@ -422,17 +422,6 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a mutated variant of an existing workflow, linking it as a child in the lineage."
-    )]
-    async fn improve_workflow(
-        &self,
-        Parameters(params): Parameters<ImproveWorkflowParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.reject_if_read_only()?;
-        tools::workflows::improve_workflow(self, params).await
-    }
-
-    #[tool(
         description = "Deprecate a workflow (and optionally its entire lineage). Sets truth to 0.05."
     )]
     async fn deprecate_workflow(
@@ -850,7 +839,7 @@ impl EpiGraphMcpFull {
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.read_only { "read-only" } else { "full" };
-        let tool_count = if self.read_only { 33 } else { 60 };
+        let tool_count = if self.read_only { 33 } else { 59 };
         ServerInfo {
             instructions: Some(format!(
                 "EpiGraph {mode} MCP server with {tool_count} epistemic tools."

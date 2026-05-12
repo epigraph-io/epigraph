@@ -308,35 +308,6 @@ pub struct ReportWorkflowOutcomeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ImproveWorkflowParams {
-    #[schemars(description = "UUID of the parent workflow to improve")]
-    pub parent_workflow_id: String,
-
-    #[schemars(description = "Updated goal (omit to inherit from parent)")]
-    pub goal: Option<String>,
-
-    #[schemars(description = "Updated steps (omit to inherit from parent)")]
-    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
-    pub steps: Option<Vec<String>>,
-
-    #[schemars(description = "Updated prerequisites (omit to inherit from parent)")]
-    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
-    pub prerequisites: Option<Vec<String>>,
-
-    #[schemars(description = "Updated expected outcome (omit to inherit from parent)")]
-    pub expected_outcome: Option<String>,
-
-    #[schemars(
-        description = "Why this variant was created (e.g. 'Step 3 consistently fails, switching to rsync')"
-    )]
-    pub change_rationale: String,
-
-    #[schemars(description = "Tags for categorization (inherits from parent + adds these)")]
-    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
-    pub tags: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeprecateWorkflowParams {
     #[schemars(description = "UUID of the workflow to deprecate")]
     pub workflow_id: String,
@@ -753,17 +724,6 @@ pub struct ReportWorkflowOutcomeResponse {
     pub truth_after: f64,
     pub total_uses: i64,
     pub success_rate: f64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ImproveWorkflowResponse {
-    pub variant_id: String,
-    pub parent_id: String,
-    pub goal: String,
-    pub step_count: usize,
-    pub generation: i64,
-    pub truth_value: f64,
-    pub embedded: bool,
 }
 
 #[derive(Debug, Serialize)]
