@@ -31,6 +31,7 @@ required-features = ["db"]
 
 
 [dependencies]
+epigraph-auth = { workspace = true }
 epigraph-interfaces = { workspace = true }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
 epigraph-ingest = { workspace = true, features = ["openapi"] }  # Workflow/document extraction schemas and ingest planners
 epigraph-ingest-executor = { workspace = true, optional = true }  # Persistence executor for workflow ingest (db feature)

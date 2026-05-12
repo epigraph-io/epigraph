@@ -11,14 +11,7 @@ use crate::middleware::bearer::AuthContext;
 /// Check that the request's AuthContext has all required scopes.
 /// Call this from route handlers as a guard.
 pub fn check_scopes(auth: &AuthContext, required: &[&str]) -> Result<(), ApiError> {
-    for scope in required {
-        if !auth.has_scope(scope) {
-            return Err(ApiError::Forbidden {
-                reason: format!("Missing required scope: {scope}"),
-            });
-        }
-    }
-    Ok(())
+    epigraph_auth::check_scopes(auth, required).map_err(|reason| ApiError::Forbidden { reason })
 }
 
 /// Returns `Ok(())` if either:
@@ -69,7 +62,7 @@ pub async fn require_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::bearer::ClientType;
+    use crate::middleware::ClientType;
     use uuid::Uuid;
 
     fn make_auth(scopes: &[&str], client_id: Uuid, owner_id: Option<Uuid>) -> AuthContext {

@@ -1,9 +1,11 @@
 #![allow(clippy::doc_markdown)]
 
+pub mod auth;
 pub mod claim_helper;
 pub mod embed;
 pub mod errors;
 pub mod migrate_flat;
+pub mod scope_map;
 pub mod server;
 pub mod tools;
 pub mod types;

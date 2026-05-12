@@ -11,6 +11,7 @@ members = [
     "crates/epigraph-db",
     "crates/epigraph-embeddings",
     "crates/epigraph-engine",
+    "crates/epigraph-auth",
     "crates/epigraph-api",
     "crates/epigraph-cli",
     "crates/epigraph-jobs",
@@ -65,6 +66,7 @@ curve25519-dalek = "4"
 
 # Internal crates (kernel only)
 epigraph-interfaces = { path = "crates/epigraph-interfaces" }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
+epigraph-auth = { path = "crates/epigraph-auth" }
 epigraph-core = { path = "crates/epigraph-core" }
 epigraph-crypto = { path = "crates/epigraph-crypto" }
 epigraph-db = { path = "crates/epigraph-db" }

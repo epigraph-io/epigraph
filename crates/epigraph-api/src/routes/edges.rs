@@ -2944,7 +2944,8 @@ mod db_tests {
     // event emissions from create_edge / patch_edge handlers.
     // ─────────────────────────────────────────────────────────────────────
 
-    use crate::middleware::bearer::{AuthContext, ClientType};
+    use crate::middleware::bearer::AuthContext;
+    use crate::middleware::ClientType;
     use axum::Extension;
 
     /// Insert a real `oauth_clients` row so provenance_log FK succeeds.
