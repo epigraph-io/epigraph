@@ -14,6 +14,7 @@ pub mod provenance;
 pub mod rdf;
 pub mod recall;
 pub mod sheaf;
+pub mod step_ops;
 pub mod supersede;
 pub mod themes;
 pub mod workflow_hierarchical;

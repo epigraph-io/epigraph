@@ -441,6 +441,28 @@ impl EpiGraphMcpFull {
         tools::workflow_hierarchical::report_hierarchical_outcome(self, params).await
     }
 
+    #[tool(
+        description = "Append or middle-insert a step into an existing hierarchical workflow. `position=None` appends; `position=Some(i)` inserts at the 0-indexed slot i. Idempotent on `(canonical_name, step_text)` via deterministic claim ID. Re-wires the `step_follows` chain."
+    )]
+    async fn add_step(
+        &self,
+        Parameters(params): Parameters<crate::tools::step_ops::AddStepParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::step_ops::add_step(self, params).await
+    }
+
+    #[tool(
+        description = "Soft-delete a workflow step by step_lineage_id. Sets the head claim's truth_value to 0.05; default min_truth filters hide it from active queries while preserving history. Does not rewire the step_follows chain."
+    )]
+    async fn delete_step(
+        &self,
+        Parameters(params): Parameters<crate::tools::step_ops::DeleteStepParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::step_ops::delete_step(self, params).await
+    }
+
     // ── Graph (2 tools) ──
 
     #[tool(
@@ -776,7 +798,7 @@ impl EpiGraphMcpFull {
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.read_only { "read-only" } else { "full" };
-        let tool_count = if self.read_only { 33 } else { 57 };
+        let tool_count = if self.read_only { 33 } else { 59 };
         ServerInfo {
             instructions: Some(format!(
                 "EpiGraph {mode} MCP server with {tool_count} epistemic tools."

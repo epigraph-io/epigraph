@@ -158,79 +158,87 @@ pub struct LineageHeadResult {
 
 // ── Handlers ──
 
-/// POST /api/v1/workflows - Store a new workflow as a claim.
+/// Slugify a free-text goal into a `canonical_name`. Inlined here to avoid
+/// pulling `epigraph-mcp` as a dep for one helper. Will collapse with the
+/// migrate_flat::slugify duplicate when migrate_flat is deleted.
+fn slugify_goal(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// POST /api/v1/workflows — store a hierarchical workflow.
+///
+/// Input shape stays simple (`goal` + `steps[]`); internally constructs a
+/// `WorkflowExtraction` (single `"Body"` phase, thesis = goal) and runs
+/// `execute_workflow_ingest_plan`. Each step becomes a first-class claim.
+/// Idempotent on `(slugify(goal), generation=0)`.
 #[cfg(feature = "db")]
 pub async fn store_workflow(
     State(state): State<AppState>,
     Json(request): Json<StoreWorkflowRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let confidence = request.confidence.unwrap_or(0.5).clamp(0.0, 1.0);
-    let initial_truth = 0.25 + (confidence * 0.25); // [0.25, 0.5]
+    use epigraph_ingest::common::schema::ThesisDerivation;
+    use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
+    use epigraph_ingest::workflow::WorkflowExtraction;
 
-    let content = serde_json::json!({
-        "goal": request.goal,
-        "steps": request.steps,
-        "prerequisites": request.prerequisites.as_deref().unwrap_or(&[]),
-        "expected_outcome": request.expected_outcome,
-        "tags": request.tags.as_deref().unwrap_or(&[]),
-    });
+    let canonical_name = slugify_goal(&request.goal);
+    let prereqs = request.prerequisites.unwrap_or_default();
+    let tags = request.tags.unwrap_or_default();
+    let confidence = request.confidence.unwrap_or(0.8).clamp(0.0, 1.0);
 
-    // Ensure system agent exists
-    let sys_agent_id = get_or_create_system_agent(&state.db_pool).await?;
+    let phases = if request.steps.is_empty() {
+        vec![]
+    } else {
+        vec![Phase {
+            title: "Body".to_string(),
+            // Phase claim content = summary; DB enforces non-empty. Using
+            // "Body" matches the migrate_flat convention and avoids a hash
+            // collision with the thesis claim (which uses goal).
+            summary: "Body".to_string(),
+            steps: request
+                .steps
+                .iter()
+                .map(|t| Step {
+                    compound: t.clone(),
+                    rationale: String::new(),
+                    operations: vec![],
+                    generality: vec![],
+                    confidence,
+                })
+                .collect(),
+        }]
+    };
 
-    // Create workflow claim
-    let content_str = content.to_string();
-    let content_hash = epigraph_crypto::ContentHasher::hash(content_str.as_bytes());
-    let workflow_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties) \
-         VALUES ($1, $2, $3, $4, ARRAY['workflow'], $5) \
-         RETURNING id",
-    )
-    .bind(&content_str)
-    .bind(content_hash.as_slice())
-    .bind(sys_agent_id)
-    .bind(initial_truth)
-    .bind(serde_json::json!({
-        "generation": 0,
-        "use_count": 0,
-        "success_count": 0,
-        "failure_count": 0,
-        "avg_variance": 0.0,
-    }))
-    .fetch_one(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to create workflow: {e}"),
-    })?;
+    let extraction = WorkflowExtraction {
+        source: WorkflowSource {
+            canonical_name: canonical_name.clone(),
+            goal: request.goal.clone(),
+            generation: 0,
+            parent_canonical_name: None,
+            authors: vec![],
+            expected_outcome: request.expected_outcome.clone(),
+            tags: tags.clone(),
+            metadata: serde_json::json!({"prerequisites": prereqs}),
+        },
+        thesis: Some(request.goal.clone()),
+        thesis_derivation: ThesisDerivation::default(),
+        phases,
+        relationships: vec![],
+    };
 
-    // Generate embedding if service available
-    let mut embedded = false;
-    if let Some(embedder) = state.embedding_service() {
-        let embed_text = format!("{}\n{}", request.goal, request.steps.join("\n"));
-        if let Ok(vec) = embedder.generate(&embed_text).await {
-            let emb_str = format_embedding(&vec);
-            let _ = sqlx::query("UPDATE claims SET embedding = $2::vector WHERE id = $1")
-                .bind(workflow_id)
-                .bind(&emb_str)
-                .execute(&state.db_pool)
-                .await;
-            embedded = true;
-        }
-    }
-
-    // Materialize agent --AUTHORED--> claim edge
-    let _ = epigraph_db::EdgeRepository::create(
-        &state.db_pool,
-        sys_agent_id,
-        "agent",
-        workflow_id,
-        "claim",
-        "AUTHORED",
-        None,
-        None,
-        None,
-    )
-    .await;
+    let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
+    let result =
+        epigraph_ingest_executor::execute_workflow_ingest_plan(&state.db_pool, &plan, &extraction)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("workflow ingest: {e}"),
+            })?;
 
     // Emit event
     let _ = epigraph_db::EventRepository::insert(
@@ -238,19 +246,23 @@ pub async fn store_workflow(
         "workflow.created",
         None,
         &serde_json::json!({
-            "workflow_id": workflow_id,
+            "workflow_id": result.workflow_id,
+            "canonical_name": result.canonical_name,
             "goal": request.goal,
             "step_count": request.steps.len(),
+            "already_ingested": result.already_ingested,
         }),
     )
     .await;
 
     Ok(Json(serde_json::json!({
-        "workflow_id": workflow_id,
+        "workflow_id": result.workflow_id,
+        "canonical_name": result.canonical_name,
         "goal": request.goal,
+        "generation": result.generation,
         "step_count": request.steps.len(),
-        "truth_value": initial_truth,
-        "embedded": embedded,
+        "claims_ingested": result.claims_ingested,
+        "already_ingested": result.already_ingested,
     })))
 }
 
@@ -1427,6 +1439,112 @@ struct WorkflowContentRow {
     content: String,
     truth_value: Option<f64>,
     properties: Option<serde_json::Value>,
+}
+
+// ── add_step / delete_step ──────────────────────────────────────────────────
+
+#[cfg(feature = "db")]
+#[derive(Debug, Deserialize)]
+pub struct AddStepRequest {
+    pub canonical_name: String,
+    pub step_text: String,
+    #[serde(default)]
+    pub position: Option<u32>,
+}
+
+#[cfg(feature = "db")]
+#[derive(Debug, Deserialize)]
+pub struct DeleteStepRequest {
+    pub canonical_name: String,
+    pub step_lineage_id: Uuid,
+}
+
+/// Map executor's StepOpError to ApiError. WorkflowNotFound + StepNotFound
+/// are 404; Invalid is 400; Db/Executor are 500.
+#[cfg(feature = "db")]
+fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
+    use epigraph_ingest_executor::StepOpError as E;
+    match e {
+        E::WorkflowNotFound(name) => ApiError::NotFound {
+            entity: "workflow".into(),
+            id: name,
+        },
+        E::StepNotFound { lineage, .. } => ApiError::NotFound {
+            entity: "step".into(),
+            id: lineage.to_string(),
+        },
+        E::PhaseMissing => ApiError::InternalError {
+            message: "workflow has no level-1 phase claim".into(),
+        },
+        E::Invalid(msg) => ApiError::BadRequest { message: msg },
+        E::Db(e) => ApiError::InternalError {
+            message: format!("db: {e}"),
+        },
+        E::Repo(e) => ApiError::InternalError {
+            message: format!("repo: {e}"),
+        },
+        E::Executor(e) => ApiError::InternalError {
+            message: format!("executor: {e}"),
+        },
+    }
+}
+
+/// POST /api/v1/workflows/steps - add a step to a hierarchical workflow.
+#[cfg(feature = "db")]
+pub async fn add_step(
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Json(req): Json<AddStepRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth_ctx.ok_or_else(|| ApiError::Unauthorized {
+        reason: "add_step requires authentication".into(),
+    })?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
+    let r = epigraph_ingest_executor::add_step(
+        &state.db_pool,
+        &req.canonical_name,
+        &req.step_text,
+        req.position,
+    )
+    .await
+    .map_err(map_step_err)?;
+
+    Ok(Json(serde_json::json!({
+        "workflow_id": r.workflow_id,
+        "step_claim_id": r.step_claim_id,
+        "step_index": r.step_index,
+        "step_lineage_id": r.step_lineage_id,
+        "already_present": r.already_present,
+    })))
+}
+
+/// POST /api/v1/workflows/steps/delete - soft-delete a step lineage.
+#[cfg(feature = "db")]
+pub async fn delete_step(
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Json(req): Json<DeleteStepRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth_ctx.ok_or_else(|| ApiError::Unauthorized {
+        reason: "delete_step requires authentication".into(),
+    })?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
+    let r = epigraph_ingest_executor::delete_step(
+        &state.db_pool,
+        &req.canonical_name,
+        req.step_lineage_id,
+    )
+    .await
+    .map_err(map_step_err)?;
+
+    Ok(Json(serde_json::json!({
+        "workflow_id": r.workflow_id,
+        "step_claim_id": r.step_claim_id,
+        "step_lineage_id": r.step_lineage_id,
+        "truth_value": r.truth_value,
+    })))
 }
 
 #[cfg(all(test, feature = "db"))]
