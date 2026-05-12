@@ -15,7 +15,7 @@ Modes:
   --apply  (Q4-ratified)
       For each candidate JSON in the dry-run output dir, ingests the
       hierarchical workflow via POST /api/v1/workflows/ingest, emits a
-      `variant_of` edge from the new hierarchical claim back to the
+      `supersedes` edge from the new hierarchical claim back to the
       original flat claim via POST /api/v1/edges, then deprecates the
       flat claim via DELETE /api/v1/workflows/<id>?reason=...
       Appends one audit-log line per workflow to
@@ -27,13 +27,10 @@ Modes:
       before flipping the real switch.
 
 Notes / known caveats:
-  * `variant_of` is NOT currently in the edges API's VALID_RELATIONSHIPS
-    allowlist (see crates/epigraph-api/src/routes/edges.rs). The existing
-    workflow code (improve_workflow) works around this with a direct
-    SQL INSERT. This script POSTs as the spec instructs; if the API
-    rejects, the audit log will record `edge_failed` and the
-    hierarchical claim will still exist (the missing edge can be
-    backfilled once the allowlist is updated).
+  * The back-edge uses `supersedes` (in the edges API VALID_RELATIONSHIPS
+    allowlist — see crates/epigraph-api/src/routes/edges.rs). The original
+    spec called for `variant_of`, but it isn't in the allowlist, so we use
+    `supersedes` and record the migration intent in `properties.reason`.
   * Step 3 (deprecate) sets truth_value=0.05 today. After PR #97 merges
     it will also set is_current=false. The 0.05 truth is enough for the
     default min_truth filtering to hide the flat claim, so this script
@@ -201,17 +198,26 @@ def assign_slugs(
     ordered = sorted(workflows, key=lambda w: (w.get("created_at") or "", w["id"]))
     id_to_slug: dict[str, str] = {}
     slug_to_first_id: dict[str, str] = {}
+    id_to_source: dict[str, str] = {}  # wid -> "canonical_name" | "goal"
     collisions_by_base: dict[str, list[str]] = {}
 
     for w in ordered:
         wid = w["id"]
         structured = extract_structured(w)
-        goal = structured.get("goal") or ""
-        if not goal:
-            # Use the freeform content as a slug seed if there's no goal
-            content = w.get("content") or ""
-            goal = content if isinstance(content, str) else ""
-        base = slugify(goal)
+        # Prefer the workflow's existing canonical_name (e.g.
+        # "cdst-tier2-enrichment") so curated slugs survive migration;
+        # fall back to slugifying the goal, then the raw content.
+        existing_slug = structured.get("canonical_name")
+        if isinstance(existing_slug, str) and existing_slug.strip():
+            base = slugify(existing_slug)
+            id_to_source[wid] = "canonical_name"
+        else:
+            goal = structured.get("goal") or ""
+            if not goal:
+                content = w.get("content") or ""
+                goal = content if isinstance(content, str) else ""
+            base = slugify(goal)
+            id_to_source[wid] = "goal"
 
         if base not in slug_to_first_id:
             id_to_slug[wid] = base
@@ -230,10 +236,21 @@ def assign_slugs(
         slug_to_first_id.setdefault(candidate, wid)
         collisions_by_base.setdefault(base, [slug_to_first_id[base]]).append(wid)
 
-    collisions = [
-        {"slug": base, "ids": ids}
-        for base, ids in collisions_by_base.items()
-    ]
+    collisions = []
+    for base, ids in collisions_by_base.items():
+        # Per-id source path so an operator can spot when a curated
+        # canonical_name was bumped to a -v{gen} variant by a goal-derived
+        # collision (and might want to re-curate manually instead).
+        sources = {wid: id_to_source.get(wid, "unknown") for wid in ids}
+        any_canonical = any(s == "canonical_name" for s in sources.values())
+        collisions.append(
+            {
+                "slug": base,
+                "ids": ids,
+                "sources": sources,
+                "involves_canonical_name": any_canonical,
+            }
+        )
     return id_to_slug, collisions
 
 
@@ -314,7 +331,9 @@ def build_payload(
         "phases": [
             {
                 "title": "Execution",
-                "summary": "",
+                # Phase claim content = summary; DB enforces non-empty.
+                # Use the goal so the phase claim is queryable.
+                "summary": goal,
                 "steps": step_objects,
             }
         ],
@@ -554,7 +573,7 @@ def _build_edge_body(
     flat_claim_id: str,
     migrated_at: str,
 ) -> dict[str, Any]:
-    """Build the POST /api/v1/edges body for the variant_of back-edge."""
+    """Build the POST /api/v1/edges body for the supersedes back-edge."""
     return {
         "source_id": new_hier_id,
         "source_type": "claim",

@@ -317,6 +317,11 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/workflows/steps/:id/evolve",
             post(workflows::evolve_step),
         )
+        .route("/api/v1/workflows/steps", post(workflows::add_step))
+        .route(
+            "/api/v1/workflows/steps/delete",
+            post(workflows::delete_step),
+        )
         .route(
             "/api/v1/experiments/hypothesize",
             post(experiments::hypothesize),

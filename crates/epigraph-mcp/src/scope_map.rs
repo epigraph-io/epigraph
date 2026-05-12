@@ -54,11 +54,13 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("system_stats", "claims:read"),
     ("traverse", "claims:read"),
     // ─── claims:write ──────────────────────────────────────────────────
+    ("add_step", "claims:write"),
     ("assign_ownership", "claims:write"),
     ("batch_submit_claims", "claims:write"),
     ("challenge_claim", "claims:write"),
     ("create_frame", "claims:write"),
     ("create_perspective", "claims:write"),
+    ("delete_step", "claims:write"),
     ("deprecate_workflow", "claims:write"),
     ("evolve_step", "claims:write"),
     ("improve_workflow", "claims:write"),

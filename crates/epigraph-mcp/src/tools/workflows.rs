@@ -79,120 +79,42 @@ fn parse_workflow_content(content: &str) -> (String, Vec<String>, Vec<String>, O
     )
 }
 
+/// Store a new hierarchical workflow.
+///
+/// Input shape stays simple (`goal` + `steps[]`); internally builds a
+/// `WorkflowExtraction` and runs the hierarchical ingest pipeline. Each step
+/// becomes a first-class claim under a single `"Body"` phase. The workflow
+/// itself is a row in the `workflows` table, identified by a deterministic
+/// UUID from `(canonical_name, generation)`. Idempotent on `canonical_name`.
 pub async fn store_workflow(
     server: &EpiGraphMcpFull,
     params: StoreWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
-    let agent_id = server.agent_id().await?;
-    let agent_id_typed = AgentId::from_uuid(agent_id);
-    let pub_key = server.signer.public_key();
-    let confidence = params.confidence.unwrap_or(0.5).clamp(0.0, 1.0);
-    let tags = params.tags.unwrap_or_default();
+    let canonical_name = crate::migrate_flat::slugify(&params.goal);
     let prereqs = params.prerequisites.unwrap_or_default();
+    let tags = params.tags.unwrap_or_default();
 
-    let content = serde_json::json!({
-        "goal": params.goal,
-        "steps": params.steps,
-        "prerequisites": prereqs,
-        "expected_outcome": params.expected_outcome,
-        "tags": tags,
-        "type": "workflow",
-        "generation": 0,
-        "use_count": 0,
-        "success_count": 0,
-        "failure_count": 0,
-        "avg_variance": 1.0,
-    });
-    let content_str = serde_json::to_string(&content).map_err(internal_error)?;
-
-    let raw_truth = (confidence * 0.5).clamp(0.01, 0.99);
-    let mut claim = Claim::new(
-        content_str.clone(),
-        agent_id_typed,
-        pub_key,
-        TruthValue::clamped(raw_truth),
-    );
-    claim.content_hash = ContentHasher::hash(content_str.as_bytes());
-    claim.signature = Some(server.signer.sign(&claim.content_hash));
-
-    let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "store_workflow")
-            .await?;
-    let claim_uuid = claim.id.as_uuid();
-
-    let (final_truth, ds, embedded) = if was_created {
-        let evidence_text = format!("Workflow hypothesis: {}", params.goal);
-        let evidence_hash = ContentHasher::hash(evidence_text.as_bytes());
-        let mut evidence = Evidence::new(
-            agent_id_typed,
-            pub_key,
-            evidence_hash,
-            EvidenceType::Testimony {
-                source: "mcp-workflow".to_string(),
-                testified_at: chrono::Utc::now(),
-                verification: None,
-            },
-            Some(evidence_text),
-            claim.id,
-        );
-        evidence.signature = Some(server.signer.sign(&evidence_hash));
-
-        let trace = ReasoningTrace::new(
-            agent_id_typed,
-            pub_key,
-            Methodology::Heuristic,
-            vec![TraceInput::Evidence { id: evidence.id }],
-            confidence,
-            format!("Workflow stored: {}", params.goal),
-        );
-
-        ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
-            .await
-            .map_err(internal_error)?;
-        EvidenceRepository::create(&server.pool, &evidence)
-            .await
-            .map_err(internal_error)?;
-        ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
-            .await
-            .map_err(internal_error)?;
-
-        let ds = match ds_auto::auto_wire_ds_for_claim(
-            &server.pool,
-            claim_uuid,
-            agent_id,
-            confidence,
-            0.5,
-            true,
-            None,
-        )
-        .await
-        {
-            Ok(r) => Some(r),
-            Err(e) => {
-                tracing::warn!(workflow_id = %claim_uuid, "ds auto-wire workflow failed: {e}");
-                None
-            }
-        };
-
-        let embed_text = workflow_embed_text(&params.goal, &params.steps, &prereqs);
-        let embedded = server
-            .embedder
-            .embed_and_store(claim_uuid, &embed_text)
-            .await;
-
-        (raw_truth, ds, embedded)
-    } else {
-        (claim.truth_value.value(), None, false)
+    let parsed = crate::migrate_flat::FlatContent {
+        goal: params.goal.clone(),
+        steps: params.steps.clone(),
+        prerequisites: prereqs,
+        expected_outcome: params.expected_outcome.clone(),
+        tags,
     };
+    let extraction = crate::migrate_flat::build_extraction(&parsed, canonical_name, 0, None);
+
+    let response =
+        crate::tools::workflow_ingest::do_ingest_workflow_via_pool(&server.pool, &extraction)
+            .await?;
 
     success_json(&StoreWorkflowResponse {
-        workflow_id: claim_uuid.to_string(),
+        workflow_id: response.workflow_id,
+        canonical_name: response.canonical_name,
         goal: params.goal,
+        generation: response.generation,
         step_count: params.steps.len(),
-        truth_value: final_truth,
-        embedded,
-        belief: ds.as_ref().map(|d| d.belief),
-        plausibility: ds.as_ref().map(|d| d.plausibility),
+        claims_ingested: response.claims_ingested,
+        already_ingested: response.already_ingested,
     })
 }
 

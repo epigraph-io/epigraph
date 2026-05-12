@@ -714,15 +714,16 @@ pub struct PaperResponse {
 
 #[derive(Debug, Serialize)]
 pub struct StoreWorkflowResponse {
+    /// `workflows.id` (deterministic from canonical_name + generation).
     pub workflow_id: String,
+    pub canonical_name: String,
     pub goal: String,
+    pub generation: i32,
     pub step_count: usize,
-    pub truth_value: f64,
-    pub embedded: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub belief: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub plausibility: Option<f64>,
+    pub claims_ingested: usize,
+    /// `true` if a workflow with this `(canonical_name, generation)` was
+    /// already present and the call short-circuited.
+    pub already_ingested: bool,
 }
 
 #[derive(Debug, Serialize)]
