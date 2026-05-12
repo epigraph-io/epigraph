@@ -102,10 +102,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // auth (e.g., a unix-socket listener behind filesystem permissions).
     if cli.listen.is_some() {
         match (cli.jwt_secret.as_deref(), cli.allow_unauthenticated_http) {
-            (Some(secret), false) if secret.as_bytes().len() < 32 => {
+            (Some(secret), false) if secret.len() < 32 => {
                 eprintln!(
                     "ERROR: --jwt-secret must be at least 32 bytes (got {}).",
-                    secret.as_bytes().len()
+                    secret.len()
                 );
                 std::process::exit(1);
             }

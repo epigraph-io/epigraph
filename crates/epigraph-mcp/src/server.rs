@@ -857,7 +857,7 @@ impl ServerHandler for EpiGraphMcpFull {
                 // Emit a denial audit event so 403s show up alongside successes.
                 self.emit_tool_invoked(&format!("denied:{}", request.name))
                     .await;
-                return Err(err.into());
+                return Err(err);
             }
         }
 
