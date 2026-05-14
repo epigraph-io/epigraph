@@ -25,7 +25,7 @@ pub async fn batch_submit_claims(
     for (i, entry) in params.claims.iter().enumerate() {
         let claim_params = SubmitClaimParams {
             content: entry.content.clone(),
-            methodology: "batch_submission".to_string(),
+            methodology: "inductive_generalization".to_string(),
             evidence_data: entry.evidence_data.clone(),
             evidence_type: entry.evidence_type.clone(),
             confidence: entry.confidence.unwrap_or(0.5),
