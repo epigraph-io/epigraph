@@ -1538,6 +1538,126 @@ pub async fn update_labels(
     Ok(Json(UpdateLabelsResponse { id, labels: vec![] }))
 }
 
+// =============================================================================
+// GET /api/v1/claims/by-labels
+// =============================================================================
+
+/// Query parameters for `GET /api/v1/claims/by-labels`.
+///
+/// `labels` and `exclude_labels` are comma-separated strings (not repeated
+/// query keys) to keep the API trivially callable from the Python cleanup +
+/// reconciler scripts that drive backlog retirement (Tasks 7 + 8).
+#[derive(Deserialize)]
+pub struct ClaimsByLabelsQuery {
+    /// Comma-separated labels; a claim must carry ALL of them to match.
+    pub labels: String,
+    /// Comma-separated labels; a claim carrying ANY of them is excluded.
+    #[serde(default)]
+    pub exclude_labels: Option<String>,
+    /// When true, drops claims with `is_current = false`.
+    #[serde(default)]
+    pub current_only: Option<bool>,
+    /// Minimum truth_value (default 0.0).
+    #[serde(default)]
+    pub min_truth: Option<f64>,
+    /// Max claims to return (clamped to [`MIN_PAGE_LIMIT`, `MAX_PAGE_LIMIT`]).
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Response row for `GET /api/v1/claims/by-labels`.
+///
+/// Distinct from [`ClaimResponse`] because we surface `is_current` and
+/// `supersedes` unconditionally — backlog tooling needs to see the
+/// open/superseded distinction in every row, not have it elided.
+#[derive(Serialize)]
+pub struct ClaimByLabelsResponse {
+    pub id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub agent_id: Uuid,
+    pub created_at: String,
+    pub labels: Vec<String>,
+    pub is_current: bool,
+    pub supersedes: Option<Uuid>,
+}
+
+/// GET /api/v1/claims/by-labels?labels=backlog[&exclude_labels=resolved][&current_only=true]
+///
+/// Mirrors the MCP `query_claims_by_label` tool over plain HTTP so the
+/// backlog cleanup + reconciler Python scripts can read without direct DB
+/// access. Public (no auth) — these are read-only queries over public claim
+/// metadata, same as `GET /api/v1/claims` and `GET /api/v1/claims/by-belief`.
+#[cfg(feature = "db")]
+pub async fn list_by_labels(
+    State(state): State<AppState>,
+    Query(q): Query<ClaimsByLabelsQuery>,
+) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
+    let labels: Vec<String> = q
+        .labels
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if labels.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "labels query parameter required (comma-separated, non-empty)".into(),
+        });
+    }
+    let exclude_labels: Vec<String> = q
+        .exclude_labels
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let current_only = q.current_only.unwrap_or(false);
+    let min_truth = q.min_truth.unwrap_or(0.0);
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .clamp(MIN_PAGE_LIMIT, MAX_PAGE_LIMIT);
+
+    let rows = ClaimRepository::list_by_labels(
+        &state.db_pool,
+        &labels,
+        &exclude_labels,
+        current_only,
+        min_truth,
+        limit,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+    })?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|(c, claim_labels)| ClaimByLabelsResponse {
+                id: c.id.as_uuid(),
+                content: c.content,
+                truth_value: c.truth_value.value(),
+                agent_id: c.agent_id.as_uuid(),
+                created_at: c.created_at.to_rfc3339(),
+                labels: claim_labels,
+                is_current: c.is_current,
+                supersedes: c.supersedes.map(|s| s.as_uuid()),
+            })
+            .collect(),
+    ))
+}
+
+/// Stub for non-db builds — returns an empty list.
+#[cfg(not(feature = "db"))]
+pub async fn list_by_labels(
+    State(_state): State<AppState>,
+    Query(_q): Query<ClaimsByLabelsQuery>,
+) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
+    Ok(Json(vec![]))
+}
+
 /// Phase 1: Propose deletion of a claim. Requires `claims:delete` scope.
 ///
 /// Creates a `proposed_deletion` challenge in pending state. The claim is NOT
