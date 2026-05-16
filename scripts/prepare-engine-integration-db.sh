@@ -22,13 +22,19 @@ export PGPASSWORD="$DB_PASS"
 
 echo "→ Dropping and recreating $DB_NAME (existing data will be lost)"
 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$ADMIN_DB" \
-    -c "DROP DATABASE IF EXISTS $DB_NAME" >/dev/null
+    -c "DROP DATABASE IF EXISTS \"$DB_NAME\"" >/dev/null
 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$ADMIN_DB" \
-    -c "CREATE DATABASE $DB_NAME OWNER $DB_USER" >/dev/null
+    -c "CREATE DATABASE \"$DB_NAME\" OWNER \"$DB_USER\"" >/dev/null
 
 echo "→ Applying migrations from ./migrations"
-for f in migrations/*.sql; do
-    [ -f "$f" ] || continue
+shopt -s nullglob
+migration_files=(migrations/*.sql)
+shopt -u nullglob
+if [ ${#migration_files[@]} -eq 0 ]; then
+    echo "ERROR: no migrations/*.sql found. Run from repo root." >&2
+    exit 1
+fi
+for f in "${migration_files[@]}"; do
     echo "    $f"
     psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
         -v ON_ERROR_STOP=1 -q -f "$f"
