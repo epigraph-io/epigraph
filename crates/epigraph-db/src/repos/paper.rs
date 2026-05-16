@@ -205,15 +205,17 @@ impl PaperRepository {
         .await?;
         rows.into_iter()
             .map(|r| {
-                let content_hash: [u8; 32] = r.content_hash.as_slice().try_into().map_err(|_| {
-                    DbError::InvalidData {
-                        reason: format!(
-                            "claim {} has content_hash of length {} (expected 32)",
-                            r.id,
-                            r.content_hash.len()
-                        ),
-                    }
-                })?;
+                let content_hash: [u8; 32] =
+                    r.content_hash
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| DbError::InvalidData {
+                            reason: format!(
+                                "claim {} has content_hash of length {} (expected 32)",
+                                r.id,
+                                r.content_hash.len()
+                            ),
+                        })?;
                 Ok(AssertedClaimRow {
                     id: r.id,
                     content: r.content,
