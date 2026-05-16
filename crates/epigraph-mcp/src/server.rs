@@ -270,6 +270,17 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Returns {resolution_claim_id, original_id, original_labels}."
+    )]
+    async fn resolve_backlog_item(
+        &self,
+        Parameters(params): Parameters<crate::types::ResolveBacklogItemParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::claims::resolve_backlog_item(self, params).await
+    }
+
+    #[tool(
         description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required."
     )]
     async fn patch_claim(

@@ -901,6 +901,22 @@ pub struct SupersedeClaimParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResolveBacklogItemParams {
+    #[schemars(description = "UUID of the backlog claim being retired")]
+    pub original_id: String,
+
+    #[schemars(
+        description = "Narrative explaining how the issue was resolved. Will be prefixed with 'Resolves <original_id>: '."
+    )]
+    pub resolution_content: String,
+
+    #[schemars(
+        description = "Methodology for the resolution claim (default: 'expert_elicitation'). Use 'inductive_generalization' if the resolution generalizes from an observed pattern."
+    )]
+    pub methodology: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpdateLabelsParams {
     #[schemars(description = "UUID of the claim to label")]
     pub claim_id: String,
