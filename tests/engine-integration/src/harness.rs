@@ -207,9 +207,10 @@ pub async fn cleanup_test_data(pool: &PgPool, content_prefix: &str) {
 /// - Reads `claims` rows with `content LIKE prefix%` and registers each as a
 ///   `Claim` (with the DB-assigned id and truth_value).
 /// - Reads `edges` joining those claims and converts:
-///     `relationship = 'supports'`   → `is_supporting = true`,  EvidenceType::Empirical
-///     `relationship = 'contradicts'`→ `is_supporting = false`, EvidenceType::Empirical
-///   All edges use `strength = 0.8`, `age_days = 0.0` (test defaults).
+///   `relationship = 'supports'` → `is_supporting = true`,
+///   `relationship = 'contradicts' | 'refutes'` → `is_supporting = false`,
+///   everything else maps to `is_supporting = true`. Evidence type is
+///   `EvidenceType::Empirical`; `strength = 0.8`; `age_days = 0.0`.
 ///
 /// Anything more elaborate (loading strength from edges.properties,
 /// mapping evidence_type from a column, etc.) belongs in a production loader
