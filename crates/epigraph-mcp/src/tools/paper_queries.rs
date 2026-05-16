@@ -6,7 +6,6 @@ use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
-use epigraph_core::Claim;
 use epigraph_crypto::ContentHasher;
 use epigraph_db::{ClaimRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository};
 
@@ -215,27 +214,29 @@ pub async fn query_claims_by_label(
         });
     }
 
-    // Pass default `exclude_labels=[]` and `current_only=false` for now; Task 3
-    // of the backlog-retirement plan rewires this caller to surface the new
-    // fields and accept the filters from MCP params.
-    let claim_pairs =
-        ClaimRepository::list_by_labels(&server.pool, &params.labels, &[], false, min_truth, limit)
-            .await
-            .map_err(internal_error)?;
-    let claims: Vec<Claim> = claim_pairs.into_iter().map(|(c, _)| c).collect();
+    let rows = ClaimRepository::list_by_labels(
+        &server.pool,
+        &params.labels,
+        &params.exclude_labels,
+        params.current_only,
+        min_truth,
+        limit,
+    )
+    .await
+    .map_err(internal_error)?;
 
-    let results: Vec<ClaimResponse> = claims
-        .iter()
-        .map(|c| ClaimResponse {
+    let results: Vec<ClaimResponse> = rows
+        .into_iter()
+        .map(|(c, labels)| ClaimResponse {
             id: c.id.as_uuid().to_string(),
             content: c.content.clone(),
             truth_value: c.truth_value.value(),
             agent_id: c.agent_id.as_uuid().to_string(),
             content_hash: ContentHasher::to_hex(&c.content_hash),
             created_at: c.created_at.to_rfc3339(),
-            labels: Vec::new(),
-            is_current: true,
-            supersedes: None,
+            labels,
+            is_current: c.is_current,
+            supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
         })
         .collect();
 

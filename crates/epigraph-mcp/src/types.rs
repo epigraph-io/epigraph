@@ -212,6 +212,18 @@ pub struct QueryClaimsByLabelParams {
     )]
     pub labels: Vec<String>,
 
+    #[schemars(
+        description = "Labels to exclude — drops claims containing ANY of these labels (e.g. [\"resolved\"]). Default: no exclusion."
+    )]
+    #[serde(default)]
+    pub exclude_labels: Vec<String>,
+
+    #[schemars(
+        description = "When true, returns only claims with is_current = true (drops superseded/retired claims). Default: false."
+    )]
+    #[serde(default)]
+    pub current_only: bool,
+
     #[schemars(description = "Minimum truth value (0.0-1.0, default 0.0)")]
     pub min_truth: Option<f64>,
 
