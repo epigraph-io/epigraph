@@ -121,6 +121,10 @@ pub async fn create_test_factor(
 ///
 /// Tests should construct one at the top of the test body:
 /// `let _guard = PrefixGuard::new(&db.pool, "[test-foo]");`
+///
+/// Note: `Drop` reads `DATABASE_URL` from the environment at drop time.
+/// Tests must not mutate that variable mid-test or cleanup will run against
+/// the wrong database.
 pub struct PrefixGuard {
     // The pool passed to `new` is kept alive for the test's duration but Drop
     // opens a fresh connection on its own runtime to avoid cross-runtime I/O
@@ -216,6 +220,12 @@ pub async fn cleanup_test_data(pool: &PgPool, content_prefix: &str) {
 /// mapping evidence_type from a column, etc.) belongs in a production loader
 /// — this is a test helper that exists to make the regression test exercise
 /// real DB→engine flow rather than reconstructing state by hand.
+///
+/// Limitation: the edge SELECT filters on `cs.content LIKE prefix%` for the
+/// source side only. Tests must use the same prefix for both endpoints of
+/// every edge — an edge to an out-of-prefix target is still added to the
+/// DAG via `add_dependency`, but the target claim is never `register_claim`'d,
+/// and `update_and_propagate` silently skips propagation through it.
 pub async fn load_orchestrator_from_db(
     pool: &PgPool,
     prefix: &str,
