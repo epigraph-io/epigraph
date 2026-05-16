@@ -92,7 +92,7 @@ pub use method::{
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
 };
 pub use ownership::OwnershipRepository;
-pub use paper::{PaperRepository, PaperRow};
+pub use paper::{AssertedClaimRow, PaperRepository, PaperRow};
 pub use perspective::PerspectiveRepository;
 pub use political::{
     AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,

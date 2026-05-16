@@ -111,4 +111,129 @@ impl PaperRepository {
         .await?;
         Ok(row.is_some())
     }
+
+    /// Count the claims this paper asserts (`paper -asserts-> claim` edges).
+    ///
+    /// Used by MCP `query_paper` as the canonical "did this paper land in the
+    /// graph?" probe — replaces the old broken `ILIKE '%doi%'` content search.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn count_asserted_claims(pool: &PgPool, paper_id: Uuid) -> Result<i64, DbError> {
+        let row = sqlx::query!(
+            r#"
+            SELECT COUNT(*) AS "count!"
+            FROM edges
+            WHERE source_id = $1
+              AND source_type = 'paper'
+              AND target_type = 'claim'
+              AND relationship = 'asserts'
+            "#,
+            paper_id,
+        )
+        .fetch_one(pool)
+        .await?;
+        Ok(row.count)
+    }
+
+    /// List the authors of a paper as `(agent_id, display_name)` pairs,
+    /// resolved via `agent -authored-> paper` edges.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn list_authors(
+        pool: &PgPool,
+        paper_id: Uuid,
+    ) -> Result<Vec<(Uuid, Option<String>)>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT a.id AS "id!", a.display_name
+            FROM edges e
+            JOIN agents a ON a.id = e.source_id
+            WHERE e.target_id = $1
+              AND e.target_type = 'paper'
+              AND e.source_type = 'agent'
+              AND e.relationship = 'authored'
+            ORDER BY a.display_name NULLS LAST, a.id
+            "#,
+            paper_id,
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.id, r.display_name)).collect())
+    }
+
+    /// List claim summaries asserted by this paper, up to `limit` rows,
+    /// reached via `paper -asserts-> claim` edges. Ordered by claim
+    /// `created_at` ascending (ingest order) for stable pagination.
+    ///
+    /// Returns `(id, content, truth_value, agent_id, content_hash, created_at)`
+    /// per claim — the shape `query_paper` needs for `ClaimResponse`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn list_asserted_claims(
+        pool: &PgPool,
+        paper_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<AssertedClaimRow>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                c.id          AS "id!",
+                c.content     AS "content!",
+                c.truth_value AS "truth_value!",
+                c.agent_id    AS "agent_id!",
+                c.content_hash AS "content_hash!",
+                c.created_at  AS "created_at!"
+            FROM edges e
+            JOIN claims c ON c.id = e.target_id
+            WHERE e.source_id = $1
+              AND e.source_type = 'paper'
+              AND e.target_type = 'claim'
+              AND e.relationship = 'asserts'
+            ORDER BY c.created_at ASC, c.id
+            LIMIT $2
+            "#,
+            paper_id,
+            limit,
+        )
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                let content_hash: [u8; 32] = r.content_hash.as_slice().try_into().map_err(|_| {
+                    DbError::InvalidData {
+                        reason: format!(
+                            "claim {} has content_hash of length {} (expected 32)",
+                            r.id,
+                            r.content_hash.len()
+                        ),
+                    }
+                })?;
+                Ok(AssertedClaimRow {
+                    id: r.id,
+                    content: r.content,
+                    truth_value: r.truth_value,
+                    agent_id: r.agent_id,
+                    content_hash,
+                    created_at: r.created_at,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Minimal claim shape returned by [`PaperRepository::list_asserted_claims`].
+#[derive(Debug, Clone)]
+pub struct AssertedClaimRow {
+    pub id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub agent_id: Uuid,
+    pub content_hash: [u8; 32],
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
