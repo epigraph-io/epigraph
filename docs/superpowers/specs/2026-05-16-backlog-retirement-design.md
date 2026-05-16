@@ -62,7 +62,7 @@ Changes:
   - Output: every returned claim includes `is_current` and `supersedes` (and `labels`, currently absent).
 - The default behaviour of `query_claims_by_label` is unchanged when the new params are omitted, so existing callers don't break.
 
-Implementation: changes to `epigraph-mcp` server tool definitions + corresponding handler in `epigraph-api` if the query is delegated, or direct SQL filter (`NOT (labels && $exclude::text[])` and `is_current = true`) if the MCP server queries the DB directly. The actual implementation path is decided in the implementation plan after reading the current MCP handler code.
+Implementation: extend the HTTP API first, MCP server passes through. Concretely: extend whatever HTTP route currently serves `query_claims_by_label` to accept the new `exclude_labels` and `current_only` params and to return the new `labels` / `is_current` / `supersedes` fields. Then update the `epigraph-mcp` tool definition and handler to pass the new params through and surface the new fields. This keeps SQL surface area centralised in `epigraph-api`; the MCP server stays a thin shim. No direct DB access from MCP for this work.
 
 ### Component 2: MCP write-side tool — `resolve_backlog_item`
 
@@ -101,7 +101,7 @@ Algorithm:
 
 1. Pull all claims with `labels @> ["backlog"]` (page through; `query_claims_by_label` caps at 100, so use offset/limit until exhausted).
 2. Pull all claims with `labels @> ["resolved"]` into memory, indexed by every UUID-shaped substring found in their content.
-3. Build a set of "supersedes-retired" originals: every claim with `is_current = false` AND a `supersedes` value, OR every claim whose UUID appears as the `supersedes` target of another claim. (Requires Component 1 to be deployed for the MCP path, OR direct DB read for the cleanup — script may use direct DB read since it's one-shot and operator-supervised.)
+3. Build a set of "supersedes-retired" originals: every claim with `is_current = false` AND a `supersedes` value, OR every claim whose UUID appears as the `supersedes` target of another claim. Requires Component 1 to be deployed so this signal is readable via the HTTP API — the cleanup script reads only via HTTP, no direct DB access. This makes Component 1 a hard prerequisite for the cleanup pass; sequence the implementation plan accordingly.
 4. For each backlog item:
    - If already has `"resolved"` label → skip (idempotent).
    - If matched by exactly one resolution claim AND no other downstream conflict → bucket as `auto-patch`.
