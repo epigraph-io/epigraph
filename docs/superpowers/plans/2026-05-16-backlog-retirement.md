@@ -40,8 +40,9 @@
 
 - Task 1 is a hard prerequisite for Tasks 2–9 (everything downstream reads the extended repo output).
 - Tasks 2–4 (MCP read-side) are independent of Task 5 (HTTP route) — can be done in any order after Task 1.
-- Task 6 (`resolve_backlog_item`) is independent of Tasks 2–5 but should land before Task 7 (cleanup script) so the cleanup can use it for the auto-patch operation.
-- Task 8 (reconciler) depends on Task 5 (HTTP route).
+- Task 6 (`resolve_backlog_item`) is independent of Tasks 2–5 but its tests need Tasks 1 and 4 merged first (they assert on `is_current`/`supersedes` and `labels` round-tripping).
+- **Task 7 (cleanup script) requires Task 5 to be both merged AND deployed** — Task 7 Step 2 is the explicit build/restart/verify step.
+- Task 8 (reconciler) shares matching logic with Task 7 and also requires Task 5 deployed.
 - Task 9 (docs) can land last but should reference the merged tool names exactly.
 
 ---
@@ -50,11 +51,19 @@
 
 **Files:**
 - Modify: `crates/epigraph-db/src/repos/claim.rs:865-901` (`list_by_labels`)
-- Modify: `crates/epigraph-db/src/repos/claim.rs:1664-1672` (`ClaimRow` struct)
-- Modify: `crates/epigraph-db/src/repos/claim.rs:71-103` (`claim_from_row`)
 - Test: `crates/epigraph-db/tests/list_by_labels.rs` (new file)
 
-The domain `Claim` struct already has `supersedes: Option<ClaimId>` and `is_current: bool` (see `crates/epigraph-core/src/domain/claim.rs:70,76`). The `ClaimRow` and `claim_from_row` in `claim.rs` currently drop them. We surface them, then add `labels: Vec<String>` to the return tuple alongside the `Claim`.
+The domain `Claim` struct already has `supersedes: Option<ClaimId>` and `is_current: bool` (see `crates/epigraph-core/src/domain/claim.rs:70,76`). We extend the `SELECT` in `list_by_labels` to include those columns AND `labels`, then post-fix the `Claim` after `claim_from_row` returns and pair it with the labels in the result tuple.
+
+**Important — do not change `claim_from_row`'s signature.** It has 20 callers; widening its signature would cascade through every list/query in the repo. Instead, mutate the returned `Claim` in `list_by_labels` only:
+
+```rust
+let mut claim = claim_from_row(...);  // unchanged 7-arg call
+claim.is_current = row.is_current;
+claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+```
+
+This keeps the blast radius to one function. Other call sites continue to return `Claim` with default `is_current=true`/`supersedes=None`, which is correct for paths that don't care about retirement state and is what Task 4 will fix specifically for `get_by_id`.
 
 - [ ] **Step 1: Write the failing integration test**
 
@@ -68,14 +77,15 @@ use uuid::Uuid;
 
 #[sqlx::test]
 async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
-    // Seed: one current backlog claim, one resolved backlog claim, one superseded backlog claim
+    // Seed: one current backlog claim, one resolved backlog claim, one superseded backlog claim.
+    // The superseded one references the open one as its successor, so the supersedes FK resolves.
     let backlog_open = seed_claim(&pool, &["backlog"], true, None).await;
     let backlog_resolved = seed_claim(&pool, &["backlog", "resolved"], true, None).await;
     let backlog_superseded = seed_claim(
         &pool,
         &["backlog"],
         false,
-        Some(ClaimId::new()),
+        Some(backlog_open),
     )
     .await;
 
@@ -192,77 +202,9 @@ Run: `DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test 
 
 Expected: FAIL with a signature-mismatch compile error (current `list_by_labels` takes 4 args, test passes 6).
 
-- [ ] **Step 3: Update `ClaimRow` to include the new columns**
+- [ ] **Step 3: Rewrite `list_by_labels` with new params and an inline `Row` struct**
 
-In `crates/epigraph-db/src/repos/claim.rs` around line 1664, replace the struct:
-
-```rust
-#[derive(sqlx::FromRow)]
-struct ClaimRow {
-    id: Uuid,
-    content: String,
-    truth_value: f64,
-    agent_id: Uuid,
-    trace_id: Option<Uuid>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-    labels: Vec<String>,
-    is_current: bool,
-    supersedes: Option<Uuid>,
-}
-```
-
-- [ ] **Step 4: Update `claim_from_row` to thread `is_current`/`supersedes` through**
-
-In `crates/epigraph-db/src/repos/claim.rs` around line 71, replace the function signature and body:
-
-```rust
-fn claim_from_row(
-    id: Uuid,
-    content: String,
-    agent_id: Uuid,
-    trace_id: Option<Uuid>,
-    truth_value: TruthValue,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-    is_current: bool,
-    supersedes: Option<Uuid>,
-) -> Claim {
-    let content_hash_vec = ContentHasher::hash(content.as_bytes());
-    let mut content_hash = [0u8; 32];
-    content_hash.copy_from_slice(&content_hash_vec);
-    let public_key = [0u8; 32];
-    let signature = None;
-
-    let mut claim = Claim::with_id(
-        ClaimId::from_uuid(id),
-        content,
-        AgentId::from_uuid(agent_id),
-        public_key,
-        content_hash,
-        trace_id.map(TraceId::from_uuid),
-        signature,
-        truth_value,
-        created_at,
-        updated_at,
-    );
-    claim.is_current = is_current;
-    claim.supersedes = supersedes.map(ClaimId::from_uuid);
-    claim
-}
-```
-
-You will get compile errors in every other call site of `claim_from_row`. Fix each one by passing `row.is_current` and `row.supersedes` when the surrounding `SELECT` includes those columns. Many callers (e.g. `get_by_id` at line 337–367) do NOT select those columns — for those, pass literal `true` and `None` respectively. They're the safe defaults and Task 4 will properly thread them through for `get_by_id`. Use grep to find every call:
-
-```bash
-grep -n 'claim_from_row(' crates/epigraph-db/src/repos/claim.rs
-```
-
-For each call site where the surrounding `SELECT` already selects `is_current` and `supersedes`, thread them through. For call sites where the surrounding `SELECT` doesn't, pass literal `true` and `None` — do NOT silently extend the SELECT, that's out of scope for this task.
-
-- [ ] **Step 5: Rewrite `list_by_labels` with new params**
-
-Replace lines 865–901 in `crates/epigraph-db/src/repos/claim.rs`:
+Replace lines 865–901 in `crates/epigraph-db/src/repos/claim.rs`. Use a local row struct so the existing global `ClaimRow` stays untouched (it's used by other queries that don't select the new columns):
 
 ```rust
 pub async fn list_by_labels(
@@ -273,10 +215,22 @@ pub async fn list_by_labels(
     min_truth: f64,
     limit: i64,
 ) -> Result<Vec<(Claim, Vec<String>)>, DbError> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: Uuid,
+        content: String,
+        truth_value: f64,
+        agent_id: Uuid,
+        trace_id: Option<Uuid>,
+        created_at: chrono::DateTime<chrono::Utc>,
+        updated_at: chrono::DateTime<chrono::Utc>,
+        labels: Vec<String>,
+        is_current: bool,
+        supersedes: Option<Uuid>,
+    }
+
     let limit = limit.clamp(1, 1000);
-    // Build the WHERE clause. `labels @> $1` uses the GIN index; the optional
-    // NOT (labels && $2) and is_current=true filters are applied after.
-    let rows = sqlx::query_as::<_, ClaimRow>(
+    let rows = sqlx::query_as::<_, Row>(
         r#"
         SELECT id, content, truth_value, agent_id, trace_id,
                created_at, updated_at, labels, is_current, supersedes
@@ -300,7 +254,7 @@ pub async fn list_by_labels(
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let truth_value = TruthValue::new(row.truth_value)?;
-        let claim = claim_from_row(
+        let mut claim = claim_from_row(
             row.id,
             row.content,
             row.agent_id,
@@ -308,36 +262,37 @@ pub async fn list_by_labels(
             truth_value,
             row.created_at,
             row.updated_at,
-            row.is_current,
-            row.supersedes,
         );
+        claim.is_current = row.is_current;
+        claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
         out.push((claim, row.labels));
     }
     Ok(out)
 }
 ```
 
-- [ ] **Step 6: Fix the other call site of `list_by_labels`**
+- [ ] **Step 4: Fix the other call sites of `list_by_labels`**
 
 Search and fix every caller of `list_by_labels`:
 
 ```bash
-grep -rn "list_by_labels(" crates/
+grep -rn "list_by_labels(" crates/ tests/
 ```
 
 The signature change (4→6 args and `Vec<Claim>` → `Vec<(Claim, Vec<String>)>`) will break the MCP `query_claims_by_label` caller at `crates/epigraph-mcp/src/tools/paper_queries.rs:208`. Defer fixing that to Task 3 — for now, add the new args with sensible defaults (`&[]`, `false`) at every existing call and destructure the tuple as `(claim, _labels)` to drop the labels:
 
 ```rust
 // Example fix at paper_queries.rs:208
-let claims = ClaimRepository::list_by_labels(&server.pool, &params.labels, &[], false, min_truth, limit)
-    .await
-    .map_err(internal_error)?;
-let claims: Vec<Claim> = claims.into_iter().map(|(c, _)| c).collect();
+let claim_pairs =
+    ClaimRepository::list_by_labels(&server.pool, &params.labels, &[], false, min_truth, limit)
+        .await
+        .map_err(internal_error)?;
+let claims: Vec<Claim> = claim_pairs.into_iter().map(|(c, _)| c).collect();
 ```
 
 (Task 3 will rewrite this properly to thread labels through.)
 
-- [ ] **Step 7: Run the test**
+- [ ] **Step 5: Run the test**
 
 Run: `DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo test -p epigraph-db --test list_by_labels`
 
@@ -345,13 +300,13 @@ Expected: PASS.
 
 If the `epigraph_db_repo_test` database doesn't exist, create it once: `psql -U epigraph -d postgres -c "CREATE DATABASE epigraph_db_repo_test"` and apply migrations: `sqlx migrate run --database-url postgres://epigraph:epigraph@localhost/epigraph_db_repo_test`.
 
-- [ ] **Step 8: Run the rest of the repo test suite to check nothing else broke**
+- [ ] **Step 6: Run the rest of the repo test suite to check nothing else broke**
 
 Run: `DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo test -p epigraph-db`
 
-Expected: PASS for all existing tests. If any fail because they assert on `Claim`/`ClaimRow` shape, update them to match the new field set (passing through `is_current=true`/`supersedes=None` is the safe default).
+Expected: PASS for all existing tests. The signature change to `list_by_labels` only affects this one function — `claim_from_row` is untouched and other callers continue to work unchanged.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/epigraph-db/src/repos/claim.rs crates/epigraph-mcp/src/tools/paper_queries.rs crates/epigraph-db/tests/list_by_labels.rs
@@ -359,9 +314,9 @@ git commit -m "feat(db): extend list_by_labels with exclude_labels + current_onl
 
 Surface labels, is_current, and supersedes alongside the Claim so the
 MCP and HTTP readers can distinguish live, resolved, and superseded
-claims. Add two new filter params; defaults preserve existing behavior.
-Caller at MCP query_claims_by_label adjusted to drop labels for now
-(Task 3 wires them through).
+claims. Inline Row struct keeps the global ClaimRow untouched — the
+20 other claim_from_row callers are unaffected. MCP query_claims_by_label
+caller updated to drop labels for now (Task 3 wires them through).
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ```
@@ -388,16 +343,14 @@ pub struct ClaimResponse {
     pub agent_id: String,
     pub content_hash: String,
     pub created_at: String,
-    #[serde(default)]
     pub labels: Vec<String>,
-    #[serde(default = "default_true")]
     pub is_current: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
 }
-
-fn default_true() -> bool { true }
 ```
+
+(No `#[serde(default)]` — `ClaimResponse` derives `Serialize` only. Every construction site (Tasks 3 and 4) must populate the new fields.)
 
 - [ ] **Step 2: Compile to verify the struct still parses**
 
@@ -575,11 +528,54 @@ Run: `DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test 
 
 Expected: FAIL — current handler doesn't set the new fields.
 
-- [ ] **Step 3: Update the handler**
+- [ ] **Step 3: Extend `get_by_id` to surface retirement state**
 
-The current `get_claim` calls `ClaimRepository::get_by_id` which returns `Option<Claim>`. The `Claim` already has `is_current` and `supersedes` (after Task 1's `claim_from_row` fix). But it does NOT have `labels` — those live on the row, not the domain object. Add a new repo method to fetch labels separately, OR change `get_by_id` to also return labels. The simpler path: add a thin repo helper.
+Currently `get_by_id` at `crates/epigraph-db/src/repos/claim.rs:337` selects 7 columns and the returned `Claim` always has `is_current=true`/`supersedes=None` (set inside `Claim::with_id`). We extend its `SELECT` and post-fix the returned `Claim` — same pattern as Task 1, again without touching `claim_from_row`'s signature.
 
-Add to `crates/epigraph-db/src/repos/claim.rs` (near the other `get_by_id` methods):
+Replace `get_by_id` (lines 337–367):
+
+```rust
+pub async fn get_by_id(pool: &PgPool, id: ClaimId) -> Result<Option<Claim>, DbError> {
+    let uuid: Uuid = id.into();
+
+    let row = sqlx::query!(
+        r#"
+        SELECT id, content, truth_value, agent_id, trace_id,
+               created_at, updated_at, is_current, supersedes
+        FROM claims
+        WHERE id = $1
+        "#,
+        uuid
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        Some(row) => {
+            let truth_value = TruthValue::new(row.truth_value)?;
+            let mut claim = claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            );
+            claim.is_current = row.is_current.unwrap_or(true);
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            Ok(Some(claim))
+        }
+        None => Ok(None),
+    }
+}
+```
+
+(`is_current` is `NOT NULL` in the schema but `sqlx::query!` returns it as `Option<bool>` because the column has a `DEFAULT`. The `unwrap_or(true)` is defensive.)
+
+- [ ] **Step 4: Add a `get_labels` repo helper for `get_claim`**
+
+Add this near the other `get_by_id` methods in `crates/epigraph-db/src/repos/claim.rs`:
 
 ```rust
 pub async fn get_labels(pool: &PgPool, id: ClaimId) -> Result<Vec<String>, DbError> {
@@ -592,7 +588,9 @@ pub async fn get_labels(pool: &PgPool, id: ClaimId) -> Result<Vec<String>, DbErr
 }
 ```
 
-Then replace `crates/epigraph-mcp/src/tools/claims.rs:281-299`:
+- [ ] **Step 5: Update the MCP `get_claim` handler**
+
+Replace `crates/epigraph-mcp/src/tools/claims.rs:281-299`:
 
 ```rust
 pub async fn get_claim(
@@ -623,22 +621,28 @@ pub async fn get_claim(
 }
 ```
 
-Verify `get_by_id` returns a `Claim` whose `is_current` and `supersedes` reflect the row by checking `crates/epigraph-db/src/repos/claim.rs:337`. If its `SELECT` doesn't include those columns, add them (small in-scope change because Task 1's `claim_from_row` now expects them). If you only see `is_current` selected in some queries and not others, normalize the `SELECT` lists in this same commit.
-
-- [ ] **Step 4: Run the test**
+- [ ] **Step 6: Run the test**
 
 Run: `DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo test -p epigraph-mcp --test get_claim`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Run the rest of the test suite — `get_by_id` change is upstream of many tests**
+
+Run: `DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo test -p epigraph-db -p epigraph-mcp -p epigraph-api`
+
+Expected: PASS. If a test fails because it now sees `is_current=false` for a claim that was previously `true` (because the previous `get_by_id` always returned `true`), that's a pre-existing bug being surfaced — investigate, don't suppress.
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add crates/epigraph-db/src/repos/claim.rs crates/epigraph-mcp/src/tools/claims.rs crates/epigraph-mcp/tests/get_claim.rs
 git commit -m "feat(mcp): get_claim returns labels/is_current/supersedes
 
-Adds ClaimRepository::get_labels helper and threads the new fields
-through the MCP get_claim handler.
+Extends ClaimRepository::get_by_id SELECT to include is_current and
+supersedes (post-fix Claim after claim_from_row, no signature
+cascade). Adds get_labels repo helper. Threads the new fields through
+the MCP get_claim handler.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ```
@@ -715,7 +719,9 @@ pub async fn list_by_labels(
 ) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
     let labels: Vec<String> = q.labels.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
     if labels.is_empty() {
-        return Err(ApiError::BadRequest("labels query parameter required".into()));
+        return Err(ApiError::BadRequest {
+            message: "labels query parameter required".into(),
+        });
     }
     let exclude_labels: Vec<String> = q.exclude_labels
         .unwrap_or_default()
@@ -750,17 +756,23 @@ pub async fn list_by_labels(
 }
 ```
 
-If `ApiError::BadRequest` doesn't exist, use whichever bad-request variant the existing routes use (`ApiError::Validation`, `ApiError::InvalidRequest`, etc.) — grep `enum ApiError` in `crates/epigraph-api/src/errors.rs`.
+`ApiError::BadRequest { message: String }` is a struct variant (see `crates/epigraph-api/src/errors.rs:15`). Use struct-init syntax, not tuple-init.
 
 - [ ] **Step 4: Register the route in `mod.rs`**
+
+First check what's imported. Run:
+
+```bash
+grep -n "use axum::routing\|axum::routing::get" crates/epigraph-api/src/routes/mod.rs
+```
+
+If `get` is already in scope (look for `use axum::routing::{get, post, patch, ...}` or `use axum::routing::*`), proceed. Otherwise add `get` to the import line at the top of the file.
 
 In `crates/epigraph-api/src/routes/mod.rs`, near line 221 and 855 (both router-build sites), add:
 
 ```rust
 .route("/api/v1/claims/by-labels", get(claims::list_by_labels))
 ```
-
-Use `axum::routing::get`.
 
 - [ ] **Step 5: Run the test**
 
@@ -862,7 +874,11 @@ pub struct ResolveBacklogItemParams {
 }
 ```
 
-- [ ] **Step 4: Add the handler**
+- [ ] **Step 4: Add the handler — call the canonical `submit_claim` pipeline, then PATCH labels**
+
+`submit_claim` (claims.rs:72) is the canonical claim-creation path. It calls `create_claim_idempotent` (which dedups by `(content_hash, agent_id)` via `create_or_get`, NOT by content_hash alone) and runs the full lifecycle: Evidence + ReasoningTrace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding + label patch. `resolve_backlog_item` MUST go through this path so resolution claims are searchable via `recall`/RAG and produce a clean audit trail.
+
+The cleanest way to share the lifecycle: construct a `SubmitClaimParams` and call `submit_claim` directly. `SubmitClaimParams` already accepts a `labels: Vec<String>` field (types.rs:73) so labels land on the resolution claim atomically. We parse the resulting `CallToolResult` to extract the resolution claim's UUID.
 
 In `crates/epigraph-mcp/src/tools/claims.rs` (near `update_labels`):
 
@@ -874,43 +890,38 @@ pub async fn resolve_backlog_item(
     let original_id = parse_uuid(&params.original_id)?;
     let original_claim_id = ClaimId::from_uuid(original_id);
 
-    // Warn-only: confirm the target exists; do NOT reject if it lacks ["backlog"]
-    // (sometimes you resolve something that was never labeled).
-    let original = ClaimRepository::get_by_id(&server.pool, original_claim_id)
+    // Confirm the target exists (warn-only: don't reject if it lacks "backlog")
+    let _original = ClaimRepository::get_by_id(&server.pool, original_claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {original_id} not found")))?;
 
-    // 1. Submit the resolution claim with labels=["resolved"]
-    let agent_id = server.agent_id().await?;
-    let agent_id_typed = AgentId::from_uuid(agent_id);
-    let pub_key = server.signer.public_key();
-    let resolution_content = format!(
-        "Resolves {}: {}",
-        original_id, params.resolution_content
-    );
-    let content_hash = ContentHasher::hash(resolution_content.as_bytes());
-    let mut content_hash_arr = [0u8; 32];
-    content_hash_arr.copy_from_slice(&content_hash);
-    let mut resolution = Claim::new(
-        agent_id_typed,
-        pub_key,
-        resolution_content,
-        content_hash_arr,
-        None,
-        TruthValue::new(0.5).unwrap(),
-    );
-    resolution.signature = Some(server.signer.sign(&content_hash_arr));
-    let resolution_id = ClaimRepository::create(&server.pool, &resolution)
-        .await
-        .map_err(internal_error)?;
-    // Tag the resolution claim with "resolved"
-    ClaimRepository::update_labels(&server.pool, *resolution_id.as_uuid(), &["resolved".to_string()], &[])
-        .await
-        .map_err(internal_error)?;
+    // 1. Submit the resolution claim via the canonical pipeline.
+    let methodology = params.methodology.unwrap_or_else(|| "expert_elicitation".to_string());
+    let resolution_content = format!("Resolves {}: {}", original_id, params.resolution_content);
+    let submit_params = crate::types::SubmitClaimParams {
+        content: resolution_content,
+        methodology,
+        evidence_data: format!(
+            "Operational resolution of backlog claim {}. Filed via resolve_backlog_item.",
+            original_id
+        ),
+        evidence_type: "testimonial".to_string(),
+        confidence: 0.8,
+        source_url: None,
+        reasoning: Some(format!(
+            "Backlog claim {original_id} retired by agent assertion via resolve_backlog_item."
+        )),
+        labels: vec!["resolved".to_string()],
+    };
+    let submit_result = submit_claim(server, submit_params).await?;
+    // submit_claim returns success_json(&SubmitClaimResponse) — parse the text content
+    // back into the typed struct to extract the UUID.
+    let resolution_id = extract_submit_claim_id(&submit_result)?;
 
-    // 2. Patch the original's labels: add "resolved", keep "backlog"
-    // Best-effort: if this fails, return the partial-success error including the resolution UUID.
+    // 2. PATCH the original's labels: add "resolved", keep "backlog".
+    //    Best-effort: if this fails the resolution claim already exists, return
+    //    a partial-success error so the reconciler can back-fill.
     let after_labels = match ClaimRepository::update_labels(
         &server.pool,
         original_id,
@@ -924,30 +935,44 @@ pub async fn resolve_backlog_item(
             return Err(McpError {
                 code: rmcp::model::ErrorCode::INTERNAL_ERROR,
                 message: format!(
-                    "resolution claim {} created but failed to patch original {}: {}",
-                    resolution_id.as_uuid(),
-                    original_id,
-                    e
+                    "resolution claim {resolution_id} created but failed to patch original {original_id}: {e}"
                 )
                 .into(),
                 data: Some(serde_json::json!({
-                    "resolution_claim_id": resolution_id.as_uuid().to_string(),
+                    "resolution_claim_id": resolution_id,
                     "original_id": original_id.to_string(),
                 })),
             });
         }
     };
 
-    let _ = original; // silence unused (kept for future "warn if no backlog label" hook)
     success_json(&serde_json::json!({
-        "resolution_claim_id": resolution_id.as_uuid().to_string(),
+        "resolution_claim_id": resolution_id,
         "original_id": original_id.to_string(),
         "original_labels": after_labels,
     }))
 }
+
+fn extract_submit_claim_id(result: &CallToolResult) -> Result<String, McpError> {
+    use rmcp::model::Content;
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| match c {
+            Content { raw: rmcp::model::RawContent::Text(t), .. } => Some(t.text.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| internal_error("submit_claim returned no text content"))?;
+    let parsed: serde_json::Value = serde_json::from_str(text).map_err(internal_error)?;
+    parsed
+        .get("claim_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| internal_error("submit_claim response missing claim_id"))
+}
 ```
 
-Check `Claim::new` and `ClaimRepository::create` signatures exactly — adjust the construction to whatever the canonical `submit_claim` MCP handler does (look at `crates/epigraph-mcp/src/tools/claims.rs` around `pub async fn submit_claim`). Mirror its construction (this avoids drift from the canonical submit path).
+Confirm the `Content` / `RawContent` shape by reading `crates/epigraph-mcp/src/tools/claims.rs:66-69` (`success_json` helper) — if the rmcp Content shape differs from the snippet above, mirror whatever pattern `success_json` produces. The point: parse the JSON the canonical helper wrote, don't replicate the claim-creation logic.
 
 - [ ] **Step 5: Register the tool**
 
@@ -1030,8 +1055,18 @@ from pathlib import Path
 
 import httpx
 
-UUID_RE = re.compile(
+FULL_UUID_RE = re.compile(
     r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
+    re.IGNORECASE,
+)
+# Existing resolved-claim convention uses 8-char prefixes after a resolution keyword:
+#   "Resolves 1c31a529", "Resolves k-means portion of c4e48078",
+#   "Supersedes 6949d004; agent claim was stale memory"
+# Match keyword + (optionally up to ~40 chars of intervening prose) + 8 hex chars,
+# capturing either the full UUID or the bare 8-char prefix.
+KEYWORD_RE = re.compile(
+    r"\b(?:resolves?|supersedes?|closes?|fixes?)\b[^\n]{0,40}?"
+    r"\b([0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?)\b",
     re.IGNORECASE,
 )
 
@@ -1073,13 +1108,36 @@ def main() -> int:
     open_backlog = page_claims(args.base_url, ["backlog"], ["resolved"], current_only=False)
     print(f"Found {len(open_backlog)} open backlog claims (not already labelled resolved)")
 
-    # 2. Pull all resolved claims and build a UUID-prefix index of which backlog ids they mention
+    # Build a lookup of full UUID and 8-char prefix → backlog claim
+    backlog_by_full: dict[str, dict] = {bc["id"].lower(): bc for bc in open_backlog}
+    backlog_by_prefix: dict[str, list[dict]] = {}
+    for bc in open_backlog:
+        backlog_by_prefix.setdefault(bc["id"][:8].lower(), []).append(bc)
+
+    # 2. Pull all resolved claims and extract keyword-anchored UUID/prefix references.
+    #    Only count a reference if it follows "Resolves"/"Supersedes"/"Closes"/"Fixes"
+    #    within ~40 chars — bare hex strings in content are not enough.
     resolved_claims = page_claims(args.base_url, ["resolved"], [], current_only=False)
-    resolved_by_uuid: dict[str, list[dict]] = {}
+    matches_for_backlog: dict[str, list[dict]] = {}
     for rc in resolved_claims:
-        for m in UUID_RE.findall(rc["content"]):
-            resolved_by_uuid.setdefault(m.lower(), []).append(rc)
-    print(f"Indexed {len(resolved_claims)} resolved claims mentioning {len(resolved_by_uuid)} distinct UUIDs")
+        text = rc["content"]
+        seen_in_this_rc: set[str] = set()
+        for m in KEYWORD_RE.finditer(text):
+            token = m.group(1).lower()
+            # Match either as full UUID or as 8-char prefix
+            candidates: list[dict] = []
+            if len(token) == 36 and token in backlog_by_full:
+                candidates = [backlog_by_full[token]]
+            elif len(token) == 8:
+                # 8-char prefix may collide if two open backlog UUIDs share a prefix
+                candidates = backlog_by_prefix.get(token, [])
+            for bc in candidates:
+                if bc["id"] in seen_in_this_rc:
+                    continue
+                seen_in_this_rc.add(bc["id"])
+                matches_for_backlog.setdefault(bc["id"], []).append(rc)
+    print(f"Scanned {len(resolved_claims)} resolved claims; "
+          f"matched references to {len(matches_for_backlog)} backlog UUIDs")
 
     auto_patch: list[tuple[dict, dict]] = []
     needs_review: list[tuple[dict, list[dict]]] = []
@@ -1087,15 +1145,18 @@ def main() -> int:
     superseded: list[dict] = []
 
     for bc in open_backlog:
-        bid = bc["id"].lower()
         # supersedes-based retirement: the backlog claim itself is_current=false or has supersedes
         if not bc.get("is_current", True) or bc.get("supersedes"):
             superseded.append(bc)
             continue
-        matches = resolved_by_uuid.get(bid, [])
+        matches = matches_for_backlog.get(bc["id"], [])
+        # Also flag prefix collisions as needs-review: if any other open backlog
+        # claim shares this one's 8-char prefix, a prefix-based match is ambiguous.
+        prefix_peers = backlog_by_prefix.get(bc["id"][:8].lower(), [])
+        prefix_ambiguous = len(prefix_peers) > 1
         if not matches:
             still_open.append(bc)
-        elif len(matches) == 1:
+        elif len(matches) == 1 and not prefix_ambiguous:
             auto_patch.append((bc, matches[0]))
         else:
             needs_review.append((bc, matches))
@@ -1149,23 +1210,37 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-- [ ] **Step 2: Smoke-test in dry-run mode**
+- [ ] **Step 2: Build and deploy the new HTTP route from Task 5**
+
+The script calls `GET /api/v1/claims/by-labels` on the live API. That route was added in Task 5 but only deployed if the running binary was rebuilt. Rebuild and restart:
+
+```bash
+cargo build --release -p epigraph-api -p epigraph-mcp
+sudo systemctl restart epigraph-api epigraph-mcp-http
+# OR whatever the deploy convention is — `ls /etc/systemd/system | grep epigraph`
+# tells you the unit names. Confirm:
+curl -s "http://localhost:8080/api/v1/claims/by-labels?labels=backlog&limit=1" | head -c 200
+```
+
+Expected: returns a JSON array. If it returns `404` or the route handler isn't recognized, the new binary isn't actually running — investigate before proceeding.
+
+- [ ] **Step 3: Smoke-test in dry-run mode**
 
 Run: `python3 scripts/cleanup_backlog_labels.py --base-url http://localhost:8080`
 
 Expected: prints counts, writes `docs/superpowers/reports/backlog-cleanup-YYYY-MM-DD.md`, makes no DB changes. Confirm `1c31a529-97bf-4471-bbeb-d1b81717c930` appears in the "needs review" bucket (it has both `4485beac` complete and `6d28afba` NOT-A-BUG resolutions).
 
-- [ ] **Step 3: Review the report manually**
+- [ ] **Step 4: Review the report manually**
 
-Open the report file and sanity-check that the auto-patch bucket looks safe. If anything in `auto-patch` should actually be `needs-review`, refine the matcher (e.g. require the resolution content to contain "Resolves" or "Supersedes" as a literal keyword adjacent to the UUID).
+Open the report file and sanity-check that the auto-patch bucket looks safe. If anything in `auto-patch` is something you don't want auto-retired, move it to needs-review by tightening the matcher.
 
-- [ ] **Step 4: Run with --apply**
+- [ ] **Step 5: Run with --apply**
 
 Run: `python3 scripts/cleanup_backlog_labels.py --apply --base-url http://localhost:8080`
 
 Expected: prints `PATCHED resolved → <uuid>` for each auto-patched item. Verify by re-querying `mcp__epigraph__query_claims_by_label(labels=["backlog"], exclude_labels=["resolved"])` — the result should be markedly shorter.
 
-- [ ] **Step 5: Commit the script and the report**
+- [ ] **Step 6: Commit the script and the report**
 
 ```bash
 git add scripts/cleanup_backlog_labels.py docs/superpowers/reports/backlog-cleanup-*.md
@@ -1212,8 +1287,10 @@ from pathlib import Path
 
 import httpx
 
-UUID_RE = re.compile(
-    r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
+# Shared with cleanup_backlog_labels.py — same convention.
+KEYWORD_RE = re.compile(
+    r"\b(?:resolves?|supersedes?|closes?|fixes?)\b[^\n]{0,40}?"
+    r"\b([0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?)\b",
     re.IGNORECASE,
 )
 RECON_WINDOW_DAYS = int(os.environ.get("RECON_WINDOW_DAYS", "7"))
@@ -1240,31 +1317,60 @@ def patch_labels(base_url: str, claim_id: str, add: list[str]) -> dict:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--apply", action="store_true", default=True)
+    # Default DRY-RUN. Cron entry MUST pass --apply explicitly.
+    p.add_argument("--apply", action="store_true", help="Actually PATCH labels (default: dry-run)")
     p.add_argument("--base-url", default=os.environ.get("EPIGRAPH_API", "http://localhost:8080"))
     args = p.parse_args()
 
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=RECON_WINDOW_DAYS)
     open_backlog = page_claims(args.base_url, ["backlog"], ["resolved"])
+    backlog_by_full = {bc["id"].lower(): bc for bc in open_backlog}
+    backlog_by_prefix: dict[str, list[dict]] = {}
+    for bc in open_backlog:
+        backlog_by_prefix.setdefault(bc["id"][:8].lower(), []).append(bc)
+
+    # Page resolved claims; warn if we hit the limit (means we need pagination
+    # or a server-side created_after filter).
+    resolved_page = page_claims(args.base_url, ["resolved"], [])
+    if len(resolved_page) >= 100:
+        print(
+            f"WARN: resolved page returned {len(resolved_page)} (page cap). "
+            "Older resolution claims may be missed — extend the HTTP route with "
+            "created_after or paginate.",
+            file=sys.stderr,
+        )
     resolved_recent = [
-        rc for rc in page_claims(args.base_url, ["resolved"], [])
-        if datetime.datetime.fromisoformat(rc["created_at"]) >= cutoff
+        rc for rc in resolved_page
+        if datetime.datetime.fromisoformat(rc["created_at"].replace("Z", "+00:00")) >= cutoff
     ]
 
-    resolved_by_uuid: dict[str, list[dict]] = {}
+    matches_for_backlog: dict[str, list[dict]] = {}
     for rc in resolved_recent:
-        for m in UUID_RE.findall(rc["content"]):
-            resolved_by_uuid.setdefault(m.lower(), []).append(rc)
+        seen_in_this_rc: set[str] = set()
+        for m in KEYWORD_RE.finditer(rc["content"]):
+            token = m.group(1).lower()
+            candidates: list[dict] = []
+            if len(token) == 36 and token in backlog_by_full:
+                candidates = [backlog_by_full[token]]
+            elif len(token) == 8:
+                candidates = backlog_by_prefix.get(token, [])
+            for bc in candidates:
+                if bc["id"] in seen_in_this_rc:
+                    continue
+                seen_in_this_rc.add(bc["id"])
+                matches_for_backlog.setdefault(bc["id"], []).append(rc)
 
     log_path = Path("docs/superpowers/reports/reconciler-needs-review.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     patched = 0
     review = 0
     for bc in open_backlog:
-        matches = resolved_by_uuid.get(bc["id"].lower(), [])
+        matches = matches_for_backlog.get(bc["id"], [])
+        prefix_peers = backlog_by_prefix.get(bc["id"][:8].lower(), [])
+        prefix_ambiguous = len(prefix_peers) > 1
         if not matches:
             continue
-        if len(matches) == 1:
+        if len(matches) == 1 and not prefix_ambiguous:
             if args.apply:
                 try:
                     patch_labels(args.base_url, bc["id"], ["resolved"])
@@ -1273,11 +1379,13 @@ def main() -> int:
                     print(f"FAIL {bc['id']}: {e}", file=sys.stderr)
         else:
             with log_path.open("a") as f:
-                f.write(f"{datetime.datetime.utcnow().isoformat()} AMBIGUOUS {bc['id']} "
-                        f"matches={[m['id'] for m in matches]}\n")
+                f.write(
+                    f"{datetime.datetime.utcnow().isoformat()} AMBIGUOUS {bc['id']} "
+                    f"matches={[m['id'] for m in matches]} prefix_peers={len(prefix_peers)}\n"
+                )
             review += 1
 
-    print(f"Reconciler: patched={patched} needs_review={review}")
+    print(f"Reconciler: patched={patched} needs_review={review} apply={args.apply}")
     return 0
 
 
@@ -1291,20 +1399,22 @@ Run: `python3 scripts/reconcile_backlog_labels.py --base-url http://localhost:80
 
 Expected: prints `Reconciler: patched=N needs_review=M`. After Task 7 has run, expect both numbers small.
 
-- [ ] **Step 3: Wire it into the scheduled-task harness**
+- [ ] **Step 3: Wire it into the scheduled-task harness with `--apply`**
 
-Locate the scheduled-task config. Look in `/home/jeremy/epiclaw-host/` for a scheduler config (likely a TOML or YAML listing scheduled scripts). Add an entry:
+Locate the scheduled-task config. Look in `/home/jeremy/epiclaw-host/src/host/scheduler.rs` first (the user's memory mentions this file holds a static task list). If the task list is data-driven (TOML/YAML), find the config file via `grep -r "schedule" /home/jeremy/epiclaw-host/src/host/`. Add an entry passing `--apply` explicitly:
 
 ```toml
 # Example shape — adapt to actual config format
 [[task]]
 name = "reconcile_backlog_labels"
 schedule = "0 4 * * *"  # daily at 04:00 UTC
-command = "python3 /opt/epigraph/scripts/reconcile_backlog_labels.py"
+command = "python3 /opt/epigraph/scripts/reconcile_backlog_labels.py --apply"
 group = "main"
 ```
 
-If you can't find the scheduler config, ask the user where scheduled tasks are configured — the memory mentions `epiclaw-host/src/host/scheduler.rs` which may contain a static task list.
+The default DRY-RUN behaviour means the script is safe to invoke manually for testing; only the cron entry should pass `--apply`.
+
+If you can't find a place to wire this — ask the user where to register it.
 
 - [ ] **Step 4: Commit**
 
@@ -1385,7 +1495,15 @@ human triage at `docs/superpowers/reports/reconciler-needs-review.log`.
 
 - [ ] **Step 2: Update EpiClaw CLAUDE.md**
 
-In `/home/jeremy/epiclaw-host/release/epiclaw/CLAUDE.md`, add a new section under "Critical Rules":
+First confirm the file exists and is the canonical one:
+
+```bash
+ls -la /home/jeremy/epiclaw-host/release/epiclaw/CLAUDE.md
+# If absent, search:
+find /home/jeremy/epiclaw-host -name CLAUDE.md
+```
+
+If the canonical location is different, edit there and update Task 9 accordingly. In the confirmed file, add a new rule under "Critical Rules":
 
 ```markdown
 8. **Retiring backlog items.** When you complete or refute a backlog item,
