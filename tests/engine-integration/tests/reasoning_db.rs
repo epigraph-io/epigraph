@@ -13,6 +13,7 @@ const PREFIX: &str = "[test-reasoning-db]";
 #[ignore] // Requires DATABASE_URL pointing to live PostgreSQL
 async fn transitive_support_detected_from_db() {
     let db = TestDb::setup().await;
+    let _guard = PrefixGuard::new(&db.pool, PREFIX);
     let agent = create_test_agent(&db.pool).await;
 
     // Create 3 claims forming a support chain: A → B → C
@@ -106,6 +107,4 @@ async fn transitive_support_detected_from_db() {
             .any(|ts| ts.source == claim_b && ts.target == claim_c),
         "Direct support B→C should be in transitive_supports"
     );
-
-    cleanup_test_data(&db.pool, PREFIX).await;
 }
