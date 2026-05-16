@@ -17,12 +17,16 @@ const PREFIX: &str = "[test-trust-db]";
 /// expected reputation derived from `ReputationConfig::default()`.
 ///
 /// With 5 claims of truth 0.80..0.88, age_days=5.0, was_refuted=false:
-/// - recency factor per claim: 1/(1+5/30) = 6/7 (identical → weighted mean = arith mean = 0.84)
-/// - combined = 0.84 (no historical claims)
-/// - stability factor for n=5 < min_claims_for_stability=10:
+/// - All age_days <= 30 → all "recent", `historical` is empty.
+/// - Per-claim recency factor: 1/(1+5/30) = 6/7 ≈ 0.857 (identical for all 5).
+/// - Identical weights → weighted mean of truth values = arith mean = 0.84.
+/// - `historical.is_empty()` → combined = recent_score = 0.84
+///   (the `recency_weight` default is NOT used here; it only kicks in
+///   when both recent and historical groups are non-empty).
+/// - n=5 < min_claims_for_stability=10 → stability factor applied:
 ///     progress = 5/10 = 0.5
-///     stability = 0.5*0.84 + 0.5*0.5 = 0.67
-/// - clamped to (0.1, 0.95) → 0.67
+///     stability = 0.5*0.84 + 0.5*initial_reputation(0.5) = 0.67
+/// - clamped to (min_reputation=0.1, max_reputation=0.95) → 0.67
 ///
 /// This locks the result; any change to ReputationConfig defaults or the
 /// reputation algorithm trips this assertion.
@@ -118,6 +122,9 @@ async fn conflict_classified_from_db_contradicts_edge() {
             source_id: row.get("source_id"),
             target_id: row.get("target_id"),
             relationship: row.get::<String, _>("relationship").to_lowercase(),
+            // Must be > 0.3: the contradiction rule at reasoning.rs:166 gates on
+            // `s1.0 > 0.3 && s2.0 > 0.3`. Below threshold, the contradiction
+            // is silently dropped and the len() == 1 assertion would fail.
             strength: 0.8,
         })
         .collect();
