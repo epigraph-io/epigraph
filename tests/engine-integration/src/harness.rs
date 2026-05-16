@@ -1,7 +1,7 @@
 //! Shared test harness for engine integration tests.
 //! Provides TestDb, helper functions for creating test entities in PostgreSQL.
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 /// Wrapper around PgPool for integration tests.
@@ -199,6 +199,98 @@ pub async fn cleanup_test_data(pool: &PgPool, content_prefix: &str) {
         .bind(&ids)
         .execute(pool)
         .await;
+}
+
+/// Load all claims and edges matching `prefix` into a fresh
+/// `PropagationOrchestrator`.
+///
+/// - Reads `claims` rows with `content LIKE prefix%` and registers each as a
+///   `Claim` (with the DB-assigned id and truth_value).
+/// - Reads `edges` joining those claims and converts:
+///     `relationship = 'supports'`   → `is_supporting = true`,  EvidenceType::Empirical
+///     `relationship = 'contradicts'`→ `is_supporting = false`, EvidenceType::Empirical
+///   All edges use `strength = 0.8`, `age_days = 0.0` (test defaults).
+///
+/// Anything more elaborate (loading strength from edges.properties,
+/// mapping evidence_type from a column, etc.) belongs in a production loader
+/// — this is a test helper that exists to make the regression test exercise
+/// real DB→engine flow rather than reconstructing state by hand.
+pub async fn load_orchestrator_from_db(
+    pool: &PgPool,
+    prefix: &str,
+) -> epigraph_engine::PropagationOrchestrator {
+    use epigraph_core::{AgentId, Claim, ClaimId, TruthValue};
+    use epigraph_engine::{EvidenceType, PropagationOrchestrator};
+
+    let mut orch = PropagationOrchestrator::new();
+
+    let claim_rows = sqlx::query(
+        "SELECT id, content, agent_id, truth_value FROM claims WHERE content LIKE $1",
+    )
+    .bind(format!("{prefix}%"))
+    .fetch_all(pool)
+    .await
+    .expect("load claims");
+
+    for row in &claim_rows {
+        let id: Uuid = row.get("id");
+        let agent_id: Uuid = row.get("agent_id");
+        let content: String = row.get("content");
+        let truth: f64 = row.get("truth_value");
+
+        // Reconstruct a Claim with the DB-assigned id. Public key is
+        // synthetic — we never sign anything; the orchestrator doesn't verify.
+        let mut public_key = [0u8; 32];
+        public_key[..16].copy_from_slice(agent_id.as_bytes());
+        let claim_proto = Claim::new(
+            content,
+            AgentId::from_uuid(agent_id),
+            public_key,
+            TruthValue::new(truth).unwrap(),
+        );
+        let claim = Claim::with_id(
+            ClaimId::from_uuid(id),
+            claim_proto.content,
+            claim_proto.agent_id,
+            claim_proto.public_key,
+            claim_proto.content_hash,
+            claim_proto.trace_id,
+            claim_proto.signature,
+            claim_proto.truth_value,
+            claim_proto.created_at,
+            claim_proto.updated_at,
+        );
+        orch.register_claim(claim).expect("register");
+    }
+
+    let edge_rows = sqlx::query(
+        "SELECT e.source_id, e.target_id, e.relationship \
+         FROM edges e \
+         JOIN claims cs ON cs.id = e.source_id \
+         WHERE cs.content LIKE $1",
+    )
+    .bind(format!("{prefix}%"))
+    .fetch_all(pool)
+    .await
+    .expect("load edges");
+
+    for row in &edge_rows {
+        let src: Uuid = row.get("source_id");
+        let tgt: Uuid = row.get("target_id");
+        let rel: String = row.get("relationship");
+        let is_supporting = !matches!(rel.to_lowercase().as_str(), "contradicts" | "refutes");
+        orch.add_dependency(
+            ClaimId::from_uuid(src),
+            ClaimId::from_uuid(tgt),
+            is_supporting,
+            0.8,
+            EvidenceType::Empirical,
+            0.0,
+        )
+        .expect("add_dependency");
+    }
+
+    orch
 }
 
 #[cfg(test)]
