@@ -581,6 +581,10 @@ pub struct ClaimResponse {
     pub agent_id: String,
     pub content_hash: String,
     pub created_at: String,
+    pub labels: Vec<String>,
+    pub is_current: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

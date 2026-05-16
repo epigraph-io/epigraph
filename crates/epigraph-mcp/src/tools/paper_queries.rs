@@ -77,6 +77,9 @@ pub async fn query_paper(
             agent_id: c.agent_id.to_string(),
             content_hash: ContentHasher::to_hex(&c.content_hash),
             created_at: c.created_at.to_rfc3339(),
+            labels: Vec::new(),
+            is_current: true,
+            supersedes: None,
         })
         .collect();
 
@@ -134,6 +137,9 @@ pub async fn query_claims_by_evidence(
                 agent_id: claim.agent_id.as_uuid().to_string(),
                 content_hash: ContentHasher::to_hex(&claim.content_hash),
                 created_at: claim.created_at.to_rfc3339(),
+                labels: Vec::new(),
+                is_current: true,
+                supersedes: None,
             });
         }
 
@@ -178,6 +184,9 @@ pub async fn query_claims_by_methodology(
                         agent_id: claim.agent_id.as_uuid().to_string(),
                         content_hash: ContentHasher::to_hex(&claim.content_hash),
                         created_at: claim.created_at.to_rfc3339(),
+                        labels: Vec::new(),
+                        is_current: true,
+                        supersedes: None,
                     });
                 }
             }
@@ -224,6 +233,9 @@ pub async fn query_claims_by_label(
             agent_id: c.agent_id.as_uuid().to_string(),
             content_hash: ContentHasher::to_hex(&c.content_hash),
             created_at: c.created_at.to_rfc3339(),
+            labels: Vec::new(),
+            is_current: true,
+            supersedes: None,
         })
         .collect();
 
