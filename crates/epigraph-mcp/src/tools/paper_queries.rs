@@ -7,7 +7,7 @@ use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
 use epigraph_crypto::ContentHasher;
-use epigraph_db::{ClaimRepository, EvidenceRepository, ReasoningTraceRepository};
+use epigraph_db::{ClaimRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -15,34 +15,76 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     )]))
 }
 
+/// Look up a paper by DOI and return its title, authors, claim count, and up
+/// to 100 asserted-claim summaries.
+///
+/// The earlier implementation searched claim *content* for the DOI substring
+/// via `ClaimRepository::list(.., Some(doi))` — that almost never matched, so
+/// every paper looked like a "bare shell with claim_count=0", which then made
+/// EpiClaw's nightly monitor mis-diagnose `ingest_document`'s (correct)
+/// `already_ingested=true` idempotency response as a bug.
+///
+/// The real shape: papers are first-class nodes joined to claims by
+/// `paper -asserts-> claim` edges and to authors by
+/// `agent -authored-> paper` edges.
+///
+/// Returns a zero-shaped response (claim_count=0, empty title/authors) when
+/// the DOI isn't in the graph. Callers (the monitor) use this as a dedup
+/// probe and expect a structured response, not a 404.
 pub async fn query_paper(
     server: &EpiGraphMcpFull,
     params: QueryPaperParams,
 ) -> Result<CallToolResult, McpError> {
-    // Search for claims whose evidence references this DOI
-    // We look for edges from a "paper" node, or search claims with DOI in evidence
-    let claims = ClaimRepository::list(&server.pool, 100, 0, Some(&params.doi))
+    let paper = PaperRepository::find_by_doi(&server.pool, &params.doi)
         .await
         .map_err(internal_error)?;
 
-    let mut claim_responses = Vec::new();
-    for c in &claims {
-        claim_responses.push(ClaimResponse {
-            id: c.id.as_uuid().to_string(),
-            content: c.content.clone(),
-            truth_value: c.truth_value.value(),
-            agent_id: c.agent_id.as_uuid().to_string(),
+    let Some(paper) = paper else {
+        return success_json(&PaperResponse {
+            doi: params.doi,
+            title: String::new(),
+            authors: vec![],
+            claim_count: 0,
+            claims: vec![],
+        });
+    };
+
+    let claim_count = PaperRepository::count_asserted_claims(&server.pool, paper.id)
+        .await
+        .map_err(internal_error)?;
+
+    let authors = PaperRepository::list_authors(&server.pool, paper.id)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|(agent_id, display_name)| AuthorResponse {
+            agent_id: agent_id.to_string(),
+            name: display_name.unwrap_or_default(),
+        })
+        .collect();
+
+    let claim_rows = PaperRepository::list_asserted_claims(&server.pool, paper.id, 100)
+        .await
+        .map_err(internal_error)?;
+
+    let claims = claim_rows
+        .into_iter()
+        .map(|c| ClaimResponse {
+            id: c.id.to_string(),
+            content: c.content,
+            truth_value: c.truth_value,
+            agent_id: c.agent_id.to_string(),
             content_hash: ContentHasher::to_hex(&c.content_hash),
             created_at: c.created_at.to_rfc3339(),
-        });
-    }
+        })
+        .collect();
 
     success_json(&PaperResponse {
-        doi: params.doi,
-        title: String::new(),
-        authors: vec![],
-        claim_count: claim_responses.len() as i64,
-        claims: claim_responses,
+        doi: paper.doi,
+        title: paper.title.unwrap_or_default(),
+        authors,
+        claim_count,
+        claims,
     })
 }
 

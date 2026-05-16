@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) AS \"count!\"\n            FROM edges\n            WHERE source_id = $1\n              AND source_type = 'paper'\n              AND target_type = 'claim'\n              AND relationship = 'asserts'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "d7b55e620854cdd0cbbfece1c2003c641b4b5dff3515415fe88800bc89459f61"
+}

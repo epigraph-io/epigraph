@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT a.id AS \"id!\", a.display_name\n            FROM edges e\n            JOIN agents a ON a.id = e.source_id\n            WHERE e.target_id = $1\n              AND e.target_type = 'paper'\n              AND e.source_type = 'agent'\n              AND e.relationship = 'authored'\n            ORDER BY a.display_name NULLS LAST, a.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "display_name",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "020149ef8247143cadbaf5ffbdcc56a4f07e1de0a4edca69a65fdf87cda2f64b"
+}
