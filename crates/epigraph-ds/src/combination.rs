@@ -1797,9 +1797,7 @@ mod tests {
             // And the converse: no extra focal elements in the permutation.
             for fe in combined.masses().keys() {
                 if !baseline.masses().contains_key(fe) {
-                    panic!(
-                        "permutation {i} produced focal element {fe} absent from baseline"
-                    );
+                    panic!("permutation {i} produced focal element {fe} absent from baseline");
                 }
             }
         }
