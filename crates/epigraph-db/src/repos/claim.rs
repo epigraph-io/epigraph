@@ -339,7 +339,8 @@ impl ClaimRepository {
 
         let row = sqlx::query!(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            SELECT id, content, truth_value, agent_id, trace_id,
+                   created_at, updated_at, is_current, supersedes
             FROM claims
             WHERE id = $1
             "#,
@@ -351,8 +352,7 @@ impl ClaimRepository {
         match row {
             Some(row) => {
                 let truth_value = TruthValue::new(row.truth_value)?;
-
-                Ok(Some(claim_from_row(
+                let mut claim = claim_from_row(
                     row.id,
                     row.content,
                     row.agent_id,
@@ -360,10 +360,33 @@ impl ClaimRepository {
                     truth_value,
                     row.created_at,
                     row.updated_at,
-                )))
+                );
+                // Post-fix retirement state so callers see real DB values
+                // instead of `claim_from_row`'s defaults (is_current=true,
+                // supersedes=None). sqlx::query! returns is_current as a
+                // plain bool here because the schema marks it NOT NULL with
+                // a DEFAULT — the macro trusts the NOT NULL annotation.
+                claim.is_current = row.is_current;
+                claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+                Ok(Some(claim))
             }
             None => Ok(None),
         }
+    }
+
+    /// Fetch only the labels for a single claim. Used by MCP `get_claim` to
+    /// surface labels without re-fetching the whole Claim.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_labels(pool: &PgPool, id: ClaimId) -> Result<Vec<String>, DbError> {
+        let row: Option<(Vec<String>,)> =
+            sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
+                .bind(id.as_uuid())
+                .fetch_optional(pool)
+                .await?;
+        Ok(row.map(|(l,)| l).unwrap_or_default())
     }
 
     /// kNN search over `claims.embedding` (1536d) or `claims.embedding_3072`,

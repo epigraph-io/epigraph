@@ -286,10 +286,14 @@ pub async fn get_claim(
     params: GetClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
-    let claim = ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(id))
+    let claim_id = ClaimId::from_uuid(id);
+    let claim = ClaimRepository::get_by_id(&server.pool, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
+    let labels = ClaimRepository::get_labels(&server.pool, claim_id)
+        .await
+        .map_err(internal_error)?;
 
     success_json(&ClaimResponse {
         id: claim.id.as_uuid().to_string(),
@@ -298,9 +302,9 @@ pub async fn get_claim(
         agent_id: claim.agent_id.as_uuid().to_string(),
         content_hash: ContentHasher::to_hex(&claim.content_hash),
         created_at: claim.created_at.to_rfc3339(),
-        labels: Vec::new(),
-        is_current: true,
-        supersedes: None,
+        labels,
+        is_current: claim.is_current,
+        supersedes: claim.supersedes.map(|s| s.as_uuid().to_string()),
     })
 }
 
