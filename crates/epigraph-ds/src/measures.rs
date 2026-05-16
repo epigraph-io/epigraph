@@ -18,6 +18,9 @@ use epigraph_core::TruthValue;
 /// `Bel(A)` = sum `m(B)` for all B positive with `B.subset` subset of `A.subset`, B non-empty
 ///
 /// Complement elements are excluded — they represent "outside" evidence.
+///
+/// Result is clamped to [0, 1]; without the clamp, repeated folds accumulate
+/// floating-point drift that trips the `claims_belief_bounds` CHECK constraint.
 #[must_use]
 pub fn belief(m: &MassFunction, target: &FocalElement) -> f64 {
     if target.complement {
@@ -25,13 +28,15 @@ pub fn belief(m: &MassFunction, target: &FocalElement) -> f64 {
         // Return 0 — callers should use evaluate_to_classical first
         return 0.0;
     }
-    m.masses()
+    let raw: f64 = m
+        .masses()
         .iter()
         .filter(|(fe, _)| {
             fe.is_positive() && !fe.subset.is_empty() && fe.subset.is_subset(&target.subset)
         })
         .map(|(_, &mass)| mass)
-        .sum()
+        .sum();
+    raw.clamp(0.0, 1.0)
 }
 
 /// Plausibility: sum of masses of all positive focal elements intersecting target
@@ -39,18 +44,23 @@ pub fn belief(m: &MassFunction, target: &FocalElement) -> f64 {
 /// Pl(A) = sum m(B) for all B positive with B.subset intersects A.subset
 ///
 /// Complement elements are excluded.
+///
+/// Result is clamped to [0, 1]; without the clamp, repeated folds accumulate
+/// floating-point drift that trips the `claims_plausibility_bounds` CHECK constraint.
 #[must_use]
 pub fn plausibility(m: &MassFunction, target: &FocalElement) -> f64 {
     if target.complement {
         return 0.0;
     }
-    m.masses()
+    let raw: f64 = m
+        .masses()
         .iter()
         .filter(|(fe, _)| {
             fe.is_positive() && !fe.subset.is_empty() && !fe.subset.is_disjoint(&target.subset)
         })
         .map(|(_, &mass)| mass)
-        .sum()
+        .sum();
+    raw.clamp(0.0, 1.0)
 }
 
 /// Belief interval [Bel(A), Pl(A)]
