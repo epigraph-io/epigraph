@@ -861,33 +861,72 @@ impl ClaimRepository {
     ///
     /// Uses the GIN index on `claims.labels` for efficient `@>` containment queries.
     /// Results are ordered by `created_at DESC` and filtered by optional truth threshold.
+    ///
+    /// # Filters
+    /// - `exclude_labels`: drop any claim whose label set intersects this
+    ///   collection (PostgreSQL `&&` overlap operator). Empty slice = no
+    ///   exclusion.
+    /// - `current_only`: when true, restrict to `is_current = true` (drops
+    ///   superseded rows).
+    ///
+    /// # Returns
+    /// Pairs of `(Claim, labels)`. The returned `Claim` is post-fixed with the
+    /// row's `is_current` and `supersedes` values so callers can distinguish
+    /// live, resolved, and superseded claims without re-querying.
+    ///
+    /// The inline `Row` struct keeps the global [`ClaimRow`] (used by other
+    /// queries that don't need these columns) untouched, and we don't widen
+    /// `claim_from_row`'s signature — its other ~20 callers don't care about
+    /// retirement state.
     #[instrument(skip(pool))]
     pub async fn list_by_labels(
         pool: &PgPool,
         labels: &[String],
+        exclude_labels: &[String],
+        current_only: bool,
         min_truth: f64,
         limit: i64,
-    ) -> Result<Vec<Claim>, DbError> {
+    ) -> Result<Vec<(Claim, Vec<String>)>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            labels: Vec<String>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+        }
+
         let limit = limit.clamp(1, 1000);
-        let rows = sqlx::query_as::<_, ClaimRow>(
+        let rows = sqlx::query_as::<_, Row>(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            SELECT id, content, truth_value, agent_id, trace_id,
+                   created_at, updated_at, labels, is_current, supersedes
             FROM claims
-            WHERE labels @> $1 AND truth_value >= $2
+            WHERE labels @> $1
+              AND truth_value >= $2
+              AND ($3::text[] = '{}'::text[] OR NOT (labels && $3))
+              AND ($4 = false OR is_current = true)
             ORDER BY created_at DESC
-            LIMIT $3
+            LIMIT $5
             "#,
         )
         .bind(labels)
         .bind(min_truth)
+        .bind(exclude_labels)
+        .bind(current_only)
         .bind(limit)
         .fetch_all(pool)
         .await?;
 
-        let mut claims = Vec::with_capacity(rows.len());
+        let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let truth_value = TruthValue::new(row.truth_value)?;
-            claims.push(claim_from_row(
+            let mut claim = claim_from_row(
                 row.id,
                 row.content,
                 row.agent_id,
@@ -895,9 +934,12 @@ impl ClaimRepository {
                 truth_value,
                 row.created_at,
                 row.updated_at,
-            ));
+            );
+            claim.is_current = row.is_current;
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            out.push((claim, row.labels));
         }
-        Ok(claims)
+        Ok(out)
     }
 
     /// Search workflow-tagged claims by content text match.
@@ -2478,20 +2520,27 @@ mod label_tests {
             .await
             .unwrap();
 
-        let results = ClaimRepository::list_by_labels(&pool, &["backlog".into()], 0.0, 100)
-            .await
-            .unwrap();
-        assert!(
-            results.iter().any(|c| c.id.as_uuid() == claim_id),
-            "should find claim by single label"
-        );
-
         let results =
-            ClaimRepository::list_by_labels(&pool, &["backlog".into(), "pending".into()], 0.0, 100)
+            ClaimRepository::list_by_labels(&pool, &["backlog".into()], &[], false, 0.0, 100)
                 .await
                 .unwrap();
         assert!(
-            results.iter().any(|c| c.id.as_uuid() == claim_id),
+            results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
+            "should find claim by single label"
+        );
+
+        let results = ClaimRepository::list_by_labels(
+            &pool,
+            &["backlog".into(), "pending".into()],
+            &[],
+            false,
+            0.0,
+            100,
+        )
+        .await
+        .unwrap();
+        assert!(
+            results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "should find claim by ALL labels"
         );
 
@@ -2506,12 +2555,18 @@ mod label_tests {
             .await
             .unwrap();
 
-        let results =
-            ClaimRepository::list_by_labels(&pool, &["nonexistent-label".into()], 0.0, 100)
-                .await
-                .unwrap();
+        let results = ClaimRepository::list_by_labels(
+            &pool,
+            &["nonexistent-label".into()],
+            &[],
+            false,
+            0.0,
+            100,
+        )
+        .await
+        .unwrap();
         assert!(
-            !results.iter().any(|c| c.id.as_uuid() == claim_id),
+            !results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "should not match unrelated label"
         );
 
@@ -2527,19 +2582,21 @@ mod label_tests {
             .await
             .unwrap();
 
-        let results = ClaimRepository::list_by_labels(&pool, &["truth-test".into()], 0.4, 100)
-            .await
-            .unwrap();
+        let results =
+            ClaimRepository::list_by_labels(&pool, &["truth-test".into()], &[], false, 0.4, 100)
+                .await
+                .unwrap();
         assert!(
-            results.iter().any(|c| c.id.as_uuid() == claim_id),
+            results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "0.5 >= 0.4 should match"
         );
 
-        let results = ClaimRepository::list_by_labels(&pool, &["truth-test".into()], 0.9, 100)
-            .await
-            .unwrap();
+        let results =
+            ClaimRepository::list_by_labels(&pool, &["truth-test".into()], &[], false, 0.9, 100)
+                .await
+                .unwrap();
         assert!(
-            !results.iter().any(|c| c.id.as_uuid() == claim_id),
+            !results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "0.5 < 0.9 should not match"
         );
 
@@ -2571,9 +2628,10 @@ mod label_tests {
         .await
         .unwrap();
 
-        let results = ClaimRepository::list_by_labels(&pool, &["limit-test".into()], 0.0, 1)
-            .await
-            .unwrap();
+        let results =
+            ClaimRepository::list_by_labels(&pool, &["limit-test".into()], &[], false, 0.0, 1)
+                .await
+                .unwrap();
         assert_eq!(results.len(), 1, "limit=1 should return exactly 1 result");
 
         // cleanup

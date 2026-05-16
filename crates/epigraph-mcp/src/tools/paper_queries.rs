@@ -6,6 +6,7 @@ use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
+use epigraph_core::Claim;
 use epigraph_crypto::ContentHasher;
 use epigraph_db::{ClaimRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository};
 
@@ -205,9 +206,14 @@ pub async fn query_claims_by_label(
         });
     }
 
-    let claims = ClaimRepository::list_by_labels(&server.pool, &params.labels, min_truth, limit)
-        .await
-        .map_err(internal_error)?;
+    // Pass default `exclude_labels=[]` and `current_only=false` for now; Task 3
+    // of the backlog-retirement plan rewires this caller to surface the new
+    // fields and accept the filters from MCP params.
+    let claim_pairs =
+        ClaimRepository::list_by_labels(&server.pool, &params.labels, &[], false, min_truth, limit)
+            .await
+            .map_err(internal_error)?;
+    let claims: Vec<Claim> = claim_pairs.into_iter().map(|(c, _)| c).collect();
 
     let results: Vec<ClaimResponse> = claims
         .iter()
