@@ -307,6 +307,12 @@ impl EvidenceRepository {
     /// Search evidence by vector similarity using cosine distance
     ///
     /// Returns evidence IDs and similarity scores for the closest matches.
+    /// Excludes evidence whose attached claim has been superseded
+    /// (`claims.is_current = false`) so that supersede flows do not silently
+    /// keep the old claim surfaced to semantic-search consumers. Note that
+    /// `supersedes` is NOT used as an exclusion predicate — the new claim
+    /// populates `supersedes = $old` to record lineage, so filtering on
+    /// `supersedes IS NULL` would drop the replacement.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -325,6 +331,11 @@ impl EvidenceRepository {
                 1 - (e.embedding <=> $1::vector) AS similarity
             FROM evidence e
             WHERE e.embedding IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM claims c
+                  WHERE c.id = e.claim_id
+                    AND COALESCE(c.is_current, true) = true
+              )
             ORDER BY e.embedding <=> $1::vector
             LIMIT $2
             "#,

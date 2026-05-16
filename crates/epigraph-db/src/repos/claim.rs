@@ -906,6 +906,12 @@ impl ClaimRepository {
     /// evidence embeddings returns insufficient results. Workflow claims are
     /// the canonical storage; the legacy `workflows` table is mostly empty.
     ///
+    /// Excludes superseded claims (`is_current = false`) so callers never
+    /// receive a deprecated workflow definition while a newer version exists.
+    /// `supersedes` itself is NOT used as an exclusion predicate — the new
+    /// claim populates `supersedes = $old` to record lineage, so filtering on
+    /// `supersedes IS NULL` would silently drop the replacement.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
@@ -925,6 +931,7 @@ impl ClaimRepository {
             WHERE labels @> $1
               AND content ILIKE $2
               AND truth_value >= $3
+              AND COALESCE(is_current, true) = true
             ORDER BY truth_value DESC, created_at DESC
             LIMIT $4
             "#,
@@ -1252,17 +1259,25 @@ impl ClaimRepository {
 
         let mut tx = pool.begin().await?;
 
-        // Verify old claim exists and is current
-        let old_row: Option<(Uuid, bool)> =
-            sqlx::query_as("SELECT agent_id, COALESCE(is_current, true) FROM claims WHERE id = $1")
-                .bind(old_uuid)
-                .fetch_optional(&mut *tx)
-                .await?;
+        // Verify old claim exists and is current; also pull labels + properties
+        // so the new claim can inherit them. Without this carry, downstream
+        // consumers that filter by labels (e.g. find_workflow's `labels @>
+        // ['workflow']` predicate) silently lose the replacement.
+        let old_row: Option<(Uuid, bool, Vec<String>, serde_json::Value)> = sqlx::query_as(
+            "SELECT agent_id, COALESCE(is_current, true), \
+                    COALESCE(labels, ARRAY[]::text[]), \
+                    COALESCE(properties, '{}'::jsonb) \
+             FROM claims WHERE id = $1",
+        )
+        .bind(old_uuid)
+        .fetch_optional(&mut *tx)
+        .await?;
 
-        let (agent_id, is_current) = old_row.ok_or(DbError::NotFound {
-            entity: "Claim".to_string(),
-            id: old_uuid,
-        })?;
+        let (agent_id, is_current, old_labels, old_properties) =
+            old_row.ok_or(DbError::NotFound {
+                entity: "Claim".to_string(),
+                id: old_uuid,
+            })?;
 
         if !is_current {
             return Err(DbError::QueryFailed {
@@ -1279,10 +1294,17 @@ impl ClaimRepository {
             .execute(&mut *tx)
             .await?;
 
-        // Insert new claim with supersedes link
+        // Insert new claim with supersedes link, carrying forward labels and
+        // properties from the old row. Embeddings are intentionally NOT copied:
+        // the new claim's content differs and any stale vector would mislead
+        // semantic search. Callers that need an embedding should re-embed
+        // (e.g. via the MCP supersede_claim handler) before relying on the
+        // semantic search path.
         sqlx::query(
-            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, supersedes, is_current, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, true, NOW(), NOW())",
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                                 supersedes, is_current, labels, properties, \
+                                 created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8, NOW(), NOW())",
         )
         .bind(new_uuid)
         .bind(new_content)
@@ -1290,6 +1312,8 @@ impl ClaimRepository {
         .bind(new_truth_val)
         .bind(agent_id)
         .bind(old_uuid)
+        .bind(&old_labels)
+        .bind(&old_properties)
         .execute(&mut *tx)
         .await?;
 
