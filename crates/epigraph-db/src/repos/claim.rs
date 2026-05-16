@@ -910,7 +910,7 @@ impl ClaimRepository {
             WHERE labels @> $1
               AND truth_value >= $2
               AND ($3::text[] = '{}'::text[] OR NOT (labels && $3))
-              AND ($4 = false OR is_current = true)
+              AND ($4 = false OR COALESCE(is_current, true) = true)
             ORDER BY created_at DESC
             LIMIT $5
             "#,
