@@ -23,18 +23,12 @@ async fn propagation_persists_updated_truth_values() {
 
     // --- Setup: 3-claim chain A → B → C in DB ---
     let agent_uuid = create_test_agent(&db.pool).await;
-    let claim_a_uuid = create_test_claim(
-        &db.pool, agent_uuid, &format!("{PREFIX} root A"), 0.8,
-    )
-    .await;
-    let claim_b_uuid = create_test_claim(
-        &db.pool, agent_uuid, &format!("{PREFIX} mid B"), 0.5,
-    )
-    .await;
-    let claim_c_uuid = create_test_claim(
-        &db.pool, agent_uuid, &format!("{PREFIX} leaf C"), 0.5,
-    )
-    .await;
+    let claim_a_uuid =
+        create_test_claim(&db.pool, agent_uuid, &format!("{PREFIX} root A"), 0.8).await;
+    let claim_b_uuid =
+        create_test_claim(&db.pool, agent_uuid, &format!("{PREFIX} mid B"), 0.5).await;
+    let claim_c_uuid =
+        create_test_claim(&db.pool, agent_uuid, &format!("{PREFIX} leaf C"), 0.5).await;
 
     create_test_edge(&db.pool, claim_a_uuid, claim_b_uuid, "supports").await;
     create_test_edge(&db.pool, claim_b_uuid, claim_c_uuid, "supports").await;
@@ -76,7 +70,10 @@ async fn propagation_persists_updated_truth_values() {
     );
 
     // --- Write back and verify persistence ---
-    for (uuid, value) in [(claim_b_uuid, truth_b.value()), (claim_c_uuid, truth_c.value())] {
+    for (uuid, value) in [
+        (claim_b_uuid, truth_b.value()),
+        (claim_c_uuid, truth_c.value()),
+    ] {
         sqlx::query("UPDATE claims SET truth_value = $1 WHERE id = $2")
             .bind(value)
             .bind(uuid)
@@ -85,7 +82,10 @@ async fn propagation_persists_updated_truth_values() {
             .expect("write back");
     }
 
-    for (uuid, expected) in [(claim_b_uuid, truth_b.value()), (claim_c_uuid, truth_c.value())] {
+    for (uuid, expected) in [
+        (claim_b_uuid, truth_b.value()),
+        (claim_c_uuid, truth_c.value()),
+    ] {
         let row = sqlx::query("SELECT truth_value FROM claims WHERE id = $1")
             .bind(uuid)
             .fetch_one(&db.pool)

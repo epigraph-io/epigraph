@@ -56,9 +56,10 @@ async fn test_c1_evidence_type_produces_different_weights() {
     use epigraph_engine::bba::{build_bba_directed, BbaParams};
     use epigraph_engine::calibration::CalibrationConfig;
 
-    let cfg = CalibrationConfig::load(std::path::Path::new(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../calibration.toml"),
-    ))
+    let cfg = CalibrationConfig::load(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../calibration.toml"
+    )))
     .expect("load calibration.toml");
 
     let base_params = BbaParams {

@@ -150,8 +150,8 @@ impl Drop for PrefixGuard {
         // the pool, and that runtime may be partially unwound or blocked when
         // Drop runs. Instead we spawn a fresh OS thread with its own runtime
         // and a brand-new pool so cleanup always succeeds.
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must be set (PrefixGuard::drop)");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set (PrefixGuard::drop)");
         let prefix = self.prefix.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -235,13 +235,12 @@ pub async fn load_orchestrator_from_db(
 
     let mut orch = PropagationOrchestrator::new();
 
-    let claim_rows = sqlx::query(
-        "SELECT id, content, agent_id, truth_value FROM claims WHERE content LIKE $1",
-    )
-    .bind(format!("{prefix}%"))
-    .fetch_all(pool)
-    .await
-    .expect("load claims");
+    let claim_rows =
+        sqlx::query("SELECT id, content, agent_id, truth_value FROM claims WHERE content LIKE $1")
+            .bind(format!("{prefix}%"))
+            .fetch_all(pool)
+            .await
+            .expect("load claims");
 
     for row in &claim_rows {
         let id: Uuid = row.get("id");
@@ -329,13 +328,11 @@ mod tests {
 
         // PrefixGuard::drop blocks until cleanup_test_data completes, so by
         // the time we reach here the rows are gone.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM claims WHERE content LIKE $1",
-        )
-        .bind(format!("{PREFIX}%"))
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content LIKE $1")
+            .bind(format!("{PREFIX}%"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
 
         assert_eq!(
             count, 0,

@@ -146,7 +146,8 @@ async fn conflict_classified_from_db_contradicts_edge() {
     let expected = std::collections::BTreeSet::from([claim_a, claim_b]);
     assert_eq!(
         observed, expected,
-        "contradiction must name claim_a and claim_b (got {:?})", c
+        "contradiction must name claim_a and claim_b (got {:?})",
+        c
     );
     assert_eq!(c.target, target, "target must match");
 }
