@@ -1259,25 +1259,28 @@ impl ClaimRepository {
 
         let mut tx = pool.begin().await?;
 
-        // Verify old claim exists and is current; also pull labels + properties
-        // so the new claim can inherit them. Without this carry, downstream
-        // consumers that filter by labels (e.g. find_workflow's `labels @>
-        // ['workflow']` predicate) silently lose the replacement.
-        let old_row: Option<(Uuid, bool, Vec<String>, serde_json::Value)> = sqlx::query_as(
+        // Verify old claim exists and is current; also pull labels so the new
+        // claim can inherit them. Without the label carry, downstream consumers
+        // that filter by labels (e.g. find_workflow's `labels @> ['workflow']`
+        // predicate) silently lose the replacement. Properties are NOT carried
+        // forward: if the supersession is fixing something that lived in
+        // `properties` (e.g. a stale `confidence_source`), blanket copy would
+        // propagate the bug the supersede was meant to correct. Callers that
+        // want to preserve specific properties on the new claim should set
+        // them via a follow-up `patch_claim`.
+        let old_row: Option<(Uuid, bool, Vec<String>)> = sqlx::query_as(
             "SELECT agent_id, COALESCE(is_current, true), \
-                    COALESCE(labels, ARRAY[]::text[]), \
-                    COALESCE(properties, '{}'::jsonb) \
+                    COALESCE(labels, ARRAY[]::text[]) \
              FROM claims WHERE id = $1",
         )
         .bind(old_uuid)
         .fetch_optional(&mut *tx)
         .await?;
 
-        let (agent_id, is_current, old_labels, old_properties) =
-            old_row.ok_or(DbError::NotFound {
-                entity: "Claim".to_string(),
-                id: old_uuid,
-            })?;
+        let (agent_id, is_current, old_labels) = old_row.ok_or(DbError::NotFound {
+            entity: "Claim".to_string(),
+            id: old_uuid,
+        })?;
 
         if !is_current {
             return Err(DbError::QueryFailed {
@@ -1294,17 +1297,16 @@ impl ClaimRepository {
             .execute(&mut *tx)
             .await?;
 
-        // Insert new claim with supersedes link, carrying forward labels and
-        // properties from the old row. Embeddings are intentionally NOT copied:
-        // the new claim's content differs and any stale vector would mislead
-        // semantic search. Callers that need an embedding should re-embed
-        // (e.g. via the MCP supersede_claim handler) before relying on the
-        // semantic search path.
+        // Insert new claim with supersedes link, carrying forward only labels
+        // from the old row. Embeddings are intentionally NOT copied: the new
+        // claim's content differs and any stale vector would mislead semantic
+        // search. Properties are NOT copied either (see above) — callers must
+        // re-set them explicitly if needed.
         sqlx::query(
             "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
-                                 supersedes, is_current, labels, properties, \
+                                 supersedes, is_current, labels, \
                                  created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8, NOW(), NOW())",
+             VALUES ($1, $2, $3, $4, $5, $6, true, $7, NOW(), NOW())",
         )
         .bind(new_uuid)
         .bind(new_content)
@@ -1313,7 +1315,6 @@ impl ClaimRepository {
         .bind(agent_id)
         .bind(old_uuid)
         .bind(&old_labels)
-        .bind(&old_properties)
         .execute(&mut *tx)
         .await?;
 

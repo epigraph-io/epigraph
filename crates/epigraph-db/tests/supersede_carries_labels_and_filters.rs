@@ -7,9 +7,11 @@
 //! 1. `search_by_label_and_text` did not filter `is_current`, so the demoted
 //!    old claim kept winning the workflow ILIKE fallback. (`supersedes` is
 //!    the new claim's lineage pointer, not an exclusion predicate.)
-//! 2. `ClaimRepository::supersede` did not copy `labels` or `properties` to
-//!    the new claim, so even if (1) had filtered, the replacement was
-//!    invisible to `labels @> ['workflow']`.
+//! 2. `ClaimRepository::supersede` did not copy `labels` to the new claim,
+//!    so even if (1) had filtered, the replacement was invisible to
+//!    `labels @> ['workflow']`. Only labels are carried — properties are
+//!    intentionally NOT copied so a supersession can legitimately fix a
+//!    bug that lived in `properties` without re-introducing it.
 //!
 //! These tests pin both behaviors together: after supersede, the new claim
 //! must carry the old labels AND it must be the only one returned by the
@@ -77,7 +79,7 @@ async fn properties_of(pool: &PgPool, claim_id: Uuid) -> serde_json::Value {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn supersede_carries_labels_and_properties_to_new_claim(pool: PgPool) {
+async fn supersede_carries_labels_but_not_properties_to_new_claim(pool: PgPool) {
     let agent = seed_agent(&pool).await;
     let v1 = seed_workflow_claim(&pool, agent, r#"{"goal":"old goal","steps":["a"]}"#).await;
 
@@ -96,11 +98,13 @@ async fn supersede_carries_labels_and_properties_to_new_claim(pool: PgPool) {
         new_labels.contains(&"workflow".to_string()),
         "new claim must inherit the 'workflow' label; got {new_labels:?}"
     );
+
+    // Properties are intentionally NOT carried — a supersession that fixes
+    // something in `properties` would otherwise re-introduce the bug.
     let new_props = properties_of(&pool, v2).await;
-    assert_eq!(
-        new_props.get("canonical_name").and_then(|v| v.as_str()),
-        Some("test-wf"),
-        "new claim must inherit properties from the old; got {new_props}"
+    assert!(
+        new_props.get("canonical_name").is_none(),
+        "new claim must NOT inherit old properties (caller's job to set fresh ones); got {new_props}"
     );
 }
 
