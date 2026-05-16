@@ -40,57 +40,65 @@ fn contradiction_bba(frame: FrameOfDiscernment, mass: f64) -> MassFunction {
 // C1: evidence_type weighting
 // ---------------------------------------------------------------------------
 
-/// C1 regression: evidence_type must produce different BBA masses.
+/// C1 regression: evidence_type weighting must change BBA output.
 ///
-/// Empirical evidence (type_weight = 1.0) should produce a more informative
-/// BBA than circumstantial evidence (type_weight = 0.4) at the same raw
-/// confidence level.
+/// Real test: call `build_bba_directed` (the actual production code in
+/// `crates/epigraph-engine/src/bba.rs`) with two different `evidence_type`
+/// values and identical everything else. The resulting pignistic BetP on
+/// {supported} must differ — empirical evidence (type_weight = 1.0) must produce
+/// higher BetP(supported) than circumstantial (type_weight = 0.4).
 ///
-/// This test validates that the mass computation `confidence * type_weight`
-/// in bba.rs produces meaningfully different BBAs and that the difference
-/// propagates through to pignistic probability.
+/// This catches the C1 bug class: any change in `bba.rs` that loses the
+/// evidence-type signal (e.g. removing the `* type_weight` multiplication,
+/// or replacing the weight lookup with a constant) breaks this assertion.
 #[tokio::test]
 async fn test_c1_evidence_type_produces_different_weights() {
-    let frame = binary_frame();
-    let confidence = 0.7_f64;
+    use epigraph_engine::bba::{build_bba_directed, BbaParams};
+    use epigraph_engine::calibration::CalibrationConfig;
 
-    // Empirical: type_weight = 1.0
-    let empirical_mass = confidence * 1.0;
-    let empirical_bba = support_bba(frame.clone(), empirical_mass);
+    let cfg = CalibrationConfig::load(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../calibration.toml"
+    )))
+    .expect("load calibration.toml");
 
-    // Circumstantial: type_weight = 0.4
-    let circumstantial_mass = confidence * 0.4;
-    let circumstantial_bba = support_bba(frame.clone(), circumstantial_mass);
+    let base_params = BbaParams {
+        evidence_type: "empirical".to_string(),
+        methodology: "instrumental".to_string(),
+        confidence: 0.7,
+        supports: true,
+        section_tier: None,
+        journal_reliability: None,
+        open_world_fraction: 0.0,
+        uncertainty: None,
+    };
 
-    // Both discounted by same reliability (source is equally reliable)
-    let reliability = 0.8_f64;
-    let empirical_disc = discount(&empirical_bba, reliability).unwrap();
-    let circumstantial_disc = discount(&circumstantial_bba, reliability).unwrap();
+    let empirical = build_bba_directed(&base_params, &cfg).expect("empirical bba");
+    let circumstantial = build_bba_directed(
+        &BbaParams {
+            evidence_type: "circumstantial".to_string(),
+            ..base_params.clone()
+        },
+        &cfg,
+    )
+    .expect("circumstantial bba");
 
-    let betp_empirical = measures::pignistic_probability(&empirical_disc, 0);
-    let betp_circumstantial = measures::pignistic_probability(&circumstantial_disc, 0);
+    // The mass functions use frame ["supported", "unsupported"]; index 0 = supported.
+    let betp_emp = measures::pignistic_probability(&empirical, 0);
+    let betp_circ = measures::pignistic_probability(&circumstantial, 0);
 
-    println!(
-        "C1: BetP(TRUE) empirical={betp_empirical:.4}, circumstantial={betp_circumstantial:.4}"
-    );
+    println!("C1: BetP(supported) empirical={betp_emp:.4}, circumstantial={betp_circ:.4}");
 
-    // Empirical evidence should produce higher BetP(TRUE)
     assert!(
-        betp_empirical > betp_circumstantial,
-        "C1 FAILED: empirical BBA ({betp_empirical:.4}) should dominate circumstantial ({betp_circumstantial:.4})"
+        betp_emp > betp_circ,
+        "C1 FAILED: empirical BBA BetP({betp_emp:.4}) must exceed circumstantial ({betp_circ:.4}); \
+         bba.rs has stopped honouring evidence_type"
     );
-
-    // The gap should be substantial — empirical is 2.5× more informative
-    let gap = betp_empirical - betp_circumstantial;
     assert!(
-        gap > 0.05,
-        "C1 FAILED: gap between empirical and circumstantial too small ({gap:.4}), expected > 0.05"
-    );
-
-    // Empirical BBA should push BetP well above 0.5
-    assert!(
-        betp_empirical > 0.55,
-        "C1 FAILED: empirical BBA should push BetP(TRUE) > 0.55, got {betp_empirical:.4}"
+        (betp_emp - betp_circ) > 0.05,
+        "C1 FAILED: gap between empirical and circumstantial ({:.4}) too small (< 0.05); \
+         evidence_type weighting has been diluted",
+        betp_emp - betp_circ
     );
 }
 

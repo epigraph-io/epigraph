@@ -1,10 +1,10 @@
 //! Integration tests: DB claims → ReputationCalculator → verify trust scores.
 //!
 //! Test 1: Load 5 claims from DB, build ClaimOutcome vector, compute reputation,
-//!         verify trust > 0.5 for an agent with high-truth claims.
+//!         verify trust == 0.67 (deterministic from ReputationConfig::default()).
 //!
 //! Test 2: Create 2 claims with CONTRADICTS edge, verify ReasoningEngine detects
-//!         the contradiction (conflict classification from DB data).
+//!         exactly one contradiction naming the specific claim pair and target.
 
 use engine_integration_tests::harness::*;
 use epigraph_engine::reputation::{ClaimOutcome, ReputationCalculator};
@@ -13,88 +13,92 @@ use sqlx::Row;
 
 const PREFIX: &str = "[test-trust-db]";
 
+/// Trust computation from 5 high-truth recent claims yields a specific
+/// expected reputation derived from `ReputationConfig::default()`.
+///
+/// With 5 claims of truth 0.80..0.88, age_days=5.0, was_refuted=false:
+/// - All age_days <= 30 → all "recent", `historical` is empty.
+/// - Per-claim recency factor: 1/(1+5/30) = 6/7 ≈ 0.857 (identical for all 5).
+/// - Identical weights → weighted mean of truth values = arith mean = 0.84.
+/// - `historical.is_empty()` → combined = recent_score = 0.84
+///   (the `recency_weight` default is NOT used here; it only kicks in
+///   when both recent and historical groups are non-empty).
+/// - n=5 < min_claims_for_stability=10 → stability factor applied:
+///     progress = 5/10 = 0.5
+///     stability = 0.5*0.84 + 0.5*initial_reputation(0.5) = 0.67
+/// - clamped to (min_reputation=0.1, max_reputation=0.95) → 0.67
+///
+/// This locks the result; any change to ReputationConfig defaults or the
+/// reputation algorithm trips this assertion.
 #[tokio::test]
 #[ignore] // Requires DATABASE_URL pointing to live PostgreSQL
 async fn trust_computed_from_db_claims() {
     let db = TestDb::setup().await;
+    let _guard = PrefixGuard::new(&db.pool, PREFIX);
     let agent = create_test_agent(&db.pool).await;
 
-    // Insert 5 high-truth claims
     let mut claim_ids = Vec::new();
     for i in 0..5 {
         let id = create_test_claim(
             &db.pool,
             agent,
             &format!("{PREFIX} trust-claim-{i}"),
-            0.8 + (i as f64) * 0.02, // 0.80, 0.82, 0.84, 0.86, 0.88
+            0.8 + (i as f64) * 0.02,
         )
         .await;
         claim_ids.push(id);
     }
 
-    // Load truth values from DB, build ClaimOutcome vector
     let rows = sqlx::query("SELECT truth_value FROM claims WHERE content LIKE $1 ORDER BY content")
         .bind(format!("{PREFIX} trust-claim-%"))
         .fetch_all(&db.pool)
         .await
-        .expect("Failed to load claims from DB");
-
-    assert_eq!(rows.len(), 5, "Should have loaded 5 claims from DB");
+        .expect("load claims");
+    assert_eq!(rows.len(), 5);
 
     let outcomes: Vec<ClaimOutcome> = rows
         .iter()
-        .map(|row| {
-            let truth_value: f64 = row.get("truth_value");
-            ClaimOutcome {
-                truth_value,
-                age_days: 5.0, // recent claims
-                was_refuted: false,
-            }
+        .map(|row| ClaimOutcome {
+            truth_value: row.get::<f64, _>("truth_value"),
+            age_days: 5.0,
+            was_refuted: false,
         })
         .collect();
 
-    let calc = ReputationCalculator::new();
-    let trust = calc.calculate(&outcomes).expect("reputation calculation");
+    let trust = ReputationCalculator::new()
+        .calculate(&outcomes)
+        .expect("reputation");
 
-    // 5 claims with truth 0.80..0.88, all recent, none refuted → trust > 0.5
+    let expected = 0.67;
     assert!(
-        trust > 0.5,
-        "Agent with high-truth claims should have trust > 0.5, got: {trust}"
+        (trust - expected).abs() < 1e-9,
+        "expected reputation == {expected} from defaults + hand-calculation; got {trust}. \
+         If ReputationConfig defaults changed, update this expected value and \
+         the doc-comment derivation."
     );
-
-    // Also verify it's bounded below max (0.95) — only 5 claims, stability penalty applies
-    assert!(
-        trust <= 0.95,
-        "Trust should be bounded by max_reputation, got: {trust}"
-    );
-
-    cleanup_test_data(&db.pool, PREFIX).await;
 }
 
+/// CONTRADICTS edge in DB produces a Contradiction record that names the
+/// specific supporting + refuting claims and the shared target.
 #[tokio::test]
 #[ignore] // Requires DATABASE_URL pointing to live PostgreSQL
 async fn conflict_classified_from_db_contradicts_edge() {
     let db = TestDb::setup().await;
+    let _guard = PrefixGuard::new(&db.pool, PREFIX);
     let agent = create_test_agent(&db.pool).await;
 
-    // Create two claims with an imbalance in truth values
-    let claim_a = create_test_claim(&db.pool, agent, &format!("{PREFIX} strong-claim"), 0.9).await;
-    let claim_b = create_test_claim(&db.pool, agent, &format!("{PREFIX} weak-claim"), 0.3).await;
+    let claim_a = create_test_claim(&db.pool, agent, &format!("{PREFIX} strong"), 0.9).await;
+    let claim_b = create_test_claim(&db.pool, agent, &format!("{PREFIX} weak"), 0.3).await;
+    let target = create_test_claim(&db.pool, agent, &format!("{PREFIX} target"), 0.6).await;
 
-    // Create a target claim that both relate to
-    let target = create_test_claim(&db.pool, agent, &format!("{PREFIX} target-claim"), 0.6).await;
-
-    // A supports target, B contradicts target
     create_test_edge(&db.pool, claim_a, target, "supports").await;
     create_test_edge(&db.pool, claim_b, target, "contradicts").await;
 
-    // Load claims and edges from DB
     let claim_rows = sqlx::query("SELECT id, truth_value FROM claims WHERE content LIKE $1")
         .bind(format!("{PREFIX}%"))
         .fetch_all(&db.pool)
         .await
         .expect("load claims");
-
     let claims: Vec<ReasoningClaim> = claim_rows
         .iter()
         .map(|row| ReasoningClaim {
@@ -105,39 +109,45 @@ async fn conflict_classified_from_db_contradicts_edge() {
 
     let edge_rows = sqlx::query(
         "SELECT e.source_id, e.target_id, e.relationship \
-         FROM edges e \
-         JOIN claims cs ON cs.id = e.source_id \
+         FROM edges e JOIN claims cs ON cs.id = e.source_id \
          WHERE cs.content LIKE $1",
     )
     .bind(format!("{PREFIX}%"))
     .fetch_all(&db.pool)
     .await
     .expect("load edges");
-
     let edges: Vec<ReasoningEdge> = edge_rows
         .iter()
-        .map(|row| {
-            let rel: String = row.get("relationship");
-            ReasoningEdge {
-                source_id: row.get("source_id"),
-                target_id: row.get("target_id"),
-                relationship: rel.to_lowercase(),
-                strength: 0.8, // default strength for DB edges
-            }
+        .map(|row| ReasoningEdge {
+            source_id: row.get("source_id"),
+            target_id: row.get("target_id"),
+            relationship: row.get::<String, _>("relationship").to_lowercase(),
+            // Must be > 0.3: the contradiction rule at reasoning.rs:166 gates on
+            // `s1.0 > 0.3 && s2.0 > 0.3`. Below threshold, the contradiction
+            // is silently dropped and the len() == 1 assertion would fail.
+            strength: 0.8,
         })
         .collect();
 
     let result = ReasoningEngine::analyze(&claims, &edges);
 
-    // Should detect at least one contradiction: A supports target while B refutes it
-    assert!(
-        !result.contradictions.is_empty(),
-        "ReasoningEngine should detect contradiction from CONTRADICTS edge, got 0 contradictions"
+    // Exactly one contradiction, naming (claim_a as supporter, claim_b as refuter, target).
+    // Contradiction.claim_a/claim_b ordering is not guaranteed by the engine, so
+    // accept either order but require the *set* to match.
+    assert_eq!(
+        result.contradictions.len(),
+        1,
+        "expected exactly one contradiction, got {} ({:?})",
+        result.contradictions.len(),
+        result.contradictions
     );
-
-    // Verify the contradiction involves our target claim
-    let found = result.contradictions.iter().any(|c| c.target == target);
-    assert!(found, "Contradiction should involve the target claim");
-
-    cleanup_test_data(&db.pool, PREFIX).await;
+    let c = &result.contradictions[0];
+    let observed = std::collections::BTreeSet::from([c.claim_a, c.claim_b]);
+    let expected = std::collections::BTreeSet::from([claim_a, claim_b]);
+    assert_eq!(
+        observed, expected,
+        "contradiction must name claim_a and claim_b (got {:?})",
+        c
+    );
+    assert_eq!(c.target, target, "target must match");
 }

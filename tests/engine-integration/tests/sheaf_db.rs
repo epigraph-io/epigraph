@@ -13,6 +13,7 @@ const PREFIX: &str = "[test-sheaf-db]";
 #[ignore] // Requires DATABASE_URL pointing to live PostgreSQL
 async fn sheaf_consistency_from_db_neighborhood() {
     let db = TestDb::setup().await;
+    let _guard = PrefixGuard::new(&db.pool, PREFIX);
     let agent = create_test_agent(&db.pool).await;
 
     // Create center claim + 3 neighbors
@@ -87,6 +88,4 @@ async fn sheaf_consistency_from_db_neighborhood() {
         (betp - expected_approx).abs() < 1e-9,
         "Expected BetP ≈ {expected_approx}, got: {betp}"
     );
-
-    cleanup_test_data(&db.pool, PREFIX).await;
 }
