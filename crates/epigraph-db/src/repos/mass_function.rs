@@ -262,6 +262,10 @@ impl MassFunctionRepository {
     /// Update a claim's belief, plausibility, and pignistic probability columns
     ///
     /// Called after combining mass functions to persist the computed interval.
+    /// All numeric values are clamped to [0, 1] at the write boundary so
+    /// floating-point drift accumulated upstream cannot trip the
+    /// `claims_{belief,plausibility,mass_on_empty,mass_on_missing,pignistic_prob}_bounds`
+    /// CHECK constraints.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -275,6 +279,12 @@ impl MassFunctionRepository {
         pignistic_prob: Option<f64>,
         mass_on_missing: f64,
     ) -> Result<(), DbError> {
+        let belief = belief.clamp(0.0, 1.0);
+        let plausibility = plausibility.clamp(0.0, 1.0);
+        let mass_on_empty = mass_on_empty.clamp(0.0, 1.0);
+        let mass_on_missing = mass_on_missing.clamp(0.0, 1.0);
+        let pignistic_prob = pignistic_prob.map(|p| p.clamp(0.0, 1.0));
+
         sqlx::query(
             r#"
             UPDATE claims

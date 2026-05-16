@@ -470,6 +470,31 @@ pub fn adaptive_combine(
     }
 }
 
+/// Canonical comparison of two mass functions for deterministic ordering.
+///
+/// Compares the underlying `BTreeMap<FocalElement, f64>` lex-pair-wise. f64
+/// uses `total_cmp` so NaN does not produce ambiguous orderings. This is the
+/// sort key used by [`combine_multiple`] to make the fold order-independent.
+fn canonical_mass_cmp(a: &MassFunction, b: &MassFunction) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut ai = a.masses().iter();
+    let mut bi = b.masses().iter();
+    loop {
+        match (ai.next(), bi.next()) {
+            (Some((fa, ma)), Some((fb, mb))) => match fa.cmp(fb) {
+                Ordering::Equal => match ma.total_cmp(mb) {
+                    Ordering::Equal => continue,
+                    o => return o,
+                },
+                o => return o,
+            },
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+}
+
 /// Combine multiple mass functions by pairwise adaptive folding
 ///
 /// For each pairwise step, computes the conflict coefficient K and the
@@ -483,6 +508,12 @@ pub fn adaptive_combine(
 ///
 /// The `_conflict_threshold` parameter is retained for backward compatibility
 /// but is no longer used; rule selection is fully adaptive.
+///
+/// Inputs are sorted via [`canonical_mass_cmp`] before folding so the result
+/// is independent of the caller's iteration order. Without the sort, the
+/// adaptive rule selection (which depends on accumulated state) made the fold
+/// non-commutative: reordering evidence could switch between Dempster,
+/// CdstConjunctive, and Inagaki rules and produce different final masses.
 ///
 /// # Errors
 /// - `DsError::InsufficientSources` if `masses` is empty
@@ -500,10 +531,13 @@ pub fn combine_multiple(
         return Ok((masses[0].clone(), Vec::new()));
     }
 
-    let mut accumulated = masses[0].clone();
-    let mut reports = Vec::with_capacity(masses.len() - 1);
+    let mut sorted: Vec<MassFunction> = masses.to_vec();
+    sorted.sort_by(canonical_mass_cmp);
 
-    for m in &masses[1..] {
+    let mut accumulated = sorted[0].clone();
+    let mut reports = Vec::with_capacity(sorted.len() - 1);
+
+    for m in &sorted[1..] {
         let k = conflict_coefficient(&accumulated, m)?;
         let owf = accumulated.open_world_fraction();
         let rule = select_combination_rule(k, owf);
@@ -1723,5 +1757,49 @@ mod tests {
             pl_after_refutation < 0.5,
             "Pl({pl_after_refutation:.6}) should be well below 0.5 after strong refutation"
         );
+    }
+
+    /// Regression: `combine_multiple` must be order-independent.
+    ///
+    /// Prior to the canonical sort, adaptive rule selection (which depends on
+    /// the *accumulated* fold state) could pick a different `CombinationRule`
+    /// for the same input set when callers reordered evidence. Filed as
+    /// backlog claim `cebb0043` on 2026-05-16 (non-commutativity stress test).
+    #[test]
+    fn combine_multiple_is_order_independent() {
+        let frame = ternary_frame();
+        // Three sources with distinct mass profiles — one supporting, one
+        // partially conflicting, one missing-heavy. This is the kind of mix
+        // that previously triggered rule-switching across permutations.
+        let m_support = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 0.7).unwrap();
+        let m_partial = MassFunction::simple(frame.clone(), BTreeSet::from([0, 1]), 0.6).unwrap();
+        let m_refute = MassFunction::simple(frame.clone(), BTreeSet::from([1]), 0.5).unwrap();
+
+        let permutations = [
+            vec![m_support.clone(), m_partial.clone(), m_refute.clone()],
+            vec![m_refute.clone(), m_support.clone(), m_partial.clone()],
+            vec![m_partial.clone(), m_refute.clone(), m_support.clone()],
+            vec![m_refute.clone(), m_partial.clone(), m_support.clone()],
+            vec![m_support.clone(), m_refute.clone(), m_partial.clone()],
+            vec![m_partial.clone(), m_support.clone(), m_refute.clone()],
+        ];
+
+        let (baseline, _) = combine_multiple(&permutations[0], 0.1).unwrap();
+        for (i, perm) in permutations.iter().enumerate().skip(1) {
+            let (combined, _) = combine_multiple(perm, 0.1).unwrap();
+            for (fe, mass) in baseline.masses() {
+                let other = combined.mass_of(fe);
+                assert!(
+                    (mass - other).abs() < 1e-12,
+                    "permutation {i} diverges on {fe}: baseline={mass}, perm={other}"
+                );
+            }
+            // And the converse: no extra focal elements in the permutation.
+            for fe in combined.masses().keys() {
+                if !baseline.masses().contains_key(fe) {
+                    panic!("permutation {i} produced focal element {fe} absent from baseline");
+                }
+            }
+        }
     }
 }
