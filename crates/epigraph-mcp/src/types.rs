@@ -679,6 +679,43 @@ pub struct IngestDocumentParams {
     pub file_path: String,
 }
 
+/// Parameters for the `link_hierarchical` MCP tool.
+///
+/// Wires two existing claims with one of the structural relationships emitted
+/// by the hierarchical ingest pipeline (`decomposes_to`, `section_follows`,
+/// `continues_argument`). Mirrors the contract of
+/// `POST /api/v1/edges/hierarchical` but bypasses HTTP and goes directly
+/// through the repo layer, which keeps per-chapter chapter-to-book wiring
+/// working when the HTTP API binary is unavailable.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LinkHierarchicalParams {
+    #[schemars(description = "UUID of the source claim")]
+    pub source_claim_id: String,
+
+    #[schemars(description = "UUID of the target claim")]
+    pub target_claim_id: String,
+
+    #[schemars(
+        description = "Structural relationship type. One of: decomposes_to, section_follows, continues_argument."
+    )]
+    pub relationship: String,
+
+    #[schemars(description = "Optional arbitrary JSON object attached to the edge.")]
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
+}
+
+/// Response for the `link_hierarchical` MCP tool.
+///
+/// `created=true` means a new edge row was inserted; `created=false` means an
+/// edge with the same `(source, target, relationship)` triple already
+/// existed and the existing edge_id is returned (idempotent re-runs).
+#[derive(Debug, Serialize)]
+pub struct LinkHierarchicalResponse {
+    pub edge_id: String,
+    pub created: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct IngestDocumentResponse {
     pub paper_id: String,
