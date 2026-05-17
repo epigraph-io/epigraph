@@ -381,11 +381,10 @@ impl ClaimRepository {
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn get_labels(pool: &PgPool, id: ClaimId) -> Result<Vec<String>, DbError> {
-        let row: Option<(Vec<String>,)> =
-            sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
-                .bind(id.as_uuid())
-                .fetch_optional(pool)
-                .await?;
+        let row: Option<(Vec<String>,)> = sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
+            .bind(id.as_uuid())
+            .fetch_optional(pool)
+            .await?;
         Ok(row.map(|(l,)| l).unwrap_or_default())
     }
 

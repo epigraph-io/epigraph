@@ -23,8 +23,7 @@ async fn by_labels_returns_filtered_claims() {
 
     let agent = seed_agent(&pool).await;
     let backlog_open = seed_claim(&pool, agent, &["backlog"], true, None).await;
-    let _backlog_resolved =
-        seed_claim(&pool, agent, &["backlog", "resolved"], true, None).await;
+    let _backlog_resolved = seed_claim(&pool, agent, &["backlog", "resolved"], true, None).await;
     let _backlog_superseded =
         seed_claim(&pool, agent, &["backlog"], false, Some(backlog_open)).await;
 
@@ -33,7 +32,9 @@ async fn by_labels_returns_filtered_claims() {
 
     // No filters: all 3 claims, with labels/is_current/supersedes populated.
     let resp = client
-        .get(format!("http://{addr}/api/v1/claims/by-labels?labels=backlog"))
+        .get(format!(
+            "http://{addr}/api/v1/claims/by-labels?labels=backlog"
+        ))
         .send()
         .await
         .unwrap();
@@ -49,7 +50,11 @@ async fn by_labels_returns_filtered_claims() {
                 || id == _backlog_superseded.to_string()
         })
         .collect();
-    assert_eq!(ours.len(), 3, "expected our 3 seeded backlog claims (filtered): got body={body}");
+    assert_eq!(
+        ours.len(),
+        3,
+        "expected our 3 seeded backlog claims (filtered): got body={body}"
+    );
 
     let open = ours
         .iter()
@@ -98,10 +103,7 @@ async fn by_labels_returns_filtered_claims() {
         1,
         "exclude_labels=resolved + current_only=true must leave only backlog_open: got {ours:?}"
     );
-    assert_eq!(
-        ours[0]["id"].as_str().unwrap(),
-        backlog_open.to_string()
-    );
+    assert_eq!(ours[0]["id"].as_str().unwrap(), backlog_open.to_string());
 
     // Missing labels query parameter → 400.
     let resp = client
@@ -121,7 +123,11 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
     // Per-test-binary distinct prefix (DD) so we don't collide with other test
     // binaries' agent public_keys (graph_routes_test uses AA, themes BB,
     // neighborhoods CC, mcp query_claims_by_label uses BB-pattern via `bb`).
-    let pk: Vec<u8> = std::iter::repeat(0xDD).take(16).chain(id.as_bytes().iter().copied()).take(32).collect();
+    let pk: Vec<u8> = std::iter::repeat(0xDD)
+        .take(16)
+        .chain(id.as_bytes().iter().copied())
+        .take(32)
+        .collect();
     sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, $2)")
         .bind(id)
         .bind(&pk)

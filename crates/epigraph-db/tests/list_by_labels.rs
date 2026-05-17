@@ -23,13 +23,14 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
     // its successor, so the supersedes FK resolves.
     let backlog_open = seed_claim(&pool, agent, &["backlog"], true, None).await;
     let backlog_resolved = seed_claim(&pool, agent, &["backlog", "resolved"], true, None).await;
-    let backlog_superseded = seed_claim(&pool, agent, &["backlog"], false, Some(backlog_open)).await;
+    let backlog_superseded =
+        seed_claim(&pool, agent, &["backlog"], false, Some(backlog_open)).await;
 
     // Default call: returns all three with labels populated
     let rows = ClaimRepository::list_by_labels(
         &pool,
         &["backlog".to_string()],
-        &[], // exclude_labels
+        &[],   // exclude_labels
         false, // current_only
         0.0,
         50,
@@ -45,7 +46,10 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
     };
     assert_eq!(labels_for(backlog_open), vec!["backlog"]);
     assert!(labels_for(backlog_resolved).contains(&"resolved".to_string()));
-    let superseded_row = rows.iter().find(|(c, _)| c.id == backlog_superseded).unwrap();
+    let superseded_row = rows
+        .iter()
+        .find(|(c, _)| c.id == backlog_superseded)
+        .unwrap();
     assert!(!superseded_row.0.is_current);
     assert!(superseded_row.0.supersedes.is_some());
 
@@ -64,16 +68,10 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
     assert!(filtered.iter().all(|(c, _)| c.id != backlog_resolved));
 
     // current_only=true drops the superseded one
-    let current = ClaimRepository::list_by_labels(
-        &pool,
-        &["backlog".to_string()],
-        &[],
-        true,
-        0.0,
-        50,
-    )
-    .await
-    .unwrap();
+    let current =
+        ClaimRepository::list_by_labels(&pool, &["backlog".to_string()], &[], true, 0.0, 50)
+            .await
+            .unwrap();
     assert_eq!(current.len(), 2);
     assert!(current.iter().all(|(c, _)| c.id != backlog_superseded));
 
