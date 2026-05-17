@@ -34,12 +34,38 @@ RECON_WINDOW_DAYS = int(os.environ.get("RECON_WINDOW_DAYS", "7"))
 
 
 def page_claims(base_url: str, labels: list[str], exclude: list[str]) -> list[dict]:
-    params = {"labels": ",".join(labels), "limit": 100}
-    if exclude:
-        params["exclude_labels"] = ",".join(exclude)
-    r = httpx.get(f"{base_url}/api/v1/claims/by-labels", params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    """Page through all claims matching the filter — loops until a short page.
+
+    See `cleanup_backlog_labels.page_claims` for the shared semantics. We
+    keep the parameter list slimmer here (no `current_only`) to minimize
+    collateral with the existing reconciler call sites; pagination is the
+    only behavior change.
+    """
+    out: list[dict] = []
+    offset = 0
+    page_size = 100
+    while True:
+        params: dict[str, object] = {
+            "labels": ",".join(labels),
+            "limit": page_size,
+            "offset": offset,
+        }
+        if exclude:
+            params["exclude_labels"] = ",".join(exclude)
+        r = httpx.get(f"{base_url}/api/v1/claims/by-labels", params=params, timeout=30)
+        r.raise_for_status()
+        page = r.json()
+        out.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+        if offset >= 10_000:  # safety belt
+            print(
+                f"WARN: page_claims hit 10k cap at labels={labels}",
+                file=sys.stderr,
+            )
+            break
+    return out
 
 
 def patch_labels(base_url: str, claim_id: str, add: list[str]) -> dict:
@@ -67,15 +93,8 @@ def main() -> int:
     for bc in open_backlog:
         backlog_by_prefix.setdefault(bc["id"][:8].lower(), []).append(bc)
 
-    # Page resolved claims; warn if we hit the limit.
+    # Page resolved claims (page_claims now loops until exhaustion or 10k cap).
     resolved_page = page_claims(args.base_url, ["resolved"], [])
-    if len(resolved_page) >= 100:
-        print(
-            f"WARN: resolved page returned {len(resolved_page)} (page cap). "
-            "Older resolution claims may be missed — extend the HTTP route with "
-            "created_after or paginate.",
-            file=sys.stderr,
-        )
     resolved_recent = [
         rc for rc in resolved_page
         if datetime.datetime.fromisoformat(rc["created_at"].replace("Z", "+00:00")) >= cutoff

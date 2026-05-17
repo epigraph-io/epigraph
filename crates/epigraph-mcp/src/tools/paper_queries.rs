@@ -205,6 +205,7 @@ pub async fn query_claims_by_label(
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
+    let offset = params.offset.unwrap_or(0).max(0);
 
     if params.labels.is_empty() {
         return Err(McpError {
@@ -221,6 +222,7 @@ pub async fn query_claims_by_label(
         params.current_only,
         min_truth,
         limit,
+        offset,
     )
     .await
     .map_err(internal_error)?;

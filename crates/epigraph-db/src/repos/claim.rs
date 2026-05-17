@@ -908,6 +908,7 @@ impl ClaimRepository {
         current_only: bool,
         min_truth: f64,
         limit: i64,
+        offset: i64,
     ) -> Result<Vec<(Claim, Vec<String>)>, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
@@ -924,6 +925,7 @@ impl ClaimRepository {
         }
 
         let limit = limit.clamp(1, 1000);
+        let offset = offset.max(0);
         let rows = sqlx::query_as::<_, Row>(
             r#"
             SELECT id, content, truth_value, agent_id, trace_id,
@@ -935,6 +937,7 @@ impl ClaimRepository {
               AND ($4 = false OR COALESCE(is_current, true) = true)
             ORDER BY created_at DESC
             LIMIT $5
+            OFFSET $6
             "#,
         )
         .bind(labels)
@@ -942,6 +945,7 @@ impl ClaimRepository {
         .bind(exclude_labels)
         .bind(current_only)
         .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?;
 
@@ -2543,7 +2547,7 @@ mod label_tests {
             .unwrap();
 
         let results =
-            ClaimRepository::list_by_labels(&pool, &["backlog".into()], &[], false, 0.0, 100)
+            ClaimRepository::list_by_labels(&pool, &["backlog".into()], &[], false, 0.0, 100, 0)
                 .await
                 .unwrap();
         assert!(
@@ -2558,6 +2562,7 @@ mod label_tests {
             false,
             0.0,
             100,
+            0,
         )
         .await
         .unwrap();
@@ -2584,6 +2589,7 @@ mod label_tests {
             false,
             0.0,
             100,
+            0,
         )
         .await
         .unwrap();
@@ -2605,7 +2611,7 @@ mod label_tests {
             .unwrap();
 
         let results =
-            ClaimRepository::list_by_labels(&pool, &["truth-test".into()], &[], false, 0.4, 100)
+            ClaimRepository::list_by_labels(&pool, &["truth-test".into()], &[], false, 0.4, 100, 0)
                 .await
                 .unwrap();
         assert!(
@@ -2614,7 +2620,7 @@ mod label_tests {
         );
 
         let results =
-            ClaimRepository::list_by_labels(&pool, &["truth-test".into()], &[], false, 0.9, 100)
+            ClaimRepository::list_by_labels(&pool, &["truth-test".into()], &[], false, 0.9, 100, 0)
                 .await
                 .unwrap();
         assert!(
@@ -2651,7 +2657,7 @@ mod label_tests {
         .unwrap();
 
         let results =
-            ClaimRepository::list_by_labels(&pool, &["limit-test".into()], &[], false, 0.0, 1)
+            ClaimRepository::list_by_labels(&pool, &["limit-test".into()], &[], false, 0.0, 1, 0)
                 .await
                 .unwrap();
         assert_eq!(results.len(), 1, "limit=1 should return exactly 1 result");

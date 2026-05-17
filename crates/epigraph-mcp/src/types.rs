@@ -229,6 +229,12 @@ pub struct QueryClaimsByLabelParams {
 
     #[schemars(description = "Maximum results (default 20)")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Skip the first N matching claims (default 0). Combine with `limit` to page through large result sets — results are ordered by `created_at DESC`."
+    )]
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 // ── Workflows ──
