@@ -169,18 +169,18 @@ Assemble all stages into a single `DocumentExtraction` JSON structure:
 
 Once the `DocumentExtraction` is assembled:
 
-1. **Write to file**: Save the JSON to `/tmp/extraction_<source_hash>.json`
+1. **Write to file**: Save the JSON to `/home/jeremy/tmp/extractions/extraction_<source_hash>.json`.
+   The `ingest_document` MCP tool canonicalizes the path and rejects anything
+   outside the server's working directory (`/home/jeremy`). `/tmp/...` paths
+   will fail with "file path must be within the working directory".
 2. **Call ingest_document**: Use the MCP tool to submit:
    ```
    ingest_document({
-     file_path: "/tmp/extraction_<source_hash>.json",
-     metadata: {
-       extraction_method: "hierarchical",
-       extractor_version: "1.0",
-       timestamp: "2025-03-31T14:23:00Z"
-     }
+     file_path: "/home/jeremy/tmp/extractions/extraction_<source_hash>.json"
    })
    ```
+   The tool takes only `file_path` — extraction metadata travels inside the
+   `DocumentExtraction.source.metadata` JSON field, not as a sibling param.
 
 The API will:
 - Parse and validate the JSON schema

@@ -85,6 +85,8 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "asserts",               // paper → claim (paper asserts a claim)
     "same_source",           // claim → claim (same source document)
     "decomposes_to",         // claim → claim (atomic decomposition)
+    "section_follows",       // claim → claim (sibling section ordering within a document)
+    "continues_argument",    // claim → claim (sibling paragraph ordering within a section)
     "same_as",               // claim → claim (deduplication identity)
     "CORROBORATES",          // claim → claim (cross-source corroboration)
     "AUTHORED",              // agent → claim (materialized authorship)
@@ -2404,6 +2406,8 @@ mod tests {
         assert!(is_valid_relationship("generated"));
         assert!(is_valid_relationship("attributed_to"));
         assert!(is_valid_relationship("associated_with"));
+        assert!(is_valid_relationship("section_follows"));
+        assert!(is_valid_relationship("continues_argument"));
         assert!(!is_valid_relationship("invalid"));
         assert!(!is_valid_relationship(""));
     }
