@@ -212,28 +212,28 @@ async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
     let ch1 = do_ingest_document(&server, &make_chapter(1))
         .await
         .expect("ch1 ingest");
-    let ch1_json: serde_json::Value =
-        serde_json::from_str(&result_text(&ch1)).unwrap();
+    let ch1_json: serde_json::Value = serde_json::from_str(&result_text(&ch1)).unwrap();
     assert_eq!(ch1_json["already_ingested"], serde_json::json!(false));
     let paper_id = uuid::Uuid::parse_str(ch1_json["paper_id"].as_str().unwrap()).unwrap();
 
     let ch2 = do_ingest_document(&server, &make_chapter(2))
         .await
         .expect("ch2 ingest");
-    let ch2_json: serde_json::Value =
-        serde_json::from_str(&result_text(&ch2)).unwrap();
+    let ch2_json: serde_json::Value = serde_json::from_str(&result_text(&ch2)).unwrap();
     assert_eq!(
         ch2_json["already_ingested"],
         serde_json::json!(false),
         "chapter 2 must not be blocked by chapter 1's processed_by edge"
     );
-    assert_eq!(ch2_json["paper_id"], ch1_json["paper_id"], "same paper row reused");
+    assert_eq!(
+        ch2_json["paper_id"], ch1_json["paper_id"],
+        "same paper row reused"
+    );
 
     let ch2_repeat = do_ingest_document(&server, &make_chapter(2))
         .await
         .expect("ch2 re-ingest");
-    let repeat_json: serde_json::Value =
-        serde_json::from_str(&result_text(&ch2_repeat)).unwrap();
+    let repeat_json: serde_json::Value = serde_json::from_str(&result_text(&ch2_repeat)).unwrap();
     assert_eq!(
         repeat_json["already_ingested"],
         serde_json::json!(true),
