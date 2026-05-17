@@ -118,9 +118,16 @@ def main() -> int:
     superseded: list[dict] = []
 
     for bc in open_backlog:
-        # supersedes-based retirement: the backlog claim itself is_current=false or has supersedes
-        if not bc.get("is_current", True) or bc.get("supersedes"):
+        # Supersedes-based retirement per spec: is_current=false AND supersedes set.
+        # A pure is_current=false (without supersedes) could be dedup or maintenance
+        # marking — not a retirement signal — so route those to needs-review.
+        is_current = bc.get("is_current", True)
+        has_supersedes = bool(bc.get("supersedes"))
+        if not is_current and has_supersedes:
             superseded.append(bc)
+            continue
+        if not is_current and not has_supersedes:
+            needs_review.append((bc, []))
             continue
         matches = matches_for_backlog.get(bc["id"], [])
         prefix_peers = backlog_by_prefix.get(bc["id"][:8].lower(), [])
