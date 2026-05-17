@@ -360,6 +360,17 @@ impl EpiGraphMcpFull {
         tools::ingestion::ingest_document(self, params).await
     }
 
+    #[tool(
+        description = "Create a cross-tier structural edge between two existing claims (decomposes_to, section_follows, or continues_argument). Purpose-built for per-chapter ingest wire-ups (chapter thesis -> book thesis, chapter[N] -> chapter[N+1]). Idempotent on (source, target, relationship): re-runs return the existing edge_id with created=false. Bypasses HTTP and goes straight through the repo layer."
+    )]
+    async fn link_hierarchical(
+        &self,
+        Parameters(params): Parameters<LinkHierarchicalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::link_hierarchical::link_hierarchical(self, params).await
+    }
+
     // ── Paper Queries (3 tools) ──
 
     #[tool(description = "Look up a paper by its DOI, returning title, authors, and claims.")]
@@ -850,7 +861,7 @@ impl EpiGraphMcpFull {
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.read_only { "read-only" } else { "full" };
-        let tool_count = if self.read_only { 33 } else { 59 };
+        let tool_count = if self.read_only { 33 } else { 60 };
         ServerInfo {
             instructions: Some(format!(
                 "EpiGraph {mode} MCP server with {tool_count} epistemic tools."

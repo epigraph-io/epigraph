@@ -19,6 +19,7 @@ use crate::routes::challenge::{ChallengeResponse, SubmitChallengeRequest};
 use crate::routes::claims::{
     ClaimResponse, PatchClaimRequest, UpdateLabelsRequest, UpdateLabelsResponse,
 };
+use crate::routes::edges::{LinkHierarchicalRequest, LinkHierarchicalResponse};
 use crate::routes::health::HealthResponse;
 use crate::routes::rag::{RagContextResponse, RagContextResult, RagQueryParams};
 use crate::routes::submit::{
@@ -69,6 +70,7 @@ use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowExtraction, Workflo
         report_hierarchical_outcome_doc,
         deprecate_workflow_doc,
         ingest_workflow_doc,
+        create_hierarchical_edge_doc,
     ),
     components(
         schemas(
@@ -118,6 +120,8 @@ use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowExtraction, Workflo
             HierarchicalWorkflowResult,
             ResolvedStepResult,
             LineageHeadResult,
+            LinkHierarchicalRequest,
+            LinkHierarchicalResponse,
         )
     ),
     modifiers(&SecurityAddon),
@@ -129,6 +133,7 @@ use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowExtraction, Workflo
         (name = "admin", description = "Administrative endpoints"),
         (name = "claims", description = "Claim management endpoints"),
         (name = "workflows", description = "Workflow management endpoints"),
+        (name = "edges", description = "Edge creation and management"),
     )
 )]
 pub struct ApiDoc;
@@ -449,6 +454,29 @@ async fn deprecate_workflow_doc() {}
     security(("ed25519_signature" = []))
 )]
 async fn ingest_workflow_doc() {}
+
+/// Create a cross-tier hierarchical structural edge between two claims (doc stub).
+///
+/// Tight-contract sibling of the generic POST /api/v1/edges: locked to the
+/// three structural relationships (`decomposes_to`, `section_follows`,
+/// `continues_argument`), both endpoints must be existing claims, and
+/// `(source, target, relationship)` is idempotent so per-chapter wire-ups
+/// can retry safely.
+#[utoipa::path(
+    post,
+    path = "/api/v1/edges/hierarchical",
+    tag = "edges",
+    request_body = LinkHierarchicalRequest,
+    responses(
+        (status = 200, description = "Edge created or already present", body = LinkHierarchicalResponse),
+        (status = 400, description = "Invalid relationship or self-loop", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token", body = ErrorResponse),
+        (status = 403, description = "Token missing edges:write scope", body = ErrorResponse),
+        (status = 404, description = "Source or target claim does not exist", body = ErrorResponse),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn create_hierarchical_edge_doc() {}
 
 /// Generate the OpenAPI JSON specification.
 ///

@@ -233,6 +233,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/papers", post(papers::create_paper))
         .route("/api/v1/edges", post(edges::create_edge))
         .route(
+            "/api/v1/edges/hierarchical",
+            post(edges::create_hierarchical_edge),
+        )
+        .route(
             "/api/v1/analyze/unconstrained",
             post(analyze::unconstrained_analysis),
         )
@@ -867,6 +871,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/ingest/paper-url", post(ingest::ingest_paper))
         .route("/api/v1/papers", post(papers::create_paper))
         .route("/api/v1/edges", post(edges::create_edge))
+        .route(
+            "/api/v1/edges/hierarchical",
+            post(edges::create_hierarchical_edge),
+        )
         .route(
             "/api/v1/analyze/unconstrained",
             post(analyze::unconstrained_analysis),

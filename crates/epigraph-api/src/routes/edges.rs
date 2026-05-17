@@ -962,6 +962,164 @@ pub async fn delete_edge(
 }
 
 // =============================================================================
+// CROSS-TIER HIERARCHICAL EDGE (purpose-built single-edge endpoint)
+// =============================================================================
+
+/// Allowed relationship strings for `POST /api/v1/edges/hierarchical`.
+///
+/// Deliberately tighter than the generic `VALID_RELATIONSHIPS` allow-list: this
+/// endpoint exists to wire chapters / sections / paragraphs across ingest
+/// boundaries, not to insert arbitrary edge types. New entries here must be
+/// claim-claim structural relationships emitted by the hierarchical ingest
+/// builder (see `epigraph-ingest/src/document/builder.rs`).
+pub const HIERARCHICAL_RELATIONSHIPS: &[&str] =
+    &["decomposes_to", "section_follows", "continues_argument"];
+
+fn is_hierarchical_relationship(s: &str) -> bool {
+    HIERARCHICAL_RELATIONSHIPS.contains(&s)
+}
+
+/// Request body for `POST /api/v1/edges/hierarchical`.
+///
+/// Both endpoints (`source_claim_id`, `target_claim_id`) are claim UUIDs;
+/// `source_type` and `target_type` are implicitly `"claim"` and the caller
+/// cannot override them. `properties` is an arbitrary JSON object the
+/// caller can attach to the edge (e.g. `{"sibling_order": 2}` for chapter
+/// chains). `relationship` must be one of `HIERARCHICAL_RELATIONSHIPS`.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct LinkHierarchicalRequest {
+    pub source_claim_id: Uuid,
+    pub target_claim_id: Uuid,
+    pub relationship: String,
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub properties: Option<serde_json::Value>,
+}
+
+/// Response body for `POST /api/v1/edges/hierarchical`.
+///
+/// `created=true` means a new edge row was inserted; `created=false` means
+/// `(source, target, relationship)` already existed and the existing edge_id
+/// is returned. Both cases return 200 OK so retried per-chapter wire-ups
+/// stay idempotent without the caller having to inspect status codes.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct LinkHierarchicalResponse {
+    pub edge_id: Uuid,
+    pub created: bool,
+}
+
+/// Create a cross-tier hierarchical structural edge between two claims.
+///
+/// `POST /api/v1/edges/hierarchical`
+///
+/// Purpose-built sibling of the generic `POST /api/v1/edges`: locked down to
+/// the three structural edge types emitted by hierarchical ingest
+/// (`decomposes_to`, `section_follows`, `continues_argument`), both endpoints
+/// must be existing claims, and `(source, target, relationship)` is
+/// deduplicated so per-chapter wire-ups can re-run idempotently. Intentionally
+/// side-effect-free vs the generic POST: no DS recomputation, no factor
+/// inserts, no edge.added event, no provenance — these structural edges carry
+/// no evidential semantics and the matching `ingest_document` path treats
+/// them the same way.
+///
+/// Returns 200 OK in both the freshly-inserted and dedup-hit cases so
+/// retried wiring calls don't need to distinguish status codes.
+#[cfg(feature = "db")]
+pub async fn create_hierarchical_edge(
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Json(request): Json<LinkHierarchicalRequest>,
+) -> Result<(StatusCode, Json<LinkHierarchicalResponse>), ApiError> {
+    // Enforce scope when OAuth2-authenticated (mirrors generic POST /api/v1/edges).
+    if let Some(axum::Extension(ref auth)) = auth_ctx {
+        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
+    }
+
+    // Tight relationship allow-list — narrower than VALID_RELATIONSHIPS by design.
+    if !is_hierarchical_relationship(&request.relationship) {
+        return Err(ApiError::ValidationError {
+            field: "relationship".to_string(),
+            reason: format!(
+                "Invalid relationship '{}'. Valid hierarchical types: {}",
+                request.relationship,
+                HIERARCHICAL_RELATIONSHIPS.join(", ")
+            ),
+        });
+    }
+
+    // No self-loops: source and target are both claims, so equal UUIDs always loop.
+    if request.source_claim_id == request.target_claim_id {
+        return Err(ApiError::ValidationError {
+            field: "target_claim_id".to_string(),
+            reason: "Self-loops are not allowed (source and target are the same claim)".to_string(),
+        });
+    }
+
+    let pool = &state.db_pool;
+
+    // Verify both claims exist via the repo layer (no inline SQL — CLAUDE.md
+    // requires SQL stays in epigraph-db). Disambiguate which side is missing
+    // so callers can fix the right end of the link.
+    if epigraph_db::ClaimRepository::get_by_id(
+        pool,
+        epigraph_core::ClaimId::from_uuid(request.source_claim_id),
+    )
+    .await?
+    .is_none()
+    {
+        return Err(ApiError::NotFound {
+            entity: "source_claim".to_string(),
+            id: request.source_claim_id.to_string(),
+        });
+    }
+    if epigraph_db::ClaimRepository::get_by_id(
+        pool,
+        epigraph_core::ClaimId::from_uuid(request.target_claim_id),
+    )
+    .await?
+    .is_none()
+    {
+        return Err(ApiError::NotFound {
+            entity: "target_claim".to_string(),
+            id: request.target_claim_id.to_string(),
+        });
+    }
+
+    // Idempotent on (source, target, relationship) so per-chapter wire-ups
+    // can re-run safely. source_type / target_type are always "claim" here.
+    let (edge_row, was_created) = EdgeRepository::create_if_not_exists(
+        pool,
+        request.source_claim_id,
+        "claim",
+        request.target_claim_id,
+        "claim",
+        &request.relationship,
+        request.properties.clone(),
+        None,
+        None,
+    )
+    .await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(LinkHierarchicalResponse {
+            edge_id: edge_row.id,
+            created: was_created,
+        }),
+    ))
+}
+
+/// Cross-tier hierarchical edge endpoint (placeholder - no database).
+#[cfg(not(feature = "db"))]
+pub async fn create_hierarchical_edge(
+    State(_state): State<AppState>,
+    Json(_request): Json<LinkHierarchicalRequest>,
+) -> Result<(StatusCode, Json<LinkHierarchicalResponse>), ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "database".to_string(),
+    })
+}
+
+// =============================================================================
 // PATCH EDGE
 // =============================================================================
 
