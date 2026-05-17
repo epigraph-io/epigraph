@@ -25,10 +25,14 @@ use common::build_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPool) {
-    let agent = seed_agent(&pool).await;
-    let original = seed_claim(&pool, agent, &["backlog"], true, None).await;
-
     let server = build_test_server(pool.clone());
+
+    // Author the backlog claim through the MCP server's own signer so the
+    // owner-or-admin check inside resolve_backlog_item succeeds. (The
+    // server's signer agent is registered as a side-effect of submit_claim;
+    // we then look up its UUID via the just-created claim.)
+    let server_agent = bootstrap_server_agent(&server, &pool).await;
+    let original = seed_claim(&pool, server_agent, &["backlog"], true, None).await;
 
     let result = resolve_backlog_item(
         &server,
@@ -122,15 +126,38 @@ fn parse_json(result: &CallToolResult) -> Value {
     serde_json::from_str(&text).expect("response is JSON")
 }
 
-async fn seed_agent(pool: &PgPool) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, decode($2, 'hex'))")
-        .bind(id)
-        .bind("bb".repeat(32))
-        .execute(pool)
+/// Submit a throwaway claim through the server so its signer agent is
+/// registered, then return that agent's UUID. We need the server-signer
+/// agent (not a freshly-seeded random agent) because
+/// `resolve_backlog_item` now enforces caller-owns-claim.
+async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &PgPool) -> Uuid {
+    let result = epigraph_mcp::tools::claims::submit_claim(
+        server,
+        epigraph_mcp::types::SubmitClaimParams {
+            content: "bootstrap claim for resolve_backlog_item test".into(),
+            methodology: "deductive_logic".into(),
+            evidence_data: "ev".into(),
+            evidence_type: "logical".into(),
+            confidence: 0.5,
+            source_url: None,
+            reasoning: None,
+            labels: vec![],
+        },
+    )
+    .await
+    .expect("bootstrap submit_claim");
+    let body = parse_json(&result);
+    let claim_id: Uuid = body["claim_id"]
+        .as_str()
+        .expect("claim_id is string")
+        .parse()
+        .expect("valid UUID");
+    let (agent_id,): (Uuid,) = sqlx::query_as("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(pool)
         .await
-        .expect("seed agent");
-    id
+        .expect("fetch agent_id");
+    agent_id
 }
 
 async fn seed_claim(

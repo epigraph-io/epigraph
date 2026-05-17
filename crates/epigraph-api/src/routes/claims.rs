@@ -1563,6 +1563,11 @@ pub struct ClaimsByLabelsQuery {
     /// Max claims to return (clamped to [`MIN_PAGE_LIMIT`, `MAX_PAGE_LIMIT`]).
     #[serde(default)]
     pub limit: Option<i64>,
+    /// Skip the first N matching claims (default 0; negative values clamped to 0).
+    /// Combine with `limit` to page through large result sets — claims are
+    /// ordered by `created_at DESC`.
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 /// Response row for `GET /api/v1/claims/by-labels`.
@@ -1619,6 +1624,7 @@ pub async fn list_by_labels(
         .limit
         .unwrap_or(DEFAULT_PAGE_LIMIT)
         .clamp(MIN_PAGE_LIMIT, MAX_PAGE_LIMIT);
+    let offset = q.offset.unwrap_or(0).max(0);
 
     let rows = ClaimRepository::list_by_labels(
         &state.db_pool,
@@ -1627,6 +1633,7 @@ pub async fn list_by_labels(
         current_only,
         min_truth,
         limit,
+        offset,
     )
     .await
     .map_err(|e| ApiError::InternalError {

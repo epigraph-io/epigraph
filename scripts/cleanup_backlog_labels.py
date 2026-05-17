@@ -50,18 +50,40 @@ KEYWORD_RE = re.compile(
 
 
 def page_claims(base_url: str, labels: list[str], exclude: list[str], current_only: bool) -> list[dict]:
-    """Page through all claims matching the filter (limit=100 per page)."""
-    params = {
-        "labels": ",".join(labels),
-        "limit": 100,
-    }
-    if exclude:
-        params["exclude_labels"] = ",".join(exclude)
-    if current_only:
-        params["current_only"] = "true"
-    r = httpx.get(f"{base_url}/api/v1/claims/by-labels", params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    """Page through all claims matching the filter — loops until a short page.
+
+    Calls `GET /api/v1/claims/by-labels` repeatedly with monotonically
+    increasing `offset` and a fixed `page_size=100`. Stops when a page
+    returns fewer than `page_size` rows (i.e. the result set is exhausted)
+    or the safety belt of 10,000 rows is hit (whichever comes first).
+    """
+    out: list[dict] = []
+    offset = 0
+    page_size = 100
+    while True:
+        params: dict[str, object] = {
+            "labels": ",".join(labels),
+            "limit": page_size,
+            "offset": offset,
+        }
+        if exclude:
+            params["exclude_labels"] = ",".join(exclude)
+        if current_only:
+            params["current_only"] = "true"
+        r = httpx.get(f"{base_url}/api/v1/claims/by-labels", params=params, timeout=30)
+        r.raise_for_status()
+        page = r.json()
+        out.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+        if offset >= 10_000:  # safety belt
+            print(
+                f"WARN: page_claims hit 10k cap at labels={labels}",
+                file=sys.stderr,
+            )
+            break
+    return out
 
 
 def patch_labels(base_url: str, claim_id: str, add: list[str]) -> dict:

@@ -37,6 +37,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             current_only: false,
             min_truth: None,
             limit: Some(10),
+            offset: None,
         },
     )
     .await
@@ -80,6 +81,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             current_only: false,
             min_truth: None,
             limit: Some(10),
+            offset: None,
         },
     )
     .await
@@ -103,6 +105,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             current_only: true,
             min_truth: None,
             limit: Some(10),
+            offset: None,
         },
     )
     .await
@@ -126,6 +129,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             current_only: true,
             min_truth: None,
             limit: Some(10),
+            offset: None,
         },
     )
     .await

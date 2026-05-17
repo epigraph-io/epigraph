@@ -34,6 +34,7 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
         false, // current_only
         0.0,
         50,
+        0, // offset
     )
     .await
     .unwrap();
@@ -61,6 +62,7 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
         false,
         0.0,
         50,
+        0,
     )
     .await
     .unwrap();
@@ -69,7 +71,7 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
 
     // current_only=true drops the superseded one
     let current =
-        ClaimRepository::list_by_labels(&pool, &["backlog".to_string()], &[], true, 0.0, 50)
+        ClaimRepository::list_by_labels(&pool, &["backlog".to_string()], &[], true, 0.0, 50, 0)
             .await
             .unwrap();
     assert_eq!(current.len(), 2);
@@ -83,11 +85,98 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
         true,
         0.0,
         50,
+        0,
     )
     .await
     .unwrap();
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].0.id, backlog_open);
+}
+
+/// Pagination contract for [`ClaimRepository::list_by_labels`]: with
+/// `ORDER BY created_at DESC`, `limit=N offset=K` must return rows K..K+N
+/// and disjoint pages must cover every row exactly once. Seeds 5 claims
+/// with deterministic `created_at` ordering by inserting one at a time —
+/// `DEFAULT now()` plus the per-row INSERT roundtrip guarantees strict
+/// monotonicity (and we sort our local truth list the same way to avoid
+/// timestamp races).
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_by_labels_pagination(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+
+    // Seed 5 claims one-at-a-time; collect in insertion order. created_at
+    // strictly increases per insert, so DESC order is the reverse of this
+    // vector.
+    let mut seeded: Vec<ClaimId> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let id = seed_claim(&pool, agent, &["page-test"], true, None).await;
+        seeded.push(id);
+    }
+    // Newest first (matches the SQL ORDER BY created_at DESC).
+    let expected_desc: Vec<ClaimId> = seeded.into_iter().rev().collect();
+
+    // Page 1: limit=2 offset=0 — first 2 newest.
+    let page1 =
+        ClaimRepository::list_by_labels(&pool, &["page-test".to_string()], &[], false, 0.0, 2, 0)
+            .await
+            .unwrap();
+    assert_eq!(page1.len(), 2, "page1 len");
+    let page1_ids: Vec<ClaimId> = page1.iter().map(|(c, _)| c.id).collect();
+    assert_eq!(page1_ids, expected_desc[0..2]);
+
+    // Page 2: limit=2 offset=2 — next 2.
+    let page2 =
+        ClaimRepository::list_by_labels(&pool, &["page-test".to_string()], &[], false, 0.0, 2, 2)
+            .await
+            .unwrap();
+    assert_eq!(page2.len(), 2, "page2 len");
+    let page2_ids: Vec<ClaimId> = page2.iter().map(|(c, _)| c.id).collect();
+    assert_eq!(page2_ids, expected_desc[2..4]);
+
+    // Page 3: limit=2 offset=4 — only 1 remaining (5 total).
+    let page3 =
+        ClaimRepository::list_by_labels(&pool, &["page-test".to_string()], &[], false, 0.0, 2, 4)
+            .await
+            .unwrap();
+    assert!(
+        page3.len() <= 1,
+        "page3 should have <=1 row (got {})",
+        page3.len()
+    );
+    let page3_ids: Vec<ClaimId> = page3.iter().map(|(c, _)| c.id).collect();
+    assert_eq!(page3_ids, expected_desc[4..]);
+
+    // No overlap across pages.
+    let all_ids: Vec<ClaimId> = page1_ids
+        .iter()
+        .chain(page2_ids.iter())
+        .chain(page3_ids.iter())
+        .copied()
+        .collect();
+    let unique: std::collections::HashSet<ClaimId> = all_ids.iter().copied().collect();
+    assert_eq!(
+        all_ids.len(),
+        unique.len(),
+        "no claim should appear on more than one page"
+    );
+
+    // Negative offset must clamp to 0 (matches the implementation contract).
+    let clamped = ClaimRepository::list_by_labels(
+        &pool,
+        &["page-test".to_string()],
+        &[],
+        false,
+        0.0,
+        2,
+        -100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        clamped.iter().map(|(c, _)| c.id).collect::<Vec<_>>(),
+        expected_desc[0..2],
+        "negative offset should behave like offset=0"
+    );
 }
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
