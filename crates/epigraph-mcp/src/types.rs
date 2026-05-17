@@ -212,6 +212,18 @@ pub struct QueryClaimsByLabelParams {
     )]
     pub labels: Vec<String>,
 
+    #[schemars(
+        description = "Labels to exclude — drops claims containing ANY of these labels (e.g. [\"resolved\"]). Default: no exclusion."
+    )]
+    #[serde(default)]
+    pub exclude_labels: Vec<String>,
+
+    #[schemars(
+        description = "When true, returns only claims with is_current = true (drops superseded/retired claims). Default: false."
+    )]
+    #[serde(default)]
+    pub current_only: bool,
+
     #[schemars(description = "Minimum truth value (0.0-1.0, default 0.0)")]
     pub min_truth: Option<f64>,
 
@@ -581,6 +593,10 @@ pub struct ClaimResponse {
     pub agent_id: String,
     pub content_hash: String,
     pub created_at: String,
+    pub labels: Vec<String>,
+    pub is_current: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -882,6 +898,22 @@ pub struct SupersedeClaimParams {
     pub truth_value: f64,
     #[schemars(description = "Why the previous claim is being superseded")]
     pub reason: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResolveBacklogItemParams {
+    #[schemars(description = "UUID of the backlog claim being retired")]
+    pub original_id: String,
+
+    #[schemars(
+        description = "Narrative explaining how the issue was resolved. Will be prefixed with 'Resolves <original_id>: '."
+    )]
+    pub resolution_content: String,
+
+    #[schemars(
+        description = "Methodology for the resolution claim (default: 'expert_elicitation'). Use 'inductive_generalization' if the resolution generalizes from an observed pattern."
+    )]
+    pub methodology: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

@@ -76,6 +76,9 @@ pub async fn query_paper(
             agent_id: c.agent_id.to_string(),
             content_hash: ContentHasher::to_hex(&c.content_hash),
             created_at: c.created_at.to_rfc3339(),
+            labels: Vec::new(),
+            is_current: true,
+            supersedes: None,
         })
         .collect();
 
@@ -133,6 +136,9 @@ pub async fn query_claims_by_evidence(
                 agent_id: claim.agent_id.as_uuid().to_string(),
                 content_hash: ContentHasher::to_hex(&claim.content_hash),
                 created_at: claim.created_at.to_rfc3339(),
+                labels: Vec::new(),
+                is_current: true,
+                supersedes: None,
             });
         }
 
@@ -177,6 +183,9 @@ pub async fn query_claims_by_methodology(
                         agent_id: claim.agent_id.as_uuid().to_string(),
                         content_hash: ContentHasher::to_hex(&claim.content_hash),
                         created_at: claim.created_at.to_rfc3339(),
+                        labels: Vec::new(),
+                        is_current: true,
+                        supersedes: None,
                     });
                 }
             }
@@ -205,19 +214,29 @@ pub async fn query_claims_by_label(
         });
     }
 
-    let claims = ClaimRepository::list_by_labels(&server.pool, &params.labels, min_truth, limit)
-        .await
-        .map_err(internal_error)?;
+    let rows = ClaimRepository::list_by_labels(
+        &server.pool,
+        &params.labels,
+        &params.exclude_labels,
+        params.current_only,
+        min_truth,
+        limit,
+    )
+    .await
+    .map_err(internal_error)?;
 
-    let results: Vec<ClaimResponse> = claims
-        .iter()
-        .map(|c| ClaimResponse {
+    let results: Vec<ClaimResponse> = rows
+        .into_iter()
+        .map(|(c, labels)| ClaimResponse {
             id: c.id.as_uuid().to_string(),
             content: c.content.clone(),
             truth_value: c.truth_value.value(),
             agent_id: c.agent_id.as_uuid().to_string(),
             content_hash: ContentHasher::to_hex(&c.content_hash),
             created_at: c.created_at.to_rfc3339(),
+            labels,
+            is_current: c.is_current,
+            supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
         })
         .collect();
 

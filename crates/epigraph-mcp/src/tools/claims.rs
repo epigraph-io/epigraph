@@ -272,6 +272,9 @@ pub async fn query_claims(
             agent_id: c.agent_id.as_uuid().to_string(),
             content_hash: ContentHasher::to_hex(&c.content_hash),
             created_at: c.created_at.to_rfc3339(),
+            labels: Vec::new(),
+            is_current: true,
+            supersedes: None,
         })
         .collect();
 
@@ -283,10 +286,14 @@ pub async fn get_claim(
     params: GetClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
-    let claim = ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(id))
+    let claim_id = ClaimId::from_uuid(id);
+    let claim = ClaimRepository::get_by_id(&server.pool, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
+    let labels = ClaimRepository::get_labels(&server.pool, claim_id)
+        .await
+        .map_err(internal_error)?;
 
     success_json(&ClaimResponse {
         id: claim.id.as_uuid().to_string(),
@@ -295,6 +302,9 @@ pub async fn get_claim(
         agent_id: claim.agent_id.as_uuid().to_string(),
         content_hash: ContentHasher::to_hex(&claim.content_hash),
         created_at: claim.created_at.to_rfc3339(),
+        labels,
+        is_current: claim.is_current,
+        supersedes: claim.supersedes.map(|s| s.as_uuid().to_string()),
     })
 }
 
@@ -399,6 +409,108 @@ pub async fn update_with_evidence(
         plausibility: Some(ds.plausibility),
         pignistic_prob: Some(ds.pignistic_prob),
     })
+}
+
+/// One-call backlog-item retirement.
+///
+/// Submits a resolution claim via the canonical `submit_claim` pipeline
+/// (full lifecycle: idempotent create + Evidence + ReasoningTrace +
+/// DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding +
+/// label patch), then PATCHes the original claim's labels with
+/// `add=["resolved"]`. The original keeps `is_current=true` and
+/// `supersedes=None` — retirement is label-side, not lineage-side.
+///
+/// Partial-failure semantics: if the label PATCH on the original fails
+/// after the resolution claim is created, returns an error including
+/// the `resolution_claim_id` so the reconciler can back-fill.
+pub async fn resolve_backlog_item(
+    server: &EpiGraphMcpFull,
+    params: crate::types::ResolveBacklogItemParams,
+) -> Result<CallToolResult, McpError> {
+    let original_id = parse_uuid(&params.original_id)?;
+    let original_claim_id = ClaimId::from_uuid(original_id);
+
+    // Confirm the target exists; we do NOT require the "backlog" label —
+    // a stricter precondition belongs to the call site (HTTP filters /
+    // operator UI) rather than the verb.
+    let _original = ClaimRepository::get_by_id(&server.pool, original_claim_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_params(format!("claim {original_id} not found")))?;
+
+    // 1. Submit the resolution claim via the canonical pipeline.
+    let methodology = params
+        .methodology
+        .unwrap_or_else(|| "expert_elicitation".to_string());
+    let resolution_content = format!("Resolves {}: {}", original_id, params.resolution_content);
+    let submit_params = crate::types::SubmitClaimParams {
+        content: resolution_content,
+        methodology,
+        evidence_data: format!(
+            "Operational resolution of backlog claim {}. Filed via resolve_backlog_item.",
+            original_id
+        ),
+        evidence_type: "testimonial".to_string(),
+        confidence: 0.8,
+        source_url: None,
+        reasoning: Some(format!(
+            "Backlog claim {original_id} retired by agent assertion via resolve_backlog_item."
+        )),
+        labels: vec!["resolved".to_string()],
+    };
+    let submit_result = submit_claim(server, submit_params).await?;
+    let resolution_id = extract_submit_claim_id(&submit_result)?;
+
+    // 2. PATCH the original's labels: add "resolved", keep "backlog".
+    //    Best-effort: if this fails the resolution claim already exists,
+    //    return a partial-success error so the reconciler can back-fill.
+    let after_labels = match ClaimRepository::update_labels(
+        &server.pool,
+        original_id,
+        &["resolved".to_string()],
+        &[],
+    )
+    .await
+    {
+        Ok(labels) => labels,
+        Err(e) => {
+            return Err(McpError {
+                code: rmcp::model::ErrorCode::INTERNAL_ERROR,
+                message: format!(
+                    "resolution claim {resolution_id} created but failed to patch original {original_id}: {e}"
+                )
+                .into(),
+                data: Some(serde_json::json!({
+                    "resolution_claim_id": resolution_id,
+                    "original_id": original_id.to_string(),
+                })),
+            });
+        }
+    };
+
+    success_json(&serde_json::json!({
+        "resolution_claim_id": resolution_id,
+        "original_id": original_id.to_string(),
+        "original_labels": after_labels,
+    }))
+}
+
+/// Pull `claim_id` out of a `submit_claim` response. Mirrors the
+/// `first_text` helper in `tests/common/mod.rs` (the proven shape for
+/// pattern-matching `CallToolResult.content` in this rmcp version).
+fn extract_submit_claim_id(result: &CallToolResult) -> Result<String, McpError> {
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.as_str())
+        .ok_or_else(|| internal_error("submit_claim returned no text content"))?;
+    let parsed: serde_json::Value = serde_json::from_str(text).map_err(internal_error)?;
+    parsed
+        .get("claim_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| internal_error("submit_claim response missing claim_id"))
 }
 
 pub async fn update_labels(
