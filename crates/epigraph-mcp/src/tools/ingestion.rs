@@ -32,7 +32,28 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 // ingest_document — hierarchical DocumentExtraction → graph
 // ────────────────────────────────────────────────────────────────────────────
 
-const PIPELINE_VERSION: &str = "hierarchical_extraction_v1";
+const PIPELINE_VERSION_BASE: &str = "hierarchical_extraction_v1";
+
+/// Pipeline version stamp used by the `processed_by` edge and the version gate.
+///
+/// For documents ingested whole (papers), this is just `PIPELINE_VERSION_BASE`
+/// so re-ingesting the same paper short-circuits as before. For chunked
+/// ingests where many `DocumentExtraction`s share one paper row (e.g. a
+/// textbook ingested chapter-by-chapter), `source.metadata.chapter_index` is
+/// appended so each chunk is gated independently — without it, the first
+/// chunk's `processed_by` edge would block every subsequent chunk for the
+/// same paper.
+fn effective_pipeline_version(extraction: &DocumentExtraction) -> String {
+    extraction
+        .source
+        .metadata
+        .get("chapter_index")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(
+            || PIPELINE_VERSION_BASE.to_string(),
+            |n| format!("{PIPELINE_VERSION_BASE}:ch{n}"),
+        )
+}
 
 pub async fn ingest_document(
     server: &EpiGraphMcpFull,
@@ -72,13 +93,14 @@ pub async fn do_ingest_document(
 
     let paper_title = extraction.source.title.clone();
     let doi = resolve_doi(extraction);
+    let pipeline_version = effective_pipeline_version(extraction);
 
     // ── 1. Version gate: skip if already processed by this pipeline ──
     if let Some(prior) = PaperRepository::find_by_doi(pool, &doi)
         .await
         .map_err(internal_error)?
     {
-        if PaperRepository::has_processed_by_edge(pool, prior.id, PIPELINE_VERSION)
+        if PaperRepository::has_processed_by_edge(pool, prior.id, &pipeline_version)
             .await
             .map_err(internal_error)?
         {
@@ -384,7 +406,12 @@ pub async fn do_ingest_document(
     // models "this paper was processed by this agent at this pipeline
     // version". (Self-loops on paper are blocked by the edges_no_self_loop
     // check constraint, so we cannot point the edge back at the paper.)
-    let (_row, _was_created) = EdgeRepository::create_if_not_exists(
+    // Direct create (not create_if_not_exists): the gate above guarantees no
+    // edge with this exact `pipeline` value exists yet for this paper. Using
+    // create_if_not_exists here would dedupe on (paper, agent, "processed_by")
+    // alone and silently retain a prior chapter's pipeline marker, breaking
+    // the per-chapter gate on re-ingest.
+    let _edge_id = EdgeRepository::create(
         pool,
         paper_id,
         "paper",
@@ -392,7 +419,7 @@ pub async fn do_ingest_document(
         "agent",
         "processed_by",
         Some(serde_json::json!({
-            "pipeline": PIPELINE_VERSION,
+            "pipeline": pipeline_version,
             "tool": "ingest_document",
         })),
         None,

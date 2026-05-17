@@ -170,6 +170,93 @@ async fn re_ingest_hits_version_gate(pool: PgPool) {
     assert_eq!(json["relationships_created"], serde_json::json!(0));
 }
 
+/// Per-chapter version gating: a textbook ingested chapter-by-chapter shares
+/// one paper row across many `DocumentExtraction`s. With `source.metadata.
+/// chapter_index` set, each chunk's `processed_by` edge carries
+/// `pipeline=hierarchical_extraction_v1:ch<N>` so chapter 2 isn't blocked by
+/// the edge chapter 1 left behind. Re-ingesting the *same* chapter still hits
+/// the gate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
+    let server = make_server(pool.clone());
+
+    let make_chapter = |idx: u64| -> DocumentExtraction {
+        let json = format!(
+            r#"{{
+              "source": {{
+                "title": "Test Textbook — Chapter {idx}",
+                "doi": "10.1234/textbook-chunked",
+                "source_type": "Textbook",
+                "authors": [{{"name": "Alice Author", "affiliations": [], "roles": ["author"]}}],
+                "metadata": {{"chapter_index": {idx}}}
+              }},
+              "thesis": "Chapter {idx} thesis",
+              "thesis_derivation": "TopDown",
+              "sections": [{{
+                "title": "Sec",
+                "summary": "Chapter {idx} section summary",
+                "paragraphs": [{{
+                  "compound": "Chapter {idx} compound claim",
+                  "supporting_text": "Chapter {idx} support",
+                  "atoms": ["Chapter {idx} atom one"],
+                  "generality": [3],
+                  "confidence": 0.8
+                }}]
+              }}],
+              "relationships": []
+            }}"#
+        );
+        serde_json::from_str(&json).expect("fixture parses")
+    };
+
+    let ch1 = do_ingest_document(&server, &make_chapter(1))
+        .await
+        .expect("ch1 ingest");
+    let ch1_json: serde_json::Value = serde_json::from_str(&result_text(&ch1)).unwrap();
+    assert_eq!(ch1_json["already_ingested"], serde_json::json!(false));
+    let paper_id = uuid::Uuid::parse_str(ch1_json["paper_id"].as_str().unwrap()).unwrap();
+
+    let ch2 = do_ingest_document(&server, &make_chapter(2))
+        .await
+        .expect("ch2 ingest");
+    let ch2_json: serde_json::Value = serde_json::from_str(&result_text(&ch2)).unwrap();
+    assert_eq!(
+        ch2_json["already_ingested"],
+        serde_json::json!(false),
+        "chapter 2 must not be blocked by chapter 1's processed_by edge"
+    );
+    assert_eq!(
+        ch2_json["paper_id"], ch1_json["paper_id"],
+        "same paper row reused"
+    );
+
+    let ch2_repeat = do_ingest_document(&server, &make_chapter(2))
+        .await
+        .expect("ch2 re-ingest");
+    let repeat_json: serde_json::Value = serde_json::from_str(&result_text(&ch2_repeat)).unwrap();
+    assert_eq!(
+        repeat_json["already_ingested"],
+        serde_json::json!(true),
+        "re-ingesting the same chapter must still hit the per-chapter gate"
+    );
+
+    // Both per-chapter processed_by edges must coexist on the paper.
+    let count: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges
+        WHERE source_id = $1 AND source_type = 'paper'
+          AND relationship = 'processed_by'
+          AND properties ->> 'pipeline' IN
+              ('hierarchical_extraction_v1:ch1', 'hierarchical_extraction_v1:ch2')
+        "#,
+    )
+    .bind(paper_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count.0, 2, "one processed_by edge per chapter");
+}
+
 /// A second fixture sharing one atom and the same author with the primary
 /// fixture. Validates cross-paper atom convergence and author dedup.
 const FIXTURE_OVERLAP: &str = r#"{
