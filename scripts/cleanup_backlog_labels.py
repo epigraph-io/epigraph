@@ -20,11 +20,18 @@ Output: docs/superpowers/reports/backlog-cleanup-YYYY-MM-DD.md
 """
 import argparse
 import datetime
+import os
 import re
 import sys
 from pathlib import Path
 
 import httpx
+
+# Bearer auth for the PATCH route (read route is public). Pass via
+# EPIGRAPH_TOKEN env var. Mint with scripts/mint_epigraph_token.py
+# (EPIGRAPH_SCOPE="claims:read claims:write" or higher).
+TOKEN = os.environ.get("EPIGRAPH_TOKEN")
+AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
 
 FULL_UUID_RE = re.compile(
     r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
@@ -61,6 +68,7 @@ def patch_labels(base_url: str, claim_id: str, add: list[str]) -> dict:
     r = httpx.patch(
         f"{base_url}/api/v1/claims/{claim_id}/labels",
         json={"add": add, "remove": []},
+        headers=AUTH_HEADERS,
         timeout=30,
     )
     r.raise_for_status()
