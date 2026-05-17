@@ -50,8 +50,7 @@ async fn resolve_backlog_item_refuses_foreign_agent_claim(pool: PgPool) {
     // Seed a backlog claim authored by a DIFFERENT, foreign agent. The
     // MCP handler should refuse to retire it.
     let foreign_agent = seed_random_agent(&pool).await;
-    let foreign_claim =
-        seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;
+    let foreign_claim = seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;
 
     let err = resolve_backlog_item(
         &server,
@@ -148,10 +147,7 @@ fn parse_json(result: &CallToolResult) -> Value {
 /// the server's signer agent. The agent UUID returned is unused by
 /// callers that just want the side-effect (registration); the foreign-
 /// agent test path discards it.
-async fn bootstrap_server_agent(
-    server: &epigraph_mcp::EpiGraphMcpFull,
-    pool: &PgPool,
-) -> Uuid {
+async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &PgPool) -> Uuid {
     let result = epigraph_mcp::tools::claims::submit_claim(
         server,
         SubmitClaimParams {

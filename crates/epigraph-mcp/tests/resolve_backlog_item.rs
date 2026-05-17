@@ -130,10 +130,7 @@ fn parse_json(result: &CallToolResult) -> Value {
 /// registered, then return that agent's UUID. We need the server-signer
 /// agent (not a freshly-seeded random agent) because
 /// `resolve_backlog_item` now enforces caller-owns-claim.
-async fn bootstrap_server_agent(
-    server: &epigraph_mcp::EpiGraphMcpFull,
-    pool: &PgPool,
-) -> Uuid {
+async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &PgPool) -> Uuid {
     let result = epigraph_mcp::tools::claims::submit_claim(
         server,
         epigraph_mcp::types::SubmitClaimParams {

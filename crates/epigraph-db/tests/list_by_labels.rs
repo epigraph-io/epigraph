@@ -116,49 +116,28 @@ async fn list_by_labels_pagination(pool: PgPool) {
     let expected_desc: Vec<ClaimId> = seeded.into_iter().rev().collect();
 
     // Page 1: limit=2 offset=0 — first 2 newest.
-    let page1 = ClaimRepository::list_by_labels(
-        &pool,
-        &["page-test".to_string()],
-        &[],
-        false,
-        0.0,
-        2,
-        0,
-    )
-    .await
-    .unwrap();
+    let page1 =
+        ClaimRepository::list_by_labels(&pool, &["page-test".to_string()], &[], false, 0.0, 2, 0)
+            .await
+            .unwrap();
     assert_eq!(page1.len(), 2, "page1 len");
     let page1_ids: Vec<ClaimId> = page1.iter().map(|(c, _)| c.id).collect();
     assert_eq!(page1_ids, expected_desc[0..2]);
 
     // Page 2: limit=2 offset=2 — next 2.
-    let page2 = ClaimRepository::list_by_labels(
-        &pool,
-        &["page-test".to_string()],
-        &[],
-        false,
-        0.0,
-        2,
-        2,
-    )
-    .await
-    .unwrap();
+    let page2 =
+        ClaimRepository::list_by_labels(&pool, &["page-test".to_string()], &[], false, 0.0, 2, 2)
+            .await
+            .unwrap();
     assert_eq!(page2.len(), 2, "page2 len");
     let page2_ids: Vec<ClaimId> = page2.iter().map(|(c, _)| c.id).collect();
     assert_eq!(page2_ids, expected_desc[2..4]);
 
     // Page 3: limit=2 offset=4 — only 1 remaining (5 total).
-    let page3 = ClaimRepository::list_by_labels(
-        &pool,
-        &["page-test".to_string()],
-        &[],
-        false,
-        0.0,
-        2,
-        4,
-    )
-    .await
-    .unwrap();
+    let page3 =
+        ClaimRepository::list_by_labels(&pool, &["page-test".to_string()], &[], false, 0.0, 2, 4)
+            .await
+            .unwrap();
     assert!(
         page3.len() <= 1,
         "page3 should have <=1 row (got {})",
