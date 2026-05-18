@@ -573,15 +573,18 @@ pub async fn create_claim(
                 Ok(embedding) => {
                     let pgvector_str = format!(
                         "[{}]",
-                        embedding.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+                        embedding
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
                     );
-                    if let Err(e) = sqlx::query(
-                        "UPDATE claims SET embedding = $1::vector WHERE id = $2",
-                    )
-                    .bind(&pgvector_str)
-                    .bind(claim_uuid)
-                    .execute(&state.db_pool)
-                    .await
+                    if let Err(e) =
+                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+                            .bind(&pgvector_str)
+                            .bind(claim_uuid)
+                            .execute(&state.db_pool)
+                            .await
                     {
                         tracing::warn!(
                             claim_id = %claim_uuid,

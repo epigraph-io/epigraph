@@ -44,7 +44,10 @@ async fn returns_inserted_claim_ids_and_content(pool: PgPool) {
     let extraction = build_extraction("executor-embed-surfacing-test");
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let planned_count = plan.claims.len();
-    assert!(planned_count > 0, "fixture should produce at least one planned claim");
+    assert!(
+        planned_count > 0,
+        "fixture should produce at least one planned claim"
+    );
 
     // First run: every planned claim is newly inserted and must be surfaced.
     let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
@@ -61,7 +64,10 @@ async fn returns_inserted_claim_ids_and_content(pool: PgPool) {
     let planned_contents: std::collections::HashSet<&str> =
         plan.claims.iter().map(|c| c.content.as_str()).collect();
     for (id, content) in &r1.inserted {
-        assert!(planned_contents.contains(content.as_str()), "{id} content mismatch");
+        assert!(
+            planned_contents.contains(content.as_str()),
+            "{id} content mismatch"
+        );
     }
 
     // Second run: idempotency gate fires; no new surfacing.
@@ -69,7 +75,10 @@ async fn returns_inserted_claim_ids_and_content(pool: PgPool) {
         .await
         .expect("second call");
     assert!(r2.already_ingested);
-    assert!(r2.inserted.is_empty(), "idempotent re-run must surface no new inserts");
+    assert!(
+        r2.inserted.is_empty(),
+        "idempotent re-run must surface no new inserts"
+    );
 }
 
 /// Regression guard for the partial-dedup resume case: an interrupted first
@@ -88,7 +97,10 @@ async fn returns_empty_inserted_on_partial_dedup(pool: PgPool) {
     let extraction = build_extraction("executor-partial-dedup-test");
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let planned_count = plan.claims.len();
-    assert!(planned_count > 0, "fixture should produce at least one planned claim");
+    assert!(
+        planned_count > 0,
+        "fixture should produce at least one planned claim"
+    );
 
     // First run: writes workflow row + claims + executes edges normally.
     let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)

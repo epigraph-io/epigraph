@@ -70,17 +70,21 @@ async fn create_claim_embeds_inline(pool: PgPool) {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let claim_id: Uuid = v["id"].as_str().unwrap().parse().unwrap();
 
-    let has_embedding: bool = sqlx::query_scalar(
-        "SELECT embedding IS NOT NULL FROM claims WHERE id = $1",
-    )
-    .bind(claim_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let has_embedding: bool =
+        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
-    assert!(has_embedding, "claim {claim_id} should have embedding populated by create_claim");
+    assert!(
+        has_embedding,
+        "claim {claim_id} should have embedding populated by create_claim"
+    );
 }

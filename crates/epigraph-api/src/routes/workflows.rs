@@ -235,13 +235,12 @@ pub async fn store_workflow(
             match embedder.generate(content).await {
                 Ok(embedding) => {
                     let pgvector_str = format_embedding(&embedding);
-                    if let Err(e) = sqlx::query(
-                        "UPDATE claims SET embedding = $1::vector WHERE id = $2",
-                    )
-                    .bind(&pgvector_str)
-                    .bind(*claim_id)
-                    .execute(&state.db_pool)
-                    .await
+                    if let Err(e) =
+                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+                            .bind(&pgvector_str)
+                            .bind(*claim_id)
+                            .execute(&state.db_pool)
+                            .await
                     {
                         tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
                     }
@@ -1231,13 +1230,12 @@ pub async fn ingest_workflow(
             match embedder.generate(content).await {
                 Ok(embedding) => {
                     let pgvector_str = format_embedding(&embedding);
-                    if let Err(e) = sqlx::query(
-                        "UPDATE claims SET embedding = $1::vector WHERE id = $2",
-                    )
-                    .bind(&pgvector_str)
-                    .bind(*claim_id)
-                    .execute(&state.db_pool)
-                    .await
+                    if let Err(e) =
+                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+                            .bind(&pgvector_str)
+                            .bind(*claim_id)
+                            .execute(&state.db_pool)
+                            .await
                     {
                         tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
                     }

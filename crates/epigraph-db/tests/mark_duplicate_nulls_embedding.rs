@@ -51,21 +51,25 @@ async fn mark_duplicate_nulls_embedding(pool: PgPool) {
     .await
     .unwrap();
 
-    let dup_has_embedding: bool = sqlx::query_scalar(
-        "SELECT embedding IS NOT NULL FROM claims WHERE id = $1",
-    )
-    .bind(dup_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let canon_has_embedding: bool = sqlx::query_scalar(
-        "SELECT embedding IS NOT NULL FROM claims WHERE id = $1",
-    )
-    .bind(canonical_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let dup_has_embedding: bool =
+        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(dup_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let canon_has_embedding: bool =
+        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(canonical_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
-    assert!(!dup_has_embedding, "duplicate {dup_id} embedding should be NULL after mark_duplicate");
-    assert!(canon_has_embedding, "canonical {canonical_id} embedding must be preserved");
+    assert!(
+        !dup_has_embedding,
+        "duplicate {dup_id} embedding should be NULL after mark_duplicate"
+    );
+    assert!(
+        canon_has_embedding,
+        "canonical {canonical_id} embedding must be preserved"
+    );
 }
