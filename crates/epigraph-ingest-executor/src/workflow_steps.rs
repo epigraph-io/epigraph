@@ -29,6 +29,10 @@ pub struct AddStepResult {
     /// re-add); the existing position/lineage_id are returned and the chain
     /// is not rewired.
     pub already_present: bool,
+    /// Content of the step claim if this call inserted a new row;
+    /// `None` if the step was already present (idempotent re-add). The
+    /// caller embeds when `Some(_)`; see CLAUDE.md "Embedding policy".
+    pub inserted_content: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +196,7 @@ pub async fn add_step(
             step_index: idx as u32,
             step_lineage_id: existing_lineage.unwrap_or_else(Uuid::nil),
             already_present: true,
+            inserted_content: None,
         });
     }
 
@@ -319,6 +324,7 @@ pub async fn add_step(
         step_index: position as u32,
         step_lineage_id: step_lineage,
         already_present: false,
+        inserted_content: Some(step_text.to_string()),
     })
 }
 
