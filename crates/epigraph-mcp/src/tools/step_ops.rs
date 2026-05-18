@@ -71,6 +71,14 @@ pub async fn add_step(
     )
     .await
     .map_err(map_step_err)?;
+
+    if let Some(ref content) = r.inserted_content {
+        let _ = server
+            .embedder
+            .embed_and_store(r.step_claim_id, content)
+            .await;
+    }
+
     success_json(&AddStepResponse {
         workflow_id: r.workflow_id,
         step_claim_id: r.step_claim_id,

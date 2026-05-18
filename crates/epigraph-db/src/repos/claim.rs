@@ -2119,6 +2119,14 @@ impl ClaimRepository {
             "UPDATE claims SET supersedes = $1, is_current = false, updated_at = NOW() WHERE id = $2",
         )
         .bind(canon_uuid).bind(dup_uuid).execute(&mut *tx).await?;
+
+        // is_current=false invariant: drop the duplicate from semantic search.
+        // Mirrors supersede() at line 1401. See CLAUDE.md "Embedding policy".
+        sqlx::query("UPDATE claims SET embedding = NULL WHERE id = $1")
+            .bind(dup_uuid)
+            .execute(&mut *tx)
+            .await?;
+
         tx.commit().await?;
         Ok(())
     }

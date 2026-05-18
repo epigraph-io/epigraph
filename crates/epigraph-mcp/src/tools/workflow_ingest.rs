@@ -40,22 +40,21 @@ pub struct IngestWorkflowResponse {
 
 // ── Pool-only inner ────────────────────────────────────────────────────────
 
-/// Pool-only ingest logic. Callable from both the MCP entry point (which
-/// supplies `server.pool`) and from integration tests (which supply a
-/// `sqlx::test`-managed pool directly).
-///
-/// Thin wrapper over [`epigraph_ingest_executor::execute_workflow_ingest_plan`];
-/// see that function for the canonical persistence semantics.
-pub async fn do_ingest_workflow_via_pool(
+/// Inner helper: runs the executor and builds the response, but also returns
+/// the executor's `inserted` vec so MCP entry points can embed those claims
+/// inline. `pub(crate)` so sibling MCP tool modules (e.g. `workflows::store_workflow`)
+/// can drive the same embed loop without duplicating the executor wiring.
+pub(crate) async fn execute_workflow_ingest_with_inserted(
     pool: &sqlx::PgPool,
     extraction: &WorkflowExtraction,
-) -> Result<IngestWorkflowResponse, McpError> {
+) -> Result<(IngestWorkflowResponse, Vec<(uuid::Uuid, String)>), McpError> {
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan(pool, &plan, extraction)
         .await
         .map_err(|e| internal_error(format!("workflow ingest: {e}")))?;
 
-    Ok(IngestWorkflowResponse {
+    let inserted = result.inserted.clone();
+    let response = IngestWorkflowResponse {
         workflow_id: result.workflow_id.to_string(),
         canonical_name: result.canonical_name,
         generation: result.generation,
@@ -64,7 +63,24 @@ pub async fn do_ingest_workflow_via_pool(
         executes_edges: result.executes_edges_created,
         relationships_created: result.relationship_edges_created,
         already_ingested: result.already_ingested,
-    })
+    };
+    Ok((response, inserted))
+}
+
+/// Pool-only ingest logic. Callable from both the MCP entry point (which
+/// supplies `server.pool`) and from integration tests (which supply a
+/// `sqlx::test`-managed pool directly).
+///
+/// Thin wrapper over [`epigraph_ingest_executor::execute_workflow_ingest_plan`];
+/// see that function for the canonical persistence semantics. Does NOT embed
+/// — embedding happens in the MCP entry point [`do_ingest_workflow`], which
+/// has access to `server.embedder`.
+pub async fn do_ingest_workflow_via_pool(
+    pool: &sqlx::PgPool,
+    extraction: &WorkflowExtraction,
+) -> Result<IngestWorkflowResponse, McpError> {
+    let (response, _inserted) = execute_workflow_ingest_with_inserted(pool, extraction).await?;
+    Ok(response)
 }
 
 // ── MCP entry point ────────────────────────────────────────────────────────
@@ -74,7 +90,17 @@ pub async fn do_ingest_workflow(
     server: &EpiGraphMcpFull,
     extraction: &WorkflowExtraction,
 ) -> Result<CallToolResult, McpError> {
-    let response = do_ingest_workflow_via_pool(&server.pool, extraction).await?;
+    let (response, inserted) =
+        execute_workflow_ingest_with_inserted(&server.pool, extraction).await?;
+
+    // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
+    // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue —
+    // embedding is recoverable via backfill; the workflow ingest is not.
+    // `embed_and_store` logs tracing::warn on failure internally; no outer handling needed.
+    for (claim_id, content) in &inserted {
+        let _ = server.embedder.embed_and_store(*claim_id, content).await;
+    }
+
     success_json(&response)
 }
 
@@ -112,20 +138,15 @@ pub struct ImproveWorkflowHierarchyResponse {
     pub already_ingested: bool,
 }
 
-/// Pool-only logic for `improve_workflow_hierarchy`. Resolves the max
-/// generation for `parent_canonical_name`, overwrites the caller-supplied
-/// extraction source fields with the resolved variant identity, then calls
-/// `do_ingest_workflow_via_pool` to perform the actual hierarchical ingest.
-///
-/// Caller-supplied values for `extraction.source.canonical_name`,
-/// `extraction.source.generation`, and `extraction.source.parent_canonical_name`
-/// are intentionally OVERWRITTEN so that the variant's identity is dictated
-/// by the resolver, not the caller.
-pub async fn improve_workflow_hierarchy_via_pool(
+/// Inner helper: same as [`improve_workflow_hierarchy_via_pool`] but also
+/// returns the executor's `inserted` vec so MCP entry points can embed.
+/// Called by `improve_workflow_hierarchy` (this module) — kept private since
+/// no other module needs the inserted vec for this path.
+async fn improve_workflow_hierarchy_with_inserted(
     pool: &sqlx::PgPool,
     parent_canonical_name: &str,
     mut extraction: WorkflowExtraction,
-) -> Result<ImproveWorkflowHierarchyResponse, McpError> {
+) -> Result<(ImproveWorkflowHierarchyResponse, Vec<(uuid::Uuid, String)>), McpError> {
     let parent_max =
         epigraph_db::WorkflowRepository::max_generation_by_canonical(pool, parent_canonical_name)
             .await
@@ -143,16 +164,37 @@ pub async fn improve_workflow_hierarchy_via_pool(
         .map_err(|e| internal_error(format!("new_generation does not fit in u32: {e}")))?;
     extraction.source.parent_canonical_name = Some(parent_canonical_name.to_string());
 
-    let response = do_ingest_workflow_via_pool(pool, &extraction).await?;
+    let (response, inserted) = execute_workflow_ingest_with_inserted(pool, &extraction).await?;
 
-    Ok(ImproveWorkflowHierarchyResponse {
+    let improve_response = ImproveWorkflowHierarchyResponse {
         parent_canonical_name: parent_canonical_name.to_string(),
         parent_generation: parent_max,
         new_generation,
         workflow_id: response.workflow_id,
         claims_ingested: response.claims_ingested,
         already_ingested: response.already_ingested,
-    })
+    };
+    Ok((improve_response, inserted))
+}
+
+/// Pool-only logic for `improve_workflow_hierarchy`. Resolves the max
+/// generation for `parent_canonical_name`, overwrites the caller-supplied
+/// extraction source fields with the resolved variant identity, then calls
+/// the shared inner helper to perform the actual hierarchical ingest.
+///
+/// Caller-supplied values for `extraction.source.canonical_name`,
+/// `extraction.source.generation`, and `extraction.source.parent_canonical_name`
+/// are intentionally OVERWRITTEN so that the variant's identity is dictated
+/// by the resolver, not the caller. Does NOT embed — embedding happens in
+/// the MCP entry point [`improve_workflow_hierarchy`].
+pub async fn improve_workflow_hierarchy_via_pool(
+    pool: &sqlx::PgPool,
+    parent_canonical_name: &str,
+    extraction: WorkflowExtraction,
+) -> Result<ImproveWorkflowHierarchyResponse, McpError> {
+    let (response, _inserted) =
+        improve_workflow_hierarchy_with_inserted(pool, parent_canonical_name, extraction).await?;
+    Ok(response)
 }
 
 /// MCP tool entry point for `improve_workflow_hierarchy`.
@@ -160,12 +202,19 @@ pub async fn improve_workflow_hierarchy(
     server: &EpiGraphMcpFull,
     params: ImproveWorkflowHierarchyParams,
 ) -> Result<CallToolResult, McpError> {
-    let response = improve_workflow_hierarchy_via_pool(
+    let (response, inserted) = improve_workflow_hierarchy_with_inserted(
         &server.pool,
         &params.parent_canonical_name,
         params.extraction,
     )
     .await?;
+
+    // Embed inline, best-effort (see `do_ingest_workflow` for rationale).
+    // `embed_and_store` logs tracing::warn on failure internally; no outer handling needed.
+    for (claim_id, content) in &inserted {
+        let _ = server.embedder.embed_and_store(*claim_id, content).await;
+    }
+
     success_json(&response)
 }
 
