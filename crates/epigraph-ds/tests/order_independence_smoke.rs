@@ -62,9 +62,11 @@ fn belief_and_plausibility_clamp_floating_point_drift() {
     // MassFunction::new accepts it (within SUM_TOLERANCE = 1e-9), but pre-#149
     // belief(theta) and plausibility(theta) would return 1.0000000000000002,
     // tripping the claims_{belief,plausibility}_bounds CHECK constraint.
-    let frame =
-        FrameOfDiscernment::new("five", vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()])
-            .unwrap();
+    let frame = FrameOfDiscernment::new(
+        "five",
+        vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+    )
+    .unwrap();
 
     // Pick 20 non-empty subsets out of 31 available.
     let subsets: Vec<BTreeSet<usize>> = vec![
@@ -118,7 +120,10 @@ fn belief_and_plausibility_clamp_floating_point_drift() {
     );
     // Clamp pins drifted-above-1.0 sums to exactly 1.0.
     assert_eq!(bel_theta, 1.0, "belief(Theta) not pinned to 1.0 by clamp");
-    assert_eq!(pl_theta, 1.0, "plausibility(Theta) not pinned to 1.0 by clamp");
+    assert_eq!(
+        pl_theta, 1.0,
+        "plausibility(Theta) not pinned to 1.0 by clamp"
+    );
 
     // And the singletons stay in [0,1] too — each singleton intersects ~half
     // the focal elements, so plausibility could drift past 1.0 the same way.
@@ -126,7 +131,10 @@ fn belief_and_plausibility_clamp_floating_point_drift() {
         let fe = FocalElement::positive(BTreeSet::from([i]));
         let b = belief(&m, &fe);
         let p = plausibility(&m, &fe);
-        assert!((0.0..=1.0).contains(&b), "belief({i}) escaped [0,1]: {b:.20e}");
+        assert!(
+            (0.0..=1.0).contains(&b),
+            "belief({i}) escaped [0,1]: {b:.20e}"
+        );
         assert!(
             (0.0..=1.0).contains(&p),
             "plausibility({i}) escaped [0,1]: {p:.20e}"
