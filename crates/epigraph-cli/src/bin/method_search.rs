@@ -50,6 +50,8 @@ async fn main() {
 /// Returns true if all gaps filled, false if gaps remain.
 async fn run(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
     let pool = epigraph_cli::db_connect().await?;
+    let embedder = epigraph_cli::embedding_service()
+        .ok_or("OPENAI_API_KEY not set — embeddings required for method_search ingestion")?;
 
     // 1. Load hypothesis
     let (statement,): (String,) = sqlx::query_as("SELECT content FROM claims WHERE id = $1")
@@ -197,11 +199,26 @@ Return 3-8 claims."#,
             let journal = claim.get("journal").and_then(|v| v.as_str());
             let year = claim.get("year").and_then(|v| v.as_i64());
 
+            // Embed inline (matches hypothesis.rs pattern; embedding policy requires
+            // is_current=true claims to have an embedding).
+            let embedding = embedder
+                .generate(content)
+                .await
+                .map_err(|e| format!("Embedding failed: {e}"))?;
+            let embedding_str = format!(
+                "[{}]",
+                embedding
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+
             // Insert claim
             let claim_id: (Uuid,) = sqlx::query_as(
                 r#"
-                INSERT INTO claims (content, content_hash, truth_value, labels, properties)
-                VALUES ($1, $2, $3, ARRAY['experimental', 'web_search'], $4)
+                INSERT INTO claims (content, content_hash, truth_value, labels, properties, embedding)
+                VALUES ($1, $2, $3, ARRAY['experimental', 'web_search'], $4, $5::vector)
                 RETURNING id
                 "#,
             )
@@ -215,6 +232,7 @@ Return 3-8 claims."#,
                 "year": year,
                 "protocol_parameters": claim.get("protocol_parameters"),
             }))
+            .bind(&embedding_str)
             .fetch_one(&pool)
             .await?;
 
