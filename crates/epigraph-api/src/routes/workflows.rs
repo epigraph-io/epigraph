@@ -228,6 +228,31 @@ pub async fn store_workflow(
                 message: format!("workflow ingest: {e}"),
             })?;
 
+    // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
+    // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
+    if let Some(embedder) = state.embedding_service() {
+        for (claim_id, content) in &result.inserted {
+            match embedder.generate(content).await {
+                Ok(embedding) => {
+                    let pgvector_str = format_embedding(&embedding);
+                    if let Err(e) = sqlx::query(
+                        "UPDATE claims SET embedding = $1::vector WHERE id = $2",
+                    )
+                    .bind(&pgvector_str)
+                    .bind(*claim_id)
+                    .execute(&state.db_pool)
+                    .await
+                    {
+                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for ingested workflow claim");
+                }
+            }
+        }
+    }
+
     // Emit event
     let _ = epigraph_db::EventRepository::insert(
         &state.db_pool,
@@ -1198,6 +1223,31 @@ pub async fn ingest_workflow(
             .map_err(|e| ApiError::InternalError {
                 message: format!("workflow ingest: {e}"),
             })?;
+
+    // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
+    // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
+    if let Some(embedder) = state.embedding_service() {
+        for (claim_id, content) in &result.inserted {
+            match embedder.generate(content).await {
+                Ok(embedding) => {
+                    let pgvector_str = format_embedding(&embedding);
+                    if let Err(e) = sqlx::query(
+                        "UPDATE claims SET embedding = $1::vector WHERE id = $2",
+                    )
+                    .bind(&pgvector_str)
+                    .bind(*claim_id)
+                    .execute(&state.db_pool)
+                    .await
+                    {
+                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for ingested workflow claim");
+                }
+            }
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "workflow_id": result.workflow_id,
