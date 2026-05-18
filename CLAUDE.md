@@ -67,3 +67,54 @@ DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo 
 - Feature branches, never land 3+ commits directly on `main`.
 - `gh pr merge --merge --delete-branch` by default; never `--squash`
   unless explicitly told.
+
+## Embedding policy
+
+**Invariant:** every claim with `is_current = true` should have an embedding;
+every claim with `is_current = false` should have `embedding = NULL`. Semantic
+recall (`recall()`, `recall_with_context()`, `theme_cluster`, `find_workflow`'s
+semantic path) reads from `embedding`, so violations either hide live claims
+or surface stale ones.
+
+### Write paths (must embed on insert)
+
+When adding a new code path that inserts a claim, embed inline post-commit,
+best-effort (warn on failure, never block the write). Current call-sites:
+
+- **MCP `submit_claim`** — `crates/epigraph-mcp/src/tools/claims.rs:217`
+- **MCP `memorize`** — `crates/epigraph-mcp/src/tools/memory.rs:103`
+- **MCP `batch_submit_claims`** — delegates to `submit_claim`
+- **MCP `ingest_document`** — `crates/epigraph-mcp/src/tools/ingestion.rs:321`
+- **MCP `workflow_ingest`** — embeds executor output; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
+- **MCP `store_workflow`** — embeds executor output via `execute_workflow_ingest_with_inserted`; `crates/epigraph-mcp/src/tools/workflows.rs::store_workflow`
+- **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some`
+- **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
+- **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs:1480`
+- **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
+
+`epigraph-ingest-executor` is pure-DB and does **not** embed itself; it returns
+`inserted: Vec<(Uuid, String)>` / `AddStepResult::inserted_content` so each
+caller embeds with its own configured embedder.
+
+### Cleanup paths (must null on `is_current = false`)
+
+When superseding or otherwise flipping `is_current` to false, null the
+embedding in the same transaction:
+
+- **`ClaimRepository::supersede`** — `crates/epigraph-db/src/repos/claim.rs:1401`
+- **`ClaimRepository::mark_duplicate`** — `crates/epigraph-db/src/repos/claim.rs:2076`
+
+If you add a third path that flips `is_current = false`, add the matching
+`UPDATE claims SET embedding = NULL WHERE id = $1` inside the same tx.
+
+### Auditing the gap
+
+```sql
+SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL) AS live_missing,
+       COUNT(*) FILTER (WHERE NOT is_current AND embedding IS NOT NULL) AS stale_present
+FROM claims;
+```
+
+Both should trend toward zero. `live_missing` growing means a write path is
+bypassing the embedder; `stale_present` growing means a cleanup path is
+missing the null. Track via `system_stats` if exposed; otherwise spot-check.
