@@ -2,9 +2,12 @@
 """Update the stored 'Run k-means theme maintenance' workflow steps to reflect
 the anchor-aware behaviour added by spec 2026-05-18-cross-source-anchor.
 
-Calls mcp__epigraph__evolve_step (via the HTTP API) on the affected step
-claims. Idempotent: skips steps whose current content already matches the
-new content.
+Supersedes each affected step claim via direct SQL: insert a new
+is_current row that points `supersedes` at the old id, then mark the old
+row is_current=false. Mirrors what mcp__epigraph__evolve_step would do
+but without an MCP round-trip — there is no Python evolve_step client.
+Idempotent: skips steps whose current content already matches the new
+content.
 
 Affected step IDs (verified 2026-05-18):
   - 4d9bf697-e53c-57ac-ad92-526c8e86f06a  (old: "Run hypothesize() with cluster_count=8 ...")
