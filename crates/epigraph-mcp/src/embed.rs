@@ -78,10 +78,15 @@ impl McpEmbedder {
         };
 
         let pgvec = format_pgvector(&embedding);
-        match epigraph_db::EvidenceRepository::store_embedding(&self.pool, claim_id.into(), &pgvec)
-            .await
-        {
-            Ok(_) => true,
+        match epigraph_db::ClaimRepository::store_embedding(&self.pool, claim_id, &pgvec).await {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(
+                    claim_id = %claim_id,
+                    "embedding store affected 0 rows (claim missing?)"
+                );
+                false
+            }
             Err(e) => {
                 tracing::warn!("embedding store failed: {e}");
                 false
@@ -149,13 +154,15 @@ impl EmbeddingService for McpEmbedder {
         Ok(results)
     }
 
-    /// Store an embedding for a claim via `EvidenceRepository::store_embedding`.
+    /// Store an embedding on `claims.embedding` via `ClaimRepository::store_embedding`.
     ///
-    /// `McpEmbedder` stores embeddings against *evidence* rows (keyed by claim).
-    /// Here we delegate to that path: format the vector, then call the DB method.
+    /// Per the embedding-policy contract in CLAUDE.md, the canonical storage
+    /// site for claim embeddings is `claims.embedding`. An earlier impl wrote
+    /// to `evidence.embedding` keyed by `claim_id`, which silently no-op'd
+    /// because evidence rows have their own ids.
     async fn store(&self, claim_id: uuid::Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
         let pgvec = format_pgvector(embedding);
-        epigraph_db::EvidenceRepository::store_embedding(&self.pool, claim_id.into(), &pgvec)
+        epigraph_db::ClaimRepository::store_embedding(&self.pool, claim_id, &pgvec)
             .await
             .map(|_| ())
             .map_err(|e| EmbeddingError::DatabaseError(e.to_string()))
