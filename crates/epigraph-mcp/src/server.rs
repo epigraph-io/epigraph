@@ -790,6 +790,20 @@ impl EpiGraphMcpFull {
         tools::sheaf::reconcile_sheaf(self, params).await
     }
 
+    // ── Embeddings (1 tool) ──
+
+    #[tool(
+        description = "Aggregate claim count + similarity stats for the embedding ball around a free-text query. Mirrors POST /api/v1/embeddings/neighborhood-density. Returns n_claims, mean/median cosine similarity, a squashed sparsity score, and breakdowns by level + source_type. Defaults: radius=0.30 (cosine distance), max_sample=500 (clamped to [1, 5000]). Use this to detect dense regions that warrant theme sub-splitting and to drive the nightly theme-maintenance workflow."
+    )]
+    async fn embedding_neighborhood_density(
+        &self,
+        Parameters(params): Parameters<
+            crate::tools::embeddings::EmbeddingNeighborhoodDensityParams,
+        >,
+    ) -> Result<CallToolResult, McpError> {
+        crate::tools::embeddings::embedding_neighborhood_density(self, params).await
+    }
+
     // ── Themes (1 tool) ──
 
     #[tool(

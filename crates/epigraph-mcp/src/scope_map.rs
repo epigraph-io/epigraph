@@ -25,6 +25,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // ─── claims:read ───────────────────────────────────────────────────
     ("check_sheaf_consistency", "claims:read"),
     ("compare_methods", "claims:read"),
+    ("embedding_neighborhood_density", "claims:read"),
     ("entity_neighborhood", "claims:read"),
     ("find_workflow", "claims:read"),
     ("find_workflow_hierarchical", "claims:read"),
