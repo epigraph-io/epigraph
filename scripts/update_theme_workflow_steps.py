@@ -2,12 +2,10 @@
 """Update the stored 'Run k-means theme maintenance' workflow steps to reflect
 the anchor-aware behaviour added by spec 2026-05-18-cross-source-anchor.
 
-Supersedes each affected step claim via direct SQL: insert a new
-is_current row that points `supersedes` at the old id, then mark the old
-row is_current=false. Mirrors what mcp__epigraph__evolve_step would do
-but without an MCP round-trip — there is no Python evolve_step client.
-Idempotent: skips steps whose current content already matches the new
-content.
+Uses POST /api/v1/workflows/steps/:id/evolve (the canonical evolve_step
+endpoint) so the supersession is captured by the same primitive
+mcp__epigraph__evolve_step uses internally. Idempotent: skips steps whose
+current content already matches the new content.
 
 Affected step IDs (verified 2026-05-18):
   - 4d9bf697-e53c-57ac-ad92-526c8e86f06a  (old: "Run hypothesize() with cluster_count=8 ...")
@@ -22,8 +20,11 @@ import sys
 
 import psycopg2
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _api_client import EpiGraphClient
+
 DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
+    "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
 )
 
 UPDATES = {
@@ -43,11 +44,14 @@ def main() -> int:
     args = ap.parse_args()
 
     conn = psycopg2.connect(args.database_url)
-    conn.autocommit = False
     cur = conn.cursor()
+    api = EpiGraphClient(scopes=["claims:write"])
 
     for step_id, new_content in UPDATES.items():
-        cur.execute("SELECT content FROM claims WHERE id = %s AND is_current = true", (step_id,))
+        cur.execute(
+            "SELECT content FROM claims WHERE id = %s AND is_current = true",
+            (step_id,),
+        )
         row = cur.fetchone()
         if not row:
             print(f"[skip] {step_id}: not found")
@@ -59,18 +63,19 @@ def main() -> int:
         print(f"[update] {step_id}")
         if args.dry_run:
             continue
-        # Mark current as superseded; insert new current with same lineage.
-        # We don't have a Python evolve_step helper, so do it inline:
-        cur.execute(
-            "INSERT INTO claims (content, content_hash, agent_id, properties, supersedes, is_current) "
-            "SELECT %s, decode(md5(%s) || md5(%s), 'hex'), agent_id, properties, %s, true "
-            "FROM claims WHERE id = %s RETURNING id",
-            (new_content, new_content, new_content, step_id, step_id),
+        resp = api.post(
+            f"/api/v1/workflows/steps/{step_id}/evolve",
+            json={
+                "parent_id": step_id,
+                "content": new_content,
+                "edge_type": "supersedes",
+                "reason": "anchor-aware rewrite per spec 2026-05-18-cross-source-anchor",
+                "level": 2,
+            },
         )
-        new_id = cur.fetchone()[0]
-        cur.execute("UPDATE claims SET is_current = false WHERE id = %s", (step_id,))
-        conn.commit()
-        print(f"  -> {new_id}")
+        resp.raise_for_status()
+        body = resp.json()
+        print(f"  -> {body['claim_id']} (edge {body['edge_type']} {body['edge_id']})")
 
     return 0
 
