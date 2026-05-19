@@ -111,10 +111,9 @@ everywhere. Three seed strategies are in use today:
   The same string always produces the same agent across processes,
   so the get-or-create lookup is idempotent. Container restart, fresh
   deploy, parallel host — all the same agent UUID.
-- **LLM-driven agents (planned)** — the seed is a hash of
-  `(model identifier, system prompt)` so the same model+prompt pair
-  resolves to the same agent identity across sessions
-  (see user-memory `project_epigraph_agent_identity.md`).
+- **LLM-driven agents (planned, tracked in [issue #166](https://github.com/epigraph-io/epigraph/issues/166))** —
+  the seed is a hash of `(model identifier, system prompt)` so the same
+  model+prompt pair resolves to the same agent identity across sessions.
   User OAuth passthrough sits next on that roadmap, so writes
   attributed to "Claude with prompt X acting for Jeremy" can be
   distinguished from "Claude with prompt X acting for Carrie".
