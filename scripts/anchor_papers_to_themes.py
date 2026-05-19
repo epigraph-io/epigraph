@@ -37,6 +37,9 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _api_client import EpiGraphClient
+
 DEFAULT_DATABASE_URL = (
     "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
 )
@@ -173,38 +176,51 @@ def judge_via_claude(paper_text: str, label: str, description: str) -> dict:
     return parsed
 
 
-def insert_instantiates_edge(conn, source_id: str, target_id: str,
+def insert_instantiates_edge(api: EpiGraphClient, source_id: str, target_id: str,
                              confidence: float, anchor_label: str) -> None:
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO edges (source_id, target_id, source_type, target_type, "
-        "                   relationship, properties) "
-        "VALUES (%s, %s, 'claim', 'claim', 'INSTANTIATES', %s::jsonb) "
-        "ON CONFLICT DO NOTHING",
-        (source_id, target_id,
-         json.dumps({
-             "confidence": confidence,
-             "anchor_label": anchor_label,
-             "judge_model": JUDGE_MODEL,
-             "created_at": datetime.now(timezone.utc).isoformat(),
-         })),
+    """POST /api/v1/edges creating an INSTANTIATES edge."""
+    resp = api.post(
+        "/api/v1/edges",
+        json={
+            "source_id": source_id,
+            "target_id": target_id,
+            "source_type": "claim",
+            "target_type": "claim",
+            "relationship": "INSTANTIATES",
+            "properties": {
+                "confidence": confidence,
+                "anchor_label": anchor_label,
+                "judge_model": JUDGE_MODEL,
+            },
+            "if_not_exists": True,  # idempotent for re-runs
+        },
     )
+    # 200 (existing) or 201 (created) both fine; 4xx/5xx raise.
+    if resp.status_code >= 400:
+        resp.raise_for_status()
 
 
+# BACKLOG: No explicit-assign API endpoint exists. POST /api/v1/themes/reassign
+# auto-decides based on embedding distance — it can't be told to use the LLM
+# judge's choice. Until POST /api/v1/themes/:id/assign-claims is added,
+# this script uses raw SQL for primary theme assignment. Per
+# feedback_no_raw_sql.md, the missing endpoint should be filed as a feature
+# request. See spec 2026-05-18-cross-source-anchor §3.
 def set_primary_theme(conn, claim_id: str, theme_id: str) -> None:
     cur = conn.cursor()
     cur.execute("UPDATE claims SET theme_id = %s WHERE id = %s", (theme_id, claim_id))
 
 
-def mark_anchored(conn, claim_id: str) -> None:
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE claims SET properties = properties || %s::jsonb WHERE id = %s",
-        (json.dumps({"anchored_at": datetime.now(timezone.utc).isoformat()}), claim_id),
+def mark_anchored(api: EpiGraphClient, claim_id: str) -> None:
+    """PATCH /api/v1/claims/:id merging anchored_at into properties."""
+    resp = api.patch(
+        f"/api/v1/claims/{claim_id}",
+        json={"properties": {"anchored_at": datetime.now(timezone.utc).isoformat()}},
     )
+    resp.raise_for_status()
 
 
-def anchor_one(conn, claim: dict, layer: str, top_k: int, min_sim: float,
+def anchor_one(conn, api: EpiGraphClient, claim: dict, layer: str, top_k: int, min_sim: float,
                maybe_threshold: float, dry_run: bool) -> None:
     cid = str(claim["id"])
     content = claim["content"] or ""
@@ -221,8 +237,7 @@ def anchor_one(conn, claim: dict, layer: str, top_k: int, min_sim: float,
     if not targets:
         print(f"[noshort] {cid} :: {content[:60]}")
         if not dry_run:
-            mark_anchored(conn, cid)
-            conn.commit()
+            mark_anchored(api, cid)
         return
 
     verdicts: list[tuple[str, dict, dict]] = []
@@ -241,8 +256,7 @@ def anchor_one(conn, claim: dict, layer: str, top_k: int, min_sim: float,
     if not yes_or_strong_maybe:
         print(f"[noanchor] {cid} :: {content[:60]}")
         if not dry_run:
-            mark_anchored(conn, cid)
-            conn.commit()
+            mark_anchored(api, cid)
         return
 
     yes_or_strong_maybe.sort(key=lambda t: float(t[2].get("confidence", 0)), reverse=True)
@@ -257,14 +271,17 @@ def anchor_one(conn, claim: dict, layer: str, top_k: int, min_sim: float,
 
     # Primary: textbook theme → theme_id; review L2 → INSTANTIATES only (no theme_id flip).
     if primary_layer == "textbook":
+        # set_primary_theme stays raw SQL (see BACKLOG comment); commit the tx
+        # so the theme_id UPDATE persists.
         set_primary_theme(conn, cid, primary_cand["id"])
+        conn.commit()
         textbook_l1 = primary_cand["source_textbook_claim_id"]
         if textbook_l1:
-            insert_instantiates_edge(conn, cid, textbook_l1,
+            insert_instantiates_edge(api, cid, textbook_l1,
                                      float(primary_verdict.get("confidence", 0.5)),
                                      primary_verdict.get("refined_anchor_label", primary_cand["label"]))
     else:
-        insert_instantiates_edge(conn, cid, primary_cand["id"],
+        insert_instantiates_edge(api, cid, primary_cand["id"],
                                  float(primary_verdict.get("confidence", 0.5)),
                                  primary_verdict.get("refined_anchor_label", primary_cand["label"]))
 
@@ -273,12 +290,11 @@ def anchor_one(conn, claim: dict, layer: str, top_k: int, min_sim: float,
         target_id = cand["source_textbook_claim_id"] if layer_name == "textbook" else cand["id"]
         if not target_id:
             continue
-        insert_instantiates_edge(conn, cid, target_id,
+        insert_instantiates_edge(api, cid, target_id,
                                  float(v.get("confidence", 0.5)),
                                  v.get("refined_anchor_label", cand["label"]))
 
-    mark_anchored(conn, cid)
-    conn.commit()
+    mark_anchored(api, cid)
 
 
 def main() -> int:
@@ -296,12 +312,17 @@ def main() -> int:
     conn = psycopg2.connect(args.database_url)
     conn.autocommit = False
 
+    # API client for edge POST + claim PATCH. `claims:write` covers the
+    # anchored_at PATCH; `edges:write` covers INSTANTIATES edge creation;
+    # `claims:admin` left in for future theme-assign endpoint convergence.
+    api = EpiGraphClient(scopes=["claims:write", "edges:write", "claims:admin"])
+
     claims = fetch_paper_claims(conn, args.layer, args.level, args.limit)
     print(f"Anchoring {len(claims)} paper L{args.level} claims (layer={args.layer}).")
 
     for c in claims:
         try:
-            anchor_one(conn, c, args.layer, args.top_k, args.min_sim,
+            anchor_one(conn, api, c, args.layer, args.top_k, args.min_sim,
                        args.maybe_threshold, args.dry_run)
         except Exception as e:
             print(f"[fatal] {c['id']}: {e}", file=sys.stderr)
