@@ -238,6 +238,7 @@ async fn find_workflow_hierarchical_frozen_by_default(pool: PgPool) {
             query: "versioning probe".to_string(),
             limit: Some(5),
             resolve_to_latest: None,
+            min_truth: None,
         },
     )
     .await
@@ -350,6 +351,7 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
             query: "resolve_to_latest target".to_string(),
             limit: Some(5),
             resolve_to_latest: Some(true),
+            min_truth: None,
         },
     )
     .await
@@ -392,4 +394,156 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     );
 
     assert_eq!(body["resolve_to_latest"], serde_json::json!(true));
+}
+
+// ── Bug 1 (claim a73dee60): canonical_name-with-hyphens divergence ──────
+//
+// Repro for the norcal-rfp-monitor failure on 2026-05-19: a query string
+// containing spaces ("scan norcal rfps") only substring-matched gen-0's
+// goal verbatim. Later generations (gen-4/5/6) had differentiated goals
+// that no longer contained the gen-0 phrase, yet their canonical_name
+// slug (`scan-norcal-rfps`) still represents the lineage. Before the
+// hyphen-normalized concat, those rows were invisible to the tool even
+// though they were the rows callers actually wanted.
+//
+// This test seeds the exact divergence shape (slug constant, goals
+// diverge) and asserts both rows return. With the old `goal ILIKE $1 OR
+// canonical_name ILIKE $1` form, only the gen-0 row would surface
+// because spaces never match hyphens in either column.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_workflow_hierarchical_matches_canonical_name_across_diverged_goals(pool: PgPool) {
+    let server = build_server(pool.clone());
+
+    let gen0 = Uuid::new_v4();
+    let gen4 = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, generation, goal, parent_id, metadata, created_at) \
+         VALUES \
+           ($1, 'scan-norcal-architecture-rfps', 0, \
+                'Scan NorCal architecture RFPs and send email notification', \
+                NULL, '{}', NOW()), \
+           ($2, 'scan-norcal-architecture-rfps', 4, \
+                'Scan via direct query-string GETs over aggregators with form-fill', \
+                NULL, '{}', NOW())",
+    )
+    .bind(gen0)
+    .bind(gen4)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The query is the gen-0 goal phrase verbatim. Gen-4's goal does NOT
+    // contain it. The slug (with hyphens) does NOT contain it either.
+    // Only the hyphen-normalized `(replace(canonical_name,'-',' ') || ' '
+    // || goal)` concat surfaces gen-4.
+    let result = find_workflow_hierarchical(
+        &server,
+        FindWorkflowHierarchicalParams {
+            query: "scan norcal architecture rfps".to_string(),
+            limit: Some(10),
+            resolve_to_latest: None,
+            min_truth: Some(0.0),
+        },
+    )
+    .await
+    .expect("find_workflow_hierarchical");
+
+    let body = parse_body(&result);
+    let workflows = body["workflows"].as_array().expect("workflows array");
+    let found_ids: std::collections::HashSet<String> = workflows
+        .iter()
+        .filter_map(|w| w["workflow_id"].as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        found_ids.contains(&gen0.to_string()),
+        "gen-0 (verbatim goal match) must return; got ids {found_ids:?}"
+    );
+    assert!(
+        found_ids.contains(&gen4.to_string()),
+        "gen-4 (canonical_name slug match only) must return; got ids {found_ids:?}. \
+         This regresses without hyphen normalization of canonical_name."
+    );
+}
+
+// ── Bug 2 (claim a73dee60): deprecation must filter via min_truth ──────
+//
+// `deprecate_workflow` writes `truth_value = 0.05`. Before this fix, the
+// `workflows` table had no truth_value column, so the deprecation was
+// invisible to `find_workflow_hierarchical` (it only touched `claims`).
+// Repro: gen-3 of the norcal monitor was deprecated 2026-05-19 16:48 UTC
+// yet kept appearing.
+//
+// This test seeds two rows under the same canonical_name with different
+// truth_values directly (we test the filter, not the cascade — the
+// cascade has its own coverage in tests/deprecate_workflow_is_current_test.rs).
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_workflow_hierarchical_filters_deprecated_via_min_truth(pool: PgPool) {
+    let server = build_server(pool.clone());
+
+    let live_id = Uuid::new_v4();
+    let dead_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value) \
+         VALUES \
+           ($1, 'rfp-monitor-test', 4, 'live differentiated goal', NULL, '{}', NOW(), 1.0), \
+           ($2, 'rfp-monitor-test', 3, 'deprecated older goal',    NULL, '{}', NOW(), 0.05)",
+    )
+    .bind(live_id)
+    .bind(dead_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Default min_truth (0.3) → only the live row.
+    let default_result = find_workflow_hierarchical(
+        &server,
+        FindWorkflowHierarchicalParams {
+            query: "rfp monitor test".to_string(),
+            limit: Some(10),
+            resolve_to_latest: None,
+            min_truth: None,
+        },
+    )
+    .await
+    .expect("default min_truth");
+    let body = parse_body(&default_result);
+    let ids: std::collections::HashSet<String> = body["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["workflow_id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        ids.contains(&live_id.to_string()),
+        "live (truth=1.0) row must surface under default min_truth=0.3"
+    );
+    assert!(
+        !ids.contains(&dead_id.to_string()),
+        "deprecated (truth=0.05) row must NOT surface under default min_truth=0.3; got {ids:?}"
+    );
+
+    // min_truth=0.0 → both rows (caller opts into the cemetery).
+    let all_result = find_workflow_hierarchical(
+        &server,
+        FindWorkflowHierarchicalParams {
+            query: "rfp monitor test".to_string(),
+            limit: Some(10),
+            resolve_to_latest: None,
+            min_truth: Some(0.0),
+        },
+    )
+    .await
+    .expect("min_truth=0.0");
+    let body = parse_body(&all_result);
+    let ids: std::collections::HashSet<String> = body["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["workflow_id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        ids.contains(&live_id.to_string()) && ids.contains(&dead_id.to_string()),
+        "min_truth=0.0 must include both live and deprecated; got {ids:?}"
+    );
 }

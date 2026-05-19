@@ -372,7 +372,7 @@ pub struct ImproveWorkflowHierarchyParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindWorkflowHierarchicalParams {
     #[schemars(
-        description = "Free-text search over hierarchical workflow goal and canonical_name (ILIKE)."
+        description = "Free-text search over hierarchical workflow goal and canonical_name (ILIKE). The canonical_name slug is hyphen-normalized to spaces before matching so a goal-text query still matches the slug across generations whose goals have diverged from the lineage's canonical phrase."
     )]
     pub query: String,
 
@@ -380,9 +380,14 @@ pub struct FindWorkflowHierarchicalParams {
     pub limit: Option<i64>,
 
     #[schemars(
-        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`. Defaults to false (frozen step references)."
+        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`, and order results by (canonical_name ASC, generation DESC) so the newest variant per lineage is first. Defaults to false (frozen step references, newest-created-at first)."
     )]
     pub resolve_to_latest: Option<bool>,
+
+    #[schemars(
+        description = "Minimum truth value to surface; defaults to 0.3 so deprecated rows (truth=0.05 via deprecate_workflow) are hidden. Pass 0.0 to include deprecated workflows."
+    )]
+    pub min_truth: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
