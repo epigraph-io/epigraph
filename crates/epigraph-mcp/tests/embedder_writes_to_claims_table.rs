@@ -33,12 +33,11 @@ async fn mcp_embedder_store_writes_to_claims_embedding(pool: PgPool) {
          the storage target is `claims`, not `evidence` (see CLAUDE.md embedding policy)"
     );
 
-    let evidence_row_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM evidence WHERE id = $1")
-            .bind(claim_id)
-            .fetch_one(&pool)
-            .await
-            .expect("query evidence");
+    let evidence_row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM evidence WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("query evidence");
     assert_eq!(
         evidence_row_count, 0,
         "no evidence row should exist at id = claim_id; if this fails the schema \
