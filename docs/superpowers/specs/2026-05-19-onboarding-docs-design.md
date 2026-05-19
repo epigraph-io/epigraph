@@ -9,7 +9,7 @@
 
 ## 1. Problem
 
-EpiGraph and Episcience have no top-level READMEs and no entry-point documentation for new users. A fresh clone of either repo is opaque: a Rust workspace with 17 (epigraph) or 3 (episcience) crates, 34 (epigraph) or 11 (episcience) migrations, no instructions for getting from "I have the source" to "I successfully called my first MCP tool."
+EpiGraph and Episcience have no top-level READMEs and no entry-point documentation for new users. A fresh clone of either repo is opaque: a Rust workspace with 17 (epigraph) or 3 (episcience) crates, 32 (epigraph) or 11 (episcience) migrations, no instructions for getting from "I have the source" to "I successfully called my first MCP tool."
 
 New collaborators — including future contributors, downstream-app builders (WRHQ, Praxis, NDI tooling), and Astera-style residency reviewers — currently rely on synchronous onboarding from Jeremy. The cost grows with each new person and effectively caps how widely the system can be adopted.
 
@@ -82,7 +82,7 @@ Sections in order:
 1. **What is EpiGraph?** Two paragraphs. EpiGraph is an epistemic kernel: claims (nouns), edges (verbs), agents that sign their assertions, beliefs propagated via Dempster-Shafer. It replaces static papers with a live experimental loop — hypothesis → experiment → data → analysis → belief update.
 2. **Who is this for?** Bulleted: devs building epistemic apps; researchers querying the graph via Claude Code; contributors extending the kernel.
 3. **Status & license.** Apache-2.0, version 0.3.0, "alpha — kernel stable, layers iterate."
-4. **5-minute quickstart** (inline, ~10 commands): clone, start Postgres (`postgres://epigraph:epigraph@localhost`), `cargo build --release -p epigraph-api -p epigraph-mcp`, `cargo run --bin epigraph-migrate`, start the API, register the MCP server in `~/.mcp.json` (show the exact config), open Claude Code, call `recall_with_context "test"`. End-state: a JSON response showing the empty corpus or hitting the user's first claim.
+4. **5-minute quickstart** (inline, ~10 commands): clone, start Postgres (`postgres://epigraph:epigraph@localhost`), `cargo build --release -p epigraph-api -p epigraph-mcp`, `cargo run --bin epigraph-migrate`, start the API, register the MCP server in `~/.mcp.json` (show the exact config, with binary name `epigraph-mcp-full`), open Claude Code, call `recall_with_context "test"`. End-state: a JSON response showing the empty corpus or hitting the user's first claim.
 5. **Where to next.** Linked TOC into `docs/intro/`, plus a "Deeper material" section pointing to `docs/architecture/noun-claims-and-verb-edges.md`, `docs/deploy.md`, `CLAUDE.md` (for agents), and `scripts/README.md`.
 
 ### 6.2 EpiGraph `docs/intro/01-quickstart.md` (~200 lines)
@@ -90,11 +90,11 @@ Sections in order:
 A robust expansion of the README's 5-minute version, with:
 
 - **Prereqs** explicit: Rust ≥1.75, PostgreSQL 16+ with the `vector` extension installed, Claude Code installed, ~$5 OpenAI credit for embeddings (set `OPENAI_API_KEY`).
-- **Step 1: PostgreSQL.** Install, create role `epigraph` with password `epigraph` and `SUPERUSER` (required for sqlx-test per memory `feedback_sqlx_test_uses_superuser`), create database `epigraph`, `CREATE EXTENSION vector;`.
-- **Step 2: Clone and build.** `git clone … && cd epigraph && cargo build --release -p epigraph-api -p epigraph-mcp -p epigraph-cli`.
+- **Step 1: PostgreSQL.** Install, create role `epigraph` with password `epigraph` (no `SUPERUSER` needed for runtime use), create database `epigraph`, `CREATE EXTENSION vector;`. Add a footnote: running the test suite under `sqlx::test` additionally requires `SUPERUSER` because it `LOCK`s `pg_namespace` (memory `feedback_sqlx_test_uses_superuser`); grant it temporarily or use a separate test-only superuser role.
+- **Step 2: Clone and build.** `git clone … && cd epigraph && cargo build --release -p epigraph-api -p epigraph-mcp -p epigraph-cli`. Note that the `epigraph-mcp` package produces a binary named `epigraph-mcp-full` (see `crates/epigraph-mcp/Cargo.toml`).
 - **Step 3: Migrations.** `cargo run --release --bin epigraph-migrate`. Document the 2026-05-05 reconcile script as a "first-time-on-pre-existing-prod-data" footnote pointing to `docs/deploy.md`; not required for fresh installs.
-- **Step 4: Start the API.** `cargo run --release -p epigraph-api --bin server`. Verify with `curl http://127.0.0.1:8080/healthz`.
-- **Step 5: Install the MCP server.** Two options: (a) `sudo cp target/release/epigraph-mcp /usr/local/bin/` (matches `/home/jeremy/.mcp.json`); (b) `cargo install --path crates/epigraph-mcp` for users without `/usr/local/bin` write access. Show the exact `~/.mcp.json` block to add.
+- **Step 4: Start the API.** `cargo run --release -p epigraph-api --bin server`. Verify with `curl http://127.0.0.1:8080/health`.
+- **Step 5: Install the MCP server.** Two options: (a) `sudo cp target/release/epigraph-mcp-full /usr/local/bin/epigraph-mcp` (rename to match `/home/jeremy/.mcp.json`) — or leave the binary name as-is and update the `~/.mcp.json` `command` to `/usr/local/bin/epigraph-mcp-full`; (b) `cargo install --path crates/epigraph-mcp` for users without `/usr/local/bin` write access (installed name will still be `epigraph-mcp-full`). Show the exact `~/.mcp.json` block to add for each option.
 - **Step 6: First MCP call.** Open Claude Code in any directory, ask "use the recall tool to search for 'test'", expect a JSON `recall_with_context` response with empty results. Then ask Claude to "submit a claim that 'EpiGraph is installed correctly'" and observe the submitted-claim ID.
 - **Common errors.** Tabular: `sqlx checksum mismatch` → see deploy.md; `connection refused on 5432` → start Postgres; `extension "vector" is not available` → install pgvector; `OPENAI_API_KEY not set` → export it.
 - **Tear-down.** `dropdb epigraph` if reinstalling.
@@ -138,17 +138,17 @@ Four short sections, each one paragraph plus links:
 1. **What is episcience?** One paragraph. Apache-2.0 layer over EpiGraph that adds the experimental loop: samples, protocols, blobs, countersignatures, synthesis claims. Where EpiGraph models *what is believed*, episcience models *how beliefs were tested*.
 2. **Status & license.** Apache-2.0, version 0.1.0, "alpha — Phase 0 prereqs pinned to a specific epigraph rev per `Cargo.toml`."
 3. **Prerequisites.** A running EpiGraph kernel (link to its README quickstart). Same Postgres instance is fine.
-4. **5-minute extension quickstart** (inline, ~5 commands): clone, apply episcience migrations on top of the kernel DB, `cargo build --release -p episcience-api`, start it, verify with a sample synthesis-claim submission.
+4. **5-minute extension quickstart** (inline, ~5 commands): clone, apply episcience migrations on top of the kernel DB using `sqlx migrate run`, `cargo build --release -p episcience-api`, start `episcience-server`, verify with a sample synthesis-claim submission via the `synthesize` MCP tool.
 5. **TOC** into `docs/intro/` plus a "Why a separate repo?" note (the public Apache-2.0 layer separation, per memory `project_episcience_license.md`).
 
 ### 6.8 Episcience `docs/intro/01-quickstart-extension.md` (~150 lines)
 
 - **Prereq.** EpiGraph quickstart completed; `epigraph` DB exists and migrations are applied; API is running.
-- **Step 1.** Clone episcience. Local path overrides for development if also hacking on the kernel (the `[patch."https://github.com/epigraph-io/epigraph"]` block from existing `Cargo.toml` comments).
-- **Step 2.** Apply episcience migrations against the `epigraph` DB: `cd episcience && cargo run --release -p episcience-api --bin episcience-migrate` (or `sqlx migrate run` against `migrations/`). Note ordering: must run after kernel migrations 040-043 are applied (already true if EpiGraph quickstart was followed).
-- **Step 3.** Build and start `episcience-api` on a separate port from `epigraph-api`. Verify `/healthz`.
-- **Step 4.** Submit a sample-bound synthesis claim via curl or MCP; observe it propagate to the EpiGraph kernel as a noun-claim with the synthesis entity type.
-- **Common errors.** Migration order violations; missing kernel functions (`cascade_delete_edges`, `validate_edge_reference`); port collision with `epigraph-api`.
+- **Step 1.** Clone episcience. Local path overrides for development if also hacking on the kernel: add the `[patch."https://github.com/epigraph-io/epigraph"]` block to `~/.cargo/config.toml` (NOT to the workspace `Cargo.toml`), as documented in the existing `Cargo.toml` comments. The comment explicitly says "Don't commit personal patches."
+- **Step 2.** Apply episcience migrations against the `epigraph` DB using the sqlx CLI: `cd episcience && sqlx migrate run --source migrations/ --database-url postgres://epigraph:epigraph@localhost/epigraph`. There is no `episcience-migrate` binary today; the server explicitly skips embedded migrations (see `crates/episcience-api/src/bin/episcience-server.rs`). Migrations must run after the EpiGraph kernel schema is applied (current kernel migrations through `032_claim_themes_properties.sql`); episcience depends on kernel functions like `cascade_delete_edges` and `validate_edge_reference`, which exist from kernel migrations 024-025 onward.
+- **Step 3.** Build and start `episcience-server` on a separate port from `epigraph-api`. Verify `/health` on that port.
+- **Step 4.** Submit a sample-bound synthesis claim via curl or the `episcience-mcp-server` MCP tool `synthesize`; observe it propagate to the EpiGraph kernel as a noun-claim with the synthesis entity type.
+- **Common errors.** Missing sqlx CLI (`cargo install sqlx-cli --no-default-features --features postgres,native-tls`); migration order violations (running episcience migrations against a DB without the EpiGraph kernel schema); missing kernel functions (`cascade_delete_edges`, `validate_edge_reference`) — symptom is a CREATE TRIGGER or REFERENCES failure mid-migration; port collision with `epigraph-api`.
 
 ### 6.9 Episcience `docs/intro/02-concepts-science.md` (~300 lines)
 
@@ -162,10 +162,11 @@ Six sub-sections, each 40-60 lines:
 
 ### 6.10 Episcience `docs/intro/03-walkthroughs.md` (~300 lines)
 
-Three transcripts:
-- **Walk 1: Run a single experiment.** Register a protocol, create a sample, run an experiment, file the result as a claim with `samples` and `protocols` references.
-- **Walk 2: Countersign.** Take Walk 1's result; produce a countersignature from a second agent identity; observe the chain.
-- **Walk 3: Synthesize.** Take three experiment-result claims; produce a synthesis claim that PROV-O-derives from them; observe the resulting node and edges in the kernel.
+Three transcripts. (Note: there is no `experiments` route or table in episcience today; the surface exposed is samples, protocols, blobs, syntheses, countersignatures, and the `synthesize` / `recall_synthesis` / `get_synthesis` / `list_syntheses` MCP tools. Walkthroughs use only what's actually implemented.)
+
+- **Walk 1: Stage and synthesize.** Create a sample (`POST /samples`), register a protocol (`POST /protocols`), then call the `synthesize` MCP tool to produce a synthesis claim that references the sample and protocol IDs. Observe the resulting EpiGraph noun-claim with the synthesis entity type.
+- **Walk 2: Countersign.** Take Walk 1's synthesis claim; produce a countersignature from a second agent identity via the `countersign` route; observe the chain.
+- **Walk 3: Multi-source synthesis.** Create three independent samples; produce three separate synthesis claims; then call `synthesize` to produce a higher-level synthesis that PROV-O-derives from the three; observe the resulting node and edges in the kernel via `recall_synthesis` and `get_synthesis`.
 
 ### 6.11 Episcience `docs/intro/04-glossary.md` (~60 lines)
 
