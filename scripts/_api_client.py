@@ -32,6 +32,11 @@ import requests
 
 DEFAULT_API_BASE = "http://127.0.0.1:8080"
 DEFAULT_JWT_SECRET = "epigraph-dev-secret-change-in-production!!"
+# provenance_log.principal_id has an FK to oauth_clients(id), so the JWT
+# `sub` (= auth.client_id = recorded principal_id) must be a real client row.
+# Default to the existing `epigraph-admin` service client (has claims:admin
+# + all needed scopes granted). Override via EPIGRAPH_CLIENT_ID env var.
+DEFAULT_CLIENT_ID = "5997f752-5d79-48bc-b876-cb77498066a6"
 
 
 def mint_bearer_token(
@@ -48,11 +53,17 @@ def mint_bearer_token(
       claims: {sub, iss="epigraph", aud="epigraph-api", exp, iat, nbf, jti,
                scopes, client_type, owner_id?, agent_id?}
       algorithm: HS256
+
+    `sub` defaults to the epigraph-admin oauth_clients row (via
+    EPIGRAPH_CLIENT_ID env var or DEFAULT_CLIENT_ID) so the provenance FK
+    is satisfied. A random `sub` would 500 on every write.
     """
     secret = os.environ.get("EPIGRAPH_JWT_SECRET", DEFAULT_JWT_SECRET)
+    if client_id is None:
+        client_id = uuid.UUID(os.environ.get("EPIGRAPH_CLIENT_ID", DEFAULT_CLIENT_ID))
     now = int(time.time())
     claims: dict[str, Any] = {
-        "sub": str(client_id or uuid.uuid4()),
+        "sub": str(client_id),
         "iss": "epigraph",
         "aud": "epigraph-api",
         "exp": now + ttl_seconds,
