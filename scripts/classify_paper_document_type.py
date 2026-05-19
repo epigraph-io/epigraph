@@ -131,10 +131,11 @@ def main() -> int:
     conn.autocommit = False
 
     # Initialize API client for PATCH writes (requires claims:write scope for bearer auth).
-    # claims:admin required because patch_claim's auth gate is
-    # require_owner_or_admin and the anonymous JWT here never matches the
-    # original claim owner.
-    api = EpiGraphClient(scopes=["claims:admin"])
+    # Both claims:write (check_scopes gate) and claims:admin (owner_or_admin
+    # gate) are required because patch_claim runs them sequentially with no
+    # scope hierarchy, and the anonymous JWT here never matches the original
+    # claim owner.
+    api = EpiGraphClient(scopes=["claims:write", "claims:admin"])
 
     papers = fetch_paper_l0_claims(conn, args.limit)
     if not papers:
@@ -156,7 +157,11 @@ def main() -> int:
         reason = result.get("reason", "")
         print(f"[{dt:8s} conf={conf:.2f}] {claim_id} :: {title[:80]}")
         if not args.dry_run:
-            patch_claim(api, claim_id, dt, conf, reason)
+            try:
+                patch_claim(api, claim_id, dt, conf, reason)
+            except Exception as e:
+                print(f"[patch-err] {claim_id}: {e}", file=sys.stderr)
+                continue
     return 0
 
 
