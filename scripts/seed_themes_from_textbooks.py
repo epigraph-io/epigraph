@@ -49,6 +49,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -223,6 +224,47 @@ def drop_auto_themes(conn) -> int:
     return len(cur.fetchall())
 
 
+def seed_one(section: dict, args: argparse.Namespace) -> dict:
+    """Worker for one textbook L1 section.
+
+    Opens its own psycopg2 connection (psycopg2 connections are not
+    thread-safe). Catches exceptions and returns a status dict so the
+    main thread can report them without losing parallel progress.
+    """
+    sid = str(section["id"])
+    content = section["content"] or ""
+    conn = psycopg2.connect(args.database_url)
+    conn.autocommit = False
+    try:
+        descendants = fetch_descendant_ids(conn, sid)
+        emb_1536 = mean_vector(fetch_embeddings(conn, descendants, 1536))
+        emb_3072 = mean_vector(fetch_embeddings(conn, descendants, 3072))
+        if not emb_1536 and not emb_3072:
+            return {"status": "skip", "sid": sid, "reason": "no descendants with embeddings"}
+        atoms = fetch_sample_atoms(conn, sid)
+        try:
+            label_obj = label_via_claude(content, atoms)
+        except Exception as e:
+            return {"status": "err", "sid": sid, "error": str(e)}
+        label = label_obj["label"]
+        description = label_obj["description"]
+        if args.dry_run:
+            return {"status": "dry", "sid": sid, "label": label}
+        theme_id = insert_theme(conn, label, description, emb_1536, emb_3072, sid)
+        n_assigned = assign_theme(conn, theme_id, descendants)
+        update_theme_count(conn, theme_id)
+        conn.commit()
+        return {
+            "status": "ok",
+            "sid": sid,
+            "label": label,
+            "theme_id": theme_id,
+            "n_assigned": n_assigned,
+        }
+    finally:
+        conn.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--database-url", default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL))
@@ -230,62 +272,64 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--drop-auto-after", action="store_true",
                     help="DELETE existing auto-NN themes after seeding completes (frees their 500 claim assignments).")
+    ap.add_argument("--concurrency", type=int, default=8,
+                    help="Number of parallel worker threads (default 8).")
     args = ap.parse_args()
 
-    conn = psycopg2.connect(args.database_url)
-    conn.autocommit = False
+    # Main-thread connection: used only for the initial section list and the
+    # final --drop-auto-after audit. Each worker opens its own connection.
+    main_conn = psycopg2.connect(args.database_url)
+    main_conn.autocommit = False
 
-    sections = fetch_textbook_l1_claims(conn, args.limit)
+    sections = fetch_textbook_l1_claims(main_conn, args.limit)
     if not sections:
         print("No unprocessed textbook L1 sections found.")
     else:
-        print(f"Found {len(sections)} textbook L1 sections to seed.")
+        print(f"Found {len(sections)} textbook L1 sections to seed. "
+              f"Concurrency: {args.concurrency}")
 
     n_created = 0
     n_skipped = 0
-    for s in sections:
-        sid = str(s["id"])
-        content = s["content"] or ""
-        descendants = fetch_descendant_ids(conn, sid)
-        emb_1536 = mean_vector(fetch_embeddings(conn, descendants, 1536))
-        emb_3072 = mean_vector(fetch_embeddings(conn, descendants, 3072))
-        if not emb_1536 and not emb_3072:
-            print(f"[skip] {sid}: no descendants with embeddings")
-            n_skipped += 1
-            continue
-        atoms = fetch_sample_atoms(conn, sid)
-        try:
-            label_obj = label_via_claude(content, atoms)
-        except Exception as e:
-            print(f"[err] {sid}: {e}", file=sys.stderr)
-            continue
-        label = label_obj["label"]
-        description = label_obj["description"]
-        print(f"[seed] {sid} :: {label}")
-        if args.dry_run:
-            n_created += 1
-            continue
-        theme_id = insert_theme(conn, label, description, emb_1536, emb_3072, sid)
-        n_assigned = assign_theme(conn, theme_id, descendants)
-        update_theme_count(conn, theme_id)
-        conn.commit()
-        print(f"       theme_id={theme_id} assigned {n_assigned} claims")
-        n_created += 1
+    n_err = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+        futures = {ex.submit(seed_one, s, args): s for s in sections}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                res = fut.result()
+            except Exception as e:
+                s = futures[fut]
+                print(f"[fatal] {s.get('id', '?')}: {e}", file=sys.stderr)
+                n_err += 1
+                continue
+            if res["status"] == "ok":
+                print(f"[seed] {res['sid']} :: {res['label']}")
+                print(f"       theme_id={res['theme_id']} assigned {res['n_assigned']} claims")
+                n_created += 1
+            elif res["status"] == "dry":
+                print(f"[seed-dry] {res['sid']} :: {res['label']}")
+                n_created += 1
+            elif res["status"] == "skip":
+                print(f"[skip] {res['sid']}: {res['reason']}")
+                n_skipped += 1
+            elif res["status"] == "err":
+                print(f"[err] {res['sid']}: {res['error']}", file=sys.stderr)
+                n_err += 1
 
-    print(f"\nSeeded {n_created} themes; skipped {n_skipped}.")
+    print(f"\nSeeded {n_created} themes; skipped {n_skipped}; errors {n_err}.")
 
     if args.drop_auto_after and not args.dry_run:
         # Capture audit first
-        cur = conn.cursor()
+        cur = main_conn.cursor()
         cur.execute("SELECT id, label, claim_count FROM claim_themes WHERE label LIKE 'auto-%'")
         rows = cur.fetchall()
         print(f"\nDropping {len(rows)} auto-NN themes:")
         for r in rows:
             print(f"  {r[0]} {r[1]} claim_count={r[2]}")
-        n_dropped = drop_auto_themes(conn)
-        conn.commit()
+        n_dropped = drop_auto_themes(main_conn)
+        main_conn.commit()
         print(f"Dropped {n_dropped} auto-NN themes.")
 
+    main_conn.close()
     return 0
 
 

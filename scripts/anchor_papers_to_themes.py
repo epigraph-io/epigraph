@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -297,6 +298,27 @@ def anchor_one(conn, api: EpiGraphClient, claim: dict, layer: str, top_k: int, m
     mark_anchored(api, cid)
 
 
+def anchor_worker(claim: dict, args: argparse.Namespace, api: EpiGraphClient) -> None:
+    """Worker for one paper claim.
+
+    Opens its own psycopg2 connection (psycopg2 connections are not
+    thread-safe). The shared EpiGraphClient is safe to share across threads
+    because it holds only a JWT string + base URL and dispatches via the
+    module-level `requests` functions (no shared Session).
+    """
+    conn = psycopg2.connect(args.database_url)
+    conn.autocommit = False
+    try:
+        try:
+            anchor_one(conn, api, claim, args.layer, args.top_k, args.min_sim,
+                       args.maybe_threshold, args.dry_run)
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--database-url", default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL))
@@ -307,26 +329,33 @@ def main() -> int:
     ap.add_argument("--maybe-threshold", type=float, default=0.6)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--concurrency", type=int, default=8,
+                    help="Number of parallel worker threads (default 8).")
     args = ap.parse_args()
-
-    conn = psycopg2.connect(args.database_url)
-    conn.autocommit = False
 
     # API client for edge POST + claim PATCH. `claims:write` covers the
     # anchored_at PATCH; `edges:write` covers INSTANTIATES edge creation;
     # `claims:admin` left in for future theme-assign endpoint convergence.
+    # Shared across all workers — JWT minted once at startup.
     api = EpiGraphClient(scopes=["claims:write", "edges:write", "claims:admin"])
 
-    claims = fetch_paper_claims(conn, args.layer, args.level, args.limit)
-    print(f"Anchoring {len(claims)} paper L{args.level} claims (layer={args.layer}).")
+    # Fetch the work-list with a one-shot connection, then close it.
+    fetch_conn = psycopg2.connect(args.database_url)
+    fetch_conn.autocommit = False
+    claims = fetch_paper_claims(fetch_conn, args.layer, args.level, args.limit)
+    fetch_conn.close()
 
-    for c in claims:
-        try:
-            anchor_one(conn, api, c, args.layer, args.top_k, args.min_sim,
-                       args.maybe_threshold, args.dry_run)
-        except Exception as e:
-            print(f"[fatal] {c['id']}: {e}", file=sys.stderr)
-            conn.rollback()
+    print(f"Anchoring {len(claims)} paper L{args.level} claims (layer={args.layer}). "
+          f"Concurrency: {args.concurrency}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+        futures = {ex.submit(anchor_worker, c, args, api): c for c in claims}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                cid = str(futures[fut].get("id", "?"))
+                print(f"[fatal] {cid}: {e}", file=sys.stderr)
 
     return 0
 
