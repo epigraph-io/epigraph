@@ -28,6 +28,9 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _api_client import EpiGraphClient
+
 DEFAULT_DATABASE_URL = (
     "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
 )
@@ -102,20 +105,19 @@ def classify_via_claude(title: str, opening: str) -> dict:
     return parsed
 
 
-def patch_claim(conn, claim_id: str, document_type: str, confidence: float, reason: str) -> None:
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE claims SET properties = properties || %s::jsonb, updated_at = NOW() "
-        "WHERE id = %s",
-        (
-            json.dumps({
+def patch_claim(api: EpiGraphClient, claim_id: str, document_type: str, confidence: float, reason: str) -> None:
+    """PATCH /api/v1/claims/:id to merge document_type metadata into properties."""
+    resp = api.patch(
+        f"/api/v1/claims/{claim_id}",
+        json={
+            "properties": {
                 "document_type": document_type,
                 "document_type_confidence": confidence,
                 "document_type_reason": reason,
-            }),
-            claim_id,
-        ),
+            }
+        },
     )
+    resp.raise_for_status()
 
 
 def main() -> int:
@@ -127,6 +129,9 @@ def main() -> int:
 
     conn = psycopg2.connect(args.database_url)
     conn.autocommit = False
+
+    # Initialize API client for PATCH writes (requires claims:write scope for bearer auth).
+    api = EpiGraphClient(scopes=["claims:write"])
 
     papers = fetch_paper_l0_claims(conn, args.limit)
     if not papers:
@@ -148,8 +153,7 @@ def main() -> int:
         reason = result.get("reason", "")
         print(f"[{dt:8s} conf={conf:.2f}] {claim_id} :: {title[:80]}")
         if not args.dry_run:
-            patch_claim(conn, claim_id, dt, conf, reason)
-            conn.commit()
+            patch_claim(api, claim_id, dt, conf, reason)
     return 0
 
 
