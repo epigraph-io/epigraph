@@ -45,7 +45,7 @@ def main() -> int:
 
     conn = psycopg2.connect(args.database_url)
     cur = conn.cursor()
-    api = EpiGraphClient(scopes=["claims:write"])
+    api = EpiGraphClient(scopes=["claims:admin"])
 
     for step_id, new_content in UPDATES.items():
         cur.execute(
