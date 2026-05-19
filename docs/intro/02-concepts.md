@@ -2,7 +2,7 @@
 
 EpiGraph is an evidence-graph database that records *what is claimed*, *who claimed it*, *when it occurred*, and *how strongly it is believed* — all in a way that survives re-ingest, re-extraction, and disagreement between agents. This page is the orientation layer: each sub-section explains one core idea, points at a worked example, and links to the canonical deeper doc for the specialist details. Read it once front-to-back; later you can jump back via the table of contents below.
 
-If you have not yet read [`01-overview.md`](01-overview.md), do that first — it frames *why* EpiGraph exists. This file answers *what the moving parts are*. The [`04-glossary.md`](04-glossary.md) entries refer back into the sections below by anchor.
+If you have not yet run through [`01-quickstart.md`](01-quickstart.md), do that first — it gets a kernel up so the examples below have somewhere to land. This file answers *what the moving parts are*. The [`04-glossary.md`](04-glossary.md) entries refer back into the sections below by anchor.
 
 ## Table of contents
 
