@@ -1505,46 +1505,46 @@ pub async fn submit_packet(
                 "Skipping embedding for host-provenance telemetry claim"
             );
         } else {
-        match embedding_service.generate(&packet.claim.content).await {
-            Ok(embedding) => {
-                // Store directly via SQL (provider-agnostic — works with Jina, OpenAI, etc.)
-                let pgvector_str = format!(
-                    "[{}]",
-                    embedding
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                if let Err(e) =
-                    sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                        .bind(&pgvector_str)
-                        .bind(claim_id)
-                        .execute(&state.db_pool)
-                        .await
-                {
+            match embedding_service.generate(&packet.claim.content).await {
+                Ok(embedding) => {
+                    // Store directly via SQL (provider-agnostic — works with Jina, OpenAI, etc.)
+                    let pgvector_str = format!(
+                        "[{}]",
+                        embedding
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    if let Err(e) =
+                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+                            .bind(&pgvector_str)
+                            .bind(claim_id)
+                            .execute(&state.db_pool)
+                            .await
+                    {
+                        tracing::warn!(
+                            claim_id = %claim_id,
+                            error = %e,
+                            "Failed to store claim embedding"
+                        );
+                    } else {
+                        tracing::debug!(
+                            claim_id = %claim_id,
+                            embedding_dim = embedding.len(),
+                            "Generated and stored embedding for claim"
+                        );
+                    }
+                }
+                Err(e) => {
                     tracing::warn!(
                         claim_id = %claim_id,
                         error = %e,
-                        "Failed to store claim embedding"
+                        "Failed to generate embedding for claim"
                     );
-                } else {
-                    tracing::debug!(
-                        claim_id = %claim_id,
-                        embedding_dim = embedding.len(),
-                        "Generated and stored embedding for claim"
-                    );
+                    // Continue anyway - claim submission shouldn't fail due to embedding issues
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    claim_id = %claim_id,
-                    error = %e,
-                    "Failed to generate embedding for claim"
-                );
-                // Continue anyway - claim submission shouldn't fail due to embedding issues
-            }
-        }
         }
     }
     #[cfg(not(feature = "db"))]

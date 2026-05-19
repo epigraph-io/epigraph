@@ -554,6 +554,12 @@ pub async fn deprecate_workflow(
     .execute(&server.pool)
     .await
     .map_err(internal_error)?;
+    // Cascade onto the hierarchical `workflows` row (no-op when this
+    // workflow has only a flat-claim representation). Without this,
+    // `find_workflow_hierarchical` keeps returning the deprecated row.
+    epigraph_db::WorkflowRepository::set_truth_value(&server.pool, workflow_id, 0.05)
+        .await
+        .map_err(internal_error)?;
     deprecated_ids.push(workflow_id.to_string());
 
     if cascade {
@@ -598,6 +604,10 @@ pub async fn deprecate_workflow(
                 .execute(&server.pool)
                 .await
                 .map_err(internal_error)?;
+                // Mirror onto the hierarchical row, if any.
+                epigraph_db::WorkflowRepository::set_truth_value(&server.pool, child_id, 0.05)
+                    .await
+                    .map_err(internal_error)?;
                 deprecated_ids.push(child_id.to_string());
                 queue.push(child_id);
             }

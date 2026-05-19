@@ -213,13 +213,12 @@ async fn submit_packet_still_embeds_non_telemetry_claims(pool: PgPool) {
     )
     .await;
 
-    let has_embedding_unknown: bool = sqlx::query_scalar(
-        "SELECT embedding IS NOT NULL FROM claims WHERE id = $1",
-    )
-    .bind(claim_id_unknown)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let has_embedding_unknown: bool =
+        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(claim_id_unknown)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert!(
         has_embedding_unknown,
