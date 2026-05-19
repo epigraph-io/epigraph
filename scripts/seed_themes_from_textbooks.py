@@ -18,6 +18,28 @@ in claim_themes.properties.
 
 Per spec 2026-05-18-cross-source-anchor-design.md §Component 2.
 
+BACKLOG — raw SQL used here because the API surface is incomplete:
+  * POST /api/v1/themes/create-with-centroid exists but only accepts a
+    1536d centroid and has no `properties` field. To use it we'd need
+    to extend the request struct with `properties: Option<JsonValue>` and
+    `centroid_3072: Option<Vec<f64>>` (small Rust change in
+    crates/epigraph-api/src/routes/crud.rs::CreateThemeWithCentroidRequest
+    + `ClaimThemeRepository::set_centroid_3072` + a properties merge).
+  * The drop-auto path (DELETE FROM claim_themes WHERE label LIKE 'auto-%')
+    has no API equivalent. POST /api/v1/themes/build-from-corpus has a
+    `wipe_first` parameter that drops all themes for a given label_prefix,
+    but it also re-runs k-means; we just want the delete. Need
+    DELETE /api/v1/themes/by-label-prefix or similar.
+  * Bulk theme_id assignment (UPDATE claims SET theme_id = ...) goes
+    through the same path the existing POST /api/v1/themes/reassign uses
+    via ClaimThemeRepository::bulk_assign, but reassign auto-decides which
+    theme based on embedding distance — it can't be told to use a specific
+    target. Need POST /api/v1/themes/:id/assign-claims.
+
+These three gaps should be filed as feature requests against
+crates/epigraph-api. Until they land, this script writes claim_themes
+and claims.theme_id directly via psycopg2 as a documented exception.
+
 Usage:
     python3 scripts/seed_themes_from_textbooks.py --dry-run --limit 5
     python3 scripts/seed_themes_from_textbooks.py --limit 50
