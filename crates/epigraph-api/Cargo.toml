@@ -185,3 +185,7 @@ path = "tests/events/staleness_events_test.rs"
 [[test]]
 name = "embed_on_create_claim"
 path = "tests/integration/embed_on_create_claim.rs"
+
+[[test]]
+name = "skip_embed_host_telemetry"
+path = "tests/integration/skip_embed_host_telemetry.rs"
