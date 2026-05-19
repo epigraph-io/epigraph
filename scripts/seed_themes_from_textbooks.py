@@ -37,7 +37,7 @@ import psycopg2
 import psycopg2.extras
 
 DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
+    "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
 )
 
 LABEL_PROMPT = """\

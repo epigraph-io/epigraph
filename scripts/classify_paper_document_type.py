@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _api_client import EpiGraphClient
 
 DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
+    "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
 )
 
 PROMPT_TEMPLATE = """\
