@@ -477,19 +477,43 @@ mod tests {
         let second = serde_json::json!({"0": 0.8, "0,1": 0.2});
 
         MassFunctionRepository::store_with_perspective(
-            &pool, claim_id, frame_id, Some(agent_id), None,
-            &first, None, Some("first"), Some(0.7), Some("auto_wire"),
-        ).await.unwrap();
+            &pool,
+            claim_id,
+            frame_id,
+            Some(agent_id),
+            None,
+            &first,
+            None,
+            Some("first"),
+            Some(0.7),
+            Some("auto_wire"),
+        )
+        .await
+        .unwrap();
 
         MassFunctionRepository::store_with_perspective(
-            &pool, claim_id, frame_id, Some(agent_id), None,
-            &second, None, Some("second"), Some(0.9), Some("auto_wire"),
-        ).await.unwrap();
+            &pool,
+            claim_id,
+            frame_id,
+            Some(agent_id),
+            None,
+            &second,
+            None,
+            Some("second"),
+            Some(0.9),
+            Some("auto_wire"),
+        )
+        .await
+        .unwrap();
 
         let rows = MassFunctionRepository::get_for_claim_frame(&pool, claim_id, frame_id)
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1, "NULL-perspective upsert must collapse to one row");
+        assert_eq!(
+            rows.len(),
+            1,
+            "NULL-perspective upsert must collapse to one row"
+        );
         assert_eq!(rows[0].masses, second, "Latest write must win on conflict");
         assert_eq!(rows[0].combination_method.as_deref(), Some("second"));
     }
