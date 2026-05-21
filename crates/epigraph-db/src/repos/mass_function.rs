@@ -440,6 +440,84 @@ mod tests {
         assert!(all.iter().any(|r| r.claim_id == claim2_id));
     }
 
+    /// Regression test for the NULL-perspective upsert bug fixed by
+    /// migration 034. Before the migration, the unique constraint was
+    /// NULL-distinct, so two `store_with_perspective(.., None, ..)` calls
+    /// for the same (claim, frame, agent) inserted two rows instead of
+    /// upserting. This silently amplified structural belief on hub claims.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn null_perspective_upsert_collapses_to_single_row(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'null-persp-upsert', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let frame_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO frames (name, hypotheses) VALUES ($1, '{\"supported\",\"contradicted\"}') RETURNING id",
+        )
+        .bind(format!("null-persp-upsert-{}", Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let claim_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id) VALUES ($1, sha256($1::bytea), 0.5, $2) RETURNING id",
+        )
+        .bind(format!("null-persp-upsert-{}", Uuid::new_v4()))
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let first = serde_json::json!({"0": 0.5, "0,1": 0.5});
+        let second = serde_json::json!({"0": 0.8, "0,1": 0.2});
+
+        MassFunctionRepository::store_with_perspective(
+            &pool,
+            claim_id,
+            frame_id,
+            Some(agent_id),
+            None,
+            &first,
+            None,
+            Some("first"),
+            Some(0.7),
+            Some("auto_wire"),
+        )
+        .await
+        .unwrap();
+
+        MassFunctionRepository::store_with_perspective(
+            &pool,
+            claim_id,
+            frame_id,
+            Some(agent_id),
+            None,
+            &second,
+            None,
+            Some("second"),
+            Some(0.9),
+            Some("auto_wire"),
+        )
+        .await
+        .unwrap();
+
+        let rows = MassFunctionRepository::get_for_claim_frame(&pool, claim_id, frame_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "NULL-perspective upsert must collapse to one row"
+        );
+        assert_eq!(rows[0].masses, second, "Latest write must win on conflict");
+        assert_eq!(rows[0].combination_method.as_deref(), Some("second"));
+    }
+
     #[test]
     fn mass_function_row_has_expected_fields() {
         let _row = MassFunctionRow {
