@@ -1400,6 +1400,7 @@ dependencies = [
 name = "epigraph-engine"
 version = "0.3.0"
 dependencies = [
+ "anyhow",
  "ascent",
  "async-trait",
  "chrono",

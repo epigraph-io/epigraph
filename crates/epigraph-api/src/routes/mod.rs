@@ -29,6 +29,7 @@ pub mod conflicts;
 pub mod context;
 #[cfg(feature = "db")]
 pub mod conventions;
+pub mod cross_source;
 pub mod crud;
 pub mod edges;
 #[cfg(feature = "db")]
@@ -528,6 +529,10 @@ pub fn create_router(state: AppState) -> Router {
             get(claims::list_claim_evidence),
         )
         .route("/api/v1/claims/:id/history", get(versioning::claim_history))
+        .route(
+            "/api/v1/claims/:id/cross_source_matches",
+            get(cross_source::get_cross_source_matches),
+        )
         .route("/api/v1/edges", get(edges::list_edges))
         .route("/api/v1/papers", get(papers::list_papers))
         .route(
@@ -967,6 +972,10 @@ pub fn create_router(state: AppState) -> Router {
             get(claims::list_claim_evidence),
         )
         .route("/api/v1/claims/:id/history", get(versioning::claim_history))
+        .route(
+            "/api/v1/claims/:id/cross_source_matches",
+            get(cross_source::get_cross_source_matches),
+        )
         .route("/api/v1/edges", get(edges::list_edges))
         .route("/api/v1/papers", get(papers::list_papers))
         .route(

@@ -143,6 +143,10 @@ name = "semantic_search_integration_tests"
 path = "tests/integration/semantic_search_integration_tests.rs"
 
 [[test]]
+name = "cross_source_route_tests"
+path = "tests/integration/cross_source_route_tests.rs"
+
+[[test]]
 name = "security_tests"
 path = "tests/security_tests.rs"
 

@@ -3,6 +3,7 @@
 //! This module contains integration tests that verify the API layer
 //! correctly integrates with the database layer and middleware.
 
+pub mod cross_source_route_tests;
 pub mod db_integration_tests;
 pub mod lineage_integration_tests;
 pub mod middleware_integration_tests;

@@ -76,6 +76,21 @@ path = "src/bin/reembed.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "cross_source_sweep"
+path = "src/bin/cross_source_sweep.rs"
+required-features = ["genai"]
+
+[[bin]]
+name = "calibrate_matcher"
+path = "src/bin/calibrate_matcher.rs"
+required-features = ["db"]
+
+[[test]]
+name = "cross_source_sweep_smoke"
+path = "tests/cross_source_sweep_smoke.rs"
+required-features = ["genai"]
+
+[[bin]]
 name = "bootstrap_clients"
 path = "src/bin/bootstrap_clients.rs"
 required-features = ["db"]

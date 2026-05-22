@@ -5,6 +5,10 @@
 //! - **Bayesian Truth Update**: Update claim truth values based on new evidence
 //! - **DAG Validation**: Ensure the reasoning graph has no cycles
 //! - **Reputation Calculation**: Compute agent reputation from track record
+//! - **Cross-source matching** ([`matching`]): blocker → scorer → verifier
+//!   → policy pipeline that emits `CORROBORATES` edges between same-claim
+//!   pairs across sources. See
+//!   `docs/superpowers/specs/2026-05-21-cross-source-matching-design.md`.
 //!
 //! # Core Principle
 //!
@@ -36,6 +40,7 @@ pub mod errors;
 pub mod evidence;
 pub mod interval_bp;
 pub mod lifecycle;
+pub mod matching;
 pub mod promotion;
 pub mod propagation;
 pub mod reasoning;

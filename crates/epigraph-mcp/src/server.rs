@@ -835,6 +835,38 @@ impl EpiGraphMcpFull {
         tools::rdf::search_triples(self, params).await
     }
 
+    // ── Cross-source matching (3 tools) ──
+
+    #[tool(
+        description = "Look up existing cross-source matches for a claim. Returns match_candidates rows (any status) plus any CORROBORATES edges already written. Read-only — to *run* the matcher across new claims, use the `cross_source_sweep` CLI."
+    )]
+    async fn find_cross_source_matches(
+        &self,
+        Parameters(params): Parameters<FindCrossSourceMatchesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::matching::find_cross_source_matches(self, params).await
+    }
+
+    #[tool(
+        description = "List match_candidates rows, sorted by score desc. Filter by status (pending|promoted|rejected|stale) or get all. Use this to triage what the matcher has surfaced."
+    )]
+    async fn list_match_candidates(
+        &self,
+        Parameters(params): Parameters<ListMatchCandidatesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::matching::list_match_candidates(self, params).await
+    }
+
+    #[tool(
+        description = "Decide a pending match candidate: 'promote' writes a CORROBORATES edge and marks the row promoted; 'reject' marks it rejected. Honours read-only mode."
+    )]
+    async fn decide_match_candidate(
+        &self,
+        Parameters(params): Parameters<DecideMatchCandidateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::matching::decide_match_candidate(self, params).await
+    }
+
     // ── Meta (1 tool) ──
 
     #[tool(

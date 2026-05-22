@@ -115,3 +115,26 @@ nei_threshold          = 0.85
 support_threshold      = 0.15
 conflict_threshold     = 0.05
 has_opposing_threshold = 0.1
+
+# ── Cross-Source Matcher ────────────────────────────────────────────────────
+# See docs/superpowers/specs/2026-05-21-cross-source-matching-design.md
+[matcher.weights]
+embed_cosine     = 0.40
+triple_overlap   = 0.20
+entity_jaccard   = 0.15
+method_match     = 0.10
+nbhd_overlap     = 0.10
+citation_overlap = 0.05
+
+[matcher.bands]
+high = 0.85
+mid  = 0.60
+
+[matcher.embedding]
+model_version = "v1"
+
+[matcher.filter]
+include_agent_id = false
+
+[matcher.fan_out]
+max_per_claim = 32
