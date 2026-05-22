@@ -28,15 +28,17 @@ impl Blocker for EmbeddingAnnBlocker {
         }
         let mut out: Vec<CandidatePair> = Vec::new();
         for &seed in seeds {
+            // The CROSS JOIN form (c1 × c2 with WHERE c1.id = $1) prevents
+            // the planner from recognizing that c1.embedding is a constant
+            // — without an index on the JOIN expression, postgres seq-scans
+            // c2. Use a scalar subquery so the planner sees a literal-like
+            // operand against c2's embedding and uses the HNSW index
+            // (idx_claims_embedding_hnsw_cosine).
             let neighbors: Vec<(Uuid,)> = sqlx::query_as(
-                "SELECT c2.id
-                 FROM claims c1
-                 CROSS JOIN claims c2
-                 WHERE c1.id = $1
-                   AND c2.id <> c1.id
-                   AND c1.embedding IS NOT NULL
-                   AND c2.embedding IS NOT NULL
-                 ORDER BY c1.embedding <=> c2.embedding ASC
+                "SELECT id FROM claims
+                 WHERE id <> $1
+                   AND embedding IS NOT NULL
+                 ORDER BY embedding <=> (SELECT embedding FROM claims WHERE id = $1)
                  LIMIT $2",
             )
             .bind(seed)
