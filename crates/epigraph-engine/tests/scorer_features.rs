@@ -265,6 +265,166 @@ async fn citation_overlap_one_shared(pool: PgPool) {
     );
 }
 
+/// Two claims share a non-self graph neighbor → graph_overlap > 0.0
+/// (Adamic-Adar over any claim↔claim edge, not just `cites`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_overlap_via_shared_neighbor(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let shared = insert_claim(&pool, agent).await;
+    // Use an arbitrary non-`cites` relationship to verify AA isn't just
+    // citation_overlap — `supports` is also a real claim-claim edge.
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship)
+         VALUES ($1, 'claim', $2, 'claim', 'supports')",
+    )
+    .bind(a)
+    .bind(shared)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship)
+         VALUES ($1, 'claim', $2, 'claim', 'supports')",
+    )
+    .bind(b)
+    .bind(shared)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let features = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+
+    assert!(
+        features.graph_overlap > 0.0,
+        "expected graph_overlap > 0.0 for two claims sharing a neighbor, got {}",
+        features.graph_overlap
+    );
+    // tanh-normalized: a single shared neighbor of degree 2 contributes
+    // ~1/ln(2)≈1.44 raw, tanh(1.44)≈0.89.
+    assert!(
+        features.graph_overlap < 1.0,
+        "graph_overlap should be < 1.0 (tanh-bounded), got {}",
+        features.graph_overlap
+    );
+}
+
+/// Two claims with no shared neighbors → graph_overlap == 0.0 (sanity check
+/// that AA doesn't false-positive on disjoint neighborhoods).
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_overlap_zero_when_neighborhoods_disjoint(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let only_a = insert_claim(&pool, agent).await;
+    let only_b = insert_claim(&pool, agent).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship)
+         VALUES ($1, 'claim', $2, 'claim', 'supports'),
+                ($3, 'claim', $4, 'claim', 'supports')",
+    )
+    .bind(a)
+    .bind(only_a)
+    .bind(b)
+    .bind(only_b)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let features = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+    assert_eq!(
+        features.graph_overlap, 0.0,
+        "expected graph_overlap = 0.0 with disjoint neighborhoods, got {}",
+        features.graph_overlap
+    );
+}
+
+/// Both claims have aligned beliefs (both ~supported) →
+/// belief_alignment > 0.9. Mismatched beliefs (one supported, one not) →
+/// belief_alignment near 0.
+#[sqlx::test(migrations = "../../migrations")]
+async fn belief_alignment_reflects_betp_distance(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let c = insert_claim(&pool, agent).await;
+
+    // sqlx::test runs migrations into a fresh DB without the seed frame
+    // rows that production deploys carry. Insert the binary frame
+    // explicitly so the mass_functions FK is satisfied.
+    let frame_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses)
+         VALUES ('binary', ARRAY['supported', 'unsupported'])
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert binary frame");
+
+    // a, b: both strongly supported. m({0}) = 0.8, m({0,1}) = 0.2 → BetP = 0.9.
+    for &claim in &[a, b] {
+        sqlx::query(
+            "INSERT INTO mass_functions (claim_id, frame_id, masses)
+             VALUES ($1, $2, '{\"0\": 0.8, \"0,1\": 0.2}')",
+        )
+        .bind(claim)
+        .bind(frame_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    // c: strongly unsupported. m({1}) = 0.8, m({0,1}) = 0.2 → BetP = 0.1.
+    sqlx::query(
+        "INSERT INTO mass_functions (claim_id, frame_id, masses)
+         VALUES ($1, $2, '{\"1\": 0.8, \"0,1\": 0.2}')",
+    )
+    .bind(c)
+    .bind(frame_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let aligned = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score a,b");
+    let opposed = score_pair(&pool, a, c, &Weights::default())
+        .await
+        .expect("score a,c");
+
+    assert!(
+        aligned.belief_alignment > 0.9,
+        "expected aligned beliefs to score > 0.9, got {}",
+        aligned.belief_alignment
+    );
+    assert!(
+        opposed.belief_alignment < 0.1,
+        "expected opposed beliefs to score < 0.1, got {}",
+        opposed.belief_alignment
+    );
+}
+
+/// No mass function on either claim → belief_alignment = 0.5 (genuinely
+/// neutral: doesn't lift the score, doesn't depress it).
+#[sqlx::test(migrations = "../../migrations")]
+async fn belief_alignment_neutral_when_no_mass_function(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let features = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+    assert!(
+        (features.belief_alignment - 0.5).abs() < 1e-6,
+        "expected belief_alignment = 0.5 (neutral) with no mass functions, got {}",
+        features.belief_alignment
+    );
+}
+
 /// Claims matching across all features → score in (0.55, 1.0].
 #[sqlx::test(migrations = "../../migrations")]
 async fn combined_score_in_unit_interval(pool: PgPool) {

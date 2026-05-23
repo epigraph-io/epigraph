@@ -120,11 +120,13 @@ has_opposing_threshold = 0.1
 # See docs/superpowers/specs/2026-05-21-cross-source-matching-design.md
 [matcher.weights]
 embed_cosine     = 0.40
-triple_overlap   = 0.20
-entity_jaccard   = 0.15
-method_match     = 0.10
-nbhd_overlap     = 0.10
+triple_overlap   = 0.15
+entity_jaccard   = 0.10
+method_match     = 0.05
+nbhd_overlap     = 0.05
 citation_overlap = 0.05
+graph_overlap    = 0.10
+belief_alignment = 0.10
 
 [matcher.bands]
 high = 0.85

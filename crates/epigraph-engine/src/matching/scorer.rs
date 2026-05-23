@@ -23,13 +23,25 @@ pub struct MatchFeatures {
     pub nbhd_overlap: f32,
     /// Jaccard over `edges.target_id` where `relationship = 'cites'`.
     pub citation_overlap: f32,
+    /// Adamic-Adar over claim↔claim edges (any relationship), tanh-normalized
+    /// to (0, 1). Common neighbors weighted by 1/ln(degree), so rare shared
+    /// neighbors count more than hub-connected ones. Tested orthogonal to
+    /// `embed_cosine` on SciFact — adds match-recall without false positives
+    /// because easy negatives almost never share graph neighbors.
+    pub graph_overlap: f32,
+    /// Stance alignment from stored CDST mass functions: `1 - 2|BetP_a - BetP_b|`
+    /// clamped to `[0, 1]`. Both-supported or both-unsupported pairs → ~1;
+    /// support-vs-deny → ~0. Returns 1.0 (no signal) if either claim has no
+    /// mass function. Designed to break the cosine+graph precision ceiling
+    /// at hard-negative same-topic-opposite-stance pairs.
+    pub belief_alignment: f32,
     /// `|days(a.created_at - b.created_at)|`; reported but not in score.
     pub temporal_dist_days: i32,
-    /// Normalized weighted sum of the six similarity features.
+    /// Normalized weighted sum of the eight similarity features.
     pub score: f32,
 }
 
-/// Weights for the six features that contribute to `score`.
+/// Weights for the eight features that contribute to `score`.
 ///
 /// `temporal_dist_days` is reported but deferred to calibration.
 #[derive(Debug, Clone, Deserialize)]
@@ -40,17 +52,26 @@ pub struct Weights {
     pub method_match: f32,
     pub nbhd_overlap: f32,
     pub citation_overlap: f32,
+    #[serde(default = "default_graph_overlap")]
+    pub graph_overlap: f32,
+    #[serde(default = "default_belief_alignment")]
+    pub belief_alignment: f32,
 }
+
+fn default_graph_overlap() -> f32 { 0.10 }
+fn default_belief_alignment() -> f32 { 0.15 }
 
 impl Default for Weights {
     fn default() -> Self {
         Self {
             embed_cosine: 0.40,
-            triple_overlap: 0.20,
-            entity_jaccard: 0.15,
-            method_match: 0.10,
-            nbhd_overlap: 0.10,
+            triple_overlap: 0.15,
+            entity_jaccard: 0.10,
+            method_match: 0.05,
+            nbhd_overlap: 0.05,
             citation_overlap: 0.05,
+            graph_overlap: 0.10,
+            belief_alignment: 0.10,
         }
     }
 }
@@ -187,6 +208,110 @@ pub async fn score_pair(
     let citation_overlap: f32 = row2.try_get("citation_overlap")?;
 
     // ------------------------------------------------------------------
+    // Query 3: Adamic-Adar on claim↔claim edges (any relationship).
+    //
+    // Common neighbors of (a, b) weighted by 1/ln(degree), so a rare shared
+    // neighbor counts more than a hub. tanh-normalizes the unbounded sum
+    // into (0, 1). Heavy-looking SQL but the inner subquery is bounded by
+    // claim degree (typically small), and the existing
+    // (source_id) / (target_id) indexes on `edges` cover the neighbor scan.
+    // ------------------------------------------------------------------
+    let row3 = sqlx::query(
+        r#"
+        WITH na AS (
+            SELECT target_id AS nbr FROM edges
+                WHERE source_id = $1 AND source_type = 'claim' AND target_type = 'claim'
+            UNION
+            SELECT source_id FROM edges
+                WHERE target_id = $1 AND source_type = 'claim' AND target_type = 'claim'
+        ),
+        nb AS (
+            SELECT target_id AS nbr FROM edges
+                WHERE source_id = $2 AND source_type = 'claim' AND target_type = 'claim'
+            UNION
+            SELECT source_id FROM edges
+                WHERE target_id = $2 AND source_type = 'claim' AND target_type = 'claim'
+        ),
+        common AS (
+            SELECT na.nbr FROM na JOIN nb USING (nbr)
+            WHERE na.nbr <> $1 AND na.nbr <> $2
+        ),
+        deg AS (
+            SELECT c.nbr, (
+                SELECT COUNT(*) FROM edges
+                WHERE (source_id = c.nbr OR target_id = c.nbr)
+                  AND source_type = 'claim' AND target_type = 'claim'
+            ) AS d FROM common c
+        )
+        SELECT
+            COALESCE(
+                TANH(SUM(1.0 / GREATEST(LN(d::float8), 0.5))),
+                0.0
+            )::real AS graph_overlap
+        FROM deg
+        "#,
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await?;
+    let graph_overlap: f32 = row3.try_get("graph_overlap")?;
+
+    // ------------------------------------------------------------------
+    // Query 4: belief_alignment from stored CDST mass functions.
+    //
+    // Pulls the most recent mass_functions row per claim, computes BetP
+    // for the supported hypothesis: m({0}) + 0.5 * m({0,1}). Then
+    // alignment = clamp(1 - 2|BetP_a - BetP_b|, 0, 1). When either claim
+    // has no mass function, alignment = 1.0 (neutral — no signal either
+    // way; let other features decide).
+    //
+    // The frame is binary {supported, unsupported} per cdst_bp's
+    // BINARY_FRAME; keys in `masses` JSONB are comma-separated focal-set
+    // indices: "0" = {supported}, "1" = {unsupported}, "0,1" = θ.
+    // ------------------------------------------------------------------
+    let row4 = sqlx::query(
+        r#"
+        WITH
+            ma AS (
+                SELECT masses FROM mass_functions
+                WHERE claim_id = $1
+                ORDER BY created_at DESC
+                LIMIT 1
+            ),
+            mb AS (
+                SELECT masses FROM mass_functions
+                WHERE claim_id = $2
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
+        SELECT
+            (SELECT COALESCE((masses->>'0')::float8, 0.0)
+                  + 0.5 * COALESCE((masses->>'0,1')::float8, 0.0)
+             FROM ma) AS betp_a,
+            (SELECT COALESCE((masses->>'0')::float8, 0.0)
+                  + 0.5 * COALESCE((masses->>'0,1')::float8, 0.0)
+             FROM mb) AS betp_b
+        "#,
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await?;
+    let betp_a: Option<f64> = row4.try_get("betp_a")?;
+    let betp_b: Option<f64> = row4.try_get("betp_b")?;
+    let belief_alignment: f32 = match (betp_a, betp_b) {
+        (Some(pa), Some(pb)) => (1.0 - 2.0 * (pa - pb).abs()).clamp(0.0, 1.0) as f32,
+        // No mass function on at least one side: genuinely neutral (0.5).
+        // Picking 1.0 would silently boost every cosine-only pair by
+        // weight*1.0 — distorts band thresholds. Picking 0.0 would punish
+        // un-BP'd claims (most of them, in early CDST rollout). 0.5 is
+        // the only choice that doesn't bias the score against either
+        // missing-data state.
+        _ => 0.5,
+    };
+
+    // ------------------------------------------------------------------
     // Combined score: normalized weighted sum (temporal_dist_days excluded)
     // ------------------------------------------------------------------
     let raw = w.embed_cosine * embed_cosine
@@ -194,13 +319,17 @@ pub async fn score_pair(
         + w.entity_jaccard * entity_jaccard
         + w.method_match * if method_match { 1.0_f32 } else { 0.0_f32 }
         + w.nbhd_overlap * nbhd_overlap
-        + w.citation_overlap * citation_overlap;
+        + w.citation_overlap * citation_overlap
+        + w.graph_overlap * graph_overlap
+        + w.belief_alignment * belief_alignment;
     let denom = w.embed_cosine
         + w.triple_overlap
         + w.entity_jaccard
         + w.method_match
         + w.nbhd_overlap
-        + w.citation_overlap;
+        + w.citation_overlap
+        + w.graph_overlap
+        + w.belief_alignment;
     let score = (raw / denom).clamp(0.0, 1.0);
 
     Ok(MatchFeatures {
@@ -210,6 +339,8 @@ pub async fn score_pair(
         method_match,
         nbhd_overlap,
         citation_overlap,
+        graph_overlap,
+        belief_alignment,
         temporal_dist_days,
         score,
     })

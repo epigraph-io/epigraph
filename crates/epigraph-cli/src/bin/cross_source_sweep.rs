@@ -6,12 +6,35 @@
 //! advances. Output is a single JSON line on stdout, easy to feed into
 //! scheduled-job logs.
 
+use async_trait::async_trait;
 use clap::Parser;
 use epigraph_cli::matching_client::RerankBridgesClient;
 use epigraph_engine::matching::calibration::MatcherConfig;
 use epigraph_engine::matching::pipeline::{run_pipeline, RunInputs};
+use epigraph_engine::matching::verifier::{Verdict, VerifierClient};
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
+
+/// Stub verifier that returns `derives_from` for every pair — maps to
+/// MatchVerdict::Distinct upstream so all mid-band pairs land as rejected.
+/// Lets `--count-only` report band distribution without spending LLM tokens.
+struct CountOnlyVerifier;
+
+#[async_trait]
+impl VerifierClient for CountOnlyVerifier {
+    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Verdict>> {
+        Ok(pairs
+            .iter()
+            .map(|(a, b)| Verdict {
+                source_id: *a,
+                target_id: *b,
+                relationship: "derives_from".to_string(),
+                strength: 0.0,
+                rationale: "count-only run; verifier skipped".to_string(),
+            })
+            .collect())
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,21 +59,28 @@ struct Args {
     /// Path to calibration.toml; defaults to the workspace root.
     #[arg(long, env = "EPIGRAPH_CALIBRATION_PATH")]
     calibration: Option<std::path::PathBuf>,
+
+    /// Skip the LLM verifier — every mid-band pair gets a `derives_from`
+    /// placeholder verdict (mapped to MatchVerdict::Distinct → Reject).
+    /// Lets you measure band distribution against the calibration without
+    /// burning LLM tokens. Forces --dry-run.
+    #[arg(long)]
+    count_only: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Exactly one of --dry-run / --apply. Default behavior — neither flag —
-    // is rejected to force operators to declare intent. (Spec §Failure Modes
-    // calls out silent edge writes as a hazard.)
-    match (args.dry_run, args.apply) {
+    // --count-only forces dry-run (no edges written) and a stub verifier.
+    let dry_run = args.dry_run || args.count_only;
+    let apply = args.apply && !args.count_only;
+    match (dry_run, apply) {
         (true, false) | (false, true) => {}
         (true, true) => anyhow::bail!("--dry-run and --apply are mutually exclusive"),
         (false, false) => anyhow::bail!("must pass one of --dry-run or --apply"),
     }
-    let auto_promote = args.apply;
+    let auto_promote = apply;
 
     let db_url =
         std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL must be set"))?;
@@ -80,7 +110,11 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     let seed_count = seeds.len();
-    let verifier = Box::new(RerankBridgesClient::new(pool.clone()));
+    let verifier: Box<dyn VerifierClient> = if args.count_only {
+        Box::new(CountOnlyVerifier)
+    } else {
+        Box::new(RerankBridgesClient::new(pool.clone()))
+    };
     let report = run_pipeline(
         &pool,
         RunInputs {
@@ -95,7 +129,10 @@ async fn main() -> anyhow::Result<()> {
     // Stamp the seed window so the next sweep moves forward, regardless of
     // whether we applied. Skipping this on --dry-run would put the sweep in
     // a loop re-scanning the same seeds.
-    if !seeds.is_empty() {
+    // EXCEPT for --count-only: that's an analysis run, not a real sweep, and
+    // stamping would skip the picked claims from the next legitimate sweep
+    // for 7 days.
+    if !seeds.is_empty() && !args.count_only {
         sqlx::query("UPDATE claims SET last_match_scan_at = now() WHERE id = ANY($1)")
             .bind(&seeds)
             .execute(&pool)
@@ -112,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
             "mid_band":      report.mid_band,
             "rejected":      report.rejected,
             "apply":         auto_promote,
+            "count_only":    args.count_only,
         })
     );
     Ok(())

@@ -72,30 +72,44 @@ impl VerifierClient for RerankBridgesClient {
         canon.dedup();
 
         let table = format!("matcher_verify_{}", Uuid::new_v4().simple());
-        // The safe-identifier check inside rerank::core::find_candidates_from_table
-        // (alphanumeric + underscore) will accept this since `simple()` strips
-        // hyphens.
+        // CREATE TEMP TABLE is per-session, but sqlx's pool routes successive
+        // .execute(&pool) calls to different connections — the temp table
+        // wouldn't be visible from the connection that later runs the
+        // rerank query. Use a regular table with a UUID-suffixed name
+        // (still safe-identifier per find_candidates_from_table) and drop
+        // it explicitly at the end.
         sqlx::query(&format!(
-            "CREATE TEMP TABLE {table}
-             (source_id uuid NOT NULL, target_id uuid NOT NULL)
-             ON COMMIT DROP"
+            "CREATE TABLE {table}
+             (source_id uuid NOT NULL, target_id uuid NOT NULL)"
         ))
         .execute(&self.pool)
         .await?;
 
-        for (a, b) in &canon {
-            sqlx::query(&format!(
-                "INSERT INTO {table} (source_id, target_id) VALUES ($1, $2)"
-            ))
-            .bind(a)
-            .bind(b)
-            .execute(&self.pool)
-            .await?;
-        }
+        // Always attempt to clean up the table, even if subsequent work
+        // errors. Defer via a guard wouldn't help across an early-return
+        // through `?`; explicit cleanup after the body is simpler.
+        let result = async {
+            for (a, b) in &canon {
+                sqlx::query(&format!(
+                    "INSERT INTO {table} (source_id, target_id) VALUES ($1, $2)"
+                ))
+                .bind(a)
+                .bind(b)
+                .execute(&self.pool)
+                .await?;
+            }
 
-        let summary = rerank_candidates_table(&self.pool, &table, &self.config)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            rerank_candidates_table(&self.pool, &table, &self.config)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+        }
+        .await;
+
+        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(&self.pool)
+            .await;
+
+        let summary = result?;
 
         // Index verdicts by canonical pair so we can re-align to caller order.
         let mut by_pair: HashMap<(Uuid, Uuid), PerPairVerdict> = HashMap::new();
