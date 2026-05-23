@@ -100,8 +100,7 @@ struct Pair {
 }
 
 /// Per-pair signal bundle. Each pair is scored on multiple features so the
-/// report can compare them — cosine-only, AA-only, and equally-weighted
-/// combined.
+/// report can compare them — cosine-only, AA-only, theme-only, and combined.
 struct PairScore {
     bucket:   Bucket,
     cosine:   f32,
@@ -109,8 +108,16 @@ struct PairScore {
     aa_raw:   f32,
     /// tanh-normalized AA in (0, 1).
     aa_norm:  f32,
-    /// (cosine + aa_norm) / 2.
+    /// 1.0 if the two claims fall in the same k-means cluster on their
+    /// embeddings, 0.0 otherwise. SciFact has no native theme attribute, so
+    /// the clustering is derived (auto-correlated with cosine to some
+    /// degree). The test question: does discretized clustering carry signal
+    /// beyond raw cosine + AA?
+    theme:    f32,
+    /// (cosine + aa_norm) / 2 — original two-feature combine.
     combined: f32,
+    /// (cosine + aa_norm + theme) / 3 — three-feature combine.
+    combined3: f32,
 }
 
 // ── Args ───────────────────────────────────────────────────────────────────
@@ -154,6 +161,11 @@ struct Args {
     /// to keep vectors of different dimensions from colliding.
     #[arg(long)]
     cache: Option<PathBuf>,
+
+    /// k-means cluster count for the derived "theme" feature. ~sqrt(n) by
+    /// rule of thumb; for SciFact's ~1400 claims, 37 is a reasonable start.
+    #[arg(long, default_value_t = 40)]
+    theme_k: usize,
 }
 
 #[tokio::main]
@@ -211,26 +223,34 @@ async fn main() -> anyhow::Result<()> {
         median(&doc_degree.values().map(|&v| v as f64).collect::<Vec<_>>())
     );
 
-    // Score each pair on three signals.
+    // Derive synthetic "themes" via k-means on the embeddings so we can
+    // probe whether discretized clustering carries any signal beyond raw
+    // cosine + AA. K is chosen as ~sqrt(n_claims) — a common heuristic.
+    let cluster_of = kmeans_clusters(&embeddings, args.theme_k);
+    let theme_for = |id: u64| cluster_of.get(&id).copied().unwrap_or(usize::MAX);
+
+    // Score each pair on four signals.
     let scored: Vec<PairScore> = pairs
         .iter()
         .map(|p| {
             let cosine_score = cosine(&embeddings[&p.a], &embeddings[&p.b]);
             let aa_raw = adamic_adar(&claims[&p.a], &claims[&p.b], &doc_degree);
-            // Normalize AA to (0, 1) via tanh — squashes the unbounded sum
-            // monotonically. tanh(1) ≈ 0.76; tanh(2) ≈ 0.96; saturates
-            // gently so adding more shared niche docs still helps.
             let aa_norm = aa_raw.tanh();
-            // Combined: equally weighted mean. Threshold sweep then asks
-            // "does (cosine + aa_norm)/2 ≥ t" — gives us a feel for whether
-            // AA is additive over cosine.
+            let theme = if theme_for(p.a) != usize::MAX && theme_for(p.a) == theme_for(p.b) {
+                1.0
+            } else {
+                0.0
+            };
             let combined = (cosine_score + aa_norm as f32) / 2.0;
+            let combined3 = (cosine_score + aa_norm as f32 + theme) / 3.0;
             PairScore {
                 bucket: p.bucket,
                 cosine: cosine_score,
                 aa_raw: aa_raw as f32,
                 aa_norm: aa_norm as f32,
+                theme,
                 combined,
+                combined3,
             }
         })
         .collect();
@@ -253,8 +273,21 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Threshold sweep on each signal independently — the report carries all
-    // three so a reader can compare AA-only vs cosine-only vs combined.
+    // Per-bucket theme stats — does same-cluster discriminate?
+    let mut theme_hits: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for s in &scored {
+        let e = theme_hits.entry(format!("{:?}", s.bucket)).or_insert((0, 0));
+        e.1 += 1;
+        if s.theme > 0.5 {
+            e.0 += 1;
+        }
+    }
+    for (b, (hits, n)) in &theme_hits {
+        let pct = (*hits as f32) * 100.0 / (*n as f32);
+        eprintln!("Theme (k={}) {b}: {hits}/{n} same-cluster ({pct:.1}%)", args.theme_k);
+    }
+
+    // Threshold sweep on each signal independently.
     let thresholds: Vec<f32> = (50..=99).map(|i| i as f32 / 100.0).collect();
     let metrics_cosine: Vec<ThresholdMetric> = thresholds
         .iter()
@@ -268,17 +301,23 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .map(|&t| metric_at(&scored, t, |s| s.combined))
         .collect();
+    let metrics_combined3: Vec<ThresholdMetric> = thresholds
+        .iter()
+        .map(|&t| metric_at(&scored, t, |s| s.combined3))
+        .collect();
 
-    let recommendation = recommend_high_threshold(&metrics_combined);
+    let recommendation = recommend_high_threshold(&metrics_combined3);
 
     let report = Report {
         seed: args.seed,
         embedding_mode: format!("{mode:?}"),
+        theme_k: args.theme_k,
         claim_count: claims.len(),
         pair_distribution: bucket_counts,
-        metrics: metrics_combined.clone(),
+        metrics: metrics_combined3.clone(),
         metrics_cosine: Some(metrics_cosine),
         metrics_aa: Some(metrics_aa),
+        metrics_combined_2: Some(metrics_combined),
         recommendation,
     };
 
@@ -289,6 +328,47 @@ async fn main() -> anyhow::Result<()> {
     // Stdout summary for shell consumption.
     println!("{}", serde_json::to_string(&report.recommendation)?);
     Ok(())
+}
+
+/// K-means clusters of claim embeddings, returning claim_id → cluster_id.
+/// Used to derive a synthetic "theme" feature for the harness — see the
+/// PairScore::theme doc comment. SciFact has no native theme attribute, so
+/// the clusters are auto-correlated with cosine; the question is whether
+/// discretizing carries signal beyond raw cosine.
+fn kmeans_clusters(embeddings: &HashMap<u64, Vec<f32>>, k: usize) -> HashMap<u64, usize> {
+    use linfa::prelude::*;
+    use linfa_clustering::KMeans;
+    use ndarray::Array2;
+
+    if embeddings.is_empty() || k < 2 {
+        return HashMap::new();
+    }
+    let ids: Vec<u64> = {
+        let mut v: Vec<u64> = embeddings.keys().copied().collect();
+        v.sort_unstable();
+        v
+    };
+    let dim = embeddings[&ids[0]].len();
+    let mut data = Array2::<f64>::zeros((ids.len(), dim));
+    for (i, id) in ids.iter().enumerate() {
+        for (j, &v) in embeddings[id].iter().enumerate() {
+            data[[i, j]] = f64::from(v);
+        }
+    }
+    let dataset = linfa::DatasetBase::from(data.view());
+    let model = match KMeans::params(k)
+        .max_n_iterations(50)
+        .tolerance(1e-3)
+        .fit(&dataset)
+    {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("kmeans fit failed: {e:?} — themes disabled");
+            return HashMap::new();
+        }
+    };
+    let labels: Vec<usize> = model.predict(&dataset).iter().copied().collect();
+    ids.into_iter().zip(labels).collect()
 }
 
 /// Adamic-Adar over the (claim → cited_doc) bipartite graph.
@@ -818,16 +898,20 @@ fn snapshot(m: &ThresholdMetric) -> RecommendedThreshold {
 struct Report {
     seed: u64,
     embedding_mode: String,
+    theme_k: usize,
     claim_count: usize,
     pair_distribution: BTreeMap<String, usize>,
-    /// Threshold sweep on the combined cosine+AA score (primary signal).
+    /// Threshold sweep on cosine + AA + theme (primary).
     metrics: Vec<ThresholdMetric>,
     /// Sweep on cosine-only (baseline comparator).
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics_cosine: Option<Vec<ThresholdMetric>>,
-    /// Sweep on AA-only (orthogonal signal sanity check).
+    /// Sweep on AA-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics_aa: Option<Vec<ThresholdMetric>>,
+    /// Sweep on cosine + AA (two-feature combine, pre-theme baseline).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics_combined_2: Option<Vec<ThresholdMetric>>,
     recommendation: Recommendation,
 }
 
