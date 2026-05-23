@@ -99,6 +99,20 @@ struct Pair {
     bucket: Bucket,
 }
 
+/// Per-pair signal bundle. Each pair is scored on multiple features so the
+/// report can compare them — cosine-only, AA-only, and equally-weighted
+/// combined.
+struct PairScore {
+    bucket:   Bucket,
+    cosine:   f32,
+    /// Raw Adamic-Adar sum (unbounded; reported for distribution sanity).
+    aa_raw:   f32,
+    /// tanh-normalized AA in (0, 1).
+    aa_norm:  f32,
+    /// (cosine + aa_norm) / 2.
+    combined: f32,
+}
+
 // ── Args ───────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -181,28 +195,90 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Compute similarity per pair.
-    let scored: Vec<(Bucket, f32)> = pairs
+    // Document degree map for Adamic-Adar: how many claims cite each doc.
+    // This is the bipartite-graph degree on the doc side; AA(a,b) sums
+    // 1/ln(deg(d)) over docs cited by both a and b. Niche docs (low deg)
+    // contribute more — Tom-Cruise-shared-movie style.
+    let mut doc_degree: HashMap<u64, usize> = HashMap::new();
+    for row in claims.values() {
+        for doc in &row.cited_doc_ids {
+            *doc_degree.entry(*doc).or_insert(0) += 1;
+        }
+    }
+    let doc_count = doc_degree.len();
+    eprintln!(
+        "Cited-doc degree map: {doc_count} unique docs, median citation count = {}",
+        median(&doc_degree.values().map(|&v| v as f64).collect::<Vec<_>>())
+    );
+
+    // Score each pair on three signals.
+    let scored: Vec<PairScore> = pairs
         .iter()
         .map(|p| {
-            let s = cosine(&embeddings[&p.a], &embeddings[&p.b]);
-            (p.bucket, s)
+            let cosine_score = cosine(&embeddings[&p.a], &embeddings[&p.b]);
+            let aa_raw = adamic_adar(&claims[&p.a], &claims[&p.b], &doc_degree);
+            // Normalize AA to (0, 1) via tanh — squashes the unbounded sum
+            // monotonically. tanh(1) ≈ 0.76; tanh(2) ≈ 0.96; saturates
+            // gently so adding more shared niche docs still helps.
+            let aa_norm = aa_raw.tanh();
+            // Combined: equally weighted mean. Threshold sweep then asks
+            // "does (cosine + aa_norm)/2 ≥ t" — gives us a feel for whether
+            // AA is additive over cosine.
+            let combined = (cosine_score + aa_norm as f32) / 2.0;
+            PairScore {
+                bucket: p.bucket,
+                cosine: cosine_score,
+                aa_raw: aa_raw as f32,
+                aa_norm: aa_norm as f32,
+                combined,
+            }
         })
         .collect();
 
-    // Threshold sweep. Bands of interest: high (auto-promote), mid
-    // (verifier), low (drop). For the high band we want precision ≥ 0.95.
-    let thresholds: Vec<f32> = (50..=99).map(|i| i as f32 / 100.0).collect();
-    let metrics: Vec<ThresholdMetric> = thresholds.iter().map(|&t| metric_at(&scored, t)).collect();
+    // Per-bucket AA distribution — sanity check that AA actually discriminates.
+    let mut aa_buckets: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+    for s in &scored {
+        aa_buckets
+            .entry(format!("{:?}", s.bucket))
+            .or_default()
+            .push(s.aa_raw);
+    }
+    for (b, vs) in &aa_buckets {
+        let n = vs.len();
+        let mean: f32 = vs.iter().sum::<f32>() / n as f32;
+        let max = vs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let nonzero = vs.iter().filter(|&&v| v > 0.0).count();
+        eprintln!(
+            "AA distribution {b}: n={n} mean={mean:.3} max={max:.3} nonzero={nonzero}"
+        );
+    }
 
-    let recommendation = recommend_high_threshold(&metrics);
+    // Threshold sweep on each signal independently — the report carries all
+    // three so a reader can compare AA-only vs cosine-only vs combined.
+    let thresholds: Vec<f32> = (50..=99).map(|i| i as f32 / 100.0).collect();
+    let metrics_cosine: Vec<ThresholdMetric> = thresholds
+        .iter()
+        .map(|&t| metric_at(&scored, t, |s| s.cosine))
+        .collect();
+    let metrics_aa: Vec<ThresholdMetric> = thresholds
+        .iter()
+        .map(|&t| metric_at(&scored, t, |s| s.aa_norm))
+        .collect();
+    let metrics_combined: Vec<ThresholdMetric> = thresholds
+        .iter()
+        .map(|&t| metric_at(&scored, t, |s| s.combined))
+        .collect();
+
+    let recommendation = recommend_high_threshold(&metrics_combined);
 
     let report = Report {
         seed: args.seed,
         embedding_mode: format!("{mode:?}"),
         claim_count: claims.len(),
         pair_distribution: bucket_counts,
-        metrics,
+        metrics: metrics_combined.clone(),
+        metrics_cosine: Some(metrics_cosine),
+        metrics_aa: Some(metrics_aa),
         recommendation,
     };
 
@@ -213,6 +289,35 @@ async fn main() -> anyhow::Result<()> {
     // Stdout summary for shell consumption.
     println!("{}", serde_json::to_string(&report.recommendation)?);
     Ok(())
+}
+
+/// Adamic-Adar over the (claim → cited_doc) bipartite graph.
+/// Two claims share a "neighbor" iff they cite the same doc; rare docs
+/// (cited by few claims) carry more weight via 1/ln(degree).
+fn adamic_adar(a: &ClaimRow, b: &ClaimRow, doc_degree: &HashMap<u64, usize>) -> f64 {
+    let aset: std::collections::HashSet<u64> = a.cited_doc_ids.iter().copied().collect();
+    let mut score = 0.0;
+    for doc in &b.cited_doc_ids {
+        if !aset.contains(doc) {
+            continue;
+        }
+        // Degree 1 means only one of (a, b) cites it — but since we're
+        // iterating common neighbors, deg ≥ 2 always. Cap ln to avoid
+        // ln(2) → tiny denominator when both claims share an exclusive doc.
+        let deg = *doc_degree.get(doc).unwrap_or(&2);
+        let denom = (deg as f64).ln().max(0.5);
+        score += 1.0 / denom;
+    }
+    score
+}
+
+fn median(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    let mut v = xs.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[v.len() / 2]
 }
 
 // ── Data loading ───────────────────────────────────────────────────────────
@@ -527,7 +632,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 // ── Metrics ────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ThresholdMetric {
     threshold: f32,
     /// True positives at this threshold (positive pairs with sim ≥ t).
@@ -556,7 +661,7 @@ struct ThresholdMetric {
     match_f1: f32,
 }
 
-fn metric_at(scored: &[(Bucket, f32)], t: f32) -> ThresholdMetric {
+fn metric_at(scored: &[PairScore], t: f32, select: impl Fn(&PairScore) -> f32) -> ThresholdMetric {
     let mut tp = 0usize;
     let mut fp_total = 0usize;
     let mut fp_hard = 0usize;
@@ -564,8 +669,9 @@ fn metric_at(scored: &[(Bucket, f32)], t: f32) -> ThresholdMetric {
     let mut fn_count = 0usize;
     let mut total_pos = 0usize;
     let mut total_hard = 0usize;
-    for &(b, s) in scored {
-        match b {
+    for p in scored {
+        let s = select(p);
+        match p.bucket {
             Bucket::Positive => {
                 total_pos += 1;
                 if s >= t {
@@ -714,7 +820,14 @@ struct Report {
     embedding_mode: String,
     claim_count: usize,
     pair_distribution: BTreeMap<String, usize>,
+    /// Threshold sweep on the combined cosine+AA score (primary signal).
     metrics: Vec<ThresholdMetric>,
+    /// Sweep on cosine-only (baseline comparator).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics_cosine: Option<Vec<ThresholdMetric>>,
+    /// Sweep on AA-only (orthogonal signal sanity check).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics_aa: Option<Vec<ThresholdMetric>>,
     recommendation: Recommendation,
 }
 
