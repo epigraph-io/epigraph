@@ -57,9 +57,9 @@ def get_auth_headers():
     return headers
 
 
-def api_get(path, params=None):
+def api_get(path, params=None, timeout=60):
     """GET request to the API."""
-    resp = requests.get(f"{API_URL}{path}", params=params, headers=get_auth_headers(), timeout=60)
+    resp = requests.get(f"{API_URL}{path}", params=params, headers=get_auth_headers(), timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
@@ -161,7 +161,7 @@ def detect_and_split(affected_theme_ids):
     """
     data = api_get("/api/v1/themes/split-candidates", {
         "variance_threshold": 0.50, "min_claims": 2000, "limit": 10,
-    })
+    }, timeout=1800)
     candidates = data.get("candidates", [])
 
     if not candidates or DRY_RUN:
@@ -200,7 +200,7 @@ def auto_split_theme(theme_id, theme_label, n_clusters=3, min_claims=500):
         from sklearn.cluster import MiniBatchKMeans
 
     # Fetch embeddings via API
-    data = api_get(f"/api/v1/themes/{theme_id}/embeddings", {"limit": 5000})
+    data = api_get(f"/api/v1/themes/{theme_id}/embeddings", {"limit": 5000}, timeout=600)
     claims = data.get("claims", [])
 
     if len(claims) < min_claims:
@@ -257,7 +257,7 @@ def report_remaining_splits():
     """Report themes that still have high variance (lower threshold, report only)."""
     data = api_get("/api/v1/themes/split-candidates", {
         "variance_threshold": 0.35, "min_claims": 500, "limit": 20,
-    })
+    }, timeout=1800)
     return data.get("candidates", [])
 
 
@@ -267,7 +267,7 @@ def detect_new_theme_candidates():
     """Find themes with distant outlier clusters."""
     data = api_get("/api/v1/themes/distant-claims", {
         "distance_threshold": 0.45, "min_cluster_size": 20, "limit": 20,
-    })
+    }, timeout=1800)
     return data.get("candidates", [])
 
 
