@@ -3,6 +3,8 @@ pub mod bootstrap;
 #[cfg(feature = "db")]
 pub mod bridge;
 pub mod enrichment;
+#[cfg(feature = "genai")]
+pub mod matching_client;
 #[cfg(feature = "db")]
 pub mod reembed;
 #[cfg(feature = "genai")]

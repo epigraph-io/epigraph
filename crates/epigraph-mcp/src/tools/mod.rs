@@ -9,6 +9,7 @@ pub mod evolve_step;
 pub mod graph;
 pub mod ingestion;
 pub mod link_hierarchical;
+pub mod matching;
 pub mod memory;
 pub mod paper_queries;
 pub mod perspectives;

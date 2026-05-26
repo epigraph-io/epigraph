@@ -65,6 +65,23 @@ pub struct RerankSummary {
     pub sample_contradiction: Option<CandidatePair>,
     /// Counts per accepted relationship type.
     pub relationship_counts: std::collections::HashMap<String, usize>,
+    /// Per-pair LLM verdicts in input order. Lets library callers (e.g. the
+    /// cross-source matcher's verifier wrapper) attribute verdicts back to
+    /// their pairs without re-parsing. Populated regardless of `dry_run`.
+    pub per_pair_verdicts: Vec<PerPairVerdict>,
+}
+
+/// Per-pair verdict surfaced alongside aggregate counts. Mirrors the
+/// `ValidationResult` shape but carries the candidate's UUIDs so callers can
+/// align it with their own pair list.
+#[derive(Debug, Clone)]
+pub struct PerPairVerdict {
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub valid: bool,
+    pub relationship: Option<String>,
+    pub strength: Option<f64>,
+    pub rationale: String,
 }
 
 // =============================================================================
@@ -330,6 +347,20 @@ async fn rerank_inner(
         };
 
         let results = parse_validation_response(&json, batch.len());
+
+        // Capture per-pair verdicts before mutating `summary` further. Output
+        // preserves input order across batches.
+        for result in &results {
+            let pair = &batch[result.pair_index];
+            summary.per_pair_verdicts.push(PerPairVerdict {
+                source_id: pair.source_id,
+                target_id: pair.target_id,
+                valid: result.valid,
+                relationship: result.relationship.clone(),
+                strength: result.strength,
+                rationale: result.rationale.clone(),
+            });
+        }
 
         for result in &results {
             let pair = &batch[result.pair_index];

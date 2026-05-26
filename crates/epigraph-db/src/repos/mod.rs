@@ -34,6 +34,7 @@ pub mod group_membership;
 pub mod learning_event;
 pub mod lineage;
 pub mod mass_function;
+pub mod match_candidate;
 pub mod method;
 pub mod oauth_client;
 pub mod ownership;
@@ -87,6 +88,7 @@ pub use gap::{GapAnalysisResult, GapRecord, GapRepository};
 pub use learning_event::{LearningEventRepository, LearningEventRow};
 pub use lineage::LineageRepository;
 pub use mass_function::MassFunctionRepository;
+pub use match_candidate::{MatchCandidateRepo, MatchCandidateRow};
 pub use method::{
     MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,

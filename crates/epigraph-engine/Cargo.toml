@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 epigraph-core = { workspace = true }
 epigraph-crypto = { workspace = true }
 epigraph-db = { workspace = true }
@@ -40,6 +41,54 @@ epigraph-ds = { workspace = true }  # DS types for frame/mass/measures tests
 [[bench]]
 name = "engine_benchmarks"
 harness = false
+
+[[test]]
+name = "source_key_derivation"
+path = "tests/source_key_derivation.rs"
+
+[[test]]
+name = "blocker_embedding_ann"
+path = "tests/blocker_embedding_ann.rs"
+
+[[test]]
+name = "blocker_theme_cluster"
+path = "tests/blocker_theme_cluster.rs"
+
+[[test]]
+name = "blocker_compound_nbhd"
+path = "tests/blocker_compound_nbhd.rs"
+
+[[test]]
+name = "blocker_shared_triple"
+path = "tests/blocker_shared_triple.rs"
+
+[[test]]
+name = "blocker_content_hash_prefix"
+path = "tests/blocker_content_hash_prefix.rs"
+
+[[test]]
+name = "blocker_union"
+path = "tests/blocker_union.rs"
+
+[[test]]
+name = "scorer_features"
+path = "tests/scorer_features.rs"
+
+[[test]]
+name = "calibration_load"
+path = "tests/calibration_load.rs"
+
+[[test]]
+name = "verifier_smoke"
+path = "tests/verifier_smoke.rs"
+
+[[test]]
+name = "pipeline_end_to_end"
+path = "tests/pipeline_end_to_end.rs"
+
+[[test]]
+name = "cdst_corroborates_aggregation"
+path = "tests/cdst_corroborates_aggregation.rs"
 
 [lints]
 workspace = true

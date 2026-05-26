@@ -1380,3 +1380,27 @@ mod tests {
         assert!(r.is_err());
     }
 }
+
+// ── Cross-source matching (T19) ──
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindCrossSourceMatchesParams {
+    #[schemars(description = "Claim UUID to look up existing cross-source matches for")]
+    pub claim_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListMatchCandidatesParams {
+    #[schemars(description = "Optional status filter: pending | promoted | rejected | stale")]
+    pub status: Option<String>,
+    #[schemars(description = "Maximum candidates to return (default 50, max 500)")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DecideMatchCandidateParams {
+    #[schemars(description = "Match-candidate UUID to decide on")]
+    pub candidate_id: String,
+    #[schemars(description = "Decision: 'promote' (writes CORROBORATES edge) or 'reject'")]
+    pub verdict: String,
+}
