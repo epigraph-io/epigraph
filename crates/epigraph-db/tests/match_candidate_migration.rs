@@ -70,7 +70,6 @@ async fn insert_claim(pool: &PgPool, agent_id: Uuid) -> Uuid {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn match_candidates_table_exists(pool: PgPool) {
-
     let row: (bool,) = sqlx::query_as(
         r#"SELECT EXISTS (
                SELECT 1 FROM information_schema.tables
@@ -94,7 +93,6 @@ async fn match_candidates_table_exists(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn match_candidates_enforces_canonical_order(pool: PgPool) {
-
     let agent_id = insert_agent(&pool).await;
     let id_a = insert_claim(&pool, agent_id).await;
     let id_b = insert_claim(&pool, agent_id).await;

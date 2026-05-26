@@ -102,18 +102,18 @@ struct Pair {
 /// Per-pair signal bundle. Each pair is scored on multiple features so the
 /// report can compare them — cosine-only, AA-only, theme-only, and combined.
 struct PairScore {
-    bucket:   Bucket,
-    cosine:   f32,
+    bucket: Bucket,
+    cosine: f32,
     /// Raw Adamic-Adar sum (unbounded; reported for distribution sanity).
-    aa_raw:   f32,
+    aa_raw: f32,
     /// tanh-normalized AA in (0, 1).
-    aa_norm:  f32,
+    aa_norm: f32,
     /// 1.0 if the two claims fall in the same k-means cluster on their
     /// embeddings, 0.0 otherwise. SciFact has no native theme attribute, so
     /// the clustering is derived (auto-correlated with cosine to some
     /// degree). The test question: does discretized clustering carry signal
     /// beyond raw cosine + AA?
-    theme:    f32,
+    theme: f32,
     /// (cosine + aa_norm) / 2 — original two-feature combine.
     combined: f32,
     /// (cosine + aa_norm + theme) / 3 — three-feature combine.
@@ -268,15 +268,15 @@ async fn main() -> anyhow::Result<()> {
         let mean: f32 = vs.iter().sum::<f32>() / n as f32;
         let max = vs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let nonzero = vs.iter().filter(|&&v| v > 0.0).count();
-        eprintln!(
-            "AA distribution {b}: n={n} mean={mean:.3} max={max:.3} nonzero={nonzero}"
-        );
+        eprintln!("AA distribution {b}: n={n} mean={mean:.3} max={max:.3} nonzero={nonzero}");
     }
 
     // Per-bucket theme stats — does same-cluster discriminate?
     let mut theme_hits: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for s in &scored {
-        let e = theme_hits.entry(format!("{:?}", s.bucket)).or_insert((0, 0));
+        let e = theme_hits
+            .entry(format!("{:?}", s.bucket))
+            .or_insert((0, 0));
         e.1 += 1;
         if s.theme > 0.5 {
             e.0 += 1;
@@ -284,7 +284,10 @@ async fn main() -> anyhow::Result<()> {
     }
     for (b, (hits, n)) in &theme_hits {
         let pct = (*hits as f32) * 100.0 / (*n as f32);
-        eprintln!("Theme (k={}) {b}: {hits}/{n} same-cluster ({pct:.1}%)", args.theme_k);
+        eprintln!(
+            "Theme (k={}) {b}: {hits}/{n} same-cluster ({pct:.1}%)",
+            args.theme_k
+        );
     }
 
     // Threshold sweep on each signal independently.
@@ -584,7 +587,10 @@ async fn openai_embeddings(
     cache_path: &Path,
 ) -> anyhow::Result<HashMap<u64, Vec<f32>>> {
     let dim = native_dim(model);
-    eprintln!("OpenAI model: {model} (native dim {dim}, cache {})", cache_path.display());
+    eprintln!(
+        "OpenAI model: {model} (native dim {dim}, cache {})",
+        cache_path.display()
+    );
     let mut cache: EmbeddingCache = if cache_path.exists() {
         let file = File::open(cache_path)?;
         serde_json::from_reader(BufReader::new(file)).unwrap_or_default()

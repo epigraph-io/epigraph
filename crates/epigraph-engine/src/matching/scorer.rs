@@ -68,9 +68,15 @@ pub struct Weights {
     pub theme_proximity: f32,
 }
 
-fn default_graph_overlap() -> f32 { 0.10 }
-fn default_belief_alignment() -> f32 { 0.15 }
-fn default_theme_proximity() -> f32 { 0.10 }
+fn default_graph_overlap() -> f32 {
+    0.10
+}
+fn default_belief_alignment() -> f32 {
+    0.15
+}
+fn default_theme_proximity() -> f32 {
+    0.10
+}
 
 impl Default for Weights {
     fn default() -> Self {

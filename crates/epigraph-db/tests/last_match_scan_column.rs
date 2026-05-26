@@ -30,7 +30,6 @@ macro_rules! test_pool_or_skip {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn last_match_scan_at_column_exists(pool: PgPool) {
-
     let count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM information_schema.columns
          WHERE table_schema='public' AND table_name='claims' AND column_name='last_match_scan_at'",

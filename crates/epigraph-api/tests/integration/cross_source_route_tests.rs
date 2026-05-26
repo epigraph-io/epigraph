@@ -12,7 +12,6 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-
 fn create_test_router(pool: PgPool) -> Router {
     let config = ApiConfig {
         require_signatures: false,
