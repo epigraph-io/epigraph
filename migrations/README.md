@@ -12,6 +12,24 @@ refuse to start.
 
 Add a NEW migration (`NNN+1_fix_typo.sql`) instead of editing an existing one.
 
+## Version range coordination with epigraph-internal
+
+The private `epigraph-internal` repo also runs `sqlx::migrate!()` against the
+same `_sqlx_migrations` table, so its versions and ours share a number space.
+The next available public version must be higher than every applied version
+in prod, including any from internal.
+
+Current reservation:
+
+- **001–034**: public
+- **035–037**: `epigraph-internal` (`claim_supersession`, `challenges_and_events`,
+  `analyses`) — applied to prod 2026-05-22
+- **038+**: public next
+
+Next public migration must be `038` or later. Picking a colliding version
+(checksum mismatch on a `_sqlx_migrations` row that's already applied) will
+panic the api binary on restart.
+
 ## Migration Order
 
 Migrations must be applied in numerical order:
