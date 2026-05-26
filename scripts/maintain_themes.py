@@ -64,7 +64,7 @@ def api_get(path, params=None, timeout=60):
     return resp.json()
 
 
-def api_post(path, body=None, timeout=120):
+def api_post(path, body=None, timeout=1800):
     """POST request to the API."""
     resp = requests.post(f"{API_URL}{path}", json=body or {}, headers=get_auth_headers(), timeout=timeout)
     resp.raise_for_status()
