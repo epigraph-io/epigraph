@@ -57,6 +57,9 @@ pub struct HierarchicalWorkflowRow {
     pub parent_id: Option<Uuid>,
     pub metadata: serde_json::Value,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Deprecation signal. Live rows are 1.0; `deprecate_workflow`
+    /// cascades a write to 0.05 so callers can filter via `min_truth`.
+    pub truth_value: f64,
 }
 
 /// Per-step resolution result for `find_workflow_hierarchical(resolve_to_latest=true)`.
@@ -571,9 +574,21 @@ impl WorkflowRepository {
     }
 
     /// Search hierarchical workflows by free-text query against `goal` and
-    /// `canonical_name`. ILIKE pattern; ranks newest first by `created_at`.
+    /// `canonical_name`. ILIKE pattern; canonical_name hyphens are normalized
+    /// to spaces before matching so queries like "scan norcal rfps" still
+    /// match the slug `scan-norcal-rfps` when a generation's `goal` text has
+    /// diverged from the lineage's canonical phrase.
     ///
-    /// Used by `GET /api/v1/workflows/hierarchical/search`.
+    /// Filters out rows with `truth_value < min_truth` so `deprecate_workflow`
+    /// (truth=0.05) hides rows from active queries.
+    ///
+    /// When `resolve_to_latest` is true, callers want the newest generation
+    /// per `canonical_name`; ordering becomes `(canonical_name ASC,
+    /// generation DESC, created_at DESC)` so callers can dedup by walking
+    /// the head of each canonical group without a sort.
+    ///
+    /// Used by `GET /api/v1/workflows/hierarchical/search` and the MCP
+    /// `find_workflow_hierarchical` tool.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
@@ -581,19 +596,59 @@ impl WorkflowRepository {
         pool: &PgPool,
         query: &str,
         limit: i64,
+        min_truth: f64,
+        resolve_to_latest: bool,
     ) -> Result<Vec<HierarchicalWorkflowRow>, sqlx::Error> {
-        let pattern = format!("%{}%", query.trim());
-        sqlx::query_as::<_, HierarchicalWorkflowRow>(
-            "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at \
+        // Normalize hyphens to spaces on BOTH sides so `deploy-canary`
+        // (slug form) and `deploy canary` (goal-text form) match each
+        // other. Without this, callers that send a goal-shaped query
+        // string (spaces) miss generations whose goals have diverged from
+        // the lineage's canonical phrase — only the slug carries the
+        // shared lineage signal. Likewise, a caller that sends the slug
+        // verbatim should still match a goal that wrote out the words.
+        let pattern = format!("%{}%", query.trim().replace('-', " "));
+        let order_clause = if resolve_to_latest {
+            "ORDER BY canonical_name ASC, generation DESC, created_at DESC, id ASC"
+        } else {
+            "ORDER BY created_at DESC, id ASC"
+        };
+        let sql = format!(
+            "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
              FROM workflows \
-             WHERE goal ILIKE $1 OR canonical_name ILIKE $1 \
-             ORDER BY created_at DESC, id ASC \
-             LIMIT $2",
-        )
-        .bind(&pattern)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
+             WHERE (replace(canonical_name, '-', ' ') || ' ' || replace(goal, '-', ' ')) ILIKE $1 \
+               AND truth_value >= $2 \
+             {order_clause} \
+             LIMIT $3"
+        );
+        sqlx::query_as::<_, HierarchicalWorkflowRow>(&sql)
+            .bind(&pattern)
+            .bind(min_truth)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+    }
+
+    /// Set `workflows.truth_value` for the given workflow id. Used by
+    /// `deprecate_workflow` to cascade truth=0.05 from the flat-claim row
+    /// onto the hierarchical-table row so `find_workflow_hierarchical`
+    /// respects the deprecation signal.
+    ///
+    /// Returns the number of rows affected (0 if `workflow_id` is a
+    /// flat-only workflow with no `workflows` row).
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn set_truth_value(
+        pool: &PgPool,
+        workflow_id: Uuid,
+        truth_value: f64,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("UPDATE workflows SET truth_value = $1 WHERE id = $2")
+            .bind(truth_value)
+            .bind(workflow_id)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -737,21 +792,22 @@ mod tests {
         .await
         .unwrap();
 
-        let hits = WorkflowRepository::search_hierarchical_by_text(&pool, "sensor", 10)
+        let hits = WorkflowRepository::search_hierarchical_by_text(&pool, "sensor", 10, 0.0, false)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].canonical_name, "data-pipeline-v1");
 
         // canonical_name match also works
-        let hits = WorkflowRepository::search_hierarchical_by_text(&pool, "deploy-canary", 10)
-            .await
-            .unwrap();
+        let hits =
+            WorkflowRepository::search_hierarchical_by_text(&pool, "deploy-canary", 10, 0.0, false)
+                .await
+                .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].canonical_name, "deploy-canary");
 
         // limit respected
-        let hits = WorkflowRepository::search_hierarchical_by_text(&pool, "%", 1)
+        let hits = WorkflowRepository::search_hierarchical_by_text(&pool, "%", 1, 0.0, false)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);

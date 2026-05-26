@@ -89,6 +89,9 @@ pub struct HierarchicalSearchQuery {
     pub limit: Option<i64>,
     #[serde(default)]
     pub resolve_to_latest: bool,
+    /// Minimum `truth_value` to surface. Defaults to 0.3 so rows
+    /// deprecated via `deprecate_workflow` (truth=0.05) drop out.
+    pub min_truth: Option<f64>,
 }
 
 #[cfg(feature = "db")]
@@ -121,6 +124,9 @@ pub struct HierarchicalWorkflowResult {
     pub parent_id: Option<uuid::Uuid>,
     pub metadata: serde_json::Value,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Deprecation signal: 1.0 for live rows; `deprecate_workflow`
+    /// cascades 0.05 onto this column.
+    pub truth_value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_steps: Option<Vec<ResolvedStepResult>>,
 }
@@ -227,6 +233,30 @@ pub async fn store_workflow(
             .map_err(|e| ApiError::InternalError {
                 message: format!("workflow ingest: {e}"),
             })?;
+
+    // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
+    // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
+    if let Some(embedder) = state.embedding_service() {
+        for (claim_id, content) in &result.inserted {
+            match embedder.generate(content).await {
+                Ok(embedding) => {
+                    let pgvector_str = format_embedding(&embedding);
+                    if let Err(e) =
+                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+                            .bind(&pgvector_str)
+                            .bind(*claim_id)
+                            .execute(&state.db_pool)
+                            .await
+                    {
+                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for ingested workflow claim");
+                }
+            }
+        }
+    }
 
     // Emit event
     let _ = epigraph_db::EventRepository::insert(
@@ -690,10 +720,13 @@ pub async fn find_workflow_hierarchical(
     Query(params): Query<HierarchicalSearchQuery>,
 ) -> Result<Json<HierarchicalSearchResponse>, ApiError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
+    let min_truth = params.min_truth.unwrap_or(0.3);
     let rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
         &state.db_pool,
         &params.q,
         limit,
+        min_truth,
+        params.resolve_to_latest,
     )
     .await
     .map_err(|e| ApiError::InternalError {
@@ -710,6 +743,7 @@ pub async fn find_workflow_hierarchical(
             parent_id: r.parent_id,
             metadata: r.metadata,
             created_at: r.created_at,
+            truth_value: r.truth_value,
             resolved_steps: None,
         })
         .collect();
@@ -1077,6 +1111,11 @@ pub async fn deprecate_workflow(
                 .bind(id)
                 .execute(&state.db_pool)
                 .await;
+        // Mirror onto the hierarchical `workflows` row when one exists
+        // (no-op for flat-only workflows). Without this, deprecated
+        // hierarchical workflows keep surfacing in
+        // `GET /api/v1/workflows/hierarchical/search`.
+        let _ = epigraph_db::WorkflowRepository::set_truth_value(&state.db_pool, *id, 0.05).await;
     }
 
     // Emit event
@@ -1198,6 +1237,30 @@ pub async fn ingest_workflow(
             .map_err(|e| ApiError::InternalError {
                 message: format!("workflow ingest: {e}"),
             })?;
+
+    // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
+    // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
+    if let Some(embedder) = state.embedding_service() {
+        for (claim_id, content) in &result.inserted {
+            match embedder.generate(content).await {
+                Ok(embedding) => {
+                    let pgvector_str = format_embedding(&embedding);
+                    if let Err(e) =
+                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+                            .bind(&pgvector_str)
+                            .bind(*claim_id)
+                            .execute(&state.db_pool)
+                            .await
+                    {
+                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for ingested workflow claim");
+                }
+            }
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "workflow_id": result.workflow_id,

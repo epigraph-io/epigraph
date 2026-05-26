@@ -131,9 +131,21 @@ pub async fn store_workflow(
         relationships: vec![],
     };
 
-    let response =
-        crate::tools::workflow_ingest::do_ingest_workflow_via_pool(&server.pool, &extraction)
-            .await?;
+    let (response, inserted) =
+        crate::tools::workflow_ingest::execute_workflow_ingest_with_inserted(
+            &server.pool,
+            &extraction,
+        )
+        .await?;
+
+    // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
+    // invariant (CLAUDE.md "Embedding policy"). Mirrors `do_ingest_workflow` —
+    // without this, step claims created via `store_workflow` land without
+    // embeddings and break semantic search.
+    // `embed_and_store` logs tracing::warn on failure internally; no outer handling needed.
+    for (claim_id, content) in &inserted {
+        let _ = server.embedder.embed_and_store(*claim_id, content).await;
+    }
 
     success_json(&StoreWorkflowResponse {
         workflow_id: response.workflow_id,
@@ -542,6 +554,12 @@ pub async fn deprecate_workflow(
     .execute(&server.pool)
     .await
     .map_err(internal_error)?;
+    // Cascade onto the hierarchical `workflows` row (no-op when this
+    // workflow has only a flat-claim representation). Without this,
+    // `find_workflow_hierarchical` keeps returning the deprecated row.
+    epigraph_db::WorkflowRepository::set_truth_value(&server.pool, workflow_id, 0.05)
+        .await
+        .map_err(internal_error)?;
     deprecated_ids.push(workflow_id.to_string());
 
     if cascade {
@@ -586,6 +604,10 @@ pub async fn deprecate_workflow(
                 .execute(&server.pool)
                 .await
                 .map_err(internal_error)?;
+                // Mirror onto the hierarchical row, if any.
+                epigraph_db::WorkflowRepository::set_truth_value(&server.pool, child_id, 0.05)
+                    .await
+                    .map_err(internal_error)?;
                 deprecated_ids.push(child_id.to_string());
                 queue.push(child_id);
             }

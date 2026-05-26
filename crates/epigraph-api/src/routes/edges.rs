@@ -126,191 +126,61 @@ pub fn is_valid_relationship(s: &str) -> bool {
     VALID_RELATIONSHIPS.contains(&s)
 }
 
-/// Check if a relationship type is evidential (supports/refutes/corroborates/contradicts).
-/// Case-insensitive matching.
-fn is_evidential_relationship(relationship: &str) -> bool {
-    matches!(
-        relationship.to_lowercase().as_str(),
-        "supports" | "refutes" | "corroborates" | "contradicts"
-    )
-}
-
-/// Check if an evidential relationship is positive (supports/corroborates) vs negative.
-fn is_positive_evidence(relationship: &str) -> bool {
-    matches!(
-        relationship.to_lowercase().as_str(),
-        "supports" | "corroborates"
-    )
-}
-
-/// Trigger DS recomputation on the target claim when an evidential edge is created.
+/// Trigger DS recomputation on the target claim when an epistemic edge is created.
 ///
-/// 1. Look up the source claim's truth_value to weight the evidence
-/// 2. Find or verify the graph-topology frame
-/// 3. Build a mass function: mass = source_truth * 0.7 * 0.5
-///    - Positive edges: mass on {supported} (hypothesis 0)
-///    - Negative edges: mass on {contradicted} (hypothesis 1)
-/// 4. Store the mass function with source_claim as source_agent_id
-/// 5. Reload all mass functions, combine, compute BetP, update claim belief
+/// Delegates to `epigraph_engine::edge_factor::auto_wire_edge_if_epistemic`,
+/// which uses the canonical `binary_truth` frame and the `RestrictionKind`
+/// transmission factors per `RestrictionProfile::scientific()`. Then runs
+/// 1-hop propagation to dependents (reasoning-trace input chain) — an
+/// HTTP-only concern that doesn't belong in the engine factor module.
+///
+/// BBA attribution: the source claim's `agent_id` is used as the BBA's
+/// `source_agent_id`, mirroring the legacy semantics ("A's author asserts
+/// A SUPPORTS B").
 #[cfg(feature = "db")]
 async fn trigger_edge_ds_recomputation(
     pool: &sqlx::PgPool,
+    edge_id: uuid::Uuid,
     source_claim_id: uuid::Uuid,
     target_claim_id: uuid::Uuid,
+    source_type: &str,
+    target_type: &str,
     relationship: &str,
 ) -> Result<(), crate::errors::ApiError> {
-    use epigraph_ds::{combination, FrameOfDiscernment, MassFunction};
-    use std::collections::BTreeSet;
+    use epigraph_engine::edge_factor::{auto_wire_edge_if_epistemic, EdgeFactorOutcome};
 
-    // 1. Get source claim's truth_value and agent_id
-    let source_row: Option<(Option<f64>, Uuid)> =
-        sqlx::query_as("SELECT truth_value, agent_id FROM claims WHERE id = $1")
+    let source_agent_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
             .bind(source_claim_id)
             .fetch_optional(pool)
             .await
             .map_err(|e| crate::errors::ApiError::DatabaseError {
-                message: format!("Failed to fetch source claim: {e}"),
+                message: format!("Failed to fetch source claim agent: {e}"),
             })?;
-
-    let (source_truth_value, source_agent_id) = match source_row {
-        Some((tv, agent_id)) => (tv.unwrap_or(0.5), agent_id),
-        None => return Ok(()), // source claim doesn't exist, skip silently
+    let Some(agent_id) = source_agent_id else {
+        return Ok(()); // source claim doesn't exist — skip silently
     };
 
-    // 2. Get the graph-topology frame ID
-    let frame_row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM frames WHERE name = 'graph-topology'")
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| crate::errors::ApiError::DatabaseError {
-                message: format!("Failed to fetch graph-topology frame: {e}"),
-            })?;
-
-    let frame_id = frame_row
-        .ok_or_else(|| crate::errors::ApiError::InternalError {
-            message: "graph-topology frame not found; run migration first".to_string(),
-        })?
-        .0;
-
-    // 3. Build the DS frame and mass function
-    let ds_frame = FrameOfDiscernment::new(
-        "graph-topology",
-        vec!["supported".to_string(), "contradicted".to_string()],
-    )
-    .map_err(|e| crate::errors::ApiError::InternalError {
-        message: format!("Failed to create DS frame: {e}"),
-    })?;
-
-    let mass_value = source_truth_value * 0.7 * 0.5;
-    let hypothesis_idx = if is_positive_evidence(relationship) {
-        0
-    } else {
-        1
-    };
-
-    let mass_fn = MassFunction::simple(
-        ds_frame.clone(),
-        BTreeSet::from([hypothesis_idx]),
-        mass_value,
-    )
-    .map_err(|e| crate::errors::ApiError::InternalError {
-        message: format!("Failed to create mass function: {e}"),
-    })?;
-
-    // 4. Store the mass function with source_claim_id as source_agent_id
-    //    This ensures each edge's evidence is stored independently via the
-    //    ON CONFLICT on (claim_id, frame_id, source_agent_id, perspective_id).
-    let masses_json = mass_fn.masses_to_json();
-    epigraph_db::MassFunctionRepository::store(
+    let outcome = auto_wire_edge_if_epistemic(
         pool,
+        true, // caller already gated on was_created
+        edge_id,
+        source_claim_id,
+        source_type,
         target_claim_id,
-        frame_id,
-        Some(source_agent_id), // source_agent_id = agent who created the source claim
-        &masses_json,
-        None,
-        Some("discount"), // match submit_evidence convention
+        target_type,
+        relationship,
+        agent_id,
     )
-    .await
-    .map_err(|e| crate::errors::ApiError::DatabaseError {
-        message: format!("Failed to store edge mass function: {e}"),
-    })?;
+    .await;
 
-    // 5. Reload all mass functions for (target_claim, graph-topology frame),
-    //    combine them, compute BetP, and update claim belief.
-    let all_rows =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, target_claim_id, frame_id)
-            .await
-            .map_err(|e| crate::errors::ApiError::DatabaseError {
-                message: format!("Failed to load mass functions for combination: {e}"),
-            })?;
-
-    // Filter to only "discount" method entries (user-submitted BBAs), sorted by ID
-    let mut indexed_rows: Vec<(Uuid, MassFunction)> = all_rows
-        .iter()
-        .filter(|row| row.combination_method.as_deref() == Some("discount"))
-        .filter_map(|row| {
-            MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
-                .ok()
-                .map(|m| (row.id, m))
-        })
-        .collect();
-    indexed_rows.sort_by_key(|(id, _)| *id);
-
-    if indexed_rows.is_empty() {
+    // Only propagate when we actually wired a factor — the other outcomes
+    // (Vacuous / SourceFactorless / NonEpistemic / wrapper-gate skip) leave
+    // target belief unchanged so dependents don't need recomputing.
+    if !matches!(outcome, Some(EdgeFactorOutcome::Wired)) {
         return Ok(());
     }
 
-    let mass_fns: Vec<MassFunction> = indexed_rows.into_iter().map(|(_, m)| m).collect();
-
-    let (combined, _reports) = if mass_fns.len() == 1 {
-        (mass_fns.into_iter().next().unwrap(), vec![])
-    } else {
-        combination::combine_multiple(&mass_fns, 0.3).map_err(|e| {
-            crate::errors::ApiError::InternalError {
-                message: format!("DS combination failed: {e}"),
-            }
-        })?
-    };
-
-    // Look up claim's hypothesis_index in claim_frames for correct Bel/Pl
-    let claim_assignment =
-        epigraph_db::FrameRepository::get_claim_assignment(pool, target_claim_id, frame_id)
-            .await
-            .map_err(|e| crate::errors::ApiError::DatabaseError {
-                message: format!("Failed to get claim assignment: {e}"),
-            })?;
-    let h_idx = claim_assignment.and_then(|ca| ca.hypothesis_index);
-
-    let (final_bel, final_pl, final_betp, m_missing) =
-        super::belief::compute_hypothesis_belief(&combined, &ds_frame, h_idx);
-    let m_empty = combined.mass_of_empty();
-
-    // Update the target claim's belief columns (including truth_value = BetP)
-    epigraph_db::MassFunctionRepository::update_claim_belief(
-        pool,
-        target_claim_id,
-        final_bel,
-        final_pl,
-        m_empty,
-        Some(final_betp),
-        m_missing,
-    )
-    .await
-    .map_err(|e| crate::errors::ApiError::DatabaseError {
-        message: format!("Failed to update claim belief: {e}"),
-    })?;
-
-    tracing::info!(
-        target_claim = %target_claim_id,
-        source_claim = %source_claim_id,
-        relationship = %relationship,
-        belief = final_bel,
-        plausibility = final_pl,
-        betp = final_betp,
-        "Edge-triggered DS recomputation complete"
-    );
-
-    // 6. Propagate to dependent claims (1-hop via reasoning trace inputs)
     let mut visited = std::collections::HashSet::new();
     visited.insert(target_claim_id);
     match propagate_to_dependents(pool, target_claim_id, &mut visited).await {
@@ -325,7 +195,6 @@ async fn trigger_edge_ds_recomputation(
             }
         }
         Err(e) => {
-            // Log but don't fail the edge creation — propagation is best-effort
             tracing::warn!(
                 updated_claim = %target_claim_id,
                 error = %e,
@@ -333,7 +202,6 @@ async fn trigger_edge_ds_recomputation(
             );
         }
     }
-
     Ok(())
 }
 
@@ -413,111 +281,30 @@ async fn propagate_to_dependents(
     Ok(recomputed)
 }
 
-/// Recompute a single claim's combined belief from its mass functions.
+/// Recompute a single claim's combined belief from its `binary_truth` BBAs.
 ///
-/// Loads all mass functions for the claim's graph-topology frame,
-/// combines them via Dempster's rule, computes BetP, and updates
-/// the claim's truth_value and belief columns.
+/// Used by `propagate_to_dependents` to refresh dependent claims whose
+/// reasoning-trace inputs changed. Delegates to the engine's canonical
+/// CDST cascade (discount-by-source_strength → combine_multiple → write
+/// Bel/Pl/BetP).
 #[cfg(feature = "db")]
 async fn recompute_claim_belief(
     pool: &sqlx::PgPool,
     claim_id: Uuid,
 ) -> Result<(), crate::errors::ApiError> {
-    use epigraph_ds::{combination, FrameOfDiscernment, MassFunction};
-
-    // Get the graph-topology frame
-    let frame_row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM frames WHERE name = 'graph-topology'")
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| crate::errors::ApiError::DatabaseError {
-                message: format!("Failed to fetch graph-topology frame: {e}"),
-            })?;
-
-    let frame_id = match frame_row {
-        Some((id,)) => id,
-        None => return Ok(()), // No frame = nothing to recompute
-    };
-
-    let ds_frame = FrameOfDiscernment::new(
-        "graph-topology",
-        vec!["supported".to_string(), "contradicted".to_string()],
-    )
-    .map_err(|e| crate::errors::ApiError::InternalError {
-        message: format!("Failed to create DS frame: {e}"),
-    })?;
-
-    // Load all mass functions for this claim
-    let all_rows =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
-            .await
-            .map_err(|e| crate::errors::ApiError::DatabaseError {
-                message: format!("Failed to load mass functions for dependent claim: {e}"),
-            })?;
-
-    let mut indexed_rows: Vec<(Uuid, MassFunction)> = all_rows
-        .iter()
-        .filter(|row| row.combination_method.as_deref() == Some("discount"))
-        .filter_map(|row| {
-            MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
-                .ok()
-                .map(|m| (row.id, m))
-        })
-        .collect();
-    indexed_rows.sort_by_key(|(id, _)| *id);
-
-    if indexed_rows.is_empty() {
-        return Ok(());
-    }
-
-    let mass_fns: Vec<MassFunction> = indexed_rows.into_iter().map(|(_, m)| m).collect();
-
-    let (combined, _reports) = if mass_fns.len() == 1 {
-        (mass_fns.into_iter().next().unwrap(), vec![])
-    } else {
-        combination::combine_multiple(&mass_fns, 0.3).map_err(|e| {
-            crate::errors::ApiError::InternalError {
-                message: format!("DS combination failed for dependent claim: {e}"),
+    epigraph_engine::edge_factor::recompute_claim_belief_binary(pool, claim_id)
+        .await
+        .map(|recomputed| {
+            if recomputed {
+                tracing::info!(
+                    claim = %claim_id,
+                    "Dependent claim recomputed via 1-hop propagation"
+                );
             }
-        })?
-    };
-
-    // Look up claim's hypothesis_index
-    let claim_assignment =
-        epigraph_db::FrameRepository::get_claim_assignment(pool, claim_id, frame_id)
-            .await
-            .map_err(|e| crate::errors::ApiError::DatabaseError {
-                message: format!("Failed to get claim assignment for dependent: {e}"),
-            })?;
-    let h_idx = claim_assignment.and_then(|ca| ca.hypothesis_index);
-
-    let (final_bel, final_pl, final_betp, m_missing) =
-        super::belief::compute_hypothesis_belief(&combined, &ds_frame, h_idx);
-    let m_empty = combined.mass_of_empty();
-
-    epigraph_db::MassFunctionRepository::update_claim_belief(
-        pool,
-        claim_id,
-        final_bel,
-        final_pl,
-        m_empty,
-        Some(final_betp),
-        m_missing,
-    )
-    .await
-    .map_err(|e| crate::errors::ApiError::DatabaseError {
-        message: format!("Failed to update dependent claim belief: {e}"),
-    })?;
-
-    tracing::info!(
-        claim = %claim_id,
-        belief = final_bel,
-        plausibility = final_pl,
-        betp = final_betp,
-        "Dependent claim recomputed via 1-hop propagation"
-    );
-
-    Ok(())
+        })
+        .map_err(|e| crate::errors::ApiError::DatabaseError {
+            message: format!("Failed to recompute dependent claim belief: {e}"),
+        })
 }
 
 // =============================================================================
@@ -781,29 +568,29 @@ pub async fn create_edge(
             }
         }
 
-        // Edge-triggered DS recomputation: if this is an evidential edge between
-        // two claims, recompute the target claim's truth_value via DS combination.
-        if is_evidential_relationship(&request.relationship)
-            && request.source_type == "claim"
-            && request.target_type == "claim"
+        // Edge-triggered DS recomputation. The engine self-filters via
+        // `RestrictionKind::Neutral` on non-epistemic relationships, so the
+        // wrapper handles all 13 epistemic types (supports/corroborates/
+        // contradicts/refutes/refines/...) instead of just the 4 evidentials.
+        if let Err(e) = trigger_edge_ds_recomputation(
+            pool,
+            edge_id,
+            request.source_id,
+            request.target_id,
+            &request.source_type,
+            &request.target_type,
+            &request.relationship,
+        )
+        .await
         {
-            if let Err(e) = trigger_edge_ds_recomputation(
-                pool,
-                request.source_id,
-                request.target_id,
-                &request.relationship,
-            )
-            .await
-            {
-                tracing::warn!(
-                    edge_id = %edge_id,
-                    source_id = %request.source_id,
-                    target_id = %request.target_id,
-                    relationship = %request.relationship,
-                    error = %e,
-                    "Edge-triggered DS recomputation failed; edge created successfully"
-                );
-            }
+            tracing::warn!(
+                edge_id = %edge_id,
+                source_id = %request.source_id,
+                target_id = %request.target_id,
+                relationship = %request.relationship,
+                error = %e,
+                "Edge-triggered DS recomputation failed; edge created successfully"
+            );
         }
 
         // P2a: Auto-create factor for epistemic edges

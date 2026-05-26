@@ -4,7 +4,9 @@
 //! `workflows` table (hierarchical roots) — distinct from the legacy flat
 //! workflow claims handled in `workflows.rs`.
 //!
-//! - `find_workflow_hierarchical` — ILIKE search over goal/canonical_name.
+//! - `find_workflow_hierarchical` — ILIKE search over goal and a
+//!   hyphen-normalized canonical_name; filters by `min_truth` so deprecated
+//!   rows (truth=0.05) drop out by default.
 //! - `report_hierarchical_outcome` — updates `workflows.metadata` counters
 //!   and writes per-step `behavioral_executions` rows with `step_claim_id`
 //!   resolved from the workflow's `executes` edges in plan order.
@@ -54,11 +56,17 @@ pub async fn find_workflow_hierarchical(
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let resolve_to_latest = params.resolve_to_latest.unwrap_or(false);
+    // Default 0.3 hides deprecated rows (truth=0.05) while leaving room
+    // for future probabilistic discounting; callers can pass 0.0 to see
+    // the deprecated cemetery.
+    let min_truth = params.min_truth.unwrap_or(0.3);
 
     let rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
         &server.pool,
         &params.query,
         limit,
+        min_truth,
+        resolve_to_latest,
     )
     .await
     .map_err(internal_error)?;
@@ -73,6 +81,7 @@ pub async fn find_workflow_hierarchical(
             "parent_id": r.parent_id,
             "metadata": r.metadata,
             "created_at": r.created_at,
+            "truth_value": r.truth_value,
         });
 
         if resolve_to_latest {
@@ -90,6 +99,7 @@ pub async fn find_workflow_hierarchical(
         "workflows": workflows,
         "total": workflows.len(),
         "resolve_to_latest": resolve_to_latest,
+        "min_truth": min_truth,
     }))
 }
 

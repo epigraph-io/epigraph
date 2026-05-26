@@ -561,6 +561,60 @@ pub async fn create_claim(
         message: format!("Failed to commit transaction: {e}"),
     })?;
 
+    // Embed inline, best-effort. Mirrors POST /api/v1/submit/packet
+    // (routes/submit.rs:1480-1507). Failures are warned but never fail the
+    // claim create — embedding is recoverable via backfill; the claim is not.
+    // Skip embedding when privacy_tier != "public" — encrypted/fully_private
+    // claims have placeholder or ciphertext content that wouldn't yield a
+    // useful semantic vector.
+    if privacy_tier == "public" && was_created {
+        if let Some(embedder) = state.embedding_service() {
+            match embedder.generate(&request.content).await {
+                Ok(embedding) => {
+                    let pgvector_str = format!(
+                        "[{}]",
+                        embedding
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    if let Err(e) =
+                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+                            .bind(&pgvector_str)
+                            .bind(claim_uuid)
+                            .execute(&state.db_pool)
+                            .await
+                    {
+                        tracing::warn!(
+                            claim_id = %claim_uuid,
+                            error = %e,
+                            "Failed to store embedding on create_claim"
+                        );
+                    } else {
+                        tracing::debug!(
+                            claim_id = %claim_uuid,
+                            embedding_dim = embedding.len(),
+                            "Generated and stored embedding on create_claim"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        claim_id = %claim_uuid,
+                        error = %e,
+                        "Failed to generate embedding on create_claim"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!(
+                claim_id = %claim_uuid,
+                "embedding_service not configured; create_claim skipping embed"
+            );
+        }
+    }
+
     // Materialize edges (best-effort, after commit)
     let _ = epigraph_db::EdgeRepository::create(
         &state.db_pool,

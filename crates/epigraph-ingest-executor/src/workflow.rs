@@ -36,6 +36,11 @@ pub struct WorkflowIngestExecutionResult {
     /// `true` when the idempotency gate short-circuited (workflow already
     /// has `executes` edges). The other counters are zero in that case.
     pub already_ingested: bool,
+    /// (claim_id, content) for every newly inserted claim in this run.
+    /// Empty on idempotent re-ingest. Callers embed these to satisfy the
+    /// is_current=true → has-embedding invariant; see CLAUDE.md
+    /// "Embedding policy".
+    pub inserted: Vec<(Uuid, String)>,
 }
 
 /// Execute a workflow ingest plan against the database.
@@ -79,6 +84,7 @@ pub async fn execute_workflow_ingest_plan(
                 variant_of_edge_created: false,
                 relationship_edges_created: 0,
                 already_ingested: true,
+                inserted: Vec::new(),
             });
         }
     }
@@ -156,6 +162,7 @@ pub async fn execute_workflow_ingest_plan(
     // ── 5. Walk planned claims: dedup-by-id ─────────────────────────────
     let mut claims_ingested = 0_usize;
     let mut claims_skipped_dedup = 0_usize;
+    let mut inserted: Vec<(Uuid, String)> = Vec::new();
     let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
 
     for planned in &plan.claims {
@@ -217,6 +224,7 @@ pub async fn execute_workflow_ingest_plan(
                 .execute(pool)
                 .await?;
             claims_ingested += 1;
+            inserted.push((planned.id, planned.content.clone()));
         } else {
             claims_skipped_dedup += 1;
         }
@@ -288,5 +296,6 @@ pub async fn execute_workflow_ingest_plan(
         variant_of_edge_created,
         relationship_edges_created: relationships_created,
         already_ingested: false,
+        inserted,
     })
 }

@@ -15,6 +15,13 @@ use uuid::Uuid;
 use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository};
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
+// Edge-factor auto-wire moved to `epigraph_engine::edge_factor` so the HTTP
+// route layer can share a single algorithm. Re-export keeps the existing
+// MCP call sites (`tools::ingestion`, `tools::workflows`) working unchanged.
+pub use epigraph_engine::edge_factor::{
+    auto_wire_ds_for_edge, auto_wire_edge_if_epistemic, EdgeFactorOutcome,
+};
+
 /// Probability value in [0.0, 1.0]. Currently f64 for codebase consistency.
 /// Future: may migrate to f32 or bounded newtype for memory optimization.
 /// Changing this alias + recompiling will flag every callsite.

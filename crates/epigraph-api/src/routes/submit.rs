@@ -1473,59 +1473,97 @@ pub async fn submit_packet(
     // This enables semantic search to find this claim based on meaning.
     // Embedding generation is non-blocking: if the service is unavailable
     // or fails, the claim submission still succeeds.
+    //
+    // Skip host-provenance telemetry (epiclaw-host signs every observable
+    // event as a signed claim for tamper-evidence; embedding sentence-shaped
+    // operational events like "Container X exited code 0 after Yms" has no
+    // semantic value and costs an OpenAI call per event).
+    let is_host_telemetry = packet
+        .claim
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("event"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|e| {
+            matches!(
+                e,
+                "container_spawned"
+                    | "container_exited"
+                    | "agent_output"
+                    | "task_scheduled"
+                    | "task_executed"
+                    | "message_received"
+                    | "message_sent"
+            )
+        });
+
     #[cfg(feature = "db")]
     if let Some(ref embedding_service) = state.embedding_service {
-        match embedding_service.generate(&packet.claim.content).await {
-            Ok(embedding) => {
-                // Store directly via SQL (provider-agnostic — works with Jina, OpenAI, etc.)
-                let pgvector_str = format!(
-                    "[{}]",
-                    embedding
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                if let Err(e) =
-                    sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                        .bind(&pgvector_str)
-                        .bind(claim_id)
-                        .execute(&state.db_pool)
-                        .await
-                {
+        if is_host_telemetry {
+            tracing::debug!(
+                claim_id = %claim_id,
+                "Skipping embedding for host-provenance telemetry claim"
+            );
+        } else {
+            match embedding_service.generate(&packet.claim.content).await {
+                Ok(embedding) => {
+                    // Store directly via SQL (provider-agnostic — works with Jina, OpenAI, etc.)
+                    let pgvector_str = format!(
+                        "[{}]",
+                        embedding
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    if let Err(e) =
+                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+                            .bind(&pgvector_str)
+                            .bind(claim_id)
+                            .execute(&state.db_pool)
+                            .await
+                    {
+                        tracing::warn!(
+                            claim_id = %claim_id,
+                            error = %e,
+                            "Failed to store claim embedding"
+                        );
+                    } else {
+                        tracing::debug!(
+                            claim_id = %claim_id,
+                            embedding_dim = embedding.len(),
+                            "Generated and stored embedding for claim"
+                        );
+                    }
+                }
+                Err(e) => {
                     tracing::warn!(
                         claim_id = %claim_id,
                         error = %e,
-                        "Failed to store claim embedding"
+                        "Failed to generate embedding for claim"
                     );
-                } else {
-                    tracing::debug!(
-                        claim_id = %claim_id,
-                        embedding_dim = embedding.len(),
-                        "Generated and stored embedding for claim"
-                    );
+                    // Continue anyway - claim submission shouldn't fail due to embedding issues
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    claim_id = %claim_id,
-                    error = %e,
-                    "Failed to generate embedding for claim"
-                );
-                // Continue anyway - claim submission shouldn't fail due to embedding issues
             }
         }
     }
     #[cfg(not(feature = "db"))]
     if let Some(ref embedding_service) = state.embedding_service {
-        match embedding_service.generate(&packet.claim.content).await {
-            Ok(embedding) => {
-                if let Err(e) = embedding_service.store(claim_id, &embedding).await {
-                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store claim embedding");
+        if is_host_telemetry {
+            tracing::debug!(
+                claim_id = %claim_id,
+                "Skipping embedding for host-provenance telemetry claim"
+            );
+        } else {
+            match embedding_service.generate(&packet.claim.content).await {
+                Ok(embedding) => {
+                    if let Err(e) = embedding_service.store(claim_id, &embedding).await {
+                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store claim embedding");
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for claim");
+                Err(e) => {
+                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for claim");
+                }
             }
         }
     }
