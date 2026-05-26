@@ -372,7 +372,7 @@ pub async fn do_ingest_document(
             continue;
         }
 
-        let (_row, _was_created) = EdgeRepository::create_if_not_exists(
+        let (row, was_created) = EdgeRepository::create_if_not_exists(
             pool,
             src,
             &src_type,
@@ -386,6 +386,21 @@ pub async fn do_ingest_document(
         .await
         .map_err(internal_error)?;
         relationships_created += 1;
+
+        // Epistemic-edge factor auto-wire (best-effort; non-epistemic and
+        // non-claim edges are filtered inside the helper).
+        ds_auto::auto_wire_edge_if_epistemic(
+            pool,
+            was_created,
+            row.id,
+            src,
+            &src_type,
+            tgt,
+            &edge.target_type,
+            &edge.relationship,
+            agent_id,
+        )
+        .await;
     }
 
     // ── 6. Auto-CDST batch wire (atoms only) ──

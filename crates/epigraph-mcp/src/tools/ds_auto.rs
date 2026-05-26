@@ -564,3 +564,38 @@ async fn recompute_combined_belief(
     .map_err(|e| format!("update_claim_belief: {e}"))?;
     Ok(())
 }
+
+/// Fire `auto_wire_ds_for_edge` from an edge-creation call site, gated on
+/// whether the edge was newly created and connects two claim nodes.
+///
+/// Best-effort: failures are logged at `warn` and swallowed. Returns `None`
+/// when the edge wasn't newly created, sources/targets aren't claims, or the
+/// auto-wire call failed. Returns `Some(outcome)` when the trigger fired.
+#[allow(clippy::too_many_arguments)]
+pub async fn auto_wire_edge_if_epistemic(
+    pool: &PgPool,
+    was_created: bool,
+    edge_id: Uuid,
+    source_id: Uuid,
+    source_type: &str,
+    target_id: Uuid,
+    target_type: &str,
+    relationship: &str,
+    agent_id: Uuid,
+) -> Option<EdgeFactorOutcome> {
+    if !was_created || source_type != "claim" || target_type != "claim" {
+        return None;
+    }
+    match auto_wire_ds_for_edge(pool, edge_id, agent_id, source_id, target_id, relationship).await {
+        Ok(outcome) => Some(outcome),
+        Err(e) => {
+            tracing::warn!(
+                edge = %edge_id,
+                target = %target_id,
+                relationship = %relationship,
+                "edge auto-wire failed: {e}",
+            );
+            None
+        }
+    }
+}
