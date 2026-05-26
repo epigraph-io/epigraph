@@ -113,10 +113,7 @@ async fn neighborhood_density_returns_count_and_breakdown() {
         .unwrap();
     let status = resp.status().as_u16();
     let body_text = resp.text().await.unwrap_or_default();
-    assert_eq!(
-        status, 200,
-        "endpoint should return 200; body: {body_text}"
-    );
+    assert_eq!(status, 200, "endpoint should return 200; body: {body_text}");
     let body: Value = serde_json::from_str(&body_text).expect("response body is JSON");
     let n = body["n_claims"].as_i64().expect("n_claims field");
     assert!(n >= 5, "expected >=5 near claims, got {n}; body: {body}");

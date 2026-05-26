@@ -24,10 +24,12 @@ async fn hypothesize_returns_clusters_when_cluster_count_set() {
     // module — they share the test DB and the density seeds use the mock
     // embedding of a different query string but at high similarity, polluting
     // our cluster count.
-    sqlx::query("DELETE FROM claims WHERE content LIKE 'hyp-cluster-%' OR content LIKE 'density-test-%'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "DELETE FROM claims WHERE content LIKE 'hyp-cluster-%' OR content LIKE 'density-test-%'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let agent_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000aa").unwrap();
     sqlx::query(
@@ -66,7 +68,10 @@ async fn hypothesize_returns_clusters_when_cluster_count_set() {
         }
         let vstr = format!(
             "[{}]",
-            v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
+            v.iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         );
         sqlx::query(
             "INSERT INTO claims (content, content_hash, agent_id, truth_value, is_current, properties, embedding) \

@@ -195,11 +195,8 @@ pub async fn hypothesize(
                 .map(|(_, _, t)| t.unwrap_or(0.5))
                 .collect();
 
-            let cluster_result = epigraph_engine::theme_cluster::cluster_embeddings(
-                &embeddings,
-                k as usize,
-                25,
-            );
+            let cluster_result =
+                epigraph_engine::theme_cluster::cluster_embeddings(&embeddings, k as usize, 25);
 
             let mut clusters: Vec<serde_json::Value> =
                 Vec::with_capacity(cluster_result.centroids.len());
