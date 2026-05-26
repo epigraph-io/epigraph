@@ -23,10 +23,13 @@ Current reservation:
 
 - **001–034**: public
 - **035–037**: `epigraph-internal` (`claim_supersession`, `challenges_and_events`,
-  `analyses`) — applied to prod 2026-05-22
-- **038+**: public next
+  `analyses`) — applied to prod 2026-05-22. Public has since renumbered these
+  same files in-tree to `036–038` (cross-source matching port); prod
+  `_sqlx_migrations` rows must be renumbered +1 on next public deploy.
+- **038**: public `corroborates_factor_strength_from_score` (PR #173)
+- **039+**: public next
 
-Next public migration must be `038` or later. Picking a colliding version
+Next public migration must be `039` or later. Picking a colliding version
 (checksum mismatch on a `_sqlx_migrations` row that's already applied) will
 panic the api binary on restart.
 
