@@ -246,7 +246,7 @@ def recompute_centroids(theme_ids=None):
     body = {}
     if theme_ids:
         body["theme_ids"] = list(theme_ids)
-    data = api_post("/api/v1/themes/recompute-centroids", body)
+    data = api_post("/api/v1/themes/recompute-centroids", body, timeout=1800)
     themes = data.get("themes", [])
     return data.get("updated", 0), themes
 
