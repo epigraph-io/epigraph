@@ -64,9 +64,9 @@ def api_get(path, params=None):
     return resp.json()
 
 
-def api_post(path, body=None):
+def api_post(path, body=None, timeout=120):
     """POST request to the API."""
-    resp = requests.post(f"{API_URL}{path}", json=body or {}, headers=get_auth_headers(), timeout=120)
+    resp = requests.post(f"{API_URL}{path}", json=body or {}, headers=get_auth_headers(), timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
@@ -74,11 +74,16 @@ def api_post(path, body=None):
 # ── Phase 1: Assign unthemed claims ──────────────────────────────────────────
 
 def assign_unthemed_claims():
-    """Assign claims with embeddings but no theme to nearest theme centroid."""
+    """Assign claims with embeddings but no theme to nearest theme centroid.
+
+    The server loops internally until all unthemed claims are assigned —
+    on a fresh DB with ~425k unthemed rows this can take many minutes.
+    The default requests timeout (120s) is too short; bump to 30 min.
+    """
     if DRY_RUN:
         print("  [DRY] Skipping assignment", file=sys.stderr)
         return 0
-    data = api_post("/api/v1/themes/assign-unthemed", {"batch_size": 500})
+    data = api_post("/api/v1/themes/assign-unthemed", {"batch_size": 500}, timeout=1800)
     return data.get("assigned", 0)
 
 
