@@ -14,6 +14,7 @@ use rmcp::model::*;
 
 use crate::errors::{internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
+use crate::tools::ds_auto;
 use crate::types::{ImproveWorkflowHierarchyParams, IngestWorkflowParams};
 
 use epigraph_ingest::workflow::WorkflowExtraction;
@@ -52,6 +53,27 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan(pool, &plan, extraction)
         .await
         .map_err(|e| internal_error(format!("workflow ingest: {e}")))?;
+
+    // Auto-wire DS factors for newly-inserted epistemic edges. The executor
+    // returns the edges so the caller can fire this without pulling
+    // `epigraph-engine` into the executor's dep graph (matches the embedding
+    // pattern documented in CLAUDE.md "Embedding policy").
+    if let Some(agent_id) = result.system_agent_id {
+        for e in &result.inserted_edges {
+            ds_auto::auto_wire_edge_if_epistemic(
+                pool,
+                true, // executor only emits an InsertedPlanEdge when was_created=true
+                e.edge_id,
+                e.source_id,
+                &e.source_type,
+                e.target_id,
+                &e.target_type,
+                &e.relationship,
+                agent_id,
+            )
+            .await;
+        }
+    }
 
     let inserted = result.inserted.clone();
     let response = IngestWorkflowResponse {

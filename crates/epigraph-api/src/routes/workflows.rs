@@ -234,6 +234,8 @@ pub async fn store_workflow(
                 message: format!("workflow ingest: {e}"),
             })?;
 
+    auto_wire_inserted_edges(&state.db_pool, &result).await;
+
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     if let Some(embedder) = state.embedding_service() {
@@ -1238,6 +1240,8 @@ pub async fn ingest_workflow(
                 message: format!("workflow ingest: {e}"),
             })?;
 
+    auto_wire_inserted_edges(&state.db_pool, &result).await;
+
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     if let Some(embedder) = state.embedding_service() {
@@ -1309,6 +1313,33 @@ fn format_embedding(embedding: &[f32]) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+/// Fire `auto_wire_edge_if_epistemic` for each plan edge the executor newly
+/// inserted. Best-effort (the helper logs and swallows individual failures).
+/// Source-claim agent attribution is handled by the engine helper via
+/// `system_agent_id` from the executor result.
+async fn auto_wire_inserted_edges(
+    pool: &sqlx::PgPool,
+    result: &epigraph_ingest_executor::WorkflowIngestExecutionResult,
+) {
+    let Some(agent_id) = result.system_agent_id else {
+        return;
+    };
+    for e in &result.inserted_edges {
+        epigraph_engine::edge_factor::auto_wire_edge_if_epistemic(
+            pool,
+            true, // executor only emits InsertedPlanEdge when was_created=true
+            e.edge_id,
+            e.source_id,
+            &e.source_type,
+            e.target_id,
+            &e.target_type,
+            &e.relationship,
+            agent_id,
+        )
+        .await;
+    }
 }
 
 // ── Internal types ──

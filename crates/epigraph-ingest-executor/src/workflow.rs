@@ -18,6 +18,20 @@ use epigraph_ingest::workflow::WorkflowExtraction;
 use crate::error::IngestExecutorError;
 use crate::system_agent::get_or_create_system_agent;
 
+/// A newly inserted plan edge as returned by the executor. Callers iterate
+/// these post-hoc to fire `auto_wire_edge_if_epistemic` (the executor itself
+/// is pure-DB and doesn't depend on epigraph-engine — mirrors the embedding
+/// pattern documented in CLAUDE.md "Embedding policy").
+#[derive(Debug, Clone)]
+pub struct InsertedPlanEdge {
+    pub edge_id: Uuid,
+    pub source_id: Uuid,
+    pub source_type: String,
+    pub target_id: Uuid,
+    pub target_type: String,
+    pub relationship: String,
+}
+
 /// Summary of what the executor wrote (or skipped) for a single plan.
 #[derive(Debug, Clone)]
 pub struct WorkflowIngestExecutionResult {
@@ -41,6 +55,15 @@ pub struct WorkflowIngestExecutionResult {
     /// is_current=true → has-embedding invariant; see CLAUDE.md
     /// "Embedding policy".
     pub inserted: Vec<(Uuid, String)>,
+    /// Newly inserted plan edges (claim→claim relationships from
+    /// `IngestPlan::edges`). Callers fire `auto_wire_edge_if_epistemic` on
+    /// each so epistemic edges materialize their factor BBA on the target.
+    /// Empty on idempotent re-ingest.
+    pub inserted_edges: Vec<InsertedPlanEdge>,
+    /// Agent the workflow attributes its writes to. Callers pass this to
+    /// `auto_wire_edge_if_epistemic` as the BBA's `source_agent_id`. `None`
+    /// on idempotent re-ingest (no agent created, no edges to wire).
+    pub system_agent_id: Option<Uuid>,
 }
 
 /// Execute a workflow ingest plan against the database.
@@ -85,6 +108,8 @@ pub async fn execute_workflow_ingest_plan(
                 relationship_edges_created: 0,
                 already_ingested: true,
                 inserted: Vec::new(),
+                inserted_edges: Vec::new(),
+                system_agent_id: None,
             });
         }
     }
@@ -252,6 +277,7 @@ pub async fn execute_workflow_ingest_plan(
 
     // ── 7. Intra-claim plan edges (decomposes_to / step_follows / phase_follows / cross-refs) ──
     let mut relationships_created = 0_usize;
+    let mut inserted_edges: Vec<InsertedPlanEdge> = Vec::new();
     for edge in &plan.edges {
         let (src, src_type) = if edge.source_type == "author_placeholder" {
             let idx = edge.properties["author_index"].as_u64().unwrap_or(0) as usize;
@@ -271,7 +297,7 @@ pub async fn execute_workflow_ingest_plan(
             .copied()
             .unwrap_or(edge.target_id);
 
-        let (_row, _was_created) = EdgeRepository::create_if_not_exists(
+        let (row, was_created) = EdgeRepository::create_if_not_exists(
             pool,
             src,
             &src_type,
@@ -284,6 +310,16 @@ pub async fn execute_workflow_ingest_plan(
         )
         .await?;
         relationships_created += 1;
+        if was_created {
+            inserted_edges.push(InsertedPlanEdge {
+                edge_id: row.id,
+                source_id: src,
+                source_type: src_type,
+                target_id: tgt,
+                target_type: edge.target_type.clone(),
+                relationship: edge.relationship.clone(),
+            });
+        }
     }
 
     Ok(WorkflowIngestExecutionResult {
@@ -297,5 +333,7 @@ pub async fn execute_workflow_ingest_plan(
         relationship_edges_created: relationships_created,
         already_ingested: false,
         inserted,
+        inserted_edges,
+        system_agent_id: Some(system_agent_id),
     })
 }
