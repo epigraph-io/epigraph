@@ -183,6 +183,10 @@ name = "staleness_events"
 path = "tests/events/staleness_events_test.rs"
 
 [[test]]
+name = "hypothesize_cluster_test"
+path = "tests/hypothesize_cluster_test.rs"
+
+[[test]]
 name = "embed_on_create_claim"
 path = "tests/integration/embed_on_create_claim.rs"
 

@@ -21,6 +21,44 @@ pub async fn spawn_app(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) 
     (addr, tx)
 }
 
+/// Spawn the test app with a `MockProvider` embedding service injected.
+///
+/// Mirrors `epigraph_api::build_app_for_tests` (lib.rs) but inserts a
+/// deterministic embedding provider into `AppState` so handlers that call
+/// `state.embedding_service()` get a real provider instead of `None`.
+///
+/// Use this for tests of routes like `POST /api/v1/embeddings/neighborhood-density`
+/// whose handler returns 500 when no embedding service is configured.
+pub async fn spawn_app_with_mock_embedding(
+    database_url: &str,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
+    use std::sync::Arc;
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(database_url)
+        .await
+        .expect("db connect");
+    let provider = MockProvider::new(EmbeddingConfig::openai(1536));
+    let svc: Arc<dyn EmbeddingService> = Arc::new(provider);
+    let state = epigraph_api::AppState::with_db(pool, epigraph_api::ApiConfig::default())
+        .with_embedding_service(svc);
+    let app = epigraph_api::routes::create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    (addr, tx)
+}
+
 /// Returns a real signed JWT that the production bearer_auth_middleware will accept.
 /// Uses the same secret-fallback logic as `AppState::default_jwt_config`.
 pub fn test_bearer_token() -> String {

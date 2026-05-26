@@ -30,6 +30,11 @@ use crate::state::AppState;
 pub struct HypothesizeRequest {
     pub statement: String,
     pub search_radius: Option<f64>,
+    /// When set, the handler runs k-means with this many clusters over the
+    /// similar-claims neighborhood and returns a `clusters` field with one
+    /// entry per cluster (centroid summary, member claim IDs, mean prior
+    /// belief). Per spec 2026-05-18-cross-source-anchor §0b.
+    pub cluster_count: Option<u32>,
 }
 
 #[cfg(feature = "db")]
@@ -153,12 +158,108 @@ pub async fn hypothesize(
         })
         .collect();
 
-    Ok(Json(serde_json::json!({
+    // Optional clustering branch — only fires when cluster_count is set.
+    let clusters_value = if let Some(k) = request.cluster_count {
+        if k == 0 || similar.is_empty() {
+            serde_json::Value::Array(vec![])
+        } else {
+            // Pull embeddings for the same neighborhood — re-query because the
+            // initial `similar` projection doesn't include the vector column.
+            // Cast pgvector -> real[] for sqlx Vec<f32> decoding. Note:
+            // `embedding::text::float4[]` does NOT work — pgvector's text
+            // form `[a,b,c]` is not a valid Postgres array literal (which
+            // requires `{a,b,c}`). Casting via `vector::real[]` is the
+            // pgvector-native path.
+            let neighborhood: Vec<(uuid::Uuid, Vec<f32>, Option<f64>)> = sqlx::query_as(
+                "SELECT id, embedding::real[], truth_value \
+                 FROM claims \
+                 WHERE embedding IS NOT NULL \
+                   AND is_current = true \
+                   AND 1 - (embedding <=> $1::vector) >= $2 \
+                 ORDER BY embedding <=> $1::vector \
+                 LIMIT 200",
+            )
+            .bind(format_embedding(&embedding))
+            .bind(search_radius)
+            .fetch_all(&state.db_pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to fetch neighborhood embeddings: {e}"),
+            })?;
+
+            let embeddings: Vec<Vec<f32>> =
+                neighborhood.iter().map(|(_, e, _)| e.clone()).collect();
+            let ids: Vec<uuid::Uuid> = neighborhood.iter().map(|(id, _, _)| *id).collect();
+            let truths: Vec<f64> = neighborhood
+                .iter()
+                .map(|(_, _, t)| t.unwrap_or(0.5))
+                .collect();
+
+            let cluster_result =
+                epigraph_engine::theme_cluster::cluster_embeddings(&embeddings, k as usize, 25);
+
+            let mut clusters: Vec<serde_json::Value> =
+                Vec::with_capacity(cluster_result.centroids.len());
+            for c in 0..cluster_result.centroids.len() {
+                let member_ids: Vec<uuid::Uuid> = cluster_result
+                    .assignments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &a)| a == c)
+                    .map(|(i, _)| ids[i])
+                    .collect();
+                if member_ids.is_empty() {
+                    continue;
+                }
+                let mean_prior: f64 = {
+                    let sum: f64 = cluster_result
+                        .assignments
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &a)| a == c)
+                        .map(|(i, _)| truths[i])
+                        .sum();
+                    sum / member_ids.len() as f64
+                };
+
+                // Centroid summary: short prefix of the cluster's nearest claim
+                // by index — keeps the handler dependency-free. Per spec open
+                // question on LLM-driven centroid_summary (deferred).
+                let nearest_idx = cluster_result
+                    .assignments
+                    .iter()
+                    .position(|&a| a == c)
+                    .unwrap();
+                let nearest_id = ids[nearest_idx];
+                let summary = similar
+                    .iter()
+                    .find(|s| s.id == nearest_id)
+                    .map(|s| s.content.chars().take(80).collect::<String>())
+                    .unwrap_or_else(|| format!("cluster-{c}"));
+
+                clusters.push(serde_json::json!({
+                    "centroid_summary": summary,
+                    "claim_ids": member_ids,
+                    "mean_prior_belief": mean_prior,
+                    "member_count": member_ids.len(),
+                }));
+            }
+            serde_json::Value::Array(clusters)
+        }
+    } else {
+        serde_json::Value::Null
+    };
+
+    let mut response = serde_json::json!({
         "prior_belief": prior_belief,
         "similar_claims": similar_json,
         "similar_count": similar.len(),
         "epistemic_status": status,
-    })))
+    });
+    if !clusters_value.is_null() {
+        response["clusters"] = clusters_value;
+    }
+    Ok(Json(response))
 }
 
 /// POST /api/v1/methods - Add a characterization/synthesis method.

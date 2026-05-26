@@ -31,6 +31,7 @@ pub mod context;
 pub mod conventions;
 pub mod crud;
 pub mod edges;
+pub mod embeddings;
 #[cfg(feature = "db")]
 pub mod entities;
 pub mod events;
@@ -661,6 +662,10 @@ pub fn create_router(state: AppState) -> Router {
             get(experiments::method_gap_analysis),
         )
         .route("/api/v1/voids/density", get(voids::embedding_density))
+        .route(
+            "/api/v1/embeddings/neighborhood-density",
+            post(embeddings::neighborhood_density),
+        )
         .route(
             "/api/v1/sheaf/consistency",
             get(computation::sheaf_consistency),

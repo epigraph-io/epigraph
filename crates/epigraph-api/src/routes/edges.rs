@@ -115,6 +115,7 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "COMPOSED_OF", // synthesis → synthesis (prereq composition)
     "METHODOLOGY", // claim → claim (methodology relation, traversal)
     "SUPERSEDES", // upper-case alias of lower-case "supersedes" above; synthesis-side callers use upper-case per PROV-O convention
+    "INSTANTIATES", // claim → claim (paper claim is an instance of textbook concept; cross-source anchor 2026-05-18-cross-source-anchor §3)
 ];
 
 pub fn is_valid_entity_type(s: &str) -> bool {
@@ -2353,6 +2354,7 @@ mod tests {
         assert!(is_valid_relationship("associated_with"));
         assert!(is_valid_relationship("section_follows"));
         assert!(is_valid_relationship("continues_argument"));
+        assert!(is_valid_relationship("INSTANTIATES"));
         assert!(!is_valid_relationship("invalid"));
         assert!(!is_valid_relationship(""));
     }

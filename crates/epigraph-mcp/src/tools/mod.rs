@@ -3,6 +3,7 @@ pub mod challenges;
 pub mod claims;
 pub mod ds;
 pub mod ds_auto;
+pub mod embeddings;
 pub mod events;
 pub mod evolve_step;
 pub mod graph;

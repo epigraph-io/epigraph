@@ -215,8 +215,15 @@ async fn main() {
     // handlers (db feature only).  The runner uses PostgresJobQueue for
     // durable persistence.  Each cron loop fires 60 s after startup then
     // every 24 h thereafter.
+    //
+    // Set EPIGRAPH_DISABLE_JOBS=1 to skip the runner entirely. Used when
+    // running a sidecar API server (e.g. for one-shot bootstrap scripts)
+    // alongside the primary server so both don't race on the same nightly
+    // cron jobs (which would OOM the smaller process and clobber state).
     #[cfg(feature = "db")]
-    {
+    if std::env::var("EPIGRAPH_DISABLE_JOBS").as_deref() == Ok("1") {
+        tracing::info!("EPIGRAPH_DISABLE_JOBS=1 set; skipping job runner registration");
+    } else {
         let queue: Arc<dyn JobQueue> = Arc::new(PostgresJobQueue::new(job_pool.clone()));
         let queue_for_cluster_cron = Arc::clone(&queue);
         let queue_for_theme_cron = Arc::clone(&queue);
