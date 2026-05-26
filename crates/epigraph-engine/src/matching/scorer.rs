@@ -35,6 +35,14 @@ pub struct MatchFeatures {
     /// mass function. Designed to break the cosine+graph precision ceiling
     /// at hard-negative same-topic-opposite-stance pairs.
     pub belief_alignment: f32,
+    /// Topic-cluster proximity from semantic themes (`claim_themes`).
+    /// 1.0 when both claims share `theme_id`; otherwise cosine similarity
+    /// of the two themes' centroids. 0.5 (neutral) when either claim is
+    /// unthemed. Captures macro-topic signal beyond per-claim cosine —
+    /// e.g. two claims both about "DNA origami" but with different
+    /// phrasings cluster to the same theme even when their per-claim
+    /// embeddings drift.
+    pub theme_proximity: f32,
     /// `|days(a.created_at - b.created_at)|`; reported but not in score.
     pub temporal_dist_days: i32,
     /// Normalized weighted sum of the eight similarity features.
@@ -56,15 +64,18 @@ pub struct Weights {
     pub graph_overlap: f32,
     #[serde(default = "default_belief_alignment")]
     pub belief_alignment: f32,
+    #[serde(default = "default_theme_proximity")]
+    pub theme_proximity: f32,
 }
 
 fn default_graph_overlap() -> f32 { 0.10 }
 fn default_belief_alignment() -> f32 { 0.15 }
+fn default_theme_proximity() -> f32 { 0.10 }
 
 impl Default for Weights {
     fn default() -> Self {
         Self {
-            embed_cosine: 0.40,
+            embed_cosine: 0.35,
             triple_overlap: 0.15,
             entity_jaccard: 0.10,
             method_match: 0.05,
@@ -72,6 +83,7 @@ impl Default for Weights {
             citation_overlap: 0.05,
             graph_overlap: 0.10,
             belief_alignment: 0.10,
+            theme_proximity: 0.05,
         }
     }
 }
@@ -312,6 +324,49 @@ pub async fn score_pair(
     };
 
     // ------------------------------------------------------------------
+    // Query 5: theme_proximity via claims.theme_id + claim_themes.centroid.
+    //
+    // Shared-theme pairs → 1.0 (strong same-topic signal). Different-theme
+    // pairs → centroid cosine, which compresses semantically-distant
+    // themes (marketing vs. astronomy) to near-0 even when individual
+    // embeddings drift toward overlap. Either claim unthemed → 0.5
+    // (neutral, same rationale as belief_alignment missing case). The
+    // HNSW index on `idx_claim_themes_centroid` makes the centroid lookup
+    // O(1) per side.
+    // ------------------------------------------------------------------
+    let row5 = sqlx::query(
+        r#"
+        WITH a AS (SELECT theme_id FROM claims WHERE id = $1),
+             b AS (SELECT theme_id FROM claims WHERE id = $2)
+        SELECT
+            CASE
+                WHEN (SELECT theme_id FROM a) IS NULL
+                  OR (SELECT theme_id FROM b) IS NULL
+                    THEN NULL
+                WHEN (SELECT theme_id FROM a) = (SELECT theme_id FROM b)
+                    THEN 1.0::real
+                ELSE
+                    COALESCE(
+                        (1.0 - (
+                            (SELECT centroid FROM claim_themes
+                                WHERE id = (SELECT theme_id FROM a))
+                            <=>
+                            (SELECT centroid FROM claim_themes
+                                WHERE id = (SELECT theme_id FROM b))
+                        ))::real,
+                        0.5::real
+                    )
+            END AS theme_proximity
+        "#,
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await?;
+    let tp_opt: Option<f32> = row5.try_get("theme_proximity")?;
+    let theme_proximity: f32 = tp_opt.unwrap_or(0.5).clamp(0.0, 1.0);
+
+    // ------------------------------------------------------------------
     // Combined score: normalized weighted sum (temporal_dist_days excluded)
     // ------------------------------------------------------------------
     let raw = w.embed_cosine * embed_cosine
@@ -321,7 +376,8 @@ pub async fn score_pair(
         + w.nbhd_overlap * nbhd_overlap
         + w.citation_overlap * citation_overlap
         + w.graph_overlap * graph_overlap
-        + w.belief_alignment * belief_alignment;
+        + w.belief_alignment * belief_alignment
+        + w.theme_proximity * theme_proximity;
     let denom = w.embed_cosine
         + w.triple_overlap
         + w.entity_jaccard
@@ -329,7 +385,8 @@ pub async fn score_pair(
         + w.nbhd_overlap
         + w.citation_overlap
         + w.graph_overlap
-        + w.belief_alignment;
+        + w.belief_alignment
+        + w.theme_proximity;
     let score = (raw / denom).clamp(0.0, 1.0);
 
     Ok(MatchFeatures {
@@ -341,6 +398,7 @@ pub async fn score_pair(
         citation_overlap,
         graph_overlap,
         belief_alignment,
+        theme_proximity,
         temporal_dist_days,
         score,
     })

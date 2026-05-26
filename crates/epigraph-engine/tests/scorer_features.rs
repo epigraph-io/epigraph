@@ -408,6 +408,109 @@ async fn belief_alignment_reflects_betp_distance(pool: PgPool) {
     );
 }
 
+/// Two claims sharing the same `theme_id` → theme_proximity = 1.0
+/// regardless of centroid distance (the same-theme shortcut avoids the
+/// cosine path).
+#[sqlx::test(migrations = "../../migrations")]
+async fn theme_proximity_same_theme(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+
+    let centroid = format!("[{}]", vec!["0.05"; 1536].join(","));
+    let theme_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO claim_themes (label, centroid)
+         VALUES ('t', $1::vector) RETURNING id",
+    )
+    .bind(&centroid)
+    .fetch_one(&pool)
+    .await
+    .expect("insert theme");
+    for &c in &[a, b] {
+        sqlx::query("UPDATE claims SET theme_id = $1 WHERE id = $2")
+            .bind(theme_id)
+            .bind(c)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let features = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+    assert!(
+        (features.theme_proximity - 1.0).abs() < 1e-6,
+        "expected theme_proximity = 1.0 for shared theme, got {}",
+        features.theme_proximity
+    );
+}
+
+/// Either claim missing `theme_id` → theme_proximity = 0.5 (neutral),
+/// same convention as belief_alignment with missing mass functions.
+#[sqlx::test(migrations = "../../migrations")]
+async fn theme_proximity_neutral_when_unthemed(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let features = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+    assert!(
+        (features.theme_proximity - 0.5).abs() < 1e-6,
+        "expected theme_proximity = 0.5 (neutral) for unthemed pair, got {}",
+        features.theme_proximity
+    );
+}
+
+/// Claims in different themes with orthogonal centroids →
+/// theme_proximity ≈ 0 (cosine sim of (1,0..) and (0,1,0..) is 0).
+#[sqlx::test(migrations = "../../migrations")]
+async fn theme_proximity_orthogonal_themes(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+
+    let mut v1 = vec!["0.0"; 1536];
+    v1[0] = "1.0";
+    let mut v2 = vec!["0.0"; 1536];
+    v2[1] = "1.0";
+    let theme_a: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO claim_themes (label, centroid) VALUES ('a', $1::vector) RETURNING id",
+    )
+    .bind(format!("[{}]", v1.join(",")))
+    .fetch_one(&pool)
+    .await
+    .expect("insert theme a");
+    let theme_b: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO claim_themes (label, centroid) VALUES ('b', $1::vector) RETURNING id",
+    )
+    .bind(format!("[{}]", v2.join(",")))
+    .fetch_one(&pool)
+    .await
+    .expect("insert theme b");
+    sqlx::query("UPDATE claims SET theme_id = $1 WHERE id = $2")
+        .bind(theme_a)
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE claims SET theme_id = $1 WHERE id = $2")
+        .bind(theme_b)
+        .bind(b)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let features = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+    assert!(
+        features.theme_proximity < 0.1,
+        "expected theme_proximity < 0.1 for orthogonal centroids, got {}",
+        features.theme_proximity
+    );
+}
+
 /// No mass function on either claim → belief_alignment = 0.5 (genuinely
 /// neutral: doesn't lift the score, doesn't depress it).
 #[sqlx::test(migrations = "../../migrations")]
