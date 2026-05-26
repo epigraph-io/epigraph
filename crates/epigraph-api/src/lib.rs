@@ -41,9 +41,18 @@ pub fn _test_event_store() -> std::sync::Arc<crate::routes::events::EventStore> 
 /// Calling this in `bin/server.rs` (and `bin/epigraph-migrate.rs`) before the
 /// HTTP listener binds ensures fresh deploys never serve traffic against a
 /// stale schema.
+///
+/// `ignore_missing(true)` is required because `epigraph-internal` shares the
+/// same `_sqlx_migrations` table and applies its own migrations (currently
+/// versions 35–37). Without this flag, the public binary would panic on
+/// restart with "migration N was previously applied but is missing in the
+/// resolved migrations". See `migrations/README.md` for the version-range
+/// reservation.
 #[cfg(feature = "db")]
 pub async fn run_migrations(pool: &epigraph_db::PgPool) -> Result<(), sqlx::migrate::MigrateError> {
-    sqlx::migrate!("../../migrations").run(pool).await
+    let mut migrator = sqlx::migrate!("../../migrations");
+    migrator.set_ignore_missing(true);
+    migrator.run(pool).await
 }
 
 #[cfg(feature = "db")]
