@@ -94,6 +94,35 @@ impl PerspectiveRepository {
         Ok(())
     }
 
+    /// Ensure a synthetic "edge_factor" perspective row exists with the given
+    /// id (= edge UUID). Used by `auto_wire_ds_for_edge` to satisfy the
+    /// `mass_functions.perspective_id` FK so each epistemic edge produces its
+    /// own BBA row keyed by `(claim, frame, agent, edge_id)`.
+    ///
+    /// Idempotent — `ON CONFLICT DO NOTHING`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn ensure_edge_perspective(
+        pool: &PgPool,
+        id: Uuid,
+        owner_agent_id: Option<Uuid>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            INSERT INTO perspectives (id, name, owner_agent_id, perspective_type)
+            VALUES ($1, 'edge_factor', $2, 'edge')
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(id)
+        .bind(owner_agent_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
     /// Get a perspective by ID
     ///
     /// # Errors
