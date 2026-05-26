@@ -288,7 +288,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Threshold sweep on each signal independently.
-    let thresholds: Vec<f32> = (50..=99).map(|i| i as f32 / 100.0).collect();
+    // Sweep 0.30-0.99 — extended down so we can compare the engine's
+    // bands.mid (typically 0.40) operating point against the SciFact P/R
+    // curve directly.
+    let thresholds: Vec<f32> = (30..=99).map(|i| i as f32 / 100.0).collect();
     let metrics_cosine: Vec<ThresholdMetric> = thresholds
         .iter()
         .map(|&t| metric_at(&scored, t, |s| s.cosine))
