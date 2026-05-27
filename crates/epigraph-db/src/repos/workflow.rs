@@ -115,6 +115,23 @@ impl WorkflowRepository {
         Ok(())
     }
 
+    /// Return true when a row exists in the `workflows` table for the given
+    /// id. Used by the legacy `report_workflow_outcome` MCP tool to decide
+    /// whether to delegate to `report_hierarchical_outcome` (when the caller
+    /// passed a `workflows.id` returned by `store_workflow` post-`acaca80`)
+    /// or fall through to the flat-claim outcome path.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn exists(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+        let (exists,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM workflows WHERE id = $1)")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+        Ok(exists)
+    }
+
     /// Look up a workflow root by `(canonical_name, generation)`.
     pub async fn find_root_by_canonical(
         pool: &PgPool,
@@ -626,6 +643,40 @@ impl WorkflowRepository {
             .bind(limit)
             .fetch_all(pool)
             .await
+    }
+
+    /// Search workflow thesis claims by embedding similarity. Returns
+    /// `(claim_id, similarity)` pairs over `claims` rows with
+    /// `properties->>'kind' = 'workflow_thesis'` and a non-NULL 1536d
+    /// embedding (the hierarchical store_workflow population — level=0
+    /// thesis claims, not the level=2 paragraph claims that
+    /// `ClaimRepository::search_by_embedding` filters to).
+    ///
+    /// Used by `recall` as a second pass so workflow theses ingested
+    /// post-`acaca80` are recallable; without it, `recall` only sees
+    /// claims with evidence-row embeddings, and hierarchical workflow
+    /// theses live with their embeddings on `claims.embedding` directly.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn search_thesis_by_embedding(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, f64)>, sqlx::Error> {
+        let rows: Vec<(Uuid, f64)> = sqlx::query_as(
+            "SELECT id, 1 - (embedding <=> $1::vector) AS similarity \
+             FROM claims \
+             WHERE properties->>'kind' = 'workflow_thesis' \
+               AND embedding IS NOT NULL \
+             ORDER BY embedding <=> $1::vector \
+             LIMIT $2",
+        )
+        .bind(query_embedding_pgvector)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Set `workflows.truth_value` for the given workflow id. Used by

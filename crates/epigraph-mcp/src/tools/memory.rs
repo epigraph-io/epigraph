@@ -12,7 +12,9 @@ use epigraph_core::{
     TruthValue,
 };
 use epigraph_crypto::ContentHasher;
-use epigraph_db::{ClaimRepository, EvidenceRepository, ReasoningTraceRepository};
+use epigraph_db::{
+    ClaimRepository, EvidenceRepository, ReasoningTraceRepository, WorkflowRepository,
+};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -131,39 +133,89 @@ pub async fn recall(
     let min_truth = params.min_truth.unwrap_or(0.3);
 
     // Try semantic search first
-    let results = if let Ok(hits) = server.embedder.search(&params.query, limit).await {
-        let mut results = Vec::new();
-        for (claim_id, similarity) in hits {
-            if let Ok(Some(claim)) =
-                ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id)).await
-            {
-                let tv = claim.truth_value.value();
-                if tv >= min_truth {
-                    results.push(RecallResult {
-                        claim_id: claim_id.to_string(),
-                        content: claim.content,
-                        truth_value: tv,
-                        similarity,
-                    });
+    let results = match server.embedder.search(&params.query, limit).await {
+        Ok(hits) => {
+            let mut results = Vec::new();
+            for (claim_id, similarity) in hits {
+                if let Ok(Some(claim)) =
+                    ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id)).await
+                {
+                    let tv = claim.truth_value.value();
+                    if tv >= min_truth {
+                        results.push(RecallResult {
+                            claim_id: claim_id.to_string(),
+                            content: claim.content,
+                            truth_value: tv,
+                            similarity,
+                        });
+                    }
                 }
             }
+
+            // Second pass: hierarchical workflow theses live on
+            // `claims.embedding` (not an evidence row), so the evidence-only
+            // search above misses them. Narrowly augment with workflow
+            // thesis claims — does NOT change recall's semantics for
+            // non-workflow memories. Resolves bug 6d3fc460.
+            if let Ok(pgvec) = server
+                .embedder
+                .generate(&params.query)
+                .await
+                .map(|v| crate::embed::format_pgvector(&v))
+            {
+                if let Ok(thesis_hits) =
+                    WorkflowRepository::search_thesis_by_embedding(&server.pool, &pgvec, limit)
+                        .await
+                {
+                    let already: std::collections::HashSet<String> =
+                        results.iter().map(|r| r.claim_id.clone()).collect();
+                    for (claim_id, similarity) in thesis_hits {
+                        if already.contains(&claim_id.to_string()) {
+                            continue;
+                        }
+                        if let Ok(Some(claim)) =
+                            ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id))
+                                .await
+                        {
+                            let tv = claim.truth_value.value();
+                            if tv >= min_truth {
+                                results.push(RecallResult {
+                                    claim_id: claim_id.to_string(),
+                                    content: claim.content,
+                                    truth_value: tv,
+                                    similarity,
+                                });
+                            }
+                        }
+                    }
+                    // Re-sort by similarity (desc) and truncate to the caller's limit.
+                    results.sort_by(|a, b| {
+                        b.similarity
+                            .partial_cmp(&a.similarity)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    results.truncate(limit as usize);
+                }
+            }
+
+            results
         }
-        results
-    } else {
-        // Fallback to text search
-        let claims = ClaimRepository::list(&server.pool, limit, 0, Some(&params.query))
-            .await
-            .map_err(internal_error)?;
-        claims
-            .into_iter()
-            .filter(|c| c.truth_value.value() >= min_truth)
-            .map(|c| RecallResult {
-                claim_id: c.id.as_uuid().to_string(),
-                content: c.content,
-                truth_value: c.truth_value.value(),
-                similarity: 0.0,
-            })
-            .collect()
+        Err(_) => {
+            // Fallback to text search
+            let claims = ClaimRepository::list(&server.pool, limit, 0, Some(&params.query))
+                .await
+                .map_err(internal_error)?;
+            claims
+                .into_iter()
+                .filter(|c| c.truth_value.value() >= min_truth)
+                .map(|c| RecallResult {
+                    claim_id: c.id.as_uuid().to_string(),
+                    content: c.content,
+                    truth_value: c.truth_value.value(),
+                    similarity: 0.0,
+                })
+                .collect()
+        }
     };
 
     success_json(&results)

@@ -287,7 +287,87 @@ pub async fn find_workflow(
         }
     }
 
+    // Hierarchical fallback (post-acaca80 store_workflow lineage). Flat
+    // searches above only see claims labeled `workflow`; the hierarchical
+    // store puts the workflow root in `workflows` and tags its thesis claim
+    // with `{claim, workflow_thesis}` (no `workflow` label), so the flat
+    // path never finds them. Resolves bug 6d3fc460.
+    if results.len() < limit_usize {
+        let h_rows = WorkflowRepository::search_hierarchical_by_text(
+            &server.pool,
+            &params.goal,
+            (limit as i64) * 2,
+            min_truth,
+            false,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("hierarchical fallback search failed: {e}");
+            Vec::new()
+        });
+
+        let already_seen: std::collections::HashSet<String> =
+            results.iter().map(|r| r.workflow_id.clone()).collect();
+
+        for row in h_rows {
+            if results.len() >= limit_usize {
+                break;
+            }
+            let id_str = row.id.to_string();
+            if already_seen.contains(&id_str) {
+                continue;
+            }
+            results.push(project_hierarchical_workflow(&row, &affinity_map));
+        }
+    }
+
     success_json(&results)
+}
+
+/// Project a `HierarchicalWorkflowRow` into the legacy `FindWorkflowResult`
+/// shape so the flat and hierarchical paths return the same result type.
+/// `steps` is left empty — the hierarchical store keeps step text in
+/// separate level=2 claim nodes; callers needing step bodies should
+/// follow up with `find_workflow_hierarchical(resolve_to_latest=true)`.
+fn project_hierarchical_workflow(
+    row: &epigraph_db::HierarchicalWorkflowRow,
+    affinity_map: &std::collections::HashMap<uuid::Uuid, (f64, i64)>,
+) -> FindWorkflowResult {
+    let use_count = row
+        .metadata
+        .get("use_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let success_count = row
+        .metadata
+        .get("success_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+
+    let (behavioral_affinity, behavioral_execution_count) = match affinity_map.get(&row.id) {
+        Some(&(sim, count)) => (Some(sim), Some(count)),
+        None => (None, None),
+    };
+    let behavioral_success_rate = if use_count > 0 {
+        Some(success_count as f64 / use_count as f64)
+    } else {
+        None
+    };
+
+    FindWorkflowResult {
+        workflow_id: row.id.to_string(),
+        goal: row.goal.clone(),
+        steps: vec![],
+        truth_value: row.truth_value,
+        similarity: 0.0,
+        use_count,
+        success_count,
+        generation: i64::from(row.generation),
+        parent_id: row.parent_id.map(|p| p.to_string()),
+        behavioral_affinity,
+        behavioral_success_rate,
+        behavioral_execution_count,
+    }
 }
 
 /// Build a `FindWorkflowResult` from a workflow claim, applying the shared
@@ -377,6 +457,37 @@ pub async fn report_workflow_outcome(
     params: ReportWorkflowOutcomeParams,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
+
+    // Hierarchical seam: `store_workflow` returns a `workflows.id`, not a
+    // claim id. Probe the `workflows` table first and delegate to the
+    // hierarchical outcome path. Without this, every workflow stored
+    // post-`acaca80` 404s from the flat lookup below. Resolves bug 6d3fc460.
+    if WorkflowRepository::exists(&server.pool, workflow_id)
+        .await
+        .map_err(internal_error)?
+    {
+        let step_executions: Vec<crate::types::HierarchicalStepExecution> = params
+            .execution_log
+            .iter()
+            .map(|s| crate::types::HierarchicalStepExecution {
+                step_index: s.step_index,
+                planned: s.planned.clone(),
+                actual: s.actual.clone(),
+                deviated: s.deviated,
+                deviation_reason: s.deviation_reason.clone(),
+            })
+            .collect();
+        return crate::tools::workflow_hierarchical::do_report_hierarchical_outcome_via_pool(
+            &server.pool,
+            workflow_id,
+            params.success,
+            &step_executions,
+            params.quality,
+            params.goal_text.as_deref(),
+        )
+        .await;
+    }
+
     let claim =
         ClaimRepository::get_by_id(&server.pool, epigraph_core::ClaimId::from_uuid(workflow_id))
             .await
