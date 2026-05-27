@@ -377,11 +377,55 @@ pub async fn report_workflow_outcome(
     params: ReportWorkflowOutcomeParams,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
+
+    // `store_workflow` was migrated to the hierarchical ingest pipeline, so
+    // workflow_ids it returns are rows in the `workflows` table — NOT claim
+    // ids. Probe `workflows` first; if the id lives there, delegate to the
+    // hierarchical outcome path. Falls through to the legacy claims-table
+    // flat-workflow path only when the id is not a hierarchical workflow
+    // (preserves backward-compat for the ~144 legacy flat-workflow claims).
+    let is_hierarchical: bool =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM workflows WHERE id = $1)")
+            .bind(workflow_id)
+            .fetch_one(&server.pool)
+            .await
+            .map_err(internal_error)?;
+
+    if is_hierarchical {
+        // Map flat StepExecution → HierarchicalStepExecution (identical
+        // field shape; the two structs exist only because each tool owns
+        // its own JsonSchema-derived params type).
+        let step_executions: Vec<crate::types::HierarchicalStepExecution> = params
+            .execution_log
+            .iter()
+            .map(|s| crate::types::HierarchicalStepExecution {
+                step_index: s.step_index,
+                planned: s.planned.clone(),
+                actual: s.actual.clone(),
+                deviated: s.deviated,
+                deviation_reason: s.deviation_reason.clone(),
+            })
+            .collect();
+        return crate::tools::workflow_hierarchical::do_report_hierarchical_outcome_via_pool(
+            &server.pool,
+            workflow_id,
+            params.success,
+            &step_executions,
+            params.quality,
+            params.goal_text.as_deref(),
+        )
+        .await;
+    }
+
     let claim =
         ClaimRepository::get_by_id(&server.pool, epigraph_core::ClaimId::from_uuid(workflow_id))
             .await
             .map_err(internal_error)?
-            .ok_or_else(|| invalid_params(format!("workflow {workflow_id} not found")))?;
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "workflow {workflow_id} not found in `workflows` or `claims` tables"
+                ))
+            })?;
 
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
