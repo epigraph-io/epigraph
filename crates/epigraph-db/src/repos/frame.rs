@@ -8,7 +8,13 @@ use sqlx::{FromRow, PgPool};
 use tracing::instrument;
 use uuid::Uuid;
 
-/// A row from the frames table
+/// A row from the frames table.
+///
+/// `properties` is a JSONB bag for per-frame epistemic overrides — see
+/// `migrations/044_frames_properties.sql`. Conventional keys:
+///   * `intra_evidence_locality_factor` (float) — locality-discount
+///     multiplier for this frame; overrides `calibration.toml`'s global
+///     default when set.
 #[derive(Debug, Clone, FromRow)]
 pub struct FrameRow {
     pub id: Uuid,
@@ -19,6 +25,7 @@ pub struct FrameRow {
     pub is_refinable: bool,
     pub version: i32,
     pub created_at: DateTime<Utc>,
+    pub properties: serde_json::Value,
 }
 
 /// A row from the claim_frames junction table
@@ -49,7 +56,7 @@ impl FrameRepository {
             r#"
             INSERT INTO frames (name, description, hypotheses)
             VALUES ($1, $2, $3)
-            RETURNING id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at
+            RETURNING id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             "#,
         )
         .bind(name)
@@ -69,7 +76,7 @@ impl FrameRepository {
     pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<FrameRow>, DbError> {
         let row: Option<FrameRow> = sqlx::query_as(
             r#"
-            SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at
+            SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             FROM frames
             WHERE id = $1
             "#,
@@ -89,7 +96,7 @@ impl FrameRepository {
     pub async fn get_by_name(pool: &PgPool, name: &str) -> Result<Option<FrameRow>, DbError> {
         let row: Option<FrameRow> = sqlx::query_as(
             r#"
-            SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at
+            SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             FROM frames
             WHERE name = $1
             "#,
@@ -109,7 +116,7 @@ impl FrameRepository {
     pub async fn list(pool: &PgPool, limit: i64, offset: i64) -> Result<Vec<FrameRow>, DbError> {
         let rows: Vec<FrameRow> = sqlx::query_as(
             r#"
-            SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at
+            SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             FROM frames
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
@@ -197,7 +204,7 @@ impl FrameRepository {
             r#"
             INSERT INTO frames (name, description, hypotheses, parent_frame_id)
             VALUES ($1, $2, $3, $4)
-            RETURNING id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at
+            RETURNING id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             "#,
         )
         .bind(name)
@@ -218,7 +225,7 @@ impl FrameRepository {
     pub async fn get_children(pool: &PgPool, frame_id: Uuid) -> Result<Vec<FrameRow>, DbError> {
         let rows: Vec<FrameRow> = sqlx::query_as(
             r#"
-            SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at
+            SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             FROM frames
             WHERE parent_frame_id = $1
             ORDER BY created_at ASC
@@ -243,15 +250,15 @@ impl FrameRepository {
         let rows: Vec<FrameRow> = sqlx::query_as(
             r#"
             WITH RECURSIVE ancestry AS (
-                SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at
+                SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
                 FROM frames
                 WHERE id = $1
                 UNION ALL
-                SELECT f.id, f.name, f.description, f.hypotheses, f.parent_frame_id, f.is_refinable, f.version, f.created_at
+                SELECT f.id, f.name, f.description, f.hypotheses, f.parent_frame_id, f.is_refinable, f.version, f.created_at, f.properties
                 FROM frames f
                 JOIN ancestry a ON f.id = a.parent_frame_id
             )
-            SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at
+            SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             FROM ancestry
             "#,
         )
@@ -301,6 +308,72 @@ impl FrameRepository {
 
         Ok(row.0)
     }
+
+    /// Read the per-frame `intra_evidence_locality_factor` override, if any.
+    ///
+    /// Returns `Ok(None)` when:
+    ///   * the frame row doesn't exist,
+    ///   * `properties` does not contain the `intra_evidence_locality_factor`
+    ///     key,
+    ///   * the key's value isn't a number (i.e. the operator wrote
+    ///     garbage — we treat that as "no override" rather than panic).
+    ///
+    /// Callers should fall back to the global default from
+    /// `calibration.toml::evidence_locality.intra_evidence_locality_factor`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` only on actual DB failure. Missing
+    /// rows / missing keys return `Ok(None)`, not an error — the consumer
+    /// is expected to use a calibration default in that case.
+    #[instrument(skip(pool))]
+    pub async fn get_intra_evidence_locality_factor(
+        pool: &PgPool,
+        frame_id: Uuid,
+    ) -> Result<Option<f64>, DbError> {
+        // `properties->>'intra_evidence_locality_factor'` returns TEXT.
+        // Casting to FLOAT8 inside the SQL would panic on malformed
+        // values; safer to fetch the TEXT and parse in Rust so the worst
+        // case is a benign None.
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT properties->>'intra_evidence_locality_factor' FROM frames WHERE id = $1",
+        )
+        .bind(frame_id)
+        .fetch_optional(pool)
+        .await?;
+        let Some((Some(raw),)) = row else {
+            return Ok(None);
+        };
+        Ok(raw.parse::<f64>().ok())
+    }
+
+    /// Set a single key on `frames.properties`. Operator/admin use; the
+    /// main intent is per-frame `intra_evidence_locality_factor` overrides.
+    ///
+    /// Uses `||` (JSONB merge) so existing keys are preserved.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, value))]
+    pub async fn set_property(
+        pool: &PgPool,
+        frame_id: Uuid,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            UPDATE frames
+               SET properties = properties || jsonb_build_object($2::text, $3::jsonb)
+             WHERE id = $1
+            "#,
+        )
+        .bind(frame_id)
+        .bind(key)
+        .bind(value)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -318,6 +391,7 @@ mod tests {
             is_refinable: true,
             version: 1,
             created_at: Utc::now(),
+            properties: serde_json::json!({}),
         };
     }
 

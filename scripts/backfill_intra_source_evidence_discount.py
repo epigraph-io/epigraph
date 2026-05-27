@@ -15,6 +15,16 @@ single-value 0.25 the original #185 script REPLACED with), but an
 empirical/intra BBA at 1.0 lands at 0.30 — preserving the evidence-type
 ordering. Cross-source BBAs are left untouched.
 
+Per-frame override: `frames.properties->>'intra_evidence_locality_factor'`,
+if set, takes precedence over the calibration.toml global default for BBAs
+on that frame (migration 044). Mirrors the resolution order in
+`edge_factor.rs`, so the backfill applies the same locality model new edge
+writes use. Operators set per-frame overrides via
+FrameRepository::set_property or directly:
+    UPDATE frames SET properties = properties ||
+      jsonb_build_object('intra_evidence_locality_factor', 0.5)
+     WHERE name = 'research_validity';
+
 Schema bridge:
   mass_functions.claim_id -> evidence.claim_id
   evidence.properties->>'doi' = (paper that asserts mass_functions.claim_id)
@@ -108,18 +118,56 @@ def in_clause(values: tuple[float, ...]) -> str:
     return "(" + ", ".join(f"{v}" for v in values) + ")"
 
 
+# Numeric-literal regex for parsing per-frame property values. Mirrors the
+# Rust `f64::parse` behaviour the engine uses, so the SQL and the engine
+# agree on which property values are "valid" overrides.
+_FACTOR_REGEX = r"^-?[0-9]+(\\.[0-9]+)?$"
+
+
+def effective_factor_sql(global_default_placeholder: str = "%s") -> str:
+    """SQL expression that resolves the per-frame factor for `mf`.
+
+    Returns a SQL fragment that evaluates to:
+      * (frames.properties->>'intra_evidence_locality_factor')::float8
+        when the override is present AND parses as a number,
+      * the global default placeholder otherwise.
+
+    The caller is responsible for binding the global default as a
+    parameter at the placeholder.
+    """
+    return (
+        "CASE "
+        f"WHEN f.properties ? 'intra_evidence_locality_factor' "
+        f"AND (f.properties->>'intra_evidence_locality_factor') ~ '{_FACTOR_REGEX}' "
+        f"THEN (f.properties->>'intra_evidence_locality_factor')::float8 "
+        f"ELSE {global_default_placeholder} "
+        "END"
+    )
+
+
 def candidate_query(scope_tiers: tuple[float, ...]) -> str:
     """SELECT for in-scope BBAs. `scope_tiers` filters `mf.source_strength`.
 
     Match criterion: BBA's claim has at least one evidence row whose
     `properties->>'doi'` equals the doi of the paper that asserts the
     claim. The set of post-composition tier values is disjoint from
-    `scope_tiers` for any intra factor < 1.0, giving natural idempotency.
+    `scope_tiers` for any intra factor < 1.0, giving natural idempotency
+    (with the additional caveat that a per-frame override at the global
+    default value won't move BBAs at that tier — operators setting
+    overrides at non-default values get clean re-runs as well).
+
+    The JOIN to `frames` lets us pull the per-frame
+    `intra_evidence_locality_factor` override when set; the
+    `effective_factor` column carries the resolved value (per-frame or
+    global default) so the caller can group preview output by it.
     """
     tier_filter = f"mf.source_strength IN {in_clause(scope_tiers)}"
+    factor_expr = effective_factor_sql()
     return f"""
-        SELECT mf.id, mf.claim_id, mf.source_strength
+        SELECT mf.id, mf.claim_id, mf.source_strength,
+               {factor_expr} AS effective_factor
           FROM mass_functions mf
+          JOIN frames f ON f.id = mf.frame_id
          WHERE {tier_filter}
            AND EXISTS (
                SELECT 1
@@ -140,44 +188,60 @@ def candidate_query(scope_tiers: tuple[float, ...]) -> str:
 def preview_distribution(
     conn, scope_tiers: tuple[float, ...], intra_factor: float
 ) -> tuple[int, int]:
-    """Show what would be written, grouped by source_strength."""
+    """Show what would be written, grouped by (source_strength, effective_factor).
+
+    The effective_factor varies when frames carry a per-frame
+    `intra_evidence_locality_factor` override. Reporting both columns
+    surfaces those overrides explicitly instead of hiding them inside a
+    single "post" number that conflates frame-level differences.
+    """
     sql = candidate_query(scope_tiers)
     with conn.cursor() as cur:
-        cur.execute(sql)
+        cur.execute(sql, (intra_factor,))
         rows = cur.fetchall()
     n_rows = len(rows)
     n_claims = len({r[1] for r in rows})
     if n_rows == 0:
         return n_rows, n_claims
 
-    # Group by source_strength tier and show pre / post values.
-    by_tier: dict[float, int] = {}
-    for _, _, ss in rows:
-        ss_f = float(ss)
-        by_tier[ss_f] = by_tier.get(ss_f, 0) + 1
+    # Group by (source_strength, effective_factor) so per-frame overrides
+    # show up as distinct buckets.
+    by_bucket: dict[tuple[float, float], int] = {}
+    for _, _, ss, factor in rows:
+        key = (float(ss), float(factor))
+        by_bucket[key] = by_bucket.get(key, 0) + 1
 
-    print(f"{'pre':>9} {'post':>9} {'rows':>10}")
-    print("-" * 32)
-    for tier in sorted(by_tier.keys(), reverse=True):
-        post = tier * intra_factor
-        print(f"{tier:>9.4f} {post:>9.4f} {by_tier[tier]:>10}")
-    print("-" * 32)
+    print(f"{'pre':>9} {'factor':>9} {'post':>9} {'rows':>10}")
+    print("-" * 42)
+    for (tier, factor) in sorted(by_bucket.keys(), reverse=True):
+        post = tier * factor
+        marker = " *" if abs(factor - intra_factor) > 1e-9 else ""
+        print(f"{tier:>9.4f} {factor:>9.4f} {post:>9.4f} {by_bucket[(tier, factor)]:>10}{marker}")
+    print("-" * 42)
     print(f"total rows: {n_rows}, distinct claims: {n_claims}")
+    print(f"  (global default factor: {intra_factor}; '*' = per-frame override)")
     return n_rows, n_claims
 
 
 def execute_backfill(
     conn, scope_tiers: tuple[float, ...], intra_factor: float
 ) -> tuple[int, list]:
-    """Multiply source_strength by intra_factor for in-scope BBAs.
+    """Multiply source_strength by the resolved per-frame factor for in-scope BBAs.
+
+    Effective factor per row = per-frame override if set, else `intra_factor`
+    (the global default from calibration.toml). Mirrors the resolution
+    order in `edge_factor::wire_evidential_edge_factor`.
 
     Returns (n_rows_updated, sorted_unique_affected_claim_ids).
     """
     tier_filter = f"mf.source_strength IN {in_clause(scope_tiers)}"
+    factor_expr = effective_factor_sql()
     sql = f"""
         UPDATE mass_functions mf
-           SET source_strength = source_strength * %s
-         WHERE {tier_filter}
+           SET source_strength = source_strength * ({factor_expr})
+          FROM frames f
+         WHERE f.id = mf.frame_id
+           AND {tier_filter}
            AND EXISTS (
                SELECT 1
                  FROM evidence e
