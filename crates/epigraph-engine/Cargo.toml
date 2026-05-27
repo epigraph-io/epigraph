@@ -98,5 +98,9 @@ path = "tests/diverse_retrieval_integration.rs"
 name = "diverse_retrieval_layering"
 path = "tests/diverse_retrieval_layering.rs"
 
+[[test]]
+name = "alt_set_cdst_integration"
+path = "tests/alt_set_cdst_integration.rs"
+
 [lints]
 workspace = true

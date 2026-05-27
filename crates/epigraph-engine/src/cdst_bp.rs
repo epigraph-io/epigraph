@@ -11,13 +11,23 @@ use std::sync::LazyLock;
 use uuid::Uuid;
 
 use epigraph_ds::{
-    combination::{adaptive_combine, discount},
+    combination::{adaptive_combine, combine_alternative_set, discount},
     measures::pignistic_probability,
     FocalElement, FrameOfDiscernment, MassFunction,
 };
 
 use crate::bp::FactorPotential;
 use crate::epistemic_interval::EpistemicInterval;
+
+/// Per-claim alternative-set membership loaded from the `alternative_set` view.
+///
+/// Map keys are claim IDs; values are the sorted equivalence-class members
+/// (excluding the key itself). The engine routes a target T's incoming
+/// supporters through [`combine_alternative_set`] when two or more
+/// supporters share an equivalence class, before Dempster-combining the
+/// per-group BBAs against unaffiliated supporters. An empty map preserves
+/// the legacy "pure Dempster" semantics.
+pub type AltSetMembership = HashMap<Uuid, Vec<Uuid>>;
 
 // -- Canonical binary frame ------------------------------------------------
 
@@ -157,6 +167,11 @@ pub struct CdstBpConfig {
     pub convergence_threshold: f64,
     pub damping: f64,
     pub conflict_threshold: f64,
+    /// Map of claim_id -> equivalence-class members (sorted, excluding self).
+    /// When two or more supporters of the same target share a class, their
+    /// BBAs are reduced via [`combine_alternative_set`] before the rest of
+    /// the per-target combine. Empty map => legacy pure-Dempster semantics.
+    pub alt_set_membership: AltSetMembership,
 }
 
 impl Default for CdstBpConfig {
@@ -166,6 +181,7 @@ impl Default for CdstBpConfig {
             convergence_threshold: 0.01,
             damping: 0.5,
             conflict_threshold: 0.3,
+            alt_set_membership: AltSetMembership::new(),
         }
     }
 }
@@ -243,6 +259,30 @@ pub fn cdst_bp_iteration(
     let mut msg_count = 0_usize;
     let mut max_conflict = 0.0_f64;
 
+    // Build a lookup from (factor_id, target_var) -> Some(source_claim_id) for
+    // 2-variable "supporter" factors (EvidentialSupport, SharedEvidence,
+    // DirectionalSupport). MutualExclusion / multi-variable / 1-variable
+    // factors map to `None` and bypass alt-set grouping (they are not
+    // supporters in the alt-set sense). Built fresh each iteration; cost is
+    // O(#factors).
+    let mut message_source: HashMap<(Uuid, Uuid), Option<Uuid>> = HashMap::new();
+    for (factor_id, potential, vars) in factors {
+        let is_supporter_potential = matches!(
+            potential,
+            FactorPotential::EvidentialSupport { .. }
+                | FactorPotential::SharedEvidence { .. }
+                | FactorPotential::DirectionalSupport { .. }
+        );
+        for &var in vars {
+            let source = if is_supporter_potential && vars.len() == 2 {
+                Some(if var == vars[0] { vars[1] } else { vars[0] })
+            } else {
+                None
+            };
+            message_source.insert((*factor_id, var), source);
+        }
+    }
+
     // Phase 1: factor->variable messages
     for (factor_id, potential, vars) in factors {
         for &var in vars {
@@ -252,25 +292,86 @@ pub fn cdst_bp_iteration(
         }
     }
 
-    // Phase 2: variable updates with evidence anchoring
-    let mut var_incoming: HashMap<Uuid, Vec<MassFunction>> = HashMap::new();
-    for ((_, var), msg) in messages.iter() {
-        var_incoming.entry(*var).or_default().push(msg.clone());
+    // Phase 2: variable updates with evidence anchoring.
+    //
+    // Incoming messages are tagged with the source claim_id (when known), so
+    // we can group "supporter" messages by alternative-set equivalence class
+    // *before* the existing pairwise adaptive_combine sweep. Multi-member
+    // groups reduce via combine_alternative_set (max-Bel/max-Pl, the
+    // least-restrictive-alternative rule). Singleton groups and untagged
+    // messages (e.g., MutualExclusion's anti-support) pass through unchanged.
+    let mut var_incoming: HashMap<Uuid, Vec<(Option<Uuid>, MassFunction)>> = HashMap::new();
+    for ((factor_id, var), msg) in messages.iter() {
+        let source = message_source.get(&(*factor_id, *var)).copied().flatten();
+        var_incoming
+            .entry(*var)
+            .or_default()
+            .push((source, msg.clone()));
     }
+
+    // Canonical-class id per claim: the minimum claim_id in the equivalence
+    // class, used as a deterministic group key. Singletons (claims not
+    // appearing in alt_set_membership) map to themselves.
+    let canonical_class = |claim_id: Uuid| -> Uuid {
+        match config.alt_set_membership.get(&claim_id) {
+            Some(members) => std::iter::once(claim_id)
+                .chain(members.iter().copied())
+                .min()
+                .unwrap_or(claim_id),
+            None => claim_id,
+        }
+    };
+
+    let target_focal = FocalElement::positive(BTreeSet::from([H_SUPPORTED]));
 
     let mut max_change = 0.0_f64;
 
-    for (var, msgs) in &var_incoming {
-        if msgs.is_empty() {
+    for (var, tagged_msgs) in &var_incoming {
+        if tagged_msgs.is_empty() {
             continue;
         }
 
         let old_m = beliefs.get(var).cloned().unwrap_or_else(vacuous);
         let old_iv = mass_to_interval(&old_m);
 
-        // Combine all incoming factor messages
-        let mut m_graph = msgs[0].clone();
-        for next in &msgs[1..] {
+        // Group supporter messages by canonical alt-set class; untagged
+        // messages (source=None) form an "anonymous" bucket that bypasses
+        // grouping and feeds the combine loop as singletons.
+        let mut supporter_groups: HashMap<Uuid, Vec<MassFunction>> = HashMap::new();
+        let mut anonymous: Vec<MassFunction> = Vec::new();
+        for (source, msg) in tagged_msgs {
+            match source {
+                Some(src) => supporter_groups
+                    .entry(canonical_class(*src))
+                    .or_default()
+                    .push(msg.clone()),
+                None => anonymous.push(msg.clone()),
+            }
+        }
+
+        // Reduce each multi-member group via combine_alternative_set;
+        // singletons pass through.
+        let mut reduced: Vec<MassFunction> = Vec::new();
+        for (_class_id, group) in supporter_groups {
+            if group.len() == 1 {
+                reduced.extend(group);
+            } else {
+                match combine_alternative_set(&group, &target_focal) {
+                    Ok(m) => reduced.push(m),
+                    Err(_) => reduced.push(vacuous()),
+                }
+            }
+        }
+        reduced.extend(anonymous);
+
+        if reduced.is_empty() {
+            continue;
+        }
+
+        // Combine all (post-grouping) incoming factor messages via the
+        // existing pairwise adaptive_combine loop.
+        let mut m_graph = reduced[0].clone();
+        for next in &reduced[1..] {
             match adaptive_combine(&m_graph, next, config.conflict_threshold) {
                 Ok((combined, report)) => {
                     max_conflict = max_conflict.max(report.conflict_k);
