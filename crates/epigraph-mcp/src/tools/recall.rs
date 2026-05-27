@@ -66,6 +66,36 @@ pub struct RecallWithContextParams {
     pub siblings_limit: Option<u32>,
     pub corroborates_limit: Option<u32>,
     pub neighbor_paragraphs_limit: Option<u32>,
+    /// When `true`, run the diverse retrieval pipeline before structural
+    /// enrichment: pull candidates from the most-similar themes and use
+    /// submodular [`diverse_select`] to spread the selection across the
+    /// theme graph. Mirrors `POST /api/v1/search/semantic?diverse=true`.
+    /// Default `false` (existing flat ANN behaviour).
+    ///
+    /// Falls back to flat ANN if the corpus has no themes yet.
+    ///
+    /// [`diverse_select`]: epigraph_engine::diverse_select::diverse_select
+    pub diverse: Option<bool>,
+    /// Max number of themes to consider in diverse mode. Default 5.
+    /// Ignored when `diverse=false`.
+    pub max_themes: Option<u32>,
+    /// Coverage vs relevance tradeoff for diverse mode. `0.0` = pure
+    /// relevance, `1.0` = pure coverage. Default `0.4`. Ignored when
+    /// `diverse=false`.
+    pub diversity_weight: Option<f32>,
+    /// Candidate-pool top-K — the second-stage cutoff after theme
+    /// selection. The diverse pipeline first picks the `max_themes`
+    /// most-similar themes, then pulls up to this many paragraphs from
+    /// them as input to submodular `diverse_select`. Bigger pool =
+    /// finer cluster granularity reaches retrieval, at the cost of more
+    /// SQL work and a quadratic in-memory similarity matrix.
+    ///
+    /// Default is
+    /// [`DEFAULT_CANDIDATE_POOL`](epigraph_engine::diverse_retrieval::DEFAULT_CANDIDATE_POOL)
+    /// (100). Clamped to
+    /// [`MAX_CANDIDATE_POOL`](epigraph_engine::diverse_retrieval::MAX_CANDIDATE_POOL)
+    /// (1000) to keep the matrix bounded. Ignored when `diverse=false`.
+    pub candidate_pool: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,16 +239,122 @@ pub async fn recall_with_context(
         .map_err(|e| internal_error(format!("embed query: {e}")))?;
     let pgvec = crate::embed::format_pgvector(&query_embedding);
 
-    // Stage 3: paragraph-primary kNN (level=2 only, optional paper_doi pre-filter).
-    let raw_hits = epigraph_db::ClaimRepository::search_by_embedding(
-        &server.pool,
-        &pgvec,
+    recall_with_context_post_embed(
+        server,
+        &params,
         centroid_dim,
-        i64::from(limit),
-        params.paper_doi_filter.as_deref(),
+        &pgvec,
+        limit,
+        min_truth,
+        siblings_limit,
+        corroborates_limit,
+        neighbor_paragraphs_limit,
     )
     .await
-    .map_err(|e| internal_error(format!("kNN: {e}")))?;
+}
+
+/// Post-embedding pipeline: shared by `recall_with_context` and the
+/// `__test_only::recall_with_context_with_pgvec` entry point that lets
+/// integration tests skip the OpenAI embedder (no API key available in
+/// the test environment).
+///
+/// Consumes a pre-computed pgvector literal and a resolved `centroid_dim`.
+#[allow(clippy::too_many_arguments)]
+async fn recall_with_context_post_embed(
+    server: &EpiGraphMcpFull,
+    params: &RecallWithContextParams,
+    centroid_dim: u32,
+    pgvec: &str,
+    limit: u32,
+    min_truth: f64,
+    siblings_limit: u32,
+    corroborates_limit: u32,
+    neighbor_paragraphs_limit: u32,
+) -> Result<CallToolResult, McpError> {
+    // Stage 3: candidate retrieval. Two paths:
+    //
+    //  - `diverse=true`: run the shared diverse-retrieval pipeline
+    //    (theme lookup → candidate pool → similarity-neighbour graph →
+    //    `diverse_select`). Falls back to flat ANN when the corpus has
+    //    no themes yet OR when no candidates were found in the selected
+    //    themes (matches REST `/api/v1/search/semantic?diverse=true`
+    //    behaviour).
+    //
+    //  - `diverse=false` (default): flat paragraph-primary ANN over
+    //    `claims.embedding[_3072]`. Unchanged from pre-diverse behaviour.
+    //
+    // The `paper_doi_filter` does NOT apply to the diverse path —
+    // candidates_in_themes_at_dim has no DOI predicate. If the caller
+    // provides BOTH `diverse=true` AND `paper_doi_filter`, the filter is
+    // currently ignored on the diverse path. TODO(diverse-recall): wire
+    // paper_doi_filter into candidates_in_themes_at_dim or reject the
+    // combination at param-parse time.
+    let diverse = params.diverse.unwrap_or(false);
+    let raw_hits = if diverse {
+        let max_themes = params.max_themes.unwrap_or(5).clamp(1, 50) as i32;
+        let alpha = params.diversity_weight.unwrap_or(0.4);
+        // Clamp candidate_pool at the request boundary so the caller sees
+        // the value they'll actually get. `build_similarity_neighbors` is
+        // O(n²) in candidate count, so MAX_CANDIDATE_POOL keeps the matrix
+        // bounded (≤1M entries at 1000) — the user explicitly asked for
+        // this lever so finer cluster granularity can reach retrieval.
+        let candidate_pool = params
+            .candidate_pool
+            .map(|n| n.min(epigraph_engine::diverse_retrieval::MAX_CANDIDATE_POOL))
+            .map(|n| n as i32)
+            .unwrap_or(epigraph_engine::diverse_retrieval::DEFAULT_CANDIDATE_POOL);
+        let config = epigraph_engine::diverse_retrieval::DiverseRetrievalConfig {
+            centroid_dim,
+            max_themes,
+            candidate_pool,
+            budget: limit as usize,
+            alpha,
+            // recall_with_context is paragraph-primary; restrict candidates
+            // to level=2 so the downstream batched-context fetch (which
+            // assumes paragraphs) has nothing to drop.
+            paragraph_only: true,
+        };
+        let selected =
+            epigraph_engine::diverse_retrieval::run_diverse_pipeline(&server.pool, pgvec, config)
+                .await
+                .map_err(|e| internal_error(format!("diverse retrieval: {e}")))?;
+
+        if selected.is_empty() {
+            // No themes (or no candidates in themes) — fall back to flat ANN
+            // so callers still get results in a freshly-clustered or
+            // unclustered corpus. Matches the REST diverse-mode fallback.
+            epigraph_db::ClaimRepository::search_by_embedding(
+                &server.pool,
+                pgvec,
+                centroid_dim,
+                i64::from(limit),
+                params.paper_doi_filter.as_deref(),
+            )
+            .await
+            .map_err(|e| internal_error(format!("kNN fallback: {e}")))?
+        } else {
+            selected
+                .into_iter()
+                .map(
+                    |(id, _content, similarity)| epigraph_db::ClaimEmbeddingHit {
+                        claim_id: id,
+                        similarity,
+                    },
+                )
+                .collect()
+        }
+    } else {
+        // Flat paragraph-primary kNN (level=2 only, optional paper_doi pre-filter).
+        epigraph_db::ClaimRepository::search_by_embedding(
+            &server.pool,
+            pgvec,
+            centroid_dim,
+            i64::from(limit),
+            params.paper_doi_filter.as_deref(),
+        )
+        .await
+        .map_err(|e| internal_error(format!("kNN: {e}")))?
+    };
 
     if raw_hits.is_empty() {
         // Empty result still returns corpus_scope (#52 Finding 2).
@@ -985,4 +1121,39 @@ pub mod __test_only {
         assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population,
         BatchedContext, ParagraphCore,
     };
+    use super::{
+        recall_with_context_post_embed, EpiGraphMcpFull, McpError, RecallWithContextParams,
+    };
+    use rmcp::model::CallToolResult;
+
+    /// Integration-test entry point that skips the OpenAI embedder.
+    ///
+    /// Tests cannot call the real embedder (no API key in CI / sandbox),
+    /// so they pre-format a known pgvector literal and dispatch directly
+    /// into the post-embed pipeline. This is the same code that
+    /// `recall_with_context` runs after `embedder.generate_at_dim`.
+    pub async fn recall_with_context_with_pgvec(
+        server: &EpiGraphMcpFull,
+        params: RecallWithContextParams,
+        centroid_dim: u32,
+        pgvec: &str,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = params.limit.unwrap_or(10).clamp(1, 50);
+        let min_truth = params.min_truth.unwrap_or(0.3);
+        let siblings_limit = params.siblings_limit.unwrap_or(8);
+        let corroborates_limit = params.corroborates_limit.unwrap_or(4);
+        let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
+        recall_with_context_post_embed(
+            server,
+            &params,
+            centroid_dim,
+            pgvec,
+            limit,
+            min_truth,
+            siblings_limit,
+            corroborates_limit,
+            neighbor_paragraphs_limit,
+        )
+        .await
+    }
 }

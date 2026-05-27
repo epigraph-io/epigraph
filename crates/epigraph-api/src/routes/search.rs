@@ -31,7 +31,10 @@ use uuid::Uuid;
 use sqlx::Row;
 
 #[cfg(feature = "db")]
-use epigraph_engine::diverse_select::diverse_select;
+use epigraph_engine::diverse_retrieval::{
+    candidates_in_themes_at_dim, find_similar_themes_at_dim, DEFAULT_CANDIDATE_POOL,
+    MAX_CANDIDATE_POOL,
+};
 
 use crate::{errors::ApiError, state::AppState};
 
@@ -102,6 +105,22 @@ pub struct SemanticSearchRequest {
     /// ValidationError). Ignored when `diverse=false`.
     #[serde(default)]
     pub centroid_dim: Option<u32>,
+
+    /// Candidate-pool top-K — the second-stage cutoff after theme
+    /// selection. The diverse pipeline first picks the `max_themes`
+    /// most-similar themes, then pulls up to this many claims across
+    /// them as the input to submodular `diverse_select`. Higher values
+    /// = better diversity coverage but more SQL work and a quadratic
+    /// in-memory similarity matrix inside `build_similarity_neighbors`.
+    ///
+    /// Default is
+    /// [`DEFAULT_CANDIDATE_POOL`](epigraph_engine::diverse_retrieval::DEFAULT_CANDIDATE_POOL)
+    /// (100, matching the historical hard-coded value). Clamped to
+    /// [`MAX_CANDIDATE_POOL`](epigraph_engine::diverse_retrieval::MAX_CANDIDATE_POOL)
+    /// (1000) to prevent runaway matrices. Ignored when
+    /// `diverse=false`.
+    #[serde(default)]
+    pub candidate_pool: Option<u32>,
 }
 
 /// CDST belief interval for a claim — more informative than a single truth value
@@ -379,39 +398,10 @@ fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
     )
 }
 
-/// Build a similarity-based kNN neighborhood graph from a candidate list.
-///
-/// For each candidate `i`, the `k` most similar other candidates (by their
-/// similarity scores — a proxy for shared semantic neighbourhood) are added as
-/// neighbours.  This gives `diverse_select` enough graph structure to avoid
-/// picking redundant near-duplicates.
-///
-/// `candidates` is a slice of `(id, content, similarity)` tuples already
-/// ranked by the query vector.  Since cosine similarity is a monotone proxy
-/// for embedding proximity, items close together in the ranked list are likely
-/// to be semantically close to each other.
-#[cfg(feature = "db")]
-fn build_similarity_neighbors(
-    candidates: &[(uuid::Uuid, String, f64)],
-    k: usize,
-) -> Vec<Vec<usize>> {
-    let n = candidates.len();
-    let mut neighbors = vec![Vec::new(); n];
-
-    for i in 0..n {
-        let sim_i = candidates[i].2;
-        // Score proximity as negative absolute difference in similarity score
-        let mut scored: Vec<(usize, f64)> = (0..n)
-            .filter(|&j| j != i)
-            .map(|j| (j, -(sim_i - candidates[j].2).abs()))
-            .collect();
-        // Sort descending by score (smallest difference = most similar rank)
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        neighbors[i] = scored.into_iter().take(k).map(|(j, _)| j).collect();
-    }
-
-    neighbors
-}
+// `build_similarity_neighbors` and the diverse-pipeline helpers live in
+// `epigraph_engine::diverse_retrieval` so the MCP `recall_with_context`
+// tool can share the same retrieval logic. See the module docs for the
+// pipeline shape.
 
 // ============================================================================
 // Handler
@@ -540,6 +530,16 @@ pub async fn semantic_search(
             let max_themes = request.max_themes.unwrap_or(5) as i32;
             let alpha = request.diversity_weight.unwrap_or(0.5);
 
+            // Clamp the candidate-pool top-K at the request boundary so the
+            // caller sees the value they will actually get (vs. silently
+            // capping deep in `build_similarity_neighbors`). Default to the
+            // pre-refactor `DEFAULT_CANDIDATE_POOL` (100) when unset.
+            let candidate_pool = request
+                .candidate_pool
+                .map(|n| n.min(MAX_CANDIDATE_POOL))
+                .map(|n| n as i32)
+                .unwrap_or(DEFAULT_CANDIDATE_POOL);
+
             // Resolve which centroid dimension to query against. Explicit hint
             // wins; otherwise auto-detect via the population fraction of
             // `claim_themes.centroid_3072` (≥50% → 3072, else 1536). This lets
@@ -595,88 +595,73 @@ pub async fn semantic_search(
                 generate_query_embedding_with_dim(&state, query, target_dim).await;
             let embedding_str = format_embedding_for_pgvector(&query_embedding);
 
-            // Branch on dim: column names are not user input (only `1536`
-            // or `3072` reach this point per the validation above), so
-            // `format!`-interpolating them is injection-safe.
-            let theme_centroid_col = if centroid_dim_used == 3072 {
-                "centroid_3072"
-            } else {
-                "centroid"
-            };
+            // The claim-embedding column name (still used by the post-
+            // selection full-row + graph-neighbor queries below). Column
+            // names are not user input (only `1536` or `3072` reach this
+            // point), so `format!`-interpolating them is injection-safe.
             let claim_embedding_col = if centroid_dim_used == 3072 {
                 "embedding_3072"
             } else {
                 "embedding"
             };
 
-            // Find the most relevant themes for the query at the chosen dim.
-            let theme_sql = format!(
-                "SELECT id, label, (1 - ({theme_centroid_col} <=> $1::vector))::float8 AS similarity \
-                 FROM claim_themes \
-                 WHERE {theme_centroid_col} IS NOT NULL \
-                 ORDER BY {theme_centroid_col} <=> $1::vector \
-                 LIMIT $2"
-            );
-            let theme_rows = sqlx::query(&theme_sql)
-                .bind(&embedding_str)
-                .bind(max_themes)
-                .fetch_all(&state.db_pool)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Theme search failed: {e}"),
-                })?;
-            let themes: Vec<(Uuid, String, f64)> = theme_rows
-                .iter()
-                .map(|row| {
-                    let id: Uuid = row.get("id");
-                    let label: String = row.get("label");
-                    let similarity: f64 = row.get("similarity");
-                    (id, label, similarity)
-                })
-                .collect();
+            // Pre-flight: cheap theme lookup ONLY to determine whether
+            // the corpus has themes at all. If empty, fall through to
+            // flat ANN (matching pre-helper behaviour); otherwise run
+            // the shared pipeline.
+            let themes = find_similar_themes_at_dim(
+                &state.db_pool,
+                &embedding_str,
+                max_themes,
+                centroid_dim_used,
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Theme search failed: {e}"),
+            })?;
 
             // Only enter diverse mode if themes have been populated
             if !themes.is_empty() {
                 let theme_ids: Vec<Uuid> = themes.iter().map(|(id, _, _)| *id).collect();
 
-                // Retrieve candidate claims from those themes — branch on dim.
-                let candidates_sql = format!(
-                    "SELECT c.id, c.content, (1 - (c.{claim_embedding_col} <=> $2::vector))::float8 AS similarity \
-                     FROM claims c \
-                     WHERE c.theme_id = ANY($1) \
-                       AND c.{claim_embedding_col} IS NOT NULL \
-                     ORDER BY c.{claim_embedding_col} <=> $2::vector \
-                     LIMIT $3"
-                );
-                let candidate_rows = sqlx::query(&candidates_sql)
-                    .bind(&theme_ids)
-                    .bind(&embedding_str)
-                    .bind(100i32)
-                    .fetch_all(&state.db_pool)
-                    .await
-                    .map_err(|e| ApiError::InternalError {
-                        message: format!("Candidate retrieval failed: {e}"),
-                    })?;
-                let candidates: Vec<(Uuid, String, f64)> = candidate_rows
-                    .iter()
-                    .map(|row| {
-                        let id: Uuid = row.get("id");
-                        let content: String = row.get("content");
-                        let similarity: f64 = row.get("similarity");
-                        (id, content, similarity)
-                    })
-                    .collect();
+                // Retrieve candidate claims via the shared helper — same
+                // SQL shape as before, plus the level-filter knob for
+                // MCP. REST passes `paragraph_only=false` to preserve
+                // pre-helper behaviour.
+                let candidates = candidates_in_themes_at_dim(
+                    &state.db_pool,
+                    &theme_ids,
+                    &embedding_str,
+                    candidate_pool,
+                    centroid_dim_used,
+                    /*paragraph_only=*/ false,
+                )
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("Candidate retrieval failed: {e}"),
+                })?;
 
-                // Build a proximity graph from the ranked candidate list (top-5 neighbours each)
-                let neighbors = build_similarity_neighbors(&candidates, 5);
-                let similarities: Vec<f32> = candidates.iter().map(|(_, _, s)| *s as f32).collect();
-
-                // Greedy submodular selection balancing coverage and relevance
-                let selected = diverse_select(&neighbors, &similarities, limit, alpha);
+                // Build proximity graph + run greedy submodular selection.
+                // Helper centralises this (k=5, alpha=user-supplied) so MCP
+                // and REST agree.
+                let selected_rows = {
+                    use epigraph_engine::diverse_retrieval::{
+                        build_similarity_neighbors, DEFAULT_SIMILARITY_K,
+                    };
+                    use epigraph_engine::diverse_select::diverse_select;
+                    let neighbors = build_similarity_neighbors(&candidates, DEFAULT_SIMILARITY_K);
+                    let similarities: Vec<f32> =
+                        candidates.iter().map(|(_, _, s)| *s as f32).collect();
+                    let selected = diverse_select(&neighbors, &similarities, limit, alpha);
+                    selected
+                        .into_iter()
+                        .map(|idx| candidates[idx].clone())
+                        .collect::<Vec<_>>()
+                };
 
                 // Collect the selected claim IDs for enrichment queries
                 let selected_claim_ids: Vec<Uuid> =
-                    selected.iter().map(|&idx| candidates[idx].0).collect();
+                    selected_rows.iter().map(|(id, _, _)| *id).collect();
 
                 // Fetch full claim data for the selected IDs (including CDST
                 // columns + theme_id and the latest cluster_id from
@@ -1332,6 +1317,7 @@ mod db_integration_tests {
             max_themes: Some(3),
             diversity_weight: Some(0.5),
             centroid_dim,
+            candidate_pool: None,
         };
         let response = semantic_search(axum::extract::State(state), axum::Json(request)).await?;
         Ok(response.0)

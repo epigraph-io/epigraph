@@ -543,6 +543,10 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
         siblings_limit: None,
         corroborates_limit: None,
         neighbor_paragraphs_limit: None,
+        diverse: None,
+        max_themes: None,
+        diversity_weight: None,
+        candidate_pool: None,
     };
 
     let result = recall_with_context(&server, params).await;
@@ -733,5 +737,597 @@ async fn neighbor_paragraphs_truncation_flag_when_over_limit(pool: PgPool) {
     assert_eq!(
         materialized[0].paragraph_id, fx.other_section_paragraph,
         "highest-priority (continues_argument) neighbor must be first"
+    );
+}
+
+// ============================================================================
+// Diverse-mode tests
+// ============================================================================
+//
+// These tests use the `__test_only::recall_with_context_with_pgvec`
+// entry point to bypass the OpenAI embedder (tests run without an API
+// key). They exercise the diverse-vs-flat branch in `recall_with_context`
+// directly, with deterministic pgvector literals.
+
+mod diverse_fixture {
+    use super::*;
+
+    const DIM: usize = 1536;
+    const N_BUCKETS: usize = 8;
+    pub const STRIDE: usize = DIM / N_BUCKETS;
+
+    fn vec_to_pgvec(v: &[f32]) -> String {
+        let inner: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+        format!("[{}]", inner.join(","))
+    }
+
+    /// Pgvector literal at dim=1536 that's heavily concentrated in
+    /// `bucket * STRIDE .. (bucket+1) * STRIDE`. Same-bucket vectors are
+    /// highly cosine-similar; different-bucket vectors are orthogonal.
+    pub fn cluster_pgvec(bucket: usize, value: f32) -> String {
+        let mut v = vec![0.0f32; DIM];
+        let start = bucket * STRIDE;
+        let end = start + STRIDE;
+        for slot in v.iter_mut().take(end).skip(start) {
+            *slot = value;
+        }
+        vec_to_pgvec(&v)
+    }
+
+    /// Pgvector with `value` in `bucket` AND `drift` in `drift_bucket`.
+    /// Used by candidate_pool tests where we need *monotonically
+    /// decreasing cosine similarity* across seeded rows: scaling
+    /// magnitude alone (as `cluster_pgvec(0, 1.0 - i*0.01)` does) yields
+    /// IDENTICAL cosine sim because direction is unchanged — direction
+    /// must drift instead. `cos = value / sqrt(value² + drift²)`,
+    /// monotonically decreasing in `drift > 0`.
+    pub fn cluster_pgvec_with_drift(
+        bucket: usize,
+        value: f32,
+        drift_bucket: usize,
+        drift: f32,
+    ) -> String {
+        let mut v = vec![0.0f32; DIM];
+        let start = bucket * STRIDE;
+        let end = start + STRIDE;
+        for slot in v.iter_mut().take(end).skip(start) {
+            *slot = value;
+        }
+        let dstart = drift_bucket * STRIDE;
+        let dend = dstart + STRIDE;
+        for slot in v.iter_mut().take(dend).skip(dstart) {
+            *slot = drift;
+        }
+        vec_to_pgvec(&v)
+    }
+
+    /// Pgvector that overlays mass in bucket 0 (the query bucket in
+    /// these tests) AND in `far_bucket`. Used so theme_b candidates
+    /// have meaningful similarity to the query (~0.7) — enough that
+    /// the calibrated alpha=0.4 default exercises diversity rather
+    /// than being overwhelmed by orthogonal sim=0 scores.
+    pub fn mixed_bucket_pgvec(far_bucket: usize, query_share: f32) -> String {
+        let mut v = vec![0.0f32; DIM];
+        for slot in v.iter_mut().take(STRIDE) {
+            *slot = query_share;
+        }
+        let start = far_bucket * STRIDE;
+        let end = start + STRIDE;
+        for slot in v.iter_mut().take(end).skip(start) {
+            *slot = 1.0;
+        }
+        vec_to_pgvec(&v)
+    }
+
+    fn hash_for(id: Uuid) -> Vec<u8> {
+        let mut h = vec![0u8; 32];
+        h[..16].copy_from_slice(id.as_bytes());
+        h
+    }
+
+    pub async fn seed_agent(pool: &PgPool) -> Uuid {
+        let agent_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, decode($2, 'hex'))")
+            .bind(agent_id)
+            .bind("bb".repeat(32))
+            .execute(pool)
+            .await
+            .expect("seed agent");
+        agent_id
+    }
+
+    pub async fn seed_paper(pool: &PgPool, doi: &str, title: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO papers (id, doi, title) VALUES ($1, $2, $3)")
+            .bind(id)
+            .bind(doi)
+            .bind(title)
+            .execute(pool)
+            .await
+            .expect("seed paper");
+        id
+    }
+
+    pub async fn seed_paragraph(
+        pool: &PgPool,
+        agent_id: Uuid,
+        paper_id: Uuid,
+        content: &str,
+        embedding_pgvec: &str,
+        theme_id: Option<Uuid>,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, properties, embedding, theme_id) \
+             VALUES ($1, $2, $3, $4, 0.7, jsonb_build_object('level', 2::int), $5::vector, $6)",
+        )
+        .bind(id)
+        .bind(content)
+        .bind(hash_for(id))
+        .bind(agent_id)
+        .bind(embedding_pgvec)
+        .bind(theme_id)
+        .execute(pool)
+        .await
+        .expect("seed paragraph");
+
+        // Paper-attribution edge so the recall pipeline keeps the hit.
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+             VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts')",
+        )
+        .bind(paper_id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("seed paper-attribution edge");
+
+        id
+    }
+
+    pub async fn seed_theme_with_centroid(pool: &PgPool, label: &str, pgvec: &str) -> Uuid {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO claim_themes (label, description) VALUES ($1, 'diverse-test theme') \
+             RETURNING id",
+        )
+        .bind(label)
+        .fetch_one(pool)
+        .await
+        .expect("create theme");
+        sqlx::query("UPDATE claim_themes SET centroid = $2::vector WHERE id = $1")
+            .bind(id)
+            .bind(pgvec)
+            .execute(pool)
+            .await
+            .expect("set centroid");
+        id
+    }
+}
+
+fn diverse_params(
+    diverse: bool,
+    max_themes: Option<u32>,
+    alpha: Option<f32>,
+    limit: u32,
+) -> epigraph_mcp::tools::recall::RecallWithContextParams {
+    diverse_params_with_pool(diverse, max_themes, alpha, limit, None)
+}
+
+fn diverse_params_with_pool(
+    diverse: bool,
+    max_themes: Option<u32>,
+    alpha: Option<f32>,
+    limit: u32,
+    candidate_pool: Option<u32>,
+) -> epigraph_mcp::tools::recall::RecallWithContextParams {
+    use epigraph_mcp::tools::recall::RecallWithContextParams;
+    RecallWithContextParams {
+        query: "ignored — pgvec is passed directly".to_string(),
+        limit: Some(limit),
+        min_truth: Some(0.0),
+        centroid_dim: Some(1536),
+        paper_doi_filter: None,
+        siblings_limit: None,
+        corroborates_limit: None,
+        neighbor_paragraphs_limit: None,
+        diverse: Some(diverse),
+        max_themes,
+        diversity_weight: alpha,
+        candidate_pool,
+    }
+}
+
+fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
+    use epigraph_crypto::AgentSigner;
+    use epigraph_mcp::embed::McpEmbedder;
+    use epigraph_mcp::EpiGraphMcpFull;
+    let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
+    let embedder = McpEmbedder::new(pool.clone(), None); // mock — tests use pre-computed pgvec
+    EpiGraphMcpFull::new(pool, signer, embedder, /*read_only=*/ false)
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct RecallResponseStruct {
+    results: Vec<RecallResultStruct>,
+    #[allow(dead_code)]
+    corpus_scope: serde_json::Value,
+    centroid_dim_used: u32,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct RecallResultStruct {
+    paragraph_id: Uuid,
+    #[allow(dead_code)]
+    paragraph_content: String,
+    #[allow(dead_code)]
+    similarity: f64,
+}
+
+fn parse_response(result: rmcp::model::CallToolResult) -> RecallResponseStruct {
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("text content");
+    serde_json::from_str(&text).expect("parse RecallWithContextResponse JSON")
+}
+
+/// Test: diverse=true with NO themes seeded must silently degrade to
+/// flat ANN and still return results. Mirrors the REST fallback.
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_mode_falls_back_to_flat_when_themes_empty(pool: PgPool) {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/fb", "Fallback test").await;
+
+    // 3 paragraphs, no themes seeded at all.
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let mut paragraph_ids = Vec::new();
+    for i in 0..3 {
+        let id = diverse_fixture::seed_paragraph(
+            &pool,
+            agent,
+            paper,
+            &format!("paragraph-{i}"),
+            &pgvec,
+            /*theme_id=*/ None,
+        )
+        .await;
+        paragraph_ids.push(id);
+    }
+
+    let server = build_test_server(pool.clone());
+    let params = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 10);
+    let result = recall_with_context_with_pgvec(&server, params, 1536, &pgvec)
+        .await
+        .expect("diverse-on-empty-themes must succeed");
+    let resp = parse_response(result);
+
+    assert_eq!(resp.centroid_dim_used, 1536);
+    assert_eq!(
+        resp.results.len(),
+        3,
+        "diverse=true with no themes must fall back to flat ANN and surface all 3 paragraphs"
+    );
+    let returned: std::collections::HashSet<Uuid> =
+        resp.results.iter().map(|r| r.paragraph_id).collect();
+    let expected: std::collections::HashSet<Uuid> = paragraph_ids.into_iter().collect();
+    assert_eq!(
+        returned, expected,
+        "fallback should surface every seeded paragraph"
+    );
+}
+
+/// Test: diverse=false leaves the existing flat-ANN ordering unchanged.
+/// Compares against `ClaimRepository::search_by_embedding` directly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/reg", "Regression test").await;
+
+    // Seed paragraphs at staggered similarity to the query.
+    let query_pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let mut paragraph_ids = Vec::new();
+    for i in 0..5 {
+        // Slight reduction in value moves the cosine score down monotonically.
+        let para_vec = diverse_fixture::cluster_pgvec(0, 1.0 - (i as f32) * 0.05);
+        let id = diverse_fixture::seed_paragraph(
+            &pool,
+            agent,
+            paper,
+            &format!("paragraph-{i}"),
+            &para_vec,
+            None,
+        )
+        .await;
+        paragraph_ids.push(id);
+    }
+
+    // Reference: direct call to the same repo function recall_with_context
+    // uses in diverse=false mode. If diverse=false matches this ordering
+    // verbatim, the diverse-routing change preserves the flat path.
+    let direct_hits =
+        epigraph_db::ClaimRepository::search_by_embedding(&pool, &query_pgvec, 1536, 10, None)
+            .await
+            .expect("direct flat ANN");
+    let direct_order: Vec<Uuid> = direct_hits.iter().map(|h| h.claim_id).collect();
+
+    let server = build_test_server(pool.clone());
+    let params = diverse_params(/*diverse=*/ false, None, None, 10);
+    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+        .await
+        .expect("diverse=false");
+    let resp = parse_response(result);
+
+    let recall_order: Vec<Uuid> = resp.results.iter().map(|r| r.paragraph_id).collect();
+    assert_eq!(
+        recall_order, direct_order,
+        "diverse=false ordering must match direct ClaimRepository::search_by_embedding ordering"
+    );
+}
+
+/// `candidate_pool` plumbing — small value should restrict the SQL pool
+/// so submodular `diverse_select` cannot see low-relevance rows.
+///
+/// Seeds 30 paragraphs in ONE theme, similarity monotonically decreasing.
+/// Runs `recall_with_context` with `diverse=true, candidate_pool=20`,
+/// `budget=5`, `diversity_weight=0.0` (pure relevance). Asserts the result
+/// is the top-5 by similarity AND none of seeded rows 20..30 (those are
+/// strictly excluded by SQL `LIMIT 20`) appear.
+#[sqlx::test(migrations = "../../migrations")]
+async fn candidate_pool_20_restricts_mcp_diverse_pool(pool: PgPool) {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/pool20", "candidate_pool=20").await;
+    let theme = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "single-theme",
+        &diverse_fixture::cluster_pgvec(0, 1.0),
+    )
+    .await;
+
+    // 30 paragraphs in this theme, monotonically decreasing similarity.
+    let mut seeded: Vec<Uuid> = Vec::with_capacity(30);
+    for i in 0..30 {
+        let v = diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, (i as f32) * 0.05);
+        let id = diverse_fixture::seed_paragraph(
+            &pool,
+            agent,
+            paper,
+            &format!("pool20-claim-{i}"),
+            &v,
+            Some(theme),
+        )
+        .await;
+        seeded.push(id);
+    }
+
+    let server = build_test_server(pool.clone());
+    let query_pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let params = diverse_params_with_pool(
+        /*diverse=*/ true,
+        Some(5),
+        /*alpha=*/ Some(0.0), // pure relevance
+        /*limit=*/ 5,
+        /*candidate_pool=*/ Some(20),
+    );
+
+    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+        .await
+        .expect("recall_with_context with candidate_pool=20");
+    let resp = parse_response(result);
+
+    let returned: std::collections::HashSet<Uuid> =
+        resp.results.iter().map(|r| r.paragraph_id).collect();
+    assert_eq!(returned.len(), 5, "budget=5 → 5 results");
+
+    // Top-5 of 30 by similarity are seeded[0..5].
+    let top_5: std::collections::HashSet<Uuid> = seeded[..5].iter().copied().collect();
+    assert_eq!(
+        returned, top_5,
+        "candidate_pool=20 + pure-relevance MUST yield exactly the top-5 by similarity"
+    );
+
+    // Rows 20..30 are strictly excluded by SQL `LIMIT 20` in candidates_in_themes_at_dim.
+    // Their exclusion is the proof that 20 reached the SQL — a leak to the default 100
+    // would still pure-relevance pick the same top-5, so we also assert the result is
+    // EXACTLY the top-5 above.
+    let excluded_tail: std::collections::HashSet<Uuid> = seeded[20..30].iter().copied().collect();
+    assert!(
+        returned.is_disjoint(&excluded_tail),
+        "rows 20..30 must not appear (SQL LIMIT 20 excludes them); returned={returned:?}"
+    );
+}
+
+/// `candidate_pool` plumbing — large value widens the SQL pool so
+/// submodular `diverse_select` under pure-coverage selects ≥1 claim
+/// outside the top-5 by similarity. With pool=5 (or 20) that claim
+/// could never enter the candidate matrix.
+#[sqlx::test(migrations = "../../migrations")]
+async fn candidate_pool_200_widens_mcp_diverse_pool(pool: PgPool) {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/pool200", "candidate_pool=200").await;
+    let theme = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "single-theme-large",
+        &diverse_fixture::cluster_pgvec(0, 1.0),
+    )
+    .await;
+
+    let mut seeded: Vec<Uuid> = Vec::with_capacity(30);
+    for i in 0..30 {
+        let v = diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, (i as f32) * 0.05);
+        let id = diverse_fixture::seed_paragraph(
+            &pool,
+            agent,
+            paper,
+            &format!("pool200-claim-{i}"),
+            &v,
+            Some(theme),
+        )
+        .await;
+        seeded.push(id);
+    }
+
+    let server = build_test_server(pool.clone());
+    let query_pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let params = diverse_params_with_pool(
+        /*diverse=*/ true,
+        Some(5),
+        /*alpha=*/ Some(1.0), // pure coverage
+        /*limit=*/ 5,
+        /*candidate_pool=*/ Some(200),
+    );
+
+    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+        .await
+        .expect("recall_with_context with candidate_pool=200");
+    let resp = parse_response(result);
+
+    let returned: std::collections::HashSet<Uuid> =
+        resp.results.iter().map(|r| r.paragraph_id).collect();
+    assert_eq!(returned.len(), 5, "budget=5 → 5 results");
+
+    // With pure coverage on a 30-row pool, submodular spread should reach
+    // claims outside the top-5 by relevance.
+    let top_5: std::collections::HashSet<Uuid> = seeded[..5].iter().copied().collect();
+    let outside_top_5: usize = returned.iter().filter(|id| !top_5.contains(id)).count();
+    assert!(
+        outside_top_5 >= 1,
+        "candidate_pool=200 + pure coverage must surface ≥1 claim outside the top-5 by relevance; \
+         returned={returned:?}, top_5={top_5:?}"
+    );
+}
+
+/// Diversity proof: diverse=true selects across ≥2 themes when flat ANN
+/// would have landed entirely in 1. Fixture has theme_a near the query
+/// and theme_b far; flat takes 5 from theme_a, diverse with alpha=0.4
+/// pulls in ≥1 from theme_b for graph coverage.
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/div", "Diversity test").await;
+
+    // theme_a near bucket 0 (query lives here); theme_b shares some
+    // mass with bucket 0 (sim_b ≈ 0.7) so it isn't orthogonally
+    // dismissed by the relevance term. See the engine integration test
+    // for the exact arithmetic — alpha=0.4 default needs sim_b > 0.33
+    // for the coverage term to win pick #2.
+    let theme_a = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "near-theme",
+        &diverse_fixture::cluster_pgvec(0, 1.0),
+    )
+    .await;
+    let theme_b = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "far-theme",
+        &diverse_fixture::mixed_bucket_pgvec(3, 1.0),
+    )
+    .await;
+
+    // 6 paragraphs near (theme_a) — slight stagger so they're top-5 by
+    // flat ANN. 6 paragraphs at the mixed (bucket 0 + bucket 3) region
+    // (theme_b) — lower flat score but coverage gain.
+    let query_pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    for i in 0..6 {
+        let v = diverse_fixture::cluster_pgvec(0, 1.0 - (i as f32) * 0.001);
+        diverse_fixture::seed_paragraph(
+            &pool,
+            agent,
+            paper,
+            &format!("near-{i}"),
+            &v,
+            Some(theme_a),
+        )
+        .await;
+    }
+    for i in 0..6 {
+        let v = diverse_fixture::mixed_bucket_pgvec(3, 1.0 - (i as f32) * 0.01);
+        diverse_fixture::seed_paragraph(
+            &pool,
+            agent,
+            paper,
+            &format!("far-{i}"),
+            &v,
+            Some(theme_b),
+        )
+        .await;
+    }
+
+    let server = build_test_server(pool.clone());
+
+    // Flat baseline: hit count by theme.
+    let flat_params = diverse_params(/*diverse=*/ false, None, None, 5);
+    let flat_result = recall_with_context_with_pgvec(&server, flat_params, 1536, &query_pgvec)
+        .await
+        .expect("flat baseline");
+    let flat_resp = parse_response(flat_result);
+    assert_eq!(
+        flat_resp.results.len(),
+        5,
+        "fixture must give flat ANN 5 results to fill the budget"
+    );
+    let flat_ids: Vec<Uuid> = flat_resp.results.iter().map(|r| r.paragraph_id).collect();
+    let flat_themes: std::collections::HashSet<Uuid> = sqlx::query_scalar(
+        "SELECT theme_id FROM claims WHERE id = ANY($1) AND theme_id IS NOT NULL",
+    )
+    .bind(&flat_ids)
+    .fetch_all(&pool)
+    .await
+    .expect("flat theme_ids")
+    .into_iter()
+    .collect();
+    assert_eq!(
+        flat_themes.len(),
+        1,
+        "fixture invariant: flat ANN must hit exactly one theme; got {flat_themes:?}"
+    );
+    assert!(
+        flat_themes.contains(&theme_a),
+        "flat ANN should pick from theme_a (closest to query)"
+    );
+
+    // Diverse path: budget 5, alpha 0.4 (MCP default).
+    let diverse_params_v = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 5);
+    let diverse_result =
+        recall_with_context_with_pgvec(&server, diverse_params_v, 1536, &query_pgvec)
+            .await
+            .expect("diverse path");
+    let diverse_resp = parse_response(diverse_result);
+    assert_eq!(
+        diverse_resp.results.len(),
+        5,
+        "diverse=true should fill the budget (5) when ≥5 paragraph candidates exist across the themes — partial fill would mean the post-selection enrichment is dropping rows unexpectedly"
+    );
+    let diverse_ids: Vec<Uuid> = diverse_resp
+        .results
+        .iter()
+        .map(|r| r.paragraph_id)
+        .collect();
+    let diverse_themes: std::collections::HashSet<Uuid> = sqlx::query_scalar(
+        "SELECT theme_id FROM claims WHERE id = ANY($1) AND theme_id IS NOT NULL",
+    )
+    .bind(&diverse_ids)
+    .fetch_all(&pool)
+    .await
+    .expect("diverse theme_ids")
+    .into_iter()
+    .collect();
+    assert!(
+        diverse_themes.len() >= 2,
+        "diverse_select must spread across ≥2 themes; got {diverse_themes:?}, diverse_ids={diverse_ids:?}"
+    );
+    assert!(
+        diverse_themes.contains(&theme_a) && diverse_themes.contains(&theme_b),
+        "diverse selection should contain both theme_a (relevance) and theme_b (coverage); got {diverse_themes:?}"
     );
 }

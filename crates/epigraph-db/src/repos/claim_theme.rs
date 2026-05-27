@@ -52,6 +52,23 @@ pub struct RecomputedThemeRow {
     pub claim_count: i32,
 }
 
+/// Validate `centroid_dim` and return the `(theme_centroid_col,
+/// claim_embedding_col)` pair for the SQL builders below.
+///
+/// Returns `None` for unsupported dims. This is the *only* path by which a
+/// pgvector column name reaches the dim-aware `format!`-interpolated SQL in
+/// this module — keeping the mapping here means the layering test in
+/// `epigraph-engine` does not need to know column names exist, while the
+/// SQL stays injection-safe.
+#[must_use]
+pub fn centroid_columns_for_dim(centroid_dim: u32) -> Option<(&'static str, &'static str)> {
+    match centroid_dim {
+        1536 => Some(("centroid", "embedding")),
+        3072 => Some(("centroid_3072", "embedding_3072")),
+        _ => None,
+    }
+}
+
 pub struct ClaimThemeRepository;
 
 impl ClaimThemeRepository {
@@ -149,23 +166,50 @@ impl ClaimThemeRepository {
     ///
     /// Returns `(theme_id, label, similarity)` tuples ordered by descending similarity.
     /// Uses the pgvector `<=>` cosine distance operator; similarity = 1 - distance.
+    ///
+    /// Legacy 1536d-only convenience over [`Self::find_similar_themes_at_dim`].
+    /// New callers should use the dim-aware variant.
     pub async fn find_similar_themes(
         pool: &PgPool,
         query_vec: &str,
         limit: i32,
     ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
-        let rows = sqlx::query(
-            "SELECT id, label, (1 - (centroid <=> $1::vector))::float8 AS similarity \
+        Self::find_similar_themes_at_dim(pool, query_vec, limit, 1536).await
+    }
+
+    /// Dim-aware variant of [`Self::find_similar_themes`] for the diverse-retrieval
+    /// pipeline.
+    ///
+    /// `centroid_dim` selects the pgvector column inside `claim_themes`:
+    /// `1536` → `centroid`, `3072` → `centroid_3072`. Any other value returns
+    /// `DbError::InvalidData` — the dim gate is the *only* path by which a
+    /// column name is interpolated, which is what makes the `format!`-built
+    /// SQL injection-safe.
+    pub async fn find_similar_themes_at_dim(
+        pool: &PgPool,
+        query_vec: &str,
+        limit: i32,
+        centroid_dim: u32,
+    ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
+        let (theme_col, _) =
+            centroid_columns_for_dim(centroid_dim).ok_or_else(|| DbError::InvalidData {
+                reason: format!("unsupported centroid_dim: {centroid_dim} (must be 1536 or 3072)"),
+            })?;
+
+        let sql = format!(
+            "SELECT id, label, (1 - ({theme_col} <=> $1::vector))::float8 AS similarity \
              FROM claim_themes \
-             WHERE centroid IS NOT NULL \
-             ORDER BY centroid <=> $1::vector \
-             LIMIT $2",
-        )
-        .bind(query_vec)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-        .map_err(DbError::from)?;
+             WHERE {theme_col} IS NOT NULL \
+             ORDER BY {theme_col} <=> $1::vector \
+             LIMIT $2"
+        );
+
+        let rows = sqlx::query(&sql)
+            .bind(query_vec)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+            .map_err(DbError::from)?;
 
         let results = rows
             .iter()
@@ -182,26 +226,67 @@ impl ClaimThemeRepository {
     /// Get claims within the specified themes, ranked by similarity to the query vector.
     ///
     /// Returns `(claim_id, content, similarity)` tuples ordered by descending similarity.
+    ///
+    /// Legacy 1536d-only convenience over [`Self::claims_in_themes_at_dim`].
     pub async fn claims_in_themes(
         pool: &PgPool,
         theme_ids: &[Uuid],
         query_vec: &str,
         limit: i32,
     ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
-        let rows = sqlx::query(
-            "SELECT c.id, c.content, (1 - (c.embedding <=> $2::vector))::float8 AS similarity \
+        Self::claims_in_themes_at_dim(pool, theme_ids, query_vec, limit, 1536, false).await
+    }
+
+    /// Dim-aware variant of [`Self::claims_in_themes`].
+    ///
+    /// `centroid_dim` selects the per-claim embedding column: `1536` →
+    /// `claims.embedding`, `3072` → `claims.embedding_3072`. Any other value
+    /// returns `DbError::InvalidData`. The same dim gate that protects
+    /// `find_similar_themes_at_dim` protects this method — column names
+    /// reach the SQL only through the `1536|3072` match in
+    /// [`centroid_columns_for_dim`], so the `format!`-interpolated string
+    /// cannot carry user input.
+    ///
+    /// When `paragraph_only` is true, restricts to `level=2` claims (the
+    /// hierarchical-paragraph level), used by MCP `recall_with_context`
+    /// where the downstream batched-context fetch assumes paragraphs.
+    /// REST passes `false` to match its historical behaviour.
+    pub async fn claims_in_themes_at_dim(
+        pool: &PgPool,
+        theme_ids: &[Uuid],
+        query_vec: &str,
+        limit: i32,
+        centroid_dim: u32,
+        paragraph_only: bool,
+    ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
+        let (_, claim_col) =
+            centroid_columns_for_dim(centroid_dim).ok_or_else(|| DbError::InvalidData {
+                reason: format!("unsupported centroid_dim: {centroid_dim} (must be 1536 or 3072)"),
+            })?;
+
+        let level_clause = if paragraph_only {
+            " AND (c.properties->>'level')::int = 2"
+        } else {
+            ""
+        };
+
+        let sql = format!(
+            "SELECT c.id, c.content, (1 - (c.{claim_col} <=> $2::vector))::float8 AS similarity \
              FROM claims c \
              WHERE c.theme_id = ANY($1) \
-               AND c.embedding IS NOT NULL \
-             ORDER BY c.embedding <=> $2::vector \
-             LIMIT $3",
-        )
-        .bind(theme_ids)
-        .bind(query_vec)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-        .map_err(DbError::from)?;
+               AND c.{claim_col} IS NOT NULL\
+               {level_clause} \
+             ORDER BY c.{claim_col} <=> $2::vector \
+             LIMIT $3"
+        );
+
+        let rows = sqlx::query(&sql)
+            .bind(theme_ids)
+            .bind(query_vec)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+            .map_err(DbError::from)?;
 
         let results = rows
             .iter()
@@ -564,5 +649,24 @@ impl ClaimThemeRepository {
             })
             .collect();
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn centroid_columns_validates_dim() {
+        assert_eq!(
+            centroid_columns_for_dim(1536),
+            Some(("centroid", "embedding"))
+        );
+        assert_eq!(
+            centroid_columns_for_dim(3072),
+            Some(("centroid_3072", "embedding_3072"))
+        );
+        assert!(centroid_columns_for_dim(1024).is_none());
+        assert!(centroid_columns_for_dim(0).is_none());
     }
 }
