@@ -49,8 +49,34 @@ pub struct CalibrationConfig {
     /// Journal name → reliability score.
     pub journal_reliability: HashMap<String, f64>,
 
+    /// Evidence-locality discounts applied to per-BBA source_strength.
+    ///
+    /// Drives Shafer reliability discounting in
+    /// `routes/edges.rs::trigger_edge_ds_recomputation` based on whether the
+    /// supporting and supported claims share a source paper.
+    #[serde(default = "default_evidence_locality")]
+    pub evidence_locality: EvidenceLocality,
+
     /// Classifier decision thresholds (NEI, support, conflict).
     pub classifier_thresholds: ClassifierThresholds,
+}
+
+/// Discount factors keyed on whether evidence crosses paper boundaries.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvidenceLocality {
+    /// `source_strength` for intra-paper evidential BBAs (low — supporters
+    /// from one paper are not independent observations).
+    pub intra_source_support_strength: f64,
+
+    /// `source_strength` for cross-paper evidential BBAs (full reliability).
+    pub cross_source_support_strength: f64,
+}
+
+fn default_evidence_locality() -> EvidenceLocality {
+    EvidenceLocality {
+        intra_source_support_strength: 0.3,
+        cross_source_support_strength: 1.0,
+    }
 }
 
 /// Thresholds used by the BetP-based classifier.
@@ -184,6 +210,21 @@ mod tests {
         assert!(
             (cfg.default_journal_reliability - 0.78).abs() < f64::EPSILON,
             "default_journal_reliability should be 0.78"
+        );
+    }
+
+    #[test]
+    fn test_evidence_locality_loads() {
+        let config = load_config();
+        assert!(
+            (config.evidence_locality.intra_source_support_strength - 0.3).abs() < 1e-9,
+            "intra_source_support_strength = {}",
+            config.evidence_locality.intra_source_support_strength
+        );
+        assert!(
+            (config.evidence_locality.cross_source_support_strength - 1.0).abs() < 1e-9,
+            "cross_source_support_strength = {}",
+            config.evidence_locality.cross_source_support_strength
         );
     }
 

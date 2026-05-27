@@ -141,3 +141,15 @@ include_agent_id = false
 
 [matcher.fan_out]
 max_per_claim = 32
+
+# ── Evidence Locality Discounting ───────────────────────────────────────────
+# Shafer reliability discount applied to evidential BBAs based on whether the
+# edge crosses paper boundaries. Intra-source supporters are not independent
+# observations of a target, so their per-BBA reliability is lower.
+#
+# Defaults tuned against the synthetic 19-supporter NEMS regression: target
+# BetP lands in [0.7, 0.85] (replacing the un-discounted 0.997 inflation).
+
+[evidence_locality]
+intra_source_support_strength = 0.3
+cross_source_support_strength = 1.0
