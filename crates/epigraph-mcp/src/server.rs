@@ -327,7 +327,7 @@ impl EpiGraphMcpFull {
     // ── Memory (2 tools) ──
 
     #[tool(
-        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later."
+        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`."
     )]
     async fn memorize(
         &self,

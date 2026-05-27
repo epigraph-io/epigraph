@@ -144,7 +144,9 @@ pub struct MemorizeParams {
     pub confidence: Option<f64>,
 
     #[schemars(
-        description = "Tags for categorization, e.g. ['code', 'rust'] or ['decision', 'architecture']"
+        description = "Tags for categorization, e.g. ['code', 'rust'] or ['decision', 'architecture']. \
+                       Persisted as claim labels — discoverable via `query_claims_by_label`. \
+                       Labels accumulate non-destructively when memorize is called more than once on the same content."
     )]
     #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub tags: Option<Vec<String>>,
