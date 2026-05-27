@@ -1,6 +1,7 @@
 //! Integration test for the owner-or-admin check in
 //! [`resolve_backlog_item`] (deferred-review item #2 of the
-//! backlog-retirement work).
+//! backlog-retirement work; cross-agent unblock for backlog item
+//! `a4cc08a6`).
 //!
 //! Background: previously `resolve_backlog_item` called
 //! `ClaimRepository::update_labels` directly on the repo layer, bypassing
@@ -9,24 +10,28 @@
 //! could retire ANY agent's claim. The fix mirrors the HTTP check inside
 //! the MCP handler.
 //!
-//! Caveat: rmcp's `tool_router` macro does NOT forward `AuthContext` into
-//! per-tool handlers (only `Parameters<T>`), so the MCP handler cannot
-//! read the caller's scopes (`claims:admin` override) or owner UUID. The
-//! check therefore degrades to agent-equality against the server's own
-//! signer agent. This test exercises that check:
+//! `AuthContext` is now propagated from the HTTP `Bearer` middleware
+//! into rmcp's `RequestContext::extensions` by `server::call_tool`, and
+//! `resolve_backlog_item` takes an `Option<&AuthContext>`. Two paths:
 //!
-//! - **Foreign-agent claim → FORBIDDEN.** Seeds a claim authored by a
-//!   freshly-inserted foreign agent UUID. `resolve_backlog_item` must
-//!   refuse with INVALID_PARAMS (the agent-equality fallback maps onto
-//!   that rmcp ErrorCode; see the `claims.rs` impl).
-//! - **Own-signer claim → OK.** Submits a claim through the same MCP
-//!   server (auto-registers the signer agent), then retires it. Must
-//!   succeed.
+//! - **With `auth = Some(_)`:** `claims:admin` OR principal-equality
+//!   against the claim's `agent_id` (mirrors HTTP layer).
+//! - **With `auth = None`:** legacy fallback — agent-equality vs the
+//!   server's own signer agent. This preserves stdio transport's
+//!   behavior (no per-request identity available there).
 //!
-//! The admin-scope override path is intentionally NOT tested here — it
-//! is unreachable without plumbing AuthContext into the tool layer
-//! (tracked as the follow-up in the handler's authz comment).
+//! This file tests both. The HTTP-path admin/principal combinations are
+//! exercised by `cross_agent_admin_scope_*` tests; the stdio-path
+//! foreign/own-signer tests use `auth = None`.
+//!
+//! - **stdio + foreign-agent claim → FORBIDDEN.** Seeds a claim authored
+//!   by a freshly-inserted foreign agent UUID. `resolve_backlog_item`
+//!   must refuse with INVALID_PARAMS.
+//! - **stdio + own-signer claim → OK.** Submits a claim through the
+//!   same MCP server (auto-registers the signer agent), then retires
+//!   it. Must succeed.
 
+use epigraph_auth::{AuthContext, ClientType};
 use epigraph_core::ClaimId;
 use epigraph_db::ClaimRepository;
 use epigraph_mcp::tools::claims::resolve_backlog_item;
@@ -59,6 +64,7 @@ async fn resolve_backlog_item_refuses_foreign_agent_claim(pool: PgPool) {
             resolution_content: "should be rejected".to_string(),
             methodology: None,
         },
+        None,
     )
     .await
     .expect_err("resolve_backlog_item must refuse a foreign-agent claim");
@@ -116,6 +122,7 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
             resolution_content: "retired by own signer".to_string(),
             methodology: None,
         },
+        None,
     )
     .await
     .expect("resolve_backlog_item must permit retirement of own claim");
@@ -131,6 +138,139 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
         labels.contains(&"resolved".to_string()),
         "own claim's label patch must succeed: {labels:?}"
     );
+}
+
+// ── HTTP-path tests: AuthContext present ────────────────────────────────────
+//
+// These exercise the path that was previously unreachable. With an
+// `AuthContext` propagated from the HTTP bearer middleware, an admin
+// token can retire a foreign-agent claim and a non-admin matching
+// principal can retire its own.
+
+/// `auth.has_scope("claims:admin")` should allow retirement of a
+/// foreign-agent claim — the cross-agent unblock for backlog
+/// `a4cc08a6`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn resolve_backlog_item_admin_scope_overrides_foreign_agent(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+
+    let foreign_agent = seed_random_agent(&pool).await;
+    let foreign_claim = seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;
+
+    let admin_auth = make_auth(&["claims:admin"], Uuid::new_v4(), None);
+
+    let result = resolve_backlog_item(
+        &server,
+        ResolveBacklogItemParams {
+            original_id: foreign_claim.as_uuid().to_string(),
+            resolution_content: "retired by admin token".to_string(),
+            methodology: None,
+        },
+        Some(&admin_auth),
+    )
+    .await
+    .expect("admin scope must override foreign-agent ownership check");
+
+    let body = parse_json(&result);
+    let labels: Vec<String> = body["original_labels"]
+        .as_array()
+        .expect("original_labels is array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        labels.contains(&"resolved".to_string()),
+        "admin retirement must patch the foreign claim's labels: {labels:?}"
+    );
+}
+
+/// Non-admin token whose principal (`owner_id` falling back to
+/// `client_id`) equals the claim's `agent_id` should pass — mirrors
+/// HTTP `require_owner_or_admin` semantics.
+#[sqlx::test(migrations = "../../migrations")]
+async fn resolve_backlog_item_matching_principal_passes_without_admin(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+
+    let agent = seed_random_agent(&pool).await;
+    let claim = seed_claim_with_agent(&pool, agent, &["backlog"]).await;
+
+    // Caller is `claims:write`-only but their owner_id == claim.agent_id.
+    let auth = make_auth(&["claims:write"], Uuid::new_v4(), Some(agent));
+
+    let result = resolve_backlog_item(
+        &server,
+        ResolveBacklogItemParams {
+            original_id: claim.as_uuid().to_string(),
+            resolution_content: "retired by owning principal".to_string(),
+            methodology: None,
+        },
+        Some(&auth),
+    )
+    .await
+    .expect("owning principal must succeed without admin scope");
+
+    let body = parse_json(&result);
+    let labels: Vec<String> = body["original_labels"]
+        .as_array()
+        .expect("original_labels is array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        labels.contains(&"resolved".to_string()),
+        "matching-principal retirement must patch labels: {labels:?}"
+    );
+}
+
+/// Foreign-agent claim + non-matching principal + no admin scope must
+/// be denied even when an `AuthContext` is present. This is the
+/// negative test for the admin/principal gate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn resolve_backlog_item_foreign_principal_without_admin_denied(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+
+    let foreign_agent = seed_random_agent(&pool).await;
+    let foreign_claim = seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;
+
+    // Caller's principal is some other UUID — neither admin nor owner.
+    let auth = make_auth(&["claims:write"], Uuid::new_v4(), Some(Uuid::new_v4()));
+
+    let err = resolve_backlog_item(
+        &server,
+        ResolveBacklogItemParams {
+            original_id: foreign_claim.as_uuid().to_string(),
+            resolution_content: "should be rejected".to_string(),
+            methodology: None,
+        },
+        Some(&auth),
+    )
+    .await
+    .expect_err("non-admin foreign principal must be denied");
+
+    let msg = err.message.to_string();
+    assert!(
+        msg.contains("claims:admin") || msg.contains("ownership"),
+        "denial must cite the required permission, got: {msg:?}"
+    );
+
+    let labels = ClaimRepository::get_labels(&pool, foreign_claim)
+        .await
+        .expect("get_labels foreign");
+    assert!(
+        !labels.contains(&"resolved".to_string()),
+        "foreign claim must NOT have been labeled 'resolved' after deny: {labels:?}"
+    );
+}
+
+fn make_auth(scopes: &[&str], client_id: Uuid, owner_id: Option<Uuid>) -> AuthContext {
+    AuthContext {
+        client_id,
+        agent_id: None,
+        owner_id,
+        client_type: ClientType::Service,
+        scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+        jti: Uuid::new_v4(),
+    }
 }
 
 fn parse_json(result: &CallToolResult) -> Value {

@@ -411,6 +411,62 @@ pub async fn update_with_evidence(
     })
 }
 
+/// Per-row authorization for MCP tools that mutate an existing claim.
+///
+/// Mirrors `epigraph_api::middleware::scopes::require_owner_or_admin`
+/// (the HTTP layer's check on PATCH `/api/v1/claims/:id/labels`) but
+/// scoped to the MCP entry path. Two callers, two policies:
+///
+/// - **HTTP (`auth = Some(_)`):** allow if the token carries
+///   `claims:admin` OR the caller's principal (`owner_id` falling back
+///   to `client_id`) equals `target_agent_id`. This is the path that
+///   unblocks cross-agent backlog retirement for admin-scope holders
+///   (backlog item `a4cc08a6`).
+/// - **stdio (`auth = None`):** the MCP server has no per-request
+///   identity, so degrade to comparing the claim's author against the
+///   server's own signer agent. Preserves the legacy behavior for
+///   non-HTTP callers without re-opening the cross-agent abuse vector.
+pub(crate) async fn require_owner_or_admin(
+    server: &EpiGraphMcpFull,
+    auth: Option<&epigraph_auth::AuthContext>,
+    target_agent_id: uuid::Uuid,
+) -> Result<(), McpError> {
+    if let Some(auth) = auth {
+        if auth.has_scope("claims:admin") {
+            return Ok(());
+        }
+        let principal = auth.owner_id.unwrap_or(auth.client_id);
+        if principal == target_agent_id {
+            return Ok(());
+        }
+        return Err(McpError {
+            code: rmcp::model::ErrorCode::INVALID_PARAMS,
+            message: format!(
+                "claim is owned by agent {target_agent_id}; \
+                 caller principal {principal} cannot retire it \
+                 (requires claims:admin scope or ownership)"
+            )
+            .into(),
+            data: None,
+        });
+    }
+
+    let caller_agent = server.agent_id().await?;
+    if caller_agent == target_agent_id {
+        return Ok(());
+    }
+    Err(McpError {
+        code: rmcp::model::ErrorCode::INVALID_PARAMS,
+        message: format!(
+            "claim is owned by agent {target_agent_id}; \
+             caller agent {caller_agent} cannot retire it \
+             (no AuthContext on this transport — claims:admin scope only honored over HTTP)"
+        )
+        .into(),
+        data: None,
+    })
+}
+
 /// One-call backlog-item retirement.
 ///
 /// Submits a resolution claim via the canonical `submit_claim` pipeline
@@ -426,6 +482,7 @@ pub async fn update_with_evidence(
 pub async fn resolve_backlog_item(
     server: &EpiGraphMcpFull,
     params: crate::types::ResolveBacklogItemParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let original_id = parse_uuid(&params.original_id)?;
     let original_claim_id = ClaimId::from_uuid(original_id);
@@ -439,37 +496,15 @@ pub async fn resolve_backlog_item(
         .ok_or_else(|| invalid_params(format!("claim {original_id} not found")))?;
 
     // Authorization: mirror PATCH /api/v1/claims/:id/labels'
-    // `require_owner_or_admin` middleware. The HTTP route's check is
-    // (claims:admin OR auth.owner_id/client_id == claim.agent_id). The
-    // rmcp tool_router macro does NOT forward the request's `AuthContext`
-    // into per-tool handlers — only `Parameters<T>` is passed. So we
-    // cannot read the caller's scopes here (admin override) or their
-    // owner/client UUID. Per Component 2 of the backlog-retirement spec
-    // ("Calls existing HTTP routes…"), HTTP forwarding would be cleaner
-    // but requires a bearer token the MCP server doesn't hold unless the
-    // caller passes one.
-    //
-    // Coarse fallback: compare the claim's author against the server's
-    // own signer agent. This blocks the most common abuse (a token with
-    // claims:write retiring a claim authored by a different signer) but
-    // it does NOT distinguish multiple human/agent callers that share
-    // the same MCP-server signer. Follow-up: plumb AuthContext through
-    // rmcp's Extension<T> pattern at the tool-handler boundary so this
-    // can check has_scope("claims:admin") and auth.owner_id properly.
-    let caller_agent = server.agent_id().await?;
+    // `require_owner_or_admin` middleware. With an HTTP `AuthContext`
+    // available (propagated into rmcp's `RequestContext::extensions` by
+    // `server::call_tool`), allow when the caller has `claims:admin` or
+    // when their principal (`owner_id` falling back to `client_id`)
+    // matches the claim's `agent_id`. With no auth (stdio transport),
+    // fall back to the legacy agent-equality check against the server's
+    // own signer agent — preserves backward compat for non-HTTP callers.
     let target_agent = original.agent_id.as_uuid();
-    if caller_agent != target_agent {
-        return Err(McpError {
-            code: rmcp::model::ErrorCode::INVALID_PARAMS,
-            message: format!(
-                "claim {original_id} is owned by agent {target_agent}; \
-                 caller agent {caller_agent} cannot retire it (claims:admin scope \
-                 override not yet plumbed into MCP tool handlers)"
-            )
-            .into(),
-            data: None,
-        });
-    }
+    require_owner_or_admin(server, auth, target_agent).await?;
 
     // 1. Submit the resolution claim via the canonical pipeline.
     let methodology = params
