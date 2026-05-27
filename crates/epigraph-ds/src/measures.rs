@@ -240,6 +240,36 @@ pub fn beta_to_cbpa(
     Ok(MassFunction::from_raw(frame.clone(), masses))
 }
 
+/// Clamp the five belief-measure fields written to `claims` to `[0.0, 1.0]`.
+///
+/// Three of the five — `belief`, `plausibility`, `mass_on_empty` — are enforced
+/// at the DB level by `claims_belief_bounds`, `claims_plausibility_bounds`, and
+/// `claims_mass_empty_bounds` respectively (see
+/// `migrations/001_initial_schema.sql:627-631`). `pignistic_prob` and
+/// `mass_on_missing` have no CHECK constraint today but are clamped defensively
+/// so a future `ALTER TABLE ... ADD CONSTRAINT ...` lands without surfacing a
+/// new bug.
+///
+/// All callers that issue
+/// `UPDATE claims SET belief|plausibility|pignistic_prob|mass_on_empty|mass_on_missing ...`
+/// MUST route their values through this helper.
+#[must_use]
+pub fn clamp_claim_belief_measures(
+    belief: f64,
+    plausibility: f64,
+    pignistic_prob: Option<f64>,
+    mass_on_empty: f64,
+    mass_on_missing: f64,
+) -> (f64, f64, Option<f64>, f64, f64) {
+    (
+        belief.clamp(0.0, 1.0),
+        plausibility.clamp(0.0, 1.0),
+        pignistic_prob.map(|p| p.clamp(0.0, 1.0)),
+        mass_on_empty.clamp(0.0, 1.0),
+        mass_on_missing.clamp(0.0, 1.0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +715,55 @@ mod tests {
         // ~{1} on binary = {0}, so Bel({0}) should be 0.6 after evaluation
         let bel = belief_classical(&m, &fe0);
         assert!((bel - 0.6).abs() < 1e-10);
+    }
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::clamp_claim_belief_measures;
+
+    #[test]
+    fn clamps_one_ulp_drift_to_one() {
+        // Summing 0.05 twenty times yields 1.0 + 1 ULP in f64 — the drift
+        // case from tests/order_independence_smoke.rs that tripped
+        // claims_{belief,plausibility}_bounds pre-#149. (The product form
+        // 0.05 * 20.0 rounds to exactly 1.0 and does NOT drift, despite what
+        // the original plan suggested; only the summation drifts.)
+        let drifted: f64 = [0.05_f64; 20].iter().sum();
+        assert!(drifted > 1.0, "test setup: expected drift > 1.0");
+        let (bel, pl, betp, me, mm) =
+            clamp_claim_belief_measures(drifted, drifted, Some(drifted), drifted, drifted);
+        assert_eq!(bel, 1.0);
+        assert_eq!(pl, 1.0);
+        assert_eq!(betp, Some(1.0));
+        assert_eq!(me, 1.0);
+        assert_eq!(mm, 1.0);
+    }
+
+    #[test]
+    fn clamps_overshoot_and_undershoot() {
+        let (bel, pl, betp, me, mm) = clamp_claim_belief_measures(1.5, -0.1, Some(2.0), -0.5, 1.7);
+        assert_eq!(bel, 1.0);
+        assert_eq!(pl, 0.0);
+        assert_eq!(betp, Some(1.0));
+        assert_eq!(me, 0.0);
+        assert_eq!(mm, 1.0);
+    }
+
+    #[test]
+    fn passes_through_in_range_values() {
+        let (bel, pl, betp, me, mm) = clamp_claim_belief_measures(0.4, 0.9, Some(0.5), 0.1, 0.05);
+        assert_eq!(bel, 0.4);
+        assert_eq!(pl, 0.9);
+        assert_eq!(betp, Some(0.5));
+        assert_eq!(me, 0.1);
+        assert_eq!(mm, 0.05);
+    }
+
+    #[test]
+    fn preserves_none_pignistic() {
+        let (_, _, betp, _, _) = clamp_claim_belief_measures(0.4, 0.9, None, 0.1, 0.05);
+        assert_eq!(betp, None);
     }
 }
 
