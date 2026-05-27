@@ -409,8 +409,7 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     )
     .await;
     seed_doi_evidence(&pool, primer, target_doi, 0x71_0000).await;
-    let primer_edge =
-        insert_edge(&pool, primer, target_id, "claim", "claim", "supports").await;
+    let primer_edge = insert_edge(&pool, primer, target_id, "claim", "claim", "supports").await;
     auto_wire_ds_for_edge(&pool, primer_edge, agent, primer, target_id, "supports")
         .await
         .expect("auto_wire primer");
@@ -442,25 +441,22 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     )
     .await;
     seed_doi_evidence(&pool, supporter, target_doi, 0x72_0000).await;
-    let edge_id =
-        insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
-    let outcome =
-        auto_wire_ds_for_edge(&pool, edge_id, agent, supporter, target_id, "supports")
-            .await
-            .expect("auto_wire override");
+    let edge_id = insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
+    let outcome = auto_wire_ds_for_edge(&pool, edge_id, agent, supporter, target_id, "supports")
+        .await
+        .expect("auto_wire override");
     assert_eq!(outcome, EdgeFactorOutcome::Wired);
 
     // The new BBA's source_strength is the one written via perspective_id =
     // edge_id (see PerspectiveRepository::ensure_edge_perspective). Reading
     // by perspective_id gives us an exact handle independent of the primer
     // row that landed at the default factor.
-    let ss: f64 = sqlx::query_scalar(
-        "SELECT source_strength FROM mass_functions WHERE perspective_id = $1",
-    )
-    .bind(edge_id)
-    .fetch_one(&pool)
-    .await
-    .expect("fetch override BBA's source_strength");
+    let ss: f64 =
+        sqlx::query_scalar("SELECT source_strength FROM mass_functions WHERE perspective_id = $1")
+            .bind(edge_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch override BBA's source_strength");
     eprintln!("[per_frame_locality_factor_override_applied] source_strength = {ss}");
 
     // Expected: 0.7 (transmission) * 0.9 (per-frame factor) = 0.63.
@@ -478,13 +474,12 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     // AFTER `set_property`. (Per-frame factor is read at write time, not
     // stored on the BBA, so a later override doesn't retroactively
     // change historical rows — backfill script's job.)
-    let primer_ss: f64 = sqlx::query_scalar(
-        "SELECT source_strength FROM mass_functions WHERE perspective_id = $1",
-    )
-    .bind(primer_edge)
-    .fetch_one(&pool)
-    .await
-    .expect("fetch primer BBA's source_strength");
+    let primer_ss: f64 =
+        sqlx::query_scalar("SELECT source_strength FROM mass_functions WHERE perspective_id = $1")
+            .bind(primer_edge)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch primer BBA's source_strength");
     assert!(
         primer_ss < 0.30,
         "primer BBA (written pre-override) should still carry default-factor discount (<0.30), got {primer_ss}"
