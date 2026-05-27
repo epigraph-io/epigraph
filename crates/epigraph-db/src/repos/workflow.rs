@@ -628,6 +628,101 @@ impl WorkflowRepository {
             .await
     }
 
+    /// Cosine-similarity search over `workflows.goal_embedding`.
+    ///
+    /// Mirrors `find_by_embedding` (flat) but reads the hierarchical
+    /// `workflows` table. Rows without an embedding are skipped — caller
+    /// should fall back to `search_hierarchical_by_text` for those.
+    ///
+    /// `similarity_threshold` filters by `(1 - cosine_distance) >=
+    /// threshold`. `min_truth` filters out deprecated rows
+    /// (`deprecate_workflow` writes 0.05). When `resolve_to_latest` is
+    /// true, ordering is `(canonical_name ASC, generation DESC,
+    /// distance ASC)` so heads-of-lineage surface first; otherwise
+    /// `distance ASC, created_at DESC`.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn find_hierarchical_by_embedding(
+        pool: &PgPool,
+        query_embedding: &[f32],
+        similarity_threshold: f64,
+        min_truth: f64,
+        limit: i64,
+        resolve_to_latest: bool,
+    ) -> Result<Vec<HierarchicalWorkflowRow>, sqlx::Error> {
+        let vec_str = format!(
+            "[{}]",
+            query_embedding
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        // For embedding-based search, semantic distance is the primary signal —
+        // sorting by canonical_name first (as the ILIKE path does for heads-walk
+        // dedup) would defeat that. Always sort by distance first; when
+        // resolve_to_latest is requested, prefer higher generation as a
+        // tiebreaker so newer variants of an equally-close lineage surface
+        // first.
+        let order_clause = if resolve_to_latest {
+            "ORDER BY distance ASC, generation DESC, created_at DESC"
+        } else {
+            "ORDER BY distance ASC, created_at DESC, id ASC"
+        };
+        let sql = format!(
+            "WITH q AS (SELECT $1::vector AS v) \
+             SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value, \
+                    (w.goal_embedding <=> q.v) AS distance \
+             FROM workflows w, q \
+             WHERE w.goal_embedding IS NOT NULL \
+               AND w.truth_value >= $3 \
+               AND (1 - (w.goal_embedding <=> q.v)) >= $2 \
+             {order_clause} \
+             LIMIT $4"
+        );
+        // The SELECT adds a `distance` column for ordering but it's not part of
+        // HierarchicalWorkflowRow — wrap in an outer SELECT that drops it.
+        let outer_sql = format!(
+            "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
+             FROM ({sql}) inner_q"
+        );
+        sqlx::query_as::<_, HierarchicalWorkflowRow>(&outer_sql)
+            .bind(&vec_str)
+            .bind(similarity_threshold)
+            .bind(min_truth)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+    }
+
+    /// Write the embedding vector for a hierarchical workflow's goal text.
+    /// Idempotent: caller is expected to skip rows where `goal_embedding`
+    /// is already set unless explicitly re-embedding.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn set_goal_embedding(
+        pool: &PgPool,
+        workflow_id: Uuid,
+        embedding: &[f32],
+    ) -> Result<u64, sqlx::Error> {
+        let vec_str = format!(
+            "[{}]",
+            embedding
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let r = sqlx::query("UPDATE workflows SET goal_embedding = $1::vector WHERE id = $2")
+            .bind(&vec_str)
+            .bind(workflow_id)
+            .execute(pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     /// Set `workflows.truth_value` for the given workflow id. Used by
     /// `deprecate_workflow` to cascade truth=0.05 from the flat-claim row
     /// onto the hierarchical-table row so `find_workflow_hierarchical`

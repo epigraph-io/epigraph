@@ -723,17 +723,42 @@ pub async fn find_workflow_hierarchical(
 ) -> Result<Json<HierarchicalSearchResponse>, ApiError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let min_truth = params.min_truth.unwrap_or(0.3);
-    let rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
-        &state.db_pool,
-        &params.q,
-        limit,
-        min_truth,
-        params.resolve_to_latest,
-    )
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("hierarchical search failed: {e}"),
-    })?;
+    let similarity_threshold = 0.5_f64;
+
+    // Embedding-first to tolerate paraphrasing; ILIKE fallback for short
+    // queries, when embedder is unavailable, or when no embedded rows clear
+    // the similarity floor.
+    let mut rows = if let Some(embedder) = state.embedding_service() {
+        match embedder.generate(&params.q).await {
+            Ok(qvec) => epigraph_db::WorkflowRepository::find_hierarchical_by_embedding(
+                &state.db_pool,
+                &qvec,
+                similarity_threshold,
+                min_truth,
+                limit,
+                params.resolve_to_latest,
+            )
+            .await
+            .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    if rows.is_empty() {
+        rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
+            &state.db_pool,
+            &params.q,
+            limit,
+            min_truth,
+            params.resolve_to_latest,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("hierarchical search failed: {e}"),
+        })?;
+    }
 
     let mut workflows: Vec<HierarchicalWorkflowResult> = rows
         .into_iter()

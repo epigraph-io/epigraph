@@ -60,16 +60,66 @@ pub async fn find_workflow_hierarchical(
     // for future probabilistic discounting; callers can pass 0.0 to see
     // the deprecated cemetery.
     let min_truth = params.min_truth.unwrap_or(0.3);
+    // Cosine-similarity floor for embedding hits. 0.5 mirrors the
+    // behavioral_affinity_lineage default used by flat find_workflow.
+    let similarity_threshold = 0.5_f64;
 
-    let rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
-        &server.pool,
-        &params.query,
-        limit,
-        min_truth,
-        resolve_to_latest,
-    )
-    .await
-    .map_err(internal_error)?;
+    // Try embedding-first to tolerate paraphrasing, punctuation drift, and
+    // word-order differences. Falls through to ILIKE substring match (the
+    // legacy search_hierarchical_by_text path) when the embedder is
+    // unavailable, the API call fails, or zero workflows have an embedding
+    // similar enough to clear the threshold.
+    let mut search_path = "ilike";
+    let mut rows = if server.embedder.is_mock() {
+        Vec::new()
+    } else {
+        match server.embedder.generate(&params.query).await {
+            Ok(qvec) => {
+                match epigraph_db::WorkflowRepository::find_hierarchical_by_embedding(
+                    &server.pool,
+                    &qvec,
+                    similarity_threshold,
+                    min_truth,
+                    limit,
+                    resolve_to_latest,
+                )
+                .await
+                {
+                    Ok(rs) if !rs.is_empty() => {
+                        search_path = "embedding";
+                        rs
+                    }
+                    Ok(_) => Vec::new(), // embedding ran but no rows cleared threshold
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            "find_hierarchical_by_embedding failed; falling back to ILIKE"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "embedder.generate failed; falling back to ILIKE"
+                );
+                Vec::new()
+            }
+        }
+    };
+
+    if rows.is_empty() {
+        rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
+            &server.pool,
+            &params.query,
+            limit,
+            min_truth,
+            resolve_to_latest,
+        )
+        .await
+        .map_err(internal_error)?;
+    }
 
     let mut workflows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
     for r in rows {
@@ -100,6 +150,7 @@ pub async fn find_workflow_hierarchical(
         "total": workflows.len(),
         "resolve_to_latest": resolve_to_latest,
         "min_truth": min_truth,
+        "search_path": search_path,
     }))
 }
 
