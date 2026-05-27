@@ -1,3 +1,4 @@
+pub mod alternative_sets;
 pub mod batch;
 pub mod challenges;
 pub mod claims;

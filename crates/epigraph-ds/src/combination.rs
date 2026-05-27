@@ -767,6 +767,97 @@ fn check_frame_compat(m1: &MassFunction, m2: &MassFunction) -> Result<(), DsErro
     Ok(())
 }
 
+/// Reduce a set of mutually-exclusive supporter BBAs to a single representative
+/// BBA via max-Bel / max-Pl on the projected belief interval toward `target`.
+///
+/// Used by CDST BP for alternative-set members: independence has failed (these
+/// claims compete to support the same target), so the product rule
+/// ([`combine_multiple`]) over-combines. Max-Pl is the "least restrictive
+/// alternative" rule from regulatory/legal reasoning: the combined belief is
+/// bounded by the most permissive single alternative.
+///
+/// Members are passed *post-discount* — the caller applies any per-BBA
+/// `source_strength` reliability discount via [`discount`] before invoking
+/// this function.
+///
+/// The result is a three-focal classical BBA:
+/// - `m({target}) = max_Bel`
+/// - `m(Θ)        = max_Pl - max_Bel`  (ignorance band)
+/// - `m(¬target)  = 1 - max_Pl`        (refutation mass)
+///
+/// Returns the singleton input unchanged.
+///
+/// # Errors
+/// - [`DsError::InsufficientSources`] if `bbas` is empty.
+/// - [`DsError::IncompatibleFrames`] if BBAs span different frames.
+/// - [`DsError::InvalidMassSum`] if the resulting masses fail validation
+///   (should not happen — internal invariant check).
+pub fn combine_alternative_set(
+    bbas: &[MassFunction],
+    target: &FocalElement,
+) -> Result<MassFunction, DsError> {
+    if bbas.is_empty() {
+        return Err(DsError::InsufficientSources);
+    }
+    if bbas.len() == 1 {
+        return Ok(bbas[0].clone());
+    }
+    let frame = bbas[0].frame().clone();
+    for m in &bbas[1..] {
+        if m.frame().id != frame.id {
+            return Err(DsError::IncompatibleFrames {
+                left: frame.id.clone(),
+                right: m.frame().id.clone(),
+            });
+        }
+    }
+
+    let max_bel = bbas
+        .iter()
+        .map(|m| crate::measures::belief(m, target))
+        .fold(0.0_f64, f64::max);
+    let max_pl = bbas
+        .iter()
+        .map(|m| crate::measures::plausibility(m, target))
+        .fold(0.0_f64, f64::max);
+    let max_bel = max_bel.clamp(0.0, 1.0);
+    let max_pl = max_pl.clamp(max_bel, 1.0); // Pl >= Bel by definition
+
+    // Construct: m({target}) = max_bel, m(Θ) = max_pl - max_bel,
+    //            m(complement(target)) = 1 - max_pl
+    let mut masses: BTreeMap<FocalElement, f64> = BTreeMap::new();
+    if max_bel > 0.0 {
+        masses.insert(target.clone(), max_bel);
+    }
+    let ignorance = max_pl - max_bel;
+    if ignorance > 1e-12 {
+        // Θ = full frame
+        masses.insert(FocalElement::positive(frame.full_set()), ignorance);
+    }
+    let neg_mass = 1.0 - max_pl;
+    if neg_mass > 1e-12 {
+        // complement of target within the frame
+        let comp: BTreeSet<usize> = frame
+            .full_set()
+            .difference(&target.subset)
+            .copied()
+            .collect();
+        if !comp.is_empty() {
+            masses.insert(FocalElement::positive(comp), neg_mass);
+        }
+    }
+
+    // Renormalize to compensate for tiny floating-point drift before validation.
+    let sum: f64 = masses.values().sum();
+    if sum > 0.0 && (sum - 1.0).abs() > 0.0 {
+        for v in masses.values_mut() {
+            *v /= sum;
+        }
+    }
+
+    MassFunction::new(frame, masses)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1801,5 +1892,83 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod combine_alternative_set_tests {
+    use super::combine_alternative_set;
+    use crate::{
+        measures::{belief, plausibility},
+        FocalElement, FrameOfDiscernment, MassFunction,
+    };
+    use std::collections::BTreeSet;
+
+    fn binary() -> FrameOfDiscernment {
+        FrameOfDiscernment::new(
+            "alt-set-test",
+            vec!["supported".into(), "unsupported".into()],
+        )
+        .unwrap()
+    }
+
+    fn target() -> FocalElement {
+        FocalElement::positive(BTreeSet::from([0])) // {supported}
+    }
+
+    #[test]
+    fn singleton_returns_input_unchanged() {
+        let frame = binary();
+        let m = MassFunction::simple(frame, BTreeSet::from([0]), 0.6).unwrap();
+        let combined = combine_alternative_set(std::slice::from_ref(&m), &target()).unwrap();
+        assert!((belief(&combined, &target()) - 0.6).abs() < 1e-9);
+        assert!((plausibility(&combined, &target()) - 1.0).abs() < 1e-9); // simple gives m(Θ) = 0.4
+    }
+
+    #[test]
+    fn two_member_set_picks_max_bel_and_max_pl() {
+        let frame = binary();
+        // Member A: BBA pushing strongly toward {supported}: Bel=0.7, Pl=1.0 (ignorance 0.3 on Θ)
+        let a = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 0.7).unwrap();
+        // Member B: BBA pushing weakly toward {supported}: Bel=0.3, Pl=1.0
+        let b = MassFunction::simple(frame, BTreeSet::from([0]), 0.3).unwrap();
+        let combined = combine_alternative_set(&[a, b], &target()).unwrap();
+        let bel = belief(&combined, &target());
+        let pl = plausibility(&combined, &target());
+        assert!(
+            (bel - 0.7).abs() < 1e-9,
+            "max_Bel should equal max(0.7, 0.3) = 0.7, got {bel}"
+        );
+        assert!(
+            (pl - 1.0).abs() < 1e-9,
+            "max_Pl should equal max(1.0, 1.0) = 1.0, got {pl}"
+        );
+    }
+
+    #[test]
+    fn mixed_alt_vs_independent_differs_from_dempster() {
+        use crate::combination::combine_multiple;
+        let frame = binary();
+        // Alt members A1, A2 — same shape as previous test
+        let a1 = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 0.7).unwrap();
+        let a2 = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 0.3).unwrap();
+        // Independent A3
+        let a3 = MassFunction::simple(frame, BTreeSet::from([0]), 0.5).unwrap();
+
+        let alt_combined = combine_alternative_set(&[a1.clone(), a2.clone()], &target()).unwrap();
+        let (mixed, _) = combine_multiple(&[alt_combined, a3.clone()], 0.1).unwrap();
+        let (pure_dempster, _) = combine_multiple(&[a1, a2, a3], 0.1).unwrap();
+
+        let mixed_bel = belief(&mixed, &target());
+        let pure_bel = belief(&pure_dempster, &target());
+        assert!(
+            (mixed_bel - pure_bel).abs() > 1e-3,
+            "max-Pl ⊕ Dempster must differ from pure-Dempster: mixed={mixed_bel}, pure={pure_bel}"
+        );
+        // Sanity: max-Pl path should not over-combine, so mixed_bel < pure_bel
+        assert!(
+            mixed_bel < pure_bel,
+            "max-Pl reduction should yield lower combined Bel than pure Dempster"
+        );
     }
 }

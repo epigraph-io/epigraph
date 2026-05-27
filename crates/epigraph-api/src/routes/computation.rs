@@ -594,10 +594,26 @@ pub async fn propagate_beliefs(
             })
             .collect();
 
+        // Load the alternative-set equivalence class for every claim from the
+        // `alternative_set` view (migration 042). Empty on a fresh graph —
+        // BP must not fail in that case, so we tolerate query failures and
+        // proceed with an empty map (== legacy pure-Dempster behavior).
+        let alt_set_rows: Vec<(Uuid, Vec<Uuid>)> =
+            sqlx::query_as("SELECT claim_id, alt_members FROM alternative_set")
+                .fetch_all(&state.db_pool)
+                .await
+                .unwrap_or_default();
+
+        let mut alt_set_membership: epigraph_engine::cdst_bp::AltSetMembership = HashMap::new();
+        for (claim_id, members) in alt_set_rows {
+            alt_set_membership.insert(claim_id, members);
+        }
+
         let cdst_config = epigraph_engine::cdst_bp::CdstBpConfig {
             max_iterations: config.max_iterations,
             convergence_threshold: config.convergence_threshold,
             damping: config.damping,
+            alt_set_membership,
             ..epigraph_engine::cdst_bp::CdstBpConfig::default()
         };
 
