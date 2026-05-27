@@ -310,6 +310,20 @@ impl EpiGraphMcpFull {
         tools::provenance::get_provenance(self, params).await
     }
 
+    // ── Alternative-set candidate finder (1 tool) ──
+
+    #[tool(
+        description = "Suggest candidate alternative_of pairs: supporters of a shared target connected by a contradicts edge that are not already linked by alternative_of. Pure suggestion — operator promotes by submitting an explicit alternative_of edge. Returns ordered candidates with score = min(BetP_A, BetP_B)."
+    )]
+    async fn suggest_alternative_sets(
+        &self,
+        Parameters(params): Parameters<
+            crate::tools::alternative_sets::SuggestAlternativeSetsParams,
+        >,
+    ) -> Result<CallToolResult, McpError> {
+        crate::tools::alternative_sets::suggest_alternative_sets(self, params).await
+    }
+
     // ── Memory (2 tools) ──
 
     #[tool(
