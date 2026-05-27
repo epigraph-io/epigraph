@@ -42,6 +42,15 @@ pub async fn memorize(
         crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "memorize").await?;
     let claim_uuid = claim.id.as_uuid();
 
+    // Persist tags as claim labels so `query_claims_by_label` can surface them.
+    // Apply on dedup-hit too — labels accumulate non-destructively via the repo's
+    // SELECT DISTINCT, so re-memorizing existing content with new tags is additive.
+    if !tags.is_empty() {
+        if let Err(e) = ClaimRepository::update_labels(&server.pool, claim_uuid, &tags, &[]).await {
+            tracing::warn!(claim_id = %claim_uuid, "memorize: update_labels failed: {e}");
+        }
+    }
+
     let (final_truth, ds, embedded) = if was_created {
         let evidence_text = if tags.is_empty() {
             "Memory stored via MCP memorize tool".to_string()
