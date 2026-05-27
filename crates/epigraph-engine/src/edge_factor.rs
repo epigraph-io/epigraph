@@ -74,19 +74,49 @@ pub async fn auto_wire_ds_for_edge(
     let source_interval =
         EpistemicInterval::new(bel, pl, ow_opt.unwrap_or((pl - bel).max(0.0) * 0.5));
 
-    let (restricted, source_strength) = match restriction {
-        RestrictionKind::Positive(f) => (restrict_epistemic_positive(&source_interval, f), f),
-        RestrictionKind::Negative(f) => (restrict_epistemic_negative(&source_interval, f), f),
-        RestrictionKind::FrameEvidence(f) => (
-            restrict_epistemic_frame_evidence(&source_interval, source_interval.betp(), f),
-            f,
-        ),
+    // The restriction transmission factor (`f`) is already folded into the
+    // BBA mass shape via `restrict_epistemic_*`; only the locality factor
+    // lands on the stored `source_strength` column below.
+    let restricted = match restriction {
+        RestrictionKind::Positive(f) => restrict_epistemic_positive(&source_interval, f),
+        RestrictionKind::Negative(f) => restrict_epistemic_negative(&source_interval, f),
+        RestrictionKind::FrameEvidence(f) => {
+            restrict_epistemic_frame_evidence(&source_interval, source_interval.betp(), f)
+        }
         RestrictionKind::Neutral => unreachable!(),
     };
 
     if restricted.width() >= 0.999 && restricted.bel < 0.01 {
         return Ok(EdgeFactorOutcome::Vacuous);
     }
+
+    // Locality-aware reliability discount. Same-paper supporters are not
+    // independent observations of the target — apply a smaller source_strength
+    // so the existing Shafer discount in CDST combine deflates the per-BBA
+    // contribution. Defaults: intra=0.3, cross=1.0 (see calibration.toml).
+    //
+    // We REPLACE the restriction transmission factor with the locality factor
+    // (rather than multiplying) per the spec at
+    // docs/superpowers/specs/2026-05-27-alternative-and-dependency-edges-design.md §2:
+    // the calibrated [0.7, 0.85] band for 19 intra-source supporters assumes
+    // the locality value IS the stored source_strength, not a composition.
+    let same_source: bool = sqlx::query_scalar::<_, bool>("SELECT same_source_papers($1, $2)")
+        .bind(source_id)
+        .bind(target_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("same_source_papers: {e}"))?;
+    let calibration = crate::calibration::CalibrationConfig::from_workspace_root().ok();
+    let (intra, cross) = calibration
+        .as_ref()
+        .map(|c| {
+            (
+                c.evidence_locality.intra_source_support_strength,
+                c.evidence_locality.cross_source_support_strength,
+            )
+        })
+        .unwrap_or((0.3, 1.0));
+    let source_strength = if same_source { intra } else { cross };
 
     let frame_id = ensure_binary_frame(pool).await?;
     let frame = binary_frame()?;
