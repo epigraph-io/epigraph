@@ -275,9 +275,16 @@ impl EpiGraphMcpFull {
     async fn resolve_backlog_item(
         &self,
         Parameters(params): Parameters<crate::types::ResolveBacklogItemParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        crate::tools::claims::resolve_backlog_item(self, params).await
+        // For HTTP callers `call_tool` copies the AuthContext into
+        // `context.extensions` so admin-scope holders can bypass the
+        // agent-equality ownership check. For stdio (no auth context)
+        // we pass `None` and the handler falls back to agent-equality
+        // against the server's own signer agent.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        crate::tools::claims::resolve_backlog_item(self, params, auth).await
     }
 
     #[tool(
@@ -928,11 +935,21 @@ impl ServerHandler for EpiGraphMcpFull {
         // `http::request::Parts` (see rmcp/src/transport/streamable_http_server/
         // tower.rs:326/384/463). For stdio transport there is no `Parts` attached —
         // the stdio process boundary is the trust gate and no auth check applies.
-        let http_parts = context.extensions.get::<Parts>();
-        let auth = http_parts.and_then(|p| p.extensions.get::<epigraph_auth::AuthContext>());
+        let is_http_call;
+        let auth_owned: Option<epigraph_auth::AuthContext>;
+        {
+            let http_parts = context.extensions.get::<Parts>();
+            is_http_call = http_parts.is_some();
+            // Clone the AuthContext out of the borrow so we can both
+            // (a) run scope enforcement and (b) reassign `context`
+            // below to insert it into rmcp's extensions map.
+            auth_owned = http_parts
+                .and_then(|p| p.extensions.get::<epigraph_auth::AuthContext>())
+                .cloned();
+        }
 
-        if http_parts.is_some() {
-            if let Err(err) = Self::enforce_tool_scope(auth, &request.name) {
+        if is_http_call {
+            if let Err(err) = Self::enforce_tool_scope(auth_owned.as_ref(), &request.name) {
                 // Emit a denial audit event so 403s show up alongside successes.
                 self.emit_tool_invoked(&format!("denied:{}", request.name))
                     .await;
@@ -947,6 +964,21 @@ impl ServerHandler for EpiGraphMcpFull {
         // **DO NOT remove this line without updating
         // `tests/event_log_wiring_tests.rs::tool_dispatch_emits_tool_invoked_event`.**
         self.emit_tool_invoked(&request.name).await;
+
+        // Propagate the HTTP-side `AuthContext` (set by
+        // `auth::bearer_auth_middleware` and forwarded by
+        // `StreamableHttpService` through `http::request::Parts`) into
+        // rmcp's `RequestContext::extensions` so per-tool handlers can
+        // pull it out via the `rmcp::model::Extensions` extractor and
+        // run per-row ownership checks (e.g. `resolve_backlog_item`'s
+        // owner-or-`claims:admin` gate). For stdio transport there is
+        // no `Parts` and no auth to copy; handlers see an empty
+        // extensions map and fall back to coarse, signer-agent-based
+        // checks.
+        let mut context = context;
+        if let Some(auth) = auth_owned {
+            context.extensions.insert(auth);
+        }
 
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await

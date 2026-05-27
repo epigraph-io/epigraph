@@ -41,6 +41,7 @@ async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPo
             resolution_content: "Fixed by replacing the index with a GIN BTREE.".to_string(),
             methodology: None,
         },
+        None,
     )
     .await
     .expect("resolve_backlog_item");
