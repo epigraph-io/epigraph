@@ -67,8 +67,8 @@ pub use claim::{
     PatchClaimDiff, PatchClaimInput,
 };
 pub use claim_theme::{
-    BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow, DistantClaimsRow, RecomputedThemeRow,
-    SplitCandidateRow,
+    centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
+    DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
 pub use community::CommunityRepository;

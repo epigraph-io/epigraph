@@ -30,6 +30,7 @@ pub mod confidence;
 pub mod cospan;
 pub mod counterfactual;
 pub mod dag;
+pub mod diverse_retrieval;
 pub mod diverse_select;
 pub mod domain_decay;
 pub mod edge_factor;

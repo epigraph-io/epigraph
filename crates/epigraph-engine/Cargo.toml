@@ -90,5 +90,13 @@ path = "tests/pipeline_end_to_end.rs"
 name = "cdst_corroborates_aggregation"
 path = "tests/cdst_corroborates_aggregation.rs"
 
+[[test]]
+name = "diverse_retrieval_integration"
+path = "tests/diverse_retrieval_integration.rs"
+
+[[test]]
+name = "diverse_retrieval_layering"
+path = "tests/diverse_retrieval_layering.rs"
+
 [lints]
 workspace = true
