@@ -46,8 +46,7 @@ mod common;
 /// FK is satisfied. Idempotent across test runs.
 async fn ensure_binary_frame(pool: &PgPool) -> Uuid {
     // Deterministic UUID so repeated test runs reuse the same row.
-    let frame_id =
-        Uuid::parse_str("00000000-0000-0000-0000-00000000bf01").expect("constant uuid");
+    let frame_id = Uuid::parse_str("00000000-0000-0000-0000-00000000bf01").expect("constant uuid");
     sqlx::query(
         "INSERT INTO frames (id, name, hypotheses) \
          VALUES ($1, 'bp_apply_test_binary', ARRAY['supported','unsupported']::text[]) \
@@ -220,9 +219,15 @@ async fn cdst_bp_apply_clamps_drifted_plausibility() {
     // Confirm the CDST branch was actually taken — otherwise the test is
     // not exercising the surface we're auditing.
     let mode = body.get("mode").and_then(|v| v.as_str()).unwrap_or("");
-    assert_eq!(mode, "cdst", "expected CDST branch, got mode={mode}; body={body_text}");
+    assert_eq!(
+        mode, "cdst",
+        "expected CDST branch, got mode={mode}; body={body_text}"
+    );
 
-    let applied = body.get("applied").and_then(|v| v.as_bool()).unwrap_or(false);
+    let applied = body
+        .get("applied")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     assert!(applied, "expected applied=true; body={body_text}");
 
     let factors_count = body
@@ -245,13 +250,12 @@ async fn cdst_bp_apply_clamps_drifted_plausibility() {
     // is what we are auditing; if the apply path ever wrote >1.0, the UPDATE
     // would have failed (silently incrementing apply_failures). This is a
     // belt-and-braces post-condition.
-    let row: (f64, f64, Option<f64>) = sqlx::query_as(
-        "SELECT belief, plausibility, pignistic_prob FROM claims WHERE id = $1",
-    )
-    .bind(claim_drift)
-    .fetch_one(&pool)
-    .await
-    .expect("read back drift claim");
+    let row: (f64, f64, Option<f64>) =
+        sqlx::query_as("SELECT belief, plausibility, pignistic_prob FROM claims WHERE id = $1")
+            .bind(claim_drift)
+            .fetch_one(&pool)
+            .await
+            .expect("read back drift claim");
     assert!(
         (0.0..=1.0).contains(&row.0),
         "belief escaped [0,1] after apply: {}",
