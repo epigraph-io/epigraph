@@ -153,10 +153,11 @@ mod clamp_tests {
 
     #[test]
     fn clamps_one_ulp_drift_to_one() {
-        // 0.05 * 20 = 1.0000000000000002 in f64 — the exact drift case
-        // measured in the order_independence_smoke test.
-        let drifted = 0.05_f64 * 20.0;
-        assert!(drifted > 1.0, "test setup: expected drift > 1.0");
+        // 0.05 * 20.0 ROUNDS to exactly 1.0 in f64; the canonical drift case
+        // is the *summation* form (see order_independence_smoke.rs:60-61):
+        // [0.05; 20].iter().sum() = 1.0000000000000002.
+        let drifted: f64 = [0.05_f64; 20].iter().sum();
+        assert!(drifted > 1.0, "test setup: summation must drift one ULP above 1.0");
         let (bel, pl, betp, me, mm) =
             clamp_claim_belief_measures(drifted, drifted, Some(drifted), drifted, drifted);
         assert_eq!(bel, 1.0);
@@ -550,8 +551,10 @@ async fn update_claim_belief_clamps_one_ulp_drift() {
     let (claim_id, _agent) = common::seed_minimal_claim(&pool).await;
     let frame_id = common::ensure_binary_frame(&pool).await;
 
-    let drifted = 0.05_f64 * 20.0; // > 1.0 by one ULP
-    assert!(drifted > 1.0);
+    // 0.05 * 20.0 rounds to exactly 1.0 in f64; the canonical drift case
+    // is the *summation* form (see crates/epigraph-ds/tests/order_independence_smoke.rs:60-61).
+    let drifted: f64 = [0.05_f64; 20].iter().sum(); // = 1.0000000000000002
+    assert!(drifted > 1.0, "summation form drifts above 1.0");
 
     MassFunctionRepository::update_claim_belief(
         &pool,
