@@ -185,6 +185,44 @@ pub async fn seed_system_agent(pool: &PgPool) -> Uuid {
     id
 }
 
+/// Connect to the configured test database. Tests that need just a pool
+/// (no spawned HTTP app) use this helper to centralize the connection.
+pub async fn test_pool() -> PgPool {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("connect to test db")
+}
+
+/// Insert an edge directly via SQL. Returns the generated edge id.
+/// Used by tests that need to seed edge fixtures without going through
+/// the HTTP edges route (e.g., tests of unique indexes, view closures,
+/// or relationships not yet exposed by the public API).
+pub async fn insert_edge(
+    pool: &PgPool,
+    source_id: Uuid,
+    target_id: Uuid,
+    source_type: &str,
+    target_type: &str,
+    relationship: &str,
+) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship) \
+         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+    )
+    .bind(source_id)
+    .bind(target_id)
+    .bind(source_type)
+    .bind(target_type)
+    .bind(relationship)
+    .fetch_one(pool)
+    .await
+    .expect("insert edge");
+    id
+}
+
 /// Insert a minimal claim with per-call unique content_hash.
 pub async fn seed_claim(pool: &PgPool, content: &str) -> Uuid {
     let agent = seed_system_agent(pool).await;
