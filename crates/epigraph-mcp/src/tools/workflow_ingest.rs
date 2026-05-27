@@ -128,12 +128,9 @@ pub async fn do_ingest_workflow(
     if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
         match server.embedder.generate(&extraction.source.goal).await {
             Ok(qvec) => {
-                if let Err(e) = epigraph_db::WorkflowRepository::set_goal_embedding(
-                    &server.pool,
-                    wf_id,
-                    &qvec,
-                )
-                .await
+                if let Err(e) =
+                    epigraph_db::WorkflowRepository::set_goal_embedding(&server.pool, wf_id, &qvec)
+                        .await
                 {
                     tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
                 }
