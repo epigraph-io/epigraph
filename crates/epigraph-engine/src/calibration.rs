@@ -49,8 +49,34 @@ pub struct CalibrationConfig {
     /// Journal name → reliability score.
     pub journal_reliability: HashMap<String, f64>,
 
+    /// Evidence-locality discounts applied to per-BBA source_strength.
+    ///
+    /// Drives Shafer reliability discounting in
+    /// `routes/edges.rs::trigger_edge_ds_recomputation` based on whether the
+    /// supporting and supported claims share a source paper.
+    #[serde(default = "default_evidence_locality")]
+    pub evidence_locality: EvidenceLocality,
+
     /// Classifier decision thresholds (NEI, support, conflict).
     pub classifier_thresholds: ClassifierThresholds,
+}
+
+/// Discount factors keyed on whether evidence crosses paper boundaries.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvidenceLocality {
+    /// `source_strength` for intra-paper evidential BBAs (low — supporters
+    /// from one paper are not independent observations).
+    pub intra_source_support_strength: f64,
+
+    /// `source_strength` for cross-paper evidential BBAs (full reliability).
+    pub cross_source_support_strength: f64,
+}
+
+fn default_evidence_locality() -> EvidenceLocality {
+    EvidenceLocality {
+        intra_source_support_strength: 0.25,
+        cross_source_support_strength: 1.0,
+    }
 }
 
 /// Thresholds used by the BetP-based classifier.
@@ -73,6 +99,32 @@ impl CalibrationConfig {
         let contents = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&contents)?;
         Ok(config)
+    }
+
+    /// Loads `calibration.toml` from the `CALIBRATION_PATH` env var if set,
+    /// otherwise from the workspace root via `CARGO_MANIFEST_DIR` (best effort).
+    ///
+    /// Falls back to the literal path `"calibration.toml"` (cwd-relative) when
+    /// neither env var is present at runtime. Returns the same
+    /// [`CalibrationError`] variants as [`Self::load`].
+    ///
+    /// Production hot-path callers should treat I/O failure as recoverable
+    /// (e.g. `.ok().map(...).unwrap_or((defaults))`) rather than propagating —
+    /// the engine has reasonable defaults for every locality / weight key.
+    pub fn from_workspace_root() -> Result<Self, CalibrationError> {
+        let path = if let Ok(explicit) = std::env::var("CALIBRATION_PATH") {
+            std::path::PathBuf::from(explicit)
+        } else if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
+            // crates/epigraph-engine/ → workspace root is two levels up.
+            std::path::PathBuf::from(manifest_dir)
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|root| root.join("calibration.toml"))
+                .unwrap_or_else(|| std::path::PathBuf::from("calibration.toml"))
+        } else {
+            std::path::PathBuf::from("calibration.toml")
+        };
+        Self::load(&path)
     }
 
     /// Resolve a methodology string to its `(base_support, base_against, base_ignorance)` profile.
@@ -184,6 +236,21 @@ mod tests {
         assert!(
             (cfg.default_journal_reliability - 0.78).abs() < f64::EPSILON,
             "default_journal_reliability should be 0.78"
+        );
+    }
+
+    #[test]
+    fn test_evidence_locality_loads() {
+        let config = load_config();
+        assert!(
+            (config.evidence_locality.intra_source_support_strength - 0.25).abs() < 1e-9,
+            "intra_source_support_strength = {}",
+            config.evidence_locality.intra_source_support_strength
+        );
+        assert!(
+            (config.evidence_locality.cross_source_support_strength - 1.0).abs() < 1e-9,
+            "cross_source_support_strength = {}",
+            config.evidence_locality.cross_source_support_strength
         );
     }
 
