@@ -526,6 +526,116 @@ mod tests {
         assert_eq!(rows[0].combination_method.as_deref(), Some("second"));
     }
 
+    /// Anti-foot-gun ratchet: pins `update_claim_belief`'s parameter ordering
+    /// to its SQL `UPDATE` column ordering.
+    ///
+    /// The function calls `epigraph_ds::measures::clamp_claim_belief_measures`,
+    /// whose parameter order differs (`pignistic_prob` is 3rd in the helper
+    /// but 4th in `update_claim_belief`). A future swap that routes
+    /// `mass_on_empty` into the `pignistic_prob` column (or any similar
+    /// reshuffle) would ship silently without this test.
+    ///
+    /// Five distinct in-range values + one ULP-drifted `belief` lock both
+    /// the column-to-arg mapping and the clamp behaviour through the helper.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn update_claim_belief_persists_each_field_to_its_own_column(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'update-claim-belief-cols', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Seed in-range starting state. The seed itself doesn't matter — what
+        // we're testing is the column→arg mapping for update_claim_belief's
+        // inputs.
+        let claim_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (
+                 content, content_hash, truth_value, agent_id,
+                 belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing
+             )
+             VALUES ($1, sha256($1::bytea), 0.5, $2, 0.5, 0.5, 0.0, 0.5, 0.0)
+             RETURNING id",
+        )
+        .bind(format!("update-claim-belief-cols-{}", Uuid::new_v4()))
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Canonical summation drift: 0.05 * 20 sums to ~1.0000000000000002
+        // (one ULP above 1.0). Confirms the helper's f64::clamp actually
+        // applies on the write path.
+        //
+        // Drift is applied to `plausibility` (not `belief`) because the
+        // `claims_bel_pl_order` CHECK requires `belief <= plausibility`;
+        // a drifted-belief of 1.0 with plausibility=0.7 would trip the
+        // constraint before reaching the column-mapping assertions. The
+        // anti-swap and drift-clamp invariants are unchanged.
+        let drifted_plausibility: f64 = [0.05_f64; 20].iter().sum();
+        assert!(
+            drifted_plausibility > 1.0,
+            "test precondition: 0.05 summed 20× must drift above 1.0 (got {drifted_plausibility})"
+        );
+
+        // Five field-identifying values. A parameter swap that lands
+        // `mass_on_empty=0.1` in the `pignistic_prob` column would fail
+        // the `pignistic_prob == Some(0.6)` assertion with "got 0.1".
+        // A `belief ↔ plausibility` swap would land 1.0 in belief and 0.7
+        // in plausibility, tripping `claims_bel_pl_order` (bonus catch).
+        MassFunctionRepository::update_claim_belief(
+            &pool,
+            claim_id,
+            0.7,                  // belief
+            drifted_plausibility, // plausibility (drift; expect clamp to 1.0)
+            0.1,                  // mass_on_empty
+            Some(0.6),            // pignistic_prob
+            0.05,                 // mass_on_missing
+        )
+        .await
+        .expect("update_claim_belief must succeed for in-range / drifted inputs");
+
+        let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing): (
+            f64,
+            f64,
+            f64,
+            Option<f64>,
+            f64,
+        ) = sqlx::query_as(
+            "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing
+             FROM claims WHERE id = $1",
+        )
+        .bind(claim_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Exact-equality passthrough — helper is a no-op for in-range f64.
+        assert_eq!(belief, 0.7, "belief column must receive arg 1");
+        // Drift case — helper's clamp must collapse 1.0000000000000002 → 1.0
+        // before the bind. A regression that bypassed the helper would
+        // persist the drifted value and trip claims_plausibility_bounds.
+        assert_eq!(
+            plausibility, 1.0,
+            "plausibility drift must be clamped to 1.0 by the helper (got {plausibility})"
+        );
+        assert_eq!(
+            mass_on_empty, 0.1,
+            "mass_on_empty column must receive arg 3"
+        );
+        assert_eq!(
+            pignistic_prob,
+            Some(0.6),
+            "pignistic_prob column must receive arg 4 (anti-swap ratchet)"
+        );
+        assert_eq!(
+            mass_on_missing, 0.05,
+            "mass_on_missing column must receive arg 5"
+        );
+    }
+
     #[test]
     fn mass_function_row_has_expected_fields() {
         let _row = MassFunctionRow {
