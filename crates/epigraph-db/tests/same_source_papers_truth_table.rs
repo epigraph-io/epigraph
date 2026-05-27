@@ -125,10 +125,7 @@ async fn same_source_papers_truth_table(pool: PgPool) {
     insert_edge(&pool, a1, a2, "claim", "claim", "decomposes_to").await;
 
     // ── Truth table ────────────────────────────────────────────────────
-    assert!(
-        same_source(&pool, a1, a1).await,
-        "self-pair must be true"
-    );
+    assert!(same_source(&pool, a1, a1).await, "self-pair must be true");
     assert!(
         same_source(&pool, a1, a2).await,
         "intra-paper via asserts+asserts (sibling) must be true"
