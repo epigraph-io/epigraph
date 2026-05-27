@@ -123,6 +123,24 @@ pub async fn do_ingest_workflow(
         let _ = server.embedder.embed_and_store(*claim_id, content).await;
     }
 
+    // Also embed the workflows-table goal for semantic find_workflow_hierarchical.
+    // Best-effort: workflow is still findable via ILIKE fallback if this errors.
+    if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
+        match server.embedder.generate(&extraction.source.goal).await {
+            Ok(qvec) => {
+                if let Err(e) =
+                    epigraph_db::WorkflowRepository::set_goal_embedding(&server.pool, wf_id, &qvec)
+                        .await
+                {
+                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
+            }
+        }
+    }
+
     success_json(&response)
 }
 
