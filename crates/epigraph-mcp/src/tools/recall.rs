@@ -239,9 +239,18 @@ pub async fn recall_with_context(
         .map_err(|e| internal_error(format!("embed query: {e}")))?;
     let pgvec = crate::embed::format_pgvector(&query_embedding);
 
-    recall_with_context_post_embed(server, &params, centroid_dim, &pgvec, limit, min_truth,
-        siblings_limit, corroborates_limit, neighbor_paragraphs_limit)
-        .await
+    recall_with_context_post_embed(
+        server,
+        &params,
+        centroid_dim,
+        &pgvec,
+        limit,
+        min_truth,
+        siblings_limit,
+        corroborates_limit,
+        neighbor_paragraphs_limit,
+    )
+    .await
 }
 
 /// Post-embedding pipeline: shared by `recall_with_context` and the
@@ -305,13 +314,10 @@ async fn recall_with_context_post_embed(
             // assumes paragraphs) has nothing to drop.
             paragraph_only: true,
         };
-        let selected = epigraph_engine::diverse_retrieval::run_diverse_pipeline(
-            &server.pool,
-            pgvec,
-            config,
-        )
-        .await
-        .map_err(|e| internal_error(format!("diverse retrieval: {e}")))?;
+        let selected =
+            epigraph_engine::diverse_retrieval::run_diverse_pipeline(&server.pool, pgvec, config)
+                .await
+                .map_err(|e| internal_error(format!("diverse retrieval: {e}")))?;
 
         if selected.is_empty() {
             // No themes (or no candidates in themes) — fall back to flat ANN
@@ -329,10 +335,12 @@ async fn recall_with_context_post_embed(
         } else {
             selected
                 .into_iter()
-                .map(|(id, _content, similarity)| epigraph_db::ClaimEmbeddingHit {
-                    claim_id: id,
-                    similarity,
-                })
+                .map(
+                    |(id, _content, similarity)| epigraph_db::ClaimEmbeddingHit {
+                        claim_id: id,
+                        similarity,
+                    },
+                )
                 .collect()
         }
     } else {
@@ -1109,14 +1117,14 @@ pub fn assemble_neighbor_paragraphs(
 
 #[doc(hidden)]
 pub mod __test_only {
-    use super::{
-        recall_with_context_post_embed, EpiGraphMcpFull, McpError, RecallWithContextParams,
-    };
-    use rmcp::model::CallToolResult;
     pub use super::{
         assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population,
         BatchedContext, ParagraphCore,
     };
+    use super::{
+        recall_with_context_post_embed, EpiGraphMcpFull, McpError, RecallWithContextParams,
+    };
+    use rmcp::model::CallToolResult;
 
     /// Integration-test entry point that skips the OpenAI embedder.
     ///

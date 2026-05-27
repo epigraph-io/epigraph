@@ -191,11 +191,10 @@ impl ClaimThemeRepository {
         limit: i32,
         centroid_dim: u32,
     ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
-        let (theme_col, _) = centroid_columns_for_dim(centroid_dim).ok_or_else(|| {
-            DbError::InvalidData {
+        let (theme_col, _) =
+            centroid_columns_for_dim(centroid_dim).ok_or_else(|| DbError::InvalidData {
                 reason: format!("unsupported centroid_dim: {centroid_dim} (must be 1536 or 3072)"),
-            }
-        })?;
+            })?;
 
         let sql = format!(
             "SELECT id, label, (1 - ({theme_col} <=> $1::vector))::float8 AS similarity \
@@ -260,11 +259,10 @@ impl ClaimThemeRepository {
         centroid_dim: u32,
         paragraph_only: bool,
     ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
-        let (_, claim_col) = centroid_columns_for_dim(centroid_dim).ok_or_else(|| {
-            DbError::InvalidData {
+        let (_, claim_col) =
+            centroid_columns_for_dim(centroid_dim).ok_or_else(|| DbError::InvalidData {
                 reason: format!("unsupported centroid_dim: {centroid_dim} (must be 1536 or 3072)"),
-            }
-        })?;
+            })?;
 
         let level_clause = if paragraph_only {
             " AND (c.properties->>'level')::int = 2"

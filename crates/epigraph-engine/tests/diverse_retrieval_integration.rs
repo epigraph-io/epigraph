@@ -288,11 +288,9 @@ async fn diverse_selection_spreads_across_themes_when_flat_would_not(pool: PgPoo
 
     // Sanity check (regression guard): the flat ANN path (i.e. what
     // diverse=false in MCP would call) returns 5 hits, ALL from theme_a.
-    let flat_hits = epigraph_db::ClaimRepository::search_by_embedding(
-        &pool, &query, 1536, 5, None,
-    )
-    .await
-    .expect("flat ANN");
+    let flat_hits = epigraph_db::ClaimRepository::search_by_embedding(&pool, &query, 1536, 5, None)
+        .await
+        .expect("flat ANN");
     assert_eq!(flat_hits.len(), 5, "flat ANN should fill the budget");
     let flat_theme_ids: std::collections::HashSet<Uuid> = sqlx::query_scalar(
         "SELECT theme_id FROM claims WHERE id = ANY($1) AND theme_id IS NOT NULL",
@@ -381,15 +379,8 @@ async fn candidate_pool_small_value_truncates_sql_input(pool: PgPool) {
     let mut seeded: Vec<Uuid> = Vec::with_capacity(30);
     for i in 0..30 {
         let v = cluster_pgvec_with_drift(0, 1.0, 1, (i as f32) * 0.05);
-        let id = seed_claim_in_theme(
-            &pool,
-            agent,
-            theme,
-            &format!("pool-small-claim-{i}"),
-            2,
-            &v,
-        )
-        .await;
+        let id =
+            seed_claim_in_theme(&pool, agent, theme, &format!("pool-small-claim-{i}"), 2, &v).await;
         seeded.push(id);
     }
 
@@ -456,15 +447,8 @@ async fn candidate_pool_large_value_widens_diverse_select_input(pool: PgPool) {
     let mut seeded: Vec<Uuid> = Vec::with_capacity(30);
     for i in 0..30 {
         let v = cluster_pgvec_with_drift(0, 1.0, 1, (i as f32) * 0.05);
-        let id = seed_claim_in_theme(
-            &pool,
-            agent,
-            theme,
-            &format!("pool-large-claim-{i}"),
-            2,
-            &v,
-        )
-        .await;
+        let id =
+            seed_claim_in_theme(&pool, agent, theme, &format!("pool-large-claim-{i}"), 2, &v).await;
         seeded.push(id);
     }
 
@@ -508,15 +492,8 @@ async fn paragraph_only_filter_excludes_non_paragraph_claims(pool: PgPool) {
     let theme = seed_theme_with_centroid(&pool, "mixed-levels", &cluster_pgvec(0, 1.0)).await;
 
     // Paragraph (level=2) and atom (level=3) both attached to the same theme.
-    let para = seed_claim_in_theme(
-        &pool,
-        agent,
-        theme,
-        "paragraph",
-        2,
-        &cluster_pgvec(0, 1.0),
-    )
-    .await;
+    let para =
+        seed_claim_in_theme(&pool, agent, theme, "paragraph", 2, &cluster_pgvec(0, 1.0)).await;
     let atom = seed_claim_in_theme(&pool, agent, theme, "atom", 3, &cluster_pgvec(0, 1.0)).await;
 
     let query = cluster_pgvec(0, 1.0);
@@ -533,8 +510,7 @@ async fn paragraph_only_filter_excludes_non_paragraph_claims(pool: PgPool) {
     let strict = run_diverse_pipeline(&pool, &query, config_strict)
         .await
         .expect("paragraph_only=true");
-    let strict_ids: std::collections::HashSet<Uuid> =
-        strict.iter().map(|(id, _, _)| *id).collect();
+    let strict_ids: std::collections::HashSet<Uuid> = strict.iter().map(|(id, _, _)| *id).collect();
     assert!(
         strict_ids.contains(&para),
         "paragraph_only must keep the level=2 paragraph"

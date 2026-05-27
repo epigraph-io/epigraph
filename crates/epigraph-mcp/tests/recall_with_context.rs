@@ -904,9 +904,12 @@ mod diverse_fixture {
     }
 }
 
-fn diverse_params(diverse: bool, max_themes: Option<u32>, alpha: Option<f32>, limit: u32)
-    -> epigraph_mcp::tools::recall::RecallWithContextParams
-{
+fn diverse_params(
+    diverse: bool,
+    max_themes: Option<u32>,
+    alpha: Option<f32>,
+    limit: u32,
+) -> epigraph_mcp::tools::recall::RecallWithContextParams {
     diverse_params_with_pool(diverse, max_themes, alpha, limit, None)
 }
 
@@ -1046,11 +1049,10 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     // Reference: direct call to the same repo function recall_with_context
     // uses in diverse=false mode. If diverse=false matches this ordering
     // verbatim, the diverse-routing change preserves the flat path.
-    let direct_hits = epigraph_db::ClaimRepository::search_by_embedding(
-        &pool, &query_pgvec, 1536, 10, None,
-    )
-    .await
-    .expect("direct flat ANN");
+    let direct_hits =
+        epigraph_db::ClaimRepository::search_by_embedding(&pool, &query_pgvec, 1536, 10, None)
+            .await
+            .expect("direct flat ANN");
     let direct_order: Vec<Uuid> = direct_hits.iter().map(|h| h.claim_id).collect();
 
     let server = build_test_server(pool.clone());

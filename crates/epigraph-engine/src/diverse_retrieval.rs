@@ -128,10 +128,7 @@ fn db_error_to_sqlx(err: epigraph_db::DbError) -> sqlx::Error {
 /// neighbours. `diverse_select` uses these to avoid picking redundant
 /// near-duplicates.
 #[must_use]
-pub fn build_similarity_neighbors(
-    candidates: &[(Uuid, String, f64)],
-    k: usize,
-) -> Vec<Vec<usize>> {
+pub fn build_similarity_neighbors(candidates: &[(Uuid, String, f64)], k: usize) -> Vec<Vec<usize>> {
     let n = candidates.len();
     let mut neighbors = vec![Vec::new(); n];
 

@@ -649,8 +649,7 @@ pub async fn semantic_search(
                         build_similarity_neighbors, DEFAULT_SIMILARITY_K,
                     };
                     use epigraph_engine::diverse_select::diverse_select;
-                    let neighbors =
-                        build_similarity_neighbors(&candidates, DEFAULT_SIMILARITY_K);
+                    let neighbors = build_similarity_neighbors(&candidates, DEFAULT_SIMILARITY_K);
                     let similarities: Vec<f32> =
                         candidates.iter().map(|(_, _, s)| *s as f32).collect();
                     let selected = diverse_select(&neighbors, &similarities, limit, alpha);
