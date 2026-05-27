@@ -137,6 +137,42 @@ pub async fn seed_claim(pool: &PgPool, content: &str, truth: f64) -> Uuid {
     id
 }
 
+/// Seed a claim with explicit DST belief-measure fields.
+///
+/// Used by `update_with_evidence_plausibility_one.rs` (issue #139 regression):
+/// the test needs to plant a claim at `plausibility = 1.0` so that any
+/// post-evidence drift above 1.0 trips `claims_plausibility_bounds`. The
+/// standard `seed_claim` helper leaves these columns at their defaults.
+///
+/// Returns the new claim's UUID. Reuses `seed_agent`'s test-signer pattern.
+pub async fn seed_claim_with_belief(
+    pool: &PgPool,
+    belief: f64,
+    plausibility: f64,
+    pignistic_prob: Option<f64>,
+) -> Uuid {
+    let agent_id = seed_agent(pool).await;
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims \
+            (id, content, content_hash, agent_id, truth_value, \
+             belief, plausibility, pignistic_prob, is_current, labels) \
+         VALUES ($1, $2, $3, $4, 0.5, $5, $6, $7, true, ARRAY[]::text[])",
+    )
+    .bind(id)
+    .bind(format!("seed_claim_with_belief regression {id}"))
+    .bind(&hash)
+    .bind(agent_id)
+    .bind(belief)
+    .bind(plausibility)
+    .bind(pignistic_prob)
+    .execute(pool)
+    .await
+    .expect("seed claim with belief");
+    id
+}
+
 pub async fn seed_claim_with_labels(pool: &PgPool, content: &str, labels: &[&str]) -> Uuid {
     let id = seed_claim(pool, content, 0.5).await;
     let labels_owned: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
