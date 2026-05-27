@@ -82,26 +82,27 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "OPERATED_BY",     // software_agent/instrument → person (prov:actedOnBehalfOf)
     "MANUFACTURED_BY", // instrument → organization
     // Ingestion and cross-source edge types (used by Python migration scripts)
-    "asserts",               // paper → claim (paper asserts a claim)
-    "same_source",           // claim → claim (same source document)
-    "decomposes_to",         // claim → claim (atomic decomposition)
-    "section_follows",       // claim → claim (sibling section ordering within a document)
-    "continues_argument",    // claim → claim (sibling paragraph ordering within a section)
-    "same_as",               // claim → claim (deduplication identity)
-    "CORROBORATES",          // claim → claim (cross-source corroboration)
-    "AUTHORED",              // agent → claim (materialized authorship)
-    "ATTRIBUTED_TO",         // claim → agent (prov:wasAttributedTo)
-    "refines",               // claim → claim (refinement)
-    "cites",                 // claim → claim (citation link)
-    "EQUIVALENT_TO",         // claim → claim (semantic equivalence)
-    "CONTRADICTS",           // claim → claim (contradiction)
-    "supersedes",            // claim → claim (version chain)
-    "revises",               // claim → claim (concurrent branch from common ancestor)
-    "enables",               // claim → claim (enablement)
+    "alternative_of",     // claim → claim (alternative formulation; spec 2026-05-27)
+    "asserts",            // paper → claim (paper asserts a claim)
+    "same_source",        // claim → claim (same source document)
+    "decomposes_to",      // claim → claim (atomic decomposition)
+    "section_follows",    // claim → claim (sibling section ordering within a document)
+    "continues_argument", // claim → claim (sibling paragraph ordering within a section)
+    "same_as",            // claim → claim (deduplication identity)
+    "CORROBORATES",       // claim → claim (cross-source corroboration)
+    "AUTHORED",           // agent → claim (materialized authorship)
+    "ATTRIBUTED_TO",      // claim → agent (prov:wasAttributedTo)
+    "refines",            // claim → claim (refinement)
+    "cites",              // claim → claim (citation link)
+    "EQUIVALENT_TO",      // claim → claim (semantic equivalence)
+    "CONTRADICTS",        // claim → claim (contradiction)
+    "supersedes",         // claim → claim (version chain)
+    "revises",            // claim → claim (concurrent branch from common ancestor)
+    "enables",            // claim → claim (enablement)
     "has_method_capability", // method → capability (method graph)
-    "interpreted_by",        // claim → agent (interpretation provenance)
-    "concludes",             // trace → claim (reasoning conclusion)
-    "HAS_TRACE",             // claim → trace (reasoning trace link)
+    "interpreted_by",     // claim → agent (interpretation provenance)
+    "concludes",          // trace → claim (reasoning conclusion)
+    "HAS_TRACE",          // claim → trace (reasoning trace link)
     // AI development patterns — context persistence, issue generation, observability
     "OBSERVED_DURING", // claim → claim (design decision observed during feature work)
     "INFORMS",         // claim → claim (decision informs future work)
@@ -2355,6 +2356,7 @@ mod tests {
         assert!(is_valid_relationship("section_follows"));
         assert!(is_valid_relationship("continues_argument"));
         assert!(is_valid_relationship("INSTANTIATES"));
+        assert!(is_valid_relationship("alternative_of"));
         assert!(!is_valid_relationship("invalid"));
         assert!(!is_valid_relationship(""));
     }
