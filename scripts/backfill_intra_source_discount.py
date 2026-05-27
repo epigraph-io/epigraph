@@ -1,14 +1,43 @@
 #!/usr/bin/env python3
 """Backfill source_strength on existing intra-source evidential BBAs.
 
-Pre-2026-05-27, every evidential edge wrote source_strength=1.0 regardless
-of whether the source and target shared a paper. After the locality-aware
-discount lands, new edges get the right value automatically, but the
-historical mass_functions rows are still over-strong.
+After the locality-aware discount lands (#185), new evidential BBAs written
+by ``edge_factor::wire_evidential_edge_factor`` carry the correct
+``source_strength`` automatically. This script catches BBAs written by that
+same path that pre-date a re-calibration of ``intra_source_support_strength``
+in ``calibration.toml``, OR that were written under the new path but somehow
+still hold a stale value (e.g. a transient bug, a partial deploy).
+
+Scope (what this script CAN backfill):
+  ``mass_functions`` rows where ``evidence_type = 'edge_factor'`` AND the
+  underlying edge (joined via ``mf.perspective_id = e.id``) is intra-source.
+
+Scope (what this script CANNOT backfill):
+  Historical BBAs written before the ``edge_factor`` write path existed do
+  NOT have ``perspective_id = edge_id`` or ``evidence_type = 'edge_factor'``
+  — the schema does not preserve enough provenance to identify which of
+  them came from an intra-source evidential edge. Such rows need a
+  schema-level remediation or a separate heuristic backfill, not this
+  script. Counts of strength=1.0 BBAs unaffected by this script can be
+  reviewed via ``SELECT COUNT(*) FROM mass_functions WHERE source_strength
+  = 1.0 AND evidence_type IS DISTINCT FROM 'edge_factor';``.
+
+Join semantics (the schema invariant this script relies on):
+  ``edge_factor::wire_evidential_edge_factor`` (crates/epigraph-engine/src/
+  edge_factor.rs) writes each BBA with ``claim_id = target_id``,
+  ``source_agent_id = edge_signer_agent_id``, ``perspective_id = edge_id``,
+  ``evidence_type = 'edge_factor'``. The correct way to find a BBA's
+  underlying edge is ``mf.perspective_id = e.id`` filtered by
+  ``mf.evidence_type = 'edge_factor'``. (The earlier version of this
+  script joined on ``mf.source_agent_id = e.source_id``; that compared
+  an agent UUID to a claim UUID and never matched in production —
+  see PR #186 follow-up.)
 
 This script:
   1. Loads intra_source_support_strength from calibration.toml.
-  2. UPDATEs mass_functions rows whose underlying edge is intra-source.
+  2. UPDATEs ``edge_factor`` mass_functions rows whose underlying edge is
+     intra-source and whose source_strength is not already at the
+     calibrated intra value.
   3. Collects affected claim_ids and POSTs each to
      /api/v1/graph/reconcile_sheaf to recompute belief.
 
@@ -70,9 +99,11 @@ def main() -> int:
         SELECT mf.id, mf.claim_id, mf.source_strength, e.id AS edge_id
           FROM mass_functions mf
           JOIN edges e
-            ON mf.source_agent_id = e.source_id
-           AND mf.claim_id        = e.target_id
-         WHERE e.relationship IN ('supports','refutes','corroborates','contradicts')
+            ON mf.perspective_id = e.id
+         WHERE mf.evidence_type = 'edge_factor'
+           AND e.relationship IN ('supports','refutes','corroborates','contradicts')
+           AND e.source_type   = 'claim'
+           AND e.target_type   = 'claim'
            AND mf.source_strength IS DISTINCT FROM %s
            AND same_source_papers(e.source_id, e.target_id);
         """,
@@ -94,9 +125,11 @@ def main() -> int:
         UPDATE mass_functions mf
            SET source_strength = %s
           FROM edges e
-         WHERE mf.source_agent_id = e.source_id
-           AND mf.claim_id        = e.target_id
+         WHERE mf.perspective_id = e.id
+           AND mf.evidence_type  = 'edge_factor'
            AND e.relationship IN ('supports','refutes','corroborates','contradicts')
+           AND e.source_type    = 'claim'
+           AND e.target_type    = 'claim'
            AND mf.source_strength IS DISTINCT FROM %s
            AND same_source_papers(e.source_id, e.target_id);
         """,
