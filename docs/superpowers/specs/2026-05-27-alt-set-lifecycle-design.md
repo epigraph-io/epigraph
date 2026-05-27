@@ -171,7 +171,7 @@ Both backlog items reference this spec for context.
 ## Acceptance
 
 - [ ] Three reserved labels (`alt-chosen`, `alt-rejected`, `alt-deferred`) are usable without code changes (verified — EpiGraph labels are free-form `text[]` with no allow-list).
-- [ ] `alt_set_decisions` view lands as the next available migration slot after #185 (041) and #187 (042). At PR-open time the implementation branch uses the lowest free integer; if collision occurs at merge, renumber per the existing `chore(db): renumber migration NN→MM` pattern (PRs #177, #178).
+- [ ] `alt_set_decisions` view lands in migration `043`. PRs #185 (041) and #187 (042) are merged to `origin/main` as of 2026-05-27; if another migration lands first, renumber per the existing `chore(db): renumber migration NN→MM` pattern (PRs #177, #178).
 - [ ] `suggest_alternative_sets` accepts `exclude_settled` and `surface_reconsiderations` params with documented defaults.
 - [ ] Tests above all pass against `epigraph_db_repo_test`.
 - [ ] Backlog items (B) and (C) filed via `mcp__epigraph__memorize` with the triggers above, labelled `["backlog", "alt-set-extension"]`.
