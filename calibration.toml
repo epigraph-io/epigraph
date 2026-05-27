@@ -143,13 +143,21 @@ include_agent_id = false
 max_per_claim = 32
 
 # ── Evidence Locality Discounting ───────────────────────────────────────────
-# Shafer reliability discount applied to evidential BBAs based on whether the
-# edge crosses paper boundaries. Intra-source supporters are not independent
-# observations of a target, so their per-BBA reliability is lower.
+# Multiplicative Shafer reliability factor applied to per-BBA source_strength
+# when the supporting evidence is intra-source (cites the paper that asserts
+# the target claim). Composes with the per-BBA evidence_type weight rather
+# than replacing it: a logical/intra BBA becomes 0.85 * 0.3 = 0.255, an
+# empirical/intra BBA becomes 1.0 * 0.3 = 0.30, etc.
 #
-# Defaults tuned against the synthetic 19-supporter NEMS regression: target
-# BetP lands in [0.7, 0.85] (replacing the un-discounted 0.997 inflation).
+# Cross-source (or no detectable intra-source evidence) leaves the BBA's
+# source_strength unchanged — no multiplicative factor needed (i.e. 1.0
+# implicit). Intra-source detection lives in the evidence table:
+# `evidence.properties->>'doi'` matching the paper that asserts the BBA's
+# target claim via the `asserts` edge.
+#
+# Default tuned against the synthetic 19-supporter NEMS regression with
+# logical-tier supporters: target BetP lands in [0.70, 0.85] (replacing the
+# un-discounted 0.997 inflation).
 
 [evidence_locality]
-intra_source_support_strength = 0.25
-cross_source_support_strength = 1.0
+intra_evidence_locality_factor = 0.3

@@ -74,9 +74,18 @@ pub async fn auto_wire_ds_for_edge(
     let source_interval =
         EpistemicInterval::new(bel, pl, ow_opt.unwrap_or((pl - bel).max(0.0) * 0.5));
 
-    // The restriction transmission factor (`f`) is already folded into the
-    // BBA mass shape via `restrict_epistemic_*`; only the locality factor
-    // lands on the stored `source_strength` column below.
+    // Extract the restriction transmission factor `f`. This is the baseline
+    // per-BBA reliability before locality composition. (`f` is ALSO folded
+    // into the BBA mass shape via `restrict_epistemic_*` — that shape and
+    // the stored source_strength are independent Dempster-Shafer levers:
+    // the shape encodes WHAT the supporter says about the target, and
+    // source_strength encodes HOW reliable the supporter is.)
+    let transmission_factor: f64 = match restriction {
+        RestrictionKind::Positive(f)
+        | RestrictionKind::Negative(f)
+        | RestrictionKind::FrameEvidence(f) => f,
+        RestrictionKind::Neutral => unreachable!(),
+    };
     let restricted = match restriction {
         RestrictionKind::Positive(f) => restrict_epistemic_positive(&source_interval, f),
         RestrictionKind::Negative(f) => restrict_epistemic_negative(&source_interval, f),
@@ -90,33 +99,55 @@ pub async fn auto_wire_ds_for_edge(
         return Ok(EdgeFactorOutcome::Vacuous);
     }
 
-    // Locality-aware reliability discount. Same-paper supporters are not
-    // independent observations of the target — apply a smaller source_strength
-    // so the existing Shafer discount in CDST combine deflates the per-BBA
-    // contribution. Defaults: intra=0.3, cross=1.0 (see calibration.toml).
+    // Locality-aware reliability discount, evidence-mediated.
     //
-    // We REPLACE the restriction transmission factor with the locality factor
-    // (rather than multiplying) per the spec at
-    // docs/superpowers/specs/2026-05-27-alternative-and-dependency-edges-design.md §2:
-    // the calibrated [0.7, 0.85] band for 19 intra-source supporters assumes
-    // the locality value IS the stored source_strength, not a composition.
-    let same_source: bool = sqlx::query_scalar::<_, bool>("SELECT same_source_papers($1, $2)")
-        .bind(source_id)
-        .bind(target_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| format!("same_source_papers: {e}"))?;
-    let calibration = crate::calibration::CalibrationConfig::from_workspace_root().ok();
-    let (intra, cross) = calibration
-        .as_ref()
-        .map(|c| {
-            (
-                c.evidence_locality.intra_source_support_strength,
-                c.evidence_locality.cross_source_support_strength,
-            )
-        })
-        .unwrap_or((0.3, 1.0));
-    let source_strength = if same_source { intra } else { cross };
+    // Detection: the source claim has ≥1 evidence row whose
+    // `properties->>'doi'` matches the doi of the paper that asserts the
+    // target claim. Equivalent semantic: "the supporter is supported by
+    // data from the target's own paper", so its contribution is
+    // correlated with the target's self-evidence and is not an
+    // independent observation.
+    //
+    // Composition: source_strength = transmission_factor * locality_factor
+    // (intra: factor < 1.0, cross: factor = 1.0). This preserves the
+    // pre-#185 transmission-factor signal and adds the locality discount
+    // multiplicatively, so a logical/intra BBA at f=0.7 with intra
+    // factor 0.3 lands at 0.21 instead of nuking to 0.25 unconditionally.
+    //
+    // Only the source claim's evidence is inspected here. The target
+    // claim's own evidence (which may also be intra-source-self-cite by
+    // construction) is the concern of the backfill script
+    // (`scripts/backfill_intra_source_evidence_discount.py`); for new
+    // edge-write paths, the source's provenance is the only signal we
+    // need to decide whether THIS edge's contribution is correlated.
+    let is_intra: bool = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+              FROM evidence e
+              JOIN edges ed_asserts
+                ON ed_asserts.target_id = $2
+               AND ed_asserts.relationship = 'asserts'
+               AND ed_asserts.source_type = 'paper'
+              JOIN papers p
+                ON p.id = ed_asserts.source_id
+               AND p.doi = e.properties->>'doi'
+             WHERE e.claim_id = $1
+               AND e.properties ? 'doi'
+        )
+        "#,
+    )
+    .bind(source_id)
+    .bind(target_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("intra-source evidence lookup: {e}"))?;
+    let intra_factor = crate::calibration::CalibrationConfig::from_workspace_root()
+        .ok()
+        .map(|c| c.evidence_locality.intra_evidence_locality_factor)
+        .unwrap_or(0.3);
+    let locality_factor = if is_intra { intra_factor } else { 1.0 };
+    let source_strength = transmission_factor * locality_factor;
 
     let frame_id = ensure_binary_frame(pool).await?;
     let frame = binary_frame()?;

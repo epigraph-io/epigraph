@@ -49,11 +49,16 @@ pub struct CalibrationConfig {
     /// Journal name → reliability score.
     pub journal_reliability: HashMap<String, f64>,
 
-    /// Evidence-locality discounts applied to per-BBA source_strength.
+    /// Multiplicative Shafer reliability factor for intra-source BBAs.
     ///
-    /// Drives Shafer reliability discounting in
-    /// `routes/edges.rs::trigger_edge_ds_recomputation` based on whether the
-    /// supporting and supported claims share a source paper.
+    /// Composes with the per-BBA evidence_type weight rather than replacing
+    /// it: a logical/intra BBA becomes 0.85 * factor, an empirical/intra
+    /// BBA becomes 1.0 * factor. Cross-source (or no detectable intra-source
+    /// evidence on the supporting claim) leaves source_strength unchanged.
+    ///
+    /// Detection lives in the evidence table:
+    /// `evidence.properties->>'doi'` matching the paper that asserts the
+    /// BBA's target claim via the `asserts` edge.
     #[serde(default = "default_evidence_locality")]
     pub evidence_locality: EvidenceLocality,
 
@@ -61,21 +66,22 @@ pub struct CalibrationConfig {
     pub classifier_thresholds: ClassifierThresholds,
 }
 
-/// Discount factors keyed on whether evidence crosses paper boundaries.
+/// Multiplicative locality factor for intra-source evidential BBAs.
+///
+/// Cross-source BBAs implicitly use factor 1.0 (no discount). Storing only
+/// the intra factor avoids a useless `cross_factor = 1.0` field that the
+/// composition formula already assumes.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EvidenceLocality {
-    /// `source_strength` for intra-paper evidential BBAs (low — supporters
-    /// from one paper are not independent observations).
-    pub intra_source_support_strength: f64,
-
-    /// `source_strength` for cross-paper evidential BBAs (full reliability).
-    pub cross_source_support_strength: f64,
+    /// Multiplier applied to per-BBA source_strength when the supporting
+    /// evidence is intra-source. `source_strength_new = source_strength_old
+    /// * intra_evidence_locality_factor`.
+    pub intra_evidence_locality_factor: f64,
 }
 
 fn default_evidence_locality() -> EvidenceLocality {
     EvidenceLocality {
-        intra_source_support_strength: 0.25,
-        cross_source_support_strength: 1.0,
+        intra_evidence_locality_factor: 0.3,
     }
 }
 
@@ -243,14 +249,9 @@ mod tests {
     fn test_evidence_locality_loads() {
         let config = load_config();
         assert!(
-            (config.evidence_locality.intra_source_support_strength - 0.25).abs() < 1e-9,
-            "intra_source_support_strength = {}",
-            config.evidence_locality.intra_source_support_strength
-        );
-        assert!(
-            (config.evidence_locality.cross_source_support_strength - 1.0).abs() < 1e-9,
-            "cross_source_support_strength = {}",
-            config.evidence_locality.cross_source_support_strength
+            (config.evidence_locality.intra_evidence_locality_factor - 0.3).abs() < 1e-9,
+            "intra_evidence_locality_factor = {}",
+            config.evidence_locality.intra_evidence_locality_factor
         );
     }
 
