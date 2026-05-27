@@ -61,35 +61,36 @@ BEGIN
         RETURN TRUE;
     END IF;
 
-    WITH RECURSIVE seeds AS (
-        -- Papers that assert `a` are seed nodes.
+    -- Postgres parses `WITH RECURSIVE x AS (anchor UNION recursive)` as a
+    -- two-branch UNION: the anchor MUST be the left side and must not
+    -- self-reference. Use ONE recursive branch that walks intra-source
+    -- edges in either direction via a CASE expression, rather than two
+    -- separate recursive branches.
+    WITH RECURSIVE
+    seeds AS (
         SELECT e.source_id AS paper_id
         FROM edges e
         WHERE e.target_id = a
           AND e.relationship = 'asserts'
     ),
     paper_a_closure AS (
-        -- Claims reachable from any of a's papers through intra-source edges.
+        -- Anchor: claims directly asserted by any of a's source papers.
         SELECT e.target_id AS claim_id
         FROM seeds s
         JOIN edges e
           ON e.source_id = s.paper_id
          AND e.relationship = 'asserts'
         UNION
-        SELECT e2.target_id
+        -- Recursive: follow intra-source edges in either direction.
+        SELECT
+            CASE
+                WHEN e2.source_id = pac.claim_id THEN e2.target_id
+                ELSE e2.source_id
+            END AS claim_id
         FROM paper_a_closure pac
         JOIN edges e2
-          ON e2.source_id = pac.claim_id
+          ON (e2.source_id = pac.claim_id OR e2.target_id = pac.claim_id)
          AND e2.relationship IN (
-             'same_source', 'section_follows',
-             'continues_argument', 'decomposes_to'
-         )
-        UNION
-        SELECT e3.source_id
-        FROM paper_a_closure pac
-        JOIN edges e3
-          ON e3.target_id = pac.claim_id
-         AND e3.relationship IN (
              'same_source', 'section_follows',
              'continues_argument', 'decomposes_to'
          )
