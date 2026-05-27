@@ -2,16 +2,21 @@
 //! Inserting alternative_of(A,B) and alternative_of(B,A) must produce
 //! exactly one edge row (the second insertion is a dedup hit on the
 //! symmetric uniqueness index from migration 042).
+//!
+//! Uses `#[sqlx::test]` so each run gets a fresh ephemeral DB with all
+//! migrations applied — sidesteps shared-DB pollution and the
+//! migration-038 checksum skew on `epigraph_db_repo_test`.
 
 mod common;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn alternative_of_dedupes_under_endpoint_swap() {
-    let pool = common::test_pool().await;
+use sqlx::PgPool;
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn alternative_of_dedupes_under_endpoint_swap(pool: PgPool) {
     let a = common::seed_claim(&pool, "alt-dedup-A").await;
     let b = common::seed_claim(&pool, "alt-dedup-B").await;
 
-    let id1 = common::insert_edge(&pool, a, b, "claim", "claim", "alternative_of").await;
+    let _id1 = common::insert_edge(&pool, a, b, "claim", "claim", "alternative_of").await;
 
     // Reversed direction — should be rejected by the unique index, not
     // silently double-recorded.
@@ -38,11 +43,4 @@ async fn alternative_of_dedupes_under_endpoint_swap() {
     .await
     .unwrap();
     assert_eq!(cnt.0, 1, "exactly one row, got {}", cnt.0);
-
-    // Cleanup so reruns don't accumulate fixture rows.
-    sqlx::query("DELETE FROM edges WHERE id = $1")
-        .bind(id1)
-        .execute(&pool)
-        .await
-        .unwrap();
 }

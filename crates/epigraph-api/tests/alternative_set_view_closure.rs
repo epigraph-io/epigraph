@@ -1,18 +1,23 @@
 #![cfg(feature = "db")]
 //! 3-cycle (A↔B, B↔C) under alternative_of must collapse into one
 //! equivalence class — every member's alt_members lists the other two.
+//!
+//! Uses `#[sqlx::test]` so each run gets a fresh ephemeral DB with all
+//! migrations applied — sidesteps shared-DB pollution and the
+//! migration-038 checksum skew on `epigraph_db_repo_test`.
 
 mod common;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn alternative_set_view_transitive_closure() {
-    let pool = common::test_pool().await;
+use sqlx::PgPool;
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn alternative_set_view_transitive_closure(pool: PgPool) {
     let a = common::seed_claim(&pool, "alt-closure-A").await;
     let b = common::seed_claim(&pool, "alt-closure-B").await;
     let c = common::seed_claim(&pool, "alt-closure-C").await;
 
-    let e_ab = common::insert_edge(&pool, a, b, "claim", "claim", "alternative_of").await;
-    let e_bc = common::insert_edge(&pool, b, c, "claim", "claim", "alternative_of").await;
+    let _e_ab = common::insert_edge(&pool, a, b, "claim", "claim", "alternative_of").await;
+    let _e_bc = common::insert_edge(&pool, b, c, "claim", "claim", "alternative_of").await;
 
     let row_a: (Vec<uuid::Uuid>,) =
         sqlx::query_as("SELECT alt_members FROM alternative_set WHERE claim_id = $1")
@@ -64,12 +69,4 @@ async fn alternative_set_view_transitive_closure() {
         "B's alt_members must include C, got {:?}",
         row_b.0
     );
-
-    // Cleanup so reruns don't accumulate fixture rows; FK on edges to
-    // claims doesn't cascade so we drop edges before the fixture claims age out.
-    sqlx::query("DELETE FROM edges WHERE id = ANY($1)")
-        .bind(&[e_ab, e_bc][..])
-        .execute(&pool)
-        .await
-        .unwrap();
 }
