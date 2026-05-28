@@ -205,6 +205,78 @@ def candidate_query(scope_tiers: tuple[float, ...]) -> str:
     """
 
 
+def count_out_of_scope_candidates(
+    conn, scope_tiers: tuple[float, ...]
+) -> tuple[int, int, list[tuple[float, int]]]:
+    """Count intra-source candidates at tiers OUTSIDE the current scope.
+
+    Catches the "0 in current scope but lots elsewhere" trap — if an
+    operator runs `--scope 0.85` after a prior run discounted that
+    tier, the in-scope count is honestly 0 but tiers like 0.75 or 0.5
+    may still hold thousands of unprocessed intra-source BBAs.
+
+    Returns ``(total_rows, distinct_claims, [(tier, rows), ...])`` for the
+    complementary tier set. Returns empty / zero when current scope is
+    already `all`.
+    """
+    out_of_scope = tuple(t for t in KNOWN_TIERS if t not in scope_tiers)
+    if not out_of_scope:
+        return 0, 0, []
+    sql = f"""
+        SELECT mf.source_strength, mf.claim_id
+          FROM mass_functions mf
+         WHERE mf.source_strength IN {in_clause(out_of_scope)}
+           AND EXISTS (
+               SELECT 1
+                 FROM evidence e
+                 JOIN edges ed
+                   ON ed.target_id = e.claim_id
+                  AND ed.relationship = 'asserts'
+                  AND ed.source_type = 'paper'
+                 JOIN papers p
+                   ON p.id = ed.source_id
+                  AND p.doi = e.properties->>'doi'
+                WHERE e.claim_id = mf.claim_id
+                  AND e.properties ? 'doi'
+           );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+    by_tier: dict[float, int] = {}
+    claims: set = set()
+    for ss, cid in rows:
+        by_tier[float(ss)] = by_tier.get(float(ss), 0) + 1
+        claims.add(cid)
+    breakdown = sorted(by_tier.items(), key=lambda kv: kv[1], reverse=True)
+    return len(rows), len(claims), breakdown
+
+
+def report_out_of_scope(scope_tiers: tuple[float, ...], conn) -> None:
+    """Print a footer showing intra-source candidates at OTHER tiers, if any.
+
+    Always runs (except when scope is already `all`) — the goal is to
+    prevent a "0 in scope = nothing to do" misread of the dry-run.
+    """
+    if set(scope_tiers) >= set(KNOWN_TIERS):
+        return
+    n_rows, n_claims, breakdown = count_out_of_scope_candidates(conn, scope_tiers)
+    if n_rows == 0:
+        return
+    print()
+    print(
+        f"FYI: {n_rows} additional intra-source candidates across "
+        f"{n_claims} claims sit at OTHER tiers (not in --scope {scope_tiers}):"
+    )
+    print(f"  {'tier':>9} {'rows':>10}")
+    for tier, rows in breakdown:
+        print(f"  {tier:>9.4f} {rows:>10}")
+    print(
+        "Run with --scope all (or specific tiers) to include them; current scope "
+        "is honest but partial."
+    )
+
+
 def preview_distribution(
     conn, scope_tiers: tuple[float, ...], intra_factor: float
 ) -> tuple[int, int]:
@@ -221,25 +293,34 @@ def preview_distribution(
         rows = cur.fetchall()
     n_rows = len(rows)
     n_claims = len({r[1] for r in rows})
-    if n_rows == 0:
-        return n_rows, n_claims
 
-    # Group by (source_strength, effective_factor) so per-frame overrides
-    # show up as distinct buckets.
-    by_bucket: dict[tuple[float, float], int] = {}
-    for _, _, ss, factor in rows:
-        key = (float(ss), float(factor))
-        by_bucket[key] = by_bucket.get(key, 0) + 1
+    print(f"matched {n_rows} BBAs across {n_claims} target claims in --scope")
 
-    print(f"{'pre':>9} {'factor':>9} {'post':>9} {'rows':>10}")
-    print("-" * 42)
-    for (tier, factor) in sorted(by_bucket.keys(), reverse=True):
-        post = tier * factor
-        marker = " *" if abs(factor - intra_factor) > 1e-9 else ""
-        print(f"{tier:>9.4f} {factor:>9.4f} {post:>9.4f} {by_bucket[(tier, factor)]:>10}{marker}")
-    print("-" * 42)
-    print(f"total rows: {n_rows}, distinct claims: {n_claims}")
-    print(f"  (global default factor: {intra_factor}; '*' = per-frame override)")
+    if n_rows > 0:
+        # Group by (source_strength, effective_factor) so per-frame
+        # overrides show up as distinct buckets.
+        by_bucket: dict[tuple[float, float], int] = {}
+        for _, _, ss, factor in rows:
+            key = (float(ss), float(factor))
+            by_bucket[key] = by_bucket.get(key, 0) + 1
+
+        print(f"{'pre':>9} {'factor':>9} {'post':>9} {'rows':>10}")
+        print("-" * 42)
+        for (tier, factor) in sorted(by_bucket.keys(), reverse=True):
+            post = tier * factor
+            marker = " *" if abs(factor - intra_factor) > 1e-9 else ""
+            print(
+                f"{tier:>9.4f} {factor:>9.4f} {post:>9.4f} "
+                f"{by_bucket[(tier, factor)]:>10}{marker}"
+            )
+        print("-" * 42)
+        print(f"  (global default factor: {intra_factor}; '*' = per-frame override)")
+
+    # Always show what's left outside the current scope — both when the
+    # in-scope count is 0 (catch the "looks idempotent, isn't done" trap)
+    # and when it's non-zero (catch "this scope is partial, here's the
+    # rest").
+    report_out_of_scope(scope_tiers, conn)
     return n_rows, n_claims
 
 
@@ -344,12 +425,11 @@ def main() -> int:
     conn = psycopg2.connect(args.database_url)
     conn.autocommit = False
 
-    n_rows, n_claims = preview_distribution(conn, scope_tiers, intra_factor)
-    print()
-    print(f"matched {n_rows} BBAs across {n_claims} target claims")
+    n_rows, _n_claims = preview_distribution(conn, scope_tiers, intra_factor)
 
     if n_rows == 0:
-        print("nothing to do")
+        print()
+        print("nothing to do in --scope (see FYI above for other tiers, if any)")
         conn.close()
         return 0
 
