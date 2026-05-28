@@ -12,6 +12,11 @@ db = ["dep:epigraph-db", "dep:sqlx"]
 genai = ["db"]
 
 [[bin]]
+name = "recompute_claim_belief"
+path = "src/bin/recompute_claim_belief.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "ingest_literature"
 path = "src/bin/ingest_literature.rs"
 
