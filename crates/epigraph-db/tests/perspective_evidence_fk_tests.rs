@@ -113,6 +113,7 @@ async fn mass_function_store_with_synthetic_perspective_succeeds(pool: PgPool) -
         Some(0.7),
         Some("observation"),
         "unknown",
+        None,
     )
     .await;
     assert!(
@@ -136,6 +137,7 @@ async fn mass_function_store_with_synthetic_perspective_succeeds(pool: PgPool) -
         Some(0.7),
         Some("observation"),
         "unknown",
+        None,
     )
     .await
     .expect("store with materialized perspective should succeed");

@@ -38,6 +38,26 @@ async fn seed_agent_and_claim(pool: &PgPool) -> (Uuid, Uuid) {
     (agent_id, claim_id)
 }
 
+/// Seed an evidence row tied to `claim_id` so the test can pass its id as
+/// `auto_wire_ds_update`'s `evidence_id` argument. Phase 3 (#197) added
+/// `mass_functions.evidence_id` with `REFERENCES evidence(id)`; a
+/// caller-fabricated UUID will violate that FK at insert time.
+async fn seed_evidence(pool: &PgPool, claim_id: Uuid) -> Uuid {
+    let evidence_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO evidence (id, content_hash, evidence_type, claim_id) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(evidence_id)
+    .bind(evidence_id.as_bytes().repeat(2))
+    .bind("testimony")
+    .bind(claim_id)
+    .execute(pool)
+    .await
+    .expect("seed evidence row");
+    evidence_id
+}
+
 #[tokio::test]
 async fn auto_wire_ds_update_stores_weight_as_source_strength() {
     let pool = test_pool_or_skip!();
@@ -46,7 +66,7 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
     // Confidence and weight differ so we can tell which one was stored.
     let confidence = 0.95;
     let weight = 0.6;
-    let evidence_id = Uuid::new_v4();
+    let evidence_id = seed_evidence(&pool, claim_id).await;
 
     tools::ds_auto::auto_wire_ds_update(
         &pool,
@@ -61,8 +81,8 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
     .await
     .expect("auto_wire_ds_update");
 
-    let stored: (Option<f64>, Option<String>) = sqlx::query_as(
-        "SELECT source_strength, evidence_type \
+    let stored: (Option<f64>, Option<String>, Option<Uuid>) = sqlx::query_as(
+        "SELECT source_strength, evidence_type, evidence_id \
            FROM mass_functions \
           WHERE claim_id = $1 AND perspective_id = $2",
     )
@@ -82,4 +102,14 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
         "source_strength must NOT equal confidence ({confidence}); confidence is encoded in BBA shape"
     );
     assert_eq!(stored.1.as_deref(), Some("testimony"));
+    // Phase 3 (issue #197): auto_wire_ds_update must pipe its evidence_id
+    // parameter through to mass_functions.evidence_id as the FK to the
+    // evidence row that produced this BBA. Without this, the linking
+    // script (scripts/link_mass_function_evidence.py) is the only path to
+    // recover per-BBA provenance — and only on a best-effort basis.
+    assert_eq!(
+        stored.2,
+        Some(evidence_id),
+        "Phase 3: evidence_id parameter must round-trip into mass_functions.evidence_id"
+    );
 }

@@ -154,6 +154,7 @@ pub async fn create_hypothesis(
         None,
         Some("prior"),
         "unknown", // vacuous prior; no evidence yet (issue #197)
+        None,      // vacuous prior — no evidence row (issue #197 Phase 3)
     )
     .await
     .map_err(|e| ApiError::InternalError {

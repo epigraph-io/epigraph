@@ -167,6 +167,7 @@ pub async fn submit_ds_evidence(
         None,
         None,
         "unknown", // MCP ds entrypoint lacks evidence-DOI vs paper context (issue #197)
+        None,      // manual DS submission has no evidence row in scope (issue #197 Phase 3)
     )
     .await
     .map_err(internal_error)?;

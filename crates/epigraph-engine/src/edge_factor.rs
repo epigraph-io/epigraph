@@ -198,6 +198,7 @@ pub async fn auto_wire_ds_for_edge(
         Some(source_strength),
         Some(relationship),
         locality_tag,
+        None, // edge_factor BBA: derived from an EDGE, not an evidence row (issue #197 Phase 3)
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
