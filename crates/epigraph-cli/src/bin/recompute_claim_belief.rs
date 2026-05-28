@@ -89,7 +89,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if cli.dry_run {
-        println!("DRY-RUN — would recompute belief on {} claims", claim_ids.len());
+        println!(
+            "DRY-RUN — would recompute belief on {} claims",
+            claim_ids.len()
+        );
         return Ok(());
     }
 
@@ -184,10 +187,9 @@ async fn recompute_one_claim_all_frames(
     .map_err(|e| format!("list frames for claim: {e}"))?;
     let mut written = 0usize;
     for (frame_id, _frame_name) in rows {
-        let did = epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
-            pool, claim_id, frame_id,
-        )
-        .await?;
+        let did =
+            epigraph_engine::edge_factor::recompute_claim_belief_on_frame(pool, claim_id, frame_id)
+                .await?;
         if did {
             written += 1;
         }
