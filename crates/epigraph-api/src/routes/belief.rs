@@ -1065,6 +1065,7 @@ pub async fn submit_evidence(
         Some("discount"),
         Some(request.reliability),
         None,
+        "unknown", // locality not known at HTTP belief endpoint; see issue #197
     )
     .await?;
 
@@ -1296,6 +1297,7 @@ pub async fn submit_evidence(
         &combined_json,
         final_k,
         final_method,
+        "unknown", // combined result; locality is per-input, not aggregate (issue #197)
     )
     .await;
 

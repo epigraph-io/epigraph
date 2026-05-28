@@ -194,6 +194,7 @@ async fn create(
         &vacuous_masses,
         None,
         Some("prior"),
+        "unknown", // vacuous prior; no evidence yet (issue #197)
     )
     .await?;
 

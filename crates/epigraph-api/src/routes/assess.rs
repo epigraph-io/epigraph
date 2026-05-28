@@ -221,6 +221,7 @@ pub async fn assess_claim(
         Some("discount"),
         None,
         None,
+        "unknown", // assess endpoint lacks the source/target paper context (issue #197)
     )
     .await?;
 
@@ -353,6 +354,7 @@ pub async fn assess_claim(
         &combined_json,
         final_k,
         final_method,
+        "unknown", // combined result; locality is per-input, not aggregate (issue #197)
     )
     .await;
 

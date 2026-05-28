@@ -166,6 +166,7 @@ pub async fn submit_ds_evidence(
         Some(&method_name),
         None,
         None,
+        "unknown", // MCP ds entrypoint lacks evidence-DOI vs paper context (issue #197)
     )
     .await
     .map_err(internal_error)?;
