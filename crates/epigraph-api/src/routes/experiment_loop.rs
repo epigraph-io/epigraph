@@ -410,6 +410,7 @@ pub async fn analyze_result(
         &masses_json,
         None,
         Some("error_derived"),
+        "unknown", // experiment-derived; no evidence-DOI vs paper comparison (issue #197)
     )
     .await
     .map_err(|e| ApiError::InternalError {

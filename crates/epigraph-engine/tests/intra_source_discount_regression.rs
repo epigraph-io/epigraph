@@ -260,6 +260,25 @@ async fn intra_source_19_supporters_betp_in_band(pool: PgPool) {
         "expected all 19 BBAs to carry the composed intra-source discount, got {composed_count}"
     );
 
+    // Phase 1a (#197): every supporter BBA was written through edge_factor
+    // with is_intra = true, so locality_tag must persist as 'intra'. This
+    // assertion locks the typing column independent of the numeric
+    // source_strength band — a future calibration shift that nudged the
+    // composed value outside [0.075, 0.405] would not break the typing
+    // contract.
+    let intra_tag_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions \
+         WHERE claim_id = $1 AND locality_tag = 'intra'",
+    )
+    .bind(target_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count locality_tag = intra rows");
+    assert_eq!(
+        intra_tag_count, 19,
+        "expected all 19 BBAs to carry locality_tag = 'intra', got {intra_tag_count}"
+    );
+
     let betp = read_betp(&pool, target_id)
         .await
         .expect("target should have computed BetP after 19 supporter wires");
@@ -347,6 +366,20 @@ async fn cross_source_19_supporters_keeps_high_betp(pool: PgPool) {
     assert_eq!(
         cross_row_count, 19,
         "expected all 19 BBAs to land in the cross-source transmission band [0.5, 0.9], got {cross_row_count}"
+    );
+
+    // Phase 1a (#197): typing column must reflect cross-source classification.
+    let cross_tag_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions \
+         WHERE claim_id = $1 AND locality_tag = 'cross'",
+    )
+    .bind(target_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count locality_tag = cross rows");
+    assert_eq!(
+        cross_tag_count, 19,
+        "expected all 19 BBAs to carry locality_tag = 'cross', got {cross_tag_count}"
     );
 
     let betp = read_betp(&pool, target_id)
@@ -483,5 +516,33 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     assert!(
         primer_ss < 0.30,
         "primer BBA (written pre-override) should still carry default-factor discount (<0.30), got {primer_ss}"
+    );
+
+    // Phase 1a (#197): both primer (pre-override, default 0.3 factor) and
+    // override-affected supporter (per-frame 0.9 factor) seeded
+    // doi-evidence rows pointing at the target's paper, so both went
+    // through the is_intra = true branch of edge_factor. Per-frame override
+    // changes the discount factor, NOT the locality classification — that
+    // invariant is what this assertion locks.
+    let primer_tag: String =
+        sqlx::query_scalar("SELECT locality_tag FROM mass_functions WHERE perspective_id = $1")
+            .bind(primer_edge)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch primer locality_tag");
+    assert_eq!(
+        primer_tag, "intra",
+        "primer BBA must carry locality_tag = 'intra' (intra evidence regardless of per-frame factor)"
+    );
+
+    let override_tag: String =
+        sqlx::query_scalar("SELECT locality_tag FROM mass_functions WHERE perspective_id = $1")
+            .bind(edge_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch override locality_tag");
+    assert_eq!(
+        override_tag, "intra",
+        "override BBA must carry locality_tag = 'intra' (per-frame factor changes only the discount, not the classification)"
     );
 }

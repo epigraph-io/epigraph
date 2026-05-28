@@ -179,6 +179,13 @@ pub async fn auto_wire_ds_for_edge(
         .await
         .map_err(|e| format!("ensure_edge_perspective: {e}"))?;
 
+    // Phase 1a (issue #197): persist the locality classification we just
+    // computed into a dedicated column. The current combine path still reads
+    // `source_strength` (which is already composed with `locality_factor`
+    // above); the tag is metadata so the backfill script and Phase 2 combine
+    // path can stop inferring typing from the numeric value-set.
+    let locality_tag = if is_intra { "intra" } else { "cross" };
+
     MassFunctionRepository::store_with_perspective(
         pool,
         target_id,
@@ -190,6 +197,7 @@ pub async fn auto_wire_ds_for_edge(
         Some("edge_factor"),
         Some(source_strength),
         Some(relationship),
+        locality_tag,
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;

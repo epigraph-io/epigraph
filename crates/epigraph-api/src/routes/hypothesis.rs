@@ -153,6 +153,7 @@ pub async fn create_hypothesis(
         &vacuous_masses,
         None,
         Some("prior"),
+        "unknown", // vacuous prior; no evidence yet (issue #197)
     )
     .await
     .map_err(|e| ApiError::InternalError {
