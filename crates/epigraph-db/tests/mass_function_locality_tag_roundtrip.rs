@@ -97,6 +97,7 @@ async fn store_with_perspective_roundtrips_intra_tag(pool: PgPool) {
         Some(0.21),
         Some("supports"),
         "intra",
+        None,
     )
     .await
     .expect("store intra");
@@ -124,6 +125,7 @@ async fn store_with_perspective_roundtrips_cross_tag(pool: PgPool) {
         Some(0.7),
         Some("supports"),
         "cross",
+        None,
     )
     .await
     .expect("store cross");
@@ -151,6 +153,7 @@ async fn store_with_perspective_roundtrips_unknown_tag(pool: PgPool) {
         None,
         None,
         "unknown",
+        None,
     )
     .await
     .expect("store unknown");

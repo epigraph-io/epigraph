@@ -28,6 +28,16 @@ pub struct MassFunctionRow {
     /// Defaults to 'unknown' on the column; not nullable. See issue #197
     /// and migration 045_mass_functions_locality_tag.sql.
     pub locality_tag: String,
+    /// FK to the specific evidence row that produced this BBA. NULL when:
+    /// - the BBA was not derived from a single evidence row (edge_factor,
+    ///   batch ds_auto, prior, combined system rows)
+    /// - the evidence row that produced it was deleted (ON DELETE SET NULL)
+    /// - legacy pre-Phase-3 row that the linking heuristic could not resolve
+    ///
+    /// When `Some`, locality is derivable directly: compare the evidence
+    /// row's `properties->>'doi'` to the DOI of the paper asserting
+    /// `claim_id`. See issue #197 Phase 3 and migration 046.
+    pub evidence_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -51,7 +61,8 @@ impl MassFunctionRepository {
         masses_json: &serde_json::Value,
         conflict_k: Option<f64>,
         combination_method: Option<&str>,
-        locality_tag: &str, // 'intra' | 'cross' | 'unknown' (issue #197)
+        locality_tag: &str,        // 'intra' | 'cross' | 'unknown' (issue #197)
+        evidence_id: Option<Uuid>, // FK to evidence(id), NULL for non-evidence BBAs (issue #197 Phase 3)
     ) -> Result<Uuid, DbError> {
         Self::store_with_perspective(
             pool,
@@ -65,6 +76,7 @@ impl MassFunctionRepository {
             None,
             None,
             locality_tag,
+            evidence_id,
         )
         .await
     }
@@ -89,12 +101,13 @@ impl MassFunctionRepository {
         source_strength: Option<f64>, // Shafer reliability discount weight
         evidence_type: Option<&str>,  // evidence classification tag
         locality_tag: &str, // 'intra' | 'cross' | 'unknown'; column NOT NULL default 'unknown' (issue #197)
+        evidence_id: Option<Uuid>, // FK to evidence(id); Some(_) on the auto_wire_ds_update evidence write path, None otherwise (issue #197 Phase 3)
     ) -> Result<Uuid, DbError> {
         let row: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO mass_functions
-                (claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                (claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (claim_id, frame_id, source_agent_id, perspective_id) DO UPDATE
             SET masses = EXCLUDED.masses,
                 conflict_k = EXCLUDED.conflict_k,
@@ -102,6 +115,7 @@ impl MassFunctionRepository {
                 source_strength = EXCLUDED.source_strength,
                 evidence_type = EXCLUDED.evidence_type,
                 locality_tag = EXCLUDED.locality_tag,
+                evidence_id = EXCLUDED.evidence_id,
                 created_at = NOW()
             RETURNING id
             "#,
@@ -116,6 +130,7 @@ impl MassFunctionRepository {
         .bind(source_strength)
         .bind(evidence_type)
         .bind(locality_tag)
+        .bind(evidence_id)
         .fetch_one(pool)
         .await?;
 
@@ -136,7 +151,7 @@ impl MassFunctionRepository {
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let rows: Vec<MassFunctionRow> = sqlx::query_as(
             r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2
             ORDER BY created_at ASC
@@ -158,7 +173,7 @@ impl MassFunctionRepository {
     pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<MassFunctionRow>, DbError> {
         let row: Option<MassFunctionRow> = sqlx::query_as(
             r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE id = $1
             "#,
@@ -182,7 +197,7 @@ impl MassFunctionRepository {
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let rows: Vec<MassFunctionRow> = sqlx::query_as(
             r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1
             ORDER BY frame_id, created_at ASC
@@ -208,7 +223,7 @@ impl MassFunctionRepository {
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let rows: Vec<MassFunctionRow> = sqlx::query_as(
             r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2 AND perspective_id = $3
             ORDER BY created_at ASC
@@ -236,7 +251,7 @@ impl MassFunctionRepository {
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let rows: Vec<MassFunctionRow> = sqlx::query_as(
             r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2 AND perspective_id = ANY($3)
             ORDER BY created_at ASC
@@ -361,7 +376,7 @@ impl MassFunctionRepository {
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let rows: Vec<MassFunctionRow> = sqlx::query_as(
             r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE frame_id = $1
             ORDER BY claim_id, created_at ASC
@@ -387,7 +402,7 @@ impl MassFunctionRepository {
             r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id,
                    masses, conflict_k, combination_method,
-                   source_strength, evidence_type, locality_tag, created_at
+                   source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = ANY($1)
             ORDER BY claim_id, created_at ASC
@@ -439,6 +454,7 @@ mod tests {
             None,
             Some("test"),
             "unknown",
+            None,
         )
         .await
         .unwrap();
@@ -451,6 +467,7 @@ mod tests {
             None,
             Some("test"),
             "unknown",
+            None,
         )
         .await
         .unwrap();
@@ -511,6 +528,7 @@ mod tests {
             Some(0.7),
             Some("auto_wire"),
             "unknown",
+            None,
         )
         .await
         .unwrap();
@@ -527,6 +545,7 @@ mod tests {
             Some(0.9),
             Some("auto_wire"),
             "unknown",
+            None,
         )
         .await
         .unwrap();
@@ -667,6 +686,7 @@ mod tests {
             source_strength: Some(0.9),
             evidence_type: Some("rct".to_string()),
             locality_tag: "unknown".to_string(),
+            evidence_id: Some(Uuid::new_v4()),
             created_at: Utc::now(),
         };
     }

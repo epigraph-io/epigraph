@@ -1066,6 +1066,7 @@ pub async fn submit_evidence(
         Some(request.reliability),
         None,
         "unknown", // locality not known at HTTP belief endpoint; see issue #197
+        None,      // HTTP belief endpoint has no evidence row in scope (issue #197 Phase 3)
     )
     .await?;
 
@@ -1298,6 +1299,7 @@ pub async fn submit_evidence(
         final_k,
         final_method,
         "unknown", // combined result; locality is per-input, not aggregate (issue #197)
+        None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
     )
     .await;
 

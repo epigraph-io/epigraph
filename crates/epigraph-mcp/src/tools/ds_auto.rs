@@ -193,6 +193,7 @@ pub async fn auto_wire_ds_for_claim(
         Some(weight),  // source_strength = evidence-type reliability
         evidence_type, // evidence_type
         "unknown",     // ds_auto single-evidence path; locality lives on edge_factor (issue #197)
+        None, // no evidence row in scope on the new-claim initial-write path (issue #197 Phase 3)
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
@@ -286,6 +287,7 @@ pub async fn auto_wire_ds_update(
         Some(weight),      // source_strength = evidence-type reliability
         evidence_type_str, // evidence_type
         "unknown",         // ds_auto evidence path; locality not derived here (issue #197)
+        evidence_id, // Phase 3: the FK to the evidence row that produced this BBA (issue #197)
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
@@ -402,6 +404,7 @@ async fn wire_single_batch_entry(
         Some(entry.weight), // source_strength = evidence-type reliability
         None,               // evidence_type (not threaded through batch yet)
         "unknown",          // batch ds_auto path; no per-entry locality (issue #197)
+        None,               // batch path predates per-claim evidence rows (issue #197 Phase 3)
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;

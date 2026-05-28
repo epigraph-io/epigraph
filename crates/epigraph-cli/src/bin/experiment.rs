@@ -486,6 +486,7 @@ async fn analyze(
         None,
         Some("error_derived"),
         "unknown", // experiment-derived; no evidence-DOI vs paper comparison (issue #197)
+        None,      // error-derived BBA has no evidence row (issue #197 Phase 3)
     )
     .await?;
 

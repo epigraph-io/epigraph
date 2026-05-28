@@ -195,6 +195,7 @@ async fn create(
         None,
         Some("prior"),
         "unknown", // vacuous prior; no evidence yet (issue #197)
+        None,      // vacuous prior — no evidence row (issue #197 Phase 3)
     )
     .await?;
 

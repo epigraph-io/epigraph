@@ -222,6 +222,7 @@ pub async fn assess_claim(
         None,
         None,
         "unknown", // assess endpoint lacks the source/target paper context (issue #197)
+        None,      // assess endpoint has no evidence row in scope (issue #197 Phase 3)
     )
     .await?;
 
@@ -355,6 +356,7 @@ pub async fn assess_claim(
         final_k,
         final_method,
         "unknown", // combined result; locality is per-input, not aggregate (issue #197)
+        None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
     )
     .await;
 

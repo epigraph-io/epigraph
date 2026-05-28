@@ -61,8 +61,8 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
     .await
     .expect("auto_wire_ds_update");
 
-    let stored: (Option<f64>, Option<String>) = sqlx::query_as(
-        "SELECT source_strength, evidence_type \
+    let stored: (Option<f64>, Option<String>, Option<Uuid>) = sqlx::query_as(
+        "SELECT source_strength, evidence_type, evidence_id \
            FROM mass_functions \
           WHERE claim_id = $1 AND perspective_id = $2",
     )
@@ -82,4 +82,14 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
         "source_strength must NOT equal confidence ({confidence}); confidence is encoded in BBA shape"
     );
     assert_eq!(stored.1.as_deref(), Some("testimony"));
+    // Phase 3 (issue #197): auto_wire_ds_update must pipe its evidence_id
+    // parameter through to mass_functions.evidence_id as the FK to the
+    // evidence row that produced this BBA. Without this, the linking
+    // script (scripts/link_mass_function_evidence.py) is the only path to
+    // recover per-BBA provenance — and only on a best-effort basis.
+    assert_eq!(
+        stored.2,
+        Some(evidence_id),
+        "Phase 3: evidence_id parameter must round-trip into mass_functions.evidence_id"
+    );
 }
