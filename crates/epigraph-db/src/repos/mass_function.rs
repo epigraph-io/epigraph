@@ -41,6 +41,7 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(pool, masses_json))]
     pub async fn store(
         pool: &PgPool,
