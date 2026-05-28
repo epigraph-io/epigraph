@@ -37,8 +37,16 @@ cross-derived BBAs. The long-term fix is per-BBA provenance (e.g.
 that lands.
 
 Usage:
-    python3 scripts/backfill_intra_source_evidence_discount.py            # dry run
-    python3 scripts/backfill_intra_source_evidence_discount.py --execute  # write + reconcile
+    # Dry run — preview, no writes:
+    python3 scripts/backfill_intra_source_evidence_discount.py
+
+    # Commit — UPDATE the BBAs AND write affected claim_ids to a file:
+    python3 scripts/backfill_intra_source_evidence_discount.py --execute
+
+    # Refresh the cached BetP on the affected claims (the
+    # `claims.{belief, plausibility, pignistic_prob, ...}` scalars):
+    DATABASE_URL=... epigraph-recompute-belief \\
+        --input /tmp/locality-backfill-affected-claims.txt
 
 By default `--scope 0.85` targets the largest tier (≈74 711 BBAs in prod
 as of 2026-05-27). Pass `--scope 1.0`, `--scope 0.75`, `--scope 0.5`,
@@ -53,9 +61,23 @@ so a second run sees no candidates. The forward write path (post-#185)
 ALSO emits composed values directly, so newly-written BBAs are also
 naturally excluded from re-discounting.
 
-After --execute, the script POSTs each affected claim_id to
-`/api/v1/graph/reconcile_sheaf` so beliefs re-aggregate against the new
-composed weights.
+Why is the recompute a separate step?
+
+The UPDATE landed on ``mass_functions.source_strength`` is one transaction
+— atomic, fast, easy to reason about. The cached BetP on each affected
+claim, on the other hand, requires fetching all BBAs on every (claim,
+frame) pair, applying the new discount, combining via Dempster's rule,
+and writing back. That's per-claim and per-frame, takes ~2 minutes for
+~16k claims, and is naturally idempotent (re-running just re-derives
+the same combined values). Coupling these two operations behind a
+single ``--execute`` flag bound them to the same transaction's
+success/failure semantics and locked the operator into one strategy
+(synchronous HTTP per-claim). An earlier version of this script tried
+that and hit two bugs at once: wrong URL, AND the only available HTTP
+route is a global obstruction-resolver that doesn't recompute the bulk
+of an affected population. PR #195 introduced ``epigraph-recompute-belief``
+as the canonical per-claim, per-frame recompute path; this script's job
+is now just to emit the claim list for it to consume.
 """
 
 from __future__ import annotations
@@ -71,11 +93,9 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for older interpreter
     import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 import psycopg2
-import requests
 
 
 DEFAULT_DATABASE_URL = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
-DEFAULT_API = "http://localhost:8080"
 DEFAULT_CALIBRATION = Path(__file__).resolve().parent.parent / "calibration.toml"
 
 # Scope flag maps to a tier filter on `mf.source_strength`. `all` means
@@ -265,33 +285,19 @@ def execute_backfill(
     return n_rows, sorted(set(claim_ids))
 
 
-def reconcile_claims(api_url: str, claim_ids: list) -> int:
-    """POST each affected claim_id to /api/v1/graph/reconcile_sheaf.
+def write_affected_claims(path: Path, claim_ids: list) -> None:
+    """Persist the affected claim_ids to a file, one UUID per line.
 
-    Returns the count of failures (non-2xx responses). Continues past
-    individual failures so a single bad claim doesn't abort the loop.
+    Consumed by `epigraph-recompute-belief --input <path>` to refresh
+    the cached `claims.{belief, plausibility, pignistic_prob, ...}`
+    that this script's UPDATE invalidates.
     """
-    failures = 0
-    for i, claim_id in enumerate(claim_ids, 1):
-        try:
-            r = requests.post(
-                f"{api_url}/api/v1/graph/reconcile_sheaf",
-                json={"claim_id": str(claim_id)},
-                timeout=60,
-            )
-        except requests.RequestException as e:
-            failures += 1
-            print(f"  [{i}/{len(claim_ids)}] {claim_id}: request failed: {e}")
-            continue
-        if not r.ok:
-            failures += 1
-            print(
-                f"  [{i}/{len(claim_ids)}] {claim_id}: "
-                f"{r.status_code} {r.text[:200]}"
-            )
-        elif i % 100 == 0:
-            print(f"  [{i}/{len(claim_ids)}] ok")
-    return failures
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        f.write("# affected claim_ids from backfill_intra_source_evidence_discount.py\n")
+        f.write(f"# {len(claim_ids)} unique claims\n")
+        for cid in claim_ids:
+            f.write(f"{cid}\n")
 
 
 def main() -> int:
@@ -299,10 +305,6 @@ def main() -> int:
     parser.add_argument(
         "--database-url",
         default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
-    )
-    parser.add_argument(
-        "--api-url",
-        default=os.environ.get("EPIGRAPH_API", DEFAULT_API),
     )
     parser.add_argument(
         "--calibration",
@@ -318,12 +320,17 @@ def main() -> int:
     parser.add_argument(
         "--execute",
         action="store_true",
-        help="Write the multiplication + POST reconcile_sheaf. Otherwise dry-run.",
+        help="Write the multiplication and persist affected claim_ids. Otherwise dry-run.",
     )
     parser.add_argument(
-        "--skip-reconcile",
-        action="store_true",
-        help="With --execute: write the UPDATE but skip the reconcile POSTs.",
+        "--affected-claims-out",
+        type=Path,
+        default=Path("/tmp/locality-backfill-affected-claims.txt"),
+        help=(
+            "Where to write the list of affected claim_ids on --execute. "
+            "Feed this file to `epigraph-recompute-belief --input <path>` "
+            "to refresh the cached BetP on the affected claims."
+        ),
     )
     args = parser.parse_args()
 
@@ -358,17 +365,20 @@ def main() -> int:
     print(f"  updated {written} BBAs across {len(claim_ids)} claims")
     conn.close()
 
-    if args.skip_reconcile:
-        print()
-        print("--skip-reconcile set; not POSTing reconcile_sheaf.")
-        print("Beliefs will re-aggregate on the next nightly graph-integrity pass.")
-        return 0
-
+    write_affected_claims(args.affected_claims_out, claim_ids)
     print()
-    print(f"POSTing reconcile_sheaf for {len(claim_ids)} claims via {args.api_url}...")
-    failures = reconcile_claims(args.api_url, claim_ids)
-    print(f"reconcile complete; {failures} failures")
-    return 1 if failures else 0
+    print(f"affected claim_ids → {args.affected_claims_out}")
+    print()
+    print("Next: refresh the cached BetP on the affected claims —")
+    print(
+        f"    DATABASE_URL=... epigraph-recompute-belief --input {args.affected_claims_out}"
+    )
+    print(
+        "Until you run that, `claims.{belief, plausibility, pignistic_prob}` for "
+        "these claims will reflect the PRE-discount BBA values; the BBA layer "
+        "is already consistent."
+    )
+    return 0
 
 
 if __name__ == "__main__":
