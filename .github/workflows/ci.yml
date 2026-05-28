@@ -24,12 +24,43 @@ jobs:
     env:
       DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
       SQLX_OFFLINE: "true"
+      # CI resource mitigations — GitHub-hosted ubuntu-latest is 4 vCPU /
+      # 16 GB RAM / ~14 GB disk. Default cargo build + lld link saturates
+      # that on a workspace this size; symptoms are intermittent SIGBUS in
+      # rust-lld (linker OOM during mmap) and ENOSPC on the host disk.
+      #
+      # CARGO_BUILD_JOBS=2: cap parallel rustc/link to 2. Each link can be
+      # 1–2 GB RSS; 2× ≈ 4 GB worst case, comfortable headroom.
+      CARGO_BUILD_JOBS: "2"
+      # CARGO_PROFILE_TEST_DEBUG=line-tables-only: keep backtraces, drop the
+      # heavy DWARF that bloats each test binary to 100–400 MB. Halves the
+      # target/ tree on workspaces of this shape — speeds linking AND
+      # reduces disk pressure.
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v4.3.1
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
           components: clippy, rustfmt
+      - name: Install mold (low-memory parallel linker)
+        # Replaces rust-lld for the workspace. mold uses dramatically less
+        # RAM than lld on multi-binary workspaces — the other half of the
+        # linker-OOM fix above. apt's mold on ubuntu-24.04 runners is
+        # sufficient (>= 2.x).
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y mold
+          mkdir -p .cargo
+          {
+            echo ""
+            echo "# CI-only: route the workspace through mold. Scoped to the"
+            echo "# runner triple so local dev on other platforms is unaffected."
+            echo "# Uses the default cc driver (-fuse-ld=mold), no clang required."
+            echo "[target.x86_64-unknown-linux-gnu]"
+            echo 'rustflags = ["-C", "link-arg=-fuse-ld=mold"]'
+          } >> .cargo/config.toml
+          mold --version
       - uses: Swatinem/rust-cache@v2.8.1
       - name: Build
         run: cargo build --workspace
