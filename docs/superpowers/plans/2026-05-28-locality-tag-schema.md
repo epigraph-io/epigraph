@@ -192,6 +192,79 @@ per-claim locality, because we can validate the per-evidence-row
 linkage against the per-claim aggregate ("if claim is fully
 intra-source, every linked evidence row should be intra-source").
 
+### Phase 4 — per-frame `evidence_type_weights` override
+
+**Goal:** let frames override individual evidence-type weights, not
+just the locality factor. The Phase 2 helper currently does
+`calibration.get_evidence_type_weight(row.evidence_type)` — a single
+global lookup. Operators can already override `intra_evidence_locality_factor`
+per frame via `frames.properties` (shipped in #193); Phase 4 extends
+that pattern to evidence-type weights so e.g. a textbook frame can
+say "observation evidence weighs 1.2 here, reference evidence weighs
+0.6" while binary_truth keeps the SciFact calibration defaults.
+
+**Schema:** no change. `frames.properties` JSONB (migration 044)
+already carries the data; convention adds a key
+`evidence_type_weights: { "<key>": <float>, ... }`.
+
+**Helper change:** the Phase 2 `effective_source_strength` signature
+gains a `per_frame_evidence_type_weights: Option<&serde_json::Value>`
+parameter (or equivalent typed map). Lookup order for evidence-type
+weight:
+
+1. `frame.properties->>'evidence_type_weights'->>(row.evidence_type)`
+   if the frame override is set for this key.
+2. `calibration.get_evidence_type_weight(row.evidence_type)` (the
+   existing global lookup, including alias resolution).
+3. The 0.5 unknown-key fallback (which Phase 2 already routes
+   through `source_strength` as the migration-compat axis — same
+   behaviour applies in Phase 4).
+
+**Operator interface:** `FrameRepository::set_property` (also
+shipped in #193) suffices for write; readers use the new lookup
+chain. Example:
+
+```rust
+FrameRepository::set_property(
+    pool, textbook_frame_id, "evidence_type_weights",
+    &json!({ "observation": 1.2, "reference": 0.6 }),
+).await?;
+```
+
+**Test plan:**
+- Unit test on the lookup chain: a frame with an override for
+  `"observation"` returns the override; a frame without one returns
+  the global; an unknown evidence_type falls through to legacy
+  fallback.
+- Integration test: an intra-source observation BBA on a frame
+  whose `evidence_type_weights["observation"] = 1.5` gets effective
+  source_strength `1.5 × intra_factor` instead of
+  `1.0 × intra_factor`. Recalibration in either dimension flows
+  through dynamically (same property as Phase 2 — no DB rewrite).
+
+**Scope boundary:** Phase 4 is per-frame, NOT per-agent or
+per-perspective. Per-agent overrides ("my prior on testimonial
+evidence is lower than calibration default") and per-perspective
+overrides would need a join table (`agent_evidence_type_weights`,
+`perspective_evidence_type_weights`), not a JSONB override on
+`frames`. Defer that to a separate design pass — the schema
+question is real and shouldn't be folded into Phase 4 without
+explicit demand.
+
+**Out of scope (deferred as separate research track):** outcome-
+driven recalibration. Learning the weights from later-validated
+claim outcomes needs a loss signal (predicted vs realized BetP),
+a residual ledger, and an optimizer (CMA-ES or genetic over the
+discrete weight space — Dempster's rule is non-differentiable so
+backprop doesn't drop in cleanly). That's a separate project; the
+extension hook this plan creates (per-frame JSONB carrying weight
+overrides) is the right substrate for an optimizer to eventually
+write to, but the optimizer itself is its own design.
+
+**Sequencing:** depends on Phase 2 (uses the helper extension
+point). Independent of Phase 3 (locality detection from
+`evidence_id` doesn't change weight resolution).
+
 ## Production state to track through the phases
 
 | metric | now | after 1a | after 1b | after 2 | after 3 |
@@ -210,6 +283,9 @@ intra-source, every linked evidence row should be intra-source").
    evidence_type null-fallback + per-frame factor lookup integration
    has enough surface to deserve its own design pass.
 4. Phase 3 deferred until Phase 2 lands.
+5. Phase 4 depends on Phase 2 (extends the helper's lookup chain).
+   Spec'd in a separate doc; design parallel-pass with Phase 2 review.
+   Code lands after Phase 2.
 
 ## Tests for the in-flight phase 1a
 
