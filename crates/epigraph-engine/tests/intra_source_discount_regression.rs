@@ -759,3 +759,177 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
          prev={nearly_undiscounted_betp}, new={deeply_discounted_betp}"
     );
 }
+
+// ── Phase 4 (#197): per-frame evidence-type weight override ────────────────
+
+/// **The key Phase 4 invariant**: a per-frame `evidence_type_weights`
+/// JSONB override flows through `recompute_claim_belief_binary` to
+/// combined BetP without any BBA rewrite. The override map is read
+/// at combine time via the new `effective_source_strength` Tier 1
+/// lookup. Without this assertion, Phase 4 ships green but the per-
+/// frame override is dead code at combine time.
+///
+/// Fixture key choice: this test exercises the same `auto_wire_ds_for_edge`
+/// write path as the Phase 2 regression. That write path resolves the
+/// `"supports"` relationship through `[evidence_type_aliases]` to the
+/// canonical SciFact key `"derived_support"` and stores THAT in
+/// `mass_functions.evidence_type` (see calibration.toml's alias section
+/// and the assertion at line ~292 of this file). So the Phase 4 override
+/// MUST be keyed on `"derived_support"`, not `"supports"` and not
+/// `"empirical"` — the BBAs aren't tagged either of those. This is the
+/// load-bearing detail the advisor flagged.
+///
+/// Q10 ([0.0, 1.0] clamp) constrains the upward-shift test: the global
+/// calibration `derived_support = 0.7`. An override `< 0.7` shifts BetP
+/// down, but an override `> 1.0` clamps to 1.0. We exercise a single
+/// down-shift + restore round-trip per the task's allowance ("if the
+/// upward case isn't possible under [0,1] clamp ... a single down-shift
+/// + restore round-trip is sufficient").
+#[sqlx::test(migrations = "../../migrations")]
+async fn per_frame_evidence_type_weight_override_applied(pool: PgPool) {
+    use epigraph_db::FrameRepository;
+
+    let agent = seed_agent(&pool, 0xD0_0001).await;
+    let target_doi = "10.phase4/evtw";
+    let paper = seed_paper(&pool, target_doi, "phase 4 evidence-type override").await;
+
+    // Target — start with NULL belief/plausibility so the only BBAs on
+    // the target come from the supporter wires.
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, is_current) \
+         VALUES ($1, $2, $3, $4, 0.5, true)",
+    )
+    .bind(target_id)
+    .bind("phase 4 evidence-type override target")
+    .bind(distinct_hash(0x60_0000))
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("seed target");
+    insert_edge(&pool, paper, target_id, "paper", "claim", "asserts").await;
+
+    // Seed two intra-source supporters, both citing the target's DOI.
+    // Each fires through `auto_wire_ds_for_edge("supports")` → BBA
+    // tagged `evidence_type = "derived_support"` (canonical), `locality_tag
+    // = "intra_self_cite"`.
+    for i in 0..2u32 {
+        let supporter = seed_claim_with_belief(
+            &pool,
+            agent,
+            &format!("phase 4 supporter {i}"),
+            0x61_0000 + i,
+            NEMS_BELIEF,
+            NEMS_BELIEF,
+            NEMS_BELIEF,
+        )
+        .await;
+        seed_doi_evidence(&pool, supporter, target_doi, 0x73_0000 + i).await;
+        let edge_id = insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
+        let outcome =
+            auto_wire_ds_for_edge(&pool, edge_id, agent, supporter, target_id, "supports")
+                .await
+                .expect("auto_wire");
+        assert_eq!(outcome, EdgeFactorOutcome::Wired);
+    }
+
+    // Sanity: 2 BBAs landed, all tagged with the canonical key.
+    let bba_count = count_target_bbas(&pool, target_id).await;
+    assert_eq!(
+        bba_count, 2,
+        "expected 2 BBAs on the target, got {bba_count}"
+    );
+    let canonical_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions \
+         WHERE claim_id = $1 AND evidence_type = 'derived_support'",
+    )
+    .bind(target_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count derived_support rows");
+    assert_eq!(
+        canonical_count, 2,
+        "expected both BBAs tagged 'derived_support' (auto-wire alias resolution), got {canonical_count}"
+    );
+
+    // Baseline BetP at calibration's global derived_support = 0.7.
+    let baseline_betp = read_betp(&pool, target_id)
+        .await
+        .expect("baseline BetP after supporter wires");
+    eprintln!(
+        "[per_frame_evidence_type_weight_override_applied] baseline BetP (global derived_support=0.7) = {baseline_betp}"
+    );
+
+    // ── Phase 4 Tier 1 down-shift: override derived_support to 0.1 ──
+    //
+    // 0.1 << 0.7 global → each supporter's reliability discount
+    // shrinks roughly 7x (composed with intra locality 0.3, the
+    // discount weight drops from 0.21 to 0.03), so each contributes
+    // far less mass to TRUE through the discount step, and combined
+    // BetP shifts downward.
+    //
+    // Why such a deep override: the BetP combine is non-linear, and
+    // a moderate override (e.g. 0.3) shifts BetP only ~0.03 in this
+    // 2-supporter fixture — within combination noise tolerance. The
+    // deep override produces a visibly-larger shift that survives the
+    // ≥0.02 threshold without false positives. Wider fixtures would
+    // amplify smaller overrides, but this 2-supporter shape is the
+    // simplest Phase 4 canary and matches the spec § 7 recipe.
+    let frame_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM frames WHERE name = $1")
+        .bind("binary_truth")
+        .fetch_one(&pool)
+        .await
+        .expect("binary_truth frame id");
+    FrameRepository::set_evidence_type_weight(&pool, frame_id, "derived_support", 0.1)
+        .await
+        .expect("set per-frame derived_support override");
+
+    // Recompute — the helper reads the override at combine time.
+    // **No BBA row rewrite** in between. This is the canary.
+    recompute_claim_belief_binary(&pool, target_id)
+        .await
+        .expect("recompute after per-frame evidence-type override");
+
+    let downshifted_betp = read_betp(&pool, target_id)
+        .await
+        .expect("BetP after override");
+    eprintln!(
+        "[per_frame_evidence_type_weight_override_applied] override 0.1 BetP = {downshifted_betp}"
+    );
+    // Threshold 0.02: combination noise from `combine_multiple`'s
+    // conflict-renormalisation is empirically << 1e-3 on a fixture
+    // this small with no random seeding. 0.02 is conservative
+    // headroom; observed shift is ~0.05+ with this override.
+    assert!(
+        downshifted_betp < baseline_betp - 0.02,
+        "per-frame override derived_support=0.1 (vs global 0.7) must shift BetP downward by ≥0.02: \
+         baseline={baseline_betp}, downshifted={downshifted_betp}"
+    );
+
+    // ── Round-trip: remove the override, BetP returns to baseline ──
+    //
+    // We remove the whole `evidence_type_weights` key — this exercises
+    // the "operator rolls back per-frame override" rollback path from
+    // Phase 4 spec § 9.6.
+    sqlx::query(
+        "UPDATE frames SET properties = properties - 'evidence_type_weights' WHERE id = $1",
+    )
+    .bind(frame_id)
+    .execute(&pool)
+    .await
+    .expect("remove evidence_type_weights key");
+    recompute_claim_belief_binary(&pool, target_id)
+        .await
+        .expect("recompute after override removal");
+
+    let restored_betp = read_betp(&pool, target_id)
+        .await
+        .expect("BetP after removal");
+    eprintln!("[per_frame_evidence_type_weight_override_applied] restored BetP = {restored_betp}");
+    assert!(
+        (restored_betp - baseline_betp).abs() < 1e-6,
+        "removing per-frame override must return BetP to baseline within float tolerance: \
+         baseline={baseline_betp}, restored={restored_betp}, delta={}",
+        (restored_betp - baseline_betp).abs()
+    );
+}

@@ -5,7 +5,8 @@
 use crate::errors::DbError;
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
-use tracing::instrument;
+use std::collections::HashMap;
+use tracing::{instrument, warn};
 use uuid::Uuid;
 
 /// A row from the frames table.
@@ -15,6 +16,13 @@ use uuid::Uuid;
 ///   * `intra_evidence_locality_factor` (float) — locality-discount
 ///     multiplier for this frame; overrides `calibration.toml`'s global
 ///     default when set.
+///   * `evidence_type_weights` (object) — per-frame override map for
+///     evidence-type weights (Phase 4 of issue #197). Keys are
+///     evidence-type strings (lowercased on read), values are floats
+///     in `[0.0, 1.0]`. Patches the global `calibration.toml`
+///     `[evidence_type_weights]` table at combine time for this frame
+///     only. See `get_per_frame_evidence_type_weights` /
+///     `set_evidence_type_weight`.
 #[derive(Debug, Clone, FromRow)]
 pub struct FrameRow {
     pub id: Uuid,
@@ -373,6 +381,133 @@ impl FrameRepository {
         .execute(pool)
         .await?;
         Ok(())
+    }
+
+    /// Read the per-frame `evidence_type_weights` override map, if any.
+    /// Phase 4 of issue #197.
+    ///
+    /// Returns `Ok(None)` when:
+    ///   * the frame row doesn't exist,
+    ///   * `properties` does not contain the `evidence_type_weights` key,
+    ///   * the key's value is not a JSON object (operator wrote garbage),
+    ///   * the JSON object is empty after parsing (no usable entries).
+    ///
+    /// Object entries are parsed:
+    ///   * key normalised to lowercase (matches
+    ///     `CalibrationConfig::get_evidence_type_weight`),
+    ///   * value coerced via `as_f64()`; non-numeric values are dropped
+    ///     with a `warn!` log (operator misspelled the weight),
+    ///   * values outside `[0.0, 1.0]` are dropped with a `warn!` log.
+    ///     The `[0.0, 1.0]` clamp matches Shafer's reliability semantics
+    ///     (a discount, not an amplification). This is the Phase 4 Q10
+    ///     locked decision — operators wanting `reference > 1.0` for
+    ///     textbook frames are out of scope; widen later if needed.
+    ///
+    /// Callers fall back to `CalibrationConfig::get_evidence_type_weight`
+    /// when this returns `None` or when the returned map does not contain
+    /// the BBA's evidence-type key.
+    ///
+    /// **Vocabulary warning**: this accessor does NOT warn on unknown
+    /// keys (keys not in `calibration.evidence_type_weights` ∪ aliases ∪
+    /// relationship-vocab). That warning happens at the call-site in
+    /// `recompute_combined_belief`, which has the `CalibrationConfig`
+    /// loaded — keeping the repo layer dependency-free of engine types.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` only on actual DB failure. Missing
+    /// rows / missing keys / malformed JSON return `Ok(None)`, not an
+    /// error — the consumer is expected to fall back to the global
+    /// calibration in that case.
+    #[instrument(skip(pool))]
+    pub async fn get_per_frame_evidence_type_weights(
+        pool: &PgPool,
+        frame_id: Uuid,
+    ) -> Result<Option<HashMap<String, f64>>, DbError> {
+        let row: Option<(Option<serde_json::Value>,)> =
+            sqlx::query_as("SELECT properties->'evidence_type_weights' FROM frames WHERE id = $1")
+                .bind(frame_id)
+                .fetch_optional(pool)
+                .await?;
+        let Some((Some(value),)) = row else {
+            return Ok(None);
+        };
+        let serde_json::Value::Object(obj) = value else {
+            warn!(
+                %frame_id,
+                "per-frame evidence_type_weights override is not a JSON object; ignoring"
+            );
+            return Ok(None);
+        };
+        let mut map: HashMap<String, f64> = HashMap::with_capacity(obj.len());
+        for (raw_key, raw_val) in obj {
+            let Some(w) = raw_val.as_f64() else {
+                warn!(
+                    %frame_id,
+                    key = %raw_key,
+                    "per-frame evidence_type_weights value is not numeric; dropping entry"
+                );
+                continue;
+            };
+            if !(0.0..=1.0).contains(&w) || !w.is_finite() {
+                warn!(
+                    %frame_id,
+                    key = %raw_key,
+                    value = %w,
+                    "per-frame evidence_type_weights value out of [0.0, 1.0]; dropping entry"
+                );
+                continue;
+            }
+            map.insert(raw_key.to_lowercase(), w);
+        }
+        if map.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(map))
+    }
+
+    /// Set a single per-frame evidence-type weight. Convenience wrapper
+    /// over `set_property` for the common single-key write path.
+    /// Phase 4 of issue #197.
+    ///
+    /// Reads the existing `evidence_type_weights` object (if any), merges
+    /// the new key, writes back. The key is NOT normalised on write —
+    /// readers normalise on read, so `"observation"` and `"OBSERVATION"`
+    /// in the JSONB resolve to the same effective entry but the JSONB
+    /// stores what the operator typed (an audit-trail consideration).
+    ///
+    /// Does NOT validate the evidence_type key against calibration;
+    /// operators may pre-register weights for evidence types not yet in
+    /// `calibration.toml`. Validation happens at read time via a warn-log
+    /// at the helper call-site (Q8 locked: loose validation).
+    ///
+    /// Does NOT validate the weight against `[0.0, 1.0]`; range-check
+    /// happens at read time in `get_per_frame_evidence_type_weights`,
+    /// dropping out-of-range entries with a warn-log (Q10 locked).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` on actual DB failure.
+    #[instrument(skip(pool))]
+    pub async fn set_evidence_type_weight(
+        pool: &PgPool,
+        frame_id: Uuid,
+        evidence_type: &str,
+        weight: f64,
+    ) -> Result<(), DbError> {
+        // Read existing map (raw, NOT through the validating accessor — we
+        // want to preserve any operator-written entries verbatim during
+        // the merge, even ones the validator would drop on read).
+        let row: Option<(Option<serde_json::Value>,)> =
+            sqlx::query_as("SELECT properties->'evidence_type_weights' FROM frames WHERE id = $1")
+                .bind(frame_id)
+                .fetch_optional(pool)
+                .await?;
+        let mut obj = match row {
+            Some((Some(serde_json::Value::Object(map)),)) => map,
+            _ => serde_json::Map::new(),
+        };
+        obj.insert(evidence_type.to_string(), serde_json::Value::from(weight));
+        let merged = serde_json::Value::Object(obj);
+        Self::set_property(pool, frame_id, "evidence_type_weights", &merged).await
     }
 }
 

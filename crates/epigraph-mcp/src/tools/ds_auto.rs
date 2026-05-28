@@ -319,12 +319,27 @@ pub async fn auto_wire_ds_update(
         .ok()
         .flatten();
 
+    // Phase 4 (issue #197): per-frame evidence-type weight override map.
+    // When set, its keyed entries win over the global calibration table
+    // at Tier 1 of `effective_source_strength`. Loaded once above the
+    // combine loop. On any DB error we fall through to `None`.
+    let per_frame_evidence_weights =
+        FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
+            .await
+            .ok()
+            .flatten();
+
     let combined = if all_rows.len() <= 1 {
         // Single BBA — still apply discount
         let r = all_rows
             .first()
             .expect("len <= 1 with non-empty check: store_with_perspective wrote one");
-        let reliability = effective_source_strength(r, per_frame_intra, &calibration);
+        let reliability = effective_source_strength(
+            r,
+            per_frame_intra,
+            per_frame_evidence_weights.as_ref(),
+            &calibration,
+        );
         let mf = parse_stored_bba(&frame, &r.masses)?;
         combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?
     } else {
@@ -332,7 +347,12 @@ pub async fn auto_wire_ds_update(
         let mut mass_fns = Vec::with_capacity(all_rows.len());
         for row in &all_rows {
             let mf = parse_stored_bba(&frame, &row.masses)?;
-            let reliability = effective_source_strength(row, per_frame_intra, &calibration);
+            let reliability = effective_source_strength(
+                row,
+                per_frame_intra,
+                per_frame_evidence_weights.as_ref(),
+                &calibration,
+            );
             let discounted =
                 combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
             mass_fns.push(discounted);
