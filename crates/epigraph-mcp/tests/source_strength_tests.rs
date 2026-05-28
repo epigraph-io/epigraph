@@ -38,6 +38,26 @@ async fn seed_agent_and_claim(pool: &PgPool) -> (Uuid, Uuid) {
     (agent_id, claim_id)
 }
 
+/// Seed an evidence row tied to `claim_id` so the test can pass its id as
+/// `auto_wire_ds_update`'s `evidence_id` argument. Phase 3 (#197) added
+/// `mass_functions.evidence_id` with `REFERENCES evidence(id)`; a
+/// caller-fabricated UUID will violate that FK at insert time.
+async fn seed_evidence(pool: &PgPool, claim_id: Uuid) -> Uuid {
+    let evidence_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO evidence (id, content_hash, evidence_type, claim_id) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(evidence_id)
+    .bind(evidence_id.as_bytes().repeat(2))
+    .bind("testimony")
+    .bind(claim_id)
+    .execute(pool)
+    .await
+    .expect("seed evidence row");
+    evidence_id
+}
+
 #[tokio::test]
 async fn auto_wire_ds_update_stores_weight_as_source_strength() {
     let pool = test_pool_or_skip!();
@@ -46,7 +66,7 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
     // Confidence and weight differ so we can tell which one was stored.
     let confidence = 0.95;
     let weight = 0.6;
-    let evidence_id = Uuid::new_v4();
+    let evidence_id = seed_evidence(&pool, claim_id).await;
 
     tools::ds_auto::auto_wire_ds_update(
         &pool,
