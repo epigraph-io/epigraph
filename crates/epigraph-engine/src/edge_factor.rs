@@ -239,7 +239,37 @@ pub async fn auto_wire_edge_if_epistemic(
 /// `propagate_to_dependents`) can share the cascade.
 pub async fn recompute_claim_belief_binary(pool: &PgPool, claim_id: Uuid) -> Result<bool, String> {
     let frame_id = ensure_binary_frame(pool).await?;
-    let frame = binary_frame()?;
+    recompute_claim_belief_on_frame(pool, claim_id, frame_id).await
+}
+
+/// Generalized variant of [`recompute_claim_belief_binary`] for any frame.
+///
+/// Used by operator one-shots (e.g.
+/// `epigraph-cli/src/bin/recompute_claim_belief.rs`) that need to refresh
+/// the cached BetP after a direct mutation to `mass_functions.source_strength`
+/// landed on a non-binary frame (research_validity, textbook_veracity_*, ...).
+/// The `claims.{belief, plausibility, pignistic_prob, ...}` columns are
+/// frame-agnostic scalars — last writer wins — so for claims with BBAs
+/// across multiple frames, the caller is responsible for ordering
+/// per-frame recomputes deterministically.
+///
+/// Returns `Ok(false)` if the claim has no BBAs on `frame_id`.
+///
+/// # Errors
+/// String error if the frame row can't be loaded, the frame's hypothesis
+/// list can't be parsed into a `FrameOfDiscernment`, or any DS combination
+/// step fails.
+pub async fn recompute_claim_belief_on_frame(
+    pool: &PgPool,
+    claim_id: Uuid,
+    frame_id: Uuid,
+) -> Result<bool, String> {
+    let row = FrameRepository::get_by_id(pool, frame_id)
+        .await
+        .map_err(|e| format!("frame get_by_id: {e}"))?
+        .ok_or_else(|| format!("frame {frame_id} not found"))?;
+    let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
+        .map_err(|e| format!("build frame {}: {e}", row.name))?;
     let all_rows = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
         .await
         .map_err(|e| format!("get_for_claim_frame: {e}"))?;
