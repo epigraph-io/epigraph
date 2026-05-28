@@ -327,7 +327,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let (sb, bb) = (bel_h0(&frame, &s), bel_h0(&frame, &b));
-        assert!(sb < bb, "skeptic {sb} should believe less than believer {bb}");
+        assert!(
+            sb < bb,
+            "skeptic {sb} should believe less than believer {bb}"
+        );
         assert!(sb > 0.0 && bb < 1.0);
     }
 

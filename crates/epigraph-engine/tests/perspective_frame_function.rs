@@ -50,7 +50,10 @@ async fn store_bba(
     mass: f64,
 ) {
     let mut bba = std::collections::BTreeMap::new();
-    bba.insert(FocalElement::positive(std::collections::BTreeSet::from([0])), mass);
+    bba.insert(
+        FocalElement::positive(std::collections::BTreeSet::from([0])),
+        mass,
+    );
     bba.insert(FocalElement::theta(frame), 1.0 - mass);
     let mf = MassFunction::new(frame.clone(), bba).unwrap();
     MassFunctionRepository::store_with_perspective(
@@ -88,16 +91,48 @@ async fn get_perspective_belief_diverges_by_observer(pool: PgPool) {
         FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone()).unwrap();
 
     // Shared corpus: a clinical result + a practitioner interview, both for H0.
-    store_bba(&pool, claim_id, frame_id, agent, &frame, "western_clinical", 0.6).await;
-    store_bba(&pool, claim_id, frame_id, agent, &frame, "practitioner_interview", 0.7).await;
+    store_bba(
+        &pool,
+        claim_id,
+        frame_id,
+        agent,
+        &frame,
+        "western_clinical",
+        0.6,
+    )
+    .await;
+    store_bba(
+        &pool,
+        claim_id,
+        frame_id,
+        agent,
+        &frame,
+        "practitioner_interview",
+        0.7,
+    )
+    .await;
 
     let skeptic = PerspectiveRepository::create(
-        &pool, "skeptic", None, None, Some("analytical"), &[], None, None,
+        &pool,
+        "skeptic",
+        None,
+        None,
+        Some("analytical"),
+        &[],
+        None,
+        None,
     )
     .await
     .expect("skeptic");
     let believer = PerspectiveRepository::create(
-        &pool, "believer", None, None, Some("analytical"), &[], None, None,
+        &pool,
+        "believer",
+        None,
+        None,
+        Some("analytical"),
+        &[],
+        None,
+        None,
     )
     .await
     .expect("believer");
@@ -122,12 +157,16 @@ async fn get_perspective_belief_diverges_by_observer(pool: PgPool) {
     .await
     .expect("believer map");
 
-    let skeptic_belief =
-        epigraph_engine::belief_query::get_perspective_belief(&pool, claim_id, frame_id, skeptic.id)
-            .await
-            .expect("skeptic belief");
+    let skeptic_belief = epigraph_engine::belief_query::get_perspective_belief(
+        &pool, claim_id, frame_id, skeptic.id,
+    )
+    .await
+    .expect("skeptic belief");
     let believer_belief = epigraph_engine::belief_query::get_perspective_belief(
-        &pool, claim_id, frame_id, believer.id,
+        &pool,
+        claim_id,
+        frame_id,
+        believer.id,
     )
     .await
     .expect("believer belief");
@@ -170,16 +209,35 @@ async fn unmapped_perspective_equals_global(pool: PgPool) {
     .expect("frame");
     let frame =
         FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone()).unwrap();
-    store_bba(&pool, claim_id, frame_row.id, agent, &frame, "practitioner_interview", 0.7).await;
+    store_bba(
+        &pool,
+        claim_id,
+        frame_row.id,
+        agent,
+        &frame,
+        "practitioner_interview",
+        0.7,
+    )
+    .await;
 
     let plain = PerspectiveRepository::create(
-        &pool, "plain", None, None, Some("analytical"), &[], None, None,
+        &pool,
+        "plain",
+        None,
+        None,
+        Some("analytical"),
+        &[],
+        None,
+        None,
     )
     .await
     .expect("plain perspective");
 
     let scoped = epigraph_engine::belief_query::get_perspective_belief(
-        &pool, claim_id, frame_row.id, plain.id,
+        &pool,
+        claim_id,
+        frame_row.id,
+        plain.id,
     )
     .await
     .expect("scoped belief");
