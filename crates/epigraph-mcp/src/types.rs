@@ -582,6 +582,16 @@ pub struct ScopedBeliefParams {
 
     #[schemars(description = "UUID of the perspective or community")]
     pub scope_id: String,
+
+    #[schemars(
+        description = "Optional frame UUID. When set with scope_type='perspective', the \
+                       belief is computed live from the claim's BBAs, each discounted by \
+                       this perspective's source-reliability map (the frame function), so \
+                       it reflects current evidence regardless of ingest path. When \
+                       omitted, returns the cached scoped belief if one exists."
+    )]
+    #[serde(default)]
+    pub frame_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

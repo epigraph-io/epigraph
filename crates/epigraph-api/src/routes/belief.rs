@@ -102,6 +102,13 @@ pub struct SubmitEvidenceRequest {
     /// Reliability discount factor [0, 1]. 1.0 = fully reliable.
     #[serde(default = "default_reliability")]
     pub reliability: f64,
+    /// Optional evidence-source tag (e.g. "western_clinical",
+    /// "practitioner_interview") stored on the BBA so per-perspective
+    /// source-reliability maps (the frame function) can re-weight this evidence
+    /// per observer at query time. See
+    /// `epigraph_engine::belief_query::get_perspective_belief`.
+    #[serde(default)]
+    pub evidence_type: Option<String>,
     /// Conflict threshold for adaptive combination
     #[serde(default = "default_conflict_threshold")]
     pub conflict_threshold: f64,
@@ -1064,7 +1071,7 @@ pub async fn submit_evidence(
         None,
         Some("discount"),
         Some(request.reliability),
-        None,
+        request.evidence_type.as_deref(),
         "unknown", // locality not known at HTTP belief endpoint; see issue #197
         None,      // HTTP belief endpoint has no evidence row in scope (issue #197 Phase 3)
     )
