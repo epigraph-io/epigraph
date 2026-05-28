@@ -358,3 +358,130 @@ async fn cross_source_19_supporters_keeps_high_betp(pool: PgPool) {
         "cross-source 19-supporter BetP should stay > 0.9, got {betp}"
     );
 }
+
+// ── Per-frame override: intra-source with a custom locality factor ─────────
+
+/// Verifies the `frames.properties->>'intra_evidence_locality_factor'`
+/// override actually flows through `edge_factor::auto_wire_ds_for_edge`.
+/// Two supporters seeded the same way; we set the binary_truth frame's
+/// per-frame factor to 0.9 (much weaker discount than the calibration
+/// default 0.3) and assert the resulting source_strength reflects that.
+///
+/// Without the per-frame override path, edge_factor would discount with
+/// the global 0.3 and the source_strength on each BBA would land near
+/// 0.7 * 0.3 = 0.21. With the per-frame 0.9 override applied, it should
+/// land near 0.7 * 0.9 = 0.63.
+#[sqlx::test(migrations = "../../migrations")]
+async fn per_frame_locality_factor_override_applied(pool: PgPool) {
+    use epigraph_db::FrameRepository;
+
+    let agent = seed_agent(&pool, 0xC0_0001).await;
+    let target_doi = "10.perframe/p1";
+    let paper = seed_paper(&pool, target_doi, "per-frame override").await;
+
+    let target_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, is_current) \
+         VALUES ($1, $2, $3, $4, 0.5, true)",
+    )
+    .bind(target_id)
+    .bind("per-frame override target")
+    .bind(distinct_hash(0x50_0000))
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("seed target");
+    insert_edge(&pool, paper, target_id, "paper", "claim", "asserts").await;
+
+    // ensure_binary_frame() inside edge_factor creates the binary_truth
+    // frame lazily, but we need it materialized BEFORE the edge writes so
+    // we can set the per-frame property. Fire one supporter just to
+    // materialize the frame row, then set the override, then run the
+    // real check.
+    let primer = seed_claim_with_belief(
+        &pool,
+        agent,
+        "primer supporter",
+        0x51_0000,
+        NEMS_BELIEF,
+        NEMS_BELIEF,
+        NEMS_BELIEF,
+    )
+    .await;
+    seed_doi_evidence(&pool, primer, target_doi, 0x71_0000).await;
+    let primer_edge = insert_edge(&pool, primer, target_id, "claim", "claim", "supports").await;
+    auto_wire_ds_for_edge(&pool, primer_edge, agent, primer, target_id, "supports")
+        .await
+        .expect("auto_wire primer");
+
+    // Now binary_truth exists. Override its locality factor.
+    let frame = FrameRepository::get_by_name(&pool, "binary_truth")
+        .await
+        .expect("query binary_truth")
+        .expect("binary_truth must exist after primer wire");
+    FrameRepository::set_property(
+        &pool,
+        frame.id,
+        "intra_evidence_locality_factor",
+        &serde_json::json!(0.9),
+    )
+    .await
+    .expect("set frame property");
+
+    // Fire a fresh supporter under the override. It should receive a
+    // less-discounted source_strength than the primer.
+    let supporter = seed_claim_with_belief(
+        &pool,
+        agent,
+        "override-affected supporter",
+        0x52_0000,
+        NEMS_BELIEF,
+        NEMS_BELIEF,
+        NEMS_BELIEF,
+    )
+    .await;
+    seed_doi_evidence(&pool, supporter, target_doi, 0x72_0000).await;
+    let edge_id = insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
+    let outcome = auto_wire_ds_for_edge(&pool, edge_id, agent, supporter, target_id, "supports")
+        .await
+        .expect("auto_wire override");
+    assert_eq!(outcome, EdgeFactorOutcome::Wired);
+
+    // The new BBA's source_strength is the one written via perspective_id =
+    // edge_id (see PerspectiveRepository::ensure_edge_perspective). Reading
+    // by perspective_id gives us an exact handle independent of the primer
+    // row that landed at the default factor.
+    let ss: f64 =
+        sqlx::query_scalar("SELECT source_strength FROM mass_functions WHERE perspective_id = $1")
+            .bind(edge_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch override BBA's source_strength");
+    eprintln!("[per_frame_locality_factor_override_applied] source_strength = {ss}");
+
+    // Expected: 0.7 (transmission) * 0.9 (per-frame factor) = 0.63.
+    // Band [0.50, 0.75] tracks plausible transmission drift but excludes
+    // both the global-default outcome (~0.21) and the un-discounted
+    // outcome (~0.7).
+    assert!(
+        (0.50..=0.75).contains(&ss),
+        "expected per-frame override (factor 0.9) to land source_strength in [0.50, 0.75], got {ss}"
+    );
+
+    // Cross-check: the primer BBA (written BEFORE the override) lives at
+    // the default factor 0.3, so its source_strength is ~0.21. Both BBAs
+    // sit on the same target frame; the override only affects writes
+    // AFTER `set_property`. (Per-frame factor is read at write time, not
+    // stored on the BBA, so a later override doesn't retroactively
+    // change historical rows — backfill script's job.)
+    let primer_ss: f64 =
+        sqlx::query_scalar("SELECT source_strength FROM mass_functions WHERE perspective_id = $1")
+            .bind(primer_edge)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch primer BBA's source_strength");
+    assert!(
+        primer_ss < 0.30,
+        "primer BBA (written pre-override) should still carry default-factor discount (<0.30), got {primer_ss}"
+    );
+}

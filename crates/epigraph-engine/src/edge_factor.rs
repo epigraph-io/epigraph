@@ -142,14 +142,30 @@ pub async fn auto_wire_ds_for_edge(
     .fetch_one(pool)
     .await
     .map_err(|e| format!("intra-source evidence lookup: {e}"))?;
-    let intra_factor = crate::calibration::CalibrationConfig::from_workspace_root()
-        .ok()
-        .map(|c| c.evidence_locality.intra_evidence_locality_factor)
-        .unwrap_or(0.3);
+    // Resolution order for the intra-evidence locality factor:
+    //   1. Per-frame override (frames.properties->>'intra_evidence_locality_factor').
+    //      Lets operators tune locality discounting per epistemic context
+    //      (binary_truth vs textbook_veracity_* vs research_validity etc.)
+    //      without code releases. Set via FrameRepository::set_property.
+    //   2. Global default from calibration.toml.
+    //   3. Hardcoded fallback 0.3 if calibration.toml is unreadable.
+    //
+    // Edge BBAs all land on the binary_truth frame today (see ensure_binary_frame
+    // below); if a future edge_factor path writes to a different frame, the
+    // per-frame override naturally follows because we look up by frame_id.
+    let frame_id = ensure_binary_frame(pool).await?;
+    let per_frame_factor = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
+        .await
+        .map_err(|e| format!("per-frame locality factor lookup: {e}"))?;
+    let intra_factor = per_frame_factor.unwrap_or_else(|| {
+        crate::calibration::CalibrationConfig::from_workspace_root()
+            .ok()
+            .map(|c| c.evidence_locality.intra_evidence_locality_factor)
+            .unwrap_or(0.3)
+    });
     let locality_factor = if is_intra { intra_factor } else { 1.0 };
     let source_strength = transmission_factor * locality_factor;
 
-    let frame_id = ensure_binary_frame(pool).await?;
     let frame = binary_frame()?;
     let bba = restricted
         .to_mass_function(&frame)
