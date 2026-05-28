@@ -205,6 +205,64 @@ impl CalibrationConfig {
         0.5
     }
 
+    /// True iff `evidence_type` resolves to a calibrated weight (either
+    /// directly via `evidence_type_weights` or transitively via
+    /// `evidence_type_aliases`).
+    ///
+    /// Used by `effective_source_strength` (Phase 2 of issue #197) to
+    /// disambiguate a real 0.5 calibration entry from the unknown-key
+    /// fallback. Without this, the helper can't tell whether
+    /// `get_evidence_type_weight("supports") = 0.5` means "supports is
+    /// the unknown-key sentinel, fall back to row.source_strength" or
+    /// "supports is genuinely calibrated at 0.5".
+    pub fn evidence_type_weight_present(&self, evidence_type: &str) -> bool {
+        let key = evidence_type.to_lowercase();
+        if self.evidence_type_weights.contains_key(&key) {
+            return true;
+        }
+        if let Some(canonical) = self.evidence_type_aliases.get(&key) {
+            if self.evidence_type_weights.contains_key(canonical) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Synthetic `CalibrationConfig` for the Phase 2 helper's failure
+    /// path. Returned when `from_workspace_root()` fails (missing
+    /// `calibration.toml`, malformed TOML, …) so the combine path can
+    /// still produce numbers that match the pre-Phase-2 fallback
+    /// hard-codes:
+    ///   * `evidence_locality.intra_evidence_locality_factor = 0.3`
+    ///     (the same value `auto_wire_ds_for_edge` falls back to)
+    ///   * `get_evidence_type_weight("anything") = 0.5` (because the
+    ///     empty `evidence_type_weights` map makes every lookup hit the
+    ///     0.5 fallback at the bottom of the resolution chain)
+    ///
+    /// All other maps are empty. Callers that need a real calibration
+    /// (e.g. classifier thresholds) must propagate the original
+    /// `CalibrationError` instead of using this fallback.
+    pub fn default_for_phase2_fallback() -> Self {
+        Self {
+            default_journal_reliability: 0.78,
+            methodology_profiles: HashMap::new(),
+            methodology_aliases: HashMap::new(),
+            evidence_type_weights: HashMap::new(),
+            evidence_type_aliases: HashMap::new(),
+            section_tier_weights: HashMap::new(),
+            journal_reliability: HashMap::new(),
+            evidence_locality: EvidenceLocality {
+                intra_evidence_locality_factor: 0.3,
+            },
+            classifier_thresholds: ClassifierThresholds {
+                nei_threshold: 0.85,
+                support_threshold: 0.15,
+                conflict_threshold: 0.05,
+                has_opposing_threshold: 0.1,
+            },
+        }
+    }
+
     /// Look up section tier weight. Returns 1.0 for unknown sections (no discount).
     pub fn get_section_tier_weight(&self, section: &str) -> f64 {
         let key = section.to_lowercase();
@@ -399,6 +457,52 @@ mod tests {
         let cfg = load_config();
         assert!((cfg.get_evidence_type_weight("OBSERVATION") - 1.0).abs() < f64::EPSILON);
         assert!((cfg.get_evidence_type_weight("Reference") - 0.85).abs() < f64::EPSILON);
+    }
+
+    /// Phase 2 (issue #197): `evidence_type_weight_present` lets the
+    /// `effective_source_strength` helper distinguish a real 0.5
+    /// calibrated weight from the unknown-key 0.5 fallback.
+    #[test]
+    fn test_evidence_type_weight_present() {
+        let cfg = load_config();
+
+        // Canonical keys present.
+        assert!(cfg.evidence_type_weight_present("empirical"));
+        assert!(cfg.evidence_type_weight_present("conversational"));
+
+        // Aliases resolve to canonical, so present.
+        assert!(cfg.evidence_type_weight_present("observation")); // → empirical
+        assert!(cfg.evidence_type_weight_present("document")); // → logical
+        assert!(cfg.evidence_type_weight_present("testimony")); // → testimonial
+
+        // Phase 2 alias additions: relationship strings now resolve.
+        assert!(cfg.evidence_type_weight_present("supports")); // → derived_support
+        assert!(cfg.evidence_type_weight_present("CORROBORATES")); // case-insensitive
+        assert!(cfg.evidence_type_weight_present("refutes"));
+        assert!(cfg.evidence_type_weight_present("supersedes"));
+
+        // Genuinely unknown keys absent.
+        assert!(!cfg.evidence_type_weight_present("alien_telepathy"));
+        assert!(!cfg.evidence_type_weight_present(""));
+    }
+
+    /// Phase 2 (issue #197): the fallback config used when calibration.toml
+    /// can't be loaded must keep the combine path's pre-Phase-2 invariants
+    /// (intra factor 0.3, unknown-key weight 0.5).
+    #[test]
+    fn test_default_for_phase2_fallback_values() {
+        let cfg = CalibrationConfig::default_for_phase2_fallback();
+        assert!(
+            (cfg.evidence_locality.intra_evidence_locality_factor - 0.3).abs() < f64::EPSILON,
+            "fallback intra factor must equal pre-Phase-2 hardcoded 0.3"
+        );
+        // Empty map → every lookup hits the 0.5 fallback at the bottom
+        // of `get_evidence_type_weight`'s resolution chain.
+        assert!((cfg.get_evidence_type_weight("empirical") - 0.5).abs() < f64::EPSILON);
+        assert!((cfg.get_evidence_type_weight("anything_at_all") - 0.5).abs() < f64::EPSILON);
+        // `evidence_type_weight_present` returns false for every key
+        // (the empty-map fallback config means everything is unknown).
+        assert!(!cfg.evidence_type_weight_present("empirical"));
     }
 
     #[test]

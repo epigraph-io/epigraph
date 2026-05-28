@@ -57,6 +57,25 @@ testimonial     = 0.6
 circumstantial  = 0.4
 conversational  = 0.3
 
+# Phase 2 (issue #197): canonical keys for BBAs written from epistemic
+# edges. `auto_wire_ds_for_edge` resolves the raw `relationship` string
+# (`supports`, `refutes`, …) through `evidence_type_aliases` below and
+# stores the canonical key in `mass_functions.evidence_type`, so the
+# Phase 2 helper resolves a real calibrated weight instead of falling
+# through to the 0.5 unknown-type fallback.
+#
+# Placeholder values mirror the existing `RestrictionProfile::scientific`
+# transmission factors (0.7 for support/refute/frame, 0.65 for elaborate,
+# 0.5 for generalize/inform, 0.7 for supersede). Retune is filed as
+# backlog claim 7e7932bf-0cad-430d-a772-ef023d3827a1.
+derived_support        = 0.7
+derived_refute         = 0.7
+derived_supersession   = 0.7
+derived_elaboration    = 0.65
+derived_generalization = 0.5
+derived_informational  = 0.5
+derived_frame_evidence = 0.7
+
 # ── Evidence Type Aliases ───────────────────────────────────────────────────
 # Maps the DB's `evidence.evidence_type` enum values to the canonical
 # SciFact-calibration keys above. Without these aliases every lookup against
@@ -70,6 +89,22 @@ computation = "statistical"    # computational / statistical analysis
 document    = "logical"        # claim asserted in a document
 reference   = "logical"        # citation to another claim/source
 testimony   = "testimonial"    # explicit agent testimony
+
+# Phase 2 (issue #197): Relationship → canonical evidence_type. These
+# are written by `auto_wire_ds_for_edge` and now go through the
+# calibrated path instead of the 0.5 unknown-type fallback. Keys must
+# be lowercase to match `CalibrationConfig::get_evidence_type_weight`'s
+# `to_lowercase()` normalization on read.
+supports        = "derived_support"
+corroborates    = "derived_support"
+refutes         = "derived_refute"
+contradicts     = "derived_refute"
+supersedes      = "derived_supersession"
+elaborates      = "derived_elaboration"
+specializes     = "derived_elaboration"
+generalizes     = "derived_generalization"
+informs         = "derived_informational"
+frame_validates = "derived_frame_evidence"
 
 # ── Section Tier Weights ────────────────────────────────────────────────────
 # Fraction of informative mass retained (rest shifted to theta).

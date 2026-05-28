@@ -18,8 +18,13 @@ use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassF
 // Edge-factor auto-wire moved to `epigraph_engine::edge_factor` so the HTTP
 // route layer can share a single algorithm. Re-export keeps the existing
 // MCP call sites (`tools::ingestion`, `tools::workflows`) working unchanged.
+//
+// Phase 2 (issue #197) re-exports `effective_source_strength` so the local
+// `auto_wire_ds_update` combine loop below can call it without an extra
+// `use` and so external integration tests can import via the MCP crate.
 pub use epigraph_engine::edge_factor::{
-    auto_wire_ds_for_edge, auto_wire_edge_if_epistemic, EdgeFactorOutcome,
+    auto_wire_ds_for_edge, auto_wire_edge_if_epistemic, effective_source_strength,
+    EdgeFactorOutcome,
 };
 
 /// Probability value in [0.0, 1.0]. Currently f64 for codebase consistency.
@@ -297,22 +302,37 @@ pub async fn auto_wire_ds_update(
         .await
         .map_err(|e| format!("get_for_claim_frame: {e}"))?;
 
+    // Phase 2 (issue #197): the combine path no longer trusts the
+    // stored `source_strength` as the authority. The Phase 2 helper
+    // derives reliability dynamically from (`evidence_type`,
+    // `locality_tag`, per-frame factor, calibration). Calibration I/O
+    // failure falls back to the synthetic config (intra 0.3, every
+    // evidence_type → 0.5 unknown) which mirrors the pre-Phase-2
+    // hardcodes. See effective_source_strength docs in
+    // `epigraph_engine::edge_factor` for the full fallback chain.
+    let calibration = epigraph_engine::calibration::CalibrationConfig::from_workspace_root()
+        .unwrap_or_else(|_| {
+            epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
+        });
+    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
+        .await
+        .ok()
+        .flatten();
+
     let combined = if all_rows.len() <= 1 {
         // Single BBA — still apply discount
-        let reliability = all_rows
+        let r = all_rows
             .first()
-            .and_then(|r| r.source_strength)
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
-        let mf = parse_stored_bba(&frame, &all_rows[0].masses)?;
+            .expect("len <= 1 with non-empty check: store_with_perspective wrote one");
+        let reliability = effective_source_strength(r, per_frame_intra, &calibration);
+        let mf = parse_stored_bba(&frame, &r.masses)?;
         combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?
     } else {
-        // Multiple BBAs — discount each by its stored source_strength, then combine
+        // Multiple BBAs — discount each via the helper, then combine.
         let mut mass_fns = Vec::with_capacity(all_rows.len());
         for row in &all_rows {
             let mf = parse_stored_bba(&frame, &row.masses)?;
-            // NULL source_strength → 1.0 (no discount for historical BBAs without metadata)
-            let reliability = row.source_strength.unwrap_or(1.0).clamp(0.0, 1.0);
+            let reliability = effective_source_strength(row, per_frame_intra, &calibration);
             let discounted =
                 combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
             mass_fns.push(discounted);

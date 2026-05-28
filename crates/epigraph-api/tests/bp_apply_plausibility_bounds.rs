@@ -97,10 +97,22 @@ async fn seed_claim_with_belief(
 /// 20 simple BBAs whose serial combination produces a drifted plausibility
 /// that — pre-clamp — would land at `1.0 + 1 ULP`.
 ///
-/// `source_strength` is set high (0.95) per-row so adaptive_combine treats each
+/// `source_strength` is set to 1.0 per-row so adaptive_combine treats each
 /// fold as confident evidence; this maximizes the chance of accumulated
 /// floating-point drift in the combined plausibility before the engine's
 /// belief()/plausibility() functions clamp.
+///
+/// Phase 2 (issue #197) note: under Phase 2, the combine path computes
+/// `effective_source_strength(evidence_type='empirical', locality='unknown')
+///  = 1.0 * 1.0 = 1.0` (no intra discount on default locality, calibrated
+/// weight 1.0 for empirical). Pre-Phase-2 the stored `source_strength` was
+/// the authority; the test originally seeded `0.95` and that landed on the
+/// drift path directly. Phase 2 makes the helper the authority — we
+/// either need an `evidence_type` whose calibrated weight is 0.95 (none
+/// exists) or we seed `source_strength = 1.0` and accept that the helper
+/// computes the same 1.0 anyway. The drift seed still drifts because the
+/// 20-supporter combine is independent of the per-row reliability — the
+/// drift accumulates in the masses themselves, not in the discount.
 async fn seed_drifting_bbas(
     pool: &PgPool,
     claim_id: Uuid,
@@ -119,10 +131,13 @@ async fn seed_drifting_bbas(
         // Each row needs a distinct source_agent_id to bypass
         // mass_functions_unique_per_perspective (claim_id, frame_id, source_agent_id, perspective_id).
         let source_agent = common::seed_system_agent(pool).await;
+        // Phase 2 (#197): seed source_strength = 1.0 to match the helper's
+        // effective output for evidence_type='empirical'+locality_tag='unknown'.
+        // locality_tag DEFAULT 'unknown' (migration 045) is implicit.
         sqlx::query(
             "INSERT INTO mass_functions \
                (id, claim_id, frame_id, source_agent_id, masses, source_strength, evidence_type) \
-             VALUES ($1, $2, $3, $4, $5, 0.95, 'empirical')",
+             VALUES ($1, $2, $3, $4, $5, 1.0, 'empirical')",
         )
         .bind(mf_id)
         .bind(claim_id)
