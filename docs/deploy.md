@@ -12,6 +12,57 @@ Applied automatically by the API binary on startup. The first deploy after
 
 Subsequent deploys: just restart; `sqlx::migrate!()` runs at boot.
 
+### Cross-worktree binary caching (foot-gun)
+
+`/home/jeremy/.cargo-target` is the shared cargo target across every worktree
+on the deploy host. `sqlx::migrate!("../../migrations")` is a proc-macro that
+embeds the migration file list **at compile time**, resolved relative to the
+crate being compiled. If a different worktree previously built `server` or
+`epigraph-mcp-full` at an older revision, the linker can reuse the cached
+artifact and you end up installing a binary whose embedded migration list
+predates the worktree you think you're building from.
+
+Symptoms on deploy:
+
+* `systemctl restart epigraph-api` succeeds and reports `Migrations up to date`.
+* `_sqlx_migrations` is missing the migration version your branch added.
+* `information_schema.columns` confirms the new column doesn't exist.
+* Health check passes (the binary doesn't crash — it just doesn't know about
+  the new migration).
+
+If you observe that pattern, do:
+
+```bash
+cd /home/jeremy/<your-deploy-worktree>
+cargo clean -p epigraph-api -p epigraph-db
+CARGO_INCREMENTAL=0 cargo build --release \
+    -p epigraph-api -p epigraph-mcp -p epigraph-cli --bin recompute_claim_belief
+sudo -n systemctl stop epigraph-mcp-http epigraph-api
+sudo -n install -m 0755 /home/jeremy/.cargo-target/release/server /usr/local/bin/epigraph-api
+sudo -n install -m 0755 /home/jeremy/.cargo-target/release/epigraph-mcp-full /usr/local/bin/epigraph-mcp
+sudo -n install -m 0755 /home/jeremy/.cargo-target/release/recompute_claim_belief /usr/local/bin/epigraph-recompute-belief
+sudo -n systemctl start epigraph-api && sleep 4 && sudo -n systemctl start epigraph-mcp-http
+docker exec epigraph-postgres psql -U epigraph -d epigraph -c \
+    "SELECT version FROM _sqlx_migrations ORDER BY version DESC LIMIT 5;"
+```
+
+The `cargo clean -p epigraph-api -p epigraph-db` step is what evicts the
+stale cached artifact. The two crates are the ones that actually call
+`sqlx::migrate!()` (and re-export it); other crates that depend on them
+get rebuilt as a side effect.
+
+Pre-deploy verification (do this BEFORE `systemctl stop`, while the old
+binary is still serving):
+
+```bash
+strings /home/jeremy/.cargo-target/release/server \
+    | grep -E '<expected_new_migration_filename>' || \
+        echo "STOP: new migration not embedded — cargo clean + rebuild before deploy"
+```
+
+`strings` finds the migration filename as a string literal in the binary's
+sqlx metadata. If grep is silent, the build is stale; do not install.
+
 ### If the reconcile goes wrong
 
 If a checksum mismatch surfaces on the next `epigraph-migrate` run (or at API
