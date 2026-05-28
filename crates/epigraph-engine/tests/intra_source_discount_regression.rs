@@ -33,7 +33,9 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use epigraph_engine::edge_factor::{auto_wire_ds_for_edge, EdgeFactorOutcome};
+use epigraph_engine::edge_factor::{
+    auto_wire_ds_for_edge, recompute_claim_belief_binary, EdgeFactorOutcome,
+};
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -261,22 +263,43 @@ async fn intra_source_19_supporters_betp_in_band(pool: PgPool) {
     );
 
     // Phase 1a (#197): every supporter BBA was written through edge_factor
-    // with is_intra = true, so locality_tag must persist as 'intra'. This
-    // assertion locks the typing column independent of the numeric
+    // with is_intra = true, so locality_tag must persist as
+    // 'intra_self_cite' (Phase 2 vocabulary expansion: DOI-match implies
+    // the self-cite case; see Q3 decision in the Phase 2 prompt).
+    // This assertion locks the typing column independent of the numeric
     // source_strength band — a future calibration shift that nudged the
     // composed value outside [0.075, 0.405] would not break the typing
     // contract.
     let intra_tag_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM mass_functions \
-         WHERE claim_id = $1 AND locality_tag = 'intra'",
+         WHERE claim_id = $1 AND locality_tag = 'intra_self_cite'",
     )
     .bind(target_id)
     .fetch_one(&pool)
     .await
-    .expect("count locality_tag = intra rows");
+    .expect("count locality_tag = intra_self_cite rows");
     assert_eq!(
         intra_tag_count, 19,
-        "expected all 19 BBAs to carry locality_tag = 'intra', got {intra_tag_count}"
+        "expected all 19 BBAs to carry locality_tag = 'intra_self_cite', got {intra_tag_count}"
+    );
+
+    // Phase 2 (#197): every supporter BBA's `evidence_type` must be the
+    // canonical SciFact key `derived_support` (resolved from the raw
+    // `supports` relationship via `[evidence_type_aliases]` in
+    // calibration.toml). Without this, the combine path's tier-2 lookup
+    // would fall through to the 0.5 unknown-key fallback and the BetP
+    // band would shift.
+    let derived_support_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions \
+         WHERE claim_id = $1 AND evidence_type = 'derived_support'",
+    )
+    .bind(target_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count evidence_type = derived_support rows");
+    assert_eq!(
+        derived_support_count, 19,
+        "expected all 19 BBAs to carry evidence_type = 'derived_support' (canonical key resolution), got {derived_support_count}"
     );
 
     let betp = read_betp(&pool, target_id)
@@ -286,6 +309,52 @@ async fn intra_source_19_supporters_betp_in_band(pool: PgPool) {
     assert!(
         (0.70..=0.85).contains(&betp),
         "expected intra-source-discounted BetP in [0.70, 0.85], got {betp}"
+    );
+
+    // ── Phase 2 recalibration canary ────────────────────────────────────
+    //
+    // The whole point of Phase 2 is that changing the per-frame factor
+    // flows through to combined BetP at recompute time, with NO BBA row
+    // rewrite. Without this assertion, Phase 2 ships green but the
+    // dynamic-recalibration property is dead code — every existing test
+    // would mechanically pass against either the old "read stored
+    // source_strength" path OR the new "compute from tag" path.
+    //
+    // Lower the per-frame intra factor from the default 0.3 to 0.1.
+    // This deepens the intra-source discount so combined BetP drops
+    // further toward 0.5. We assert the shift is observable in BetP
+    // (not just the stored cache, which the helper bypasses).
+    use epigraph_db::FrameRepository;
+    let frame_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM frames WHERE name = $1")
+        .bind("binary_truth")
+        .fetch_one(&pool)
+        .await
+        .expect("binary_truth frame id");
+    FrameRepository::set_property(
+        &pool,
+        frame_id,
+        "intra_evidence_locality_factor",
+        &serde_json::json!(0.1),
+    )
+    .await
+    .expect("set per-frame intra factor");
+
+    recompute_claim_belief_binary(&pool, target_id)
+        .await
+        .expect("recompute after per-frame override");
+
+    let recal_betp = read_betp(&pool, target_id)
+        .await
+        .expect("BetP after recalibration");
+    eprintln!("[intra_source_19_supporters_betp_in_band] recalibrated BetP = {recal_betp}");
+    // The stored cache is unchanged (Phase 2 makes the cache a
+    // write-through; the helper reads tag + factor dynamically). So
+    // this assertion would NOT pass if the combine path were still
+    // reading row.source_strength.
+    assert!(
+        recal_betp < betp - 0.02,
+        "expected per-frame factor 0.1 (deeper discount than default 0.3) to shift BetP downward: \
+         baseline={betp}, recalibrated={recal_betp}"
     );
 }
 
@@ -390,20 +459,75 @@ async fn cross_source_19_supporters_keeps_high_betp(pool: PgPool) {
         betp > 0.9,
         "cross-source 19-supporter BetP should stay > 0.9, got {betp}"
     );
+
+    // ── Phase 2 recalibration canary (cross side) ───────────────────────
+    //
+    // Counterpart to the intra recalibration canary above. Changing the
+    // per-frame intra factor should have NO effect on cross-source BBAs
+    // because the helper's tier-2 path only multiplies by the intra
+    // factor when `locality_tag.starts_with("intra")`. This asserts the
+    // helper isn't accidentally applying the discount to every BBA.
+    use epigraph_db::FrameRepository;
+    let frame_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM frames WHERE name = $1")
+        .bind("binary_truth")
+        .fetch_one(&pool)
+        .await
+        .expect("binary_truth frame id");
+    FrameRepository::set_property(
+        &pool,
+        frame_id,
+        "intra_evidence_locality_factor",
+        &serde_json::json!(0.05),
+    )
+    .await
+    .expect("set per-frame intra factor (should be a no-op for cross-source)");
+
+    recompute_claim_belief_binary(&pool, target_id)
+        .await
+        .expect("recompute after per-frame override");
+
+    let recal_betp = read_betp(&pool, target_id)
+        .await
+        .expect("BetP after recalibration");
+    eprintln!("[cross_source_19_supporters_keeps_high_betp] cross BetP under per-frame override = {recal_betp}");
+    assert!(
+        (recal_betp - betp).abs() < 0.01,
+        "cross-source BetP must NOT shift under intra-factor recalibration: \
+         baseline={betp}, recalibrated={recal_betp}"
+    );
 }
 
 // ── Per-frame override: intra-source with a custom locality factor ─────────
 
-/// Verifies the `frames.properties->>'intra_evidence_locality_factor'`
-/// override actually flows through `edge_factor::auto_wire_ds_for_edge`.
-/// Two supporters seeded the same way; we set the binary_truth frame's
-/// per-frame factor to 0.9 (much weaker discount than the calibration
-/// default 0.3) and assert the resulting source_strength reflects that.
+/// Phase 2 (#197) rewrite of the pre-Phase-2 invariant.
 ///
-/// Without the per-frame override path, edge_factor would discount with
-/// the global 0.3 and the source_strength on each BBA would land near
-/// 0.7 * 0.3 = 0.21. With the per-frame 0.9 override applied, it should
-/// land near 0.7 * 0.9 = 0.63.
+/// **Old invariant (pre-Phase-2)**: per-frame factor was read at write
+/// time. The `source_strength` column stored the composed result, so a
+/// later operator override of `intra_evidence_locality_factor` did NOT
+/// retroactively change combined BetP — it only affected future writes.
+/// The original test asserted that the primer's stored `source_strength`
+/// stayed at the default-factor discount even after the override.
+///
+/// **Phase 2 invariant (THIS test pins)**: per-frame factor is read at
+/// COMBINE time via `effective_source_strength`. The `source_strength`
+/// column is now a write-through cache — it still captures the
+/// write-time value (for the audit trail and for the legacy-null
+/// fallback), but the helper at combine time reads `locality_tag` and
+/// `evidence_type` and composes with the current per-frame factor. So:
+///
+///   * The stored `source_strength` on the primer still lands at the
+///     default-factor write-time value (the cache assertion mechanically
+///     passes the same way it did pre-Phase-2 — this is the
+///     write-through behaviour we kept on purpose).
+///   * But the COMBINED BetP on the target reflects the per-frame
+///     override applied to BOTH the primer and the override-affected
+///     supporter, because the combine path no longer reads the stored
+///     value. **This is the inversion**.
+///
+/// The new combined-BetP assertions are the canary that Phase 2 actually
+/// does what it's supposed to. Without them, Phase 2 ships green but the
+/// recalibration-without-DB-rewrite property is dead code at combine
+/// time.
 #[sqlx::test(migrations = "../../migrations")]
 async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     use epigraph_db::FrameRepository;
@@ -447,6 +571,13 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
         .await
         .expect("auto_wire primer");
 
+    // Capture the BetP at the default per-frame factor (calibration's
+    // 0.3) — this is the Phase 2 baseline we'll later compare against.
+    let baseline_betp = read_betp(&pool, target_id)
+        .await
+        .expect("baseline BetP after primer wire");
+    eprintln!("[per_frame_locality_factor_override_applied] baseline BetP (default factor 0.3) = {baseline_betp}");
+
     // Now binary_truth exists. Override its locality factor.
     let frame = FrameRepository::get_by_name(&pool, "binary_truth")
         .await
@@ -461,8 +592,12 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     .await
     .expect("set frame property");
 
-    // Fire a fresh supporter under the override. It should receive a
-    // less-discounted source_strength than the primer.
+    // Fire a fresh supporter under the override. Pre-Phase-2, this BBA
+    // would have stored a different `source_strength` than the primer.
+    // Under Phase 2 it still does (write-through cache), but more
+    // importantly: the combine on next recompute reads BOTH BBAs through
+    // the helper, which reads the CURRENT per-frame factor — so both
+    // contribute under the 0.9 factor at recompute time.
     let supporter = seed_claim_with_belief(
         &pool,
         agent,
@@ -480,33 +615,31 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
         .expect("auto_wire override");
     assert_eq!(outcome, EdgeFactorOutcome::Wired);
 
-    // The new BBA's source_strength is the one written via perspective_id =
-    // edge_id (see PerspectiveRepository::ensure_edge_perspective). Reading
-    // by perspective_id gives us an exact handle independent of the primer
-    // row that landed at the default factor.
-    let ss: f64 =
+    // ── Write-through cache assertion (carried forward from pre-Phase-2) ──
+    //
+    // The override BBA's stored `source_strength` is the write-time
+    // value composed with the per-frame override that was in effect at
+    // write time. This assertion still passes mechanically because the
+    // write path (`auto_wire_ds_for_edge`) still writes the composed
+    // value into the cache. What Phase 2 changes is that this stored
+    // value is no longer the authority at combine time.
+    let override_ss: f64 =
         sqlx::query_scalar("SELECT source_strength FROM mass_functions WHERE perspective_id = $1")
             .bind(edge_id)
             .fetch_one(&pool)
             .await
             .expect("fetch override BBA's source_strength");
-    eprintln!("[per_frame_locality_factor_override_applied] source_strength = {ss}");
-
-    // Expected: 0.7 (transmission) * 0.9 (per-frame factor) = 0.63.
-    // Band [0.50, 0.75] tracks plausible transmission drift but excludes
-    // both the global-default outcome (~0.21) and the un-discounted
-    // outcome (~0.7).
+    eprintln!(
+        "[per_frame_locality_factor_override_applied] override source_strength = {override_ss}"
+    );
     assert!(
-        (0.50..=0.75).contains(&ss),
-        "expected per-frame override (factor 0.9) to land source_strength in [0.50, 0.75], got {ss}"
+        (0.50..=0.75).contains(&override_ss),
+        "expected per-frame override (factor 0.9) to land source_strength in [0.50, 0.75], got {override_ss}"
     );
 
-    // Cross-check: the primer BBA (written BEFORE the override) lives at
-    // the default factor 0.3, so its source_strength is ~0.21. Both BBAs
-    // sit on the same target frame; the override only affects writes
-    // AFTER `set_property`. (Per-frame factor is read at write time, not
-    // stored on the BBA, so a later override doesn't retroactively
-    // change historical rows — backfill script's job.)
+    // Primer was written BEFORE the override, so its cached value is
+    // still the default-factor discount (~0.21). Write-through cache
+    // preserves the audit trail.
     let primer_ss: f64 =
         sqlx::query_scalar("SELECT source_strength FROM mass_functions WHERE perspective_id = $1")
             .bind(primer_edge)
@@ -515,15 +648,14 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
             .expect("fetch primer BBA's source_strength");
     assert!(
         primer_ss < 0.30,
-        "primer BBA (written pre-override) should still carry default-factor discount (<0.30), got {primer_ss}"
+        "primer BBA's stored cache (written pre-override) should still reflect default-factor discount (<0.30), got {primer_ss}"
     );
 
-    // Phase 1a (#197): both primer (pre-override, default 0.3 factor) and
-    // override-affected supporter (per-frame 0.9 factor) seeded
-    // doi-evidence rows pointing at the target's paper, so both went
-    // through the is_intra = true branch of edge_factor. Per-frame override
-    // changes the discount factor, NOT the locality classification — that
-    // invariant is what this assertion locks.
+    // ── Phase 2 (#197) Q3: locality_tag vocabulary expansion ──
+    //
+    // 'intra_self_cite' (DOI-match → self-cite case) replaces the
+    // bare 'intra' tag from Phase 1a. Per-frame factor changes ONLY
+    // the discount, not the classification.
     let primer_tag: String =
         sqlx::query_scalar("SELECT locality_tag FROM mass_functions WHERE perspective_id = $1")
             .bind(primer_edge)
@@ -531,8 +663,8 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
             .await
             .expect("fetch primer locality_tag");
     assert_eq!(
-        primer_tag, "intra",
-        "primer BBA must carry locality_tag = 'intra' (intra evidence regardless of per-frame factor)"
+        primer_tag, "intra_self_cite",
+        "primer BBA must carry locality_tag = 'intra_self_cite'"
     );
 
     let override_tag: String =
@@ -542,7 +674,88 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
             .await
             .expect("fetch override locality_tag");
     assert_eq!(
-        override_tag, "intra",
-        "override BBA must carry locality_tag = 'intra' (per-frame factor changes only the discount, not the classification)"
+        override_tag, "intra_self_cite",
+        "override BBA must carry locality_tag = 'intra_self_cite' (per-frame factor changes only the discount, not the classification)"
+    );
+
+    // ── Phase 2 inverted invariant: combined BetP reflects override ──
+    //
+    // This is the assertion the Phase 2 spec § 6 calls out as the canary.
+    // The combine path (`recompute_combined_belief`) does NOT read the
+    // stored `source_strength`; it derives reliability from
+    // `effective_source_strength(row, per_frame_intra, &calibration)`.
+    // So at recompute time, the 0.9 per-frame factor is applied to
+    // BOTH BBAs (primer and supporter, both `intra_self_cite`), even
+    // though the primer's cache row still reflects the 0.3 default
+    // from its write time.
+    //
+    // Compared to the baseline (single supporter at 0.3 default
+    // factor): combined BetP under 0.9 with two supporters must
+    // be visibly different — specifically HIGHER, because the
+    // discount is much weaker AND there's a second supporter
+    // adding weight.
+    let combined_betp = read_betp(&pool, target_id)
+        .await
+        .expect("BetP after override + second supporter");
+    eprintln!(
+        "[per_frame_locality_factor_override_applied] combined BetP (override 0.9, 2 BBAs) = {combined_betp}"
+    );
+    assert!(
+        combined_betp > baseline_betp,
+        "combined BetP must reflect the weaker (0.9) per-frame discount: \
+         baseline={baseline_betp}, combined={combined_betp}"
+    );
+
+    // Direct recompute canary: pin the override factor higher (0.99,
+    // nearly no discount) and recompute. BetP must shift even further
+    // toward 1.0 under the same stored cache values — this proves the
+    // helper, not the cache, drives the combine.
+    FrameRepository::set_property(
+        &pool,
+        frame.id,
+        "intra_evidence_locality_factor",
+        &serde_json::json!(0.99),
+    )
+    .await
+    .expect("set frame property to 0.99");
+    recompute_claim_belief_binary(&pool, target_id)
+        .await
+        .expect("recompute after second override");
+    let nearly_undiscounted_betp = read_betp(&pool, target_id)
+        .await
+        .expect("BetP after second recalibration");
+    eprintln!(
+        "[per_frame_locality_factor_override_applied] nearly-undiscounted BetP (factor 0.99) = {nearly_undiscounted_betp}"
+    );
+    assert!(
+        nearly_undiscounted_betp > combined_betp,
+        "raising per-frame factor 0.9 → 0.99 must further increase combined BetP \
+         WITHOUT touching the stored cache: prev={combined_betp}, new={nearly_undiscounted_betp}"
+    );
+
+    // Push the factor the other way (0.05, near-total discount) and
+    // recompute. BetP must shift back DOWN — proves the helper reads
+    // the current factor on every combine call.
+    FrameRepository::set_property(
+        &pool,
+        frame.id,
+        "intra_evidence_locality_factor",
+        &serde_json::json!(0.05),
+    )
+    .await
+    .expect("set frame property to 0.05");
+    recompute_claim_belief_binary(&pool, target_id)
+        .await
+        .expect("recompute after third override");
+    let deeply_discounted_betp = read_betp(&pool, target_id)
+        .await
+        .expect("BetP after deeper discount");
+    eprintln!(
+        "[per_frame_locality_factor_override_applied] deeply-discounted BetP (factor 0.05) = {deeply_discounted_betp}"
+    );
+    assert!(
+        deeply_discounted_betp < nearly_undiscounted_betp - 0.05,
+        "lowering per-frame factor 0.99 → 0.05 must shift combined BetP downward by ≥0.05: \
+         prev={nearly_undiscounted_betp}, new={deeply_discounted_betp}"
     );
 }

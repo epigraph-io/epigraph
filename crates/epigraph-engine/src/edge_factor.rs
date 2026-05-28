@@ -16,9 +16,12 @@ use sqlx::PgPool;
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
-use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository};
+use epigraph_db::{
+    FrameRepository, MassFunctionRepository, MassFunctionRow, PerspectiveRepository,
+};
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
+use crate::calibration::CalibrationConfig;
 use crate::epistemic_interval::{
     restrict_epistemic_frame_evidence, restrict_epistemic_negative, restrict_epistemic_positive,
     EpistemicInterval,
@@ -157,9 +160,14 @@ pub async fn auto_wire_ds_for_edge(
     let per_frame_factor = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
         .await
         .map_err(|e| format!("per-frame locality factor lookup: {e}"))?;
+    // Single calibration load for both the locality fallback AND the
+    // Phase 2 canonical-key alias resolution below. Cheap on the local
+    // filesystem; failure is recoverable (the helper's
+    // `default_for_phase2_fallback` mirrors the pre-Phase-2 hardcodes).
+    let calibration = crate::calibration::CalibrationConfig::from_workspace_root().ok();
     let intra_factor = per_frame_factor.unwrap_or_else(|| {
-        crate::calibration::CalibrationConfig::from_workspace_root()
-            .ok()
+        calibration
+            .as_ref()
             .map(|c| c.evidence_locality.intra_evidence_locality_factor)
             .unwrap_or(0.3)
     });
@@ -184,7 +192,31 @@ pub async fn auto_wire_ds_for_edge(
     // `source_strength` (which is already composed with `locality_factor`
     // above); the tag is metadata so the backfill script and Phase 2 combine
     // path can stop inferring typing from the numeric value-set.
-    let locality_tag = if is_intra { "intra" } else { "cross" };
+    //
+    // Phase 2 (issue #197) vocabulary expansion: DOI-match implies the
+    // self-cite case; non-DOI-match intra detection would land here as
+    // 'intra_methodological_overlap' once a future Phase 3+ heuristic
+    // adds it. Helper treats anything starting with "intra" as intra.
+    let locality_tag = if is_intra { "intra_self_cite" } else { "cross" };
+
+    // Phase 2 (issue #197) canonical-key write: resolve the raw
+    // relationship string (e.g. "supports") through
+    // `evidence_type_aliases` to the canonical SciFact-calibrated key
+    // (`"derived_support"`). This lets the Phase 2 helper's tier 2
+    // path resolve a real calibrated weight instead of falling
+    // through to the 0.5 unknown-key sentinel. Source-of-truth is
+    // `calibration.toml`'s `[evidence_type_aliases]` — adding a new
+    // relationship is a TOML edit, not a Rust edit. Calibration load
+    // failure (calibration.toml missing) is rare on production; the
+    // fallback below stores the raw relationship verbatim and the
+    // helper's path-3 source_strength bridge keeps the math correct.
+    let stored_evidence_type: String = calibration
+        .as_ref()
+        .and_then(|c| {
+            let lower = relationship.to_lowercase();
+            c.evidence_type_aliases.get(&lower).cloned()
+        })
+        .unwrap_or_else(|| relationship.to_string());
 
     MassFunctionRepository::store_with_perspective(
         pool,
@@ -196,7 +228,7 @@ pub async fn auto_wire_ds_for_edge(
         None,
         Some("edge_factor"),
         Some(source_strength),
-        Some(relationship),
+        Some(stored_evidence_type.as_str()),
         locality_tag,
         None, // edge_factor BBA: derived from an EDGE, not an evidence row (issue #197 Phase 3)
     )
@@ -289,6 +321,118 @@ pub async fn recompute_claim_belief_on_frame(
     Ok(true)
 }
 
+/// Compute the effective Shafer reliability discount for a single BBA
+/// at combine time.
+///
+/// Phase 2 of issue #197: stop reading the persisted
+/// `mass_functions.source_strength` column as the authority for
+/// per-row discount weight, and derive it dynamically from the
+/// `evidence_type` + `locality_tag` columns the Phase 1a write path
+/// populates. Recalibration — both global (`calibration.toml`'s
+/// `evidence_locality.intra_evidence_locality_factor`) and per-frame
+/// (`frames.properties->>'intra_evidence_locality_factor'`) — flows
+/// through to combined BetP without rewriting any BBA row.
+///
+/// # Inputs
+/// * `row` — the persisted BBA. The helper inspects
+///   `row.evidence_type`, `row.locality_tag`, and (for the legacy
+///   fallback) `row.source_strength`. The `source_strength` column is
+///   not the authority but it is kept as a migration-compat cache:
+///   * for the pre-Phase-1a population where `evidence_type IS NULL`,
+///     the helper returns the stored value unchanged (preserving the
+///     5202ded backfill semantics).
+///   * for rows whose `evidence_type` is non-NULL but does not resolve
+///     to any calibrated key (e.g. legacy `"CORROBORATES"` tags that
+///     were written before the Phase 2 alias-table refresh), the
+///     helper falls back to the stored value as a Phase-1c bridge.
+/// * `per_frame_intra_factor` — pre-loaded by the caller via
+///   `FrameRepository::get_intra_evidence_locality_factor`. Pre-loading
+///   avoids a DB round-trip per row in a multi-BBA combine. `None`
+///   means "no per-frame override; use the global calibration value".
+/// * `calibration` — pre-loaded `&CalibrationConfig`. The caller
+///   resolves the load + fallback; the helper does not do I/O.
+///
+/// # Output
+/// `f64` clamped to `[0.0, 1.0]`.
+///
+/// # Fallback chain (first match wins)
+/// 1. `evidence_type IS NULL` AND `source_strength IS NOT NULL` →
+///    return the stored value clamped. This is the pre-Phase-1a
+///    legacy cohort (5202ded backfill populated `source_strength`
+///    only, never `evidence_type`).
+/// 2. `evidence_type IS NOT NULL` AND
+///    `calibration.evidence_type_weight_present(et)` → look up the
+///    calibrated weight, compose with locality:
+///    * `locality_tag.starts_with("intra")` → `weight * intra_factor`
+///      where `intra_factor` is the per-frame override (if any), else
+///      the global calibration value.
+///    * otherwise → `weight` (no discount).
+/// 3. `evidence_type IS NOT NULL` AND not calibrated AND
+///    `source_strength IS NOT NULL` → return the stored value clamped.
+///    Path-1 sentinel from Phase 2 spec § 4: an `evidence_type` like
+///    `"CORROBORATES"` that's neither a canonical key nor an alias
+///    falls back to the write-time cache.
+/// 4. Both `evidence_type` and `source_strength` NULL → return `0.5`
+///    (the unknown-key calibration fallback).
+///
+/// # Phase 4 extension hook
+/// Phase 4 will widen the signature with a fourth parameter
+/// `per_frame_evidence_weights: Option<&HashMap<String, f64>>` for
+/// per-frame evidence-type weight overrides. See
+/// `docs/superpowers/specs/2026-05-28-per-frame-evidence-type-weights-spec.md`.
+/// The parameter is intentionally absent here so Phase 4 can introduce
+/// it without ambiguity.
+pub fn effective_source_strength(
+    row: &MassFunctionRow,
+    per_frame_intra_factor: Option<f64>,
+    calibration: &CalibrationConfig,
+) -> f64 {
+    // Step (1): legacy null-evidence_type cohort. The 5202ded backfill
+    // populated `source_strength` on these rows without setting
+    // `evidence_type`; we honor the stored value verbatim until Phase
+    // 1c (backlog claim 7b934e58) derives `evidence_type` from the
+    // linked evidence rows.
+    if row.evidence_type.is_none() {
+        if let Some(ss) = row.source_strength {
+            return ss.clamp(0.0, 1.0);
+        }
+        // Step (4): everything NULL → unknown-key 0.5 fallback.
+        return 0.5;
+    }
+
+    // SAFETY: just matched `Some` above.
+    let evidence_type = row.evidence_type.as_deref().unwrap_or("");
+
+    // Step (2): evidence_type resolves to a calibrated weight (direct
+    // or via the alias table). Compose with locality. Any locality_tag
+    // starting with "intra" — current values: 'intra_self_cite',
+    // 'intra_methodological_overlap' (Phase 2 vocabulary expansion);
+    // historical 'intra' rows are migrated to 'intra_self_cite' in
+    // the same PR — applies the intra discount. Everything else
+    // ('cross', 'unknown', or any future tag we haven't taught the
+    // helper) gets the un-discounted base weight.
+    if calibration.evidence_type_weight_present(evidence_type) {
+        let base = calibration.get_evidence_type_weight(evidence_type);
+        let intra_factor = per_frame_intra_factor
+            .unwrap_or(calibration.evidence_locality.intra_evidence_locality_factor);
+        let locality_factor = if row.locality_tag.starts_with("intra") {
+            intra_factor
+        } else {
+            1.0
+        };
+        return (base * locality_factor).clamp(0.0, 1.0);
+    }
+
+    // Step (3): evidence_type was set but isn't a calibrated key (path
+    // 1 sentinel from Phase 2 spec § 4). The legacy `source_strength`
+    // cache preserves write-time semantics; without it we drop to the
+    // 0.5 unknown-key fallback.
+    if let Some(ss) = row.source_strength {
+        return ss.clamp(0.0, 1.0);
+    }
+    0.5
+}
+
 async fn recompute_combined_belief(
     pool: &PgPool,
     claim_id: Uuid,
@@ -302,16 +446,35 @@ async fn recompute_combined_belief(
         return Ok(());
     }
 
+    // Phase 2 (issue #197): the combine path no longer trusts the
+    // stored `source_strength` as the authority. Instead we compute
+    // each BBA's effective reliability discount dynamically from
+    // (`evidence_type`, `locality_tag`, per-frame factor, calibration).
+    // Recalibration — e.g. changing `intra_evidence_locality_factor`
+    // in `calibration.toml` or via a per-frame override — flows through
+    // to combined BetP without any DB rewrite.
+    //
+    // The load is hoisted above the loop to avoid a per-row I/O cost
+    // for the multi-BBA branch. Calibration I/O failure is recoverable
+    // (per CalibrationConfig::from_workspace_root docs); we fall back
+    // to the synthetic config that mirrors the pre-Phase-2 hardcodes.
+    let calibration = CalibrationConfig::from_workspace_root()
+        .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback());
+    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
+        .await
+        .ok()
+        .flatten();
+
     let combined = if all_rows.len() == 1 {
         let r = &all_rows[0];
         let mf = parse_stored_bba(frame, &r.masses)?;
-        let reliability = r.source_strength.unwrap_or(1.0).clamp(0.0, 1.0);
+        let reliability = effective_source_strength(r, per_frame_intra, &calibration);
         combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?
     } else {
         let mut mass_fns = Vec::with_capacity(all_rows.len());
         for row in &all_rows {
             let mf = parse_stored_bba(frame, &row.masses)?;
-            let reliability = row.source_strength.unwrap_or(1.0).clamp(0.0, 1.0);
+            let reliability = effective_source_strength(row, per_frame_intra, &calibration);
             let d =
                 combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
             mass_fns.push(d);
