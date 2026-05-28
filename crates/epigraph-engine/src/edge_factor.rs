@@ -333,6 +333,15 @@ pub async fn recompute_claim_belief_on_frame(
 /// (`frames.properties->>'intra_evidence_locality_factor'`) — flows
 /// through to combined BetP without rewriting any BBA row.
 ///
+/// Phase 4 of issue #197: extend the lookup chain with a per-frame
+/// evidence-type weight override map. Operators can set a per-frame
+/// `evidence_type_weights` JSONB property; when present and containing
+/// the BBA's lowercased `evidence_type`, the override wins over the
+/// global `[evidence_type_weights]` table. **Strict-key, no alias
+/// resolution at Tier 1** (Q9 locked decision in Phase 4 spec § 5):
+/// if the operator writes `{"observation": 1.0}`, that affects rows
+/// literally tagged `"observation"`, not also `"empirical"`.
+///
 /// # Inputs
 /// * `row` — the persisted BBA. The helper inspects
 ///   `row.evidence_type`, `row.locality_tag`, and (for the legacy
@@ -349,6 +358,10 @@ pub async fn recompute_claim_belief_on_frame(
 ///   `FrameRepository::get_intra_evidence_locality_factor`. Pre-loading
 ///   avoids a DB round-trip per row in a multi-BBA combine. `None`
 ///   means "no per-frame override; use the global calibration value".
+/// * `per_frame_evidence_weights` (Phase 4) — pre-loaded by the caller
+///   via `FrameRepository::get_per_frame_evidence_type_weights`. Map
+///   keys are already lowercased by the repo accessor. `None` means
+///   "no per-frame override; use the global calibration table".
 /// * `calibration` — pre-loaded `&CalibrationConfig`. The caller
 ///   resolves the load + fallback; the helper does not do I/O.
 ///
@@ -360,31 +373,29 @@ pub async fn recompute_claim_belief_on_frame(
 ///    return the stored value clamped. This is the pre-Phase-1a
 ///    legacy cohort (5202ded backfill populated `source_strength`
 ///    only, never `evidence_type`).
-/// 2. `evidence_type IS NOT NULL` AND
+/// 2. **Phase 4 Tier 1** — `evidence_type IS NOT NULL` AND
+///    `per_frame_evidence_weights.get(et.to_lowercase()) = Some(w)`
+///    → compose `w` with locality (same locality discount Tier 3
+///    applies), clamp to `[0.0, 1.0]`. Strict-key: no alias
+///    resolution against `calibration.evidence_type_aliases`.
+/// 3. `evidence_type IS NOT NULL` AND
 ///    `calibration.evidence_type_weight_present(et)` → look up the
 ///    calibrated weight, compose with locality:
 ///    * `locality_tag.starts_with("intra")` → `weight * intra_factor`
 ///      where `intra_factor` is the per-frame override (if any), else
 ///      the global calibration value.
 ///    * otherwise → `weight` (no discount).
-/// 3. `evidence_type IS NOT NULL` AND not calibrated AND
+/// 4. `evidence_type IS NOT NULL` AND not calibrated AND
 ///    `source_strength IS NOT NULL` → return the stored value clamped.
 ///    Path-1 sentinel from Phase 2 spec § 4: an `evidence_type` like
 ///    `"CORROBORATES"` that's neither a canonical key nor an alias
 ///    falls back to the write-time cache.
-/// 4. Both `evidence_type` and `source_strength` NULL → return `0.5`
+/// 5. Both `evidence_type` and `source_strength` NULL → return `0.5`
 ///    (the unknown-key calibration fallback).
-///
-/// # Phase 4 extension hook
-/// Phase 4 will widen the signature with a fourth parameter
-/// `per_frame_evidence_weights: Option<&HashMap<String, f64>>` for
-/// per-frame evidence-type weight overrides. See
-/// `docs/superpowers/specs/2026-05-28-per-frame-evidence-type-weights-spec.md`.
-/// The parameter is intentionally absent here so Phase 4 can introduce
-/// it without ambiguity.
 pub fn effective_source_strength(
     row: &MassFunctionRow,
     per_frame_intra_factor: Option<f64>,
+    per_frame_evidence_weights: Option<&HashMap<String, f64>>,
     calibration: &CalibrationConfig,
 ) -> f64 {
     // Step (1): legacy null-evidence_type cohort. The 5202ded backfill
@@ -396,14 +407,42 @@ pub fn effective_source_strength(
         if let Some(ss) = row.source_strength {
             return ss.clamp(0.0, 1.0);
         }
-        // Step (4): everything NULL → unknown-key 0.5 fallback.
+        // Step (5): everything NULL → unknown-key 0.5 fallback.
         return 0.5;
     }
 
     // SAFETY: just matched `Some` above.
     let evidence_type = row.evidence_type.as_deref().unwrap_or("");
 
-    // Step (2): evidence_type resolves to a calibrated weight (direct
+    // Helper closure: compose a base weight with the locality discount.
+    // Used by both Tier 1 (Phase 4 per-frame override) and Tier 2 (Phase
+    // 2 global calibration). Keeps the locality semantics identical
+    // across both tiers — an operator who writes `{"empirical": 0.5}`
+    // expects the same `intra` discount to apply on top of 0.5 as it
+    // would have applied to the global 1.0.
+    let compose_with_locality = |base: f64| -> f64 {
+        let intra_factor = per_frame_intra_factor
+            .unwrap_or(calibration.evidence_locality.intra_evidence_locality_factor);
+        let locality_factor = if row.locality_tag.starts_with("intra") {
+            intra_factor
+        } else {
+            1.0
+        };
+        (base * locality_factor).clamp(0.0, 1.0)
+    };
+
+    // Step (2) — Phase 4 Tier 1: per-frame override strict-key lookup.
+    // Map keys are already lowercased by the repo accessor; lowercase
+    // the BBA's evidence_type to match. NO alias resolution at this
+    // tier — see Q9 locked decision in Phase 4 spec § 5.
+    if let Some(map) = per_frame_evidence_weights {
+        let key = evidence_type.to_lowercase();
+        if let Some(&w) = map.get(&key) {
+            return compose_with_locality(w);
+        }
+    }
+
+    // Step (3): evidence_type resolves to a calibrated weight (direct
     // or via the alias table). Compose with locality. Any locality_tag
     // starting with "intra" — current values: 'intra_self_cite',
     // 'intra_methodological_overlap' (Phase 2 vocabulary expansion);
@@ -413,17 +452,10 @@ pub fn effective_source_strength(
     // helper) gets the un-discounted base weight.
     if calibration.evidence_type_weight_present(evidence_type) {
         let base = calibration.get_evidence_type_weight(evidence_type);
-        let intra_factor = per_frame_intra_factor
-            .unwrap_or(calibration.evidence_locality.intra_evidence_locality_factor);
-        let locality_factor = if row.locality_tag.starts_with("intra") {
-            intra_factor
-        } else {
-            1.0
-        };
-        return (base * locality_factor).clamp(0.0, 1.0);
+        return compose_with_locality(base);
     }
 
-    // Step (3): evidence_type was set but isn't a calibrated key (path
+    // Step (4): evidence_type was set but isn't a calibrated key (path
     // 1 sentinel from Phase 2 spec § 4). The legacy `source_strength`
     // cache preserves write-time semantics; without it we drop to the
     // 0.5 unknown-key fallback.
@@ -431,6 +463,48 @@ pub fn effective_source_strength(
         return ss.clamp(0.0, 1.0);
     }
     0.5
+}
+
+/// Phase 4 (issue #197) Q8: warn on per-frame evidence-type override
+/// keys that aren't in calibration's known vocabulary.
+///
+/// "Known vocabulary" = canonical key in `calibration.evidence_type_weights`
+/// ∪ alias in `calibration.evidence_type_aliases` ∪ a small allow-list of
+/// relationship-vocab strings the `auto_wire_ds_for_edge` write path may
+/// emit before they're added to `evidence_type_aliases`. Operators may
+/// legitimately register weights for future evidence types not yet in
+/// calibration.toml; this is a log signal for typos, not a hard reject.
+fn warn_on_unknown_evidence_type_keys(
+    frame_id: Uuid,
+    map: &HashMap<String, f64>,
+    calibration: &CalibrationConfig,
+) {
+    const RELATIONSHIP_VOCAB_ALLOWLIST: &[&str] = &[
+        "supports",
+        "corroborates",
+        "refutes",
+        "supersedes",
+        "derived_support",
+        "derived_refute",
+        "derived_supersession",
+    ];
+    for key in map.keys() {
+        // Map keys are already lowercased by the repo accessor; calibration
+        // accessors also lowercase internally. evidence_type_weight_present
+        // covers both canonical-key and alias resolution in one call.
+        if calibration.evidence_type_weight_present(key) {
+            continue;
+        }
+        if RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.as_str()) {
+            continue;
+        }
+        tracing::warn!(
+            %frame_id,
+            key = %key,
+            "per-frame evidence_type_weights override key is not in calibration vocabulary; \
+             possibly a typo (entry is still applied at Tier 1 strict-key)"
+        );
+    }
 }
 
 async fn recompute_combined_belief(
@@ -465,16 +539,50 @@ async fn recompute_combined_belief(
         .ok()
         .flatten();
 
+    // Phase 4 (issue #197): per-frame evidence-type weight override map.
+    // When set, its keyed entries win over the global calibration
+    // table at Tier 1 of `effective_source_strength`. Loaded once above
+    // the combine loop. On any DB error we fall through to `None`
+    // (silently no-ops at Tier 1) rather than failing the whole combine
+    // — recalibration overrides are operator-facing knobs, not
+    // load-bearing for the BetP write.
+    let per_frame_evidence_weights =
+        FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
+            .await
+            .ok()
+            .flatten();
+
+    // Vocabulary warn-log (Q8 locked: loose validation at set_property,
+    // warn-log at read-site). Iterate the override map's keys and warn
+    // on any that don't resolve to a known evidence-type vocabulary
+    // entry: canonical calibration key, calibration alias, or one of
+    // the relationship-vocab strings the auto-wire write path emits.
+    // Surfaces operator typos in operational logs without blocking the
+    // write.
+    if let Some(ref map) = per_frame_evidence_weights {
+        warn_on_unknown_evidence_type_keys(frame_id, map, &calibration);
+    }
+
     let combined = if all_rows.len() == 1 {
         let r = &all_rows[0];
         let mf = parse_stored_bba(frame, &r.masses)?;
-        let reliability = effective_source_strength(r, per_frame_intra, &calibration);
+        let reliability = effective_source_strength(
+            r,
+            per_frame_intra,
+            per_frame_evidence_weights.as_ref(),
+            &calibration,
+        );
         combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?
     } else {
         let mut mass_fns = Vec::with_capacity(all_rows.len());
         for row in &all_rows {
             let mf = parse_stored_bba(frame, &row.masses)?;
-            let reliability = effective_source_strength(row, per_frame_intra, &calibration);
+            let reliability = effective_source_strength(
+                row,
+                per_frame_intra,
+                per_frame_evidence_weights.as_ref(),
+                &calibration,
+            );
             let d =
                 combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
             mass_fns.push(d);
