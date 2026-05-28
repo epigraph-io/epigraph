@@ -406,6 +406,42 @@ pub async fn scoped_belief(
         }
     };
 
+    // Frame function: when a frame is given for a perspective scope, compute the
+    // belief live from the claim's labelled BBAs — each discounted by this
+    // perspective's source-reliability map — rather than reading the cache. This
+    // reflects current evidence no matter how it was ingested.
+    if scope_type == "perspective" {
+        if let Some(frame_id_str) = params.frame_id.as_deref() {
+            let frame_id = parse_uuid(frame_id_str)?;
+            let interval = epigraph_engine::belief_query::get_perspective_belief(
+                &server.pool,
+                claim_id,
+                frame_id,
+                scope_id,
+            )
+            .await
+            .map_err(|e| match e {
+                epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
+                    invalid_params(format!("frame {id} not found"))
+                }
+                epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
+                    invalid_params(format!("invalid mass function: {msg}"))
+                }
+                other => internal_error(other),
+            })?;
+            return success_json(&ScopedBeliefResponse {
+                claim_id: claim_id.to_string(),
+                scope_type: scope_type.to_string(),
+                scope_id: scope_id.to_string(),
+                belief: interval.belief,
+                plausibility: interval.plausibility,
+                mass_on_conflict: interval.mass_on_conflict,
+                mass_on_missing: interval.mass_on_missing,
+                pignistic_prob: Some(interval.pignistic_prob),
+            });
+        }
+    }
+
     let row = ScopedBeliefRepository::get(&server.pool, claim_id, scope_type, Some(scope_id))
         .await
         .map_err(internal_error)?
