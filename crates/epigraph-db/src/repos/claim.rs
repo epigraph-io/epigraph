@@ -1875,14 +1875,24 @@ impl ClaimRepository {
         pool: &PgPool,
         limit: i64,
     ) -> Result<Vec<(Uuid, String)>, DbError> {
+        // Exclude host-provenance telemetry (epiclaw-host ProvenanceRecorder
+        // signs every observable event as an immutable claim — container
+        // lifecycle, task execution, agent output, messages). These are
+        // intentionally NOT embedded (no semantic value, one OpenAI call each)
+        // and dominate the is_current embedding gap; embedding them would
+        // pollute semantic recall. They carry the `telemetry` label (added by
+        // provenance.rs) and a `properties->>'event'` marker — filter on both
+        // so pre-label-backfill rows and any label-PATCH-failure rows are still
+        // excluded. Also restrict to current claims: per the embedding
+        // invariant, `is_current = false` rows should have `embedding = NULL`
+        // by design, so they never "need" an embedding. (backlog a4aaa487)
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
             r#"
             SELECT id, content FROM claims
             WHERE embedding IS NULL
-              AND content NOT LIKE 'Agent sent message%'
-              AND content NOT LIKE 'Container epiclaw%'
-              AND content NOT LIKE 'Received message from%'
-              AND content NOT LIKE 'Agent in epiclaw%'
+              AND COALESCE(is_current, true) = true
+              AND NOT ('telemetry' = ANY(labels))
+              AND (properties->>'event') IS NULL
             ORDER BY created_at
             LIMIT $1
             "#,
@@ -2240,10 +2250,46 @@ mod tests {
         .await
         .unwrap();
 
+        // Host-provenance telemetry must be EXCLUDED: one via the `telemetry`
+        // label, one via the `properties->>'event'` marker (covers rows whose
+        // label back-fill / post-submit PATCH never landed). (backlog a4aaa487)
+        let tele_labeled = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding, labels)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, NULL, ARRAY['telemetry','epiclaw'])
+             RETURNING id",
+        )
+        .bind(format!("Container epiclaw-x exited code 0 after 5ms {}", Uuid::new_v4()))
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let tele_event_prop = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding, properties)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, NULL, '{\"event\":\"task_executed\"}'::jsonb)
+             RETURNING id",
+        )
+        .bind(format!("Task t-{} executed, status: completed", Uuid::new_v4()))
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
         let missing = ClaimRepository::find_claims_needing_embeddings(&pool, 1000)
             .await
             .unwrap();
-        assert!(missing.iter().any(|(id, _)| *id == claim_id));
+        assert!(
+            missing.iter().any(|(id, _)| *id == claim_id),
+            "substantive claim must be returned"
+        );
+        assert!(
+            !missing.iter().any(|(id, _)| *id == tele_labeled),
+            "telemetry-labeled claim must be excluded"
+        );
+        assert!(
+            !missing.iter().any(|(id, _)| *id == tele_event_prop),
+            "event-property telemetry claim must be excluded"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

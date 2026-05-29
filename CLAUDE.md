@@ -70,11 +70,19 @@ DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo 
 
 ## Embedding policy
 
-**Invariant:** every claim with `is_current = true` should have an embedding;
-every claim with `is_current = false` should have `embedding = NULL`. Semantic
-recall (`recall()`, `recall_with_context()`, `theme_cluster`, `find_workflow`'s
-semantic path) reads from `embedding`, so violations either hide live claims
-or surface stale ones.
+**Invariant:** every **non-telemetry** claim with `is_current = true` should
+have an embedding; every claim with `is_current = false` should have
+`embedding = NULL`. Semantic recall (`recall()`, `recall_with_context()`,
+`theme_cluster`, `find_workflow`'s semantic path) reads from `embedding`, so
+violations either hide live claims or surface stale ones.
+
+**Telemetry exception:** host-provenance claims (epiclaw-host's
+`ProvenanceRecorder` — container/task lifecycle, agent output, messages) are
+intentionally NOT embedded (no semantic value, one OpenAI call each). They carry
+the `telemetry` label and a `properties->>'event'` marker, and dominate the
+is_current embedding gap. The write path already skips embedding them
+(`submit.rs` `is_host_telemetry`), and `find_claims_needing_embeddings` excludes
+them. Do NOT treat them as `live_missing`. (backlog a4aaa487)
 
 ### Write paths (must embed on insert)
 
@@ -112,7 +120,8 @@ If you add a third path that flips `is_current = false`, add the matching
 ### Auditing the gap
 
 ```sql
-SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL) AS live_missing,
+SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
+         AND NOT ('telemetry' = ANY(labels)) AND (properties->>'event') IS NULL) AS live_missing,
        COUNT(*) FILTER (WHERE NOT is_current AND embedding IS NOT NULL) AS stale_present
 FROM claims;
 ```
