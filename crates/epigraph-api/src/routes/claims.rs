@@ -454,8 +454,10 @@ pub async fn create_claim(
         // brick API boot on the existing duplicates.)
         let content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
         let agent_uuid: Uuid = claim.agent_id.into();
-        let dup_conflict = || ApiError::Conflict {
+        let dup_conflict = || {
+            ApiError::Conflict {
             reason: "claim already exists for this (content_hash, agent_id); use if_not_exists=true to retrieve it".to_string(),
+        }
         };
         if ClaimRepository::find_by_content_hash_and_agent(
             &mut tx,

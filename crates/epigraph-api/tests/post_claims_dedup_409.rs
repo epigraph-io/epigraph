@@ -69,5 +69,8 @@ async fn duplicate_create_strict_returns_409() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(count, 1, "exactly one claim row should exist, found {count}");
+    assert_eq!(
+        count, 1,
+        "exactly one claim row should exist, found {count}"
+    );
 }
