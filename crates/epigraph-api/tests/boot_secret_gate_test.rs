@@ -15,7 +15,10 @@ fn refuses_dev_secret_without_optout() {
         .env_remove("EPIGRAPH_JWT_SECRET")
         .env_remove("EPIGRAPH_ALLOW_INSECURE_SECRET")
         .env("EPIGRAPH_PORT", "0")
-        .env("DATABASE_URL", "postgres://invalid:invalid@127.0.0.1:1/nope")
+        .env(
+            "DATABASE_URL",
+            "postgres://invalid:invalid@127.0.0.1:1/nope",
+        )
         .output()
         .expect("run server bin");
     assert!(
@@ -35,7 +38,10 @@ fn optout_skips_secret_gate() {
         .env_remove("EPIGRAPH_JWT_SECRET")
         .env("EPIGRAPH_ALLOW_INSECURE_SECRET", "1")
         .env("EPIGRAPH_PORT", "0")
-        .env("DATABASE_URL", "postgres://invalid:invalid@127.0.0.1:1/nope")
+        .env(
+            "DATABASE_URL",
+            "postgres://invalid:invalid@127.0.0.1:1/nope",
+        )
         .output()
         .expect("run server bin");
     let stderr = String::from_utf8_lossy(&out.stderr);

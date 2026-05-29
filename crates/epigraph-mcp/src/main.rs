@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 // authenticated path
             }
-            (None, true) => {}     // operator-acknowledged unauthenticated path
+            (None, true) => {} // operator-acknowledged unauthenticated path
             (Some(_), true) => {
                 eprintln!(
                     "ERROR: --jwt-secret and --allow-unauthenticated-http are mutually exclusive."
