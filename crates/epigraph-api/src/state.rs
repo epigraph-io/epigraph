@@ -451,8 +451,13 @@ impl AppState {
 
     /// Default JWT config from env var or dev fallback.
     fn default_jwt_config() -> Arc<crate::oauth::JwtConfig> {
-        let secret = std::env::var("EPIGRAPH_JWT_SECRET")
-            .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+        // NOTE: intentionally NOT fail-closed. This is called by test/builder
+        // constructors; the production gate lives in bin/server.rs::main behind
+        // EPIGRAPH_ALLOW_INSECURE_SECRET. See epigraph_auth::assert_production_secret.
+        let secret = std::env::var("EPIGRAPH_JWT_SECRET").unwrap_or_else(|_| {
+            String::from_utf8(epigraph_auth::DEV_JWT_SECRET.to_vec())
+                .expect("DEV_JWT_SECRET is valid UTF-8")
+        });
         Arc::new(crate::oauth::JwtConfig::from_secret(secret.as_bytes()))
     }
 

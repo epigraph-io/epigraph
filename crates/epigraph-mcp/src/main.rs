@@ -102,15 +102,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // auth (e.g., a unix-socket listener behind filesystem permissions).
     if cli.listen.is_some() {
         match (cli.jwt_secret.as_deref(), cli.allow_unauthenticated_http) {
-            (Some(secret), false) if secret.len() < 32 => {
-                eprintln!(
-                    "ERROR: --jwt-secret must be at least 32 bytes (got {}).",
-                    secret.len()
-                );
-                std::process::exit(1);
+            (Some(secret), false) => {
+                if let Err(reason) = epigraph_auth::assert_production_secret(secret.as_bytes()) {
+                    eprintln!("ERROR: --jwt-secret rejected: {reason}");
+                    std::process::exit(1);
+                }
+                // authenticated path
             }
-            (Some(_), false) => {} // authenticated path
-            (None, true) => {}     // operator-acknowledged unauthenticated path
+            (None, true) => {} // operator-acknowledged unauthenticated path
             (Some(_), true) => {
                 eprintln!(
                     "ERROR: --jwt-secret and --allow-unauthenticated-http are mutually exclusive."
