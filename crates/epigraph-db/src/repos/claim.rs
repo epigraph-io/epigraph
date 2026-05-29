@@ -879,6 +879,55 @@ impl ClaimRepository {
         Ok(claims)
     }
 
+    /// List claims whose `truth_value` falls within `[min_truth, max_truth]`,
+    /// most-recent first. The range filter is applied in SQL **before**
+    /// `LIMIT`, so matching claims are reachable regardless of how recently
+    /// they were created.
+    ///
+    /// This exists because the obvious `list()` + post-query filter can only
+    /// ever inspect the first `limit` most-recent rows — a matching claim
+    /// outside that window is silently invisible (backlog bug `5a55a48e`:
+    /// `query_claims(max_truth=0.75)` returned empty while matching claims
+    /// existed).
+    pub async fn list_by_truth_range(
+        pool: &PgPool,
+        min_truth: f64,
+        max_truth: f64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Claim>, DbError> {
+        let rows = sqlx::query_as::<_, ClaimRow>(
+            r#"
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            FROM claims
+            WHERE truth_value >= $1 AND truth_value <= $2
+            ORDER BY created_at DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(min_truth)
+        .bind(max_truth)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+
+        let mut claims = Vec::with_capacity(rows.len());
+        for row in rows {
+            let truth_value = TruthValue::new(row.truth_value)?;
+            claims.push(claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            ));
+        }
+        Ok(claims)
+    }
+
     /// List claims that contain ALL of the specified labels.
     ///
     /// Uses the GIN index on `claims.labels` for efficient `@>` containment queries.

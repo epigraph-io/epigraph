@@ -250,21 +250,17 @@ pub async fn query_claims(
     params: QueryClaimsParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
-
-    // Use list with search for now (min/max truth filtering done post-query)
-    let claims = ClaimRepository::list(&server.pool, limit, 0, None)
-        .await
-        .map_err(internal_error)?;
-
     let min = params.min_truth.unwrap_or(0.0);
     let max = params.max_truth.unwrap_or(1.0);
 
+    // Filter by truth range in SQL (before LIMIT) so matching claims outside
+    // the most-recent `limit` rows are still reachable (bug 5a55a48e).
+    let claims = ClaimRepository::list_by_truth_range(&server.pool, min, max, limit, 0)
+        .await
+        .map_err(internal_error)?;
+
     let results: Vec<ClaimResponse> = claims
         .into_iter()
-        .filter(|c| {
-            let tv = c.truth_value.value();
-            tv >= min && tv <= max
-        })
         .map(|c| ClaimResponse {
             id: c.id.as_uuid().to_string(),
             content: c.content.clone(),
