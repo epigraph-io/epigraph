@@ -2258,7 +2258,10 @@ mod tests {
              VALUES ($1, sha256($1::bytea), 0.5, $2, NULL, ARRAY['telemetry','epiclaw'])
              RETURNING id",
         )
-        .bind(format!("Container epiclaw-x exited code 0 after 5ms {}", Uuid::new_v4()))
+        .bind(format!(
+            "Container epiclaw-x exited code 0 after 5ms {}",
+            Uuid::new_v4()
+        ))
         .bind(agent_id)
         .fetch_one(&pool)
         .await
