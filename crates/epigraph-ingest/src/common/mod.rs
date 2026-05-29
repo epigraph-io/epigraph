@@ -3,6 +3,7 @@
 //! and workflow-specific schemas wrap them in `document::` and `workflow::`.
 
 pub mod edges;
+pub mod evidence_type;
 pub mod ids;
 pub mod paths;
 pub mod plan;

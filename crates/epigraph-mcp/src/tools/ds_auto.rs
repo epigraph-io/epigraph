@@ -49,6 +49,11 @@ pub struct BatchDsEntry {
     pub claim_id: Uuid,
     pub confidence: f64,
     pub weight: f64,
+    /// Canonical evidence-type tag from the extraction plan, stored on the BBA
+    /// so `effective_source_strength` (global) and the frame function
+    /// (per-perspective) can key reliability on it. `None` → untagged BBA
+    /// (falls back to the stored `source_strength` / α = 1.0).
+    pub evidence_type: Option<String>,
 }
 
 /// Canonical binary frame name.
@@ -441,10 +446,10 @@ async fn wire_single_batch_entry(
         &masses_json,
         None,
         Some("auto_wire"),
-        Some(entry.weight), // source_strength = evidence-type reliability
-        None,               // evidence_type (not threaded through batch yet)
-        "unknown",          // batch ds_auto path; no per-entry locality (issue #197)
-        None,               // batch path predates per-claim evidence rows (issue #197 Phase 3)
+        Some(entry.weight), // source_strength = methodology weight (legacy fallback when evidence_type is None)
+        entry.evidence_type.as_deref(), // evidence_type → effective_source_strength / frame function
+        "unknown",                      // batch ds_auto path; no per-entry locality (issue #197)
+        None, // batch path predates per-claim evidence rows (issue #197 Phase 3)
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;

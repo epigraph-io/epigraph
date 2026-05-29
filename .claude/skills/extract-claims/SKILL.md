@@ -164,6 +164,45 @@ Assemble all stages into a single `DocumentExtraction` JSON structure:
 | `confidence` | 0.0–1.0; based on evidence quality and source clarity |
 | `generality` | 0 (specific fact), 1 (general principle), 2 (specialized theory) |
 | `resolved` | Boolean; true if all pronouns are explicit, entities named |
+| `evidence_type` | **Pick exactly ONE from the closed set below.** Tags the kind of support behind the claim; drives Dempster–Shafer reliability weighting. |
+
+### `evidence_type` — pick one from this closed set
+
+Choose the single value that best describes *how* the claim is supported. Set
+it per paragraph (atoms inherit it). Anything outside this set is dropped, so
+do **not** invent values:
+
+| Value | Use when the support is… |
+|-------|--------------------------|
+| `empirical` | direct observation, measurement, or experiment |
+| `statistical` | aggregate/quantitative analysis over a sample |
+| `regulatory` | a binding rule, statute, standard, or formal approval |
+| `logical` | a derivation or argument made within the text |
+| `testimonial` | attributed expert testimony or a sourced statement |
+| `circumstantial` | indirect or inferred support |
+| `conversational` | informal/anecdotal report (e.g. a transcript remark) |
+
+When unsure between two, prefer the stronger (higher in this table); if none
+fit, omit the field rather than guessing.
+
+Set it on the **paragraph** object the ingester actually reads (sibling of
+`compound`, `atoms`, `methodology`); atoms inherit it:
+
+```json
+{
+  "compound": "Two empirical observations support the thesis.",
+  "supporting_text": "Measured directly in two assays.",
+  "atoms": ["Observation one ...", "Observation two ..."],
+  "confidence": 0.8,
+  "methodology": "extraction",
+  "evidence_type": "empirical"
+}
+```
+
+> NOTE: the large illustrative JSON earlier in this doc predates the current
+> ingest schema (`source`/`compound`/string-atoms with per-paragraph
+> `evidence_type`). Follow the paragraph snippet above and the field table —
+> not the older block — for the shape `ingest_document` parses.
 
 ## Submission via `ingest_document`
 

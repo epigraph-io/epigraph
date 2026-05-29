@@ -75,6 +75,11 @@ pub struct Paragraph {
     pub confidence: f64,
     #[serde(default)]
     pub methodology: Option<String>,
+    /// Evidence type for this paragraph and its atoms. The extractor picks ONE
+    /// canonical value from [`crate::common::evidence_type::EVIDENCE_TYPES`]
+    /// (regulatory, empirical, statistical, logical, testimonial,
+    /// circumstantial, conversational). Normalised at plan-build time; any
+    /// unrecognised value is dropped to `None`.
     #[serde(default)]
     pub evidence_type: Option<String>,
     #[serde(default)]
