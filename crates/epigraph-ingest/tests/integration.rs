@@ -1,6 +1,45 @@
 use epigraph_ingest::builder::build_ingest_plan;
 use epigraph_ingest::schema::DocumentExtraction;
 
+/// Paragraph `evidence_type` is normalised to a canonical key and inherited by
+/// its atoms; an unrecognised value is dropped to `None` so it never reaches
+/// the BBA as an unknown tag.
+#[test]
+fn evidence_type_normalized_and_inherited_by_atoms() {
+    let json = r#"{
+      "source": { "title": "T" },
+      "sections": [{
+        "title": "S",
+        "paragraphs": [
+          { "compound": "c1", "evidence_type": "Empirical", "atoms": ["a1", "a2"] },
+          { "compound": "c2", "evidence_type": "made_up_type", "atoms": ["a3"] },
+          { "compound": "c3", "atoms": ["a4"] }
+        ]
+      }]
+    }"#;
+    let extraction: DocumentExtraction = serde_json::from_str(json).unwrap();
+    let plan = build_ingest_plan(&extraction);
+
+    let etype = |content: &str| {
+        plan.claims
+            .iter()
+            .find(|c| c.content == content)
+            .unwrap()
+            .evidence_type
+            .clone()
+    };
+
+    // Canonical (case-insensitive) value propagates to the paragraph and atoms.
+    assert_eq!(etype("c1").as_deref(), Some("empirical"));
+    assert_eq!(etype("a1").as_deref(), Some("empirical"));
+    assert_eq!(etype("a2").as_deref(), Some("empirical"));
+    // Unrecognised value is dropped.
+    assert_eq!(etype("c2"), None);
+    assert_eq!(etype("a3"), None);
+    // Absent value stays None.
+    assert_eq!(etype("a4"), None);
+}
+
 #[test]
 fn test_full_extraction_from_fixture() {
     let json = include_str!("fixtures/sample_hierarchical.json");

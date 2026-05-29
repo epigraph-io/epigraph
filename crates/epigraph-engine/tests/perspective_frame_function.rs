@@ -246,3 +246,119 @@ async fn unmapped_perspective_equals_global(pool: PgPool) {
         .expect("global belief");
     assert!((scoped.belief - global.belief).abs() < 1e-9);
 }
+
+/// The locality tier is config-driven and per-perspective overridable: an
+/// observer can trust an intra-source pathway that the global calibration
+/// discounts (and vice-versa), changing the belief over identical evidence.
+#[sqlx::test(migrations = "../../migrations")]
+async fn perspective_locality_reliability_overrides_global(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let claim_id = insert_claim(&pool, agent).await;
+    let frame_row =
+        FrameRepository::create(&pool, "ff_loc", None, &["H0".to_string(), "H1".to_string()])
+            .await
+            .expect("frame");
+    let frame =
+        FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone()).unwrap();
+
+    // One empirical BBA from an intra-source pathway: mass 0.8 on H0.
+    let mut bba = std::collections::BTreeMap::new();
+    bba.insert(
+        FocalElement::positive(std::collections::BTreeSet::from([0])),
+        0.8,
+    );
+    bba.insert(FocalElement::theta(&frame), 0.2);
+    let mf = MassFunction::new(frame.clone(), bba).unwrap();
+    MassFunctionRepository::store_with_perspective(
+        &pool,
+        claim_id,
+        frame_row.id,
+        Some(agent),
+        None,
+        &mf.masses_to_json(),
+        None,
+        Some("discount"),
+        Some(1.0),
+        Some("empirical"),
+        "intra_self_cite", // intra pathway → globally discounted
+        None,
+    )
+    .await
+    .expect("store bba");
+
+    // Global: empirical(1.0) × intra factor(0.3) discounts the belief.
+    let global = epigraph_engine::belief_query::get_belief(&pool, claim_id, Some(frame_row.id))
+        .await
+        .expect("global belief");
+
+    // Observer who fully trusts intra_self_cite → no intra discount → higher belief.
+    let truster = PerspectiveRepository::create(
+        &pool,
+        "intra-truster",
+        None,
+        None,
+        Some("analytical"),
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("truster");
+    PerspectiveRepository::set_locality_reliability(
+        &pool,
+        truster.id,
+        &HashMap::from([("intra_self_cite".to_string(), 1.0)]),
+    )
+    .await
+    .expect("set locality");
+    let trusted = epigraph_engine::belief_query::get_perspective_belief(
+        &pool,
+        claim_id,
+        frame_row.id,
+        truster.id,
+    )
+    .await
+    .expect("trusted belief");
+
+    // Observer who distrusts intra_self_cite harder than the global factor.
+    let skeptic = PerspectiveRepository::create(
+        &pool,
+        "intra-skeptic",
+        None,
+        None,
+        Some("analytical"),
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("skeptic");
+    PerspectiveRepository::set_locality_reliability(
+        &pool,
+        skeptic.id,
+        &HashMap::from([("intra_self_cite".to_string(), 0.1)]),
+    )
+    .await
+    .expect("set locality");
+    let skeptical = epigraph_engine::belief_query::get_perspective_belief(
+        &pool,
+        claim_id,
+        frame_row.id,
+        skeptic.id,
+    )
+    .await
+    .expect("skeptical belief");
+
+    assert!(
+        trusted.belief > global.belief,
+        "intra-truster ({}) should exceed global ({})",
+        trusted.belief,
+        global.belief
+    );
+    assert!(
+        skeptical.belief < global.belief,
+        "intra-skeptic ({}) should fall below global ({})",
+        skeptical.belief,
+        global.belief
+    );
+}

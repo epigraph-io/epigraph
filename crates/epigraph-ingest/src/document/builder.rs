@@ -110,6 +110,13 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
             path_index.insert(para_path.clone(), para_id);
 
             let enrichment = enrichment_from_paragraph(paragraph);
+            // Normalise once per paragraph to a canonical calibration key (or
+            // None); the atoms below inherit the same tag. Keeps unrecognised
+            // extractor values off the BBA, where they'd hit the 0.5
+            // unknown-evidence-type fallback.
+            let para_evidence_type = crate::common::evidence_type::normalize_evidence_type(
+                paragraph.evidence_type.as_deref(),
+            );
 
             claims.push(PlannedClaim {
                 id: para_id,
@@ -124,7 +131,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 content_hash: para_hash,
                 confidence: paragraph.confidence,
                 methodology: paragraph.methodology.clone(),
-                evidence_type: paragraph.evidence_type.clone(),
+                evidence_type: para_evidence_type.clone(),
                 supporting_text: Some(paragraph.supporting_text.clone()),
                 enrichment: enrichment.clone(),
             });
@@ -156,7 +163,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                     content_hash: atom_hash,
                     confidence: paragraph.confidence,
                     methodology: paragraph.methodology.clone(),
-                    evidence_type: paragraph.evidence_type.clone(),
+                    evidence_type: para_evidence_type.clone(),
                     supporting_text: Some(paragraph.supporting_text.clone()),
                     enrichment: enrichment.clone(),
                 });

@@ -331,6 +331,7 @@ pub async fn do_ingest_document(
                 claim_id: persisted_id,
                 confidence,
                 weight,
+                evidence_type: planned.evidence_type.clone(),
             });
         }
 

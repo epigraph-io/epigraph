@@ -526,3 +526,122 @@ fn phase4_per_frame_override_composes_with_locality() {
         "empirical/intra + per-frame{empirical: 0.5} + intra_factor 0.9 → 0.45",
     );
 }
+
+// ── Perspective overrides (frame function): effective_source_strength_with_perspective ──
+//
+// The querying perspective sits at the TOP of both tier chains (evidence-type
+// weight and locality factor). A perspective with no matching key reduces to
+// the global computation.
+
+use epigraph_engine::edge_factor::{
+    effective_source_strength_with_perspective, PerspectiveReliability,
+};
+
+fn perspective(source: &[(&str, f64)], locality: &[(&str, f64)]) -> PerspectiveReliability {
+    PerspectiveReliability {
+        source_reliability: source.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+        locality_reliability: locality
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect(),
+    }
+}
+
+#[test]
+fn perspective_evidence_weight_overrides_calibration() {
+    let cfg = load_calibration();
+    let r = row(Some("empirical"), "unknown", Some(1.0));
+    // Global: empirical 1.0 × locality(unknown→1.0) = 1.0.
+    approx(
+        effective_source_strength(&r, None, None, &cfg),
+        1.0,
+        "global empirical",
+    );
+    // Perspective downweights empirical to 0.5 → 0.5 × 1.0.
+    let p = perspective(&[("empirical", 0.5)], &[]);
+    approx(
+        effective_source_strength_with_perspective(&r, None, None, &cfg, &p),
+        0.5,
+        "perspective empirical 0.5",
+    );
+}
+
+#[test]
+fn perspective_locality_overrides_intra_factor() {
+    let cfg = load_calibration();
+    let r = row(Some("empirical"), "intra_self_cite", Some(1.0));
+    // Global: empirical 1.0 × intra 0.3 = 0.3.
+    approx(
+        effective_source_strength(&r, None, None, &cfg),
+        0.3,
+        "global intra",
+    );
+    // Perspective trusts intra_self_cite more (0.8) → 1.0 × 0.8.
+    let p = perspective(&[], &[("intra_self_cite", 0.8)]);
+    approx(
+        effective_source_strength_with_perspective(&r, None, None, &cfg, &p),
+        0.8,
+        "perspective locality 0.8",
+    );
+}
+
+#[test]
+fn perspective_composes_evidence_and_locality() {
+    let cfg = load_calibration();
+    let r = row(Some("testimonial"), "intra_self_cite", Some(1.0));
+    // Both tiers overridden: base 0.5 × locality 0.5 = 0.25.
+    let p = perspective(&[("testimonial", 0.5)], &[("intra_self_cite", 0.5)]);
+    approx(
+        effective_source_strength_with_perspective(&r, None, None, &cfg, &p),
+        0.25,
+        "0.5 × 0.5",
+    );
+}
+
+#[test]
+fn perspective_without_matching_key_equals_global() {
+    let cfg = load_calibration();
+    let r = row(Some("empirical"), "unknown", Some(1.0));
+    // Perspective has opinions, but none touch this BBA → identical to global.
+    let p = perspective(&[("statistical", 0.1)], &[("cross", 0.2)]);
+    approx(
+        effective_source_strength_with_perspective(&r, None, None, &cfg, &p),
+        effective_source_strength(&r, None, None, &cfg),
+        "non-matching perspective == global",
+    );
+    // Empty perspective is likewise a no-op.
+    let empty = PerspectiveReliability::default();
+    assert!(empty.is_empty());
+    approx(
+        effective_source_strength_with_perspective(&r, None, None, &cfg, &empty),
+        effective_source_strength(&r, None, None, &cfg),
+        "empty perspective == global",
+    );
+}
+
+#[test]
+fn perspective_locality_applies_to_untagged_evidence() {
+    let cfg = load_calibration();
+    // No evidence_type → base falls to stored source_strength (0.6). A
+    // perspective locality opinion still applies on top.
+    let r = row(None, "intra_self_cite", Some(0.6));
+    // Global leaves untyped rows at the stored source_strength (no locality).
+    approx(
+        effective_source_strength(&r, None, None, &cfg),
+        0.6,
+        "global untyped",
+    );
+    let p = perspective(&[], &[("intra_self_cite", 0.5)]);
+    approx(
+        effective_source_strength_with_perspective(&r, None, None, &cfg, &p),
+        0.6 * 0.5,
+        "untyped base 0.6 × perspective locality 0.5",
+    );
+    // With no relevant override, untyped row still equals global.
+    let unrelated = perspective(&[("empirical", 0.1)], &[("cross", 0.2)]);
+    approx(
+        effective_source_strength_with_perspective(&r, None, None, &cfg, &unrelated),
+        0.6,
+        "untyped, no matching override → global 0.6",
+    );
+}

@@ -443,6 +443,71 @@ async fn ingest_document_handles_compound_equals_atom(pool: sqlx::PgPool) {
     );
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_tags_bbas_with_normalized_evidence_type(pool: sqlx::PgPool) {
+    let server = make_server(pool.clone());
+
+    // Two atoms under a paragraph tagged (mixed-case) "Empirical" → their BBAs
+    // must carry the normalized canonical tag; nothing should carry the raw
+    // pre-normalization string.
+    let extraction_json = serde_json::json!({
+        "source": {
+            "title": "evidence-type-wiring",
+            "doi": "test/evidence-type-wiring",
+            "source_type": "Paper",
+            "authors": [{"name": "test", "affiliations": [], "roles": ["author"]}],
+            "metadata": {}
+        },
+        "thesis": "Evidence-type tags reach the BBA.",
+        "thesis_derivation": "TopDown",
+        "sections": [{
+            "title": "Body",
+            "summary": "One paragraph, two atoms, tagged Empirical.",
+            "paragraphs": [{
+                "compound": "Two empirical observations support the thesis.",
+                "supporting_text": "Measured directly in two assays.",
+                "atoms": [
+                    "Observation one holds under standard conditions",
+                    "Observation two replicates observation one"
+                ],
+                "generality": [0, 0],
+                "confidence": 0.8,
+                "methodology": "extraction",
+                "evidence_type": "Empirical"
+            }]
+        }],
+        "relationships": []
+    });
+    let extraction: epigraph_ingest::schema::DocumentExtraction =
+        serde_json::from_value(extraction_json).expect("fixture parses");
+
+    do_ingest_document(&server, &extraction)
+        .await
+        .expect("ingest succeeds");
+
+    // Atom BBAs carry the normalized canonical tag.
+    let empirical_bbas: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE evidence_type = 'empirical'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        empirical_bbas >= 2,
+        "expected >=2 atom BBAs tagged 'empirical', found {empirical_bbas}"
+    );
+
+    // The raw (un-normalized) value never reaches the column.
+    let raw_case: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE evidence_type = 'Empirical'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        raw_case, 0,
+        "raw 'Empirical' should have been normalized to lowercase"
+    );
+}
+
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     let content = result.content.first().expect("at least one content block");
     content.as_text().expect("text content").text.clone()

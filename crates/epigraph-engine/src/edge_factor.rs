@@ -465,6 +465,105 @@ pub fn effective_source_strength(
     0.5
 }
 
+/// A querying perspective's reliability overrides — the "frame function"
+/// config. Both maps are keyed lowercase and override, respectively, the
+/// evidence-type base weight and the locality factor for that observer. Empty
+/// maps mean "no opinion" (fall through to per-frame / global calibration).
+#[derive(Debug, Clone, Default)]
+pub struct PerspectiveReliability {
+    /// `evidence_type` → base reliability weight ∈ [0,1].
+    pub source_reliability: HashMap<String, f64>,
+    /// `locality_tag` → locality factor ∈ [0,1].
+    pub locality_reliability: HashMap<String, f64>,
+}
+
+impl PerspectiveReliability {
+    /// `true` when neither map has any entry — the perspective expresses no
+    /// reliability opinion and is treated identically to the global
+    /// (no-perspective) computation.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.source_reliability.is_empty() && self.locality_reliability.is_empty()
+    }
+}
+
+/// Per-BBA reliability for a **specific querying perspective** — the same tier
+/// chain as [`effective_source_strength`] with the perspective inserted as the
+/// highest-priority tier at *both* the evidence-type weight and the locality
+/// factor.
+///
+/// Resolution per BBA:
+/// - **base weight** = `perspective.source_reliability[evidence_type]`
+///   → per-frame override → global calibration weight → stored `source_strength`
+///   → 0.5.
+/// - **locality factor** = `perspective.locality_reliability[locality_tag]`
+///   → (per-frame ∨ global intra factor, applied when the tag is `intra*`)
+///   → 1.0.
+/// - result = `base × locality`, clamped.
+///
+/// When the perspective has no override touching this BBA (no matching
+/// evidence-type key *and* no matching locality key), the result is exactly
+/// [`effective_source_strength`] — so a no-opinion perspective reproduces the
+/// global belief. Nothing is hardwired: every weight comes from config
+/// (perspective JSONB → frame properties → `calibration.toml`).
+#[must_use]
+pub fn effective_source_strength_with_perspective(
+    row: &MassFunctionRow,
+    per_frame_intra_factor: Option<f64>,
+    per_frame_evidence_weights: Option<&HashMap<String, f64>>,
+    calibration: &CalibrationConfig,
+    perspective: &PerspectiveReliability,
+) -> f64 {
+    let etype = row.evidence_type.as_deref().map(str::to_lowercase);
+    let locality_key = row.locality_tag.to_lowercase();
+
+    let persp_base = etype
+        .as_ref()
+        .and_then(|t| perspective.source_reliability.get(t))
+        .copied();
+    let persp_locality = perspective.locality_reliability.get(&locality_key).copied();
+
+    // No override touches this BBA → identical to the global computation.
+    if persp_base.is_none() && persp_locality.is_none() {
+        return effective_source_strength(
+            row,
+            per_frame_intra_factor,
+            per_frame_evidence_weights,
+            calibration,
+        );
+    }
+
+    // Base evidence-type weight: perspective → per-frame → calibration →
+    // stored source_strength → 0.5.
+    let base = persp_base
+        .or_else(|| {
+            etype
+                .as_ref()
+                .and_then(|t| per_frame_evidence_weights.and_then(|m| m.get(t)).copied())
+        })
+        .or_else(|| {
+            etype
+                .as_ref()
+                .filter(|t| calibration.evidence_type_weight_present(t))
+                .map(|t| calibration.get_evidence_type_weight(t))
+        })
+        .or(row.source_strength)
+        .unwrap_or(0.5);
+
+    // Locality factor: perspective → legacy intra logic (per-frame ∨ global
+    // intra factor when the tag is intra*, else 1.0).
+    let locality = persp_locality.unwrap_or_else(|| {
+        if locality_key.starts_with("intra") {
+            per_frame_intra_factor
+                .unwrap_or(calibration.evidence_locality.intra_evidence_locality_factor)
+        } else {
+            1.0
+        }
+    });
+
+    (base * locality).clamp(0.0, 1.0)
+}
+
 /// Phase 4 (issue #197) Q8: warn on per-frame evidence-type override
 /// keys that aren't in calibration's known vocabulary.
 ///
