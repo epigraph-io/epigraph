@@ -407,3 +407,95 @@ async fn right_scope_passes_auth() {
         );
     }
 }
+
+// ─── Test 5: --allow-unauthenticated-http actually allows tool calls ───────
+// Backlog be2a3391: the flag started the HTTP listener but, because no
+// AuthContext was injected, the per-tool scope gate 403'd every call with
+// "no auth context" — so the listener accepted nothing. The fix injects a
+// permissive context (auth::inject_unauthenticated_context); this test boots
+// the router the way main.rs does for that flag and asserts a tool call is NOT
+// auth-rejected.
+
+/// MCP service wrapped in the permissive context-injection middleware
+/// (no bearer auth) — mirrors main.rs's `--allow-unauthenticated-http` branch.
+async fn boot_unauth_router() -> axum::Router {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(100))
+        .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/invalid")
+        .expect("connect_lazy never errors");
+    let signer = Arc::new(epigraph_crypto::AgentSigner::generate());
+    let embedder = Arc::new(epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None));
+
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(epigraph_mcp::EpiGraphMcpFull::new_shared(
+                pool.clone(),
+                signer.clone(),
+                embedder.clone(),
+                false,
+            ))
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+
+    axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            epigraph_mcp::auth::inject_unauthenticated_context,
+        ))
+}
+
+async fn spawn_unauth_server() -> std::net::SocketAddr {
+    let router = boot_unauth_router().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+#[tokio::test]
+async fn unauthenticated_http_passes_scope_gate() {
+    let addr = spawn_unauth_server().await;
+    let url = format!("http://{addr}/mcp");
+    let c = client();
+
+    // No real token; the inject middleware supplies a permissive context. The
+    // handshake helper still sends a (now-ignored) Authorization header.
+    let session_id = mcp_handshake(&c, &url, "unused-no-bearer").await;
+
+    let (_status, body) = call_tool(
+        &c,
+        &url,
+        "unused-no-bearer",
+        &session_id,
+        "query_claims",
+        serde_json::json!({"query": "test"}),
+    )
+    .await;
+
+    // The scope gate must NOT reject. The call WILL fail at the DB layer (lazy
+    // bogus pool) — that's fine; we assert only that the failure is not
+    // auth-shaped. Under the bug the body carried "no auth context" /
+    // "requires scope 'claims:read'".
+    let auth_strings = [
+        "Unauthorized",
+        "Forbidden",
+        "no auth context",
+        "requires scope",
+    ];
+    for s in &auth_strings {
+        assert!(
+            !body.contains(s),
+            "--allow-unauthenticated-http must not auth-reject; found {s:?} in: {body}"
+        );
+    }
+}

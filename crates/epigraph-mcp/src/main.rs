@@ -207,6 +207,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 state,
                 bearer_auth_middleware,
             ))
+        } else if cli.allow_unauthenticated_http {
+            // Operator opted out of Bearer auth (e.g. unix-socket listener
+            // behind filesystem perms). Inject a permissive AuthContext so the
+            // per-tool scope gate passes — without it every tool 403s on a
+            // missing auth context, making the flag misleading (bug be2a3391).
+            router.layer(axum::middleware::from_fn(
+                epigraph_mcp::auth::inject_unauthenticated_context,
+            ))
         } else {
             router
         };

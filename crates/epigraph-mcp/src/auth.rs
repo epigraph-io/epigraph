@@ -58,3 +58,41 @@ pub async fn bearer_auth_middleware(
             .into_response(),
     }
 }
+
+/// Build an [`AuthContext`] that holds every scope the tool registry knows
+/// about (derived from [`crate::scope_map::SCOPE_MAP`] so new scopes are
+/// covered automatically).
+///
+/// Used ONLY on the `--allow-unauthenticated-http` path. There, the operator
+/// has explicitly opted out of Bearer auth, so no real token is validated and
+/// no `AuthContext` would otherwise be attached — which makes the per-tool
+/// scope gate (`server::enforce_tool_scope`, applied to every HTTP call) reject
+/// *everything* with "no auth context", rendering the flag misleading (backlog
+/// bug `be2a3391`). Injecting this permissive context lets calls through, which
+/// is exactly what the operator asked for.
+pub fn unauthenticated_context() -> AuthContext {
+    let mut scopes: Vec<String> = crate::scope_map::SCOPE_MAP
+        .iter()
+        .map(|(_, scope)| (*scope).to_string())
+        .collect();
+    scopes.sort();
+    scopes.dedup();
+    AuthContext {
+        client_id: uuid::Uuid::nil(),
+        agent_id: None,
+        owner_id: None,
+        client_type: epigraph_auth::ClientType::Service,
+        scopes,
+        jti: uuid::Uuid::nil(),
+    }
+}
+
+/// Axum middleware for the `--allow-unauthenticated-http` listener: inject the
+/// permissive [`unauthenticated_context`] into every request so the downstream
+/// scope gate passes. Mirrors how [`bearer_auth_middleware`] inserts a
+/// *validated* `AuthContext`, minus the validation. Attach this ONLY when the
+/// operator passed `--allow-unauthenticated-http` (enforced in `main.rs`).
+pub async fn inject_unauthenticated_context(mut req: Request, next: Next) -> Response {
+    req.extensions_mut().insert(unauthenticated_context());
+    next.run(req).await
+}
