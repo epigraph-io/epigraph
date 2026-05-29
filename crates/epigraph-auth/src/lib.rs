@@ -16,6 +16,39 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// The committed development JWT secret. NEVER acceptable in production.
+/// Single source of truth — every consumer must reference this const, not a
+/// copy of the literal.
+pub const DEV_JWT_SECRET: &[u8] = b"epigraph-dev-secret-change-in-production!!";
+
+/// Minimum acceptable HMAC secret length, in bytes.
+pub const MIN_SECRET_LEN: usize = 32;
+
+/// Fail-closed production secret gate. Returns `Err(reason)` if the secret is
+/// empty, shorter than [`MIN_SECRET_LEN`] bytes, or equal to [`DEV_JWT_SECRET`].
+///
+/// Call this ONLY at binary boot, gated behind an opt-out env var for dev/CI.
+/// Do NOT call it inside `JwtConfig::from_secret` or any state/builder
+/// constructor — those are exercised by the test suite with the dev fallback.
+pub fn assert_production_secret(secret: &[u8]) -> Result<(), String> {
+    if secret.is_empty() {
+        return Err("EPIGRAPH_JWT_SECRET is empty".to_string());
+    }
+    if secret.len() < MIN_SECRET_LEN {
+        return Err(format!(
+            "EPIGRAPH_JWT_SECRET is {} bytes; minimum is {MIN_SECRET_LEN}",
+            secret.len()
+        ));
+    }
+    if secret == DEV_JWT_SECRET {
+        return Err(
+            "EPIGRAPH_JWT_SECRET is the committed dev literal; refusing to start in production"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EpiGraphClaims {
     pub sub: Uuid,
@@ -205,5 +238,31 @@ mod tests {
         };
         assert!(check_scopes(&auth, &["claims:read"]).is_ok());
         assert!(check_scopes(&auth, &["claims:write"]).is_err());
+    }
+
+    #[test]
+    fn assert_production_secret_rejects_empty() {
+        assert!(assert_production_secret(b"").is_err());
+    }
+
+    #[test]
+    fn assert_production_secret_rejects_short() {
+        // 31 bytes — one below the 32-byte floor.
+        assert!(assert_production_secret(b"0123456789012345678901234567890").is_err());
+    }
+
+    #[test]
+    fn assert_production_secret_rejects_dev_literal() {
+        assert!(
+            assert_production_secret(DEV_JWT_SECRET).is_err(),
+            "the committed dev literal must never pass the production gate"
+        );
+    }
+
+    #[test]
+    fn assert_production_secret_accepts_real_secret() {
+        // 40 random-looking bytes, not the dev literal.
+        let secret = b"R7p2-Xq9_kL4vN8wErTy6uIoP1aSdFgHjKlZ0cVb";
+        assert!(assert_production_secret(secret).is_ok());
     }
 }
