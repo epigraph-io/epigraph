@@ -294,17 +294,33 @@ pub async fn get_claim(
     let labels = ClaimRepository::get_labels(&server.pool, claim_id)
         .await
         .map_err(internal_error)?;
+    // Cached CDST classification ('supported' | 'contradicted' |
+    // 'not_enough_info' | null). Flattened onto the standard claim response so
+    // existing `ClaimResponse` consumers are unaffected.
+    let classification = ClaimRepository::get_classification(&server.pool, id)
+        .await
+        .map_err(internal_error)?;
 
-    success_json(&ClaimResponse {
-        id: claim.id.as_uuid().to_string(),
-        content: claim.content.clone(),
-        truth_value: claim.truth_value.value(),
-        agent_id: claim.agent_id.as_uuid().to_string(),
-        content_hash: ContentHasher::to_hex(&claim.content_hash),
-        created_at: claim.created_at.to_rfc3339(),
-        labels,
-        is_current: claim.is_current,
-        supersedes: claim.supersedes.map(|s| s.as_uuid().to_string()),
+    #[derive(serde::Serialize)]
+    struct GetClaimResponse {
+        #[serde(flatten)]
+        claim: ClaimResponse,
+        classification: Option<String>,
+    }
+
+    success_json(&GetClaimResponse {
+        claim: ClaimResponse {
+            id: claim.id.as_uuid().to_string(),
+            content: claim.content.clone(),
+            truth_value: claim.truth_value.value(),
+            agent_id: claim.agent_id.as_uuid().to_string(),
+            content_hash: ContentHasher::to_hex(&claim.content_hash),
+            created_at: claim.created_at.to_rfc3339(),
+            labels,
+            is_current: claim.is_current,
+            supersedes: claim.supersedes.map(|s| s.as_uuid().to_string()),
+        },
+        classification,
     })
 }
 

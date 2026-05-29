@@ -342,6 +342,34 @@ impl MassFunctionRepository {
         Ok(())
     }
 
+    /// Write the CDST classification label for a claim.
+    ///
+    /// A verdict on the claim's *combined* belief (`supported` |
+    /// `contradicted` | `not_enough_info`), produced by
+    /// `epigraph_engine::classifier::classify` inside
+    /// `recompute_combined_belief`. Kept as a separate one-column UPDATE
+    /// rather than folded into [`Self::update_claim_belief`] because that
+    /// method has many callers and a param-ordering ratchet test; only the
+    /// combine cascade computes a classification, so only it calls this.
+    /// The extra UPDATE lands on the recompute (maintenance) path, not an
+    /// online read path.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn update_claim_classification(
+        pool: &PgPool,
+        claim_id: Uuid,
+        classification: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE claims SET classification = $1, updated_at = NOW() WHERE id = $2")
+            .bind(classification)
+            .bind(claim_id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
     /// Count mass functions for a claim-frame pair
     ///
     /// # Errors

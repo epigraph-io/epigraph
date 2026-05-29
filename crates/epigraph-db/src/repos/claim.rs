@@ -1894,6 +1894,26 @@ impl ClaimRepository {
         Ok(rows)
     }
 
+    /// Read a claim's cached CDST classification label (`supported` |
+    /// `contradicted` | `not_enough_info`), or `None` if unclassified or the
+    /// claim does not exist. Written by `recompute_combined_belief` via
+    /// `MassFunctionRepository::update_claim_classification`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_classification(
+        pool: &PgPool,
+        claim_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT classification FROM claims WHERE id = $1")
+                .bind(claim_id)
+                .fetch_optional(pool)
+                .await?;
+        Ok(row.and_then(|(c,)| c))
+    }
+
     /// Store an embedding vector on a claim.
     ///
     /// The embedding string must be a valid pgvector literal (e.g., "[0.1,0.2,...]").
