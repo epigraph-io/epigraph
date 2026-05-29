@@ -80,6 +80,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("report_hierarchical_outcome", "claims:write"),
     ("report_workflow_outcome", "claims:write"),
     ("resolve_backlog_item", "claims:write"),
+    ("set_source_reliability", "claims:write"),
     ("stage_claims", "claims:write"),
     ("store_workflow", "claims:write"),
     ("submit_claim", "claims:write"),
