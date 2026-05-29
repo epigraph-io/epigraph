@@ -280,6 +280,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/perspectives",
             post(perspective::create_perspective),
         )
+        .route(
+            "/api/v1/perspectives/:id/source-reliability",
+            put(perspective::set_source_reliability),
+        )
         .route("/api/v1/communities", post(community::create_community))
         .route(
             "/api/v1/communities/:id/members",
@@ -917,6 +921,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/perspectives",
             post(perspective::create_perspective),
+        )
+        .route(
+            "/api/v1/perspectives/:id/source-reliability",
+            put(perspective::set_source_reliability),
         )
         .route("/api/v1/communities", post(community::create_community))
         .route(

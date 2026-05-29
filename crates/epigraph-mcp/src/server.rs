@@ -670,6 +670,17 @@ impl EpiGraphMcpFull {
         tools::perspectives::create_perspective(self, params).await
     }
 
+    #[tool(
+        description = "Set a perspective's source-reliability map (evidence-type tag -> alpha in [0,1]) — the frame-function lens read by scoped_belief / get_perspective_belief, so two observers weight the same evidence differently. An empty map clears the override."
+    )]
+    async fn set_source_reliability(
+        &self,
+        Parameters(params): Parameters<SetSourceReliabilityParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::perspectives::set_source_reliability(self, params).await
+    }
+
     #[tool(description = "List all perspectives with optional limit.")]
     async fn list_perspectives(
         &self,

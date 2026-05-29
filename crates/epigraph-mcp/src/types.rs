@@ -1264,6 +1264,17 @@ pub struct CreatePerspectiveParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetSourceReliabilityParams {
+    #[schemars(description = "UUID of the perspective whose source-reliability lens to set")]
+    pub perspective_id: String,
+
+    #[schemars(
+        description = "Map of evidence-type tag -> reliability alpha in [0,1] (e.g. {\"western_clinical\":0.95,\"ayurvedic_classical\":0.15}). This is the frame-function lens read by scoped_belief. An empty map clears the override."
+    )]
+    pub source_reliability: std::collections::HashMap<String, f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListPerspectivesParams {
     #[schemars(description = "Maximum number of perspectives to return (default 20)")]
     pub limit: Option<i64>,

@@ -53,6 +53,27 @@ fn default_confidence_calibration() -> f64 {
     0.5
 }
 
+/// Request to set a perspective's source-reliability map — the frame-function lens:
+/// evidence-type tag → α ∈ [0,1]. An empty map clears the override. Read at query
+/// time by `epigraph_engine::belief_query::get_perspective_belief`.
+#[derive(Debug, Deserialize)]
+pub struct SetSourceReliabilityRequest {
+    pub source_reliability: std::collections::HashMap<String, f64>,
+}
+
+/// Reject any reliability weight outside [0, 1] (or NaN) before it reaches the DB.
+fn validate_reliability(map: &std::collections::HashMap<String, f64>) -> Result<(), ApiError> {
+    for (tag, &alpha) in map {
+        if alpha.is_nan() || !(0.0..=1.0).contains(&alpha) {
+            return Err(ApiError::ValidationError {
+                field: format!("source_reliability.{tag}"),
+                reason: "reliability weight must be in [0, 1]".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Response for a perspective
 #[derive(Debug, Serialize)]
 pub struct PerspectiveResponse {
@@ -136,6 +157,26 @@ pub async fn create_perspective(
     }
 
     Ok((StatusCode::CREATED, Json(perspective_to_response(row))))
+}
+
+/// Set a perspective's source-reliability map (the frame-function lens). Merges into
+/// `properties.source_reliability`; an empty map clears the override.
+///
+/// `PUT /api/v1/perspectives/:id/source-reliability`
+#[cfg(feature = "db")]
+pub async fn set_source_reliability(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<SetSourceReliabilityRequest>,
+) -> Result<StatusCode, ApiError> {
+    validate_reliability(&request.source_reliability)?;
+    epigraph_db::PerspectiveRepository::set_source_reliability(
+        &state.db_pool,
+        id,
+        &request.source_reliability,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// List all perspectives
@@ -243,6 +284,15 @@ pub async fn create_perspective(
 }
 
 #[cfg(not(feature = "db"))]
+pub async fn set_source_reliability(
+    Path(_id): Path<Uuid>,
+    Json(request): Json<SetSourceReliabilityRequest>,
+) -> Result<StatusCode, ApiError> {
+    validate_reliability(&request.source_reliability)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(not(feature = "db"))]
 pub async fn list_perspectives(
     Query(_params): Query<ListPerspectivesQuery>,
 ) -> Result<Json<Vec<PerspectiveResponse>>, ApiError> {
@@ -288,5 +338,38 @@ mod tests {
         let q: ListPerspectivesQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(q.limit, 50);
         assert_eq!(q.offset, 0);
+    }
+
+    #[test]
+    fn set_source_reliability_request_parses() {
+        let req: SetSourceReliabilityRequest = serde_json::from_str(
+            r#"{"source_reliability":{"western_clinical":0.9,"ayurvedic_classical":0.15}}"#,
+        )
+        .unwrap();
+        assert_eq!(req.source_reliability.len(), 2);
+        assert!((req.source_reliability["western_clinical"] - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn validate_reliability_rejects_out_of_range() {
+        let bad = std::collections::HashMap::from([("western_clinical".to_string(), 1.5)]);
+        match validate_reliability(&bad) {
+            Err(ApiError::ValidationError { field, .. }) => {
+                assert_eq!(field, "source_reliability.western_clinical");
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_reliability_accepts_in_range_and_empty() {
+        // Empty map is valid — it clears the override.
+        assert!(validate_reliability(&std::collections::HashMap::new()).is_ok());
+        let ok = std::collections::HashMap::from([
+            ("a".to_string(), 0.0),
+            ("b".to_string(), 1.0),
+            ("c".to_string(), 0.42),
+        ]);
+        assert!(validate_reliability(&ok).is_ok());
     }
 }
