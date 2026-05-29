@@ -1,5 +1,6 @@
 pub mod alternative_sets;
 pub mod batch;
+pub mod cdst_maintenance;
 pub mod challenges;
 pub mod claims;
 pub mod ds;

@@ -432,6 +432,17 @@ impl EpiGraphMcpFull {
         tools::paper_queries::query_claims_by_label(self, params).await
     }
 
+    #[tool(
+        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state, per-frame, in deterministic frame-name order. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path."
+    )]
+    async fn recompute_beliefs(
+        &self,
+        Parameters(params): Parameters<RecomputeBeliefsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::cdst_maintenance::recompute_beliefs(self, params).await
+    }
+
     // ── Workflows (5 tools) ──
 
     #[tool(
@@ -928,7 +939,7 @@ impl EpiGraphMcpFull {
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.read_only { "read-only" } else { "full" };
-        let tool_count = if self.read_only { 33 } else { 60 };
+        let tool_count = if self.read_only { 33 } else { 61 };
         ServerInfo {
             instructions: Some(format!(
                 "EpiGraph {mode} MCP server with {tool_count} epistemic tools."

@@ -75,6 +75,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("memorize", "claims:write"),
     ("patch_claim", "claims:write"),
     ("publish_event", "claims:write"),
+    ("recompute_beliefs", "claims:write"),
     ("reconcile_sheaf", "claims:write"),
     ("report_hierarchical_outcome", "claims:write"),
     ("report_workflow_outcome", "claims:write"),
