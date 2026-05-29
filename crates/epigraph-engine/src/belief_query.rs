@@ -13,11 +13,13 @@ use epigraph_db::{
     ClaimRepository, FrameRepository, MassFunctionRepository, MassFunctionRow,
     PerspectiveRepository, PgPool,
 };
-use epigraph_ds::{
-    combination::{self, CombinationMethod},
-    FocalElement, FrameOfDiscernment, MassFunction,
-};
+use epigraph_ds::{combination, FocalElement, FrameOfDiscernment, MassFunction};
 use thiserror::Error;
+
+use crate::calibration::CalibrationConfig;
+use crate::edge_factor::{
+    effective_source_strength, effective_source_strength_with_perspective, PerspectiveReliability,
+};
 use uuid::Uuid;
 
 /// Errors from the library-level `get_belief` function.
@@ -131,23 +133,13 @@ pub async fn get_belief(
             return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
         }
 
-        let mut mass_fns: Vec<MassFunction> = Vec::with_capacity(all_bbas.len());
-        for row in &all_bbas {
-            let mf = MassFunction::from_json_masses(frame.clone(), &row.masses)
-                .map_err(BeliefQueryError::ParseMasses)?;
-            mass_fns.push(mf);
-        }
-
-        let combined = if mass_fns.len() == 1 {
-            mass_fns.into_iter().next().expect("checked len == 1")
-        } else {
-            let mut result = mass_fns[0].clone();
-            for mf in &mass_fns[1..] {
-                result = combination::redistribute(&result, mf, CombinationMethod::Dempster, None)
-                    .map_err(BeliefQueryError::Ds)?;
-            }
-            result
-        };
+        // Discount each BBA by its calibrated reliability (evidence-type weight
+        // × locality, via `effective_source_strength`) before combining, so the
+        // framed read agrees with the cached `claims.pignistic_prob` that the
+        // recompute path writes. `perspective = None` → global calibration.
+        let combined = recompute_framed_belief(pool, frame_id, &frame, &all_bbas, None)
+            .await?
+            .expect("all_bbas is non-empty so combination yields Some");
 
         let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
         let bel = epigraph_ds::measures::belief(&combined, &target);
@@ -176,13 +168,15 @@ pub async fn get_belief(
 /// Compute a **perspective-scoped** belief on demand — the "frame function".
 ///
 /// This is `get_belief`'s framed path re-weighted from one observer's
-/// viewpoint: every stored BBA on `(claim, frame)` is Shafer-discounted by the
-/// perspective's reliability for that BBA's `evidence_type` tag before
-/// combination. Because it recomputes from the labelled BBAs, it works
-/// regardless of how the evidence was ingested — there is no cache to populate
-/// and no dependency on a particular write path. A perspective with no
-/// `source_reliability` map (or an absent perspective) discounts nothing, so it
-/// reproduces the global `get_belief` value.
+/// viewpoint: every stored BBA on `(claim, frame)` is Shafer-discounted by its
+/// reliability *for this perspective* before combination, where the perspective
+/// may override both the evidence-type weight (`source_reliability`) and the
+/// locality factor (`locality_reliability`) on top of the per-frame / global
+/// calibration tiers. Because it recomputes from the labelled BBAs, it works
+/// regardless of how the evidence was ingested — no cache, no write-path
+/// dependency. A perspective with neither map (or an absent perspective)
+/// expresses no opinion, so the result reduces exactly to the global
+/// `get_belief`.
 ///
 /// # Errors
 /// `FrameNotFound` if `frame_id` is absent; `ParseMasses`/`Ds` on malformed or
@@ -206,13 +200,19 @@ pub async fn get_perspective_belief(
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
     }
 
-    // The perspective's source-reliability map; None when the perspective is
-    // absent or declares no map → no discount → equals the global belief.
-    let reliability = PerspectiveRepository::get_by_id(pool, perspective_id)
+    // The perspective's frame-function config: source-reliability (evidence
+    // type) + locality-reliability (pathway). Absent/empty → no opinion → the
+    // computation reduces to the global `get_belief`.
+    let perspective = PerspectiveRepository::get_by_id(pool, perspective_id)
         .await?
-        .and_then(|p| p.source_reliability());
+        .map(|p| PerspectiveReliability {
+            source_reliability: p.source_reliability().unwrap_or_default(),
+            locality_reliability: p.locality_reliability().unwrap_or_default(),
+        })
+        .unwrap_or_default();
 
-    let combined = combine_perspective_masses(&all_bbas, reliability.as_ref(), &frame)?
+    let combined = recompute_framed_belief(pool, frame_id, &frame, &all_bbas, Some(&perspective))
+        .await?
         .expect("all_bbas is non-empty so combination yields Some");
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
@@ -227,154 +227,77 @@ pub async fn get_perspective_belief(
     })
 }
 
-/// Discount each BBA by `reliability[evidence_type]` (α = 1.0 when the tag is
-/// `None` or unmapped) and Dempster-combine, mirroring `get_belief`'s framed
-/// combination. Returns `Ok(None)` only when `rows` is empty.
+/// Recompute the combined mass function for a framed claim, discounting each
+/// stored BBA by its effective reliability before Dempster combination.
 ///
-/// Pure given its inputs (no DB), so the frame-function math is unit-testable
-/// without seeding a claim/frame.
-pub fn combine_perspective_masses(
-    rows: &[MassFunctionRow],
-    reliability: Option<&std::collections::HashMap<String, f64>>,
+/// Reliability is resolved through `effective_source_strength`'s tier chain
+/// (per-frame override → global calibration → stored `source_strength`), with
+/// locality applied. When `perspective` is `Some`, the perspective's
+/// frame-function overrides sit at the top of that chain for both the
+/// evidence-type weight and the locality factor. This is the single path both
+/// `get_belief` (perspective = `None`) and `get_perspective_belief` use, so a
+/// no-opinion perspective reproduces the global belief exactly, and both agree
+/// with the cached `claims.pignistic_prob`.
+///
+/// Calibration and the per-frame overrides are loaded once. Per-frame loads are
+/// best-effort: a DB error there falls back to global calibration rather than
+/// failing the read. Returns `Ok(None)` only when `rows` is empty.
+async fn recompute_framed_belief(
+    pool: &PgPool,
+    frame_id: Uuid,
     frame: &FrameOfDiscernment,
+    rows: &[MassFunctionRow],
+    perspective: Option<&PerspectiveReliability>,
 ) -> Result<Option<MassFunction>, BeliefQueryError> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let calibration = CalibrationConfig::from_workspace_root()
+        .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback());
+    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
+        .await
+        .ok()
+        .flatten();
+    let per_frame_weights = FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
+        .await
+        .ok()
+        .flatten();
+
     let mut mass_fns: Vec<MassFunction> = Vec::with_capacity(rows.len());
     for row in rows {
         let mf = MassFunction::from_json_masses(frame.clone(), &row.masses)
             .map_err(BeliefQueryError::ParseMasses)?;
-        let alpha = reliability
-            .and_then(|m| row.evidence_type.as_deref().and_then(|t| m.get(t)))
-            .copied()
-            .unwrap_or(1.0);
-        mass_fns.push(combination::discount(&mf, alpha)?);
+        let alpha = match perspective {
+            Some(p) => effective_source_strength_with_perspective(
+                row,
+                per_frame_intra,
+                per_frame_weights.as_ref(),
+                &calibration,
+                p,
+            ),
+            None => effective_source_strength(
+                row,
+                per_frame_intra,
+                per_frame_weights.as_ref(),
+                &calibration,
+            ),
+        };
+        mass_fns.push(combination::discount(&mf, alpha).map_err(BeliefQueryError::Ds)?);
     }
 
-    if mass_fns.is_empty() {
-        return Ok(None);
-    }
-    let combined = if mass_fns.len() == 1 {
-        mass_fns.into_iter().next().expect("checked len == 1")
-    } else {
-        let mut result = mass_fns[0].clone();
-        for mf in &mass_fns[1..] {
-            result = combination::redistribute(&result, mf, CombinationMethod::Dempster, None)?;
-        }
-        result
-    };
+    // Combine via the SAME adaptive rule the recompute/write path uses
+    // (`combine_multiple`: canonical sort + per-step Dempster/Conjunctive/
+    // Yager/Inagaki selection by conflict). Matching it — not a plain Dempster
+    // fold — is what makes this compute-on-read result reproduce the recompute
+    // path's combination for the same discounted BBAs.
+    let (combined, _reports) =
+        combination::combine_multiple(&mass_fns, 0.9).map_err(BeliefQueryError::Ds)?;
     Ok(Some(combined))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use epigraph_ds::measures;
-    use std::collections::{BTreeMap, HashMap};
-
-    fn binary() -> FrameOfDiscernment {
-        FrameOfDiscernment::new("binary", vec!["H0".to_string(), "H1".to_string()]).unwrap()
-    }
-
-    /// A supporting BBA: `mass` on TRUE (H0), the rest on Θ, tagged `evidence_type`.
-    fn row(frame: &FrameOfDiscernment, evidence_type: Option<&str>, mass: f64) -> MassFunctionRow {
-        let mut bba = BTreeMap::new();
-        bba.insert(FocalElement::positive(BTreeSet::from([0])), mass);
-        bba.insert(FocalElement::theta(frame), 1.0 - mass);
-        let mf = MassFunction::new(frame.clone(), bba).unwrap();
-        MassFunctionRow {
-            id: Uuid::new_v4(),
-            claim_id: Uuid::new_v4(),
-            frame_id: Uuid::new_v4(),
-            source_agent_id: None,
-            perspective_id: None,
-            masses: mf.masses_to_json(),
-            conflict_k: None,
-            combination_method: Some("auto_wire".to_string()),
-            source_strength: Some(1.0),
-            evidence_type: evidence_type.map(str::to_string),
-            locality_tag: "unknown".to_string(),
-            evidence_id: None,
-            created_at: chrono::Utc::now(),
-        }
-    }
-
-    fn bel_h0(frame: &FrameOfDiscernment, mf: &MassFunction) -> f64 {
-        let _ = frame;
-        measures::belief(mf, &FocalElement::positive(BTreeSet::from([0])))
-    }
-
-    #[test]
-    fn divergent_beliefs_from_same_evidence() {
-        // Same two BBAs (a clinical result + an interview), two observers who
-        // trust the interview differently → different belief in H0.
-        let frame = binary();
-        let rows = [
-            row(&frame, Some("western_clinical"), 0.6),
-            row(&frame, Some("practitioner_interview"), 0.7),
-        ];
-        let skeptic = HashMap::from([
-            ("western_clinical".to_string(), 1.0),
-            ("practitioner_interview".to_string(), 0.3),
-        ]);
-        let believer = HashMap::from([
-            ("western_clinical".to_string(), 1.0),
-            ("practitioner_interview".to_string(), 1.0),
-        ]);
-
-        let s = combine_perspective_masses(&rows, Some(&skeptic), &frame)
-            .unwrap()
-            .unwrap();
-        let b = combine_perspective_masses(&rows, Some(&believer), &frame)
-            .unwrap()
-            .unwrap();
-        let (sb, bb) = (bel_h0(&frame, &s), bel_h0(&frame, &b));
-        assert!(
-            sb < bb,
-            "skeptic {sb} should believe less than believer {bb}"
-        );
-        assert!(sb > 0.0 && bb < 1.0);
-    }
-
-    #[test]
-    fn neutral_perspective_reproduces_global() {
-        // An all-α=1.0 believer and the no-map (global) case must combine
-        // identically — neutral observer == global belief.
-        let frame = binary();
-        let rows = [
-            row(&frame, Some("western_clinical"), 0.6),
-            row(&frame, Some("practitioner_interview"), 0.7),
-        ];
-        let believer = HashMap::from([
-            ("western_clinical".to_string(), 1.0),
-            ("practitioner_interview".to_string(), 1.0),
-        ]);
-        let with_map = combine_perspective_masses(&rows, Some(&believer), &frame)
-            .unwrap()
-            .unwrap();
-        let no_map = combine_perspective_masses(&rows, None, &frame)
-            .unwrap()
-            .unwrap();
-        assert!((bel_h0(&frame, &with_map) - bel_h0(&frame, &no_map)).abs() < 1e-12);
-    }
-
-    #[test]
-    fn untagged_evidence_is_not_discounted() {
-        // A BBA with no evidence_type passes through at α=1.0 even when the
-        // perspective has a (non-matching) map — you can't down-weight what you
-        // can't identify.
-        let frame = binary();
-        let tagged = [row(&frame, None, 0.8)];
-        let map = HashMap::from([("practitioner_interview".to_string(), 0.1)]);
-        let out = combine_perspective_masses(&tagged, Some(&map), &frame)
-            .unwrap()
-            .unwrap();
-        assert!((bel_h0(&frame, &out) - 0.8).abs() < 1e-12);
-    }
-
-    #[test]
-    fn empty_rows_yield_none() {
-        let frame = binary();
-        assert!(combine_perspective_masses(&[], None, &frame)
-            .unwrap()
-            .is_none());
-    }
-}
+// The frame-function reliability composition (perspective × per-frame ×
+// calibration, at both the evidence-type and locality tiers) is unit-tested at
+// its source in `edge_factor::tests` (effective_source_strength_with_perspective).
+// The full DB chain — get_perspective_belief vs get_belief over stored BBAs —
+// is covered by the `perspective_frame_function` sqlx integration test.

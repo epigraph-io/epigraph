@@ -19,31 +19,22 @@ pub struct PerspectiveRow {
     pub frame_ids: Option<Vec<Uuid>>,
     pub extraction_method: Option<String>,
     pub confidence_calibration: Option<f64>,
-    /// Free-form jsonb. The frame-function feature reads
-    /// `properties->'source_reliability'` — a map of evidence-type tag →
-    /// reliability α ∈ [0,1] — to discount a shared evidence corpus from this
-    /// perspective's viewpoint. See [`PerspectiveRow::source_reliability`].
+    /// Free-form jsonb. The frame-function feature reads two reliability maps
+    /// from it — `properties->'source_reliability'` (evidence-type tag → α) and
+    /// `properties->'locality_reliability'` (locality_tag → factor) — to
+    /// re-weight a shared evidence corpus from this perspective's viewpoint.
+    /// See [`PerspectiveRow::source_reliability`] and
+    /// [`PerspectiveRow::locality_reliability`].
     pub properties: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
 
 impl PerspectiveRow {
-    /// Per-perspective source-reliability map: evidence-type tag → α ∈ [0,1],
-    /// read from `properties->'source_reliability'`.
-    ///
-    /// This is the "frame function": it lets one observer down-weight, say,
-    /// `practitioner_interview` evidence to 0.4 while another trusts it at 1.0,
-    /// yielding different beliefs over the *same* evidence. Returns `None` when
-    /// the key is absent (the perspective falls back to legacy own-BBA scoping)
-    /// and silently skips any entry whose value is not a finite number in
-    /// `[0, 1]`.
-    #[must_use]
-    pub fn source_reliability(&self) -> Option<std::collections::HashMap<String, f64>> {
-        let obj = self
-            .properties
-            .as_ref()?
-            .get("source_reliability")?
-            .as_object()?;
+    /// Read a `properties.<key>` object as a `tag → factor` map, keeping only
+    /// entries whose value is a finite number in `[0, 1]`. Returns `None` when
+    /// the key is absent or yields no valid entries.
+    fn reliability_map(&self, key: &str) -> Option<std::collections::HashMap<String, f64>> {
+        let obj = self.properties.as_ref()?.get(key)?.as_object()?;
         let map: std::collections::HashMap<String, f64> = obj
             .iter()
             .filter_map(|(k, v)| {
@@ -56,6 +47,32 @@ impl PerspectiveRow {
         } else {
             Some(map)
         }
+    }
+
+    /// Per-perspective source-reliability map: evidence-type tag → α ∈ [0,1],
+    /// read from `properties->'source_reliability'`.
+    ///
+    /// This is one half of the "frame function": it lets one observer
+    /// down-weight, say, `testimonial` evidence to 0.4 while another trusts it
+    /// at 1.0, yielding different beliefs over the *same* evidence. The value
+    /// overrides the per-frame / global calibration evidence-type weight for the
+    /// querying perspective. Returns `None` when the key is absent (no override)
+    /// and silently skips any entry that is not a finite number in `[0, 1]`.
+    #[must_use]
+    pub fn source_reliability(&self) -> Option<std::collections::HashMap<String, f64>> {
+        self.reliability_map("source_reliability")
+    }
+
+    /// Per-perspective locality-reliability map: `mass_functions.locality_tag`
+    /// → factor ∈ [0,1], read from `properties->'locality_reliability'`.
+    ///
+    /// The other half of the frame function: it lets an observer set its own
+    /// trust in each evidence-locality pathway (e.g. `intra_self_cite` →
+    /// 0.2, `cross` → 1.0), overriding the per-frame / global intra-locality
+    /// factor. Same validation as [`Self::source_reliability`].
+    #[must_use]
+    pub fn locality_reliability(&self) -> Option<std::collections::HashMap<String, f64>> {
+        self.reliability_map("locality_reliability")
     }
 }
 
@@ -102,40 +119,63 @@ impl PerspectiveRepository {
         Ok(row)
     }
 
-    /// Set this perspective's source-reliability map (the frame function),
-    /// merging it into `properties` under the `source_reliability` key without
-    /// disturbing other `properties` entries.
-    ///
-    /// `reliability` maps an evidence-type tag (matching `mass_functions.
-    /// evidence_type`) to α ∈ [0,1]. Pass an empty map to clear the override
-    /// (the perspective then falls back to legacy own-BBA scoping).
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, reliability))]
-    pub async fn set_source_reliability(
+    /// Merge a `tag → factor` map into `properties.<field>` without disturbing
+    /// other `properties` entries. The path element is parameterised (bound as
+    /// `text[]`), so callers supply a static field name — no SQL injection.
+    #[instrument(skip(pool, map))]
+    async fn set_reliability_map(
         pool: &PgPool,
         id: Uuid,
-        reliability: &std::collections::HashMap<String, f64>,
+        field: &str,
+        map: &std::collections::HashMap<String, f64>,
     ) -> Result<(), DbError> {
-        let value = serde_json::to_value(reliability).unwrap_or(serde_json::Value::Null);
+        let value = serde_json::to_value(map).unwrap_or(serde_json::Value::Null);
         sqlx::query(
             r#"
             UPDATE perspectives
             SET properties = jsonb_set(
                 COALESCE(properties, '{}'::jsonb),
-                '{source_reliability}',
-                $2::jsonb,
+                ARRAY[$2]::text[],
+                $3::jsonb,
                 true
             )
             WHERE id = $1
             "#,
         )
         .bind(id)
+        .bind(field)
         .bind(value)
         .execute(pool)
         .await?;
         Ok(())
+    }
+
+    /// Set this perspective's source-reliability map (evidence-type tag → α ∈
+    /// [0,1]), merging into `properties.source_reliability`. Empty map clears
+    /// the override.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn set_source_reliability(
+        pool: &PgPool,
+        id: Uuid,
+        reliability: &std::collections::HashMap<String, f64>,
+    ) -> Result<(), DbError> {
+        Self::set_reliability_map(pool, id, "source_reliability", reliability).await
+    }
+
+    /// Set this perspective's locality-reliability map (`locality_tag` → factor
+    /// ∈ [0,1]), merging into `properties.locality_reliability`. Empty map
+    /// clears the override.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn set_locality_reliability(
+        pool: &PgPool,
+        id: Uuid,
+        reliability: &std::collections::HashMap<String, f64>,
+    ) -> Result<(), DbError> {
+        Self::set_reliability_map(pool, id, "locality_reliability", reliability).await
     }
 
     /// Ensure a synthetic "evidence_grounded" perspective row exists with the
@@ -322,6 +362,25 @@ mod tests {
         let map = row.source_reliability().expect("map present");
         assert!((map["western_clinical"] - 0.95).abs() < f64::EPSILON);
         assert!((map["practitioner_interview"] - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn locality_reliability_parses_independently_of_source() {
+        let row = make_row(Some(serde_json::json!({
+            "source_reliability": { "empirical": 0.9 },
+            "locality_reliability": { "intra_self_cite": 0.2, "cross": 1.0, "bad": 2.0 }
+        })));
+        let loc = row.locality_reliability().expect("locality map present");
+        assert!((loc["intra_self_cite"] - 0.2).abs() < f64::EPSILON);
+        assert!((loc["cross"] - 1.0).abs() < f64::EPSILON);
+        assert!(!loc.contains_key("bad"), "out-of-range factor dropped");
+        // The two maps are independent.
+        assert!(row.source_reliability().unwrap().contains_key("empirical"));
+        // Absent locality_reliability → None even when source_reliability is set.
+        let only_source = make_row(Some(
+            serde_json::json!({ "source_reliability": { "empirical": 0.9 } }),
+        ));
+        assert!(only_source.locality_reliability().is_none());
     }
 
     #[test]
