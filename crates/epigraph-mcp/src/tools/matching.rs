@@ -21,7 +21,7 @@ use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
-use epigraph_db::MatchCandidateRepo;
+use epigraph_db::{ClaimRepository, MatchCandidateRepo};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -139,6 +139,23 @@ pub async fn decide_match_candidate(
 
     match decision.as_str() {
         "promote" => {
+            // Guard: a CORROBORATES edge must connect two live claims. If
+            // either endpoint was superseded or marked duplicate (is_current =
+            // false) since the candidate was generated, promoting would create
+            // a structural inconsistency — an edge incident on a retired claim
+            // (backlog bug 5c7fc645). Refuse rather than write it.
+            if !ClaimRepository::are_all_current(&server.pool, &[row.claim_a, row.claim_b])
+                .await
+                .map_err(internal_error)?
+            {
+                return Err(invalid_params(format!(
+                    "cannot promote candidate {candidate_id}: a CORROBORATES edge requires both \
+                     claims to be current (is_current=true). One of {} / {} is superseded, a \
+                     duplicate, or missing.",
+                    row.claim_a, row.claim_b
+                )));
+            }
+
             repo.set_status(candidate_id, "promoted", Some(acting_agent))
                 .await
                 .map_err(internal_error)?;

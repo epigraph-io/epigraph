@@ -928,6 +928,31 @@ impl ClaimRepository {
         Ok(claims)
     }
 
+    /// Returns `true` iff **every** id in `ids` exists AND has
+    /// `is_current = true`.
+    ///
+    /// A missing id, a superseded claim (`is_current = false` via
+    /// [`Self::supersede`]), or a duplicate (via [`Self::mark_duplicate`])
+    /// all yield `false`. Used to guard structural-edge creation against
+    /// stale/duplicate endpoints — e.g. a CORROBORATES edge must not point at
+    /// a claim that has already been retired (backlog bug `5c7fc645`).
+    pub async fn are_all_current(pool: &PgPool, ids: &[uuid::Uuid]) -> Result<bool, DbError> {
+        if ids.is_empty() {
+            return Ok(true);
+        }
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM claims \
+             WHERE id = ANY($1) AND COALESCE(is_current, true) = true",
+        )
+        .bind(ids)
+        .fetch_one(pool)
+        .await?;
+        // Distinct ids must each be present-and-current. A missing or
+        // non-current id lowers the count below the distinct cardinality.
+        let distinct: std::collections::HashSet<&uuid::Uuid> = ids.iter().collect();
+        Ok(live as usize == distinct.len())
+    }
+
     /// List claims that contain ALL of the specified labels.
     ///
     /// Uses the GIN index on `claims.labels` for efficient `@>` containment queries.
