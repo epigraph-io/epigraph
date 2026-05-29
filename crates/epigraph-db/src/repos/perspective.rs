@@ -54,10 +54,19 @@ impl PerspectiveRow {
     ///
     /// This is one half of the "frame function": it lets one observer
     /// down-weight, say, `testimonial` evidence to 0.4 while another trusts it
-    /// at 1.0, yielding different beliefs over the *same* evidence. The value
-    /// overrides the per-frame / global calibration evidence-type weight for the
-    /// querying perspective. Returns `None` when the key is absent (no override)
-    /// and silently skips any entry that is not a finite number in `[0, 1]`.
+    /// at 1.0, yielding different beliefs over the *same* evidence.
+    ///
+    /// The value **replaces** (does not scale) the per-frame / global
+    /// calibration evidence-type weight for the querying perspective — it is an
+    /// absolute reliability, so it can *up-weight* an evidence type above the
+    /// global default as well as down-weight it (e.g. a traditional-medicine
+    /// perspective setting `practitioner_interview → 0.9` against a global
+    /// default below that). This replace-tier semantics is what distinguishes
+    /// the frame function from a pure multiplicative discount, which could only
+    /// reduce the global weight. A perspective with no entry for a tag falls
+    /// through to the per-frame / global weight unchanged. Returns `None` when
+    /// the key is absent (no override) and silently skips any entry that is not
+    /// a finite number in `[0, 1]`.
     #[must_use]
     pub fn source_reliability(&self) -> Option<std::collections::HashMap<String, f64>> {
         self.reliability_map("source_reliability")
