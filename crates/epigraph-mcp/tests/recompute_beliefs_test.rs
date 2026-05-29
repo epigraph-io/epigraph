@@ -52,6 +52,19 @@ async fn insert_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
     .unwrap()
 }
 
+async fn insert_claim_with_label(pool: &PgPool, agent: Uuid, content: &str, label: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current, labels)
+         VALUES ($1, sha256($1::bytea), 0.5, $2, true, ARRAY[$3]) RETURNING id",
+    )
+    .bind(content)
+    .bind(agent)
+    .bind(label)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 /// Give `claim_id` a real binary-frame BBA + cached belief.
 async fn wire_bba(pool: &PgPool, claim_id: Uuid, agent_id: Uuid) {
     tools::ds_auto::auto_wire_ds_update(
@@ -200,4 +213,60 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
     let j2 = result_json(out2);
     assert_eq!(j2["claims_considered"], 1);
     assert_eq!(j2["truncated"], false, "no claims remain after offset 1");
+}
+
+/// The labels path must report `truncated` honestly: true when more labeled
+/// claims remain past `limit`, and — critically — false when exactly `limit`
+/// claims exist and none remain (the bug the limit+1 fetch fixes).
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_labels_truncation_is_exact(pool: PgPool) {
+    let server = make_server(pool.clone());
+    let agent = insert_agent(&pool, "recompute-lbl").await;
+    let label = format!("rb-lbl-{}", Uuid::new_v4());
+    for i in 0..2 {
+        let c = insert_claim_with_label(
+            &pool,
+            agent,
+            &format!("recompute-lbl-{i}-{}", Uuid::new_v4()),
+            &label,
+        )
+        .await;
+        wire_bba(&pool, c, agent).await;
+    }
+
+    // limit=1 over 2 labeled claims → one remains → truncated.
+    let out = tools::cdst_maintenance::recompute_beliefs(
+        &server,
+        RecomputeBeliefsParams {
+            claim_ids: None,
+            labels: Some(vec![label.clone()]),
+            limit: Some(1),
+            offset: None,
+        },
+    )
+    .await
+    .expect("recompute_beliefs labels limit=1");
+    let j = result_json(out);
+    assert_eq!(j["target"], "labels");
+    assert_eq!(j["claims_considered"], 1);
+    assert_eq!(j["truncated"], true);
+
+    // limit=2 over exactly 2 labeled claims → none remain → NOT truncated.
+    let out2 = tools::cdst_maintenance::recompute_beliefs(
+        &server,
+        RecomputeBeliefsParams {
+            claim_ids: None,
+            labels: Some(vec![label]),
+            limit: Some(2),
+            offset: None,
+        },
+    )
+    .await
+    .expect("recompute_beliefs labels limit=2");
+    let j2 = result_json(out2);
+    assert_eq!(j2["claims_considered"], 2);
+    assert_eq!(
+        j2["truncated"], false,
+        "exactly limit claims, none remain — must not false-positive"
+    );
 }

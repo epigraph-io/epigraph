@@ -74,33 +74,37 @@ pub async fn recompute_beliefs(
     let claim_ids_param = params.claim_ids.unwrap_or_default();
     let labels_param = params.labels.unwrap_or_default();
 
-    let (target, claim_ids, truncated): (&'static str, Vec<Uuid>, bool) =
-        if !claim_ids_param.is_empty() {
-            let mut ids = Vec::with_capacity(claim_ids_param.len());
-            for s in &claim_ids_param {
-                ids.push(
-                    Uuid::parse_str(s.trim())
-                        .map_err(|e| invalid_params(format!("invalid claim_id {s:?}: {e}")))?,
-                );
-            }
-            ("claim_ids", ids, false)
-        } else if !labels_param.is_empty() {
-            let rows =
-                ClaimRepository::list_by_labels(pool, &labels_param, &[], true, 0.0, limit, offset)
-                    .await
-                    .map_err(internal_error)?;
-            let truncated = rows.len() as i64 == limit;
-            let ids: Vec<Uuid> = rows.into_iter().map(|(c, _)| c.id.into()).collect();
-            ("labels", ids, truncated)
-        } else {
-            // Fetch limit+1 to detect truncation, then trim back to limit.
-            let mut ids = MassFunctionRepository::list_claim_ids(pool, limit + 1, offset)
+    let (target, claim_ids, truncated): (&'static str, Vec<Uuid>, bool) = if !claim_ids_param
+        .is_empty()
+    {
+        let mut ids = Vec::with_capacity(claim_ids_param.len());
+        for s in &claim_ids_param {
+            ids.push(
+                Uuid::parse_str(s.trim())
+                    .map_err(|e| invalid_params(format!("invalid claim_id {s:?}: {e}")))?,
+            );
+        }
+        ("claim_ids", ids, false)
+    } else if !labels_param.is_empty() {
+        // Fetch limit+1 to distinguish "exactly limit, none remain" from
+        // "limit reached, more remain" (same trick as the bulk path).
+        let mut rows =
+            ClaimRepository::list_by_labels(pool, &labels_param, &[], true, 0.0, limit + 1, offset)
                 .await
                 .map_err(internal_error)?;
-            let truncated = ids.len() as i64 > limit;
-            ids.truncate(limit as usize);
-            ("all_with_bbas", ids, truncated)
-        };
+        let truncated = rows.len() as i64 > limit;
+        rows.truncate(limit as usize);
+        let ids: Vec<Uuid> = rows.into_iter().map(|(c, _)| c.id.into()).collect();
+        ("labels", ids, truncated)
+    } else {
+        // Fetch limit+1 to detect truncation, then trim back to limit.
+        let mut ids = MassFunctionRepository::list_claim_ids(pool, limit + 1, offset)
+            .await
+            .map_err(internal_error)?;
+        let truncated = ids.len() as i64 > limit;
+        ids.truncate(limit as usize);
+        ("all_with_bbas", ids, truncated)
+    };
 
     let claims_considered = claim_ids.len();
     let mut claims_recomputed = 0usize;
