@@ -155,6 +155,24 @@ async fn main() {
         }
     }
 
+    // Fail-closed JWT secret gate. Prod refuses to boot with an unset/dev
+    // secret; dev/CI opt out with EPIGRAPH_ALLOW_INSECURE_SECRET=1. The dev
+    // fallback in AppState::default_jwt_config is unchanged so the suite still
+    // compiles and runs.
+    let allow_insecure = std::env::var("EPIGRAPH_ALLOW_INSECURE_SECRET")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if !allow_insecure {
+        let secret = std::env::var("EPIGRAPH_JWT_SECRET").unwrap_or_default();
+        if let Err(reason) = epigraph_auth::assert_production_secret(secret.as_bytes()) {
+            eprintln!(
+                "FATAL: {reason}. Set a real EPIGRAPH_JWT_SECRET (>= 32 bytes, not the dev literal), \
+                 or set EPIGRAPH_ALLOW_INSECURE_SECRET=1 for local dev/CI."
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Configure API settings.
     //
     // `require_signatures` enables a packet-signature gate on the write path

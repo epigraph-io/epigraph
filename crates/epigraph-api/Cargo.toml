@@ -107,6 +107,10 @@ pkcs1 = "0.7"  # PKCS#1 encoding for RSA fixtures
 toml = "0.8"  # provider config TOML parsing in tests
 
 [[test]]
+name = "boot_secret_gate_test"
+path = "tests/boot_secret_gate_test.rs"
+
+[[test]]
 name = "graph_routes_test"
 path = "tests/graph_routes_test.rs"
 
