@@ -486,7 +486,12 @@ async fn unauthenticated_http_passes_scope_gate() {
     // bogus pool) — that's fine; we assert only that the failure is not
     // auth-shaped. Under the bug the body carried "no auth context" /
     // "requires scope 'claims:read'".
-    let auth_strings = ["Unauthorized", "Forbidden", "no auth context", "requires scope"];
+    let auth_strings = [
+        "Unauthorized",
+        "Forbidden",
+        "no auth context",
+        "requires scope",
+    ];
     for s in &auth_strings {
         assert!(
             !body.contains(s),
