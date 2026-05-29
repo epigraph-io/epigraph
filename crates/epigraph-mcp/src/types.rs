@@ -1416,3 +1416,29 @@ pub struct DecideMatchCandidateParams {
     #[schemars(description = "Decision: 'promote' (writes CORROBORATES edge) or 'reject'")]
     pub verdict: String,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecomputeBeliefsParams {
+    #[schemars(
+        description = "Explicit claim UUIDs to recompute. Highest-priority target selector — when present and non-empty, `labels` and the bulk enumeration are ignored."
+    )]
+    #[serde(default)]
+    pub claim_ids: Option<Vec<String>>,
+
+    #[schemars(
+        description = "Recompute every current claim carrying ALL of these labels (e.g. a paper's claim set). Used only when `claim_ids` is absent/empty."
+    )]
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+
+    #[schemars(
+        description = "Cap on the number of claims processed (default 500, max 2000). For the bulk path (no claim_ids/labels) this bounds the DISTINCT-claim enumeration and the response reports `truncated=true` when more remain — page with repeated calls or use the `epigraph-recompute-belief` CLI for full-DB rebuilds."
+    )]
+    pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Offset into the bulk DISTINCT-claim enumeration for pagination (default 0). Ignored when `claim_ids` or `labels` is given."
+    )]
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
