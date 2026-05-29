@@ -22,7 +22,12 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
     id
 }
 
-async fn seed_claim(pool: &PgPool, agent_id: Uuid, is_current: bool, supersedes: Option<Uuid>) -> Uuid {
+async fn seed_claim(
+    pool: &PgPool,
+    agent_id: Uuid,
+    is_current: bool,
+    supersedes: Option<Uuid>,
+) -> Uuid {
     let id = Uuid::new_v4();
     let hash: Vec<u8> = id
         .as_bytes()
@@ -62,9 +67,11 @@ async fn are_all_current_rejects_stale_or_missing(pool: PgPool) {
         .unwrap());
 
     // Any superseded endpoint → guard fails (the bug scenario).
-    assert!(!ClaimRepository::are_all_current(&pool, &[live_a, superseded])
-        .await
-        .unwrap());
+    assert!(
+        !ClaimRepository::are_all_current(&pool, &[live_a, superseded])
+            .await
+            .unwrap()
+    );
 
     // A missing id → guard fails.
     assert!(!ClaimRepository::are_all_current(&pool, &[live_a, missing])
