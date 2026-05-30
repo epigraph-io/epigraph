@@ -388,6 +388,51 @@ pub fn mint_token_with_agent(scopes: &[&str], agent_id: Uuid) -> String {
     token
 }
 
+/// Ensure `frames.properties` (JSONB) exists in the test database.
+///
+/// `migrations/044_frames_properties.sql` adds this column, and
+/// `FrameRepository::get_by_id` (called by `frame_claims_sorted` to verify the
+/// frame exists) SELECTs it on every read. The shared `epigraph_db_repo_test`
+/// DB may predate migration 044, so without the column `get_by_id` errors →
+/// HTTP 500 *before* the handler reaches the redaction branch — silently
+/// turning the A3 `frame_claims_sorted` regression guard RED. Mirrors
+/// `ensure_claim_encryption_table`: `IF NOT EXISTS` makes it a no-op on a DB
+/// where 044 has already run.
+pub async fn ensure_frame_properties_column(pool: &PgPool) {
+    sqlx::query("ALTER TABLE frames ADD COLUMN IF NOT EXISTS properties JSONB NOT NULL DEFAULT '{}'::jsonb")
+        .execute(pool)
+        .await
+        .expect("ensure frames.properties column");
+}
+
+/// Create a frame (≥2 hypotheses, per the `frames_not_empty` CHECK) and assign
+/// `claim_id` to it via `claim_frames`. Returns the new frame's id. Used by the
+/// A3 `frame_claims_sorted` (`GET /api/v1/frames/:id/claims`) tests: that handler
+/// 404s on a missing frame and JOINs `claim_frames cf JOIN claims c`, so the
+/// claim must be in the frame for it to appear in the page at all. Scoping the
+/// query to a fresh per-test frame also makes the seeded claim the only row,
+/// avoiding paging flakiness on the shared test DB.
+pub async fn seed_frame_with_claim(pool: &PgPool, claim_id: Uuid) -> Uuid {
+    let frame_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO frames (id, name, hypotheses) \
+         VALUES ($1, $2, ARRAY['h0','h1']::text[])",
+    )
+    .bind(frame_id)
+    .bind(format!("a3-test-frame-{frame_id}"))
+    .execute(pool)
+    .await
+    .expect("seed frame");
+
+    sqlx::query("INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2)")
+        .bind(claim_id)
+        .bind(frame_id)
+        .execute(pool)
+        .await
+        .expect("assign claim to frame");
+    frame_id
+}
+
 /// Mark `node_id` (a claim) as a `private` partition owned by `owner_id`.
 /// `check_content_access` returns Full only to a requester equal to
 /// `owner_id`; everyone else gets Redacted. `node_type` is NOT NULL with a
