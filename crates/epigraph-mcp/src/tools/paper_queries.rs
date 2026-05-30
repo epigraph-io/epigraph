@@ -7,7 +7,9 @@ use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
 use epigraph_crypto::ContentHasher;
+use epigraph_db::access_control::{check_content_access, ContentAccess};
 use epigraph_db::{ClaimRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository};
+use uuid::Uuid;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -34,6 +36,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 pub async fn query_paper(
     server: &EpiGraphMcpFull,
     params: QueryPaperParams,
+    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let paper = PaperRepository::find_by_doi(&server.pool, &params.doi)
         .await
@@ -67,11 +70,17 @@ pub async fn query_paper(
         .await
         .map_err(internal_error)?;
 
-    let claims = claim_rows
-        .into_iter()
-        .map(|c| ClaimResponse {
+    let mut claims = Vec::with_capacity(claim_rows.len());
+    for c in claim_rows {
+        let access = check_content_access(&server.pool, c.id, requester).await;
+        let content = if access == ContentAccess::Full {
+            c.content
+        } else {
+            "[REDACTED]".to_string()
+        };
+        claims.push(ClaimResponse {
             id: c.id.to_string(),
-            content: c.content,
+            content,
             truth_value: c.truth_value,
             agent_id: c.agent_id.to_string(),
             content_hash: ContentHasher::to_hex(&c.content_hash),
@@ -79,8 +88,8 @@ pub async fn query_paper(
             labels: Vec::new(),
             is_current: true,
             supersedes: None,
-        })
-        .collect();
+        });
+    }
 
     success_json(&PaperResponse {
         doi: paper.doi,
@@ -94,6 +103,7 @@ pub async fn query_paper(
 pub async fn query_claims_by_evidence(
     server: &EpiGraphMcpFull,
     params: QueryClaimsByEvidenceParams,
+    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
@@ -129,9 +139,15 @@ pub async fn query_claims_by_evidence(
         });
 
         if matches {
+            let access = check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
+            let content = if access == ContentAccess::Full {
+                claim.content.clone()
+            } else {
+                "[REDACTED]".to_string()
+            };
             results.push(ClaimResponse {
                 id: claim.id.as_uuid().to_string(),
-                content: claim.content.clone(),
+                content,
                 truth_value: claim.truth_value.value(),
                 agent_id: claim.agent_id.as_uuid().to_string(),
                 content_hash: ContentHasher::to_hex(&claim.content_hash),
@@ -153,6 +169,7 @@ pub async fn query_claims_by_evidence(
 pub async fn query_claims_by_methodology(
     server: &EpiGraphMcpFull,
     params: QueryClaimsByMethodologyParams,
+    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
@@ -176,9 +193,16 @@ pub async fn query_claims_by_methodology(
             {
                 let method_name = trace.methodology.description().to_lowercase();
                 if method_name.contains(&methodology_lower) {
+                    let access =
+                        check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
+                    let content = if access == ContentAccess::Full {
+                        claim.content.clone()
+                    } else {
+                        "[REDACTED]".to_string()
+                    };
                     results.push(ClaimResponse {
                         id: claim.id.as_uuid().to_string(),
-                        content: claim.content.clone(),
+                        content,
                         truth_value: claim.truth_value.value(),
                         agent_id: claim.agent_id.as_uuid().to_string(),
                         content_hash: ContentHasher::to_hex(&claim.content_hash),
@@ -202,6 +226,7 @@ pub async fn query_claims_by_methodology(
 pub async fn query_claims_by_label(
     server: &EpiGraphMcpFull,
     params: QueryClaimsByLabelParams,
+    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
@@ -227,11 +252,17 @@ pub async fn query_claims_by_label(
     .await
     .map_err(internal_error)?;
 
-    let results: Vec<ClaimResponse> = rows
-        .into_iter()
-        .map(|(c, labels)| ClaimResponse {
+    let mut results: Vec<ClaimResponse> = Vec::with_capacity(rows.len());
+    for (c, labels) in rows {
+        let access = check_content_access(&server.pool, c.id.as_uuid(), requester).await;
+        let content = if access == ContentAccess::Full {
+            c.content.clone()
+        } else {
+            "[REDACTED]".to_string()
+        };
+        results.push(ClaimResponse {
             id: c.id.as_uuid().to_string(),
-            content: c.content.clone(),
+            content,
             truth_value: c.truth_value.value(),
             agent_id: c.agent_id.as_uuid().to_string(),
             content_hash: ContentHasher::to_hex(&c.content_hash),
@@ -239,8 +270,8 @@ pub async fn query_claims_by_label(
             labels,
             is_current: c.is_current,
             supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
-        })
-        .collect();
+        });
+    }
 
     success_json(&results)
 }

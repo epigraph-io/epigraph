@@ -12,8 +12,12 @@ use epigraph_core::{
     TruthValue,
 };
 use epigraph_crypto::ContentHasher;
+use epigraph_db::access_control::{
+    batch_check_content_access, check_content_access, ContentAccess,
+};
 use epigraph_db::PatchClaimInput;
 use epigraph_db::{ClaimRepository, EdgeRepository, EvidenceRepository, ReasoningTraceRepository};
+use uuid::Uuid;
 
 fn parse_methodology(s: &str) -> Result<Methodology, String> {
     match s.to_lowercase().replace('-', "_").as_str() {
@@ -248,6 +252,7 @@ pub async fn submit_claim(
 pub async fn query_claims(
     server: &EpiGraphMcpFull,
     params: QueryClaimsParams,
+    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min = params.min_truth.unwrap_or(0.0);
@@ -259,11 +264,21 @@ pub async fn query_claims(
         .await
         .map_err(internal_error)?;
 
+    // Redact PRIVATE content the requester cannot read (A3 §7.5). The batch
+    // helper returns `(id, access)` in input order, so zipping is safe.
+    let ids: Vec<Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
+    let access = batch_check_content_access(&server.pool, &ids, requester).await;
+
     let results: Vec<ClaimResponse> = claims
         .into_iter()
-        .map(|c| ClaimResponse {
+        .zip(access)
+        .map(|(c, (_id, acc))| ClaimResponse {
             id: c.id.as_uuid().to_string(),
-            content: c.content.clone(),
+            content: if acc == ContentAccess::Full {
+                c.content.clone()
+            } else {
+                "[REDACTED]".into()
+            },
             truth_value: c.truth_value.value(),
             agent_id: c.agent_id.as_uuid().to_string(),
             content_hash: ContentHasher::to_hex(&c.content_hash),
@@ -280,6 +295,7 @@ pub async fn query_claims(
 pub async fn get_claim(
     server: &EpiGraphMcpFull,
     params: GetClaimParams,
+    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
     let claim_id = ClaimId::from_uuid(id);
@@ -290,6 +306,11 @@ pub async fn get_claim(
     let labels = ClaimRepository::get_labels(&server.pool, claim_id)
         .await
         .map_err(internal_error)?;
+    let access = check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
+    let content = match access {
+        ContentAccess::Full => claim.content.clone(),
+        ContentAccess::Redacted => "[REDACTED]".to_string(),
+    };
     // Cached CDST classification ('supported' | 'contradicted' |
     // 'not_enough_info' | null). Flattened onto the standard claim response so
     // existing `ClaimResponse` consumers are unaffected.
@@ -307,7 +328,7 @@ pub async fn get_claim(
     success_json(&GetClaimResponse {
         claim: ClaimResponse {
             id: claim.id.as_uuid().to_string(),
-            content: claim.content.clone(),
+            content,
             truth_value: claim.truth_value.value(),
             agent_id: claim.agent_id.as_uuid().to_string(),
             content_hash: ContentHasher::to_hex(&claim.content_hash),

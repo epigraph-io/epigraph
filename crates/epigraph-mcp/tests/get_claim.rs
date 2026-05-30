@@ -31,6 +31,7 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
         GetClaimParams {
             claim_id: open_id.as_uuid().to_string(),
         },
+        None,
     )
     .await
     .expect("get_claim open");
@@ -56,6 +57,7 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
         GetClaimParams {
             claim_id: superseded_id.as_uuid().to_string(),
         },
+        None,
     )
     .await
     .expect("get_claim superseded");

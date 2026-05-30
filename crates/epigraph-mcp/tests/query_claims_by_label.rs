@@ -39,6 +39,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
+        None,
     )
     .await
     .expect("query_claims_by_label default");
@@ -83,6 +84,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
+        None,
     )
     .await
     .expect("query_claims_by_label exclude_labels");
@@ -107,6 +109,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
+        None,
     )
     .await
     .expect("query_claims_by_label current_only");
@@ -131,6 +134,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
+        None,
     )
     .await
     .expect("query_claims_by_label both filters");

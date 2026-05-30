@@ -139,6 +139,7 @@ async fn get_claim_exposes_classification(pool: PgPool) {
         GetClaimParams {
             claim_id: claim.to_string(),
         },
+        None,
     )
     .await
     .expect("get_claim");
