@@ -173,3 +173,39 @@ async fn list_claims_no_token_spoofed_owner_is_redacted() {
         "no-token spoof must not reveal private content in list_claims"
     );
 }
+
+/// claims_by_belief (GET /api/v1/claims/by-belief) must redact a private
+/// claim for a no-token caller spoofing ?agent_id=<owner>. Seeded claim has
+/// truth_value 0.5; we filter min_belief=0.0 max_plausibility=1.0 so it is
+/// returned regardless of belief column nulls (belief>=0 covers NULL? no —
+/// so we set belief explicitly below).
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_by_belief_no_token_spoofed_owner_is_redacted() {
+    let (pool, addr, _shutdown) = pool_and_app().await;
+    let owner = Uuid::new_v4();
+    let claim_id = common::seed_claim_with_agent(&pool, "BELIEF private secret body", owner).await;
+    // claims_by_belief filters on c.belief / c.plausibility; ensure non-null
+    // values inside the default [0.0, 1.0] window so the row is returned.
+    sqlx::query("UPDATE claims SET belief = 0.5, plausibility = 0.9 WHERE id = $1")
+        .bind(claim_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    common::seed_private_ownership(&pool, claim_id, owner).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/claims/by-belief?min_belief=0.0&max_plausibility=1.0&limit=100&agent_id={owner}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let rows: serde_json::Value = resp.json().await.unwrap();
+    let arr = rows.as_array().expect("array of belief rows");
+    let found = arr
+        .iter()
+        .find(|it| it.get("id").and_then(|v| v.as_str()) == Some(claim_id.to_string().as_str()))
+        .expect("seeded claim present");
+    assert_eq!(content_of(found), "[REDACTED]");
+}
