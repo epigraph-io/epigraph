@@ -209,7 +209,32 @@ async fn main() {
             .expect("Failed to apply pending migrations");
         tracing::info!("Migrations up to date");
 
-        let job_pool = pool.clone();
+        // Dedicated pool for background jobs with a per-connection
+        // `statement_timeout`, so a runaway clustering query — or a backend
+        // orphaned by a hard restart — self-aborts instead of grinding for
+        // hours and saturating Postgres (incident 2026-05-29). Kept separate
+        // from the API pool so the cap never affects request handling.
+        let job_statement_timeout = std::time::Duration::from_millis(
+            std::env::var("EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2_700_000), // 45 minutes
+        );
+        let job_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(8)
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    epigraph_jobs::apply_job_connection_settings(conn, job_statement_timeout).await
+                })
+            })
+            .connect(&database_url)
+            .await
+            .expect("Failed to create background job pool");
+        tracing::info!(
+            statement_timeout_ms = job_statement_timeout.as_millis() as u64,
+            "Background job pool ready"
+        );
+
         let state = AppState::with_db(pool, config).with_embedding_service(embedding_service);
         (state, job_pool)
     };
@@ -245,6 +270,9 @@ async fn main() {
         let queue: Arc<dyn JobQueue> = Arc::new(PostgresJobQueue::new(job_pool.clone()));
         let queue_for_cluster_cron = Arc::clone(&queue);
         let queue_for_theme_cron = Arc::clone(&queue);
+        // Concrete handle for the stale-job reaper (recover_stale_jobs is a
+        // PostgresJobQueue method, not part of the JobQueue trait).
+        let reaper_queue = PostgresJobQueue::new(job_pool.clone());
 
         let handler_pool = Arc::new(job_pool);
         let mut runner = JobRunner::new(2, queue);
@@ -260,6 +288,27 @@ async fn main() {
             runner.start().await;
         });
 
+        // Reaper: a process hard-killed mid-run leaves its job stuck in
+        // `running` forever (there is no graceful shutdown). Periodically reset
+        // such rows to `pending` so the nightly is re-attempted rather than
+        // wedged. The 90-min threshold exceeds the 45-min statement_timeout, so
+        // a legitimately running job is never reset out from under itself. The
+        // first iteration runs immediately and clears the previous process's
+        // orphans on boot.
+        tokio::spawn(async move {
+            let stale_after = Duration::from_secs(90 * 60);
+            loop {
+                match reaper_queue.recover_stale_jobs(stale_after).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::warn!(recovered = n, "reaper: reset stale running jobs to pending")
+                    }
+                    Err(e) => tracing::error!(error = %e, "reaper: recover_stale_jobs failed"),
+                }
+                tokio::time::sleep(Duration::from_secs(15 * 60)).await;
+            }
+        });
+
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(60)).await;
             loop {
@@ -269,16 +318,16 @@ async fn main() {
                 })
                 .into_job()
                 {
-                    Ok(job) => {
-                        if let Err(e) = queue_for_cluster_cron.enqueue(job).await {
-                            tracing::error!(
-                                error = %e,
-                                "failed to enqueue nightly ClusterGraph job"
-                            );
-                        } else {
-                            tracing::info!("Enqueued nightly ClusterGraph job");
-                        }
-                    }
+                    Ok(job) => match queue_for_cluster_cron.enqueue_unique_pending(job).await {
+                        Ok(Some(_)) => tracing::info!("Enqueued nightly ClusterGraph job"),
+                        Ok(None) => tracing::info!(
+                            "ClusterGraph already pending; skipped duplicate nightly enqueue"
+                        ),
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "failed to enqueue nightly ClusterGraph job"
+                        ),
+                    },
                     Err(e) => {
                         tracing::error!(
                             error = %e,
@@ -306,16 +355,16 @@ async fn main() {
                 })
                 .into_job()
                 {
-                    Ok(job) => {
-                        if let Err(e) = queue_for_theme_cron.enqueue(job).await {
-                            tracing::error!(
-                                error = %e,
-                                "failed to enqueue nightly ThemeClusterRebuild job"
-                            );
-                        } else {
-                            tracing::info!("Enqueued nightly ThemeClusterRebuild job");
-                        }
-                    }
+                    Ok(job) => match queue_for_theme_cron.enqueue_unique_pending(job).await {
+                        Ok(Some(_)) => tracing::info!("Enqueued nightly ThemeClusterRebuild job"),
+                        Ok(None) => tracing::info!(
+                            "ThemeClusterRebuild already pending; skipped duplicate nightly enqueue"
+                        ),
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "failed to enqueue nightly ThemeClusterRebuild job"
+                        ),
+                    },
                     Err(e) => {
                         tracing::error!(
                             error = %e,
