@@ -261,6 +261,62 @@ impl JobQueue for PostgresJobQueue {
         Ok(job.id)
     }
 
+    /// Enqueue only if no job of the same `job_type` is currently `pending`.
+    ///
+    /// Implemented as a single `INSERT ... SELECT ... WHERE NOT EXISTS` so the
+    /// check-and-insert is one statement. Returns `Ok(None)` when a pending
+    /// job of that type already exists (nothing inserted).
+    ///
+    /// Note: a vanishingly small race remains if two processes insert in the
+    /// same instant (each cron fires at most once per boot). That is harmless
+    /// here — execution is additionally serialized by an advisory lock
+    /// (`run_serialized`), so any duplicate that slips through runs as a no-op.
+    #[instrument(skip(self, job), fields(job_id = %job.id, job_type = %job.job_type))]
+    async fn enqueue_unique_pending(&self, job: Job) -> Result<Option<JobId>, JobError> {
+        let id: Uuid = job.id.into();
+        let state_str = job_state_to_str(job.state);
+
+        let result = sqlx::query(
+            r"
+            INSERT INTO jobs (
+                id, job_type, payload, state, retry_count, max_retries,
+                created_at, updated_at, started_at, completed_at, error_message
+            )
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+            WHERE NOT EXISTS (
+                SELECT 1 FROM jobs WHERE job_type = $2 AND state = 'pending'
+            )
+            ",
+        )
+        .bind(id)
+        .bind(&job.job_type)
+        .bind(&job.payload)
+        .bind(state_str)
+        .bind(job.retry_count as i32)
+        .bind(job.max_retries as i32)
+        .bind(job.created_at)
+        .bind(job.updated_at)
+        .bind(job.started_at)
+        .bind(job.completed_at)
+        .bind(&job.error_message)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to enqueue (unique pending): {e}"),
+        })?;
+
+        if result.rows_affected() == 0 {
+            tracing::debug!(
+                job_type = %job.job_type,
+                "enqueue_unique_pending: a pending job of this type already exists; skipped"
+            );
+            Ok(None)
+        } else {
+            tracing::debug!(job_id = %job.id, "enqueue_unique_pending: enqueued");
+            Ok(Some(job.id))
+        }
+    }
+
     /// Dequeue the next pending job for processing.
     ///
     /// Uses `FOR UPDATE SKIP LOCKED` to safely handle concurrent workers:
