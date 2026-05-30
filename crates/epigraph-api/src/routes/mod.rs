@@ -99,7 +99,10 @@ pub mod webhooks;
 pub mod workflows;
 
 use crate::metrics;
-use crate::middleware::{bearer_auth_middleware, rate_limit_middleware, require_signature};
+use crate::middleware::{
+    bearer_auth_middleware, optional_bearer_auth_middleware, rate_limit_middleware,
+    require_signature,
+};
 use crate::state::AppState;
 use axum::{
     extract::DefaultBodyLimit,
@@ -758,6 +761,15 @@ pub fn create_router(state: AppState) -> Router {
         // MCP tool discovery — no auth required
         .route("/api/v1/mcp/tools", get(mcp_tools::list_mcp_tools));
 
+    // Inject authenticated identity on public reads (no 401 when absent;
+    // 401 on a present-but-invalid token). Lets partition-aware redaction
+    // (check_content_access) trust auth_ctx instead of the spoofable
+    // ?agent_id wire param. (A3, spec §7.2)
+    let public = public.layer(middleware::from_fn_with_state(
+        state.clone(),
+        optional_bearer_auth_middleware,
+    ));
+
     // OAuth2 endpoints (public, no auth required)
     let oauth = Router::new()
         .route("/oauth/token", post(crate::oauth::token_endpoint))
@@ -1134,6 +1146,13 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/mirror-narratives",
             get(political::mirror_narratives),
         );
+
+    // Inject authenticated identity on public reads (no 401 when absent;
+    // 401 on a present-but-invalid token). (A3, spec §7.2)
+    let public = public.layer(middleware::from_fn_with_state(
+        state.clone(),
+        optional_bearer_auth_middleware,
+    ));
 
     // OAuth2 endpoints (public, no auth required)
     let oauth = Router::new()
