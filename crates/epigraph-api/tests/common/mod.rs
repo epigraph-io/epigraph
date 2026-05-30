@@ -334,8 +334,12 @@ pub async fn test_bearer_token_with_seeded_client(
 
 /// Mint a real JWT whose `agent_id` claim equals `agent_id`. Used by A3
 /// read-path tests to produce OWNER (agent_id == ownership.owner_id) and
-/// STRANGER (random agent_id) tokens that the production
-/// optional_bearer_auth_middleware will accept and inject as AuthContext.
+/// STRANGER (random agent_id) tokens. The production
+/// optional_bearer_auth_middleware accepts the token and injects it as
+/// `AuthContext`; the redaction handlers (`get_claim`, `list_claims`) derive
+/// the requester from `auth_ctx.agent_id` (falling back to `client_id`), NOT
+/// the query-string `agent_id`, so this token — and only this token — drives
+/// the OWNER (Full) vs STRANGER (Redacted) distinction.
 pub fn mint_token_with_agent(scopes: &[&str], agent_id: Uuid) -> String {
     let secret = std::env::var("EPIGRAPH_JWT_SECRET")
         .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
