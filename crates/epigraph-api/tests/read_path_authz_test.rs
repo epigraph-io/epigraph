@@ -795,8 +795,11 @@ async fn graph_full_no_token_spoofed_owner_redacts_node_label() {
 }
 
 /// execute_graph_query (POST /api/v1/graph/query) reads agent_id from the
-/// JSON body. A no-token request with body agent_id == owner (spoof) must
-/// still redact the private claim node's label.
+/// JSON body. DISCRIMINATING PAIR (mirrors graph_full): a no-token caller with
+/// body agent_id == owner (spoof) sees label == "[REDACTED]", while the owner
+/// token (random spoofed body agent_id) sees the real label. The owner half
+/// proves the redaction is token-driven — not "graph_query always redacts" or
+/// "the body agent_id is still trusted" — and doubles as the presence proof.
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_query_no_token_spoofed_owner_is_redacted() {
     let (pool, addr, _shutdown) = pool_and_app().await;
@@ -805,10 +808,23 @@ async fn graph_query_no_token_spoofed_owner_is_redacted() {
         common::seed_claim_with_agent(&pool, "GQL private secret body", owner).await;
     common::seed_private_ownership(&pool, claim_id, owner).await;
 
-    // MATCH (n:claim) RETURN * with no WHERE returns all claims (capped).
-    // The shared test DB holds >200 claims and the handler default LIMIT is
-    // 200 with no ORDER BY, so raise the explicit limit to the handler cap
-    // (1000) to guarantee the freshly-seeded claim is in the result window.
+    let find_node_label = |body: &serde_json::Value| -> Option<String> {
+        body.get("nodes")
+            .and_then(|n| n.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|n| n.get("id").and_then(|v| v.as_str())
+                        == Some(claim_id.to_string().as_str()))
+                    .and_then(|n| n.get("label").and_then(|l| l.as_str()))
+                    .map(|s| s.to_string())
+            })
+    };
+
+    // No-token spoof of the owner agent_id in the body: node label redacted.
+    // MATCH (n:claim) RETURN * with no WHERE returns all claims (capped). The
+    // shared test DB holds >200 claims and the handler default LIMIT is 200
+    // with no ORDER BY, so raise the explicit limit to the handler cap (1000)
+    // to guarantee the freshly-seeded claim is in the result window.
     let body = serde_json::json!({
         "query": "MATCH (n:claim) RETURN * LIMIT 1000",
         "agent_id": owner.to_string()
@@ -821,21 +837,37 @@ async fn graph_query_no_token_spoofed_owner_is_redacted() {
         .unwrap();
     assert_eq!(resp.status(), 200, "graph query returns 200");
     let resp_body: serde_json::Value = resp.json().await.unwrap();
-    let nodes = resp_body.get("nodes").and_then(|n| n.as_array()).expect("nodes array");
-    let found = nodes
-        .iter()
-        .find(|n| n.get("id").and_then(|v| v.as_str()) == Some(claim_id.to_string().as_str()));
-    if let Some(node) = found {
-        // graph_query redacts into the node `label` field, not `content`.
-        assert_eq!(
-            node.get("label").and_then(|l| l.as_str()),
-            Some("[REDACTED]"),
-            "private claim node label must be redacted under no-token spoof"
-        );
-    } else {
-        // If the cap excluded our claim, the test cannot discriminate.
-        // Narrow with a WHERE on truth_value or raise the implicit limit is
-        // not exposed; instead assert it WAS found.
-        panic!("seeded claim not present in graph query result; widen the match");
-    }
+    // graph_query redacts into the node `label` field, not `content`. The cap
+    // (1000) must include our just-seeded claim; absence means the test can't
+    // discriminate, so require presence here too.
+    let label = find_node_label(&resp_body)
+        .expect("seeded claim not present in graph query result; widen the match");
+    assert_eq!(
+        label, "[REDACTED]",
+        "private claim node label must be redacted under no-token spoof"
+    );
+
+    // Owner token with a RANDOM (spoofed) body agent_id: node present AND label
+    // is the real content. Proves redaction is token-driven and that the body
+    // agent_id field is no longer trusted for access.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let owner_body = serde_json::json!({
+        "query": "MATCH (n:claim) RETURN * LIMIT 1000",
+        "agent_id": Uuid::new_v4().to_string()
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/graph/query"))
+        .bearer_auth(&owner_token)
+        .json(&owner_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "graph query returns 200 for owner");
+    let resp_body: serde_json::Value = resp.json().await.unwrap();
+    let label = find_node_label(&resp_body)
+        .expect("private claim node present in graph query result for owner");
+    assert_eq!(
+        label, "GQL private secret body",
+        "owner token must see the full node label even with a spoofed body agent_id"
+    );
 }
