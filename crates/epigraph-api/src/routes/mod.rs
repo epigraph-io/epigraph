@@ -762,9 +762,17 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/mcp/tools", get(mcp_tools::list_mcp_tools));
 
     // Inject authenticated identity on public reads (no 401 when absent;
-    // 401 on a present-but-invalid token). Lets partition-aware redaction
-    // (check_content_access) trust auth_ctx instead of the spoofable
-    // ?agent_id wire param. (A3, spec §7.2)
+    // 401 on a present-but-invalid token). This makes auth_ctx AVAILABLE to
+    // every public read handler so partition-aware redaction
+    // (check_content_access) can trust it instead of the spoofable ?agent_id
+    // wire param. (A3, spec §7.2)
+    //
+    // NOTE: availability != adoption. Only claims::{get_claim,list_claims}
+    // consume auth_ctx today. The sibling read handlers still pass the
+    // spoofable params.agent_id and remain live bypasses until migrated:
+    //   - belief::{claims_by_belief,frame_claims_sorted}      -> A3 Task 6
+    //   - edges.rs read handlers + evidence_by_relationship   -> A3 Task 7
+    //   - graph_query::execute_graph_query                    -> A3 Task 8
     let public = public.layer(middleware::from_fn_with_state(
         state.clone(),
         optional_bearer_auth_middleware,

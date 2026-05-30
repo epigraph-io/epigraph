@@ -16,6 +16,11 @@ async fn pool_and_app() -> (sqlx::PgPool, std::net::SocketAddr, tokio::sync::one
         .connect(&url)
         .await
         .unwrap();
+    // get_claim unconditionally queries `claim_encryption` (an out-of-tree
+    // table no migration creates). Without it the handler 500s before reaching
+    // the redaction branch, silently turning this regression guard RED on the
+    // standard epigraph_db_repo_test DB. Provision it so the suite is runnable.
+    common::ensure_claim_encryption_table(&pool).await;
     let (addr, shutdown) = common::spawn_app(&url).await;
     (pool, addr, shutdown)
 }

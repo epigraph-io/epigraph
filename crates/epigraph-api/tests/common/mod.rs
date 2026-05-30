@@ -332,6 +332,37 @@ pub async fn test_bearer_token_with_seeded_client(
     (token, client_id)
 }
 
+/// Ensure the `claim_encryption` table exists in the test database.
+///
+/// `claim_encryption` is an enterprise / out-of-tree table: it is queried by
+/// `get_claim` (`ClaimEncryptionRepository::get_by_claim_id_conn`) on every
+/// read, but NO migration in `/migrations` creates it. On the standard
+/// `epigraph_db_repo_test` DB the column is therefore absent, so `get_claim`
+/// errors -> HTTP 500 *before* it ever reaches the redaction branch — which
+/// silently turns the A3 read-path regression guard RED in CI.
+///
+/// This creates a minimal table (columns matching `ClaimEncryptionRow`, the
+/// shape `get_by_claim_id_conn` SELECTs) so the encryption query returns zero
+/// rows for an unencrypted test claim instead of erroring. The A3 tests never
+/// INSERT here, so no FKs/CHECKs are needed; `IF NOT EXISTS` makes it a no-op
+/// when the table is already present (e.g. a prod-shaped DB).
+pub async fn ensure_claim_encryption_table(pool: &PgPool) {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS claim_encryption ( \
+             claim_id uuid PRIMARY KEY, \
+             group_id uuid NOT NULL, \
+             epoch integer NOT NULL, \
+             privacy_tier varchar(20) NOT NULL, \
+             encrypted_content bytea NOT NULL, \
+             encrypted_labels bytea, \
+             created_at timestamptz NOT NULL DEFAULT now() \
+         )",
+    )
+    .execute(pool)
+    .await
+    .expect("ensure claim_encryption table");
+}
+
 /// Mint a real JWT whose `agent_id` claim equals `agent_id`. Used by A3
 /// read-path tests to produce OWNER (agent_id == ownership.owner_id) and
 /// STRANGER (random agent_id) tokens. The production
