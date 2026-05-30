@@ -96,7 +96,7 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
 
-    // Owner requester → full content.
+    // Owner requester → full content AND the real content_hash.
     let owner_body = parse_claim(
         &get_claim(
             &server,
@@ -113,8 +113,16 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
         expected_content,
         "owner must see the full private content"
     );
+    assert!(
+        !owner_body["content_hash"].as_str().unwrap().is_empty(),
+        "owner must see the real content_hash (proves blanking is conditional, \
+         not always-blank): {owner_body:?}"
+    );
 
-    // Stranger requester (a different, non-owner agent id) → redacted.
+    // Stranger requester (a different, non-owner agent id) → content AND
+    // content_hash both redacted. The hash assertion guards the
+    // confirmation-oracle leak: content_hash = BLAKE3(content), so leaking it
+    // for a redacted claim re-exposes the redacted field.
     let stranger = Uuid::new_v4();
     let stranger_body = parse_claim(
         &get_claim(
@@ -132,6 +140,12 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
         "[REDACTED]",
         "stranger must NOT see private content — this fails if the redaction \
          branch is deleted or inverted"
+    );
+    assert_eq!(
+        stranger_body["content_hash"].as_str().unwrap(),
+        "",
+        "stranger must NOT see the content_hash — BLAKE3(content) is a \
+         confirmation oracle for the redacted content"
     );
 }
 

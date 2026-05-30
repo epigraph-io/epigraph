@@ -264,33 +264,35 @@ pub async fn query_claims(
         .await
         .map_err(internal_error)?;
 
-    // Redact PRIVATE content the requester cannot read (A3 §7.5). The batch
-    // helper returns `(id, access)` in input order, so zipping is safe.
+    // Redact PRIVATE content the requester cannot read (A3 §7.5). Build a
+    // per-id access map and look each claim's decision up BY ITS OWN ID rather
+    // than positionally zipping the batch result. The lookup fails closed
+    // (`unwrap_or(Redacted)`), so a future reorder — or any id the batch helper
+    // fails to return — redacts rather than leaks. This is a durable runtime
+    // guard, not a debug-only tripwire.
     let ids: Vec<Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
-    let access = batch_check_content_access(&server.pool, &ids, requester).await;
+    let access_map: std::collections::HashMap<Uuid, ContentAccess> =
+        batch_check_content_access(&server.pool, &ids, requester)
+            .await
+            .into_iter()
+            .collect();
 
     let results: Vec<ClaimResponse> = claims
         .into_iter()
-        .zip(access)
-        .map(|(c, (_id, acc))| {
-            // Authz-critical aliasing guard: the batch helper returns ids in
-            // input order, so the zip pairs each claim with its OWN access
-            // decision. If a future reorder of the helper broke that, the
-            // access decision would land on the wrong claim's content — a leak.
-            debug_assert!(
-                _id == c.id.as_uuid(),
-                "batch_check_content_access result misaligned with claim order"
-            );
+        .map(|c| {
+            let id = c.id.as_uuid();
+            let access = access_map
+                .get(&id)
+                .copied()
+                .unwrap_or(ContentAccess::Redacted);
+            let (content, content_hash) =
+                crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
             ClaimResponse {
-                id: c.id.as_uuid().to_string(),
-                content: if acc == ContentAccess::Full {
-                    c.content.clone()
-                } else {
-                    "[REDACTED]".into()
-                },
+                id: id.to_string(),
+                content,
                 truth_value: c.truth_value.value(),
                 agent_id: c.agent_id.as_uuid().to_string(),
-                content_hash: ContentHasher::to_hex(&c.content_hash),
+                content_hash,
                 created_at: c.created_at.to_rfc3339(),
                 labels: Vec::new(),
                 is_current: true,
@@ -317,10 +319,8 @@ pub async fn get_claim(
         .await
         .map_err(internal_error)?;
     let access = check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
-    let content = match access {
-        ContentAccess::Full => claim.content.clone(),
-        ContentAccess::Redacted => "[REDACTED]".to_string(),
-    };
+    let (content, content_hash) =
+        crate::tools::redaction::redact_content(access, &claim.content, &claim.content_hash);
     // Cached CDST classification ('supported' | 'contradicted' |
     // 'not_enough_info' | null). Flattened onto the standard claim response so
     // existing `ClaimResponse` consumers are unaffected.
@@ -341,7 +341,7 @@ pub async fn get_claim(
             content,
             truth_value: claim.truth_value.value(),
             agent_id: claim.agent_id.as_uuid().to_string(),
-            content_hash: ContentHasher::to_hex(&claim.content_hash),
+            content_hash,
             created_at: claim.created_at.to_rfc3339(),
             labels,
             is_current: claim.is_current,

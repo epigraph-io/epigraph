@@ -6,8 +6,7 @@ use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
-use epigraph_crypto::ContentHasher;
-use epigraph_db::access_control::{check_content_access, ContentAccess};
+use epigraph_db::access_control::check_content_access;
 use epigraph_db::{ClaimRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository};
 use uuid::Uuid;
 
@@ -73,17 +72,14 @@ pub async fn query_paper(
     let mut claims = Vec::with_capacity(claim_rows.len());
     for c in claim_rows {
         let access = check_content_access(&server.pool, c.id, requester).await;
-        let content = if access == ContentAccess::Full {
-            c.content
-        } else {
-            "[REDACTED]".to_string()
-        };
+        let (content, content_hash) =
+            crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
         claims.push(ClaimResponse {
             id: c.id.to_string(),
             content,
             truth_value: c.truth_value,
             agent_id: c.agent_id.to_string(),
-            content_hash: ContentHasher::to_hex(&c.content_hash),
+            content_hash,
             created_at: c.created_at.to_rfc3339(),
             labels: Vec::new(),
             is_current: true,
@@ -140,17 +136,17 @@ pub async fn query_claims_by_evidence(
 
         if matches {
             let access = check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
-            let content = if access == ContentAccess::Full {
-                claim.content.clone()
-            } else {
-                "[REDACTED]".to_string()
-            };
+            let (content, content_hash) = crate::tools::redaction::redact_content(
+                access,
+                &claim.content,
+                &claim.content_hash,
+            );
             results.push(ClaimResponse {
                 id: claim.id.as_uuid().to_string(),
                 content,
                 truth_value: claim.truth_value.value(),
                 agent_id: claim.agent_id.as_uuid().to_string(),
-                content_hash: ContentHasher::to_hex(&claim.content_hash),
+                content_hash,
                 created_at: claim.created_at.to_rfc3339(),
                 labels: Vec::new(),
                 is_current: true,
@@ -195,17 +191,17 @@ pub async fn query_claims_by_methodology(
                 if method_name.contains(&methodology_lower) {
                     let access =
                         check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
-                    let content = if access == ContentAccess::Full {
-                        claim.content.clone()
-                    } else {
-                        "[REDACTED]".to_string()
-                    };
+                    let (content, content_hash) = crate::tools::redaction::redact_content(
+                        access,
+                        &claim.content,
+                        &claim.content_hash,
+                    );
                     results.push(ClaimResponse {
                         id: claim.id.as_uuid().to_string(),
                         content,
                         truth_value: claim.truth_value.value(),
                         agent_id: claim.agent_id.as_uuid().to_string(),
-                        content_hash: ContentHasher::to_hex(&claim.content_hash),
+                        content_hash,
                         created_at: claim.created_at.to_rfc3339(),
                         labels: Vec::new(),
                         is_current: true,
@@ -255,17 +251,14 @@ pub async fn query_claims_by_label(
     let mut results: Vec<ClaimResponse> = Vec::with_capacity(rows.len());
     for (c, labels) in rows {
         let access = check_content_access(&server.pool, c.id.as_uuid(), requester).await;
-        let content = if access == ContentAccess::Full {
-            c.content.clone()
-        } else {
-            "[REDACTED]".to_string()
-        };
+        let (content, content_hash) =
+            crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
         results.push(ClaimResponse {
             id: c.id.as_uuid().to_string(),
             content,
             truth_value: c.truth_value.value(),
             agent_id: c.agent_id.as_uuid().to_string(),
-            content_hash: ContentHasher::to_hex(&c.content_hash),
+            content_hash,
             created_at: c.created_at.to_rfc3339(),
             labels,
             is_current: c.is_current,
