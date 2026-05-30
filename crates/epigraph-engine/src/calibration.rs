@@ -117,7 +117,40 @@ impl CalibrationConfig {
     /// Production hot-path callers should treat I/O failure as recoverable
     /// (e.g. `.ok().map(...).unwrap_or((defaults))`) rather than propagating —
     /// the engine has reasonable defaults for every locality / weight key.
+    ///
+    /// Backed by a process-wide cache (see [`Self::cached`]): `calibration.toml`
+    /// is read and parsed once, and this returns a clone — the previous per-call
+    /// `fs::read` + TOML parse on hot paths was backlog 03cb3167. On load
+    /// failure the cache holds [`Self::default_for_phase2_fallback`], so this
+    /// returns `Ok(default)` rather than `Err` — matching what every hot-path
+    /// caller already did via `.ok()` / `.unwrap_or_else(default)`.
     pub fn from_workspace_root() -> Result<Self, CalibrationError> {
+        Ok(Self::cached().clone())
+    }
+
+    /// Process-wide cached calibration config: `calibration.toml` is read and
+    /// parsed exactly once per process, then reused. Hot paths (belief queries,
+    /// edge factors, DS auto-wiring) hit this every request. On load failure
+    /// falls back to [`Self::default_for_phase2_fallback`].
+    ///
+    /// NOTE: changes to `calibration.toml` require a process restart to take
+    /// effect (this is a deploy-time config, not a runtime-tunable).
+    #[must_use]
+    pub fn cached() -> &'static Self {
+        static CACHED: std::sync::LazyLock<CalibrationConfig> = std::sync::LazyLock::new(|| {
+            CalibrationConfig::load_from_workspace_root_uncached()
+                .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback())
+        });
+        &CACHED
+    }
+
+    /// Uncached load: resolve `calibration.toml` (`CALIBRATION_PATH` env →
+    /// workspace root via `CARGO_MANIFEST_DIR` → cwd-relative fallback) and
+    /// parse it. Hot paths should use [`Self::cached`] / [`Self::from_workspace_root`].
+    ///
+    /// # Errors
+    /// Returns [`CalibrationError`] if the file cannot be read or parsed.
+    fn load_from_workspace_root_uncached() -> Result<Self, CalibrationError> {
         let path = if let Ok(explicit) = std::env::var("CALIBRATION_PATH") {
             std::path::PathBuf::from(explicit)
         } else if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
@@ -310,6 +343,37 @@ mod tests {
             (config.evidence_locality.intra_evidence_locality_factor - 0.3).abs() < 1e-9,
             "intra_evidence_locality_factor = {}",
             config.evidence_locality.intra_evidence_locality_factor
+        );
+    }
+
+    #[test]
+    fn cached_returns_stable_singleton_with_loaded_values() {
+        // Hot paths (belief queries, edge factors, DS auto-wiring) call the
+        // workspace-root accessor per request; it must parse calibration.toml
+        // once and reuse it, not read+parse on every call (backlog 03cb3167).
+        let a = CalibrationConfig::cached();
+        let b = CalibrationConfig::cached();
+        assert!(
+            std::ptr::eq(a, b),
+            "cached() must return the same process-wide instance (parsed once)"
+        );
+        assert!(
+            (a.default_journal_reliability - 0.78).abs() < f64::EPSILON,
+            "cached() should carry loaded calibration.toml values (0.78), got {}",
+            a.default_journal_reliability
+        );
+    }
+
+    #[test]
+    fn from_workspace_root_matches_cached() {
+        // from_workspace_root now delegates to the cache; it must still return
+        // the loaded values (Ok) so existing callers are unaffected.
+        let owned = CalibrationConfig::from_workspace_root().expect("loads");
+        assert!(
+            (owned.default_journal_reliability
+                - CalibrationConfig::cached().default_journal_reliability)
+                .abs()
+                < f64::EPSILON
         );
     }
 
