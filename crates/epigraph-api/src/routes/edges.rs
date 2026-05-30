@@ -1895,6 +1895,22 @@ pub async fn get_evidence(
         row.raw_content.clone()
     };
 
+    // When the linked claim is private and the requester lacks access, the
+    // free-form `caption` (can carry the substance of the figure) and the
+    // identifying `source_url` are gated alongside `content`. The lower-value
+    // structural fields (content_hash, doi, figure_id, mime_type, page,
+    // extraction_target, page_range) follow the codebase-wide content-body
+    // redaction model and are left intact.
+    let source_url = if should_redact { None } else { row.source_url };
+    let caption = if should_redact {
+        None
+    } else {
+        props
+            .get("caption")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+
     let response = EvidenceDetailResponse {
         id: row.id,
         claim_id: claim_edge.map(|r| r.source_id),
@@ -1902,15 +1918,12 @@ pub async fn get_evidence(
         evidence_type: ev_type,
         content,
         content_hash: hex::encode(&row.content_hash),
-        source_url: row.source_url,
+        source_url,
         figure_id: props
             .get("figure_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        caption: props
-            .get("caption")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        caption,
         mime_type: props
             .get("mime_type")
             .and_then(|v| v.as_str())

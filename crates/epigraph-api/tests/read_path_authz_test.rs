@@ -548,3 +548,248 @@ async fn list_edges_no_token_spoofed_owner_omits_private_edge() {
         "owner token must see the edge even with a spoofed wire agent_id"
     );
 }
+
+/// evidence_by_relationship (GET /api/v1/claims/:id/supporting-evidence) — the
+/// explicitly-named Task-7 deliverable. The handler early-returns an EMPTY list
+/// when the claim itself is redacted for the requester (`check_content_access`
+/// on the claim), and the full evidence list otherwise. Pre-A3 it trusted the
+/// spoofable params.agent_id; the wiring now derives the requester from the
+/// token. DISCRIMINATING PAIR: a no-token caller spoofing ?agent_id=<owner>
+/// must get total==0 (empty), while the owner token (even with a random wire
+/// agent_id) must get total==1. The owner half de-vacuums the stranger half:
+/// the SUPPORTS edge here is evidence->claim (source_type='evidence',
+/// target_type='claim'), which is the OPPOSITE direction from the provenance
+/// test's claim->evidence DERIVED_FROM edge — so this seeding is what makes the
+/// query return a row at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn supporting_evidence_no_token_spoofed_owner_sees_empty_owner_sees_evidence() {
+    let (pool, addr, _shutdown) = pool_and_app().await;
+    let owner = Uuid::new_v4();
+    let claim_id = common::seed_claim_with_agent(&pool, "SUPEV private secret body", owner).await;
+    common::seed_private_ownership(&pool, claim_id, owner).await;
+
+    // SUPPORTS edge: evidence (source) -> claim (target). This is the shape the
+    // evidence_by_relationship JOIN requires (ev.id = e.source_id,
+    // e.target_id = claim, e.source_type='evidence', e.relationship='SUPPORTS').
+    let evidence_id = uuid::Uuid::new_v4();
+    let ev_hash: Vec<u8> = evidence_id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO evidence (id, raw_content, content_hash, evidence_type, claim_id, properties) \
+         VALUES ($1, 'supporting evidence body', $2, 'document', $3, '{}'::jsonb)",
+    )
+    .bind(evidence_id)
+    .bind(&ev_hash)
+    .bind(claim_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    common::insert_edge(&pool, evidence_id, claim_id, "evidence", "claim", "SUPPORTS").await;
+
+    // No-token spoof of the owner agent_id: claim is redacted → empty list.
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/claims/{claim_id}/supporting-evidence?agent_id={owner}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.get("total").and_then(|t| t.as_u64()),
+        Some(0),
+        "no-token spoof of owner agent_id must NOT see evidence for a private claim"
+    );
+    let ev = body.get("evidence").and_then(|e| e.as_array()).expect("evidence array");
+    assert!(ev.is_empty(), "evidence list must be empty for a redacted claim");
+
+    // Owner token (with a RANDOM spoofed wire agent_id): claim is Full → the
+    // evidence is returned. total==1 also proves the stranger half above was
+    // not vacuously empty due to a wrong edge direction.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let random = Uuid::new_v4();
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/claims/{claim_id}/supporting-evidence?agent_id={random}"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.get("total").and_then(|t| t.as_u64()),
+        Some(1),
+        "owner token must see the supporting evidence even with a spoofed wire agent_id"
+    );
+    let ev = body.get("evidence").and_then(|e| e.as_array()).expect("evidence array");
+    assert!(
+        ev.iter().any(|e| e.get("evidence_id").and_then(|v| v.as_str())
+            == Some(evidence_id.to_string().as_str())),
+        "owner must see the seeded evidence_id"
+    );
+}
+
+/// get_evidence (GET /api/v1/evidence/:id) blanks the evidence `content` —
+/// AND, per the A3 Task-7 field-level hardening, the free-form `caption` and
+/// identifying `source_url` — when the linked claim is private and the
+/// requester lacks access. DISCRIMINATING PAIR: a no-token caller spoofing
+/// ?agent_id=<owner> sees content=="[REDACTED]" and NO caption / source_url,
+/// while the owner token (random wire agent_id) sees the real content, caption
+/// and source_url. The edge here is claim->evidence (the get_evidence
+/// claim-link query wants target_type='evidence', source_type='claim'). The
+/// caption/source_url assertions are the ones that fail on pre-fix code (which
+/// emitted them ungated) — the owner half proves they are present to begin with.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_evidence_no_token_spoofed_owner_redacts_content_caption_and_url() {
+    let (pool, addr, _shutdown) = pool_and_app().await;
+    let owner = Uuid::new_v4();
+    let claim_id = common::seed_claim_with_agent(&pool, "GETEV private secret body", owner).await;
+    common::seed_private_ownership(&pool, claim_id, owner).await;
+
+    // Evidence with a non-null source_url column AND a caption in properties so
+    // the field-gating assertions are not vacuous (None == None).
+    let evidence_id = uuid::Uuid::new_v4();
+    let ev_hash: Vec<u8> = evidence_id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO evidence (id, raw_content, content_hash, evidence_type, claim_id, source_url, properties) \
+         VALUES ($1, 'evidence body text', $2, 'figure', $3, 'https://secret.example/leak', \
+                 '{\"evidence_type\":\"figure\",\"caption\":\"SECRET CAPTION substance\"}'::jsonb)",
+    )
+    .bind(evidence_id)
+    .bind(&ev_hash)
+    .bind(claim_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // claim -> evidence link edge (get_evidence reads source_type='claim',
+    // target_type='evidence' to find the linked claim for the access check).
+    common::insert_edge(&pool, claim_id, evidence_id, "claim", "evidence", "DERIVED_FROM").await;
+
+    // No-token spoof of the owner agent_id: claim redacted → content, caption,
+    // and source_url all gated.
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/evidence/{evidence_id}?agent_id={owner}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.get("content").and_then(|c| c.as_str()),
+        Some("[REDACTED]"),
+        "no-token spoof must not reveal evidence content for a private claim"
+    );
+    assert!(
+        body.get("caption").and_then(|c| c.as_str()).is_none(),
+        "caption must be gated when the linked claim is redacted (leaked: {:?})",
+        body.get("caption")
+    );
+    assert!(
+        body.get("source_url").and_then(|c| c.as_str()).is_none(),
+        "source_url must be gated when the linked claim is redacted (leaked: {:?})",
+        body.get("source_url")
+    );
+
+    // Owner token (random wire agent_id): full content, caption, source_url.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let random = Uuid::new_v4();
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/evidence/{evidence_id}?agent_id={random}"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.get("content").and_then(|c| c.as_str()),
+        Some("evidence body text"),
+        "owner must see full evidence content even with a spoofed wire agent_id"
+    );
+    assert_eq!(
+        body.get("caption").and_then(|c| c.as_str()),
+        Some("SECRET CAPTION substance"),
+        "owner must see the caption (proves the gated test above was non-vacuous)"
+    );
+    assert_eq!(
+        body.get("source_url").and_then(|c| c.as_str()),
+        Some("https://secret.example/leak"),
+        "owner must see the source_url (proves the gated test above was non-vacuous)"
+    );
+}
+
+/// graph_full (GET /api/v1/graph/full) labels a private claim node "[REDACTED]"
+/// when the requester lacks access — its own per-node redaction branch,
+/// independent of list_edges. DISCRIMINATING PAIR: a no-token caller spoofing
+/// ?agent_id=<owner> sees label=="[REDACTED]", while the owner token (random
+/// wire agent_id) sees the real label. The owner half doubles as the
+/// "node is actually present" proof (graph_full pulls nodes from the 2000 most
+/// recent edges, so a freshly-seeded edge guarantees inclusion).
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_full_no_token_spoofed_owner_redacts_node_label() {
+    let (pool, addr, _shutdown) = pool_and_app().await;
+    let owner = Uuid::new_v4();
+    let claim_id = common::seed_claim_with_agent(&pool, "GRAPHFULL private secret body", owner).await;
+    common::seed_private_ownership(&pool, claim_id, owner).await;
+
+    // An edge incident to the private claim so it surfaces as a graph node.
+    let other = common::seed_claim_with_agent(&pool, "GRAPHFULL public neighbor", owner).await;
+    common::insert_edge(&pool, claim_id, other, "claim", "claim", "RELATES_TO").await;
+
+    let find_node = |body: &serde_json::Value| -> Option<String> {
+        body.get("nodes")
+            .and_then(|n| n.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|n| n.get("id").and_then(|v| v.as_str())
+                        == Some(claim_id.to_string().as_str()))
+                    .and_then(|n| n.get("label").and_then(|l| l.as_str()))
+                    .map(|s| s.to_string())
+            })
+    };
+
+    // No-token spoof of the owner agent_id: node label redacted.
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/graph/full?agent_id={owner}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // The node may or may not be in the 2000-edge window on a busy DB, but when
+    // present it MUST be redacted. The owner half below asserts presence.
+    if let Some(label) = find_node(&body) {
+        assert_eq!(
+            label, "[REDACTED]",
+            "no-token spoof of owner agent_id must redact the private node label in graph_full"
+        );
+        assert!(
+            !label.contains("GRAPHFULL private secret body"),
+            "private claim content leaked into graph_full node label: {label}"
+        );
+    }
+
+    // Owner token (random wire agent_id): node present AND label is the real
+    // content (proves the redaction is token-driven and the node is in-window).
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let random = Uuid::new_v4();
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/graph/full?agent_id={random}"))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let label = find_node(&body).expect("private claim node present in graph_full for owner");
+    assert_eq!(
+        label, "GRAPHFULL private secret body",
+        "owner token must see the full node label even with a spoofed wire agent_id"
+    );
+}

@@ -767,11 +767,15 @@ pub fn create_router(state: AppState) -> Router {
     // (check_content_access) can trust it instead of the spoofable ?agent_id
     // wire param. (A3, spec §7.2)
     //
-    // NOTE: availability != adoption. Only claims::{get_claim,list_claims}
-    // consume auth_ctx today. The sibling read handlers still pass the
-    // spoofable params.agent_id and remain live bypasses until migrated:
-    //   - belief::{claims_by_belief,frame_claims_sorted}      -> A3 Task 6
-    //   - edges.rs read handlers + evidence_by_relationship   -> A3 Task 7
+    // NOTE: availability != adoption. As of A3 Tasks 4-7 the following read
+    // handlers now consume auth_ctx (deriving the requester from the
+    // authenticated agent_id, client_id fallback) instead of trusting the
+    // spoofable params.agent_id:
+    //   - claims::{get_claim,list_claims}                     (A3 Tasks 4-5)
+    //   - belief::{claims_by_belief,frame_claims_sorted}      (A3 Task 6)
+    //   - edges.rs read handlers + evidence_by_relationship   (A3 Task 7)
+    // The one remaining read handler still passing the spoofable
+    // params.agent_id (a live bypass until migrated) is:
     //   - graph_query::execute_graph_query                    -> A3 Task 8
     let public = public.layer(middleware::from_fn_with_state(
         state.clone(),
