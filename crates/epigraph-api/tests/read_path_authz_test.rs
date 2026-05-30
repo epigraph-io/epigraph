@@ -793,3 +793,49 @@ async fn graph_full_no_token_spoofed_owner_redacts_node_label() {
         "owner token must see the full node label even with a spoofed wire agent_id"
     );
 }
+
+/// execute_graph_query (POST /api/v1/graph/query) reads agent_id from the
+/// JSON body. A no-token request with body agent_id == owner (spoof) must
+/// still redact the private claim node's label.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_query_no_token_spoofed_owner_is_redacted() {
+    let (pool, addr, _shutdown) = pool_and_app().await;
+    let owner = Uuid::new_v4();
+    let claim_id =
+        common::seed_claim_with_agent(&pool, "GQL private secret body", owner).await;
+    common::seed_private_ownership(&pool, claim_id, owner).await;
+
+    // MATCH (n:claim) RETURN * with no WHERE returns all claims (capped).
+    // The shared test DB holds >200 claims and the handler default LIMIT is
+    // 200 with no ORDER BY, so raise the explicit limit to the handler cap
+    // (1000) to guarantee the freshly-seeded claim is in the result window.
+    let body = serde_json::json!({
+        "query": "MATCH (n:claim) RETURN * LIMIT 1000",
+        "agent_id": owner.to_string()
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/graph/query"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "graph query returns 200");
+    let resp_body: serde_json::Value = resp.json().await.unwrap();
+    let nodes = resp_body.get("nodes").and_then(|n| n.as_array()).expect("nodes array");
+    let found = nodes
+        .iter()
+        .find(|n| n.get("id").and_then(|v| v.as_str()) == Some(claim_id.to_string().as_str()));
+    if let Some(node) = found {
+        // graph_query redacts into the node `label` field, not `content`.
+        assert_eq!(
+            node.get("label").and_then(|l| l.as_str()),
+            Some("[REDACTED]"),
+            "private claim node label must be redacted under no-token spoof"
+        );
+    } else {
+        // If the cap excluded our claim, the test cannot discriminate.
+        // Narrow with a WHERE on truth_value or raise the implicit limit is
+        // not exposed; instead assert it WAS found.
+        panic!("seeded claim not present in graph query result; widen the match");
+    }
+}
