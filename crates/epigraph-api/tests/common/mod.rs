@@ -331,3 +331,43 @@ pub async fn test_bearer_token_with_seeded_client(
         .expect("test JWT issued");
     (token, client_id)
 }
+
+/// Mint a real JWT whose `agent_id` claim equals `agent_id`. Used by A3
+/// read-path tests to produce OWNER (agent_id == ownership.owner_id) and
+/// STRANGER (random agent_id) tokens that the production
+/// optional_bearer_auth_middleware will accept and inject as AuthContext.
+pub fn mint_token_with_agent(scopes: &[&str], agent_id: Uuid) -> String {
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (token, _jti) = cfg
+        .issue_access_token(
+            Uuid::new_v4(),
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+            "agent",
+            None,
+            Some(agent_id),
+            chrono::Duration::minutes(60),
+        )
+        .expect("test JWT issued");
+    token
+}
+
+/// Mark `node_id` (a claim) as a `private` partition owned by `owner_id`.
+/// `check_content_access` returns Full only to a requester equal to
+/// `owner_id`; everyone else gets Redacted. `node_type` is NOT NULL with a
+/// CHECK constraint, so it must be 'claim'. Create the claim first with
+/// `seed_claim_with_agent(pool, content, owner_id)` so the owner agent row
+/// exists.
+pub async fn seed_private_ownership(pool: &PgPool, node_id: Uuid, owner_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
+         VALUES ($1, 'claim', 'private', $2) \
+         ON CONFLICT (node_id) DO UPDATE SET partition_type = 'private', owner_id = $2",
+    )
+    .bind(node_id)
+    .bind(owner_id)
+    .execute(pool)
+    .await
+    .expect("seed private ownership");
+}
