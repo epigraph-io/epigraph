@@ -77,7 +77,11 @@ async fn runs_body_and_releases_lock(pool: PgPool) {
     .await
     .unwrap();
 
-    assert_eq!(outcome, Some(7), "body result is returned when lock acquired");
+    assert_eq!(
+        outcome,
+        Some(7),
+        "body result is returned when lock acquired"
+    );
     assert!(ran.load(Ordering::SeqCst), "body ran");
     assert_eq!(
         advisory_holders(&pool, KEY).await,

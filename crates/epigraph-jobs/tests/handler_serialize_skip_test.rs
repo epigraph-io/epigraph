@@ -7,9 +7,7 @@
 
 use epigraph_jobs::cluster_graph::ClusterGraphHandler;
 use epigraph_jobs::theme_cluster_rebuild::ThemeClusterRebuildHandler;
-use epigraph_jobs::{
-    EpiGraphJob, JobHandler, CLUSTER_GRAPH_LOCK_KEY, THEME_REBUILD_LOCK_KEY,
-};
+use epigraph_jobs::{EpiGraphJob, JobHandler, CLUSTER_GRAPH_LOCK_KEY, THEME_REBUILD_LOCK_KEY};
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -42,7 +40,10 @@ async fn cluster_graph_handler_skips_when_lock_held(pool: PgPool) {
         .expect("handler should succeed as a no-op skip while lock is held");
 
     assert_eq!(
-        result.output.get("skipped_locked").and_then(|v| v.as_bool()),
+        result
+            .output
+            .get("skipped_locked")
+            .and_then(|v| v.as_bool()),
         Some(true),
         "output should mark a lock-contended skip"
     );
@@ -50,7 +51,10 @@ async fn cluster_graph_handler_skips_when_lock_held(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(runs, 0, "no clustering run should execute while the lock is held");
+    assert_eq!(
+        runs, 0,
+        "no clustering run should execute while the lock is held"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -73,7 +77,10 @@ async fn theme_rebuild_handler_skips_when_lock_held(pool: PgPool) {
         .expect("handler should succeed as a no-op skip while lock is held");
 
     assert_eq!(
-        result.output.get("skipped_locked").and_then(|v| v.as_bool()),
+        result
+            .output
+            .get("skipped_locked")
+            .and_then(|v| v.as_bool()),
         Some(true),
         "output should mark a lock-contended skip"
     );
@@ -81,5 +88,8 @@ async fn theme_rebuild_handler_skips_when_lock_held(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(themes, 0, "no theme rebuild should execute while the lock is held");
+    assert_eq!(
+        themes, 0,
+        "no theme rebuild should execute while the lock is held"
+    );
 }

@@ -34,5 +34,8 @@ async fn fresh_connection_has_no_statement_timeout(pool: PgPool) {
         .fetch_one(&mut *conn)
         .await
         .unwrap();
-    assert_eq!(shown, "0", "a fresh connection has statement_timeout disabled");
+    assert_eq!(
+        shown, "0",
+        "a fresh connection has statement_timeout disabled"
+    );
 }

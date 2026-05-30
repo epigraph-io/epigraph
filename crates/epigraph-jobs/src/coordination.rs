@@ -62,9 +62,12 @@ pub async fn run_serialized<T, Fut>(
 where
     Fut: Future<Output = Result<T, JobError>>,
 {
-    let mut lock_conn = pool.acquire().await.map_err(|e| JobError::ProcessingFailed {
-        message: format!("advisory lock: failed to acquire connection: {e}"),
-    })?;
+    let mut lock_conn = pool
+        .acquire()
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("advisory lock: failed to acquire connection: {e}"),
+        })?;
 
     let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(lock_key)
