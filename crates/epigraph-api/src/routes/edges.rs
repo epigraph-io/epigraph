@@ -1275,8 +1275,13 @@ async fn entity_exists(
 pub async fn list_edges(
     State(state): State<AppState>,
     Query(params): Query<EdgeQueryParams>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<Vec<EdgeResponse>>, ApiError> {
     let pool = &state.db_pool;
+
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     // AND-compose every non-null filter at the SQL layer so drainer
     // GET-then-POST guards work. Replaces the legacy first-non-null
@@ -1297,10 +1302,10 @@ pub async fn list_edges(
     let mut edges = Vec::new();
     for row in rows {
         let source_redacted = row.source_type == "claim"
-            && check_content_access(pool, row.source_id, params.agent_id).await
+            && check_content_access(pool, row.source_id, requester).await
                 == ContentAccess::Redacted;
         let target_redacted = row.target_type == "claim"
-            && check_content_access(pool, row.target_id, params.agent_id).await
+            && check_content_access(pool, row.target_id, requester).await
                 == ContentAccess::Redacted;
 
         if !source_redacted && !target_redacted {
@@ -1332,8 +1337,13 @@ pub async fn claim_neighborhood(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<NeighborhoodParams>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<NeighborhoodResponse>, ApiError> {
     let pool = &state.db_pool;
+
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     let max_depth = params.depth.unwrap_or(2).min(3); // Cap at 3 hops
 
@@ -1407,11 +1417,11 @@ pub async fn claim_neighborhood(
     for row in deduped {
         let source_redacted = row.source_type == "claim"
             && row.source_id != claim_id
-            && check_content_access(pool, row.source_id, params.agent_id).await
+            && check_content_access(pool, row.source_id, requester).await
                 == ContentAccess::Redacted;
         let target_redacted = row.target_type == "claim"
             && row.target_id != claim_id
-            && check_content_access(pool, row.target_id, params.agent_id).await
+            && check_content_access(pool, row.target_id, requester).await
                 == ContentAccess::Redacted;
 
         if source_redacted {
@@ -1505,9 +1515,15 @@ pub struct GraphEdgesResponse {
 #[cfg(feature = "db")]
 pub async fn graph_edges(
     State(state): State<AppState>,
-    Query(params): Query<GraphAccessParams>,
+    Query(_params): Query<GraphAccessParams>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<GraphEdgesResponse>, ApiError> {
     let pool = &state.db_pool;
+
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+
     let rows = EdgeRepository::list_all(pool, 5000).await?;
 
     // Filter to claim-to-claim edges, excluding edges touching redacted claims
@@ -1516,9 +1532,9 @@ pub async fn graph_edges(
         if r.source_type != "claim" || r.target_type != "claim" {
             continue;
         }
-        let source_redacted = check_content_access(pool, r.source_id, params.agent_id).await
+        let source_redacted = check_content_access(pool, r.source_id, requester).await
             == ContentAccess::Redacted;
-        let target_redacted = check_content_access(pool, r.target_id, params.agent_id).await
+        let target_redacted = check_content_access(pool, r.target_id, requester).await
             == ContentAccess::Redacted;
         if !source_redacted && !target_redacted {
             filtered.push(r);
@@ -1638,9 +1654,14 @@ pub struct FullGraphResponse {
 #[cfg(feature = "db")]
 pub async fn graph_full(
     State(state): State<AppState>,
-    Query(params): Query<GraphAccessParams>,
+    Query(_params): Query<GraphAccessParams>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<FullGraphResponse>, ApiError> {
     let pool = &state.db_pool;
+
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     // 1. Fetch all edges (capped)
     let edge_rows = EdgeRepository::list_all(pool, 2000).await?;
@@ -1715,7 +1736,7 @@ pub async fn graph_full(
     // Redact claim labels for nodes the requester cannot access
     for node in &mut resp.nodes {
         if node.entity_type == "claim" {
-            let access = check_content_access(pool, node.id, params.agent_id).await;
+            let access = check_content_access(pool, node.id, requester).await;
             if access == ContentAccess::Redacted {
                 node.label = "[REDACTED]".to_string();
             }
@@ -1813,9 +1834,14 @@ struct EvidenceProvRow {
 pub async fn get_evidence(
     State(state): State<AppState>,
     Path(evidence_id): Path<Uuid>,
-    Query(params): Query<EvidenceAccessParams>,
+    Query(_params): Query<EvidenceAccessParams>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<EvidenceDetailResponse>, ApiError> {
     let pool = &state.db_pool;
+
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     let row: EvidenceDetailRow = sqlx::query_as(
         "SELECT id, raw_content, content_hash, source_url, properties, created_at FROM evidence WHERE id = $1"
@@ -1858,7 +1884,7 @@ pub async fn get_evidence(
 
     // Redact content if linked claim is private/community and requester lacks access
     let should_redact = if let Some(ref ce) = claim_edge {
-        check_content_access(pool, ce.source_id, params.agent_id).await == ContentAccess::Redacted
+        check_content_access(pool, ce.source_id, requester).await == ContentAccess::Redacted
     } else {
         false
     };
@@ -1957,9 +1983,14 @@ pub struct ProvenanceResponse {
 pub async fn claim_provenance(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
-    Query(params): Query<EvidenceAccessParams>,
+    Query(_params): Query<EvidenceAccessParams>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<ProvenanceResponse>, ApiError> {
     let pool = &state.db_pool;
+
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     // 1. Fetch the claim
     let claim_row: ClaimProvRow =
@@ -1976,7 +2007,7 @@ pub async fn claim_provenance(
             })?;
 
     // Redact claim content in provenance chain if requester lacks access
-    let access = check_content_access(pool, claim_id, params.agent_id).await;
+    let access = check_content_access(pool, claim_id, requester).await;
     let claim_label = if access == ContentAccess::Redacted {
         "[REDACTED]".to_string()
     } else if claim_row.content.len() > 60 {
@@ -2171,9 +2202,13 @@ struct EvidenceEdgeRow {
 pub async fn supporting_evidence(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
-    Query(params): Query<EvidenceAccessParams>,
+    Query(_params): Query<EvidenceAccessParams>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<ClaimEvidenceListResponse>, ApiError> {
-    evidence_by_relationship(&state, claim_id, "SUPPORTS", params.agent_id).await
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    evidence_by_relationship(&state, claim_id, "SUPPORTS", requester).await
 }
 
 /// Get all contradicting evidence for a claim
@@ -2186,9 +2221,13 @@ pub async fn supporting_evidence(
 pub async fn contradicting_evidence(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
-    Query(params): Query<EvidenceAccessParams>,
+    Query(_params): Query<EvidenceAccessParams>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<ClaimEvidenceListResponse>, ApiError> {
-    evidence_by_relationship(&state, claim_id, "CONTRADICTS", params.agent_id).await
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    evidence_by_relationship(&state, claim_id, "CONTRADICTS", requester).await
 }
 
 #[cfg(feature = "db")]

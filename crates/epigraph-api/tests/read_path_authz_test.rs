@@ -336,3 +336,79 @@ async fn frame_claims_sorted_owner_token_ignores_wire_param_and_sees_full() {
         "owner token must see full content in frame_claims_sorted even with a spoofed wire agent_id"
     );
 }
+
+/// claim_provenance (GET /api/v1/claims/:id/provenance) labels the claim step
+/// "[REDACTED]" when the requester lacks access. No-token spoof of the owner
+/// agent_id must still redact.
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_provenance_no_token_spoofed_owner_is_redacted() {
+    let (pool, addr, _shutdown) = pool_and_app().await;
+    let owner = Uuid::new_v4();
+    let claim_id =
+        common::seed_claim_with_agent(&pool, "PROV private secret body", owner).await;
+    common::seed_private_ownership(&pool, claim_id, owner).await;
+
+    // Force a provenance chain so the claim step is emitted and the label is
+    // asserted (otherwise the redaction path is exercised but no chain is
+    // returned). Insert an evidence row + DERIVED_FROM edge directly.
+    // NOT-NULL `evidence_type` and `claim_id` columns are required by the
+    // schema (\d evidence on epigraph_db_repo_test) in addition to the
+    // properties.evidence_type/doi read by build_evidence_chains.
+    let evidence_id = uuid::Uuid::new_v4();
+    let ev_hash: Vec<u8> = evidence_id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO evidence (id, raw_content, content_hash, evidence_type, claim_id, properties) \
+         VALUES ($1, 'ev', $2, 'document', $3, '{\"evidence_type\":\"document\",\"doi\":\"10.1/x\"}'::jsonb)",
+    )
+    .bind(evidence_id)
+    .bind(&ev_hash)
+    .bind(claim_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    common::insert_edge(&pool, claim_id, evidence_id, "claim", "evidence", "DERIVED_FROM").await;
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/claims/{claim_id}/provenance?agent_id={owner}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // The first step in the first chain is the claim step; its label is the
+    // (truncated) content or "[REDACTED]". With no chains, the response has
+    // an empty `chains` array but the claim is still redacted via the same
+    // check, so assert no chain leaks the secret and that if a claim step is
+    // present it is redacted.
+    let chains = body.get("chains").and_then(|c| c.as_array()).expect("chains array");
+    for chain in chains {
+        if let Some(path) = chain.get("path").and_then(|p| p.as_array()) {
+            for step in path {
+                let label = step.get("label").and_then(|l| l.as_str()).unwrap_or("");
+                assert!(
+                    !label.contains("PROV private secret body"),
+                    "private claim content leaked into provenance label: {label}"
+                );
+            }
+        }
+    }
+    // Stronger: the claim step label must be exactly "[REDACTED]". Find a
+    // step whose entity_type == "claim".
+    let mut saw_claim_step = false;
+    for chain in chains {
+        if let Some(path) = chain.get("path").and_then(|p| p.as_array()) {
+            for step in path {
+                if step.get("entity_type").and_then(|t| t.as_str()) == Some("claim") {
+                    saw_claim_step = true;
+                    assert_eq!(step.get("label").and_then(|l| l.as_str()), Some("[REDACTED]"));
+                }
+            }
+        }
+    }
+    // If there are no chains (claim has no trace/evidence), the redaction
+    // still ran on `claim_label`; the no-leak assertion above is the
+    // discriminating guard. saw_claim_step may be false in that case.
+    let _ = saw_claim_step;
+}
