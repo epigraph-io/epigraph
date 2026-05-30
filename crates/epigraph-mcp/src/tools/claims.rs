@@ -272,20 +272,30 @@ pub async fn query_claims(
     let results: Vec<ClaimResponse> = claims
         .into_iter()
         .zip(access)
-        .map(|(c, (_id, acc))| ClaimResponse {
-            id: c.id.as_uuid().to_string(),
-            content: if acc == ContentAccess::Full {
-                c.content.clone()
-            } else {
-                "[REDACTED]".into()
-            },
-            truth_value: c.truth_value.value(),
-            agent_id: c.agent_id.as_uuid().to_string(),
-            content_hash: ContentHasher::to_hex(&c.content_hash),
-            created_at: c.created_at.to_rfc3339(),
-            labels: Vec::new(),
-            is_current: true,
-            supersedes: None,
+        .map(|(c, (_id, acc))| {
+            // Authz-critical aliasing guard: the batch helper returns ids in
+            // input order, so the zip pairs each claim with its OWN access
+            // decision. If a future reorder of the helper broke that, the
+            // access decision would land on the wrong claim's content — a leak.
+            debug_assert!(
+                _id == c.id.as_uuid(),
+                "batch_check_content_access result misaligned with claim order"
+            );
+            ClaimResponse {
+                id: c.id.as_uuid().to_string(),
+                content: if acc == ContentAccess::Full {
+                    c.content.clone()
+                } else {
+                    "[REDACTED]".into()
+                },
+                truth_value: c.truth_value.value(),
+                agent_id: c.agent_id.as_uuid().to_string(),
+                content_hash: ContentHasher::to_hex(&c.content_hash),
+                created_at: c.created_at.to_rfc3339(),
+                labels: Vec::new(),
+                is_current: true,
+                supersedes: None,
+            }
         })
         .collect();
 

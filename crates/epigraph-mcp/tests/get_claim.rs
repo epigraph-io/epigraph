@@ -71,6 +71,70 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
     );
 }
 
+/// Discriminating redaction regression (A3 §7.5, Task 11): a `private`-partition
+/// claim must return its full content to the OWNER and exactly `"[REDACTED]"` to
+/// a stranger. The stranger assertion is what fails if the redaction branch in
+/// `get_claim` is deleted or inverted — making this test discriminating where
+/// the `None`-requester tests above are not (those have no ownership row, so
+/// `check_content_access` returns `Full` and the redaction branch is never run).
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
+    let owner = seed_agent(&pool).await;
+    let claim_id = seed_claim(&pool, owner, &[], true, None).await;
+    let expected_content = format!("test claim {}", claim_id.as_uuid());
+
+    // Mark the claim private, owned by `owner`.
+    sqlx::query(
+        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
+         VALUES ($1, 'claim', 'private', $2)",
+    )
+    .bind(claim_id.as_uuid())
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .expect("seed private ownership");
+
+    let server = build_test_server(pool.clone());
+
+    // Owner requester → full content.
+    let owner_body = parse_claim(
+        &get_claim(
+            &server,
+            GetClaimParams {
+                claim_id: claim_id.as_uuid().to_string(),
+            },
+            Some(owner),
+        )
+        .await
+        .expect("get_claim as owner"),
+    );
+    assert_eq!(
+        owner_body["content"].as_str().unwrap(),
+        expected_content,
+        "owner must see the full private content"
+    );
+
+    // Stranger requester (a different, non-owner agent id) → redacted.
+    let stranger = Uuid::new_v4();
+    let stranger_body = parse_claim(
+        &get_claim(
+            &server,
+            GetClaimParams {
+                claim_id: claim_id.as_uuid().to_string(),
+            },
+            Some(stranger),
+        )
+        .await
+        .expect("get_claim as stranger"),
+    );
+    assert_eq!(
+        stranger_body["content"].as_str().unwrap(),
+        "[REDACTED]",
+        "stranger must NOT see private content — this fails if the redaction \
+         branch is deleted or inverted"
+    );
+}
+
 fn parse_claim(result: &CallToolResult) -> Value {
     let text = result
         .content
