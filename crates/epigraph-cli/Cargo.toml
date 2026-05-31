@@ -101,6 +101,11 @@ path = "src/bin/bootstrap_clients.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "ingest-document"
+path = "src/bin/ingest_document.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "backfill_factors"
 path = "src/bin/backfill_factors.rs"
 required-features = ["db"]
@@ -113,6 +118,7 @@ epigraph-embeddings = { workspace = true }
 epigraph-interfaces = { workspace = true }
 epigraph-ds = { workspace = true }
 epigraph-mcp = { workspace = true }
+epigraph-ingest = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 epigraph-db = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
