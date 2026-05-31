@@ -129,3 +129,76 @@ FROM claims;
 Both should trend toward zero. `live_missing` growing means a write path is
 bypassing the embedder; `stale_present` growing means a cleanup path is
 missing the null. Track via `system_stats` if exposed; otherwise spot-check.
+
+<!-- BEGIN epistemic-commit-protocol (managed block — keep these markers; edit the source at ~/.epistemic-commit-protocol.md and re-run the propagator) -->
+
+## The Epistemic Commit Protocol
+
+Treat version control as an **Epistemic Ledger**: every commit is a node in the project's
+knowledge graph, parseable into a claim with evidence, reasoning, and verification. Write each
+commit so a future reader — or an automated git-log ingester — can reconstruct *what* decision
+was made, *why*, and *how we know it is correct*.
+
+### Forbidden commit messages
+
+Never write "Fixed bug", "Updated code", "WIP", "Misc changes", or "Refactored stuff". They
+destroy provenance: future developers (and future you) cannot reconstruct the *why*.
+
+### Atomic discipline
+
+One commit = one logical decision. **If the Reasoning section needs multiple unrelated
+paragraphs, split the commit.**
+
+| Too small | Just right | Too large |
+|-----------|------------|-----------|
+| "Add newline" | "Define Claim struct with validation" | "Implement the whole module" |
+| "Fix typo" | "Add BLAKE3 content hasher" | "Add all crypto functions" |
+
+### Message schema
+
+```
+<type>(<scope>): <claim — imperative summary of the single decision>
+
+**Evidence:**
+- <the raw error, issue ID, metric, or requirement that triggered this>
+
+**Reasoning:**
+- <why this solution over the alternatives>
+
+**Verification:**
+- <proof the claim holds — tests, checks, measurements>
+```
+
+`<scope>` is the module / subsystem / package the change touches (e.g. `api`, `db`, `loader`);
+keep scopes consistent within a repo. Omit `(<scope>)` only when the change is genuinely global.
+
+### Types
+
+| Type | Use |
+|------|-----|
+| `feat` | new feature or capability |
+| `fix` | bug fix |
+| `refactor` | change that neither fixes a bug nor adds behaviour |
+| `perf` | performance improvement |
+| `test` | adding or updating tests |
+| `docs` | documentation only |
+| `chore` | build, CI, dependencies |
+| `security` | security fix or hardening |
+
+### Example
+
+```
+security(crypto): use constant-time comparison in signature verification
+
+**Evidence:**
+- Audit flagged `==` on signature bytes in the verify path (timing side-channel)
+
+**Reasoning:**
+- Replaced `==` with `subtle::ConstantTimeEq`; short-circuit comparison leaks timing
+  on cryptographic material, and there is no correctness cost
+
+**Verification:**
+- cargo test passes; manual review confirms no early returns in the verify path
+```
+
+<!-- END epistemic-commit-protocol -->
