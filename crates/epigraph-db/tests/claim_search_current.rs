@@ -26,7 +26,13 @@ async fn seed_agent(pool: &PgPool, tag: &str) -> Uuid {
     let agent_id = Uuid::new_v4();
     sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, decode($2, 'hex'))")
         .bind(agent_id)
-        .bind(format!("{:0>2}", tag).repeat(32).chars().take(64).collect::<String>())
+        .bind(
+            format!("{:0>2}", tag)
+                .repeat(32)
+                .chars()
+                .take(64)
+                .collect::<String>(),
+        )
         .execute(pool)
         .await
         .expect("seed agent");
@@ -93,9 +99,18 @@ async fn search_current_returns_all_levels_excludes_non_current(pool: PgPool) {
         .expect("search_by_embedding_current");
     let ids: Vec<Uuid> = hits.iter().map(|h| h.claim_id).collect();
 
-    assert!(ids.contains(&mem), "memorized (level <none>) current claim must be returned");
-    assert!(ids.contains(&para), "level-2 current claim must be returned");
-    assert!(!ids.contains(&retired), "non-current claim must be excluded");
+    assert!(
+        ids.contains(&mem),
+        "memorized (level <none>) current claim must be returned"
+    );
+    assert!(
+        ids.contains(&para),
+        "level-2 current claim must be returned"
+    );
+    assert!(
+        !ids.contains(&retired),
+        "non-current claim must be excluded"
+    );
 
     // Contrast: the existing level-2-only method would MISS the memory and the
     // level<none> retired claim, returning only the level-2 paragraph. This is
@@ -104,8 +119,14 @@ async fn search_current_returns_all_levels_excludes_non_current(pool: PgPool) {
         .await
         .expect("legacy search_by_embedding");
     let l2_ids: Vec<Uuid> = level2_only.iter().map(|h| h.claim_id).collect();
-    assert!(!l2_ids.contains(&mem), "legacy method excludes the level <none> memory (the bug)");
-    assert!(l2_ids.contains(&para), "legacy method returns the level-2 paragraph");
+    assert!(
+        !l2_ids.contains(&mem),
+        "legacy method excludes the level <none> memory (the bug)"
+    );
+    assert!(
+        l2_ids.contains(&para),
+        "legacy method returns the level-2 paragraph"
+    );
 }
 
 /// `search_by_embedding_scoped` pushes optional tag (label containment) and
@@ -130,7 +151,10 @@ async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
         .await
         .expect("scoped none");
     let all_ids = ids(&all);
-    assert!([a_x, a_plain, b_x].iter().all(|c| all_ids.contains(c)), "no scope returns all");
+    assert!(
+        [a_x, a_plain, b_x].iter().all(|c| all_ids.contains(c)),
+        "no scope returns all"
+    );
 
     // Tag scope → only the two carrying topic-x, across agents.
     let tagged = ClaimRepository::search_by_embedding_scoped(
@@ -143,15 +167,25 @@ async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
     .await
     .expect("scoped tag");
     let tagged_ids = ids(&tagged);
-    assert!(tagged_ids.contains(&a_x) && tagged_ids.contains(&b_x), "tag scope keeps topic-x claims");
-    assert!(!tagged_ids.contains(&a_plain), "tag scope drops the untagged claim");
+    assert!(
+        tagged_ids.contains(&a_x) && tagged_ids.contains(&b_x),
+        "tag scope keeps topic-x claims"
+    );
+    assert!(
+        !tagged_ids.contains(&a_plain),
+        "tag scope drops the untagged claim"
+    );
 
     // Agent scope → only agent_a's claims, regardless of tag.
-    let by_agent = ClaimRepository::search_by_embedding_scoped(&pool, &pgvec, 10, None, Some(agent_a))
-        .await
-        .expect("scoped agent");
+    let by_agent =
+        ClaimRepository::search_by_embedding_scoped(&pool, &pgvec, 10, None, Some(agent_a))
+            .await
+            .expect("scoped agent");
     let agent_ids = ids(&by_agent);
-    assert!(agent_ids.contains(&a_x) && agent_ids.contains(&a_plain), "agent scope keeps agent_a claims");
+    assert!(
+        agent_ids.contains(&a_x) && agent_ids.contains(&a_plain),
+        "agent scope keeps agent_a claims"
+    );
     assert!(!agent_ids.contains(&b_x), "agent scope drops agent_b claim");
 
     // Both → intersection: agent_a AND topic-x = only a_x.
@@ -164,5 +198,9 @@ async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
     )
     .await
     .expect("scoped both");
-    assert_eq!(ids(&both), vec![a_x], "tag AND agent intersect to a single claim");
+    assert_eq!(
+        ids(&both),
+        vec![a_x],
+        "tag AND agent intersect to a single claim"
+    );
 }

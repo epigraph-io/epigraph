@@ -146,13 +146,33 @@ async fn mark_duplicate_migrates_edges_to_canonical(pool: PgPool) {
     .unwrap();
 
     // Incoming edge migrated: third -> dup became third -> canonical.
-    assert_eq!(edge_count(&pool, third, canonical).await, 1, "incoming edge not migrated");
-    assert_eq!(edge_count(&pool, third, dup).await, 0, "incoming edge left dangling at dup");
+    assert_eq!(
+        edge_count(&pool, third, canonical).await,
+        1,
+        "incoming edge not migrated"
+    );
+    assert_eq!(
+        edge_count(&pool, third, dup).await,
+        0,
+        "incoming edge left dangling at dup"
+    );
     // Outgoing edge migrated: dup -> third became canonical -> third.
-    assert_eq!(edge_count(&pool, canonical, third).await, 1, "outgoing edge not migrated");
-    assert_eq!(edge_count(&pool, dup, third).await, 0, "outgoing edge left dangling at dup");
+    assert_eq!(
+        edge_count(&pool, canonical, third).await,
+        1,
+        "outgoing edge not migrated"
+    );
+    assert_eq!(
+        edge_count(&pool, dup, third).await,
+        0,
+        "outgoing edge left dangling at dup"
+    );
     // Self-loop guard: the dup<->canonical edge must NOT become canonical->canonical.
-    assert_eq!(edge_count(&pool, canonical, canonical).await, 0, "created a self-loop");
+    assert_eq!(
+        edge_count(&pool, canonical, canonical).await,
+        0,
+        "created a self-loop"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
