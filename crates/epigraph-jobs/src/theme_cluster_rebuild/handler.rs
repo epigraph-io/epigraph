@@ -97,10 +97,9 @@ impl ThemeClusterRebuildHandler {
             k_min: 4,
             k_max: max_themes,
             min_claims_per_theme,
-            // 5000 is a reasonable upper bound for the cron rebuild — large
-            // enough to cover the wrhq-scale corpus, small enough that
-            // linfa k-means stays well under the 2 GB VM RAM ceiling.
-            limit: 5000,
+            // 2000 claims for centroid computation only; the assign-all
+            // phase assigns the remaining corpus via pgvector ANN.
+            limit: 2000,
             label_prefix: "auto".to_string(),
             // Scheduled rebuild replaces existing themes wholesale; the
             // skip-check above ensures we only do this when the corpus

@@ -349,7 +349,7 @@ async fn main() {
             tokio::time::sleep(Duration::from_secs(1800)).await;
             loop {
                 match (EpiGraphJob::ThemeClusterRebuild {
-                    max_themes: 50,
+                    max_themes: 80,
                     min_claims_per_theme: 5,
                     skip_if_unchanged: true,
                 })
