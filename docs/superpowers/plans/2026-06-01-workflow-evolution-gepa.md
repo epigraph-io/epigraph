@@ -57,7 +57,16 @@ The proposer is a prompt run by a `schedules.toml` Claude-CLI session under a
 
 ---
 
-## ⚠️ OPEN DECISION — the APPLY layer (prod-mutating; needs sign-off)
+## APPLY layer — option (A) chosen and BUILT (stacked branch `feat/workflow-promotion-apply`)
+
+User chose **(A) additive promotable flag** (2026-06-01). Built + TDD'd, stacked on the decide-layer branch:
+- `ClaimRepository::merge_properties` + `promotion_flag` (db) — store/read the verdict on `properties.promotion`.
+- `refresh_workflow_promotion` MCP tool (`claims:write`) — re-evaluates a variant and writes the verdict to `properties.promotion`, **overwriting every run** (bidirectional: a regressed variant is demoted, not left stale; `evaluated_at` makes staleness auditable). A lineage root is left untouched.
+- `find_workflow` surfaces `promotable` (advisory field; still ranks by similarity).
+
+The maintenance pass calls `refresh_workflow_promotion` per candidate variant; `find_workflow` callers see `promotable: true` and may prefer those variants. Reversible. Storage is a claim **property** (not a `workflows` column — variants are claims; not a label — a property carries the full verdict provenance for audit + demotion).
+
+### (historical) the fork that was decided
 
 `find_workflow` orders results by **semantic similarity**;
 `behavioral_success_rate` is a *returned field, not a sort key* (verified
@@ -95,7 +104,7 @@ jobs. Keep cadence conservative at first (e.g. daily) and log every proposal +
 verdict.
 
 ## Remaining before the loop runs in prod
-1. **Sign off the apply layer (A/B/C above).**
-2. Build the chosen apply-layer maintenance pass (TDD).
+1. ~~Sign off the apply layer~~ — done (A).
+2. ~~Build the apply-layer maintenance pass~~ — done (`refresh_workflow_promotion`, TDD).
 3. Author the `schedules.toml` proposer + apply entries (deploy-time).
 4. End-to-end dry run on a seeded lineage before enabling in prod.
