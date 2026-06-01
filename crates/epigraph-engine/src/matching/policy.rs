@@ -54,6 +54,15 @@ impl Policy {
         // doesn't accept these as args yet; we patch them in below.
         let features_json = serde_json::to_value(f)?;
 
+        // `auto_promote` gates BOTH the edge write (below) AND whether the
+        // candidate is committed (`promoted`) or staged for human review
+        // (`pending`). Before this, `auto_promote=false` left the row as
+        // `promoted` with no edge — a half-state — and the `pending` review
+        // queue (`decide_match_candidate`, `MatchCandidateRepo::list_pending`,
+        // the API `pending[]` array) had no producer at all, so the whole
+        // human-review surface was dead in normal operation.
+        let promote_status = if self.auto_promote { "promoted" } else { "pending" };
+
         match action {
             PolicyAction::AutoPromote => {
                 let id = self
@@ -63,7 +72,7 @@ impl Policy {
                         hi,
                         f.score,
                         features_json,
-                        "promoted",
+                        promote_status,
                         Some(self.run_id),
                     )
                     .await?;
@@ -83,7 +92,7 @@ impl Policy {
                         hi,
                         f.score,
                         features_json,
-                        "promoted",
+                        promote_status,
                         Some(self.run_id),
                     )
                     .await?;

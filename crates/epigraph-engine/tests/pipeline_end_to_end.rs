@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use epigraph_engine::matching::calibration::MatcherConfig;
 use epigraph_engine::matching::pipeline::{run_pipeline, RunInputs};
 use epigraph_engine::matching::verifier::{Verdict, VerifierClient};
+use epigraph_db::repos::match_candidate::MatchCandidateRepo;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -204,7 +205,7 @@ async fn high_band_pair_emits_promoted_candidate_and_corroborates_edge(pool: PgP
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn auto_promote_false_records_candidate_but_skips_edge(pool: PgPool) {
+async fn auto_promote_false_stages_pending_for_review_and_skips_edge(pool: PgPool) {
     let agent_x = insert_agent(&pool).await;
     let agent_y = insert_agent(&pool).await;
     let v = vec![1.0_f32; 1536];
@@ -230,7 +231,14 @@ async fn auto_promote_false_records_candidate_but_skips_edge(pool: PgPool) {
         auto_promote: false,
     };
     let report = run_pipeline(&pool, inputs).await.expect("pipeline");
-    assert!(report.promoted >= 1);
+    assert!(
+        report.staged >= 1,
+        "auto_promote=false must STAGE for human review, got {report:?}"
+    );
+    assert_eq!(
+        report.promoted, 0,
+        "nothing is promoted when auto_promote=false, got {report:?}"
+    );
 
     let edge_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM edges
@@ -255,7 +263,7 @@ async fn auto_promote_false_records_candidate_but_skips_edge(pool: PgPool) {
     };
     let exists: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM match_candidates
-         WHERE claim_a = $1 AND claim_b = $2 AND status = 'promoted'",
+         WHERE claim_a = $1 AND claim_b = $2 AND status = 'pending'",
     )
     .bind(lo)
     .bind(hi)
@@ -264,7 +272,62 @@ async fn auto_promote_false_records_candidate_but_skips_edge(pool: PgPool) {
     .expect("candidate count");
     assert_eq!(
         exists.0, 1,
-        "candidate row should be recorded even without edge"
+        "auto_promote=false must STAGE the candidate as 'pending' for human review, not silently 'promoted'"
+    );
+}
+
+/// LOAD-BEARING (B1): the human-review queue must now have a PRODUCER.
+/// Before this fix `Policy::act` only ever wrote `promoted`/`rejected`, so
+/// `MatchCandidateRepo::list_pending` — the reader behind the MCP
+/// `list_match_candidates`/`decide_match_candidate` tools and the API
+/// `pending[]` array — always returned empty in normal operation. With
+/// `auto_promote=false`, a high-band pair must now surface through
+/// `list_pending`, proving the producer→consumer path end-to-end (the real
+/// consumer API, not just a raw status check).
+#[sqlx::test(migrations = "../../migrations")]
+async fn auto_promote_false_populates_pending_review_queue(pool: PgPool) {
+    let agent_x = insert_agent(&pool).await;
+    let agent_y = insert_agent(&pool).await;
+    let v = vec![1.0_f32; 1536];
+    let seed = insert_claim(
+        &pool,
+        agent_x,
+        serde_json::json!({"paper_doi": "10.1/E"}),
+        &v,
+    )
+    .await;
+    let peer = insert_claim(
+        &pool,
+        agent_y,
+        serde_json::json!({"paper_doi": "10.1/F"}),
+        &v,
+    )
+    .await;
+
+    // The fresh per-test DB starts with an empty review queue.
+    let repo = MatchCandidateRepo::new(pool.clone());
+    assert!(
+        repo.list_pending(50).await.expect("list_pending").is_empty(),
+        "review queue must start empty before the pipeline runs"
+    );
+
+    let inputs = RunInputs {
+        seeds: vec![seed],
+        cfg: test_config(),
+        verifier: Box::new(AlwaysSameVerifier),
+        auto_promote: false,
+    };
+    run_pipeline(&pool, inputs).await.expect("pipeline");
+
+    let pending = repo.list_pending(50).await.expect("list_pending");
+    assert!(
+        pending.iter().any(|r| (r.claim_a == seed && r.claim_b == peer)
+            || (r.claim_a == peer && r.claim_b == seed)),
+        "high-band pair must surface in the pending review queue under auto_promote=false"
+    );
+    assert!(
+        pending.iter().all(|r| r.status == "pending"),
+        "list_pending must return only pending rows"
     );
 }
 

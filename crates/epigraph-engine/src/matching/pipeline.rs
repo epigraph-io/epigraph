@@ -28,6 +28,8 @@ pub struct RunReport {
     pub run_id: Uuid,
     pub scanned_pairs: usize,
     pub promoted: usize,
+    /// Candidates staged as `pending` for human review (`auto_promote=false`).
+    pub staged: usize,
     pub mid_band: usize,
     pub rejected: usize,
 }
@@ -115,10 +117,21 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         }
     }
 
+    // When not auto-promoting, every AutoPromote/WriteContradicts decision
+    // above actually STAGED a `pending` candidate for human review (Policy
+    // wrote `status='pending'` under the same `auto_promote` flag), so report
+    // it honestly as `staged` rather than `promoted`.
+    let (promoted, staged) = if inputs.auto_promote {
+        (promoted, 0usize)
+    } else {
+        (0usize, promoted)
+    };
+
     Ok(RunReport {
         run_id,
         scanned_pairs: pairs.len(),
         promoted,
+        staged,
         mid_band,
         rejected,
     })
