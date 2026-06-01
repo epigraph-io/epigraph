@@ -72,29 +72,56 @@ def state_paths(state_dir):
 
 # ── Phase 1: Seed ────────────────────────────────────────────────────────
 
-def sample_atomic_claims(conn, sample_size=5000):
-    """Sample atomic (leaf) claims with embeddings.
+def sample_claims(conn, sample_size=50000, atomic_only=False):
+    """Random-sample current claims with embeddings for the UMAP seed fit.
 
-    Leaf = has a decomposes_to edge pointing TO it, but does NOT have a
-    decomposes_to edge pointing OUT from it.  Same query as V2.
+    Default: sample across ALL current+embedded claims so the centroids span
+    the whole population we assign (composite claims included), not just the
+    atomic-leaf manifold. `atomic_only=True` restores the V2 behaviour (seed
+    from decomposes_to leaves only).
+
+    Two-step on purpose: projecting embedding::text *through* ORDER BY random()
+    forces Postgres to materialise every candidate embedding (~20 KB each) just
+    to sort — minutes of CPU at corpus scale. Sorting bare IDs is seconds; we
+    then fetch embeddings only for the chosen sample.
     """
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT c.id::text, c.embedding::text
-            FROM claims c
-            JOIN edges e ON e.target_id = c.id
-                AND e.relationship = 'decomposes_to'
-                AND e.source_type = 'claim' AND e.target_type = 'claim'
-            WHERE c.embedding IS NOT NULL
-              AND c.is_current = true
-              AND NOT EXISTS (
-                  SELECT 1 FROM edges e2
-                  WHERE e2.source_id = c.id AND e2.relationship = 'decomposes_to'
-                    AND e2.source_type = 'claim'
-              )
-            ORDER BY random()
-            LIMIT %s
-        """, (sample_size,))
+        if atomic_only:
+            # Leaf = decomposes_to points TO it but not OUT of it. DISTINCT so
+            # claims with multiple parents aren't over-sampled.
+            cur.execute("""
+                SELECT id FROM (
+                    SELECT DISTINCT c.id
+                    FROM claims c
+                    JOIN edges e ON e.target_id = c.id
+                        AND e.relationship = 'decomposes_to'
+                        AND e.source_type = 'claim' AND e.target_type = 'claim'
+                    WHERE c.embedding IS NOT NULL
+                      AND c.is_current = true
+                      AND NOT EXISTS (
+                          SELECT 1 FROM edges e2
+                          WHERE e2.source_id = c.id AND e2.relationship = 'decomposes_to'
+                            AND e2.source_type = 'claim'
+                      )
+                ) leaves
+                ORDER BY random()
+                LIMIT %s
+            """, (sample_size,))
+        else:
+            cur.execute("""
+                SELECT id
+                FROM claims
+                WHERE embedding IS NOT NULL AND is_current = true
+                ORDER BY random()
+                LIMIT %s
+            """, (sample_size,))
+        sampled_ids = [r[0] for r in cur.fetchall()]
+
+        # Step 2: fetch embeddings only for the sampled IDs.
+        cur.execute(
+            "SELECT id::text, embedding::text FROM claims WHERE id = ANY(%s::uuid[])",
+            (sampled_ids,),
+        )
         rows = cur.fetchall()
 
     ids = [r[0] for r in rows]
@@ -150,10 +177,11 @@ def create_theme_rows(conn, k):
     return cluster_theme_map
 
 
-def seed_phase(conn, sample_size, k_arg, state_dir, no_wipe):
+def seed_phase(conn, sample_size, k_arg, state_dir, no_wipe, atomic_only, reproducible):
     """Fit UMAP reducer + k-means, create claim_themes rows, persist artifacts."""
-    print(f"Phase 1: Sampling {sample_size} atomic claims...", file=sys.stderr)
-    ids, embs = sample_atomic_claims(conn, sample_size)
+    scope = "atomic-leaf" if atomic_only else "all current"
+    print(f"Phase 1: Sampling {sample_size} {scope} claims...", file=sys.stderr)
+    ids, embs = sample_claims(conn, sample_size, atomic_only=atomic_only)
     print(f"  Loaded {len(ids)} claims ({embs.nbytes / 1024 / 1024:.1f} MB)",
           file=sys.stderr)
 
@@ -161,10 +189,15 @@ def seed_phase(conn, sample_size, k_arg, state_dir, no_wipe):
         print(f"ERROR: Only {len(ids)} claims found — aborting.", file=sys.stderr)
         sys.exit(1)
 
-    # Fit UMAP
-    print("Fitting UMAP(32, cosine)...", file=sys.stderr)
-    reducer = umap.UMAP(n_components=32, metric="cosine", n_neighbors=30,
-                        min_dist=0.0, random_state=42)
+    # Fit UMAP. random_state forces single-threaded (UMAP warns + sets n_jobs=1);
+    # omitting it lets UMAP use all cores — much faster on large samples at the
+    # cost of run-to-run reproducibility. `--reproducible` restores the seed.
+    print(f"Fitting UMAP(32, cosine){' [reproducible/1-core]' if reproducible else ' [parallel]'}...",
+          file=sys.stderr)
+    umap_kwargs = dict(n_components=32, metric="cosine", n_neighbors=30, min_dist=0.0)
+    if reproducible:
+        umap_kwargs["random_state"] = 42
+    reducer = umap.UMAP(**umap_kwargs)
     reduced = reducer.fit_transform(embs).astype(np.float32)
     reduced_norm = normalize(reduced, norm="l2")
     print("  UMAP fit complete.", file=sys.stderr)
@@ -356,8 +389,14 @@ def main():
     parser.add_argument("--database-url",
                         default=os.environ.get("DATABASE_URL"),
                         help="PostgreSQL DSN (or set DATABASE_URL env var)")
-    parser.add_argument("--sample-size", type=int, default=5000,
-                        help="Seed sample size for UMAP fit (default 5000)")
+    parser.add_argument("--sample-size", type=int, default=50000,
+                        help="Seed sample size for UMAP fit (default 50000)")
+    parser.add_argument("--atomic-only", action="store_true",
+                        help="Seed only from decomposes_to leaf claims (V2 behaviour); "
+                             "default samples across ALL current+embedded claims")
+    parser.add_argument("--reproducible", action="store_true",
+                        help="Force UMAP random_state=42 (single-threaded, reproducible); "
+                             "default omits the seed to use all cores")
     parser.add_argument("--batch-size", type=int, default=50000,
                         help="Claims per assign batch (default 50000)")
     parser.add_argument("--k", type=int, default=None,
@@ -386,6 +425,8 @@ def main():
             k_arg=args.k,
             state_dir=args.state_dir,
             no_wipe=args.no_wipe,
+            atomic_only=args.atomic_only,
+            reproducible=args.reproducible,
         )
 
         if args.seed_only:
