@@ -107,3 +107,62 @@ async fn search_current_returns_all_levels_excludes_non_current(pool: PgPool) {
     assert!(!l2_ids.contains(&mem), "legacy method excludes the level <none> memory (the bug)");
     assert!(l2_ids.contains(&para), "legacy method returns the level-2 paragraph");
 }
+
+/// `search_by_embedding_scoped` pushes optional tag (label containment) and
+/// agent predicates into the query. A None filter must not restrict; a Some
+/// filter must restrict, and the two combine (AND).
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
+    let agent_a = seed_agent(&pool, "a1").await;
+    let agent_b = seed_agent(&pool, "b2").await;
+    let pgvec = build_query_vec();
+
+    let a_x = seed_claim(&pool, agent_a, 1, None, true, &["topic-x"], &pgvec).await;
+    let a_plain = seed_claim(&pool, agent_a, 2, None, true, &[], &pgvec).await;
+    let b_x = seed_claim(&pool, agent_b, 3, None, true, &["topic-x"], &pgvec).await;
+
+    let ids = |hits: &[epigraph_db::ClaimEmbeddingHit]| -> Vec<Uuid> {
+        hits.iter().map(|h| h.claim_id).collect()
+    };
+
+    // No scope → all three.
+    let all = ClaimRepository::search_by_embedding_scoped(&pool, &pgvec, 10, None, None)
+        .await
+        .expect("scoped none");
+    let all_ids = ids(&all);
+    assert!([a_x, a_plain, b_x].iter().all(|c| all_ids.contains(c)), "no scope returns all");
+
+    // Tag scope → only the two carrying topic-x, across agents.
+    let tagged = ClaimRepository::search_by_embedding_scoped(
+        &pool,
+        &pgvec,
+        10,
+        Some(&["topic-x".to_string()]),
+        None,
+    )
+    .await
+    .expect("scoped tag");
+    let tagged_ids = ids(&tagged);
+    assert!(tagged_ids.contains(&a_x) && tagged_ids.contains(&b_x), "tag scope keeps topic-x claims");
+    assert!(!tagged_ids.contains(&a_plain), "tag scope drops the untagged claim");
+
+    // Agent scope → only agent_a's claims, regardless of tag.
+    let by_agent = ClaimRepository::search_by_embedding_scoped(&pool, &pgvec, 10, None, Some(agent_a))
+        .await
+        .expect("scoped agent");
+    let agent_ids = ids(&by_agent);
+    assert!(agent_ids.contains(&a_x) && agent_ids.contains(&a_plain), "agent scope keeps agent_a claims");
+    assert!(!agent_ids.contains(&b_x), "agent scope drops agent_b claim");
+
+    // Both → intersection: agent_a AND topic-x = only a_x.
+    let both = ClaimRepository::search_by_embedding_scoped(
+        &pool,
+        &pgvec,
+        10,
+        Some(&["topic-x".to_string()]),
+        Some(agent_a),
+    )
+    .await
+    .expect("scoped both");
+    assert_eq!(ids(&both), vec![a_x], "tag AND agent intersect to a single claim");
+}

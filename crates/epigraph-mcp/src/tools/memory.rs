@@ -2,7 +2,7 @@
 
 use rmcp::model::*;
 
-use crate::errors::{internal_error, McpError};
+use crate::errors::{internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto;
 use crate::types::*;
@@ -132,15 +132,36 @@ pub async fn memorize(
     })
 }
 
+/// Parse the optional `agent_id` recall scope filter. A present-but-invalid
+/// UUID is an ERROR, never a silently dropped filter — silently ignoring it
+/// would widen recall to every agent (a scope bypass) while the caller
+/// believes the results are scoped. Blank/whitespace is treated as absent.
+fn parse_agent_filter(raw: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => uuid::Uuid::parse_str(s)
+            .map(Some)
+            .map_err(|e| format!("invalid agent_id {s:?}: {e}")),
+    }
+}
+
 pub async fn recall(
     server: &EpiGraphMcpFull,
     params: RecallParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let min_truth = params.min_truth.unwrap_or(0.3);
+    let agent_filter = parse_agent_filter(params.agent_id.as_deref()).map_err(invalid_params)?;
+    let tags = params.tags;
+    let tags_opt: Option<&[String]> = if tags.is_empty() { None } else { Some(&tags) };
+    let scoped = tags_opt.is_some() || agent_filter.is_some();
 
-    // Try semantic search first
-    let results = if let Ok(hits) = server.embedder.search(&params.query, limit).await {
+    // Try semantic search first, with any scope pushed into the query.
+    let results = if let Ok(hits) = server
+        .embedder
+        .search_scoped(&params.query, limit, tags_opt, agent_filter)
+        .await
+    {
         let mut results = Vec::new();
         for (claim_id, similarity) in hits {
             if let Ok(Some(claim)) =
@@ -158,8 +179,18 @@ pub async fn recall(
             }
         }
         results
+    } else if scoped {
+        // Degraded path: the embedder failed, so scoped semantic recall is
+        // unavailable. The text fallback (ILIKE over content) cannot enforce a
+        // tag scope — `Claim` carries no labels — so serving it would silently
+        // drop or bypass the requested scope. Return empty + warn rather than
+        // lie about what was searched.
+        tracing::warn!(
+            "recall: embedder unavailable; scoped recall (tags/agent_id) cannot be served by the unscoped text fallback — returning no results"
+        );
+        Vec::new()
     } else {
-        // Fallback to text search
+        // Fallback to unscoped text search (unchanged behaviour).
         let claims = ClaimRepository::list(&server.pool, limit, 0, Some(&params.query))
             .await
             .map_err(internal_error)?;
@@ -176,4 +207,30 @@ pub async fn recall(
     };
 
     success_json(&results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_agent_filter_none_or_blank_is_unscoped() {
+        assert_eq!(parse_agent_filter(None).unwrap(), None);
+        assert_eq!(parse_agent_filter(Some("")).unwrap(), None);
+        assert_eq!(parse_agent_filter(Some("   ")).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_agent_filter_accepts_valid_uuid() {
+        let u = uuid::Uuid::new_v4();
+        assert_eq!(parse_agent_filter(Some(&u.to_string())).unwrap(), Some(u));
+    }
+
+    #[test]
+    fn parse_agent_filter_rejects_bad_uuid_instead_of_silently_dropping() {
+        // A present-but-invalid agent_id MUST error. Silently returning None
+        // would widen recall to every agent while the caller believes the
+        // results are scoped — a scope bypass.
+        assert!(parse_agent_filter(Some("not-a-uuid")).is_err());
+    }
 }

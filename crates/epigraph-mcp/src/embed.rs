@@ -94,22 +94,37 @@ impl McpEmbedder {
         }
     }
 
-    /// Search by embedding similarity. Returns (claim_id, similarity) pairs.
+    /// Search current claims by embedding similarity. Returns
+    /// (claim_id, similarity) pairs. Unscoped convenience wrapper over
+    /// [`search_scoped`](Self::search_scoped).
     ///
     /// Searches `claims.embedding` (where memorize/submit/ingest write claim
-    /// vectors) via `ClaimRepository::search_by_embedding_current`, restricted
-    /// to current claims of any level. This previously called
-    /// `EvidenceRepository::search_by_embedding` = `evidence.embedding`, which
-    /// is unpopulated, so the `recall` tool's semantic path always returned
-    /// empty.
+    /// vectors). This previously called `EvidenceRepository::search_by_embedding`
+    /// = `evidence.embedding`, which is unpopulated, so the `recall` tool's
+    /// semantic path always returned empty.
     pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<(uuid::Uuid, f64)>, String> {
+        self.search_scoped(query, limit, None, None).await
+    }
+
+    /// Embedding search over current claims with optional scope pushed into
+    /// the query (see `ClaimRepository::search_by_embedding_scoped`): `tags`
+    /// requires label containment, `agent_id` requires authorship, `None` does
+    /// not restrict.
+    pub async fn search_scoped(
+        &self,
+        query: &str,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<(uuid::Uuid, f64)>, String> {
         let embedding = self.generate(query).await?;
 
         let pgvec = format_pgvector(&embedding);
-        let results =
-            epigraph_db::ClaimRepository::search_by_embedding_current(&self.pool, &pgvec, limit)
-                .await
-                .map_err(|e| e.to_string())?;
+        let results = epigraph_db::ClaimRepository::search_by_embedding_scoped(
+            &self.pool, &pgvec, limit, tags, agent_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
         Ok(results
             .into_iter()

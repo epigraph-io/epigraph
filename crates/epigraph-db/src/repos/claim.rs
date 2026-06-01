@@ -490,6 +490,33 @@ impl ClaimRepository {
         query_embedding_pgvector: &str,
         limit: i64,
     ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        Self::search_by_embedding_scoped(pool, query_embedding_pgvector, limit, None, None).await
+    }
+
+    /// [`search_by_embedding_current`] with optional scope predicates pushed
+    /// into the query: `tags` requires label containment (`c.labels @> $tags`,
+    /// the claim must carry ALL given tags) and `agent_id` requires authorship.
+    /// A `None`/empty filter does not restrict (the `$n IS NULL OR …` idiom),
+    /// so the two compose with AND. Scoping at the DB keeps it correct and
+    /// index-friendly rather than over-fetching and filtering in Rust.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn search_by_embedding_scoped(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        // Empty tag slice scopes to nothing meaningful (`@> '{}'` is all rows);
+        // collapse it to None so the IS NULL branch short-circuits.
+        let tags_owned: Option<Vec<String>> = match tags {
+            Some(t) if !t.is_empty() => Some(t.to_vec()),
+            _ => None,
+        };
+
         let rows = sqlx::query_as::<_, ClaimEmbeddingHit>(
             r#"
             SELECT c.id AS claim_id,
@@ -497,12 +524,16 @@ impl ClaimRepository {
             FROM claims c
             WHERE c.embedding IS NOT NULL
               AND c.is_current
+              AND ($3::text[] IS NULL OR c.labels @> $3::text[])
+              AND ($4::uuid IS NULL OR c.agent_id = $4::uuid)
             ORDER BY c.embedding <=> $1::vector
             LIMIT $2
             "#,
         )
         .bind(query_embedding_pgvector)
         .bind(limit)
+        .bind(tags_owned)
+        .bind(agent_id)
         .fetch_all(pool)
         .await?;
 
