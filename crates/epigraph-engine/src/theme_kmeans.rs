@@ -35,6 +35,11 @@ use ndarray::Array2;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Step size for the coarse elbow-search k-grid. Fitting every integer k with
+/// linfa's default n_runs=10 is a multi-hour hang on large samples; a coarse
+/// grid keeps the nightly rebuild tractable.
+const K_SEARCH_STEP: usize = 8;
+
 use epigraph_db::{ClaimThemeRepository, DbError};
 
 /// Configuration for [`run_theme_kmeans`].
@@ -219,11 +224,33 @@ pub async fn run_theme_kmeans(
         }
         k
     } else {
+        // Coarse k-grid search. Fitting every k in k_min..=k_max with linfa's
+        // default n_runs=10 is 770 fits at k_max=80 — a multi-hour hang on a
+        // 100K sample. We instead test a coarse grid (step K_SEARCH_STEP),
+        // each with n_runs=1 + max_n_iterations=50 (search-quality, not final),
+        // and keep the same elbow penalty heuristic to pick best_k. The final
+        // fit at best_k below uses full quality.
+        let mut candidates: Vec<usize> = (k_min_usize..=actual_k_max)
+            .step_by(K_SEARCH_STEP)
+            .collect();
+        if *candidates.last().unwrap_or(&k_min_usize) != actual_k_max {
+            candidates.push(actual_k_max);
+        }
+        tracing::info!(
+            k_min = k_min_usize,
+            k_max = actual_k_max,
+            step = K_SEARCH_STEP,
+            candidates = ?candidates,
+            "theme_kmeans: starting coarse elbow search"
+        );
+
         let mut best_k = k_min_usize;
         let mut best_score = f64::NEG_INFINITY;
-        for k in k_min_usize..=actual_k_max {
+        for &k in &candidates {
+            let fit_start = std::time::Instant::now();
             let model = KMeans::params(k)
-                .max_n_iterations(100)
+                .n_runs(1)
+                .max_n_iterations(50)
                 .tolerance(1e-4)
                 .fit(&dataset)
                 .map_err(|e| {
@@ -243,24 +270,41 @@ pub async fn run_theme_kmeans(
                 total_dist += dist;
             }
             let inertia = -total_dist / n_claims as f64;
-            // Elbow penalty: discourage runaway k.
+            // Elbow penalty: discourage runaway k. (Unchanged heuristic.)
             let penalized = inertia * (1.0 - 0.05 * k as f64);
+            tracing::info!(
+                k,
+                inertia,
+                penalized,
+                elapsed_secs = format!("{:.1}", fit_start.elapsed().as_secs_f64()),
+                "theme_kmeans: elbow candidate"
+            );
             if penalized > best_score {
                 best_score = penalized;
                 best_k = k;
             }
         }
+        tracing::info!(best_k, "theme_kmeans: elbow search selected k");
         best_k
     };
 
-    // 4. Final fit at chosen_k.
+    // 4. Final fit at chosen_k. n_runs(3) balances quality vs cost — the
+    //    search above used n_runs(1) for speed; the final centroids deserve
+    //    a few restarts to avoid a bad local optimum.
+    let final_fit_start = std::time::Instant::now();
     let model = KMeans::params(chosen_k)
+        .n_runs(3)
         .max_n_iterations(200)
         .tolerance(1e-5)
         .fit(&dataset)
         .map_err(|e| {
             ThemeKmeansError::KMeansFit(format!("Final k-means fit failed at k={chosen_k}: {e}"))
         })?;
+    tracing::info!(
+        chosen_k,
+        elapsed_secs = format!("{:.1}", final_fit_start.elapsed().as_secs_f64()),
+        "theme_kmeans: final fit complete"
+    );
     let labels: Vec<usize> = model.predict(&dataset).iter().copied().collect();
     let centroids = model.centroids();
 

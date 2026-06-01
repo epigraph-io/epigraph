@@ -99,9 +99,11 @@ impl ThemeClusterRebuildHandler {
             k_min: 4,
             k_max: max_themes,
             min_claims_per_theme,
-            // 2000 claims for centroid computation only; the assign-all
-            // phase assigns the remaining corpus via pgvector ANN.
-            limit: 2000,
+            // 100K-claim sample for the elbow search — large enough to expose
+            // real cluster structure (the old 500/2000 sample collapsed to ~16
+            // themes). VM has ~5 GB free; 100K×1536 f64 ≈ 1.2 GB. The assign-all
+            // phase below assigns the full corpus via pgvector ANN.
+            limit: 100_000,
             label_prefix: "auto".to_string(),
             // Scheduled rebuild replaces existing themes wholesale; the
             // skip-check above ensures we only do this when the corpus
