@@ -446,7 +446,7 @@ impl EpiGraphMcpFull {
     // ── Workflows (5 tools) ──
 
     #[tool(
-        description = "Store a new workflow as an epistemic hypothesis with ordered steps and prerequisites."
+        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table; use `report_workflow_outcome` with that returned id to record execution results."
     )]
     async fn store_workflow(
         &self,
@@ -465,7 +465,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Record what actually happened when you used a workflow — step-by-step lab notebook with deviations."
+        description = "Record what actually happened when you used a workflow. Accepts workflow_id values returned by `store_workflow` (rows in `workflows`) and delegates to the hierarchical outcome path; legacy flat workflow claim IDs are still supported for backward compatibility."
     )]
     async fn report_workflow_outcome(
         &self,
@@ -526,7 +526,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Record an outcome for a hierarchical workflow run. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution with step_claim_id resolved from the workflow's `executes` edges in plan order. Use `report_workflow_outcome` instead for flat workflow claims."
+        description = "Record an outcome for a hierarchical workflow run by workflows-table id. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution with step_claim_id resolved from the workflow's `executes` edges in plan order. `report_workflow_outcome` is the compatibility entry point for callers that may have either store_workflow ids or legacy flat workflow claim ids."
     )]
     async fn report_hierarchical_outcome(
         &self,
