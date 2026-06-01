@@ -59,7 +59,7 @@ pub async fn build_from_bridges(
         })?
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
-    use epigraph_jobs::cluster_graph::louvain::{louvain, LouvainInput};
+    use epigraph_jobs::cluster_graph::louvain::{louvain, LouvainConfig, LouvainInput};
     use std::collections::HashMap;
 
     let pool = &state.db_pool;
@@ -161,7 +161,7 @@ pub async fn build_from_bridges(
             edges: louvain_edges,
             resolution,
         };
-        louvain(&input)
+        louvain(&input, &LouvainConfig::default())
             .map_err(|e| ApiError::InternalError {
                 message: format!("louvain: {e}"),
             })?
