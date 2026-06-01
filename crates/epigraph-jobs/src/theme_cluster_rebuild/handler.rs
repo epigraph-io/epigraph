@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use epigraph_db::ClaimThemeRepository;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -115,10 +116,49 @@ impl ThemeClusterRebuildHandler {
                 message: format!("theme rebuild: {e}"),
             })?;
 
+        // Phase 2: Assign every remaining unthemed claim to its nearest centroid.
+        // The k-means sample (limit=2000) assigned ~2000 claims; the corpus has
+        // 400K+. Loop assign_unthemed_batch until exhausted.
+        let mut assign_all_total: i64 = 0;
+        let mut assign_batch_num: u32 = 0;
+        loop {
+            let batch = ClaimThemeRepository::assign_unthemed_batch(pool, 2000)
+                .await
+                .map_err(|e| JobError::ProcessingFailed {
+                    message: format!("assign-all batch {assign_batch_num}: {e}"),
+                })?;
+            if batch == 0 {
+                break;
+            }
+            assign_all_total += batch;
+            assign_batch_num += 1;
+            tracing::info!(
+                batch = assign_batch_num,
+                batch_assigned = batch,
+                total_assigned = assign_all_total,
+                "theme_cluster_rebuild: assign-all progress"
+            );
+        }
+        tracing::info!(
+            total_assigned = assign_all_total,
+            batches = assign_batch_num,
+            "theme_cluster_rebuild: assign-all complete"
+        );
+
+        // Phase 3: Recompute centroids from the full assignment set.
+        // k-means centroids were computed from a 2000-claim sample;
+        // after assign-all they should reflect the true cluster geometry.
+        ClaimThemeRepository::recompute_all_centroids(pool)
+            .await
+            .map_err(|e| JobError::ProcessingFailed {
+                message: format!("recompute_all_centroids: {e}"),
+            })?;
+        tracing::info!("theme_cluster_rebuild: centroids recomputed from full assignment");
+
         Ok(HandleSummary {
             skipped: false,
             themes_created: summary.themes_created,
-            claims_assigned: summary.claims_assigned,
+            claims_assigned: summary.claims_assigned + assign_all_total as usize,
         })
     }
 }
