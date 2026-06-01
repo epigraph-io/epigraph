@@ -1286,6 +1286,7 @@ dependencies = [
  "epigraph-ds",
  "epigraph-embeddings",
  "epigraph-engine",
+ "epigraph-ingest",
  "epigraph-interfaces",
  "epigraph-mcp",
  "futures",
