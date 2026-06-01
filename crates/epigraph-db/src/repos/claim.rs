@@ -2231,6 +2231,33 @@ impl ClaimRepository {
             .execute(&mut *tx)
             .await?;
 
+        // Migrate edges off the now-non-current duplicate onto the canonical
+        // claim, mirroring supersede()'s edge migration — otherwise edges to/from
+        // third claims dangle at a claim that no longer surfaces. Unlike supersede
+        // (which targets a freshly-minted claim with no pre-existing edges), the
+        // canonical here already exists, so guard against creating a
+        // canonical->canonical self-loop when an edge already linked dup and
+        // canonical. The 'supersedes' edges (dedup/lineage trail) are preserved.
+        sqlx::query(
+            "UPDATE edges SET target_id = $1 \
+             WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
+               AND NOT (source_type = 'claim' AND source_id = $1)",
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE edges SET source_id = $1 \
+             WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes' \
+               AND NOT (target_type = 'claim' AND target_id = $1)",
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         Ok(())
     }
