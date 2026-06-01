@@ -34,7 +34,10 @@ pub async fn protected_resource_metadata(State(state): State<AppState>) -> Json<
     Json(json!({
         "resource": format!("{base}/mcp"),
         "authorization_servers": [base],
-        "scopes_supported": ["claims:read", "claims:write", "analysis:belief"],
+        // Mirror the scope values the /mcp resource actually accepts — the codomain
+        // of epigraph-mcp's SCOPE_MAP. claims:admin gates mark_duplicate /
+        // supersede_claim / update_partition; analysis:belief is required by no tool.
+        "scopes_supported": ["claims:read", "claims:write", "claims:admin"],
         "bearer_methods_supported": ["header"]
     }))
 }

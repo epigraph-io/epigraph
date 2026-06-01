@@ -73,4 +73,18 @@ async fn protected_resource_metadata_points_at_this_as() {
         body["authorization_servers"][0],
         "https://test.example"
     );
+    // scopes_supported MUST reflect the scope values the /mcp resource actually
+    // accepts — i.e. the codomain of epigraph-mcp's SCOPE_MAP {claims:read,
+    // claims:write, claims:admin}. claims:admin gates mark_duplicate /
+    // supersede_claim / update_partition, so a connector reading this doc must
+    // learn it can request it; analysis:belief is required by NO MCP tool.
+    let scopes = body["scopes_supported"].as_array().unwrap();
+    assert!(
+        scopes.iter().any(|v| v == "claims:admin"),
+        "scopes_supported must advertise claims:admin (admin MCP tools need it); got: {scopes:?}"
+    );
+    assert!(
+        !scopes.iter().any(|v| v == "analysis:belief"),
+        "scopes_supported must NOT advertise analysis:belief (no MCP tool requires it); got: {scopes:?}"
+    );
 }
