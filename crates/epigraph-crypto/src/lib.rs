@@ -25,7 +25,7 @@ pub mod signer;
 pub mod verifier;
 
 pub use canonical::{to_canonical_bytes, to_canonical_json, Canonical};
-pub use did_key::DidKey;
+pub use did_key::{did_key_for_llm_agent, keypair_from_llm_agent, DidKey};
 pub use encryption::{decrypt, encrypt, EncryptedPayload};
 pub use epoch::derive_epoch_key;
 pub use errors::CryptoError;

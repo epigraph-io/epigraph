@@ -1,8 +1,9 @@
 //! W3C `did:key` identifiers for Ed25519 agents
 //!
-//! Implements deterministic `did:key` generation for human author agents.
-//! An ORCID (or normalized author name) is hashed with BLAKE3 to produce
-//! a deterministic Ed25519 keypair, then encoded as a `did:key` URI.
+//! Implements deterministic `did:key` generation for human author agents and
+//! LLM-driven agents. An ORCID, normalized author name, or model+prompt seed is
+//! hashed with BLAKE3 to produce a deterministic Ed25519 keypair, then encoded
+//! as a `did:key` URI.
 //!
 //! # did:key Format
 //!
@@ -17,6 +18,7 @@
 //!
 //! ```text
 //! BLAKE3("orcid:0000-0002-1825-0097") → 32-byte seed → Ed25519 keypair → did:key
+//! BLAKE3("llm-agent:<model-id>:<prompt-hash>") → 32-byte seed → Ed25519 keypair → did:key
 //! ```
 //!
 //! The same ORCID always produces the same `did:key`. For authors without an
@@ -140,6 +142,39 @@ pub fn keypair_from_name(name: &str) -> AgentSigner {
     let normalized = normalize_author_name(name);
     let seed_input = format!("author:{normalized}");
     keypair_from_seed(&seed_input)
+}
+
+/// Derive a deterministic Ed25519 keypair for an LLM-driven agent.
+///
+/// The model identifier is trimmed but otherwise preserved because provider
+/// model IDs are case- and punctuation-bearing external identifiers. The full
+/// system prompt is not embedded directly in the seed string; its BLAKE3 hash
+/// is used so very large prompts do not become seed material while still
+/// changing the derived identity on any prompt change.
+#[must_use]
+pub fn keypair_from_llm_agent(model_id: &str, system_prompt: &str) -> AgentSigner {
+    let model_id = model_id.trim();
+    let prompt_hash = blake3::hash(system_prompt.as_bytes()).to_hex();
+    let seed_input = format!("llm-agent:{model_id}:{prompt_hash}");
+    keypair_from_seed(&seed_input)
+}
+
+/// Generate a `did:key` for an LLM-driven agent.
+///
+/// Same `(model_id, system_prompt)` inputs produce the same DID across
+/// processes and hosts. Changing either input produces a different signer and
+/// DID, which makes prompt revisions attribution-visible.
+///
+/// Returns `(did_key, public_key_bytes)`.
+#[must_use]
+pub fn did_key_for_llm_agent(
+    model_id: &str,
+    system_prompt: &str,
+) -> (DidKey, [u8; PUBLIC_KEY_SIZE]) {
+    let signer = keypair_from_llm_agent(model_id, system_prompt);
+    let public_key = signer.public_key();
+    let did = DidKey::from_public_key(&public_key);
+    (did, public_key)
 }
 
 /// Generate a `did:key` for a human author agent.
@@ -285,6 +320,26 @@ mod tests {
         let (did2, _) = did_key_for_author(Some(""), "John Smith");
         // Empty ORCID should fall back to name
         assert_eq!(did1, did2);
+    }
+
+    #[test]
+    fn llm_agent_derivation_is_deterministic() {
+        let (did1, pk1) = did_key_for_llm_agent("gpt-4.1", "You are a careful analyst.");
+        let (did2, pk2) = did_key_for_llm_agent("gpt-4.1", "You are a careful analyst.");
+
+        assert_eq!(did1, did2);
+        assert_eq!(pk1, pk2);
+    }
+
+    #[test]
+    fn llm_agent_derivation_changes_with_model_or_prompt() {
+        let (base, _) = did_key_for_llm_agent("gpt-4.1", "You are a careful analyst.");
+        let (model_changed, _) =
+            did_key_for_llm_agent("gpt-4.1-mini", "You are a careful analyst.");
+        let (prompt_changed, _) = did_key_for_llm_agent("gpt-4.1", "You are a terse analyst.");
+
+        assert_ne!(base, model_changed);
+        assert_ne!(base, prompt_changed);
     }
 
     #[test]
