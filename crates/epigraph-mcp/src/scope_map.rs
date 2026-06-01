@@ -37,6 +37,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("get_ownership", "claims:read"),
     ("get_perspective", "claims:read"),
     ("get_provenance", "claims:read"),
+    ("get_workflow_executions", "claims:read"),
     ("list_challenges", "claims:read"),
     ("list_events", "claims:read"),
     ("list_frames", "claims:read"),

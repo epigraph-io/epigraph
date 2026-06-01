@@ -282,6 +282,17 @@ pub struct FindWorkflowParams {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetWorkflowExecutionsParams {
+    #[schemars(
+        description = "Workflow UUID (a `workflows` row id / lineage member) whose recent executions to fetch"
+    )]
+    pub workflow_id: String,
+
+    #[schemars(description = "Max executions to return, newest first (default 20, max 100)")]
+    pub limit: Option<i64>,
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
     #[schemars(description = "Zero-based index of the step in the workflow")]
