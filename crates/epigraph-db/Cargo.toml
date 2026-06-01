@@ -48,6 +48,10 @@ name = "claim_search_by_embedding"
 path = "tests/claim_search_by_embedding.rs"
 
 [[test]]
+name = "claim_search_claims_by_embedding"
+path = "tests/claim_search_claims_by_embedding.rs"
+
+[[test]]
 name = "match_candidate_migration"
 path = "tests/match_candidate_migration.rs"
 
