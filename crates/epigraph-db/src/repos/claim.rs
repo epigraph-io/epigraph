@@ -470,6 +470,94 @@ impl ClaimRepository {
         Ok(q.fetch_all(pool).await?)
     }
 
+    /// Level-agnostic semantic search over `claims.embedding` (1536d) or
+    /// `claims.embedding_3072` (3072d) by cosine distance.
+    ///
+    /// Unlike [`ClaimRepository::search_by_embedding`], this method does NOT
+    /// filter on `(properties->>'level')::int = 2`. That paragraph-primary gate
+    /// is correct for `recall_with_context` (paper kNN), but it silently drops
+    /// every memorized claim (`memorize` writes no `level` property) and every
+    /// `workflow`-labeled claim, which is exactly why flat `recall` and
+    /// `find_workflow` returned empty against ~426k embedded claims (backlog
+    /// 1564bdaf): their read paths queried `evidence.embedding`, which has 0
+    /// populated rows, while the canonical write paths embed `claims.embedding`.
+    ///
+    /// Predicate mirrors `EvidenceRepository::search_by_embedding`'s
+    /// `COALESCE(c.is_current, true) = true` so superseded claims never surface.
+    /// `WHERE c.{column} IS NOT NULL ORDER BY c.{column} <=> $1::vector` matches
+    /// the full (non-level-partial) HNSW index `idx_claims_embedding_hnsw`
+    /// (migration 001) for the 1536d path.
+    ///
+    /// When `label_filter` is `Some(&labels)`, only claims whose `labels` array
+    /// overlaps (`&&`) the filter are returned — `find_workflow` passes
+    /// `&["workflow".to_string()]` so semantic hits match the ILIKE fallback's
+    /// scope before `enrich_workflow_result`. Pass `None` for unfiltered recall.
+    ///
+    /// Runtime `sqlx::query_as` (not the compile-checked `query!` macro) because
+    /// the column name and the optional label predicate are chosen at runtime —
+    /// the same precedent as `search_by_embedding`. Consequence: a SQL typo here
+    /// compiles but fails at runtime, so the integration test is load-bearing.
+    ///
+    /// # Errors
+    /// * [`DbError::InvalidData`] if `dim` is neither 1536 nor 3072.
+    /// * [`DbError::QueryFailed`] on database errors.
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn search_claims_by_embedding(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        dim: u32,
+        limit: i64,
+        label_filter: Option<&[String]>,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        let column = match dim {
+            1536 => "embedding",
+            3072 => "embedding_3072",
+            _ => {
+                return Err(DbError::InvalidData {
+                    reason: format!("unsupported centroid_dim: {dim} (must be 1536 or 3072)"),
+                });
+            }
+        };
+
+        // Two shapes: with / without the label-overlap predicate, to keep the
+        // no-filter path index-friendly and bind only what each shape uses.
+        let sql = if label_filter.is_some() {
+            format!(
+                r#"
+                SELECT c.id AS claim_id,
+                       1 - (c.{column} <=> $1::vector) AS similarity
+                FROM claims c
+                WHERE c.{column} IS NOT NULL
+                  AND COALESCE(c.is_current, true) = true
+                  AND c.labels && $3
+                ORDER BY c.{column} <=> $1::vector
+                LIMIT $2
+                "#
+            )
+        } else {
+            format!(
+                r#"
+                SELECT c.id AS claim_id,
+                       1 - (c.{column} <=> $1::vector) AS similarity
+                FROM claims c
+                WHERE c.{column} IS NOT NULL
+                  AND COALESCE(c.is_current, true) = true
+                ORDER BY c.{column} <=> $1::vector
+                LIMIT $2
+                "#
+            )
+        };
+
+        let mut q = sqlx::query_as::<_, ClaimEmbeddingHit>(&sql)
+            .bind(query_embedding_pgvector)
+            .bind(limit);
+        if let Some(labels) = label_filter {
+            q = q.bind(labels);
+        }
+
+        Ok(q.fetch_all(pool).await?)
+    }
+
     /// Get all claims by an agent
     ///
     /// # Errors
