@@ -9,7 +9,7 @@
 use crate::matching::scorer::MatchFeatures;
 use crate::matching::verifier::{map_relationship, Verdict};
 use epigraph_db::repos::match_candidate::MatchCandidateRepo;
-use sqlx::types::Json;
+use epigraph_db::EdgeRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -136,11 +136,12 @@ impl Policy {
         Ok(())
     }
 
-    /// Insert a claim→claim edge, skipping if the same (source, target,
-    /// relationship) triple already exists. The unique index
-    /// `idx_edges_unique_triple_non_authored` (migration 108) covers this for
-    /// CORROBORATES/contradicts; we still do an explicit existence check so
-    /// we don't depend on partial-index ON-CONFLICT inference quirks.
+    /// Insert a claim→claim edge, skipping if the same relationship already
+    /// connects the two claims in either direction. Delegates the dedup SQL to
+    /// [`EdgeRepository::create_symmetric_if_absent`] so the bidirectional
+    /// `WHERE NOT EXISTS` form lives in one place. Migrations 017/018 dropped
+    /// the unique triple index, so the explicit existence check (not
+    /// `ON CONFLICT`) is what prevents duplicates on re-run.
     async fn write_edge(
         &self,
         a: Uuid,
@@ -159,23 +160,7 @@ impl Policy {
             "verifier_rationale": v.map(|x| &x.rationale),
             "source":             "cross_source_matcher",
         });
-        sqlx::query(
-            "INSERT INTO edges (source_id, source_type, target_id, target_type,
-                                relationship, properties)
-             SELECT $1, 'claim', $2, 'claim', $3, $4
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM edges
-                 WHERE ((source_id = $1 AND target_id = $2)
-                     OR (source_id = $2 AND target_id = $1))
-                   AND relationship = $3
-             )",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .bind(Json(props))
-        .execute(&self.pool)
-        .await?;
+        EdgeRepository::create_symmetric_if_absent(&self.pool, a, b, relationship, props).await?;
         Ok(())
     }
 }
