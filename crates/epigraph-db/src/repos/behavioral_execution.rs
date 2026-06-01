@@ -180,6 +180,45 @@ impl BehavioralExecutionRepository {
         Ok(rate.unwrap_or(0.0))
     }
 
+    /// Fetch the most recent `limit` behavioral executions for a workflow,
+    /// newest first (by `created_at`).
+    ///
+    /// Projects every column EXCEPT `goal_embedding` (which has no
+    /// `sqlx::Decode` in this crate), matching [`BehavioralExecutionRow`]. This
+    /// is the raw-row getter the workflow-evolution (GEPA) proposer reads to
+    /// reflect on a workflow's recent runs — `step_beliefs` (per-step
+    /// `deviation_reason`), `tool_pattern`, `quality`, `success` — before
+    /// proposing a variant. The aggregate methods (`rolling_success_rate`,
+    /// `behavioral_affinity`) summarise; this returns the rows themselves.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn recent_executions(
+        pool: &PgPool,
+        workflow_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<BehavioralExecutionRow>, DbError> {
+        let rows = sqlx::query_as::<_, BehavioralExecutionRow>(
+            r#"
+            SELECT id, workflow_id, goal_text,
+                   success, step_beliefs, tool_pattern,
+                   quality, deviation_count, total_steps, created_at,
+                   step_claim_id
+            FROM behavioral_executions
+            WHERE workflow_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(workflow_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Find workflows with high behavioral success for goals similar to the
     /// supplied embedding.
     ///
@@ -401,5 +440,82 @@ mod tests {
         .await
         .unwrap();
         assert!(count >= 1);
+    }
+
+    /// `recent_executions` returns a workflow's rows newest-first, honours the
+    /// limit, and is scoped to the requested workflow_id (the GEPA proposer
+    /// reads exactly this to reflect on a workflow's recent runs).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn recent_executions_newest_first_scoped_and_limited(pool: sqlx::PgPool) {
+        let agent_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(blake3::hash(b"re-agent").as_bytes().as_slice())
+        .bind("re-agent")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mk_wf = |content: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, uuid::Uuid>(
+                    "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
+                     VALUES ($1, $2, $3, 0.5) RETURNING id",
+                )
+                .bind(content)
+                .bind(blake3::hash(content.as_bytes()).as_bytes().as_slice())
+                .bind(agent_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let wf = mk_wf("wf-target").await;
+        let other = mk_wf("wf-other").await;
+
+        let base = chrono::Utc::now();
+        let mk_row = |wfid: uuid::Uuid, secs: i64, goal: &str| BehavioralExecutionRow {
+            id: uuid::Uuid::new_v4(),
+            workflow_id: wfid,
+            goal_text: goal.to_string(),
+            success: true,
+            step_beliefs: serde_json::json!({}),
+            tool_pattern: vec![],
+            quality: None,
+            deviation_count: 0,
+            total_steps: 1,
+            created_at: base + chrono::Duration::seconds(secs),
+            step_claim_id: None,
+        };
+        for (wfid, secs, goal) in [
+            (wf, 0, "oldest"),
+            (wf, 1, "mid"),
+            (wf, 2, "newest"),
+            (other, 5, "other-wf"),
+        ] {
+            BehavioralExecutionRepository::create(&pool, mk_row(wfid, secs, goal), None)
+                .await
+                .unwrap();
+        }
+
+        // Limit < count: newest two of the target workflow, DESC by created_at.
+        let recent = BehavioralExecutionRepository::recent_executions(&pool, wf, 2)
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 2, "limit honoured");
+        assert_eq!(recent[0].goal_text, "newest", "newest first");
+        assert_eq!(recent[1].goal_text, "mid");
+        assert!(
+            recent.iter().all(|r| r.workflow_id == wf),
+            "scoped to the requested workflow"
+        );
+
+        // Limit > count: all three target rows, never the other workflow's row.
+        let all = BehavioralExecutionRepository::recent_executions(&pool, wf, 100)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|r| r.workflow_id == wf));
     }
 }
