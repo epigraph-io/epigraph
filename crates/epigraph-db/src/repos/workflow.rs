@@ -360,6 +360,35 @@ impl WorkflowRepository {
         Ok(root.map(|(id,)| id).unwrap_or(workflow_id))
     }
 
+    /// The immediate parent of a workflow variant: the `target` of its outgoing
+    /// `variant_of`/`supersedes` edge (the workflow this one was derived from).
+    /// Returns `None` for a lineage root (no such outgoing edge). One hop only —
+    /// unlike [`find_lineage_root`], which walks to the ancestral root. Matches
+    /// that method's relationship set and claim→claim typing.
+    ///
+    /// The promotion gate compares a variant against its immediate parent; this
+    /// resolves which workflow that is.
+    pub async fn immediate_variant_parent(
+        pool: &PgPool,
+        workflow_id: Uuid,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let parent: Option<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT e.target_id
+            FROM edges e
+            WHERE e.source_id = $1
+              AND e.relationship IN ('variant_of', 'supersedes')
+              AND e.source_type = 'claim' AND e.target_type = 'claim'
+            LIMIT 1
+            "#,
+        )
+        .bind(workflow_id)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(parent.map(|(id,)| id))
+    }
+
     /// For each `executes`-edge from the workflow root, walk supersedes/revises
     /// edges to the latest head claim. Mirrors the resolution logic that
     /// previously lived in `epigraph-mcp::tools::workflow_hierarchical::build_resolved_steps`.
@@ -777,6 +806,57 @@ mod tests {
         assert_eq!(row.1, 0);
         assert_eq!(row.2, "Deploy a canary release safely.");
         assert_eq!(row.3["tags"][0], "deploy");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn immediate_variant_parent_returns_one_hop(pool: sqlx::PgPool) {
+        let agent: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO agents (public_key, display_name) VALUES ($1, 'ivp') RETURNING id",
+        )
+        .bind(blake3::hash(b"ivp-agent").as_bytes().as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mk_claim = |content: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, uuid::Uuid>(
+                    "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
+                     VALUES ($1, sha256($1::bytea), $2, 0.5) RETURNING id",
+                )
+                .bind(content)
+                .bind(agent)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let parent = mk_claim("ivp-parent").await;
+        let variant = mk_claim("ivp-variant").await;
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+             VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'variant_of')",
+        )
+        .bind(variant)
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The variant's one-hop parent is the variant_of target.
+        assert_eq!(
+            WorkflowRepository::immediate_variant_parent(&pool, variant)
+                .await
+                .unwrap(),
+            Some(parent)
+        );
+        // A lineage root has no outgoing variant_of/supersedes edge → None.
+        assert_eq!(
+            WorkflowRepository::immediate_variant_parent(&pool, parent)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
