@@ -771,6 +771,14 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/oauth/:provider/exchange",
             post(crate::oauth::exchange_endpoint),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(crate::oauth::authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(crate::oauth::protected_resource_metadata),
         );
 
     // Apply rate limiting and body limit as outermost layers
@@ -1148,6 +1156,14 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/oauth/:provider/exchange",
             post(crate::oauth::exchange_endpoint),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(crate::oauth::authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(crate::oauth::protected_resource_metadata),
         );
 
     // Apply rate limiting and body limit as outermost layers
