@@ -27,6 +27,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("compare_methods", "claims:read"),
     ("embedding_neighborhood_density", "claims:read"),
     ("entity_neighborhood", "claims:read"),
+    ("evaluate_workflow_promotion", "claims:read"),
     ("find_cross_source_matches", "claims:read"),
     ("find_workflow", "claims:read"),
     ("find_workflow_hierarchical", "claims:read"),

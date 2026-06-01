@@ -443,7 +443,7 @@ impl EpiGraphMcpFull {
         tools::cdst_maintenance::recompute_beliefs(self, params).await
     }
 
-    // ── Workflows (6 tools) ──
+    // ── Workflows (7 tools) ──
 
     #[tool(
         description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table; use `report_workflow_outcome` with that returned id to record execution results."
@@ -472,6 +472,16 @@ impl EpiGraphMcpFull {
         Parameters(params): Parameters<GetWorkflowExecutionsParams>,
     ) -> Result<CallToolResult, McpError> {
         tools::workflows::get_workflow_executions(self, params).await
+    }
+
+    #[tool(
+        description = "Evaluate whether a workflow variant is statistically ready to be promoted over its immediate (variant_of) parent: the Wilson lower bound of the variant's behavioral success rate vs the parent's rate, over the same window, gated on a minimum sample. Read-only — returns a verdict, does not promote."
+    )]
+    async fn evaluate_workflow_promotion(
+        &self,
+        Parameters(params): Parameters<EvaluateWorkflowPromotionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::workflows::evaluate_workflow_promotion(self, params).await
     }
 
     #[tool(
@@ -960,7 +970,7 @@ impl EpiGraphMcpFull {
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.read_only { "read-only" } else { "full" };
-        let tool_count = if self.read_only { 34 } else { 62 };
+        let tool_count = if self.read_only { 35 } else { 63 };
         ServerInfo {
             instructions: Some(format!(
                 "EpiGraph {mode} MCP server with {tool_count} epistemic tools."

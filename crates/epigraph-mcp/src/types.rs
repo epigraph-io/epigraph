@@ -293,6 +293,19 @@ pub struct GetWorkflowExecutionsParams {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EvaluateWorkflowPromotionParams {
+    #[schemars(
+        description = "Workflow variant UUID to evaluate for promotion over its variant_of parent"
+    )]
+    pub workflow_id: String,
+
+    #[schemars(
+        description = "Execution window compared on each side, newest first (default 50, max 500)"
+    )]
+    pub window: Option<i64>,
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
     #[schemars(description = "Zero-based index of the step in the workflow")]
