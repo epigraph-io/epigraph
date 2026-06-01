@@ -473,9 +473,18 @@ impl MassFunctionRepository {
         Ok(rows)
     }
 
-    /// List distinct `claim_id`s that have at least one BBA, ordered by
-    /// `claim_id` for stable pagination. Used by bulk belief-recompute to
-    /// enumerate the rebuild population when no explicit target set is given.
+    /// List distinct `claim_id`s of **current** claims that have at least one
+    /// BBA, ordered by `claim_id` for stable pagination. Used by bulk
+    /// belief-recompute to enumerate the rebuild population when no explicit
+    /// target set is given.
+    ///
+    /// The `JOIN claims … WHERE c.is_current` matters because supersede /
+    /// mark_duplicate flip `is_current = false` but leave the claim's
+    /// `mass_functions` rows in place; without the filter the bulk path would
+    /// recompute beliefs on retired claims. This mirrors the sibling
+    /// labels-target path (`list_by_labels(.., current_only = true, ..)`).
+    /// `recompute_beliefs`' explicit `claim_ids` target bypasses this method,
+    /// so a caller can still deliberately recompute a non-current claim by id.
     #[instrument(skip(pool))]
     pub async fn list_claim_ids(
         pool: &PgPool,
@@ -484,9 +493,11 @@ impl MassFunctionRepository {
     ) -> Result<Vec<Uuid>, DbError> {
         let rows: Vec<Uuid> = sqlx::query_scalar(
             r#"
-            SELECT DISTINCT claim_id
-            FROM mass_functions
-            ORDER BY claim_id
+            SELECT DISTINCT mf.claim_id
+            FROM mass_functions mf
+            JOIN claims c ON c.id = mf.claim_id
+            WHERE c.is_current
+            ORDER BY mf.claim_id
             LIMIT $1 OFFSET $2
             "#,
         )
@@ -722,6 +733,59 @@ mod tests {
             .unwrap();
         assert_eq!(page1, expected[..2].to_vec());
         assert_eq!(page2, vec![expected[2]]);
+    }
+
+    /// `list_claim_ids` (the bulk belief-recompute enumeration) must EXCLUDE
+    /// non-current claims. supersede/mark_duplicate flip `is_current = false`
+    /// but deliberately leave the claim's `mass_functions` rows in place, so
+    /// without an is_current filter the bulk recompute path rebuilds beliefs
+    /// on retired claims — wasted work, and it diverges from the sibling
+    /// labels-target path which is already current-only.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_claim_ids_excludes_non_current_claims(pool: sqlx::PgPool) {
+        let agent = insert_agent(&pool, "lci-cur-a").await;
+        let suffix = Uuid::new_v4();
+        let frame_id = insert_frame(&pool, &format!("lci-cur-frame-{suffix}")).await;
+        let c_current = insert_claim(&pool, agent, &format!("lci-cur-1-{suffix}")).await;
+        let c_retired = insert_claim(&pool, agent, &format!("lci-cur-2-{suffix}")).await;
+
+        let masses = serde_json::json!({"0": 0.6, "0,1": 0.4});
+        for c in [c_current, c_retired] {
+            MassFunctionRepository::store(
+                &pool,
+                c,
+                frame_id,
+                Some(agent),
+                &masses,
+                None,
+                Some("test"),
+                "unknown",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Retire one claim the way supersede/mark_duplicate do — flip
+        // is_current WITHOUT removing its BBAs.
+        sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+            .bind(c_retired)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let ids = MassFunctionRepository::list_claim_ids(&pool, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![c_current],
+            "only the current claim's id is enumerated"
+        );
+        assert!(
+            !ids.contains(&c_retired),
+            "retired (is_current=false) claim must be excluded from bulk recompute"
+        );
     }
 
     /// Regression test for the NULL-perspective upsert bug fixed by
