@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::louvain::{louvain, LouvainInput};
+use super::louvain::{louvain, LouvainConfig, LouvainInput};
 
 /// Edge relationship strings considered "epistemic" for clustering. Governance
 /// edges (OCCUPIES, GOVERNED_BY, HAS_ROLE) are excluded by NOT being listed.
@@ -86,7 +86,9 @@ pub async fn run_clustering(pool: &PgPool, cfg: &RunConfig) -> Result<RunSummary
         edges: edge_pairs,
         resolution: cfg.resolution,
     };
-    let result = louvain(&input).map_err(|e| sqlx::Error::Protocol(format!("louvain: {e}")))?;
+    let louvain_cfg = LouvainConfig::default(); // 5-min timeout, 32 max iters
+    let result = louvain(&input, &louvain_cfg)
+        .map_err(|e| sqlx::Error::Protocol(format!("louvain: {e}")))?;
 
     let run_id = Uuid::new_v4();
     let degraded = unique_count(&result.assignments) < 2;

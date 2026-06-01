@@ -23,6 +23,8 @@ pub struct LouvainResult {
     /// `assignments[node_id]` = community id (0-based, dense).
     pub assignments: Vec<u32>,
     pub modularity: f64,
+    /// `true` if the watchdog timer fired and terminated the run early.
+    pub timed_out: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -31,14 +33,44 @@ pub enum LouvainError {
     InvalidEdge { node: u32, node_count: usize },
 }
 
-pub fn louvain(input: &LouvainInput) -> Result<LouvainResult, LouvainError> {
+/// Tuning knobs for the Louvain pass.
+#[derive(Debug, Clone)]
+pub struct LouvainConfig {
+    /// Wall-clock timeout in seconds. When `Some(t)` and elapsed > t,
+    /// the current community assignment is returned immediately with a
+    /// tracing::warn. `None` means no timeout.
+    pub timeout_secs: Option<f64>,
+    /// Maximum sweep iterations (default 32).
+    pub max_iter: u32,
+}
+
+impl Default for LouvainConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: Some(300.0), // 5-minute production default
+            max_iter: 32,
+        }
+    }
+}
+
+pub fn louvain(input: &LouvainInput, cfg: &LouvainConfig) -> Result<LouvainResult, LouvainError> {
     let n = input.node_count;
+    tracing::debug!(
+        nodes = n,
+        edges = input.edges.len(),
+        resolution = input.resolution,
+        timeout_secs = ?cfg.timeout_secs,
+        max_iter = cfg.max_iter,
+        "louvain: starting"
+    );
     if n == 0 {
         return Ok(LouvainResult {
             assignments: Vec::new(),
             modularity: 0.0,
+            timed_out: false,
         });
     }
+    let wall_start = std::time::Instant::now();
 
     // Build adjacency: adj[node] -> Vec<(neighbor, weight)>.
     let mut adj: Vec<Vec<(u32, f64)>> = vec![Vec::new(); n];
@@ -70,6 +102,7 @@ pub fn louvain(input: &LouvainInput) -> Result<LouvainResult, LouvainError> {
         return Ok(LouvainResult {
             assignments,
             modularity: 0.0,
+            timed_out: false,
         });
     }
 
@@ -95,8 +128,29 @@ pub fn louvain(input: &LouvainInput) -> Result<LouvainResult, LouvainError> {
     let mut order: Vec<usize> = (0..n).collect();
     let mut moved = true;
     let mut iter = 0u32;
-    while moved && iter < 32 {
+    let mut timed_out = false;
+    while moved && iter < cfg.max_iter {
+        // Watchdog: check wall-clock before starting this sweep.
+        if let Some(limit) = cfg.timeout_secs {
+            let elapsed = wall_start.elapsed().as_secs_f64();
+            if elapsed > limit {
+                tracing::warn!(
+                    iter,
+                    elapsed_secs = elapsed,
+                    timeout_secs = limit,
+                    nodes = n,
+                    edges = input.edges.len(),
+                    "louvain: WATCHDOG fired — returning current state. \
+                     Graph is too dense or oscillating. \
+                     Reduce resolution or check for hub nodes with very high degree."
+                );
+                timed_out = true;
+                break;
+            }
+        }
+
         moved = false;
+        let mut moves_this_iter = 0u32;
         order.shuffle(&mut rng);
         for &i in &order {
             // Remove i from its current community for the calculation.
@@ -141,10 +195,33 @@ pub fn louvain(input: &LouvainInput) -> Result<LouvainResult, LouvainError> {
             sigma_tot.insert(best_c, st);
             if best_c != ci {
                 moved = true;
+                moves_this_iter += 1;
             }
         }
         iter += 1;
+
+        let elapsed = wall_start.elapsed().as_secs_f64();
+        tracing::debug!(
+            iter,
+            elapsed_secs = format!("{elapsed:.2}"),
+            moves = moves_this_iter,
+            communities = {
+                comm.iter()
+                    .filter(|&&c| c != u32::MAX)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+            },
+            "louvain: sweep complete"
+        );
     }
+
+    let total_elapsed = wall_start.elapsed().as_secs_f64();
+    tracing::info!(
+        iters = iter,
+        elapsed_secs = format!("{total_elapsed:.2}"),
+        nodes = n,
+        "louvain: finished"
+    );
 
     // Densify community ids (0-based contiguous).
     let mut remap: HashMap<u32, u32> = HashMap::new();
@@ -158,9 +235,11 @@ pub fn louvain(input: &LouvainInput) -> Result<LouvainResult, LouvainError> {
 
     // Compute modularity for diagnostic output.
     let modularity = compute_modularity(&adj, &assignments, total_weight, resolution);
+    tracing::debug!(modularity, communities = remap.len(), "louvain: modularity computed");
     Ok(LouvainResult {
         assignments,
         modularity,
+        timed_out,
     })
 }
 

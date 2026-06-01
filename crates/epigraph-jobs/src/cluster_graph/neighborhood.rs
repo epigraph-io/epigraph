@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::louvain::{louvain, LouvainInput};
+use super::louvain::{louvain, LouvainConfig, LouvainInput};
 
 /// Configuration for the per-theme neighborhood pass.
 #[derive(Debug)]
@@ -210,11 +210,15 @@ async fn run_one_theme(
         weighted_pairs.push((a, b, e.weight));
     }
 
-    let result = louvain(&LouvainInput {
-        node_count: atoms.len(),
-        edges: weighted_pairs,
-        resolution: cfg.resolution,
-    })
+    let louvain_cfg = LouvainConfig::default(); // 5-min timeout, 32 max iters
+    let result = louvain(
+        &LouvainInput {
+            node_count: atoms.len(),
+            edges: weighted_pairs,
+            resolution: cfg.resolution,
+        },
+        &louvain_cfg,
+    )
     .map_err(|e| sqlx::Error::Protocol(format!("louvain: {e}")))?;
 
     write_neighborhoods(pool, run_id, theme_id, &atoms, &result.assignments).await?;
