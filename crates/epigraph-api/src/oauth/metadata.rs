@@ -34,10 +34,16 @@ pub async fn protected_resource_metadata(State(state): State<AppState>) -> Json<
     Json(json!({
         "resource": format!("{base}/mcp"),
         "authorization_servers": [base],
-        // Mirror the scope values the /mcp resource actually accepts — the codomain
-        // of epigraph-mcp's SCOPE_MAP. claims:admin gates mark_duplicate /
-        // supersede_claim / update_partition; analysis:belief is required by no tool.
-        "scopes_supported": ["claims:read", "claims:write", "claims:admin"],
+        // Advertise only the /mcp scopes a connector authorizing through THIS AS can
+        // both obtain and use. epigraph-mcp's SCOPE_MAP codomain is {claims:read,
+        // claims:write, claims:admin}, but claims:admin is unreachable here: no
+        // register.rs grant path (agent/service/human) issues it — it is provisioned
+        // only to the separate epigraph-admin client out-of-band. Advertising it would
+        // name a scope this AS's clients can never get AND break RFC 8414/9728 subset
+        // coherence (the AS doc's scopes_supported omits claims:admin). claims:admin
+        // gates only mark_duplicate / supersede_claim / update_partition, none of which
+        // a connector can call; analysis:belief is in neither doc's codomain.
+        "scopes_supported": ["claims:read", "claims:write"],
         "bearer_methods_supported": ["header"]
     }))
 }

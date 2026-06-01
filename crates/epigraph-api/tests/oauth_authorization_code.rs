@@ -73,18 +73,25 @@ async fn protected_resource_metadata_points_at_this_as() {
         body["authorization_servers"][0],
         "https://test.example"
     );
-    // scopes_supported MUST reflect the scope values the /mcp resource actually
-    // accepts — i.e. the codomain of epigraph-mcp's SCOPE_MAP {claims:read,
-    // claims:write, claims:admin}. claims:admin gates mark_duplicate /
-    // supersede_claim / update_partition, so a connector reading this doc must
-    // learn it can request it; analysis:belief is required by NO MCP tool.
+    // scopes_supported MUST advertise only the scopes a connector authorizing
+    // through THIS AS can actually obtain AND use against /mcp. epigraph-mcp's
+    // SCOPE_MAP codomain is {claims:read, claims:write, claims:admin}, but
+    // claims:admin is unreachable here: no register.rs grant path (agent/service/
+    // human) hands it out — it is provisioned only to the separate epigraph-admin
+    // client out-of-band. Advertising it would (a) be a scope this AS's clients
+    // can never get, and (b) break RFC 8414/9728 subset coherence (the AS doc's
+    // scopes_supported omits claims:admin). So the resource doc must list exactly
+    // the connector-reachable /mcp scopes: claims:read + claims:write. It must
+    // NOT advertise claims:admin (unreachable) or analysis:belief (no MCP tool
+    // requires it, not in SCOPE_MAP codomain).
     let scopes = body["scopes_supported"].as_array().unwrap();
-    assert!(
-        scopes.iter().any(|v| v == "claims:admin"),
-        "scopes_supported must advertise claims:admin (admin MCP tools need it); got: {scopes:?}"
-    );
-    assert!(
-        !scopes.iter().any(|v| v == "analysis:belief"),
-        "scopes_supported must NOT advertise analysis:belief (no MCP tool requires it); got: {scopes:?}"
+    assert_eq!(
+        scopes,
+        &vec![
+            Value::from("claims:read"),
+            Value::from("claims:write"),
+        ],
+        "scopes_supported must be exactly [claims:read, claims:write] — the \
+         connector-reachable /mcp scopes; got: {scopes:?}"
     );
 }
