@@ -177,11 +177,21 @@ pub async fn find_workflow(
         }
     };
 
-    // Semantic search via evidence embeddings (only when embedding is available).
+    // Semantic search over claims.embedding (evidence.embedding is empty for
+    // workflows). Restrict to `workflow`-labeled claims so semantic neighbors
+    // match the ILIKE fallback's scope before enrich_workflow_result (which
+    // requires a workflow content blob). 1536d = McpEmbedder's model.
+    let workflow_labels = ["workflow".to_string()];
     let semantic_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
-        epigraph_db::EvidenceRepository::search_by_embedding(&server.pool, pgvec, limit * 3)
-            .await
-            .map_err(internal_error)?
+        epigraph_db::ClaimRepository::search_claims_by_embedding(
+            &server.pool,
+            pgvec,
+            1536,
+            limit * 3,
+            Some(&workflow_labels),
+        )
+        .await
+        .map_err(internal_error)?
     } else {
         Vec::new()
     };

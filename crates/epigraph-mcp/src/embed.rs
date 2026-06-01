@@ -99,10 +99,14 @@ impl McpEmbedder {
         let embedding = self.generate(query).await?;
 
         let pgvec = format_pgvector(&embedding);
-        let results =
-            epigraph_db::EvidenceRepository::search_by_embedding(&self.pool, &pgvec, limit)
-                .await
-                .map_err(|e| e.to_string())?;
+        // McpEmbedder uses text-embedding-3-small (1536d). Read claims.embedding
+        // (426k populated) not evidence.embedding (0 populated). No label filter:
+        // flat recall spans the whole corpus, including level-less memorized claims.
+        let results = epigraph_db::ClaimRepository::search_claims_by_embedding(
+            &self.pool, &pgvec, 1536, limit, None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
         Ok(results
             .into_iter()
@@ -176,7 +180,7 @@ impl EmbeddingService for McpEmbedder {
         Err(EmbeddingError::NotFound { claim_id })
     }
 
-    /// Find similar claims via `EvidenceRepository::search_by_embedding`.
+    /// Find similar claims via `ClaimRepository::search_claims_by_embedding`.
     ///
     /// Converts `f64` similarity from the DB row to `f32` for `SimilarClaim`.
     async fn similar(
@@ -186,10 +190,11 @@ impl EmbeddingService for McpEmbedder {
         min_similarity: f32,
     ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
         let pgvec = format_pgvector(embedding);
-        let rows =
-            epigraph_db::EvidenceRepository::search_by_embedding(&self.pool, &pgvec, k as i64)
-                .await
-                .map_err(|e| EmbeddingError::DatabaseError(e.to_string()))?;
+        let rows = epigraph_db::ClaimRepository::search_claims_by_embedding(
+            &self.pool, &pgvec, 1536, k as i64, None,
+        )
+        .await
+        .map_err(|e| EmbeddingError::DatabaseError(e.to_string()))?;
 
         Ok(rows
             .into_iter()

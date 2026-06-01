@@ -14,7 +14,7 @@
 //! MCP behaviour.
 
 use epigraph_core::ClaimId;
-use epigraph_db::{ClaimRepository, EvidenceRepository, PgPool};
+use epigraph_db::{ClaimRepository, PgPool};
 use epigraph_embeddings::EmbeddingService;
 use thiserror::Error;
 
@@ -79,7 +79,11 @@ pub async fn recall(
     // Try semantic search first.
     let results = if let Ok(embedding) = embedder.generate_query(query).await {
         let pgvec = format_pgvector(&embedding);
-        match EvidenceRepository::search_by_embedding(pool, &pgvec, limit_i64).await {
+        // Read claims.embedding (populated) not evidence.embedding (empty); no
+        // label filter (library recall spans the whole corpus). dim comes from
+        // the injected embedder so a 3072d provider still routes correctly.
+        let dim = embedder.dimension() as u32;
+        match ClaimRepository::search_claims_by_embedding(pool, &pgvec, dim, limit_i64, None).await {
             Ok(hits) => {
                 let mut results = Vec::new();
                 for hit in hits {
