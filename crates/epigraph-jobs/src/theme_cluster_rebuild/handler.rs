@@ -10,10 +10,11 @@ use chrono::{DateTime, Utc};
 use epigraph_db::ClaimThemeRepository;
 use sqlx::PgPool;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::{
-    run_serialized, EpiGraphJob, Job, JobError, JobHandler, JobQueue, JobResult, JobResultMetadata,
-    THEME_REBUILD_LOCK_KEY,
+    run_serialized, theme_cluster_rebuild::namer, EpiGraphJob, Job, JobError, JobHandler, JobQueue,
+    JobResult, JobResultMetadata, THEME_REBUILD_LOCK_KEY,
 };
 
 /// Job handler for the scheduled theme rebuild.
@@ -154,6 +155,38 @@ impl ThemeClusterRebuildHandler {
                 message: format!("recompute_all_centroids: {e}"),
             })?;
         tracing::info!("theme_cluster_rebuild: centroids recomputed from full assignment");
+
+        // Phase 4: Name each theme via LLM (10 nearest claims → claude haiku).
+        // Falls back to the existing "auto-NN" label if claude is unavailable.
+        let theme_rows: Vec<(Uuid, String)> = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT id, label FROM claim_themes ORDER BY created_at",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("fetch themes for naming: {e}"),
+        })?;
+
+        for (theme_id, current_label) in &theme_rows {
+            let new_label = namer::name_theme(pool, *theme_id, current_label).await;
+            if new_label != *current_label {
+                if let Err(e) = sqlx::query(
+                    "UPDATE claim_themes SET label = $2, updated_at = NOW() WHERE id = $1",
+                )
+                .bind(theme_id)
+                .bind(&new_label)
+                .execute(pool)
+                .await
+                {
+                    tracing::warn!(
+                        %theme_id,
+                        error = %e,
+                        "theme_cluster_rebuild: failed to persist theme name, keeping old label"
+                    );
+                }
+            }
+        }
+        tracing::info!(count = theme_rows.len(), "theme_cluster_rebuild: naming pass complete");
 
         Ok(HandleSummary {
             skipped: false,

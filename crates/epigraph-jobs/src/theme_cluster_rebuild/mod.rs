@@ -5,5 +5,6 @@
 //! when the corpus has changed since the last run.
 
 pub mod handler;
+pub mod namer;
 
 pub use handler::ThemeClusterRebuildHandler;

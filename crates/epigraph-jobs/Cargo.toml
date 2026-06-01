@@ -24,6 +24,7 @@ hex = { workspace = true }  # Hex encoding for signatures
 petgraph = { workspace = true }
 rand = { workspace = true }  # used by Louvain to break ties between equal-modularity moves
 sqlx = { workspace = true }  # PostgreSQL persistence for job queue
+anyhow = { workspace = true }  # Error handling for claude CLI invocation
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

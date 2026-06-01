@@ -1487,6 +1487,7 @@ dependencies = [
 name = "epigraph-jobs"
 version = "0.3.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "epigraph-core",
