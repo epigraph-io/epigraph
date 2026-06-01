@@ -139,9 +139,14 @@ pub async fn recall(
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let min_truth = params.min_truth.unwrap_or(0.3);
 
-    // Try semantic search first
-    let results = if let Ok(hits) = server.embedder.search(&params.query, limit).await {
-        let mut results = Vec::new();
+    // Try semantic search first. The text fallback below fires whenever the
+    // assembled result set is empty — not only on embedder error — so an
+    // Ok(empty) from semantic search (the silent-empty failure mode that made
+    // recall dead against live data in backlog 1564bdaf) still degrades to
+    // text search instead of returning []. This also covers the case where
+    // every semantic hit was filtered out by min_truth.
+    let mut results: Vec<RecallResult> = Vec::new();
+    if let Ok(hits) = server.embedder.search(&params.query, limit).await {
         for (claim_id, similarity) in hits {
             if let Ok(Some(claim)) =
                 ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id)).await
@@ -157,13 +162,14 @@ pub async fn recall(
                 }
             }
         }
-        results
-    } else {
-        // Fallback to text search
+    }
+
+    if results.is_empty() {
+        // Fallback to ILIKE text search over claim content.
         let claims = ClaimRepository::list(&server.pool, limit, 0, Some(&params.query))
             .await
             .map_err(internal_error)?;
-        claims
+        results = claims
             .into_iter()
             .filter(|c| c.truth_value.value() >= min_truth)
             .map(|c| RecallResult {
@@ -172,8 +178,8 @@ pub async fn recall(
                 truth_value: c.truth_value.value(),
                 similarity: 0.0,
             })
-            .collect()
-    };
+            .collect();
+    }
 
     success_json(&results)
 }
