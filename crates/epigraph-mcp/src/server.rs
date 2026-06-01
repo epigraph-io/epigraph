@@ -184,7 +184,7 @@ impl EpiGraphMcpFull {
         }
     }
 
-    // ── Claims (5 tools) ──
+    // ── Claims (11 tools) ──
 
     #[tool(
         description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite."
@@ -205,6 +205,16 @@ impl EpiGraphMcpFull {
         Parameters(params): Parameters<QueryClaimsParams>,
     ) -> Result<CallToolResult, McpError> {
         tools::claims::query_claims(self, params).await
+    }
+
+    #[tool(
+        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow; feed the returned claim_ids to the decompose_claims CLI."
+    )]
+    async fn query_undecomposed_claims(
+        &self,
+        Parameters(params): Parameters<crate::types::QueryUndecomposedClaimsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::claims::query_undecomposed_claims(self, params).await
     }
 
     #[tool(
