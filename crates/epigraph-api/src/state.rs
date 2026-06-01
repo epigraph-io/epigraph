@@ -244,6 +244,10 @@ pub struct ApiConfig {
     pub require_signatures: bool,
     /// Maximum size of request bodies in bytes
     pub max_request_size: usize,
+    /// Public HTTPS base URL this API is reachable at externally (no trailing slash),
+    /// used to build OAuth discovery documents and consent/redirect links.
+    /// e.g. "https://5-78-124-36.nip.io"
+    pub public_base_url: String,
 }
 
 impl AppState {
@@ -592,6 +596,7 @@ impl Default for ApiConfig {
         Self {
             require_signatures: false,
             max_request_size: 10 * 1024 * 1024, // 10MB
+            public_base_url: "http://localhost:8080".to_string(),
         }
     }
 }
@@ -628,6 +633,7 @@ mod tests {
         let config = ApiConfig {
             require_signatures: true,
             max_request_size: 2048,
+            public_base_url: "http://localhost:8080".to_string(),
         };
         let cloned = config.clone();
         assert!(cloned.require_signatures);

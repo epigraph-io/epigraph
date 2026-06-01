@@ -34,6 +34,7 @@ fn config() -> ApiConfig {
     ApiConfig {
         require_signatures: false,
         max_request_size: 1024 * 1024,
+        public_base_url: "https://test.example".to_string(),
     }
 }
 
