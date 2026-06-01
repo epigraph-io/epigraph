@@ -95,12 +95,19 @@ impl McpEmbedder {
     }
 
     /// Search by embedding similarity. Returns (claim_id, similarity) pairs.
+    ///
+    /// Searches `claims.embedding` (where memorize/submit/ingest write claim
+    /// vectors) via `ClaimRepository::search_by_embedding_current`, restricted
+    /// to current claims of any level. This previously called
+    /// `EvidenceRepository::search_by_embedding` = `evidence.embedding`, which
+    /// is unpopulated, so the `recall` tool's semantic path always returned
+    /// empty.
     pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<(uuid::Uuid, f64)>, String> {
         let embedding = self.generate(query).await?;
 
         let pgvec = format_pgvector(&embedding);
         let results =
-            epigraph_db::EvidenceRepository::search_by_embedding(&self.pool, &pgvec, limit)
+            epigraph_db::ClaimRepository::search_by_embedding_current(&self.pool, &pgvec, limit)
                 .await
                 .map_err(|e| e.to_string())?;
 

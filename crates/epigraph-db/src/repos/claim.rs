@@ -470,6 +470,45 @@ impl ClaimRepository {
         Ok(q.fetch_all(pool).await?)
     }
 
+    /// Search **current** claims by embedding similarity across **all levels**.
+    ///
+    /// This is the search backing the simple `recall` MCP tool. Unlike
+    /// [`search_by_embedding`] — which is paper-paragraph-primary and
+    /// restricts to `(properties->>'level')::int = 2` — memorized claims have
+    /// no `level` property and store their vector on the 1536d
+    /// `claims.embedding` column. `recall` therefore needs a search with no
+    /// level restriction, limited to `is_current` so superseded/retired claims
+    /// are not resurfaced. (`recall` previously queried
+    /// `EvidenceRepository::search_by_embedding`, i.e. `evidence.embedding`,
+    /// which is unpopulated — so its semantic path returned nothing.)
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn search_by_embedding_current(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        limit: i64,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        let rows = sqlx::query_as::<_, ClaimEmbeddingHit>(
+            r#"
+            SELECT c.id AS claim_id,
+                   1 - (c.embedding <=> $1::vector) AS similarity
+            FROM claims c
+            WHERE c.embedding IS NOT NULL
+              AND c.is_current
+            ORDER BY c.embedding <=> $1::vector
+            LIMIT $2
+            "#,
+        )
+        .bind(query_embedding_pgvector)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Get all claims by an agent
     ///
     /// # Errors
