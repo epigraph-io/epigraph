@@ -208,11 +208,53 @@ pub async fn auto_wire_ds_for_claim(
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
 
-    // C-2: Apply reliability discount before computing measures so that initial
-    // pignistic probability respects source strength, not just raw BBA mass.
-    let reliability = confidence.clamp(0.0, 1.0);
-    let discounted =
-        combination::discount(&bba, reliability).map_err(|e| format!("discount: {e}"))?;
+    // BetP-drop fix (backlog b3d12e2a): previously this path discounted by
+    // `confidence`, while the batch writer applied NO discount and the
+    // update/recompute paths discount by `effective_source_strength` — three
+    // writers, three answers for the same stored BBA. Unify onto the SAME
+    // discount authority (`effective_source_strength`) so the new-claim initial
+    // cache matches the first `update_with_evidence` and `recompute_beliefs`.
+    //
+    // We re-read the row we just stored and compute its discounted single-BBA
+    // measures inline, mirroring the `all_rows.len() <= 1` branch of
+    // `auto_wire_ds_update` below. (Honest cost: this duplicates the
+    // calibration-load block rather than calling the engine `recombine` fn —
+    // `recompute_claim_belief_on_frame` returns `bool`, not the measures, so it
+    // cannot hand back the scalars this fn must return in DsAutoResult. The
+    // shared invariant is the discount AUTHORITY, not a single code path.)
+    //
+    // NOTE: because submit_claim persists `truth_value = clamped(ds.pignistic_prob)`,
+    // this also shifts the new-claim persisted truth_value from a confidence-based
+    // value to the evidence-type-discounted BetP — a deliberate, correctness-positive
+    // change in persisted truth, not only in cached BetP.
+    let calibration = epigraph_engine::calibration::CalibrationConfig::from_workspace_root()
+        .unwrap_or_else(|_| {
+            epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
+        });
+    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
+        .await
+        .ok()
+        .flatten();
+    let per_frame_evidence_weights =
+        FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
+            .await
+            .ok()
+            .flatten();
+
+    let all_rows = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
+        .await
+        .map_err(|e| format!("get_for_claim_frame: {e}"))?;
+    let row = all_rows
+        .first()
+        .ok_or_else(|| "no BBA row after store_with_perspective".to_string())?;
+    let reliability = effective_source_strength(
+        row,
+        per_frame_intra,
+        per_frame_evidence_weights.as_ref(),
+        &calibration,
+    );
+    let mf = parse_stored_bba(&frame, &row.masses)?;
+    let discounted = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
     let (bel, pl, betp, conflict, missing) = compute_measures(&discounted);
 
     // Update claim DS columns
@@ -454,19 +496,21 @@ async fn wire_single_batch_entry(
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
 
-    let (bel, pl, betp, conflict, missing) = compute_measures(&bba);
-
-    MassFunctionRepository::update_claim_belief(
-        pool,
-        entry.claim_id,
-        bel,
-        pl,
-        conflict,
-        Some(betp),
-        missing,
-    )
-    .await
-    .map_err(|e| format!("update_claim_belief: {e}"))?;
+    // BetP-drop fix (backlog b3d12e2a): the initial cache MUST be written
+    // through the same discount authority every other writer uses. Calling
+    // compute_measures(&bba) on the raw, UNDISCOUNTED BBA here recorded an
+    // inflated m({TRUE})/BetP; the first `update_with_evidence` then re-read
+    // all rows, re-discounted this one by `effective_source_strength`
+    // (e.g. statistical=0.9, circumstantial=0.4, unknown=0.5) and recombined
+    // from scratch, dropping the cached BetP even though a SUPPORTING source
+    // was just added (observed 0.848 -> 0.716). Routing through the canonical
+    // recombine makes the initial cache agree with auto_wire_ds_update and
+    // recompute_beliefs. `recompute_claim_belief_on_frame` re-reads the row we
+    // just stored, applies `effective_source_strength`, and writes Bel/Pl/BetP
+    // (and, on the binary frame, classification) via update_claim_belief.
+    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(pool, entry.claim_id, frame_id)
+        .await
+        .map_err(|e| format!("recompute initial cache: {e}"))?;
 
     Ok(())
 }
