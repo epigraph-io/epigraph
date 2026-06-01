@@ -339,45 +339,27 @@ async fn main() {
             }
         });
 
-        // Sibling cron: ThemeClusterRebuild — staggered 30-minute warmup
-        // (vs ClusterGraph's 60 s) so ClusterGraph finishes its first run
-        // before ThemeClusterRebuild's `wipe_first` cascades into
-        // `graph_neighborhoods.theme_id` (ON DELETE CASCADE, migration
-        // 026).  Subsequent daily runs preserve the same offset.
-        // `skip_if_unchanged: true` makes this a cheap no-op on idle days.
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(1800)).await;
-            loop {
-                match (EpiGraphJob::ThemeClusterRebuild {
-                    max_themes: 80,
-                    min_claims_per_theme: 5,
-                    skip_if_unchanged: true,
-                })
-                .into_job()
-                {
-                    Ok(job) => match queue_for_theme_cron.enqueue_unique_pending(job).await {
-                        Ok(Some(_)) => tracing::info!("Enqueued nightly ThemeClusterRebuild job"),
-                        Ok(None) => tracing::info!(
-                            "ThemeClusterRebuild already pending; skipped duplicate nightly enqueue"
-                        ),
-                        Err(e) => tracing::error!(
-                            error = %e,
-                            "failed to enqueue nightly ThemeClusterRebuild job"
-                        ),
-                    },
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "failed to serialize ThemeClusterRebuild job payload"
-                        );
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(86_400)).await;
-            }
-        });
+        // ThemeClusterRebuild nightly auto-enqueue is DISABLED.
+        //
+        // Theme clustering moved to the V2-style Python pipeline
+        // (`scripts/cluster_themes.py` + `scripts/label_themes_llm.py`,
+        // scheduled out-of-process): UMAP(32) reduces 1536-dim embeddings,
+        // k-means seeds on a 5K sample, and every claim is assigned to a
+        // FIXED centroid in batches — never re-fitting. This avoids the
+        // in-memory 1536-dim k-means that wedged epigraph-api for ~30 min
+        // after every restart (linfa n_runs=10 × elbow range, see
+        // theme_kmeans.rs) and gives stable, dimensionality-reduced themes
+        // a tiny 1536-dim sample never could.
+        //
+        // The handler stays registered above so an operator can still POST a
+        // one-off rebuild via the jobs API, but nothing auto-enqueues it.
+        // `queue_for_theme_cron` is retained for that handler registration.
+        let _ = &queue_for_theme_cron;
 
         tracing::info!(
-            "Job runner started (2 workers); nightly ClusterGraph + ThemeClusterRebuild jobs scheduled"
+            "Job runner started (2 workers); nightly ClusterGraph scheduled; \
+             ThemeClusterRebuild auto-enqueue disabled (theming runs via the \
+             external cluster_themes.py UMAP pipeline)"
         );
     }
 
