@@ -36,12 +36,37 @@ pub struct AuthorizeQuery {
 
 const GOOGLE_PROVIDER: &str = "google";
 
+/// Pending authorize-session lifetime: the user must complete the Google login +
+/// consent within this window before the session expires.
+#[cfg(feature = "db")]
+const AUTHORIZE_SESSION_TTL: chrono::Duration = chrono::Duration::minutes(10);
+
+/// Authorization-code lifetime: a freshly minted code is single-use and must be
+/// redeemed at `/oauth/token` within this window (RFC 6749 §4.1.2 recommends short).
+#[cfg(feature = "db")]
+const AUTH_CODE_TTL: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Build a redirect URL by parsing the (allowlist-validated) `redirect_uri` and
+/// appending query parameters via `url::Url::query_pairs_mut`. This percent-encodes
+/// every value — including the attacker-supplied OAuth `state` — so a control byte
+/// (e.g. a decoded `%0A`) can never reach `Redirect::to`'s `HeaderValue::try_from`
+/// and panic the handler, and it merges correctly with a `redirect_uri` that already
+/// carries a query component (no naive double-`?`).
+#[cfg(feature = "db")]
+fn build_redirect_url(redirect_uri: &str, params: &[(&str, &str)]) -> Result<String, ApiError> {
+    let mut url = url::Url::parse(redirect_uri).map_err(|e| ApiError::InternalError {
+        message: format!("validated redirect_uri did not parse: {e}"),
+    })?;
+    url.query_pairs_mut().extend_pairs(params.iter().copied());
+    Ok(url.into())
+}
+
 #[cfg(feature = "db")]
 pub async fn authorize_endpoint(
     State(state): State<AppState>,
     Query(q): Query<AuthorizeQuery>,
 ) -> Result<Response, ApiError> {
-    use chrono::{Duration, Utc};
+    use chrono::Utc;
     use epigraph_db::repos::authorize_session::AuthorizeSessionRepository;
     use epigraph_db::repos::oauth_client::OAuthClientRepository;
 
@@ -119,7 +144,7 @@ pub async fn authorize_endpoint(
         // we key the session by. Do not cross the two.
         q.state.as_deref(),
         &verifier,
-        Utc::now() + Duration::minutes(10),
+        Utc::now() + AUTHORIZE_SESSION_TTL,
     )
     .await
     .map_err(|e| ApiError::InternalError {
@@ -279,7 +304,7 @@ pub async fn consent_endpoint(
     State(state): State<AppState>,
     axum::extract::Form(form): axum::extract::Form<ConsentForm>,
 ) -> Result<Response, ApiError> {
-    use chrono::{Duration, Utc};
+    use chrono::Utc;
     use epigraph_db::repos::authorization_code::AuthorizationCodeRepository;
     use epigraph_db::repos::authorize_session::AuthorizeSessionRepository;
 
@@ -294,10 +319,14 @@ pub async fn consent_endpoint(
 
     let claude_state = session.claude_state.clone().unwrap_or_default();
     if form.decision != "allow" {
-        let url = format!(
-            "{}?error=access_denied&state={}",
-            session.redirect_uri, claude_state
-        );
+        // Build via url::Url so the client-supplied `state` is percent-encoded: a raw
+        // control byte (a decoded `%0A`) would otherwise make `Redirect::to`'s
+        // `HeaderValue::try_from` panic. This also merges correctly with a redirect_uri
+        // that already has a query component.
+        let url = build_redirect_url(
+            &session.redirect_uri,
+            &[("error", "access_denied"), ("state", &claude_state)],
+        )?;
         return Ok(Redirect::to(&url).into_response());
     }
 
@@ -328,17 +357,20 @@ pub async fn consent_endpoint(
         &session.code_challenge,
         &scopes,
         None,
-        Utc::now() + Duration::seconds(60),
+        Utc::now() + AUTH_CODE_TTL,
     )
     .await
     .map_err(|e| ApiError::InternalError {
         message: e.to_string(),
     })?;
 
-    let url = format!(
-        "{}?code={}&state={}",
-        session.redirect_uri, code, claude_state
-    );
+    // Same url::Url construction as the deny branch: `code` is hex (URL-safe) but the
+    // client-supplied `state` must be percent-encoded to avoid panicking on a control
+    // byte, and to merge with a redirect_uri that already carries a query.
+    let url = build_redirect_url(
+        &session.redirect_uri,
+        &[("code", &code), ("state", &claude_state)],
+    )?;
     Ok(Redirect::to(&url).into_response())
 }
 

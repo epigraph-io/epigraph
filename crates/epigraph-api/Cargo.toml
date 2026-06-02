@@ -89,6 +89,7 @@ jsonwebtoken = "9"        # JWT creation and validation
 rand = { workspace = true }  # Token generation, nonce generation
 blake3 = { workspace = true }  # Content hashing for refresh tokens
 ed25519-dalek = { workspace = true }  # Ed25519 agent assertion verification
+url = "2"  # Safe redirect-URL construction (percent-encodes attacker-supplied OAuth `state`); resolves to locked 2.5.8, already in graph via reqwest
 
 [dev-dependencies]
 axum-test = "14"  # Testing utilities for Axum
