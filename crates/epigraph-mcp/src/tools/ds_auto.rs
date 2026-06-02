@@ -262,7 +262,8 @@ pub async fn auto_wire_ds_for_claim(
         &calibration,
     );
     let mf = parse_stored_bba(&frame, &row.masses)?;
-    let discounted = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
+    let discounted =
+        combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
     let (bel, pl, betp, conflict, missing) = compute_measures(&discounted);
 
     // Update claim DS columns
