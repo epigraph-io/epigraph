@@ -62,36 +62,24 @@ jobs:
           } >> .cargo/config.toml
           mold --version
       - name: Free disk space on /
-        # ENOSPC root cause: this workspace's build artifacts plus the postgres
-        # service's per-test #[sqlx::test] databases (docker overlay, on /)
-        # exhaust the root volume, killing the run at "Test (epigraph-api)" with
-        # "No space left on device". ubuntu-latest preinstalls ~25 GB of
-        # Android/.NET/GHC/Haskell/hosted-toolcache under / that this build never
-        # touches; removing it is the geometry-independent fix — it frees the
-        # exact volume that fills, no matter how /mnt is sized or mounted.
+        # ENOSPC root cause: runs died at "Test (epigraph-api)" with
+        # "No space left on device" on /, yet a df at this point shows / with
+        # ~107 GB free in BYTES (target/ is only ~5.4 GB) — so byte exhaustion
+        # is impossible and the binding constraint is INODES. ubuntu-latest
+        # preinstalls Android/.NET/GHC/Haskell/hosted-toolcache trees holding
+        # millions of small files; removing the trees this build never uses
+        # frees those inodes. (An earlier CARGO_TARGET_DIR=/mnt move was inert:
+        # /mnt is a directory on /dev/root, not a separate disk — confirmed by
+        # the mount table.) `df -ih` before/after records the inodes reclaimed.
         run: |
-          df -h /
+          df -ih /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
             /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost || true
+          df -ih /
           df -h /
-      - name: Relocate cargo target/ to the ephemeral /mnt disk
-        # Belt-and-suspenders with the free-disk step above: move the largest
-        # writer (target/) off / entirely. Must run BEFORE rust-cache so the
-        # cache restores/saves at this path (the action honors CARGO_TARGET_DIR).
-        run: |
-          sudo mkdir -p /mnt/cargo-target
-          sudo chown "$USER:$USER" /mnt/cargo-target
-          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2.8.1
       - name: Build
         run: cargo build --workspace
-      - name: Disk diagnostic (post-build)
-        if: always()
-        # Captures ground truth on what consumes each volume at peak; earlier
-        # steps' stdout is retained even when a later test step ENOSPC-fails.
-        run: |
-          df -h
-          sudo du -sh /mnt/cargo-target ~/.cargo /var/lib/docker 2>/dev/null || true
       - name: Test (non-DB packages, parallel)
         # Packages without DB tests can run fully in parallel.
         # Crates with #[sqlx::test] integration tests (or live DB usage) are
