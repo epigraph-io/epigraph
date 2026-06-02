@@ -61,6 +61,18 @@ jobs:
             echo 'rustflags = ["-C", "link-arg=-fuse-ld=mold"]'
           } >> .cargo/config.toml
           mold --version
+      - name: Relocate cargo target/ to the large ephemeral disk
+        # The runner's root volume (/) has only ~14 GB free; this workspace's
+        # debug target/ tree plus the per-crate #[sqlx::test] integration test
+        # binaries exceed that, ENOSPC-killing the run partway through the
+        # serialized test suites (observed: dies at "Test (epigraph-api)",
+        # _diag log write fails with "No space left on device"). The runner's
+        # /mnt ephemeral disk has ~70 GB free, so point CARGO_TARGET_DIR there.
+        # Must run BEFORE rust-cache so the cache restores/saves at this path.
+        run: |
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown "$USER:$USER" /mnt/cargo-target
+          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2.8.1
       - name: Build
         run: cargo build --workspace
