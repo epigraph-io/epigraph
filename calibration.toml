@@ -174,6 +174,15 @@ model_version = "v1"
 [matcher.filter]
 include_agent_id = false
 
+# Candidate hygiene: claims carrying ANY of these labels (or a host-provenance
+# `properties->>'event'` marker) are dropped from candidate generation before
+# scoring. `workflow_step` artifacts (e.g. content "Body") dominate the
+# high-cosine candidate pool on prod (806/838 of embed_cosine>=0.90 pairs)
+# without being substantive cross-source claims; `telemetry` is host noise.
+# Set `exclude_labels = []` to disable.
+[matcher.eligibility]
+exclude_labels = ["workflow_step", "telemetry"]
+
 [matcher.fan_out]
 max_per_claim = 32
 
