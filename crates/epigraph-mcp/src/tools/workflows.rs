@@ -34,6 +34,120 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     )]))
 }
 
+/// Read-only window into a workflow's recent behavioral executions, newest
+/// first: per-run `success`, `quality`, `tool_pattern`, `deviation_count`, and
+/// `step_beliefs` (per-step `deviation_reason`), plus a `window_success_rate`.
+/// This is the telemetry the workflow-evolution proposer reads before
+/// proposing a variant; an invalid `workflow_id` errors rather than returning
+/// an empty set (which would read as "no runs" and mislead the proposer).
+pub async fn get_workflow_executions(
+    server: &EpiGraphMcpFull,
+    params: GetWorkflowExecutionsParams,
+) -> Result<CallToolResult, McpError> {
+    let workflow_id = parse_uuid(params.workflow_id.trim())?;
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+
+    let rows = BehavioralExecutionRepository::recent_executions(&server.pool, workflow_id, limit)
+        .await
+        .map_err(internal_error)?;
+
+    let returned = rows.len();
+    let successes = rows.iter().filter(|r| r.success).count();
+    let window_success_rate = if returned > 0 {
+        successes as f64 / returned as f64
+    } else {
+        0.0
+    };
+    let executions: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "goal_text": r.goal_text,
+                "success": r.success,
+                "quality": r.quality,
+                "deviation_count": r.deviation_count,
+                "total_steps": r.total_steps,
+                "tool_pattern": r.tool_pattern,
+                "step_beliefs": r.step_beliefs,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+
+    success_json(&serde_json::json!({
+        "workflow_id": workflow_id,
+        "returned": returned,
+        "window_success_rate": window_success_rate,
+        "executions": executions,
+    }))
+}
+
+/// Evaluate whether a workflow variant is statistically ready to be promoted
+/// over its immediate (`variant_of`) parent — the autonomous-statistical-gate
+/// verdict the workflow-evolution maintenance pass consumes. Resolves the
+/// parent, compares both sides over the SAME execution window with the Wilson
+/// lower-bound gate, and returns the verdict. READ-ONLY: it decides, it does
+/// not promote (applying a promotion is a separate, deliberate step).
+pub async fn evaluate_workflow_promotion(
+    server: &EpiGraphMcpFull,
+    params: EvaluateWorkflowPromotionParams,
+) -> Result<CallToolResult, McpError> {
+    use epigraph_engine::workflow_promotion::{
+        evaluate_workflow_promotion as gate, WorkflowPromotionConfig, WorkflowSampleStats,
+    };
+
+    let variant_id = parse_uuid(params.workflow_id.trim())?;
+    let window = params.window.unwrap_or(50).clamp(1, 500);
+
+    let Some(parent_id) = WorkflowRepository::immediate_variant_parent(&server.pool, variant_id)
+        .await
+        .map_err(|e| internal_error(e.to_string()))?
+    else {
+        return success_json(&serde_json::json!({
+            "workflow_id": variant_id,
+            "parent_id": serde_json::Value::Null,
+            "promotable": false,
+            "reason": "workflow has no variant_of/supersedes parent (it is a lineage root); nothing to promote over",
+        }));
+    };
+
+    // Same window on both sides — comparing across different windows would be
+    // apples to oranges.
+    let (v_succ, v_total) =
+        BehavioralExecutionRepository::success_stats(&server.pool, variant_id, window)
+            .await
+            .map_err(internal_error)?;
+    let (p_succ, p_total) =
+        BehavioralExecutionRepository::success_stats(&server.pool, parent_id, window)
+            .await
+            .map_err(internal_error)?;
+
+    let variant = WorkflowSampleStats {
+        successes: v_succ,
+        total: v_total,
+    };
+    let parent = WorkflowSampleStats {
+        successes: p_succ,
+        total: p_total,
+    };
+    let config = WorkflowPromotionConfig::default();
+    let verdict = gate(&variant, parent.success_rate(), &config);
+
+    success_json(&serde_json::json!({
+        "workflow_id": variant_id,
+        "parent_id": parent_id,
+        "window": window,
+        "min_executions": config.min_executions,
+        "variant": { "successes": v_succ, "total": v_total },
+        "parent": { "successes": p_succ, "total": p_total, "success_rate": parent.success_rate() },
+        "promotable": verdict.promotable,
+        "variant_lower_bound": verdict.variant_lower_bound,
+        "parent_rate": verdict.parent_rate,
+        "reason": verdict.reason,
+    }))
+}
+
 fn parse_workflow_content(content: &str) -> (String, Vec<String>, Vec<String>, Option<String>) {
     serde_json::from_str::<serde_json::Value>(content).map_or_else(
         |_| (content.to_string(), vec![], vec![], None),

@@ -57,6 +57,7 @@ pub mod theme_kmeans;
 pub mod uncertainty;
 pub mod unified_bp;
 pub mod voi;
+pub mod workflow_promotion;
 
 #[allow(deprecated)]
 pub use bayesian::BayesianUpdater;
