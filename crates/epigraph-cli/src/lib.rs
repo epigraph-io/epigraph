@@ -2,6 +2,7 @@
 pub mod bootstrap;
 #[cfg(feature = "db")]
 pub mod bridge;
+pub mod decompose;
 pub mod enrichment;
 #[cfg(feature = "genai")]
 pub mod matching_client;

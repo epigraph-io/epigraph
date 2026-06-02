@@ -646,3 +646,32 @@ pub async fn patch_claim(
         "after_trace": diff.after_trace,
     }))
 }
+
+pub async fn query_undecomposed_claims(
+    server: &EpiGraphMcpFull,
+    params: crate::types::QueryUndecomposedClaimsParams,
+) -> Result<CallToolResult, McpError> {
+    let limit = params.limit.unwrap_or(50).clamp(1, 1000);
+    let offset = params.offset.unwrap_or(0).max(0);
+
+    let claims = ClaimRepository::list_undecomposed(&server.pool, limit, offset)
+        .await
+        .map_err(internal_error)?;
+
+    let results: Vec<ClaimResponse> = claims
+        .into_iter()
+        .map(|c| ClaimResponse {
+            id: c.id.as_uuid().to_string(),
+            content: c.content.clone(),
+            truth_value: c.truth_value.value(),
+            agent_id: c.agent_id.as_uuid().to_string(),
+            content_hash: ContentHasher::to_hex(&c.content_hash),
+            created_at: c.created_at.to_rfc3339(),
+            labels: Vec::new(),
+            is_current: true,
+            supersedes: None,
+        })
+        .collect();
+
+    success_json(&results)
+}

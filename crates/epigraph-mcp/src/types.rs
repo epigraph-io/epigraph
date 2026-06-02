@@ -89,6 +89,20 @@ pub struct QueryClaimsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct QueryUndecomposedClaimsParams {
+    #[schemars(
+        description = "Maximum number of undecomposed claims to return (default 50, max 1000). Claims are ordered created_at ASC (oldest first) so scheduled runs make monotonic progress."
+    )]
+    pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Skip the first N matching claims (default 0). Combine with limit to page through the backlog."
+    )]
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetClaimParams {
     #[schemars(description = "The UUID of the claim to retrieve")]
     pub claim_id: String,

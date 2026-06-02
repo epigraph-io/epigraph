@@ -1198,6 +1198,91 @@ impl ClaimRepository {
         Ok(out)
     }
 
+    /// List claims that have NEVER been touched by decomposition: claims that
+    /// are neither the source (parent) nor the target (child) of any
+    /// `decomposes_to` edge.
+    ///
+    /// `decomposes_to` is parent -> child (source = compound/parent, target =
+    /// atom/child) — see `epigraph_ingest::common::edges::decomposes_edge`
+    /// ("Build a decomposes_to edge between two claim nodes ... for parent ->
+    /// child relationships"). A leaf atom therefore has only an *incoming*
+    /// decomposes_to edge, so an outgoing-only predicate would wrongly
+    /// re-select every atom for re-decomposition. We exclude BOTH directions —
+    /// matching V2 `scripts/export_decomposition_input.py`'s
+    /// `NOT EXISTS (... source_id = c.id ...) AND NOT EXISTS (... target_id =
+    /// c.id ...)` predicate — so only standalone claims created via
+    /// non-hierarchical paths (`memorize`, `submit_claim`, workflow outputs,
+    /// legacy imports) are returned.
+    ///
+    /// Excludes host-telemetry claims (the `telemetry` label OR a
+    /// `properties->>'event'` marker) per the repo embedding policy — these
+    /// are container/task lifecycle noise with no decomposable propositional
+    /// content, and replace V2's brittle `content LIKE 'Agent sent message%'`
+    /// skip-patterns. Also drops trivially short content (`length > 10`), the
+    /// one filter ported verbatim from V2.
+    ///
+    /// Ordered `created_at ASC` (oldest first) so a bounded batch makes
+    /// monotonic progress through the backlog across scheduled runs.
+    pub async fn list_undecomposed(
+        pool: &PgPool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Claim>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        let limit = limit.clamp(1, 1000);
+        let offset = offset.max(0);
+        let rows = sqlx::query_as::<_, Row>(
+            r#"
+            SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                   c.created_at, c.updated_at
+            FROM claims c
+            WHERE COALESCE(c.is_current, true) = true
+              AND length(c.content) > 10
+              AND NOT ('telemetry' = ANY(c.labels))
+              AND (c.properties ->> 'event') IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM edges e
+                  WHERE e.source_id = c.id AND e.relationship = 'decomposes_to'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM edges e
+                  WHERE e.target_id = c.id AND e.relationship = 'decomposes_to'
+              )
+            ORDER BY c.created_at ASC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+
+        let mut claims = Vec::with_capacity(rows.len());
+        for row in rows {
+            let truth_value = TruthValue::new(row.truth_value)?;
+            claims.push(claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            ));
+        }
+        Ok(claims)
+    }
+
     /// Search workflow-tagged claims by content text match.
     ///
     /// Used by find_workflow MCP tool as a fallback when semantic search via
