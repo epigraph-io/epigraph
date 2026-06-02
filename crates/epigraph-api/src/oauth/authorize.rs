@@ -6,12 +6,12 @@
 //! the existing Google OIDC redirect flow. The Google callback (Task 8) recovers
 //! the session, provisions the user, renders consent, and mints the code that the
 //! `authorization_code` grant in `/oauth/token` (Task 6) redeems.
+#[cfg(feature = "db")]
+use axum::response::{Html, IntoResponse, Redirect};
 use axum::{
     extract::{Query, State},
     response::Response,
 };
-#[cfg(feature = "db")]
-use axum::response::{Html, IntoResponse, Redirect};
 use serde::Deserialize;
 
 use crate::errors::ApiError;
@@ -185,13 +185,12 @@ pub async fn callback_endpoint(
         })?;
 
     // 2. Exchange the Google code -> id_token -> validated identity (reuse the provider flow).
-    let provider =
-        state
-            .providers
-            .by_name(GOOGLE_PROVIDER)
-            .ok_or(ApiError::InternalError {
-                message: "google provider missing".into(),
-            })?;
+    let provider = state
+        .providers
+        .by_name(GOOGLE_PROVIDER)
+        .ok_or(ApiError::InternalError {
+            message: "google provider missing".into(),
+        })?;
     let flow = state
         .providers
         .redirect_flow(GOOGLE_PROVIDER)
@@ -253,7 +252,12 @@ pub async fn callback_endpoint(
     })?;
 
     // 6. Render consent keyed by the nonce. email + scopes are server-derived, not from a form.
-    Ok(Html(render_consent_page(&consent_nonce, &user.client_name, &grantable)).into_response())
+    Ok(Html(render_consent_page(
+        &consent_nonce,
+        &user.client_name,
+        &grantable,
+    ))
+    .into_response())
 }
 
 /// Pure HTML render. `ticket` is the consent-session nonce the POST handler will consume.

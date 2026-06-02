@@ -96,7 +96,13 @@ pub async fn register_endpoint(
 
     // A DCR (no client_type) for the authorization_code flow MUST carry redirect_uris;
     // a typeless body without one is not a valid registration.
-    if is_dcr && req.redirect_uris.as_ref().map(|u| u.is_empty()).unwrap_or(true) {
+    if is_dcr
+        && req
+            .redirect_uris
+            .as_ref()
+            .map(|u| u.is_empty())
+            .unwrap_or(true)
+    {
         return Err(ApiError::BadRequest {
             message: "redirect_uris is required for dynamic client registration".to_string(),
         });

@@ -44,7 +44,10 @@ async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 async fn post_form(app: axum::Router, uri: &str, body: &str) -> (StatusCode, Value) {
@@ -58,7 +61,10 @@ async fn post_form(app: axum::Router, uri: &str, body: &str) -> (StatusCode, Val
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 // ── DB-backed authorization_code redeem tests ────────────────────────────────
@@ -187,7 +193,8 @@ fn token_body_no_client_id(grant_code: &str, verifier: &str) -> String {
 async fn db_authorization_code_happy_path_issues_valid_jwt() {
     let scopes = vec!["claims:read".to_string(), "claims:write".to_string()];
     let (app, pool, jwt) = db_app().await;
-    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
+    let (client_id, code) =
+        seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
     let (status, body) = post_form(
         app,
@@ -209,7 +216,10 @@ async fn db_authorization_code_happy_path_issues_valid_jwt() {
         .validate_token(access_token)
         .expect("issued token must validate");
     assert_eq!(claims.aud, "epigraph-api");
-    assert_eq!(claims.scopes, scopes, "token scopes must equal seeded code scopes");
+    assert_eq!(
+        claims.scopes, scopes,
+        "token scopes must equal seeded code scopes"
+    );
     assert_eq!(body["scope"], "claims:read claims:write");
 }
 
@@ -218,16 +228,13 @@ async fn db_authorization_code_happy_path_issues_valid_jwt() {
 async fn db_authorization_code_wrong_verifier_is_rejected() {
     let scopes = vec!["claims:read".to_string()];
     let (app, pool, _jwt) = db_app().await;
-    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
+    let (client_id, code) =
+        seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
     // Identical to happy path except the PKCE verifier is wrong → challenge
     // mismatch → 400. (One factor varied vs the happy path.)
-    let (status, _body) = post_form(
-        app,
-        "/oauth/token",
-        &token_body(&code, "wrong", &client_id),
-    )
-    .await;
+    let (status, _body) =
+        post_form(app, "/oauth/token", &token_body(&code, "wrong", &client_id)).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
@@ -237,7 +244,8 @@ async fn db_authorization_code_wrong_verifier_is_rejected() {
 async fn db_authorization_code_is_single_use() {
     let scopes = vec!["claims:read".to_string()];
     let (app, pool, _jwt) = db_app().await;
-    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
+    let (client_id, code) =
+        seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
     // First redeem succeeds (consume marks used_at atomically).
     let (status1, body1) = post_form(
@@ -246,7 +254,11 @@ async fn db_authorization_code_is_single_use() {
         &token_body(&code, VERIFIER, &client_id),
     )
     .await;
-    assert_eq!(status1, StatusCode::OK, "first redeem must succeed, body: {body1}");
+    assert_eq!(
+        status1,
+        StatusCode::OK,
+        "first redeem must succeed, body: {body1}"
+    );
 
     // Second redeem of the SAME code against the SAME pool/state → already used → 400.
     let (status2, _body2) = post_form(
@@ -255,7 +267,11 @@ async fn db_authorization_code_is_single_use() {
         &token_body(&code, VERIFIER, &client_id),
     )
     .await;
-    assert_eq!(status2, StatusCode::BAD_REQUEST, "reused code must be rejected");
+    assert_eq!(
+        status2,
+        StatusCode::BAD_REQUEST,
+        "reused code must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -264,7 +280,8 @@ async fn db_authorization_code_expired_is_rejected() {
     let scopes = vec!["claims:read".to_string()];
     let (app, pool, _jwt) = db_app().await;
     // expires_at in the past → consume's `expires_at > now()` guard rejects it.
-    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() - Duration::hours(1), "active").await;
+    let (client_id, code) =
+        seed_client_and_code(&pool, &scopes, Utc::now() - Duration::hours(1), "active").await;
 
     let (status, _body) = post_form(
         app,
@@ -273,7 +290,11 @@ async fn db_authorization_code_expired_is_rejected() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::BAD_REQUEST, "expired code must be rejected");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expired code must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -290,7 +311,12 @@ async fn db_authorization_code_suspended_client_is_forbidden() {
     let (client_id, code) =
         seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "suspended").await;
 
-    let (status, _body) = post_form(app, "/oauth/token", &token_body(&code, VERIFIER, &client_id)).await;
+    let (status, _body) = post_form(
+        app,
+        "/oauth/token",
+        &token_body(&code, VERIFIER, &client_id),
+    )
+    .await;
 
     assert_eq!(
         status,
@@ -317,8 +343,12 @@ async fn db_authorization_code_omitted_client_id_is_rejected() {
     let (_client_id, code) =
         seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
-    let (status, _body) =
-        post_form(app, "/oauth/token", &token_body_no_client_id(&code, VERIFIER)).await;
+    let (status, _body) = post_form(
+        app,
+        "/oauth/token",
+        &token_body_no_client_id(&code, VERIFIER),
+    )
+    .await;
 
     assert_eq!(
         status,
@@ -394,10 +424,7 @@ async fn protected_resource_metadata_points_at_this_as() {
     let (status, body) = get_json(app(), "/.well-known/oauth-protected-resource").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["resource"], "https://test.example/mcp");
-    assert_eq!(
-        body["authorization_servers"][0],
-        "https://test.example"
-    );
+    assert_eq!(body["authorization_servers"][0], "https://test.example");
     // scopes_supported MUST advertise only the scopes a connector authorizing
     // through THIS AS can actually obtain AND use against /mcp. epigraph-mcp's
     // SCOPE_MAP codomain is {claims:read, claims:write, claims:admin}, but
@@ -412,10 +439,7 @@ async fn protected_resource_metadata_points_at_this_as() {
     let scopes = body["scopes_supported"].as_array().unwrap();
     assert_eq!(
         scopes,
-        &vec![
-            Value::from("claims:read"),
-            Value::from("claims:write"),
-        ],
+        &vec![Value::from("claims:read"), Value::from("claims:write"),],
         "scopes_supported must be exactly [claims:read, claims:write] — the \
          connector-reachable /mcp scopes; got: {scopes:?}"
     );
@@ -658,14 +682,16 @@ async fn authorize_redirects_to_google() {
     // A pending authorize session row must now exist for this client. The handler
     // keys it by a server-generated Google-CSRF state we don't see, so assert by
     // client_id (UUID-unique to this test, so the count is exactly 1).
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM oauth_authorize_sessions WHERE client_id = $1",
-    )
-    .bind(&client_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count sessions");
-    assert_eq!(count, 1, "authorize must persist exactly one pending session");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_authorize_sessions WHERE client_id = $1")
+            .bind(&client_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count sessions");
+    assert_eq!(
+        count, 1,
+        "authorize must persist exactly one pending session"
+    );
 }
 
 #[tokio::test]
@@ -677,11 +703,9 @@ async fn consent_allow_mints_redeemable_code() {
     let (app, pool, jwt) = db_app().await;
     let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
     let claude_state = "claude-roundtrip-state-xyz";
-    let ticket =
-        seed_consent_session(&pool, &client_id, client_uuid, &scopes, claude_state).await;
+    let ticket = seed_consent_session(&pool, &client_id, client_uuid, &scopes, claude_state).await;
 
-    let (status, loc) =
-        post_consent(app.clone(), &format!("ticket={ticket}&decision=allow")).await;
+    let (status, loc) = post_consent(app.clone(), &format!("ticket={ticket}&decision=allow")).await;
     // axum's Redirect::to emits 303 See Other (the correct POST→GET redirect).
     assert_eq!(
         status,
@@ -712,12 +736,19 @@ async fn consent_allow_mints_redeemable_code() {
     .fetch_one(&pool)
     .await
     .expect("query code row");
-    assert!(row_exists, "an authorization_code row must exist for blake3(code)");
+    assert!(
+        row_exists,
+        "an authorization_code row must exist for blake3(code)"
+    );
 
     // Redeem end-to-end: matching verifier + redirect_uri + client_id → 200 + JWT.
     let (rstatus, rbody) =
         post_form(app, "/oauth/token", &token_body(code, VERIFIER, &client_id)).await;
-    assert_eq!(rstatus, StatusCode::OK, "redeem must succeed, body: {rbody}");
+    assert_eq!(
+        rstatus,
+        StatusCode::OK,
+        "redeem must succeed, body: {rbody}"
+    );
     let access_token = rbody["access_token"]
         .as_str()
         .unwrap_or_else(|| panic!("no access_token in {rbody}"));
@@ -737,13 +768,15 @@ async fn consent_deny_redirects_with_error() {
     let scopes = vec!["claims:read".to_string()];
     let (app, pool, _jwt) = db_app().await;
     let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
-    let ticket =
-        seed_consent_session(&pool, &client_id, client_uuid, &scopes, "deny-state").await;
+    let ticket = seed_consent_session(&pool, &client_id, client_uuid, &scopes, "deny-state").await;
 
-    let (status, loc) =
-        post_consent(app, &format!("ticket={ticket}&decision=deny")).await;
+    let (status, loc) = post_consent(app, &format!("ticket={ticket}&decision=deny")).await;
 
-    assert_eq!(status, StatusCode::SEE_OTHER, "Deny must 303-redirect back to the client");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "Deny must 303-redirect back to the client"
+    );
     let loc = loc.expect("Deny must carry a Location header");
     assert!(
         loc.starts_with(REDIRECT_URI),
@@ -776,12 +809,10 @@ async fn consent_control_byte_state_does_not_panic() {
     let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
     // A literal newline (0x0A) — the post-percent-decode value of `state=%0A`.
     let evil_state = "before\nafter";
-    let ticket =
-        seed_consent_session(&pool, &client_id, client_uuid, &scopes, evil_state).await;
+    let ticket = seed_consent_session(&pool, &client_id, client_uuid, &scopes, evil_state).await;
 
     // Deny path (does not mint a code, isolating the redirect construction).
-    let (status, loc) =
-        post_consent(app, &format!("ticket={ticket}&decision=deny")).await;
+    let (status, loc) = post_consent(app, &format!("ticket={ticket}&decision=deny")).await;
 
     assert_eq!(
         status,
@@ -819,8 +850,7 @@ async fn consent_ticket_is_single_use() {
         post_consent(app.clone(), &format!("ticket={ticket}&decision=allow")).await;
     assert_eq!(status1, StatusCode::SEE_OTHER, "first Allow must succeed");
 
-    let (status2, _loc2) =
-        post_consent(app, &format!("ticket={ticket}&decision=allow")).await;
+    let (status2, _loc2) = post_consent(app, &format!("ticket={ticket}&decision=allow")).await;
     assert!(
         status2.is_client_error(),
         "a replayed consent ticket must be rejected (4xx), got {status2}"
@@ -841,7 +871,10 @@ async fn post_json2(app: axum::Router, uri: &str, body: serde_json::Value) -> (S
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 #[tokio::test]
@@ -863,7 +896,11 @@ async fn dcr_registration_returns_client_id_and_locks_redirect() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "DCR must return 201, got {status}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "DCR must return 201, got {status}"
+    );
     assert!(
         body["client_id"]
             .as_str()

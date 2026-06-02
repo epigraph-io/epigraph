@@ -56,7 +56,18 @@ impl AuthorizationCodeRepository {
         pool: &PgPool,
         code_hash: &[u8],
     ) -> Result<Option<AuthorizationCodeRow>, DbError> {
-        let row = sqlx::query_as::<_, (String, Uuid, String, String, Vec<String>, Option<DateTime<Utc>>, DateTime<Utc>)>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                Uuid,
+                String,
+                String,
+                Vec<String>,
+                Option<DateTime<Utc>>,
+                DateTime<Utc>,
+            ),
+        >(
             r#"UPDATE oauth_authorization_codes
                SET used_at = now()
                WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now()
