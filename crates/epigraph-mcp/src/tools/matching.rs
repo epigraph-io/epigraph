@@ -15,13 +15,12 @@
 
 use rmcp::model::*;
 use serde::Serialize;
-use sqlx::types::Json;
 
 use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
-use epigraph_db::{ClaimRepository, MatchCandidateRepo};
+use epigraph_db::{ClaimRepository, EdgeRepository, MatchCandidateRepo};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -161,9 +160,11 @@ pub async fn decide_match_candidate(
                 .map_err(internal_error)?;
 
             // Write CORROBORATES edge if it doesn't already exist (either
-            // direction). The unique-triple index was dropped in migration
-            // 109, so this explicit check is the only guard against
-            // duplicates from repeated `decide` calls.
+            // direction). The unique-triple index was dropped in migrations
+            // 017/018, so this explicit existence check — now centralized in
+            // `EdgeRepository::create_symmetric_if_absent` — is the only guard
+            // against duplicates from repeated `decide` calls. The
+            // are_all_current guard above stays here at the call site.
             let props = serde_json::json!({
                 "candidate_id":     candidate_id,
                 "score":            row.score,
@@ -172,21 +173,13 @@ pub async fn decide_match_candidate(
                 "decided_by":       acting_agent,
                 "source":           "cross_source_matcher",
             });
-            sqlx::query(
-                "INSERT INTO edges (source_id, source_type, target_id, target_type,
-                                     relationship, properties)
-                 SELECT $1, 'claim', $2, 'claim', 'CORROBORATES', $3
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM edges
-                     WHERE ((source_id = $1 AND target_id = $2)
-                         OR (source_id = $2 AND target_id = $1))
-                       AND relationship = 'CORROBORATES'
-                 )",
+            EdgeRepository::create_symmetric_if_absent(
+                &server.pool,
+                row.claim_a,
+                row.claim_b,
+                "CORROBORATES",
+                props,
             )
-            .bind(row.claim_a)
-            .bind(row.claim_b)
-            .bind(Json(props))
-            .execute(&server.pool)
             .await
             .map_err(internal_error)?;
         }

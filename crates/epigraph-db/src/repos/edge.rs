@@ -1,6 +1,7 @@
 //! Edge repository for LPG-style relationships
 
 use crate::errors::DbError;
+use sqlx::types::Json;
 use sqlx::PgPool;
 use tracing::instrument;
 use uuid::Uuid;
@@ -170,6 +171,57 @@ impl EdgeRepository {
             },
             true,
         ))
+    }
+
+    /// Insert a `relationship` edge between `a` and `b` (both `claim`-typed),
+    /// skipping the insert when an edge with the same relationship already
+    /// connects the two in EITHER direction.
+    ///
+    /// This is the single home for the cross-source matcher's edge-write SQL:
+    /// the `Policy::write_edge` body in `epigraph-engine` and the
+    /// `decide_match_candidate` PROMOTE arm in `epigraph-mcp` both route
+    /// through it so the dedup form lives in one place. The existence check is
+    /// **bidirectional** — `(a,b)` and `(b,a)` with the same `relationship`
+    /// count as the same edge — because CORROBORATES is semantically symmetric
+    /// even though the row preserves the caller's `a,b` ordering (we do NOT
+    /// canonicalize).
+    ///
+    /// Returns `true` when a new row was inserted, `false` on a dedup hit.
+    ///
+    /// Single-statement `INSERT … SELECT … WHERE NOT EXISTS`; **not**
+    /// `ON CONFLICT` — migrations 017/018 dropped the unique triple index, so
+    /// there is no constraint to infer on. The matcher's `are_all_current`
+    /// guard stays at the MCP call site; this method is purely the write.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, properties))]
+    pub async fn create_symmetric_if_absent(
+        pool: &PgPool,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type,
+                                relationship, properties)
+             SELECT $1, 'claim', $2, 'claim', $3, $4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM edges
+                 WHERE ((source_id = $1 AND target_id = $2)
+                     OR (source_id = $2 AND target_id = $1))
+                   AND relationship = $3
+             )",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(relationship)
+        .bind(Json(properties))
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     /// Get edges by source entity
