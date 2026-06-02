@@ -521,6 +521,12 @@ async fn handle_authorization_code(
         })?;
 
     // PKCE S256: base64url(SHA256(verifier)) == stored challenge.
+    // We assume S256 (we never compute the "plain" transform). That assumption is
+    // safe by construction: oauth_authorization_codes.code_challenge_method defaults
+    // to 'S256' (migration 049), AuthorizationCodeRepository::create never sets a
+    // different value, and Task 7's /authorize will reject any method != "S256"
+    // before a code is ever minted. consume() therefore omits the method column
+    // rather than carrying an always-'S256' field through this hot path.
     let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(sha2::Sha256::digest(verifier.as_bytes()));
     if computed != row.code_challenge {
@@ -562,7 +568,15 @@ async fn handle_authorization_code(
         });
     }
 
-    let ttl = Duration::hours(1);
+    // TTLs by client type, matching the sibling grant handlers' tables. Per-user
+    // clients are always client_type="human" (1h access / 30d refresh); keying off
+    // client_type keeps the values coupled to type rather than hardcoded.
+    let ttl = match client.client_type.as_str() {
+        "agent" => Duration::minutes(15),
+        "human" => Duration::hours(1),
+        "service" => Duration::hours(1),
+        _ => Duration::minutes(15),
+    };
     let effective_scopes = row.scopes.clone();
     let (access_token, _jti) = state
         .jwt_config
@@ -584,12 +598,18 @@ async fn handle_authorization_code(
         let raw: [u8; 32] = rand::thread_rng().gen();
         let token_str = hex::encode(raw);
         let hash = blake3::hash(&raw);
+        let refresh_ttl = match client.client_type.as_str() {
+            "agent" => Duration::hours(24),
+            "human" => Duration::days(30),
+            "service" => Duration::days(90),
+            _ => Duration::hours(24),
+        };
         epigraph_db::repos::refresh_token::RefreshTokenRepository::create(
             &state.db_pool,
             hash.as_bytes(),
             client.id,
             &effective_scopes,
-            Utc::now() + Duration::days(30),
+            Utc::now() + refresh_ttl,
         )
         .await
         .map_err(|e| ApiError::InternalError {
