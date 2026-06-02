@@ -49,7 +49,10 @@ async fn deprecate_claim_nulls_embedding_and_preserves_control(pool: PgPool) {
     let affected = ClaimRepository::deprecate_claim(&pool, ClaimId::from_uuid(target_id))
         .await
         .unwrap();
-    assert_eq!(affected, 1, "deprecate_claim should touch exactly the target row");
+    assert_eq!(
+        affected, 1,
+        "deprecate_claim should touch exactly the target row"
+    );
 
     // Full post-condition on the target: truth 0.05, not current, embedding NULL.
     let (truth, is_current, has_embedding): (f64, bool, bool) = sqlx::query_as(
@@ -59,9 +62,15 @@ async fn deprecate_claim_nulls_embedding_and_preserves_control(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!((truth - 0.05).abs() < 1e-9, "target truth_value should be 0.05, got {truth}");
+    assert!(
+        (truth - 0.05).abs() < 1e-9,
+        "target truth_value should be 0.05, got {truth}"
+    );
     assert!(!is_current, "target is_current should be false");
-    assert!(!has_embedding, "target embedding should be NULL after deprecate_claim");
+    assert!(
+        !has_embedding,
+        "target embedding should be NULL after deprecate_claim"
+    );
 
     // Control row must be entirely unaffected: still current, still embedded,
     // truth unchanged. Without this assertion the test would pass even if
@@ -73,7 +82,10 @@ async fn deprecate_claim_nulls_embedding_and_preserves_control(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!((c_truth - 0.9).abs() < 1e-9, "control truth_value must be unchanged");
+    assert!(
+        (c_truth - 0.9).abs() < 1e-9,
+        "control truth_value must be unchanged"
+    );
     assert!(c_current, "control is_current must stay true");
     assert!(c_has_embedding, "control embedding must be preserved");
 
@@ -82,12 +94,17 @@ async fn deprecate_claim_nulls_embedding_and_preserves_control(pool: PgPool) {
     let affected2 = ClaimRepository::deprecate_claim(&pool, ClaimId::from_uuid(target_id))
         .await
         .unwrap();
-    assert_eq!(affected2, 1, "re-deprecating an already-deprecated claim is a safe no-op flip");
-    let still_null: bool =
-        sqlx::query_scalar("SELECT embedding IS NULL FROM claims WHERE id = $1")
-            .bind(target_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(still_null, "embedding stays NULL after a second deprecate_claim");
+    assert_eq!(
+        affected2, 1,
+        "re-deprecating an already-deprecated claim is a safe no-op flip"
+    );
+    let still_null: bool = sqlx::query_scalar("SELECT embedding IS NULL FROM claims WHERE id = $1")
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        still_null,
+        "embedding stays NULL after a second deprecate_claim"
+    );
 }
