@@ -52,6 +52,7 @@ pub async fn provision_external_user_client(
                 None,
                 None,
                 Some(&email),
+                None, // redirect_uris: provisioned via Google OIDC, not a registered redirect
             )
             .await
             .map_err(|e| ApiError::InternalError {

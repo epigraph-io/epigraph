@@ -196,6 +196,7 @@ pub async fn create_agent(
             Some(auth.client_id), // owner_id = the creating user/service
             None,                 // legal_entity_name
             None,                 // legal_contact_email
+            None,                 // redirect_uris: agents use Ed25519 assertion auth, no redirect
         )
         .await
         {

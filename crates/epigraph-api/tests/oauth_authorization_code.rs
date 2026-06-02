@@ -143,6 +143,7 @@ async fn seed_client_and_code(
         None,
         None,
         None,
+        None, // redirect_uris (irrelevant to the token redeem path)
     )
     .await
     .expect("seed oauth_client");
@@ -523,6 +524,7 @@ async fn seed_active_human_client(pool: &PgPool, scopes: &[String]) -> (String, 
         None, // owner_id (self-FK; NULL is valid for 'human')
         None, // legal_entity_name
         None, // legal_contact_email
+        None, // redirect_uris (this helper's callers seed the column via SQL UPDATE)
     )
     .await
     .expect("seed oauth_client");
@@ -624,11 +626,11 @@ async fn authorize_redirects_to_google() {
     let (app, pool, _fx) = db_app_with_google().await;
     let scopes = vec!["claims:read".to_string()];
     let (client_id, _uuid) = seed_active_human_client(&pool, &scopes).await;
-    // OAuthClientRepository::create does NOT persist redirect_uris (it has no such
-    // parameter), but the authorize handler validates the request's redirect_uri
-    // against client.redirect_uris. Seed the column directly so the handler accepts
-    // the exact claude callback. (See concerns: register.rs accepts redirect_uris in
-    // the request body but likewise never persists it — a separate gap.)
+    // seed_active_human_client passes None for redirect_uris, so seed the column
+    // directly here: the authorize handler validates the request's redirect_uri
+    // against client.redirect_uris, which must contain the exact claude callback.
+    // (The DCR path in register.rs now persists redirect_uris via create's new
+    // parameter; this helper keeps the SQL UPDATE to stay independent of it.)
     sqlx::query("UPDATE oauth_clients SET redirect_uris = $2 WHERE client_id = $1")
         .bind(&client_id)
         .bind(&[REDIRECT_URI.to_string()][..])
@@ -822,5 +824,80 @@ async fn consent_ticket_is_single_use() {
     assert!(
         status2.is_client_error(),
         "a replayed consent ticket must be rejected (4xx), got {status2}"
+    );
+}
+
+// ── RFC 7591 dynamic client registration (Task 9) ────────────────────────────
+
+/// POST a JSON body to `uri` and return (status, parsed JSON body).
+async fn post_json2(app: axum::Router, uri: &str, body: serde_json::Value) -> (StatusCode, Value) {
+    use axum::http::header;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
+async fn dcr_registration_returns_client_id_and_locks_redirect() {
+    // A claude.ai-shaped DCR request (redirect_uris + response_types=[code], no
+    // client_type) must create an ACTIVE public client and echo back the locked
+    // redirect_uri verbatim per RFC 7591.
+    let (app, _pool, _jwt) = db_app().await;
+    let (status, body) = post_json2(
+        app,
+        "/oauth/register",
+        serde_json::json!({
+            "client_name": "Claude",
+            "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "DCR must return 201, got {status}");
+    assert!(
+        body["client_id"]
+            .as_str()
+            .expect("client_id present")
+            .starts_with("epigraph_"),
+        "client_id must be a generated epigraph_ id, got: {:?}",
+        body["client_id"]
+    );
+    assert_eq!(
+        body["redirect_uris"][0], "https://claude.ai/api/mcp/auth_callback",
+        "the locked redirect_uri must be echoed back, got: {:?}",
+        body["redirect_uris"]
+    );
+}
+
+#[tokio::test]
+async fn dcr_rejects_non_claude_redirect_host() {
+    // A DCR carrying a redirect_uri whose host is NOT claude.ai/claude.com must be
+    // rejected with 400 BEFORE any DB access (the host allowlist runs first), so this
+    // runs DB-free under the dummy-DB `app()` like authorization_code_missing_code.
+    let (status, _body) = post_json2(
+        app(),
+        "/oauth/register",
+        serde_json::json!({
+            "client_name": "Evil",
+            "redirect_uris": ["https://evil.example/api/mcp/auth_callback"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a non-claude redirect host must be rejected with 400, got {status}"
     );
 }
