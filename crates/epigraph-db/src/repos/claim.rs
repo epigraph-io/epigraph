@@ -2479,6 +2479,40 @@ mod tests {
 // ── Label Mutation ──
 
 impl ClaimRepository {
+    /// Deprecate a single claim: drop its truth to the 0.05 sentinel, flip
+    /// `is_current = false`, and NULL its embedding in one statement.
+    ///
+    /// This is the canonical deprecation primitive for workflow claims. It is
+    /// the THIRD `is_current = false` cleanup path (alongside `supersede` and
+    /// `mark_duplicate`); per CLAUDE.md "Embedding policy → Cleanup paths",
+    /// any path flipping `is_current = false` MUST null the embedding in the
+    /// same statement so the row drops out of semantic recall and does not
+    /// inflate the `stale_present` audit count.
+    ///
+    /// Returns the number of rows affected (0 when `id` does not exist).
+    /// Idempotent: re-running on an already-deprecated claim is a no-op flip
+    /// plus a no-op NULL — safe to call twice (used as the post-deploy
+    /// remediation path for claims deprecated by the pre-fix binary).
+    ///
+    /// Uses the runtime `sqlx::query` (string) form — NOT the compile-time
+    /// `query!` macro — to match the existing deprecation call-sites and to
+    /// avoid touching `.sqlx/` (no `cargo sqlx prepare` required).
+    ///
+    /// # Errors
+    /// Returns `DbError` if the database query fails.
+    pub async fn deprecate_claim(pool: &PgPool, id: ClaimId) -> Result<u64, DbError> {
+        let uuid: Uuid = id.into();
+        let result = sqlx::query(
+            "UPDATE claims \
+             SET truth_value = 0.05, is_current = false, embedding = NULL, updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(uuid)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Update labels on a claim by adding and/or removing labels atomically.
     ///
     /// Uses PostgreSQL array functions. Idempotent: adding a duplicate is a no-op,
