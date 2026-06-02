@@ -4,7 +4,7 @@ use epigraph_api::{create_router, ApiConfig, AppState};
 #[cfg(feature = "db")]
 use epigraph_jobs::{
     cluster_graph::ClusterGraphHandler, theme_cluster_rebuild::ThemeClusterRebuildHandler,
-    EpiGraphJob, JobQueue, JobRunner, PostgresJobQueue,
+    JobQueue, JobRunner, PostgresJobQueue,
 };
 use std::sync::Arc;
 #[cfg(feature = "db")]
@@ -274,7 +274,6 @@ async fn main() {
         tracing::info!("EPIGRAPH_DISABLE_JOBS=1 set; skipping job runner registration");
     } else {
         let queue: Arc<dyn JobQueue> = Arc::new(PostgresJobQueue::new(job_pool.clone()));
-        let queue_for_cluster_cron = Arc::clone(&queue);
         let queue_for_theme_cron = Arc::clone(&queue);
         // Concrete handle for the stale-job reaper (recover_stale_jobs is a
         // PostgresJobQueue method, not part of the JobQueue trait).
@@ -315,75 +314,26 @@ async fn main() {
             }
         });
 
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            loop {
-                match (EpiGraphJob::ClusterGraph {
-                    resolution: 1.0,
-                    retain_runs: 3,
-                })
-                .into_job()
-                {
-                    Ok(job) => match queue_for_cluster_cron.enqueue_unique_pending(job).await {
-                        Ok(Some(_)) => tracing::info!("Enqueued nightly ClusterGraph job"),
-                        Ok(None) => tracing::info!(
-                            "ClusterGraph already pending; skipped duplicate nightly enqueue"
-                        ),
-                        Err(e) => tracing::error!(
-                            error = %e,
-                            "failed to enqueue nightly ClusterGraph job"
-                        ),
-                    },
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "failed to serialize ClusterGraph job payload"
-                        );
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(86_400)).await;
-            }
-        });
-
-        // Sibling cron: ThemeClusterRebuild — staggered 30-minute warmup
-        // (vs ClusterGraph's 60 s) so ClusterGraph finishes its first run
-        // before ThemeClusterRebuild's `wipe_first` cascades into
-        // `graph_neighborhoods.theme_id` (ON DELETE CASCADE, migration
-        // 026).  Subsequent daily runs preserve the same offset.
-        // `skip_if_unchanged: true` makes this a cheap no-op on idle days.
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(1800)).await;
-            loop {
-                match (EpiGraphJob::ThemeClusterRebuild {
-                    max_themes: 50,
-                    min_claims_per_theme: 5,
-                    skip_if_unchanged: true,
-                })
-                .into_job()
-                {
-                    Ok(job) => match queue_for_theme_cron.enqueue_unique_pending(job).await {
-                        Ok(Some(_)) => tracing::info!("Enqueued nightly ThemeClusterRebuild job"),
-                        Ok(None) => tracing::info!(
-                            "ThemeClusterRebuild already pending; skipped duplicate nightly enqueue"
-                        ),
-                        Err(e) => tracing::error!(
-                            error = %e,
-                            "failed to enqueue nightly ThemeClusterRebuild job"
-                        ),
-                    },
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "failed to serialize ThemeClusterRebuild job payload"
-                        );
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(86_400)).await;
-            }
-        });
+        // Nightly auto-enqueue is DISABLED for both ClusterGraph and
+        // ThemeClusterRebuild.
+        //
+        // The ThemeClusterRebuild rebuild (in-memory 1536-dim k-means, linfa
+        // n_runs=10 × elbow range, see theme_kmeans.rs) wedged epigraph-api
+        // for ~30 min after every restart — its cron fired 1800 s post-boot,
+        // so a bounce was effectively a forced full re-cluster. ClusterGraph
+        // (Louvain) likewise self-triggered ~60 s after boot. Both jobs are
+        // expensive and not latency-sensitive, so they should run on operator
+        // demand, not as an unconditional side effect of starting the server.
+        //
+        // Both handlers stay REGISTERED above (the theme handler borrows
+        // `queue_for_theme_cron` for its follow-up queue), so an operator can
+        // still trigger a one-off run by enqueuing a `ClusterGraph` or
+        // `ThemeClusterRebuild` job via the jobs API; nothing auto-enqueues
+        // either.
 
         tracing::info!(
-            "Job runner started (2 workers); nightly ClusterGraph + ThemeClusterRebuild jobs scheduled"
+            "Job runner started (2 workers); ClusterGraph + ThemeClusterRebuild \
+             auto-enqueue disabled (run on demand via the jobs API)"
         );
     }
 
