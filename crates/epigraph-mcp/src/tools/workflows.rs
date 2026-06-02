@@ -821,14 +821,14 @@ pub async fn deprecate_workflow(
 
     let mut deprecated_ids = Vec::new();
 
-    // Deprecate the target workflow (A4: also set is_current = false)
-    sqlx::query(
-        "UPDATE claims SET truth_value = 0.05, is_current = false, updated_at = NOW() WHERE id = $1",
-    )
-    .bind(workflow_id)
-    .execute(&server.pool)
-    .await
-    .map_err(internal_error)?;
+    // Deprecate the target workflow (A4: also set is_current = false).
+    // ClaimRepository::deprecate_claim ALSO nulls the embedding in the same
+    // statement — required by CLAUDE.md "Embedding policy → Cleanup paths"
+    // so the deprecated workflow drops out of semantic recall and does not
+    // inflate the `stale_present` audit count.
+    ClaimRepository::deprecate_claim(&server.pool, epigraph_core::ClaimId::from_uuid(workflow_id))
+        .await
+        .map_err(internal_error)?;
     // Cascade onto the hierarchical `workflows` row (no-op when this
     // workflow has only a flat-claim representation). Without this,
     // `find_workflow_hierarchical` keeps returning the deprecated row.
@@ -872,11 +872,10 @@ pub async fn deprecate_workflow(
                     continue;
                 }
 
-                sqlx::query(
-                    "UPDATE claims SET truth_value = 0.05, is_current = false, updated_at = NOW() WHERE id = $1",
+                ClaimRepository::deprecate_claim(
+                    &server.pool,
+                    epigraph_core::ClaimId::from_uuid(child_id),
                 )
-                .bind(child_id)
-                .execute(&server.pool)
                 .await
                 .map_err(internal_error)?;
                 // Mirror onto the hierarchical row, if any.

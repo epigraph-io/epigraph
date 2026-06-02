@@ -1133,11 +1133,17 @@ pub async fn deprecate_workflow(
     // common default) still saw deprecated workflows because 0.05 > 0.0.
     // See epigraph-io/epigraph#36.
     for id in &ids_to_deprecate {
-        let _ =
-            sqlx::query("UPDATE claims SET truth_value = 0.05, is_current = false WHERE id = $1")
-                .bind(id)
-                .execute(&state.db_pool)
-                .await;
+        // deprecate_claim also nulls the embedding (CLAUDE.md "Embedding
+        // policy → Cleanup paths"); the prior bare UPDATE left a non-NULL
+        // embedding on an is_current=false row, inflating `stale_present`.
+        // (It additionally sets `updated_at = NOW()`, which the prior bare
+        // UPDATE here omitted — a benign, more-correct side effect of
+        // unifying on the repo method.)
+        let _ = epigraph_db::ClaimRepository::deprecate_claim(
+            &state.db_pool,
+            epigraph_core::ClaimId::from_uuid(*id),
+        )
+        .await;
         // Mirror onto the hierarchical `workflows` row when one exists
         // (no-op for flat-only workflows). Without this, deprecated
         // hierarchical workflows keep surfacing in
