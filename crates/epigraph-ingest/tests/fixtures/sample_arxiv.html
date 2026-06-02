@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><title>raw head title (ignored)</title><style>.x{}</style></head>
+<body>
+  <h1>Structured Source-First Ingestion for Epistemic Graphs</h1>
+  <div class="authors">Ada Lovelace, Charles Babbage and Grace Hopper</div>
+  <div class="abstract">
+    <p>We present a structure-recovery preprocessor that maps arXiv HTML into a
+    hierarchical extraction schema. It recovers sections and paragraphs without
+    invoking a language model.</p>
+  </div>
+  <section>
+    <h2>Introduction</h2>
+    <p>Scientific HTML such as ar5iv pages carries explicit section structure.
+    Exploiting that structure avoids lossy OCR. The preprocessor walks headings
+    and accumulates section text. <math><mi>E</mi><mo>=</mo><mi>m</mi></math>
+    appears inline but is skipped by the parser.</p>
+  </section>
+  <section>
+    <h2>Method</h2>
+    <p>The parser tracks a heading stack and flushes a section when a new
+    heading of level two or greater begins. Each recovered section becomes one
+    node in the downstream hierarchy. Tiny sections under fifty characters are
+    discarded to suppress navigation noise.</p>
+  </section>
+  <footer>nav junk that must be skipped</footer>
+</body>
+</html>
