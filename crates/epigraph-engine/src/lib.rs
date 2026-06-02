@@ -47,6 +47,7 @@ pub mod propagation;
 pub mod reasoning;
 pub mod recall;
 pub mod reconciliation;
+pub mod rerank;
 pub mod reputation;
 pub mod retention;
 pub mod service;
@@ -97,6 +98,12 @@ pub use recall::{recall, RecallError, RecallResult};
 pub use reconciliation::{
     cluster_obstructions, extract_cospan, reconcile, ClusterSummary, ReconciliationConfig,
     ReconciliationResult,
+};
+pub use rerank::{
+    apply_groundedness, build_groundedness_prompt, build_rerank_client_from_env,
+    merge_rerank_scores, parse_groundedness_response, parse_rerank_response, Groundedness,
+    GroundednessGate, HttpRerankClient, MockRerankClient, RerankCandidate, RerankClient,
+    RerankError, RerankProviderConfig, RerankScore, RerankedHit,
 };
 pub use reputation::ReputationCalculator;
 pub use service::{
