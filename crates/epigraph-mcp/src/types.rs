@@ -162,6 +162,18 @@ pub struct RecallParams {
 
     #[schemars(description = "Maximum number of memories to return (default 10)")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Restrict recall to claims carrying ALL these labels/tags (array containment). Default: no tag filter."
+    )]
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    #[schemars(
+        description = "Restrict recall to claims authored by this agent UUID. Default: any agent. An invalid UUID is rejected, not silently ignored."
+    )]
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 // ── Ingestion ──

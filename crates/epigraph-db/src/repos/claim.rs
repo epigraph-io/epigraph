@@ -523,6 +523,76 @@ impl ClaimRepository {
         Ok(q.fetch_all(pool).await?)
     }
 
+    /// Search **current** claims by embedding similarity across **all levels**.
+    ///
+    /// This is the search backing the simple `recall` MCP tool. Unlike
+    /// [`search_by_embedding`] — which is paper-paragraph-primary and
+    /// restricts to `(properties->>'level')::int = 2` — memorized claims have
+    /// no `level` property and store their vector on the 1536d
+    /// `claims.embedding` column. `recall` therefore needs a search with no
+    /// level restriction, limited to `is_current` so superseded/retired claims
+    /// are not resurfaced. (`recall` previously queried
+    /// `EvidenceRepository::search_by_embedding`, i.e. `evidence.embedding`,
+    /// which is unpopulated — so its semantic path returned nothing.)
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn search_by_embedding_current(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        limit: i64,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        Self::search_by_embedding_scoped(pool, query_embedding_pgvector, limit, None, None).await
+    }
+
+    /// [`search_by_embedding_current`] with optional scope predicates pushed
+    /// into the query: `tags` requires label containment (`c.labels @> $tags`,
+    /// the claim must carry ALL given tags) and `agent_id` requires authorship.
+    /// A `None`/empty filter does not restrict (the `$n IS NULL OR …` idiom),
+    /// so the two compose with AND. Scoping at the DB keeps it correct and
+    /// index-friendly rather than over-fetching and filtering in Rust.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn search_by_embedding_scoped(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        // Empty tag slice scopes to nothing meaningful (`@> '{}'` is all rows);
+        // collapse it to None so the IS NULL branch short-circuits.
+        let tags_owned: Option<Vec<String>> = match tags {
+            Some(t) if !t.is_empty() => Some(t.to_vec()),
+            _ => None,
+        };
+
+        let rows = sqlx::query_as::<_, ClaimEmbeddingHit>(
+            r#"
+            SELECT c.id AS claim_id,
+                   1 - (c.embedding <=> $1::vector) AS similarity
+            FROM claims c
+            WHERE c.embedding IS NOT NULL
+              AND c.is_current
+              AND ($3::text[] IS NULL OR c.labels @> $3::text[])
+              AND ($4::uuid IS NULL OR c.agent_id = $4::uuid)
+            ORDER BY c.embedding <=> $1::vector
+            LIMIT $2
+            "#,
+        )
+        .bind(query_embedding_pgvector)
+        .bind(limit)
+        .bind(tags_owned)
+        .bind(agent_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Get all claims by an agent
     ///
     /// # Errors
@@ -2283,6 +2353,33 @@ impl ClaimRepository {
             .bind(dup_uuid)
             .execute(&mut *tx)
             .await?;
+
+        // Migrate edges off the now-non-current duplicate onto the canonical
+        // claim, mirroring supersede()'s edge migration — otherwise edges to/from
+        // third claims dangle at a claim that no longer surfaces. Unlike supersede
+        // (which targets a freshly-minted claim with no pre-existing edges), the
+        // canonical here already exists, so guard against creating a
+        // canonical->canonical self-loop when an edge already linked dup and
+        // canonical. The 'supersedes' edges (dedup/lineage trail) are preserved.
+        sqlx::query(
+            "UPDATE edges SET target_id = $1 \
+             WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
+               AND NOT (source_type = 'claim' AND source_id = $1)",
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE edges SET source_id = $1 \
+             WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes' \
+               AND NOT (target_type = 'claim' AND target_id = $1)",
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         Ok(())

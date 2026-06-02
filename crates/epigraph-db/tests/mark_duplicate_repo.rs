@@ -100,6 +100,81 @@ async fn mark_duplicate_rejects_self(pool: PgPool) {
     assert!(format!("{err:?}").contains("dup == canonical"), "{err:?}");
 }
 
+async fn seed_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties, created_at) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', $3, '{}'::jsonb, NOW())",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn edge_count(pool: &PgPool, source: Uuid, target: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM edges WHERE source_id = $1 AND target_id = $2")
+        .bind(source)
+        .bind(target)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_migrates_edges_to_canonical(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, agent, "canonical").await;
+    let dup = seed_claim(&pool, agent, "duplicate").await;
+    let third = seed_claim(&pool, agent, "third").await;
+
+    // Incoming: a third claim supports the dup.
+    seed_edge(&pool, third, dup, "supports").await;
+    // Outgoing: the dup supports the third claim.
+    seed_edge(&pool, dup, third, "supports").await;
+    // Self-loop hazard: an edge already between dup and canonical. Redirecting its
+    // source to canonical would create a canonical->canonical self-loop.
+    seed_edge(&pool, dup, canonical, "related").await;
+
+    ClaimRepository::mark_duplicate(
+        &pool,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .unwrap();
+
+    // Incoming edge migrated: third -> dup became third -> canonical.
+    assert_eq!(
+        edge_count(&pool, third, canonical).await,
+        1,
+        "incoming edge not migrated"
+    );
+    assert_eq!(
+        edge_count(&pool, third, dup).await,
+        0,
+        "incoming edge left dangling at dup"
+    );
+    // Outgoing edge migrated: dup -> third became canonical -> third.
+    assert_eq!(
+        edge_count(&pool, canonical, third).await,
+        1,
+        "outgoing edge not migrated"
+    );
+    assert_eq!(
+        edge_count(&pool, dup, third).await,
+        0,
+        "outgoing edge left dangling at dup"
+    );
+    // Self-loop guard: the dup<->canonical edge must NOT become canonical->canonical.
+    assert_eq!(
+        edge_count(&pool, canonical, canonical).await,
+        0,
+        "created a self-loop"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_duplicate_rejects_missing_canonical(pool: PgPool) {
     let agent = seed_agent(&pool).await;

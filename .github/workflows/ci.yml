@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Actions are pinned to a full commit SHA (not a floating tag) so a compromised
+# or force-pushed upstream tag cannot silently change what runs in CI. The
+# trailing comment records the version the SHA resolved to at pin time.
+# dtolnay/rust-toolchain selects the channel from the *ref name*; pinning by SHA
+# defeats that, so the channel stays explicit via the `toolchain` input below.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -38,8 +43,8 @@ jobs:
       # reduces disk pressure.
       CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
-      - uses: actions/checkout@v4.3.1
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
           components: clippy, rustfmt
@@ -81,15 +86,18 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
             /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost || true
           df -ih / ; df -h /
-      - uses: Swatinem/rust-cache@v2.8.1
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      # --locked: Cargo.lock is committed; enforce it so CI builds the exact
+      # locked dependency graph and fails loudly if the lock is stale rather
+      # than silently resolving newer versions.
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
       - name: Test (non-DB packages, parallel)
         # Packages without DB tests can run fully in parallel.
         # Crates with #[sqlx::test] integration tests (or live DB usage) are
         # excluded here and run sequentially below — concurrent test instances
         # race on _sqlx_migrations when applying migrations to the template DB.
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
           --exclude epigraph-db
           --exclude epigraph-api
           --exclude epigraph-engine
@@ -100,20 +108,44 @@ jobs:
         # binaries race on _sqlx_migrations → "tuple concurrently updated".
         # --test-threads=1 serializes within the binary; running packages
         # sequentially prevents cross-binary races.
-        run: cargo test -p epigraph-db -- --test-threads=1
+        run: cargo test -p epigraph-db --locked -- --test-threads=1
       - name: Test (epigraph-api, serialized)
-        run: cargo test -p epigraph-api -- --test-threads=1
+        run: cargo test -p epigraph-api --locked -- --test-threads=1
       - name: Test (epigraph-engine, serialized)
-        run: cargo test -p epigraph-engine -- --test-threads=1
+        run: cargo test -p epigraph-engine --locked -- --test-threads=1
       - name: Test (epigraph-mcp, serialized)
         # claim_helper_tests adds a temporary CHECK constraint on `edges`
         # that would race with sibling tests under parallel execution.
-        run: cargo test -p epigraph-mcp -- --test-threads=1
+        run: cargo test -p epigraph-mcp --locked -- --test-threads=1
       - name: Test (epigraph-embeddings, serialized)
         # pgvector tests use #[sqlx::test] which races with parallel siblings
         # on _sqlx_migrations whenever a new migration is added.
-        run: cargo test -p epigraph-embeddings -- --test-threads=1
+        run: cargo test -p epigraph-embeddings --locked -- --test-threads=1
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --locked -- -D warnings
       - name: Format check
         run: cargo fmt --check
+
+  # Advisory, NOT a merge gate. cargo audit checks Cargo.lock against the
+  # RustSec DB fetched at run time, so a blocking gate would red-light every
+  # open PR the moment a new advisory lands on any transitive dependency —
+  # and Foreman auto-merges epigraph PRs, so unrelated red CI is actively
+  # harmful. continue-on-error keeps the result visible without blocking.
+  # The lockfile currently carries known advisories (bytes, rsa, rustls-webpki,
+  # sqlx, instant, …); flip this to a gate only once that backlog is triaged.
+  audit:
+    name: Security audit (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      # Installed from source rather than via a prebuilt-binary action so the
+      # trust surface stays the three actions pinned above — no extra upstream.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit
