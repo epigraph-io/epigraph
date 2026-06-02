@@ -79,6 +79,10 @@ name = "calibration_load"
 path = "tests/calibration_load.rs"
 
 [[test]]
+name = "conformal_classify"
+path = "tests/conformal_classify.rs"
+
+[[test]]
 name = "verifier_smoke"
 path = "tests/verifier_smoke.rs"
 

@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use crate::calibration::ClassifierThresholds;
+use crate::calibration::{ClassifierThresholds, ConformalConfig};
 
 // ── Classification label ─────────────────────────────────────────────────────
 
@@ -111,6 +111,57 @@ pub fn classify(
 
     // Rule 7: fallback → not_enough_info
     CdstClassification::NotEnoughInfo
+}
+
+/// Set-valued split-conformal classifier (backlog d5ba91a5).
+///
+/// Returns the *prediction set* — the subset of {Supported, Contradicted,
+/// NotEnoughInfo} whose nonconformity score does not exceed its calibrated
+/// quantile. Unlike [`classify`] (a single F1-tuned point label), this carries
+/// a distribution-free marginal (1 - alpha) coverage guarantee on the SciFact
+/// calibration distribution: the true label is in the returned set with
+/// probability >= 1 - alpha.
+///
+/// # Nonconformity scores
+/// The runtime exposes `betp_sup`, `betp_unsup` and `theta` only — there is no
+/// `betp_nei`; supported/contradicted share one axis and theta is the
+/// (closed-world) ignorance axis. The three class scores are therefore:
+/// - `score(Supported)     = 1 - betp_sup`
+/// - `score(Contradicted)  = 1 - betp_unsup`
+/// - `score(NotEnoughInfo) = 1 - theta`
+///
+/// matching exactly the quantiles `scripts/calibrate_conformal.py` fits.
+///
+/// # Parameters
+/// - `betp_sup`: pignistic probability of `supported` (idx 0) — same value the
+///   combine path passes to [`classify`] as `betp`.
+/// - `betp_unsup`: pignistic probability of `contradicted` (idx 1).
+/// - `theta`: closed-world ignorance m({0,1}) (open-world m(~) excluded, Smets).
+/// - `conformal`: calibrated quantiles (use the loaded `CalibrationConfig.conformal`).
+///
+/// # Returns
+/// The prediction set, in canonical order Supported, Contradicted,
+/// NotEnoughInfo. CAN BE EMPTY: an empty set means every class's score exceeded
+/// its quantile (a strong out-of-distribution / abstention signal), and is a
+/// legitimate conformal outcome, not an error.
+pub fn classify_conformal(
+    betp_sup: f64,
+    betp_unsup: f64,
+    theta: f64,
+    conformal: &ConformalConfig,
+) -> Vec<CdstClassification> {
+    let q = &conformal.quantiles;
+    let mut out = Vec::with_capacity(3);
+    if (1.0 - betp_sup) <= q.supported {
+        out.push(CdstClassification::Supported);
+    }
+    if (1.0 - betp_unsup) <= q.contradicted {
+        out.push(CdstClassification::Contradicted);
+    }
+    if (1.0 - theta) <= q.not_enough_info {
+        out.push(CdstClassification::NotEnoughInfo);
+    }
+    out
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
