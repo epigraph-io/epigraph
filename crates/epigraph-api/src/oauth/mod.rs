@@ -11,6 +11,8 @@ pub mod revoke;
 pub mod token;
 
 pub use authorize::{authorize_endpoint, AuthorizeQuery};
+#[cfg(feature = "db")]
+pub use authorize::{callback_endpoint, consent_endpoint};
 pub use device::{auth_url_endpoint, exchange_endpoint};
 pub use introspect::introspect_endpoint;
 pub use jwt::{EpiGraphClaims, JwtConfig};

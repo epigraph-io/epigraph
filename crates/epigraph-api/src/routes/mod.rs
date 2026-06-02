@@ -769,6 +769,14 @@ pub fn create_router(state: AppState) -> Router {
             get(crate::oauth::authorize_endpoint),
         )
         .route(
+            "/oauth/callback",
+            get(crate::oauth::callback_endpoint),
+        )
+        .route(
+            "/oauth/authorize/consent",
+            post(crate::oauth::consent_endpoint),
+        )
+        .route(
             "/oauth/:provider/auth-url",
             post(crate::oauth::auth_url_endpoint),
         )

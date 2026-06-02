@@ -11,7 +11,7 @@ use axum::{
     response::Response,
 };
 #[cfg(feature = "db")]
-use axum::response::{IntoResponse, Redirect};
+use axum::response::{Html, IntoResponse, Redirect};
 use serde::Deserialize;
 
 use crate::errors::ApiError;
@@ -127,6 +127,214 @@ pub async fn authorize_endpoint(
     })?;
 
     Ok(Redirect::to(&auth_url).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CallbackQuery {
+    pub code: String,
+    pub state: String,
+}
+
+/// Google redirects here (`GET /oauth/callback`). Recover the pending authorize session by
+/// the Google CSRF `state` (READ-ONLY), exchange the Google code for an id_token, validate
+/// identity, provision the per-user client (no tokens yet), compute requested∩grantable
+/// scopes, then ATOMICALLY rotate the session to a fresh consent nonce carrying the resolved
+/// user + scopes server-side. Render consent keyed by that nonce. The user and scopes are
+/// NEVER read from browser-supplied form fields — only from the server-side session row.
+#[cfg(feature = "db")]
+pub async fn callback_endpoint(
+    State(state): State<AppState>,
+    Query(q): Query<CallbackQuery>,
+) -> Result<Response, ApiError> {
+    use crate::oauth::providers::provision_external_user_client;
+    use epigraph_db::repos::authorize_session::AuthorizeSessionRepository;
+
+    // 1. Read-only lookup (NO delete): we still need the verifier + request to transition.
+    let session = AuthorizeSessionRepository::find_by_state(&state.db_pool, &q.state)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?
+        .ok_or(ApiError::BadRequest {
+            message: "unknown or expired authorize session".into(),
+        })?;
+
+    // 2. Exchange the Google code -> id_token -> validated identity (reuse the provider flow).
+    let provider =
+        state
+            .providers
+            .by_name(GOOGLE_PROVIDER)
+            .ok_or(ApiError::InternalError {
+                message: "google provider missing".into(),
+            })?;
+    let flow = state
+        .providers
+        .redirect_flow(GOOGLE_PROVIDER)
+        .ok_or(ApiError::InternalError {
+            message: "google provider not configured".into(),
+        })?;
+    let google_redirect = format!(
+        "{}/oauth/callback",
+        state.config.public_base_url.trim_end_matches('/')
+    );
+    let id_token = flow
+        .exchange_code(&q.code, &google_redirect, &session.google_code_verifier)
+        .await
+        .map_err(|e| ApiError::BadGateway {
+            reason: format!("{e:?}"),
+        })?;
+    let identity = provider
+        .validate(&id_token)
+        .await
+        .map_err(|e| ApiError::Unauthorized {
+            reason: format!("{e:?}"),
+        })?;
+
+    // 3. Provision/find the per-user `human` oauth_client for this identity (no tokens yet).
+    let user = provision_external_user_client(&state, provider.as_ref(), &identity).await?;
+
+    // 4. Compute requested ∩ grantable scopes (server-side only).
+    let requested: Vec<String> = session
+        .scope
+        .as_deref()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    let grantable: Vec<String> = if requested.is_empty() {
+        user.granted_scopes.clone()
+    } else {
+        requested
+            .into_iter()
+            .filter(|s| user.granted_scopes.contains(s))
+            .collect()
+    };
+
+    // 5. Atomically rotate state -> fresh consent nonce, recording user + scopes server-side.
+    let consent_nonce = crate::oauth::device::generate_state_public();
+    let _consent_session = AuthorizeSessionRepository::transition_to_consent(
+        &state.db_pool,
+        &q.state,
+        &consent_nonce,
+        user.id,
+        &grantable,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+    })?
+    .ok_or(ApiError::BadRequest {
+        message: "authorize session expired".into(),
+    })?;
+
+    // 6. Render consent keyed by the nonce. email + scopes are server-derived, not from a form.
+    Ok(Html(render_consent_page(&consent_nonce, &user.client_name, &grantable)).into_response())
+}
+
+/// Pure HTML render. `ticket` is the consent-session nonce the POST handler will consume.
+fn render_consent_page(ticket: &str, email: &str, scopes: &[String]) -> String {
+    let scope_items: String = scopes
+        .iter()
+        .map(|s| format!("<li><code>{}</code></li>", html_escape(s)))
+        .collect();
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8">
+<title>Authorize Claude</title></head><body style="font-family:sans-serif;max-width:32rem;margin:4rem auto">
+<h1>Authorize Claude</h1>
+<p>Claude wants to access EpiGraph as <strong>{email}</strong> with:</p>
+<ul>{scope_items}</ul>
+<form method="post" action="/oauth/authorize/consent">
+  <input type="hidden" name="ticket" value="{ticket}">
+  <button name="decision" value="allow">Allow</button>
+  <button name="decision" value="deny">Deny</button>
+</form></body></html>"#,
+        email = html_escape(email),
+        ticket = html_escape(ticket),
+        scope_items = scope_items
+    )
+}
+
+/// Minimal HTML escaping for every value interpolated into the consent page.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConsentForm {
+    pub ticket: String,
+    pub decision: String,
+}
+
+/// `POST /oauth/authorize/consent`. Consumes the consent ticket (single-use), and on Allow
+/// mints a single-use 60s authorization code bound to client+user+PKCE+redirect+scopes —
+/// the user and scopes come from the server-side session row, NEVER from the form — then
+/// 302s back to the client's `redirect_uri` with `code` + the client's original `state`.
+/// On Deny (or any non-Allow decision) it 302s with `error=access_denied`.
+#[cfg(feature = "db")]
+pub async fn consent_endpoint(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<ConsentForm>,
+) -> Result<Response, ApiError> {
+    use chrono::{Duration, Utc};
+    use epigraph_db::repos::authorization_code::AuthorizationCodeRepository;
+    use epigraph_db::repos::authorize_session::AuthorizeSessionRepository;
+
+    let session = AuthorizeSessionRepository::take(&state.db_pool, &form.ticket)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?
+        .ok_or(ApiError::BadRequest {
+            message: "expired consent ticket".into(),
+        })?;
+
+    let claude_state = session.claude_state.clone().unwrap_or_default();
+    if form.decision != "allow" {
+        let url = format!(
+            "{}?error=access_denied&state={}",
+            session.redirect_uri, claude_state
+        );
+        return Ok(Redirect::to(&url).into_response());
+    }
+
+    // Mint the authorization code (single-use, 60s), bound to client+user+pkce+redirect+scopes.
+    // user + scopes are read from the server-side session row recorded at the callback, never
+    // from the browser-supplied form, to prevent scope/identity tampering.
+    let resolved_user = session
+        .resolved_oauth_client_id
+        .ok_or(ApiError::InternalError {
+            message: "consent ticket missing user".into(),
+        })?;
+    let scopes = session.granted_scopes.clone().unwrap_or_default();
+    use rand::Rng;
+    let raw: [u8; 32] = rand::thread_rng().gen();
+    let code = hex::encode(raw);
+    let code_hash = blake3::hash(&raw);
+    AuthorizationCodeRepository::create(
+        &state.db_pool,
+        code_hash.as_bytes(),
+        &session.client_id,
+        resolved_user,
+        &session.redirect_uri,
+        &session.code_challenge,
+        &scopes,
+        None,
+        Utc::now() + Duration::seconds(60),
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+    })?;
+
+    let url = format!(
+        "{}?code={}&state={}",
+        session.redirect_uri, code, claude_state
+    );
+    Ok(Redirect::to(&url).into_response())
 }
 
 #[cfg(not(feature = "db"))]
