@@ -765,6 +765,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/oauth/revoke", post(crate::oauth::revoke_endpoint))
         .route("/oauth/introspect", post(crate::oauth::introspect_endpoint))
         .route(
+            "/oauth/authorize",
+            get(crate::oauth::authorize_endpoint),
+        )
+        .route(
             "/oauth/:provider/auth-url",
             post(crate::oauth::auth_url_endpoint),
         )
@@ -1149,6 +1153,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/oauth/register", post(crate::oauth::register_endpoint))
         .route("/oauth/revoke", post(crate::oauth::revoke_endpoint))
         .route("/oauth/introspect", post(crate::oauth::introspect_endpoint))
+        .route(
+            "/oauth/authorize",
+            get(crate::oauth::authorize_endpoint),
+        )
         .route(
             "/oauth/:provider/auth-url",
             post(crate::oauth::auth_url_endpoint),

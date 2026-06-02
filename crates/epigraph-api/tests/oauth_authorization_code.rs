@@ -413,3 +413,19 @@ async fn protected_resource_metadata_points_at_this_as() {
          connector-reachable /mcp scopes; got: {scopes:?}"
     );
 }
+
+// ── /oauth/authorize entry-point (DB-free) ───────────────────────────────────
+//
+// PKCE is MANDATORY on the authorization endpoint (OAuth 2.1 / RFC 9700). The
+// handler must reject a request that omits `code_challenge` BEFORE any DB
+// round-trip, so this test runs against the dummy-pool `app()` with no DB.
+#[tokio::test]
+async fn authorize_without_pkce_is_rejected() {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/oauth/authorize?response_type=code&client_id=epigraph_x&redirect_uri=https://claude.ai/api/mcp/auth_callback&state=abc")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}

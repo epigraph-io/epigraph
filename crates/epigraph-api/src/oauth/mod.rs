@@ -1,5 +1,6 @@
 //! OAuth2 authorization server module.
 
+pub mod authorize;
 pub mod device;
 pub mod introspect;
 pub mod jwt;
@@ -9,6 +10,7 @@ pub mod register;
 pub mod revoke;
 pub mod token;
 
+pub use authorize::{authorize_endpoint, AuthorizeQuery};
 pub use device::{auth_url_endpoint, exchange_endpoint};
 pub use introspect::introspect_endpoint;
 pub use jwt::{EpiGraphClaims, JwtConfig};
