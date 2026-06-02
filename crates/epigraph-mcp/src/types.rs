@@ -814,6 +814,12 @@ pub struct FindWorkflowResult {
     pub behavioral_success_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub behavioral_execution_count: Option<i64>,
+    /// Set by the workflow-promotion maintenance pass (`refresh_workflow_promotion`)
+    /// from the variant's `properties.promotion.promotable`. `Some(true)` means
+    /// the gate found this variant statistically better than its parent; absent
+    /// when never evaluated. Advisory — callers may prefer promoted variants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotable: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

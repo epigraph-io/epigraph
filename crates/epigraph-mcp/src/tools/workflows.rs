@@ -7,7 +7,7 @@ use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto;
 use crate::types::*;
 
-use epigraph_core::{AgentId, Claim, Evidence, EvidenceType, TruthValue};
+use epigraph_core::{AgentId, Claim, ClaimId, Evidence, EvidenceType, TruthValue};
 use epigraph_crypto::ContentHasher;
 use epigraph_db::{
     BehavioralExecutionRepository, ClaimRepository, EdgeRepository, EvidenceRepository,
@@ -93,54 +93,164 @@ pub async fn evaluate_workflow_promotion(
     server: &EpiGraphMcpFull,
     params: EvaluateWorkflowPromotionParams,
 ) -> Result<CallToolResult, McpError> {
+    let variant_id = parse_uuid(params.workflow_id.trim())?;
+    let window = params.window.unwrap_or(50).clamp(1, 500);
+    let assessment = assess_workflow_promotion(server, variant_id, window).await?;
+    success_json(&assessment.to_json())
+}
+
+/// One workflow variant's promotion assessment: its parent (if any), both
+/// sides' counts over the same window, and the gate verdict. Shared by the
+/// read-only `evaluate_workflow_promotion` tool and the write-side
+/// `refresh_workflow_promotion` pass so both compute the verdict identically.
+struct PromotionAssessment {
+    variant_id: uuid::Uuid,
+    parent_id: Option<uuid::Uuid>,
+    window: i64,
+    min_executions: i64,
+    variant: (i64, i64),
+    parent: (i64, i64),
+    /// `None` exactly when the workflow has no parent (a lineage root).
+    verdict: Option<epigraph_engine::workflow_promotion::WorkflowPromotionVerdict>,
+}
+
+impl PromotionAssessment {
+    fn parent_rate(&self) -> f64 {
+        let (s, t) = self.parent;
+        if t <= 0 {
+            0.0
+        } else {
+            s as f64 / t as f64
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match &self.verdict {
+            None => serde_json::json!({
+                "workflow_id": self.variant_id,
+                "parent_id": serde_json::Value::Null,
+                "promotable": false,
+                "reason": "workflow has no variant_of/supersedes parent (it is a lineage root); nothing to promote over",
+            }),
+            Some(v) => serde_json::json!({
+                "workflow_id": self.variant_id,
+                "parent_id": self.parent_id,
+                "window": self.window,
+                "min_executions": self.min_executions,
+                "variant": { "successes": self.variant.0, "total": self.variant.1 },
+                "parent": { "successes": self.parent.0, "total": self.parent.1, "success_rate": self.parent_rate() },
+                "promotable": v.promotable,
+                "variant_lower_bound": v.variant_lower_bound,
+                "parent_rate": v.parent_rate,
+                "reason": v.reason,
+            }),
+        }
+    }
+}
+
+/// Resolve the variant's immediate parent, pull both sides' (successes, total)
+/// over the SAME window (mixing windows would be apples-to-oranges), and apply
+/// the Wilson gate. A lineage root yields `verdict: None`.
+async fn assess_workflow_promotion(
+    server: &EpiGraphMcpFull,
+    variant_id: uuid::Uuid,
+    window: i64,
+) -> Result<PromotionAssessment, McpError> {
     use epigraph_engine::workflow_promotion::{
         evaluate_workflow_promotion as gate, WorkflowPromotionConfig, WorkflowSampleStats,
     };
+    let config = WorkflowPromotionConfig::default();
 
+    let parent_id = WorkflowRepository::immediate_variant_parent(&server.pool, variant_id)
+        .await
+        .map_err(|e| internal_error(e.to_string()))?;
+
+    let variant = BehavioralExecutionRepository::success_stats(&server.pool, variant_id, window)
+        .await
+        .map_err(internal_error)?;
+
+    let (parent, verdict) = match parent_id {
+        None => ((0, 0), None),
+        Some(pid) => {
+            let parent = BehavioralExecutionRepository::success_stats(&server.pool, pid, window)
+                .await
+                .map_err(internal_error)?;
+            let parent_rate = if parent.1 <= 0 {
+                0.0
+            } else {
+                parent.0 as f64 / parent.1 as f64
+            };
+            let v = gate(
+                &WorkflowSampleStats {
+                    successes: variant.0,
+                    total: variant.1,
+                },
+                parent_rate,
+                &config,
+            );
+            (parent, Some(v))
+        }
+    };
+
+    Ok(PromotionAssessment {
+        variant_id,
+        parent_id,
+        window,
+        min_executions: config.min_executions,
+        variant,
+        parent,
+        verdict,
+    })
+}
+
+/// Apply layer (additive promotable flag). Re-evaluate a workflow variant's
+/// promotion verdict and write it to the variant claim's
+/// `properties.promotion`, OVERWRITING any prior value. This is bidirectional
+/// by construction: a variant that has regressed below threshold gets
+/// `promotable: false` on the next run rather than keeping a stale `true`. A
+/// lineage root (no parent) is left untouched. The maintenance pass / scheduled
+/// job calls this per candidate variant; `find_workflow` surfaces the flag.
+pub async fn refresh_workflow_promotion(
+    server: &EpiGraphMcpFull,
+    params: EvaluateWorkflowPromotionParams,
+) -> Result<CallToolResult, McpError> {
     let variant_id = parse_uuid(params.workflow_id.trim())?;
     let window = params.window.unwrap_or(50).clamp(1, 500);
+    let assessment = assess_workflow_promotion(server, variant_id, window).await?;
 
-    let Some(parent_id) = WorkflowRepository::immediate_variant_parent(&server.pool, variant_id)
-        .await
-        .map_err(|e| internal_error(e.to_string()))?
-    else {
+    let Some(verdict) = &assessment.verdict else {
         return success_json(&serde_json::json!({
             "workflow_id": variant_id,
-            "parent_id": serde_json::Value::Null,
-            "promotable": false,
-            "reason": "workflow has no variant_of/supersedes parent (it is a lineage root); nothing to promote over",
+            "refreshed": false,
+            "reason": "lineage root (no variant_of parent); nothing to promote over",
         }));
     };
 
-    // Same window on both sides — comparing across different windows would be
-    // apples to oranges.
-    let (v_succ, v_total) =
-        BehavioralExecutionRepository::success_stats(&server.pool, variant_id, window)
-            .await
-            .map_err(internal_error)?;
-    let (p_succ, p_total) =
-        BehavioralExecutionRepository::success_stats(&server.pool, parent_id, window)
-            .await
-            .map_err(internal_error)?;
-
-    let variant = WorkflowSampleStats {
-        successes: v_succ,
-        total: v_total,
-    };
-    let parent = WorkflowSampleStats {
-        successes: p_succ,
-        total: p_total,
-    };
-    let config = WorkflowPromotionConfig::default();
-    let verdict = gate(&variant, parent.success_rate(), &config);
+    // Overwrite properties.promotion with the CURRENT verdict (provenance for
+    // audit + demotion). Overwriting — not a write-once set — is what keeps the
+    // flag honest as more executions accrue.
+    let promotion = serde_json::json!({
+        "promotion": {
+            "promotable": verdict.promotable,
+            "lower_bound": verdict.variant_lower_bound,
+            "parent_rate": verdict.parent_rate,
+            "parent_id": assessment.parent_id,
+            "n": assessment.variant.1,
+            "evaluated_at": chrono::Utc::now().to_rfc3339(),
+        }
+    });
+    ClaimRepository::merge_properties(
+        &server.pool,
+        epigraph_core::ClaimId::from_uuid(variant_id),
+        &promotion,
+    )
+    .await
+    .map_err(internal_error)?;
 
     success_json(&serde_json::json!({
         "workflow_id": variant_id,
-        "parent_id": parent_id,
-        "window": window,
-        "min_executions": config.min_executions,
-        "variant": { "successes": v_succ, "total": v_total },
-        "parent": { "successes": p_succ, "total": p_total, "success_rate": parent.success_rate() },
+        "parent_id": assessment.parent_id,
+        "refreshed": true,
         "promotable": verdict.promotable,
         "variant_lower_bound": verdict.variant_lower_bound,
         "parent_rate": verdict.parent_rate,
@@ -470,6 +580,12 @@ async fn enrich_workflow_result(
         None
     };
 
+    // Promotion flag set by the refresh_workflow_promotion maintenance pass.
+    // Advisory metadata; best-effort (a lookup failure must not drop the result).
+    let promotable = ClaimRepository::promotion_flag(pool, ClaimId::from_uuid(workflow_id))
+        .await
+        .unwrap_or(None);
+
     Some(FindWorkflowResult {
         workflow_id: workflow_id.to_string(),
         goal,
@@ -483,6 +599,7 @@ async fn enrich_workflow_result(
         behavioral_affinity,
         behavioral_success_rate,
         behavioral_execution_count,
+        promotable,
     })
 }
 

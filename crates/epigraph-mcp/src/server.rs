@@ -443,7 +443,7 @@ impl EpiGraphMcpFull {
         tools::cdst_maintenance::recompute_beliefs(self, params).await
     }
 
-    // ── Workflows (7 tools) ──
+    // ── Workflows (8 tools) ──
 
     #[tool(
         description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table; use `report_workflow_outcome` with that returned id to record execution results."
@@ -482,6 +482,17 @@ impl EpiGraphMcpFull {
         Parameters(params): Parameters<EvaluateWorkflowPromotionParams>,
     ) -> Result<CallToolResult, McpError> {
         tools::workflows::evaluate_workflow_promotion(self, params).await
+    }
+
+    #[tool(
+        description = "Re-evaluate a workflow variant's promotion verdict and write it to the variant's properties.promotion, overwriting any prior value (so a regressed variant is demoted, not left stale). The apply layer of the workflow-evolution gate; the maintenance pass calls this per candidate variant. Write."
+    )]
+    async fn refresh_workflow_promotion(
+        &self,
+        Parameters(params): Parameters<EvaluateWorkflowPromotionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::workflows::refresh_workflow_promotion(self, params).await
     }
 
     #[tool(
@@ -970,7 +981,7 @@ impl EpiGraphMcpFull {
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.read_only { "read-only" } else { "full" };
-        let tool_count = if self.read_only { 35 } else { 63 };
+        let tool_count = if self.read_only { 35 } else { 64 };
         ServerInfo {
             instructions: Some(format!(
                 "EpiGraph {mode} MCP server with {tool_count} epistemic tools."
