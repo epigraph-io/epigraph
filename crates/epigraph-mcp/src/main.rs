@@ -177,12 +177,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create embedder
     let embedder = McpEmbedder::new(pool.clone(), cli.openai_api_key);
 
-    let mode = if cli.read_only {
-        "read-only (33 tools)"
-    } else {
-        "full (58 tools)"
-    };
-    tracing::info!("EpiGraph MCP server running in {mode} mode");
+    let tool_count = EpiGraphMcpFull::all_tools_json()
+        .as_array()
+        .map_or(0, Vec::len);
+    let mode = if cli.read_only { "read-only" } else { "full" };
+    tracing::info!("EpiGraph MCP server running in {mode} ({tool_count} tools) mode");
 
     if let Some(addr) = &cli.listen {
         // ── HTTP transport (TCP or Unix socket) ────────────────────────
