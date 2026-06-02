@@ -95,55 +95,28 @@ pub async fn ensure_binary_frame(pool: &PgPool) -> Result<Uuid, String> {
     }
 }
 
-/// Small fixed opposing mass assigned to the NON-primary singleton so that a
-/// supporting BBA is no longer a pure simple-support function. With this mass
-/// present, Θ no longer absorbs ALL non-primary mass, so Pl(primary) < 1.0 and
-/// plausibility can contract as refuting evidence accumulates. Value is the
-/// `default` methodology profile's `base_against` from calibration.toml
-/// (`default = [0.50, 0.08, 0.42]`), the documented no-methodology constant.
-/// We do NOT adopt V2's `base_support*type_weight*confidence` primary-mass
-/// formula (see build_default_bba_directed): build_binary_bba receives no
-/// methodology, and changing the primary scale would move every auto-wired
-/// claim's BetP. Model (against-mass on the opposing singleton) is ported from
-/// V2 epigraph-nano/src/cdst.rs::build_default_bba_directed; the magnitude is
-/// the calibrated `default` base_against. (backlog b3d12e2a, Fix 2)
-const BINARY_BBA_BASE_AGAINST: f64 = 0.08;
-
-/// Build a directed BBA for a binary frame.
+/// Build a simple-support BBA for a binary frame: `m({primary}) =
+/// (confidence*weight).clamp(0.01, 0.99)`, with the remainder on Θ.
 ///
-/// - `supports = true`  → m({TRUE}) = confidence*weight (clamped),
-///   m({FALSE}) = base_against, m(Θ) = remainder
-/// - `supports = false` → m({FALSE}) = confidence*weight (clamped),
-///   m({TRUE}) = base_against, m(Θ) = remainder
-///
-/// The small {opposing} mass makes Pl(primary) < 1.0 (was identically 1.0 with
-/// the previous simple-support shape). base_against is held below the theta
-/// remainder so the mass sums to exactly 1.0.
+/// NOTE (backlog b3d12e2a): an earlier Fix(2) added a fixed `base_against`
+/// opposing-singleton mass to make `Pl(primary) < 1.0`. That was reverted —
+/// it flipped weakly-supported claims (where `confidence*weight < base_against`)
+/// to `contradicted` (regression in `classify_test::high_ignorance_*`), and
+/// nothing consumes the plausibility headroom today. The reported BetP-drop bug
+/// is fixed by the writer discount-authority unification (Fix(1)), not by this
+/// shape change. Reintroduce a directed shape only with a bound that keeps the
+/// opposing mass strictly below the primary mass, and only when a real consumer
+/// of `Pl(primary) < 1.0` exists.
 fn build_binary_bba(
     frame: &FrameOfDiscernment,
     confidence: f64,
     weight: f64,
     supports: bool,
 ) -> Result<MassFunction, String> {
-    let m_primary = (confidence * weight).clamp(0.01, 0.99);
-    // Reserve headroom: never let against-mass eat into primary; theta absorbs
-    // the rest. (1.0 - m_primary) is in [0.01, 0.99], so base_against fits.
-    let m_against = BINARY_BBA_BASE_AGAINST.min((1.0 - m_primary - 1e-6).max(0.0));
-    let m_theta = (1.0 - m_primary - m_against).max(0.0);
-
-    let primary_idx = usize::from(!supports); // 0=TRUE supports, 1=FALSE refutes
-    let opposing_idx = usize::from(supports); // the other singleton
-
-    let mut masses: std::collections::BTreeMap<FocalElement, f64> =
-        std::collections::BTreeMap::new();
-    masses.insert(FocalElement::positive(BTreeSet::from([primary_idx])), m_primary);
-    if m_against > 1e-10 {
-        masses.insert(FocalElement::positive(BTreeSet::from([opposing_idx])), m_against);
-    }
-    if m_theta > 1e-10 {
-        masses.insert(FocalElement::theta(frame), m_theta);
-    }
-    MassFunction::new(frame.clone(), masses).map_err(|e| format!("build BBA: {e}"))
+    let mass = (confidence * weight).clamp(0.01, 0.99);
+    let idx = usize::from(!supports); // 0=TRUE, 1=FALSE
+    MassFunction::simple(frame.clone(), BTreeSet::from([idx]), mass)
+        .map_err(|e| format!("build BBA: {e}"))
 }
 
 /// Serialize a `MassFunction` to JSON for DB storage.
@@ -548,63 +521,4 @@ async fn wire_single_batch_entry(
         .map_err(|e| format!("recompute initial cache: {e}"))?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod build_binary_bba_shape_tests {
-    use super::*;
-    use epigraph_ds::measures;
-
-    fn frame() -> FrameOfDiscernment {
-        binary_frame().expect("binary frame")
-    }
-
-    #[test]
-    fn supporting_bba_has_plausibility_true_below_one() {
-        // Backlog b3d12e2a Fix(2): a supporting BBA must NOT be a pure
-        // simple-support function (which pins Pl(TRUE)=1.0). With base_against
-        // mass on {FALSE}, Pl(TRUE) = m({TRUE}) + m(theta) < 1.0.
-        let f = frame();
-        let bba = build_binary_bba(&f, /*confidence*/ 0.85, /*weight*/ 0.9, /*supports*/ true)
-            .expect("build supporting BBA");
-        let true_el = FocalElement::positive(std::collections::BTreeSet::from([0_usize]));
-        let pl_true = measures::plausibility(&bba, &true_el);
-        let bel_true = measures::belief(&bba, &true_el);
-        assert!(
-            pl_true < 1.0 - 1e-9,
-            "Pl(TRUE) must be < 1.0 after Fix(2); got {pl_true} (simple-support regression)"
-        );
-        // Bel(TRUE) = mass on subsets of {TRUE} = m({TRUE}) only; the directed
-        // shape must NOT change the primary support mass (SciFact calibration
-        // guard). m_primary = (0.85*0.9).clamp(0.01,0.99) = 0.765.
-        assert!(
-            (bel_true - 0.765).abs() < 1e-6,
-            "Bel(TRUE) must remain the primary support mass 0.765; got {bel_true}"
-        );
-        // The opposing singleton {FALSE} must now carry the base_against mass.
-        let false_el = FocalElement::positive(std::collections::BTreeSet::from([1_usize]));
-        let m_false = bba.mass_of(&false_el);
-        assert!(
-            (m_false - 0.08).abs() < 1e-9,
-            "m({{FALSE}}) must equal base_against 0.08; got {m_false}"
-        );
-    }
-
-    #[test]
-    fn high_confidence_support_does_not_underflow_against_or_theta() {
-        // Edge: confidence*weight clamps to 0.99, leaving only 0.01 for
-        // against+theta. base_against must shrink to fit so MassFunction::new
-        // (which validates sum==1.0) does not reject the BBA.
-        let f = frame();
-        let bba = build_binary_bba(&f, 1.0, 1.0, true).expect("clamped high-confidence BBA");
-        let total: f64 = [
-            FocalElement::positive(std::collections::BTreeSet::from([0_usize])),
-            FocalElement::positive(std::collections::BTreeSet::from([1_usize])),
-            FocalElement::theta(&f),
-        ]
-        .iter()
-        .map(|e| bba.mass_of(e))
-        .sum();
-        assert!((total - 1.0).abs() < 1e-9, "masses must sum to 1.0; got {total}");
-    }
 }
