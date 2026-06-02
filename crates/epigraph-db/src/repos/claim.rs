@@ -233,6 +233,59 @@ impl ClaimRepository {
         Ok(())
     }
 
+    /// Read a claim's workflow-promotion flag
+    /// (`properties->'promotion'->>'promotable'`). `None` when the claim was
+    /// never evaluated (or does not exist); `Some(bool)` otherwise. Used by
+    /// `find_workflow` to surface whether a variant has been promoted.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn promotion_flag(pool: &PgPool, claim_id: ClaimId) -> Result<Option<bool>, DbError> {
+        let id: Uuid = claim_id.into();
+        let flag: Option<Option<bool>> = sqlx::query_scalar(
+            "SELECT (properties->'promotion'->>'promotable')::bool FROM claims WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(flag.flatten())
+    }
+
+    /// Shallow-merge `patch` into the claim's `properties` JSONB (`||`),
+    /// preserving keys not present in `patch` and overwriting those that are.
+    /// Unlike [`set_properties`] (which replaces the whole object), this is for
+    /// incrementally attaching/refreshing a sub-object — e.g. the workflow
+    /// promotion verdict — without clobbering hierarchy metadata like `level`.
+    ///
+    /// # Errors
+    /// Returns `DbError::NotFound` if no claim has `claim_id`;
+    /// `DbError::QueryFailed` on other database errors.
+    #[instrument(skip(pool, patch))]
+    pub async fn merge_properties(
+        pool: &PgPool,
+        claim_id: ClaimId,
+        patch: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        let id: Uuid = claim_id.into();
+        let result = sqlx::query(
+            "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || $2, \
+             updated_at = NOW() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(patch)
+        .execute(pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound {
+                entity: "Claim".to_string(),
+                id,
+            });
+        }
+        Ok(())
+    }
+
     /// Create a new claim within an existing transaction (LEGACY — implicit content-hash dedup)
     ///
     /// Same as `create()` but accepts a `&mut PgConnection` for transactional use.
@@ -2404,6 +2457,76 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row.0, props);
+    }
+
+    /// `merge_properties` shallow-merges a patch into `properties`, preserving
+    /// untouched keys and OVERWRITING the patched key on a repeat call. This is
+    /// what makes the workflow-promotion flag bidirectional: re-running the
+    /// pass with promotable=false replaces a prior promotable=true rather than
+    /// leaving a stale mark, while sibling keys (e.g. `level`) survive.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn merge_properties_preserves_siblings_and_overwrites_target(pool: sqlx::PgPool) {
+        let (agent_id, agent_pk): (Uuid, Vec<u8>) = sqlx::query_as(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'merge-props-test', 'system', ARRAY['test'])
+             RETURNING id, public_key",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut public_key = [0u8; 32];
+        public_key.copy_from_slice(&agent_pk);
+        let claim = Claim::new(
+            "Test claim for merge".to_string(),
+            AgentId::from_uuid(agent_id),
+            public_key,
+            TruthValue::clamped(0.5),
+        );
+        let persisted = ClaimRepository::create(&pool, &claim).await.unwrap();
+        ClaimRepository::set_properties(&pool, persisted.id, serde_json::json!({"level": 2}))
+            .await
+            .unwrap();
+
+        // Merge a promotion verdict — `level` must survive.
+        ClaimRepository::merge_properties(
+            &pool,
+            persisted.id,
+            &serde_json::json!({"promotion": {"promotable": true, "lower_bound": 0.72}}),
+        )
+        .await
+        .unwrap();
+        let row: (serde_json::Value,) =
+            sqlx::query_as("SELECT properties FROM claims WHERE id = $1")
+                .bind(Uuid::from(persisted.id))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0["level"], 2, "sibling key preserved");
+        assert_eq!(row.0["promotion"]["promotable"], true);
+
+        // Re-merge with promotable=false (a demotion) — overwrites the promotion
+        // sub-object, `level` still preserved.
+        ClaimRepository::merge_properties(
+            &pool,
+            persisted.id,
+            &serde_json::json!({"promotion": {"promotable": false}}),
+        )
+        .await
+        .unwrap();
+        let row2: (serde_json::Value,) =
+            sqlx::query_as("SELECT properties FROM claims WHERE id = $1")
+                .bind(Uuid::from(persisted.id))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row2.0["level"], 2,
+            "sibling key still preserved after re-merge"
+        );
+        assert_eq!(
+            row2.0["promotion"]["promotable"], false,
+            "promotion sub-object overwritten — bidirectional, no stale mark"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

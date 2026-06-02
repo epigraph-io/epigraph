@@ -1,4 +1,4 @@
-//! Pair scorer: computes 7 match features and a weighted combined score.
+//! Pair scorer: computes 9 match features and a weighted combined score.
 //!
 //! See `docs/superpowers/specs/2026-05-21-cross-source-matching-design.md`
 //! Tasks 11 + 12.
@@ -12,6 +12,7 @@ use uuid::Uuid;
 pub struct MatchFeatures {
     /// Cosine similarity of claim embeddings: `1 - (a.embedding <=> b.embedding)`.
     /// Returns `0.0` if either embedding is NULL.
+    /// The `0.0`-on-NULL default is deliberate (not the neutral-`0.5` fallback `belief_alignment`/`theme_proximity` use): a missing embedding on an `is_current` non-telemetry claim violates the embedding invariant, so similarity is suppressed rather than guessed — and since the default weights sum to `1.0`, the max score with `embed_cosine = 0` is `0.65`, below the default `0.85` high band, so such a pair never auto-promotes.
     pub embed_cosine: f32,
     /// Jaccard over `(subject_id, predicate)` triples.
     pub triple_overlap: f32,
@@ -45,11 +46,11 @@ pub struct MatchFeatures {
     pub theme_proximity: f32,
     /// `|days(a.created_at - b.created_at)|`; reported but not in score.
     pub temporal_dist_days: i32,
-    /// Normalized weighted sum of the eight similarity features.
+    /// Normalized weighted sum of the nine similarity features.
     pub score: f32,
 }
 
-/// Weights for the eight features that contribute to `score`.
+/// Weights for the nine features that contribute to `score`.
 ///
 /// `temporal_dist_days` is reported but deferred to calibration.
 #[derive(Debug, Clone, Deserialize)]
@@ -94,11 +95,14 @@ impl Default for Weights {
     }
 }
 
-/// Compute all 7 features for the claim pair `(a, b)` and combine them.
+/// Compute all 9 features for the claim pair `(a, b)` and combine them.
 ///
-/// Uses three focused queries to keep each one readable and debuggable:
+/// Uses five focused queries to keep each one readable and debuggable:
 /// 1. Embedding cosine + scalar fields (method_match, temporal_dist_days).
 /// 2. Jaccard features (triple_overlap, entity_jaccard, nbhd_overlap, citation_overlap).
+/// 3. Adamic-Adar graph_overlap over claim↔claim edges.
+/// 4. belief_alignment from stored CDST mass functions.
+/// 5. theme_proximity from claims.theme_id + claim_themes.centroid.
 pub async fn score_pair(
     pool: &PgPool,
     a: Uuid,
