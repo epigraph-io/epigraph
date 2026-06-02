@@ -1,0 +1,25 @@
+{
+  "scifact_id": 157,
+  "claim": "BLM gene encodes RecQ-class DNA helicase.",
+  "evidence_sentences": [
+    "cDNA analysis of the candidate gene identified a 4437 bp cDNA that encodes a 1417 amino acid peptide with homology to the RecQ helicases, a subfamily of DExH box-containing DNA and RNA helicases."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13439128",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [
+      "cDNA analysis"
+    ],
+    "reagents_involved": [
+      "cDNA"
+    ],
+    "conditions": [
+      "4437 bp cDNA",
+      "1417 amino acid peptide"
+    ],
+    "evidence_type": "empirical"
+  }
+}

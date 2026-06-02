@@ -1,0 +1,23 @@
+{
+  "scifact_id": 1390,
+  "claim": "mcm 5 s 2 U is required for proper decoding of NNR codons in eukaryotes.",
+  "evidence_sentences": [
+    "The wobble modification in tRNAs, 5-methoxycarbonylmethyl-2-thiouridine (mcm(5)s(2)U), is required for the proper decoding of NNR codons in eukaryotes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2890952",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.98,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "5-methoxycarbonylmethyl-2-thiouridine (mcm(5)s(2)U)"
+    ],
+    "conditions": [
+      "eukaryotic translation",
+      "wobble position modification in tRNAs"
+    ],
+    "evidence_type": "empirical"
+  }
+}

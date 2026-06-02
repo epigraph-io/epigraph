@@ -1,0 +1,20 @@
+{
+  "scifact_id": 430,
+  "claim": "FoxO3a activation in neuronal death is inhibited by reactive oxygen species (ROS).",
+  "evidence_sentences": [
+    "Thus, one way in which members of the Sir2 family of proteins may increase organismal longevity is by tipping FOXO-dependent responses away from apoptosis and toward stress resistance."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "28937856",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.45,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "logical",
+    "tier2_enriched": true,
+    "tier3_enriched": true
+  }
+}

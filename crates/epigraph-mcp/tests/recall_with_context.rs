@@ -547,6 +547,9 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
         max_themes: None,
         diversity_weight: None,
         candidate_pool: None,
+        rerank: None,
+        rerank_pool_factor: None,
+        groundedness_gate: None,
     };
 
     let result = recall_with_context(&server, params).await;
@@ -934,6 +937,9 @@ fn diverse_params_with_pool(
         max_themes,
         diversity_weight: alpha,
         candidate_pool,
+        rerank: None,
+        rerank_pool_factor: None,
+        groundedness_gate: None,
     }
 }
 

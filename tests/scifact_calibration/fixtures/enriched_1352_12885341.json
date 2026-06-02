@@ -1,0 +1,27 @@
+{
+  "scifact_id": 1352,
+  "claim": "Upregulation of mosGCTL-1 is induced upon infection with West Nile virus.",
+  "evidence_sentences": [
+    "In vivo experiments show that mosGCTL-1 and mosPTP-1 function as part of the same pathway and are critical for WNV infection of mosquitoes.",
+    "During the mosquito blood-feeding process, WNV infection was blocked in vivo with mosGCTL-1 antibodies."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "12885341",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.45,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "mosGCTL-1 antibodies",
+      "mosGCTL-1",
+      "mosPTP-1"
+    ],
+    "conditions": [
+      "in vivo",
+      "mosquito blood-feeding process",
+      "WNV infection"
+    ],
+    "evidence_type": "empirical"
+  }
+}

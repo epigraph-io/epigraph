@@ -1,0 +1,24 @@
+{
+  "scifact_id": 57,
+  "claim": "APOE4 expression in iPSC-derived neurons increases AlphaBeta production and tau phosphorylation, delaying GABA neuron degeneration.",
+  "evidence_sentences": [
+    "Using human neurons derived from induced pluripotent stem cells that expressed apolipoprotein E4 (ApoE4), a variant of the APOE gene product and the major genetic risk factor for AD, we demonstrated that ApoE4-expressing neurons had higher levels of tau phosphorylation, unrelated to their increased production of amyloid-\u03b2 (A\u03b2) peptides, and that they displayed GABAergic neuron degeneration."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "4709641",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "induced pluripotent stem cells",
+      "apolipoprotein E4",
+      "amyloid-\u03b2 peptides"
+    ],
+    "conditions": [
+      "ApoE4 expression in human iPSC-derived neurons"
+    ],
+    "evidence_type": "empirical"
+  }
+}

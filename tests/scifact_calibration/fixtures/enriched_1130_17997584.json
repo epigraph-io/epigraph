@@ -1,0 +1,23 @@
+{
+  "scifact_id": 1130,
+  "claim": "T regulatory cells (tTregs) lacking \u03b1v\u03b28 are more adept at suppressing pathogenic T-cell responses during active inflammation.",
+  "evidence_sentences": [
+    "However, Treg cells lacking expression of integrin \u03b1v\u03b28 were unable to suppress pathogenic T cell responses during active inflammation."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "17997584",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "integrin \u03b1v\u03b28"
+    ],
+    "conditions": [
+      "active inflammation",
+      "Treg cells lacking integrin \u03b1v\u03b28 expression"
+    ],
+    "evidence_type": "empirical"
+  }
+}

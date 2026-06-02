@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<document xmlns="http://cnx.rice.edu/cnxml" xmlns:md="http://cnx.rice.edu/mdml" xmlns:m="http://www.w3.org/1998/Math/MathML" class="">
+  <title>Electric Charge and Coulomb's Law</title>
+  <metadata>
+    <md:content-id>m00042</md:content-id>
+    <md:uuid>11111111-2222-3333-4444-555555555555</md:uuid>
+  </metadata>
+  <content>
+    <section>
+      <title>Coulomb's Law</title>
+      <para id="p1">The electrostatic force between two point charges is proportional to the product of the charges and inversely proportional to the square of the distance between them, as expressed by <math><mi>F</mi><mo>=</mo><mi>k</mi></math> in standard form.</para>
+      <para id="p2">In this section, we will explore charge.</para>
+    </section>
+  </content>
+  <glossary>
+    <definition>
+      <term>Coulomb</term>
+      <meaning>the SI unit of electric charge, equal to the charge transported by a constant current of one ampere in one second</meaning>
+    </definition>
+  </glossary>
+</document>

@@ -1,0 +1,21 @@
+{
+  "scifact_id": 149,
+  "claim": "Autophagy deficiency in the liver increases vulnerability to insulin resistance.",
+  "evidence_sentences": [
+    "Unexpectedly, these mice showed decreased fat mass and were protected from diet-induced obesity and insulin resistance; this phenotype was accompanied by increased fatty acid oxidation and browning of white adipose tissue (WAT) owing to induction of fibroblast growth factor 21 (Fgf21).",
+    "We also observed induction of Fgf21, resistance to diet-induced obesity and amelioration of insulin resistance in mice with autophagy deficiency in the liver, another insulin target tissue.",
+    "These findings suggest that autophagy deficiency and subsequent mitochondrial dysfunction promote Fgf21 expression, a hormone we consequently term a 'mitokine', and together these processes promote protection from diet-induced obesity and insulin resistance."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "6227220",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

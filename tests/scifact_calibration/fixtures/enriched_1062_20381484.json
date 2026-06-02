@@ -1,0 +1,25 @@
+{
+  "scifact_id": 1062,
+  "claim": "S-nitrosylated GAPDH physiologically transnitrosylates histone deacetylases.",
+  "evidence_sentences": [
+    "Here, we show that SNO-GAPDH physiologically transnitrosylates nuclear proteins, including the deacetylating enzyme sirtuin-1 (SIRT1), histone deacetylase-2 (HDAC2) and DNA-activated protein kinase (DNA-PK)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "20381484",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "SNO-GAPDH",
+      "SIRT1",
+      "HDAC2",
+      "DNA-PK"
+    ],
+    "conditions": [
+      "physiological"
+    ],
+    "evidence_type": "empirical"
+  }
+}

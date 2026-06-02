@@ -1,0 +1,69 @@
+{
+  "source": {
+    "title": "Structured Source-First Ingestion for Epistemic Graphs",
+    "source_type": "Paper",
+    "authors": [
+      {
+        "name": "Ada Lovelace",
+        "affiliations": [],
+        "roles": [
+          "author"
+        ]
+      },
+      {
+        "name": "Charles Babbage",
+        "affiliations": [],
+        "roles": [
+          "author"
+        ]
+      },
+      {
+        "name": "Grace Hopper",
+        "affiliations": [],
+        "roles": [
+          "author"
+        ]
+      }
+    ],
+    "doi": "10.48550/arXiv.2603.04139",
+    "uri": "https://arxiv.org/html/2603.04139v1",
+    "metadata": {
+      "extractor": "extract_html.py",
+      "extraction_stage": "structure_recovery_only",
+      "arxiv_id": "2603.04139"
+    }
+  },
+  "thesis": "We present a structure-recovery preprocessor that maps arXiv HTML into a hierarchical extraction schema. It recovers sections and paragraphs without invoking a language model.",
+  "thesis_derivation": "TopDown",
+  "sections": [
+    {
+      "title": "Introduction",
+      "summary": "Section: Introduction",
+      "paragraphs": [
+        {
+          "compound": "Scientific HTML such as ar5iv pages carries explicit section structure.",
+          "supporting_text": "Scientific HTML such as ar5iv pages carries explicit section structure. Exploiting that structure avoids lossy OCR. The preprocessor walks headings and accumulates section text. appears inline but is skipped by the parser.",
+          "atoms": [],
+          "generality": [],
+          "confidence": 0.8,
+          "methodology": "structured_html_parse"
+        }
+      ]
+    },
+    {
+      "title": "Method",
+      "summary": "Section: Method",
+      "paragraphs": [
+        {
+          "compound": "The parser tracks a heading stack and flushes a section when a new heading of level two or greater begins.",
+          "supporting_text": "The parser tracks a heading stack and flushes a section when a new heading of level two or greater begins. Each recovered section becomes one node in the downstream hierarchy. Tiny sections under fifty characters are discarded to suppress navigation noise.",
+          "atoms": [],
+          "generality": [],
+          "confidence": 0.8,
+          "methodology": "structured_html_parse"
+        }
+      ]
+    }
+  ],
+  "relationships": []
+}

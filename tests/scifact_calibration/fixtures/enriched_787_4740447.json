@@ -1,0 +1,22 @@
+{
+  "scifact_id": 787,
+  "claim": "Microcin J25 encourages nucleoside triphosphate (NTP) binding.",
+  "evidence_sentences": [
+    "Biochemical results indicate that inhibition of transcription occurs at the level of NTP uptake or NTP binding by RNAP."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "4740447",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Microcin J25",
+      "nucleoside triphosphate",
+      "RNAP"
+    ],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

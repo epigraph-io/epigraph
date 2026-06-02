@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1009,
+  "claim": "RUNX1 is downregulated or mutated in TLX1 T-ALL.",
+  "evidence_sentences": [
+    "Notably, a network structure analysis of this hierarchical network identified RUNX1 as a key mediator of the T-ALL induced by TLX1 and TLX3 and predicted a tumor-suppressor role for RUNX1 in T cell transformation.",
+    "Overall, these results place TLX1 and TLX3 at the top of an oncogenic transcriptional network controlling leukemia development, show the power of network analyses to identify key elements in the regulatory circuits governing human cancer and identify RUNX1 as a tumor-suppressor gene in T-ALL."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1982286",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

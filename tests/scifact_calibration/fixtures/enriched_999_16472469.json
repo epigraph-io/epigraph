@@ -1,0 +1,27 @@
+{
+  "scifact_id": 999,
+  "claim": "Pyridostatin reduces proliferation of homologous recombination - defective cells.",
+  "evidence_sentences": [
+    "Remarkably, PDS reduces proliferation of HR-defective cells by inducing DSB accumulation, checkpoint activation, and deregulated G2/M progression and by enhancing the replication defect intrinsic to HR deficiency."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16472469",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Pyridostatin",
+      "PDS"
+    ],
+    "conditions": [
+      "HR-defective cells",
+      "DSB accumulation",
+      "checkpoint activation",
+      "deregulated G2/M progression",
+      "replication defect intrinsic to HR deficiency"
+    ],
+    "evidence_type": "empirical"
+  }
+}

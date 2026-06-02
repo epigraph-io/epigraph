@@ -1,0 +1,25 @@
+{
+  "scifact_id": 1121,
+  "claim": "Synaptic activity enhances local release of brain derived neurotrophic factor from postsynaptic dendrites.",
+  "evidence_sentences": [
+    "Together, these findings reveal a spine-autonomous, autocrine signalling mechanism involving NMDAR\u2013CaMKII-dependent BDNF release from stimulated dendritic spines and subsequent TrkB activation on these same spines that is crucial for structural and functional plasticity."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4456756",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "BDNF",
+      "TrkB"
+    ],
+    "conditions": [
+      "NMDAR\u2013CaMKII-dependent BDNF release",
+      "stimulated dendritic spines",
+      "structural and functional plasticity"
+    ],
+    "evidence_type": "empirical"
+  }
+}

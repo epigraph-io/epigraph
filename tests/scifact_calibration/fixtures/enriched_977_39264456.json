@@ -1,0 +1,20 @@
+{
+  "scifact_id": 977,
+  "claim": "Pro-inflammatory cytokines are up regulated during tumor development.",
+  "evidence_sentences": [
+    "However, it was significantly higher in NSCLC patients compared with controls (44.1 +/- 64.3 and 15.1 +/-",
+    "14.3 pg/mL, P = 0.03)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "39264456",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.72,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

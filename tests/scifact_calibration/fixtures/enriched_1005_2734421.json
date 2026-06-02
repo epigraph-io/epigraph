@@ -1,0 +1,22 @@
+{
+  "scifact_id": 1005,
+  "claim": "RANK-RANKL pathway signalling is linked to development of Aire-expressing medullary thymic epithelial cells.",
+  "evidence_sentences": [
+    "Here, we demonstrate crucial regulation of mTEC development by receptor activator of NF-kappaB (RANK) and CD40 signals.",
+    "Whereas only RANK signaling was essential for mTEC development during embryogenesis, in postnatal mice, cooperation between CD40 and RANK signals was required for mTEC development to successfully establish the medullary microenvironment.",
+    "Ligation of RANK or CD40 on fetal thymic stroma in vitro induced mTEC development in a tumor necrosis factor-associated factor 6 (TRAF6)-, NF-kappaB inducing kinase (NIK)-, and IkappaB kinase beta (IKKbeta)-dependent manner.",
+    "These results show that developmental-stage-dependent cooperation between RANK and CD40 promotes mTEC development, thereby establishing self-tolerance."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2734421",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

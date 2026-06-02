@@ -1,0 +1,22 @@
+{
+  "scifact_id": 847,
+  "claim": "New drugs for tuberculosis often do not penetrate the necrotic portion of a tuberculosis lesion in high concentrations.",
+  "evidence_sentences": [
+    "Rifampicin even accumulates in necrotic caseum, a critical lesion site where persisting tubercle bacilli reside."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "16787954",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.4,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Rifampicin"
+    ],
+    "conditions": [
+      "necrotic caseum"
+    ],
+    "evidence_type": "empirical"
+  }
+}

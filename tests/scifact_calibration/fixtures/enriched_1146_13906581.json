@@ -1,0 +1,24 @@
+{
+  "scifact_id": 1146,
+  "claim": "Teaching hospitals do not provide better care than non-teaching hospitals.",
+  "evidence_sentences": [
+    "Synthesis of the available adjusted estimates on mortality yielded a summary relative risk of 0.96 (95% confidence interval [CI], 0.93\u20131.00) for teaching versus nonteaching healthcare structures and 1.04 (95% CI, 0.99\u20131.10) for minor teaching versus nonteaching ones.",
+    "Other outcomes were diverse, but typically teaching healthcare structures did not do better than nonteaching ones.      ",
+    "Conclusions  The available data are limited by their nonrandomized design, but overall they do not suggest that a healthcare facility's teaching status on its own markedly improves or worsens patient outcomes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13906581",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "adjusted estimates on mortality",
+      "teaching versus nonteaching healthcare structures",
+      "minor teaching versus nonteaching"
+    ],
+    "evidence_type": "statistical"
+  }
+}

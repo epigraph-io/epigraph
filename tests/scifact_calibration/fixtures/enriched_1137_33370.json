@@ -1,0 +1,25 @@
+{
+  "scifact_id": 1137,
+  "claim": "TNFAIP3 is a tumor suppressor in glioblastoma.",
+  "evidence_sentences": [
+    "The tumorigenic potential of GSCs was decreased with A20 targeting, resulting in increased survival of mice bearing human glioma xenografts.",
+    "Although inactivating mutations in A20 in lymphoma suggest A20 can act as a tumor suppressor, similar point mutations have not been identified through glioma genomic sequencing: in fact, our data suggest A20 may function as a tumor enhancer in glioma through promotion of GSC survival."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "33370",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "A20",
+      "human glioma xenografts"
+    ],
+    "conditions": [
+      "GSC targeting",
+      "in vivo mouse xenograft model"
+    ],
+    "evidence_type": "empirical"
+  }
+}

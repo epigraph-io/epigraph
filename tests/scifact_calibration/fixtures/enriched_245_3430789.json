@@ -1,0 +1,26 @@
+{
+  "scifact_id": 245,
+  "claim": "Charcoal is an effective treatment for acute paraquat poisoning.",
+  "evidence_sentences": [
+    "Activated charcoal hemoperfusion had little effect on avoiding acute kidney injury in patients with severe PQ poisoning."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "3430789",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.6,
+    "supports_claim": false,
+    "instruments_used": [
+      "hemoperfusion device"
+    ],
+    "reagents_involved": [
+      "activated charcoal",
+      "paraquat"
+    ],
+    "conditions": [
+      "severe PQ poisoning",
+      "acute kidney injury"
+    ],
+    "evidence_type": "empirical"
+  }
+}

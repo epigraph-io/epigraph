@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1144,
+  "claim": "Taxation of sugar-sweetened beverages had no effect on the incidence rate of type II diabetes in India.",
+  "evidence_sentences": [
+    "The 20% SSB tax was anticipated to reduce overweight and obesity prevalence by 3.0% (95% CI 1.6%-5.9%) and type 2 diabetes incidence by 1.6% (95% CI 1.2%-1.9%) among various Indian subpopulations over the period 2014-2023, if SSB consumption continued to increase linearly in accordance with secular trends.",
+    "However, acceleration in SSB consumption trends consistent with industry marketing models would be expected to increase the impact efficacy of taxation, averting 4.2% of prevalent overweight/obesity (95% CI 2.5-10.0%) and 2.5% (95% CI 1.0-2.8%) of incident type 2 diabetes from 2014-2023.",
+    "CONCLUSION Sustained SSB taxation at a high tax rate could mitigate rising obesity and type 2 diabetes in India among both urban and rural subpopulations."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "10071552",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "20% SSB tax rate",
+      "period 2014-2023",
+      "linear SSB consumption trend",
+      "accelerated SSB consumption trend",
+      "urban and rural subpopulations"
+    ],
+    "evidence_type": "statistical"
+  }
+}

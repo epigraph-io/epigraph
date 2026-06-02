@@ -1,0 +1,24 @@
+{
+  "scifact_id": 1323,
+  "claim": "Treatment with a protein named FN impairs regenerative abilities of aged muscles.",
+  "evidence_sentences": [
+    "Deletion of the gene encoding FN from young regenerating muscles replicates the aging phenotype and leads to a loss of MuSC numbers.",
+    "Reconstitution of FN levels in the aged niche remobilizes stem cells and restores youth-like muscle regeneration."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "19912367",
+  "enrichment": {
+    "methodology": "deductive_logic",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "FN"
+    ],
+    "conditions": [
+      "gene deletion from young regenerating muscles",
+      "reconstitution of FN levels in aged niche"
+    ],
+    "evidence_type": "empirical"
+  }
+}

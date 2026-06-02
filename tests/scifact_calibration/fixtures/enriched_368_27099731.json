@@ -1,0 +1,20 @@
+{
+  "scifact_id": 368,
+  "claim": "Early patent ductus ateriosus (PDA) screening increases in-hospital mortality.",
+  "evidence_sentences": [
+    "Exposed infants had a lower hospital death rate (14.2% vs 18.5% ; OR, 0.73 [95% CI, 0.54 to 0.98]; ARR, 4.3 [95% CI, 0.3 to 8.3]) and a lower rate of pulmonary hemorrhage (5.6% vs 8.9%; OR, 0.60 [95% CI, 0.38 to 0.95]; ARR, 3.3 [95% CI, 0.4 to 6.3]).",
+    "CONCLUSIONS AND RELEVANCE In this national population-based cohort of extremely preterm infants, screening echocardiography before day 3 of life was associated with lower in-hospital mortality and likelihood of pulmonary hemorrhage but not with differences in necrotizing enterocolitis, severe bronchopulmonary dysplasia, or severe cerebral lesions."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "27099731",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "scifact_id": 378,
+  "claim": "Energy balance requires hypothalamic glutamate neurotransmission.",
+  "evidence_sentences": [
+    "Here, we demonstrate that metabolic status and leptin also modify astrocyte-specific glutamate and glucose transporters, indicating that metabolic signals influence synaptic efficacy and glucose uptake and, ultimately, neuronal function.",
+    "We found that basal and glucose-stimulated electrical activity of hypothalamic proopiomelanocortin (POMC) neurons in mice were altered in the offspring of mothers fed a high-fat diet.",
+    "In adulthood, increased body weight and fasting also altered the expression of glucose and glutamate transporters."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "17150648",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.65,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "leptin",
+      "glucose",
+      "glutamate"
+    ],
+    "conditions": [
+      "high-fat diet",
+      "fasting",
+      "basal electrical activity",
+      "glucose-stimulated electrical activity",
+      "adulthood",
+      "increased body weight"
+    ],
+    "evidence_type": "empirical"
+  }
+}

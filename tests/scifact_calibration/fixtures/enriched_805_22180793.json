@@ -1,0 +1,26 @@
+{
+  "scifact_id": 805,
+  "claim": "Monoclonal antibody targeting of N-cadherin inhibits metastasis.",
+  "evidence_sentences": [
+    "In vivo, these antibodies slowed the growth of multiple established CRPC xenografts, blocked local invasion and metastasis and, at higher doses, led to complete regression.",
+    "Therapeutic targeting of this factor with monoclonal antibodies may have considerable clinical benefit."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "22180793",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "monoclonal antibodies",
+      "N-cadherin"
+    ],
+    "conditions": [
+      "in vivo",
+      "CRPC xenografts",
+      "higher doses"
+    ],
+    "evidence_type": "empirical"
+  }
+}

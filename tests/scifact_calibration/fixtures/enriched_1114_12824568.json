@@ -1,0 +1,23 @@
+{
+  "scifact_id": 1114,
+  "claim": "Surfactin producing cells and exopolymer producing cells cooperate to generate \"Van Gogh\" bundles that have sliding abilities on specialized media.",
+  "evidence_sentences": [
+    "The formation of van Gogh bundles depends critically on the synergistic interaction of surfactin-producing and matrix-producing cells.",
+    "We propose that surfactin-producing cells reduce the friction between cells and their substrate, thereby facilitating matrix-producing cells to form bundles."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "12824568",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "surfactin"
+    ],
+    "conditions": [
+      "specialized media"
+    ],
+    "evidence_type": "logical"
+  }
+}

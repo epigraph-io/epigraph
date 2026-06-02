@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1295,
+  "claim": "There is no relation between Erythromycin use and hypertrophic pyloric stenosis.",
+  "evidence_sentences": [
+    "CONCLUSIONS Treatment of young infants with macrolide antibiotics was strongly associated with IHPS and should therefore only be administered if potential treatment benefits outweigh the risk.",
+    "Maternal use of macrolides during the first two weeks after birth was also associated with an increased risk of IHPS."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "21239672",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

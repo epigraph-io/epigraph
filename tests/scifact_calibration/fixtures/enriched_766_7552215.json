@@ -1,0 +1,21 @@
+{
+  "scifact_id": 766,
+  "claim": "Medications to treat obesity have unwanted side effects.",
+  "evidence_sentences": [
+    "Orlistat reduced the incidence of diabetes and improved concentrations of total cholesterol and low density lipoprotein cholesterol, blood pressure, and glycaemic control in patients with diabetes but increased rates of gastrointestinal side effects and slightly lowered concentrations of high density lipoprotein.",
+    "Sibutramine improved [corrected] concentrations of high density lipoprotein cholesterol and triglycerides [corrected] Rimonabant improved concentrations of high density lipoprotein cholesterol and triglycerides, blood pressure, and glycaemic control in patients with diabetes but increased the risk of mood disorders.   \n",
+    "CONCLUSIONS Orlistat, sibutramine, and rimonabant modestly reduce weight, have differing effects on cardiovascular risk profiles, and have specific adverse effects."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "7552215",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

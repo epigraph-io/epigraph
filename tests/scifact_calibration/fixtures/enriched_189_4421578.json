@@ -1,0 +1,22 @@
+{
+  "scifact_id": 189,
+  "claim": "Broadly HIV-1 Neutralizing Antibodies (bnAb) 10EB have no affinity for phospholipids.",
+  "evidence_sentences": [
+    "In contrast to other neutralizing MPER antibodies, 10E8 did not bind phospholipids, was not autoreactive, and bound cell-surface envelope."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4421578",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "10E8",
+      "phospholipids",
+      "cell-surface envelope"
+    ],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

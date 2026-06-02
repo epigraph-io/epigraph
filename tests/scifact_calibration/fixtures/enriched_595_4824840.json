@@ -1,0 +1,25 @@
+{
+  "scifact_id": 595,
+  "claim": "Incidence of sepsis has fallen substantially from 2009 to 2014.",
+  "evidence_sentences": [
+    "From 2009-2014, sepsis incidence using clinical criteria was stable (+0.6% relative change/y [95% CI, \u22122.3% to 3.5%], P = .67) whereas incidence per claims increased (+10.3%/y [95% CI, 7.2% to 13.3%], P < .001).",
+    "Conclusions and Relevance In clinical data from 409 hospitals, sepsis was present in 6% of adult hospitalizations, and in contrast to claims-based analyses, neither the incidence of sepsis nor the combined outcome of death or discharge to hospice changed significantly between 2009-2014."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "4824840",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "2009-2014 timeframe",
+      "clinical criteria",
+      "claims-based criteria",
+      "409 hospitals",
+      "adult hospitalizations"
+    ],
+    "evidence_type": "statistical"
+  }
+}

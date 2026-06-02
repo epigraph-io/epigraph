@@ -1,0 +1,16 @@
+{
+  "scifact_id": 877,
+  "claim": "Occipital activation levels are associated with auditory spatial performance in parietal regions of the brain.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

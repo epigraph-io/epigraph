@@ -1,0 +1,31 @@
+{
+  "scifact_id": 951,
+  "claim": "Piezo1 channels are sensors for cell migration in epithelial cells.",
+  "evidence_sentences": [
+    "This interaction was confirmed by co-immunoprecipitation and co-localisation of TFF1 and Piezo1 in GES-1 cells.",
+    "We demonstrate that TFF1, but not TFF2 or TFF3, bind to and co-localize with Piezo1 in the cytoplasm in vitro.",
+    "TFF1 interacts with the C-terminal portion of the Piezo1 protein.",
+    "Our data demonstrate that Piezo1 is a novel TFF1 binding protein that is important for TFF1-mediated cell migration and suggest that this interaction may be a therapeutic target in the invasion and metastasis of gastric cancer."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "21414718",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.65,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "TFF1",
+      "TFF2",
+      "TFF3",
+      "Piezo1 protein"
+    ],
+    "conditions": [
+      "in vitro",
+      "GES-1 cells",
+      "co-immunoprecipitation",
+      "co-localisation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

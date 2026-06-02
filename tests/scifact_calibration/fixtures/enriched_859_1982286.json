@@ -1,0 +1,22 @@
+{
+  "scifact_id": 859,
+  "claim": "Normal expression of RUNX1 has tumor-promoting effects.",
+  "evidence_sentences": [
+    "Notably, a network structure analysis of this hierarchical network identified RUNX1 as a key mediator of the T-ALL induced by TLX1 and TLX3 and predicted a tumor-suppressor role for RUNX1 in T cell transformation."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "1982286",
+  "enrichment": {
+    "methodology": "deductive_logic",
+    "confidence": 0.65,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "network structure analysis",
+      "hierarchical network",
+      "T-ALL induced by TLX1 and TLX3"
+    ],
+    "evidence_type": "logical"
+  }
+}

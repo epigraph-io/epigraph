@@ -1,0 +1,23 @@
+{
+  "scifact_id": 78,
+  "claim": "Active caspase-11 participate in regulating phagosome-lysosome fusion.",
+  "evidence_sentences": [
+    "However, caspase-11 was dispensable for the fusion of lysosomes with phagosomes containing nonpathogenic bacteria, uncovering a fundamental difference in the trafficking of phagosomes according to their cargo."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5099266",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "caspase-11",
+      "lysosomes"
+    ],
+    "conditions": [
+      "phagosomes containing nonpathogenic bacteria"
+    ],
+    "evidence_type": "empirical"
+  }
+}

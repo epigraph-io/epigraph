@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1205,
+  "claim": "The combination of physical examinations with C-reactive protein values do not improve the accuracy of radiographic verified pneumonia predictions.",
+  "evidence_sentences": [
+    "Addition of CRP at the optimal cut off of >30 mg/L increased the ROC area to 0.77 (0.73 to 0.81) and improved the diagnostic classification (net reclassification improvement 28%).",
+    "Addition of CRP concentration at the optimal cut off of >30 mg/L improved diagnostic information, but measurement of procalcitonin concentration did not add clinically relevant information in this group."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "5558754",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

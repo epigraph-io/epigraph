@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1391,
+  "claim": "miR-142-5P is a known regulator of raised body temperature.",
+  "evidence_sentences": [
+    "ThermomiRs such as miR-142-5p and miR-143 in turn target endogenous pyrogens including IL-6, IL6ST, TLR2, PGE2 and TNF to complete a negative feedback mechanism, which may be crucial to prevent pathological hyperthermia."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6766459",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "miR-142-5p",
+      "miR-143",
+      "IL-6",
+      "IL6ST",
+      "TLR2",
+      "PGE2",
+      "TNF"
+    ],
+    "conditions": [],
+    "evidence_type": "logical"
+  }
+}

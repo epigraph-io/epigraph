@@ -1,0 +1,25 @@
+{
+  "scifact_id": 576,
+  "claim": "In melanoma, anti-CTLA-4 treatment reinvigorates exhausted PD-1+Eomes+CD8 T cells.",
+  "evidence_sentences": [
+    "Unbiased analyses of mice revealed that resistance was due to upregulation of PD-L1 on melanoma cells and associated with T-cell exhaustion."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4468861",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.3,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "PD-L1",
+      "anti-CTLA-4"
+    ],
+    "conditions": [
+      "melanoma",
+      "T-cell exhaustion",
+      "resistance to treatment"
+    ],
+    "evidence_type": "empirical"
+  }
+}

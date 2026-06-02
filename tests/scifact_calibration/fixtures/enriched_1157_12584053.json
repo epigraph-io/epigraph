@@ -1,0 +1,21 @@
+{
+  "scifact_id": 1157,
+  "claim": "The DESMOND program demonstrates no significant impact on biochemical outcomes.",
+  "evidence_sentences": [
+    "After adjusting for baseline and cluster the difference was not significant (difference -0.02, 95% confidence interval -0.22 to 0.17).",
+    "The groups did not differ for the other biomedical and lifestyle outcomes and drug use.",
+    "CONCLUSION A single programme for people with newly diagnosed type 2 diabetes mellitus showed no difference in biomedical or lifestyle outcomes at three years although there were sustained improvements in some illness beliefs.   \n"
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "12584053",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

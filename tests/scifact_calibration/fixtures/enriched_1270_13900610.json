@@ -1,0 +1,23 @@
+{
+  "scifact_id": 1270,
+  "claim": "The risk of male prisoners harming themselves is ten times that of female prisoners.",
+  "evidence_sentences": [
+    "FINDINGS 139,195 self-harm incidents were recorded in 26,510 individual prisoners between 2004 and 2009; 5-6% of male prisoners and 20-24% of female inmates self-harmed every year.",
+    "Self-harm rates were more than ten times higher in female prisoners than in male inmates."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "13900610",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "prison population 2004-2009",
+      "139195 self-harm incidents",
+      "26510 individual prisoners"
+    ],
+    "evidence_type": "statistical"
+  }
+}

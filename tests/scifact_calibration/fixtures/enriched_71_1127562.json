@@ -1,0 +1,28 @@
+{
+  "scifact_id": 71,
+  "claim": "Activation of the Rac1 homolog CED-10 kills viable cells in SRGP-1 mutant Caenorhabditis elegans.",
+  "evidence_sentences": [
+    "We show that SRGP-1 functions in engulfing cells and functions as a GTPase activating protein (GAP) for CED-10 (Rac1).",
+    "Interestingly, loss of srgp-1 function promotes not only the clearance of already dead cells, but also the removal of cells that have been brought to the verge of death through sublethal apoptotic, necrotic or cytotoxic insults."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1127562",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.55,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "CED-10",
+      "Rac1",
+      "SRGP-1"
+    ],
+    "conditions": [
+      "srgp-1 loss of function",
+      "sublethal apoptotic insults",
+      "sublethal necrotic insults",
+      "sublethal cytotoxic insults"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "scifact_id": 378,
+  "claim": "Energy balance requires hypothalamic glutamate neurotransmission.",
+  "evidence_sentences": [
+    "Deletion of NMDARs from AgRP neurons markedly reduced weight, body fat and food intake whereas deletion from POMC neurons had no effect.",
+    "Activation of AgRP neurons by fasting, as assessed by c-Fos, Agrp and Npy mRNA expression, AMPA receptor-mediated EPSCs, depolarization and firing rates, required NMDARs.",
+    "Furthermore, AgRP but not POMC neurons have dendritic spines and increased glutamatergic input onto AgRP neurons caused by fasting was paralleled by an increase in spines, suggesting fasting induced synaptogenesis and spinogenesis.",
+    "Thus glutamatergic synaptic transmission and its modulation by NMDARs play key roles in controlling AgRP neurons and determining the cellular and behavioral response to fasting."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "10534299",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

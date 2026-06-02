@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1177,
+  "claim": "The PRDM1 gene, when combined with the PRDM14 gene, plays an important role during primordial germ cell specification.",
+  "evidence_sentences": [
+    "Blimp1 (Prdm1), the key determinant of primordial germ cells (PGCs), plays a combinatorial role with Prdm14 during PGC specification from postimplantation epiblast cells."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13910150",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

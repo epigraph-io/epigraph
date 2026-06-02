@@ -1,0 +1,28 @@
+{
+  "scifact_id": 261,
+  "claim": "Chronic aerobic exercise alters endothelial function, improving vasodilating mechanisms mediated by NO.",
+  "evidence_sentences": [
+    "Relaxation to the endothelium-dependent vasodilator bradykinin was decreased (P<0.05) in arterioles isolated from collateral-dependent LCx versus nonoccluded LAD regions of SED animals.",
+    "CONCLUSIONS These data indicate that exercise training enhances bradykinin-mediated relaxation of collateral-dependent LCx arterioles isolated after chronic coronary occlusion, most likely because of effects on ecNOS mRNA expression and increased production of NO."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1122279",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.78,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "bradykinin",
+      "NO"
+    ],
+    "conditions": [
+      "chronic coronary occlusion",
+      "exercise training",
+      "sedentary control",
+      "collateral-dependent LCx region",
+      "nonoccluded LAD region"
+    ],
+    "evidence_type": "empirical"
+  }
+}

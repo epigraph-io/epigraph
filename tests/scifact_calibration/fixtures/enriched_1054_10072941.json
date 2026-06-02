@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1054,
+  "claim": "Risk of cardiovascular events can be cut by a third by using antihypertensive drug therapy among hemodialysis patients.",
+  "evidence_sentences": [
+    "Among 1202 patients who we identified in 5 studies, the overall benefit of antihypertensive therapy compared with the control or placebo group had a combined hazard ratio for cardiovascular events of 0.69 (95% CI: 0.56 to 0.84) using a fixed-effects model and 0.62 (95% CI: 0.45 to 0.86) using a random-effects model."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "10072941",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

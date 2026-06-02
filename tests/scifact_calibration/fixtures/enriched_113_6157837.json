@@ -1,0 +1,20 @@
+{
+  "scifact_id": 113,
+  "claim": "Angiotensin converting enzyme inhibitors are associated with increased risk for functional renal insufficiency.",
+  "evidence_sentences": [
+    "Although ACE inhibitor therapy usually improves renal blood flow (RBF) and sodium excretion rates in CHF and reduces the rate of progressive renal injury in chronic renal disease, its use can also be associated with a syndrome of \u201cfunctional renal insufficiency\u201d and/or hyperkalemia.",
+    "Understanding the pathophysiological mechanisms and the common risk factors for ACE inhibitor\u2013induced functional ARF is critical, because preventive strategies for ARF exist, and if effectively used, they may permit use of these compounds in a less restricted fashion.  "
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6157837",
+  "enrichment": {
+    "methodology": "expert_elicitation",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "testimonial",
+    "tier2_enriched": true
+  }
+}

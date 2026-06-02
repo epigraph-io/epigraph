@@ -1,0 +1,19 @@
+{
+  "scifact_id": 34,
+  "claim": "A deficiency of folate increases blood levels of homocysteine.",
+  "evidence_sentences": [
+    "RESULTS Median serum homocysteine level decreased with increasing folic acid dosage, to a maximum at 0.8 mg of folic acid per day, when the homocysteine reduction (placebo adjusted) was 2.7 micromol/L (23%), similar to the known effect of folic acid dosages of 1 mg/d and above."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11705328",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

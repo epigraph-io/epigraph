@@ -1,0 +1,28 @@
+{
+  "scifact_id": 504,
+  "claim": "Healthy volunteers exhibit rapid and transient increase of cellular ATP after being bolus-injected with fructose.",
+  "evidence_sentences": [
+    "Liver ATP levels were similar in the 2 groups before fructose infusion and decreased similarly in both after fructose infusion (P = .01 vs initial ATP levels)."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "10883736",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.82,
+    "supports_claim": false,
+    "instruments_used": [
+      "31P magnetic resonance spectroscopy"
+    ],
+    "reagents_involved": [
+      "fructose",
+      "ATP"
+    ],
+    "conditions": [
+      "before fructose infusion",
+      "after fructose infusion",
+      "bolus injection",
+      "2 groups compared"
+    ],
+    "evidence_type": "empirical"
+  }
+}

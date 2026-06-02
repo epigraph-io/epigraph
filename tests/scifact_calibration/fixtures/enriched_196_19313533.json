@@ -1,0 +1,25 @@
+{
+  "scifact_id": 196,
+  "claim": "C2 works synergistically with A-769662 to activate dephosphorylated AMPK.",
+  "evidence_sentences": [
+    "C2 acts synergistically with the drug A769662 to activate AMPK \u03b11-containing complexes independent of upstream kinases."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "19313533",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "C2",
+      "A769662",
+      "AMPK \u03b11-containing complexes"
+    ],
+    "conditions": [
+      "independent of upstream kinases",
+      "dephosphorylated AMPK"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "scifact_id": 166,
+  "claim": "Bariatric surgery leads to negative outcomes in mental health.",
+  "evidence_sentences": [
+    "Bariatric surgery was, however, consistently associated with postoperative decreases in the prevalence of depression (7 studies; 8%-74% decrease) and the severity of depressive symptoms (6 studies; 40%-70% decrease).   \n",
+    "Moderate-quality evidence supports an association between bariatric surgery and lower rates of depression postoperatively."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "18872233",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.92,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

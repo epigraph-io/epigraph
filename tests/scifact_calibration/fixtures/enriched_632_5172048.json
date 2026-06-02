@@ -1,0 +1,22 @@
+{
+  "scifact_id": 632,
+  "claim": "Inhibiting focal adhesion formation enables cells to convert mechanical strain into eventual scarring.",
+  "evidence_sentences": [
+    "Fibroblast-specific FAK knockout mice have substantially less inflammation and fibrosis than control mice in a model of hypertrophic scar formation.",
+    "Similarly, MCP-1 knockout mice form minimal scars, indicating that inflammatory chemokine pathways are a major mechanism by which FAK mechanotransduction induces fibrosis.",
+    "Small-molecule inhibition of FAK blocks these effects in human cells and reduces scar formation in vivo through attenuated MCP-1 signaling and inflammatory cell recruitment.",
+    "These findings collectively indicate that physical force regulates fibrosis through inflammatory FAK\u2013ERK\u2013MCP-1 pathways and that molecular strategies targeting FAK can effectively uncouple mechanical force from pathologic scar formation."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "5172048",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.9,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

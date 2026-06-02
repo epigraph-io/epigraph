@@ -1,0 +1,25 @@
+{
+  "scifact_id": 770,
+  "claim": "Metastatic colorectal cancer treated with a single agent fluoropyrimidines resulted in reduced efficacy and lower quality of life when compared with oxaliplatin-based chemotherapy in elderly patients.",
+  "evidence_sentences": [
+    "On balance, a combination including oxaliplatin was preferable to single-agent fluoropyrimidines, although the primary endpoint of PFS was not met."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "15476777",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.6,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "fluoropyrimidines",
+      "oxaliplatin"
+    ],
+    "conditions": [
+      "metastatic colorectal cancer",
+      "elderly patients",
+      "single-agent vs combination chemotherapy"
+    ],
+    "evidence_type": "empirical"
+  }
+}

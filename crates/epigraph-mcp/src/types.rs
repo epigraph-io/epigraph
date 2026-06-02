@@ -89,6 +89,20 @@ pub struct QueryClaimsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct QueryUndecomposedClaimsParams {
+    #[schemars(
+        description = "Maximum number of undecomposed claims to return (default 50, max 1000). Claims are ordered created_at ASC (oldest first) so scheduled runs make monotonic progress."
+    )]
+    pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Skip the first N matching claims (default 0). Combine with limit to page through the backlog."
+    )]
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetClaimParams {
     #[schemars(description = "The UUID of the claim to retrieve")]
     pub claim_id: String,
@@ -162,6 +176,18 @@ pub struct RecallParams {
 
     #[schemars(description = "Maximum number of memories to return (default 10)")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Restrict recall to claims carrying ALL these labels/tags (array containment). Default: no tag filter."
+    )]
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    #[schemars(
+        description = "Restrict recall to claims authored by this agent UUID. Default: any agent. An invalid UUID is rejected, not silently ignored."
+    )]
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 // ── Ingestion ──
@@ -280,6 +306,30 @@ pub struct FindWorkflowParams {
 
     #[schemars(description = "Maximum number of workflows to return (default 5)")]
     pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetWorkflowExecutionsParams {
+    #[schemars(
+        description = "Workflow UUID (a `workflows` row id / lineage member) whose recent executions to fetch"
+    )]
+    pub workflow_id: String,
+
+    #[schemars(description = "Max executions to return, newest first (default 20, max 100)")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EvaluateWorkflowPromotionParams {
+    #[schemars(
+        description = "Workflow variant UUID to evaluate for promotion over its variant_of parent"
+    )]
+    pub workflow_id: String,
+
+    #[schemars(
+        description = "Execution window compared on each side, newest first (default 50, max 500)"
+    )]
+    pub window: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -790,6 +840,12 @@ pub struct FindWorkflowResult {
     pub behavioral_success_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub behavioral_execution_count: Option<i64>,
+    /// Set by the workflow-promotion maintenance pass (`refresh_workflow_promotion`)
+    /// from the variant's `properties.promotion.promotable`. `Some(true)` means
+    /// the gate found this variant statistically better than its parent; absent
+    /// when never evaluated. Advisory — callers may prefer promoted variants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotable: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

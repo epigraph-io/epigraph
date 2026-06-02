@@ -1,0 +1,21 @@
+{
+  "scifact_id": 1378,
+  "claim": "Women are more susceptible to death due to pneumonia when compared to men.",
+  "evidence_sentences": [
+    "CONCLUSIONS Although gender may not be predictive of mortality among all infections, women appear to be at increased risk for death from hospital-acquired pneumonia, even after controlling for other comorbidities."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2488880",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "hospital-acquired pneumonia",
+      "controlled for other comorbidities"
+    ],
+    "evidence_type": "statistical"
+  }
+}

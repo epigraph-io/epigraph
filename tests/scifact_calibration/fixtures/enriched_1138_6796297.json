@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1138,
+  "claim": "TRAP+ osteoclasts regulate mature osteoblast maintenance.",
+  "evidence_sentences": [
+    "Mice with depletion of PDGF-BB in the tartrate-resistant acid phosphatase\u2013positive cell lineage show significantly lower trabecular and cortical bone mass, serum and bone marrow PDGF-BB concentrations, and fewer CD31hiEmcnhi vessels compared to wild-type mice."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6796297",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.55,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

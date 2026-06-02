@@ -1,0 +1,23 @@
+{
+  "scifact_id": 236,
+  "claim": "Cell autonomous sex determination in somatic cells occurs in Passeriformes.",
+  "evidence_sentences": [
+    "These studies demonstrated that gynandromorph birds are genuine male:female chimaeras, and indicated that male and female avian somatic cells may have an inherent sex identity.",
+    "In an example where female tissue was transplanted into a male host, donor cells contributing to the developing testis retained a female identity and expressed a marker of female function.",
+    "Our study demonstrates that avian somatic cells possess an inherent sex identity and that, in birds, sexual differentiation is substantively cell autonomous."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4388470",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "female tissue transplanted into male host",
+      "gynandromorph bird chimaeras"
+    ],
+    "evidence_type": "empirical"
+  }
+}

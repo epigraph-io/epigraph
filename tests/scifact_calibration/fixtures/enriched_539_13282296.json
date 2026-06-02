@@ -1,0 +1,24 @@
+{
+  "scifact_id": 539,
+  "claim": "Hypoglycemia increases the risk of dementia.",
+  "evidence_sentences": [
+    "Compared with patients with no hypoglycemia, patients with single or multiple episodes had a graded increase in risk with fully adjusted hazard ratios (HRs): for 1 episode (HR, 1.26; 95% confidence interval [CI], 1.10-1.49); 2 episodes (HR, 1.80; 95% CI, 1.37-2.36); and 3 or more episodes (HR, 1.94; 95% CI, 1.42-2.64).",
+    "CONCLUSIONS Among older patients with type 2 diabetes, a history of severe hypoglycemic episodes was associated with a greater risk of dementia."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13282296",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "type 2 diabetes",
+      "older patients",
+      "severe hypoglycemic episodes",
+      "fully adjusted hazard ratios"
+    ],
+    "evidence_type": "statistical"
+  }
+}

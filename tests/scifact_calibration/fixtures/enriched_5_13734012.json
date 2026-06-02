@@ -1,0 +1,21 @@
+{
+  "scifact_id": 5,
+  "claim": "1/2000 in UK have abnormal PrP positivity.",
+  "evidence_sentences": [
+    "RESULTS Of the 32,441 appendix samples 16 were positive for abnormal PrP, indicating an overall prevalence of 493 per million population (95% confidence interval 282 to 801 per million)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13734012",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "32441 appendix samples",
+      "UK population survey"
+    ],
+    "evidence_type": "statistical"
+  }
+}

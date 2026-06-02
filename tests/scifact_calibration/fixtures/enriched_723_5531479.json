@@ -1,0 +1,22 @@
+{
+  "scifact_id": 723,
+  "claim": "Ly49Q directs the organization of neutrophil migration to inflammation sites by regulating membrane raft functions.",
+  "evidence_sentences": [
+    "Here, we show that an inhibitory MHC I receptor, Ly49Q, was crucial for the swift polarization of and tissue infiltration by neutrophils.",
+    "Ly49Q-dependent polarization and migration were affected by Ly49Q regulation of membrane raft functions."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5531479",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "inflammation sites",
+      "tissue infiltration"
+    ],
+    "evidence_type": "empirical"
+  }
+}

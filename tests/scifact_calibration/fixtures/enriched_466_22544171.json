@@ -1,0 +1,26 @@
+{
+  "scifact_id": 466,
+  "claim": "Genomic sequences involved in alternative splicing responsible for Hutchinson-Gilford progeria syndrome (HGPS) are abundant in the ''progerinonly'' allele of Lmna knock-in models.",
+  "evidence_sentences": [
+    "Hutchinson-Gilford progeria syndrome (HGPS) is a childhood premature aging disease caused by a spontaneous point mutation in lamin A (encoded by LMNA), one of the major architectural elements of the mammalian cell nucleus.",
+    "The mutant LMNA mRNA and lamin A protein can be efficiently eliminated by correction of the aberrant splicing event using a modified oligonucleotide targeted to the activated cryptic splice site.",
+    "Upon splicing correction, HGPS fibroblasts assume normal nuclear morphology, the aberrant nuclear distribution and cellular levels of lamina-associated proteins are rescued, defects in heterochromatin-specific histone modifications are corrected and proper expression of several misregulated genes is reestablished."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "22544171",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.2,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "modified oligonucleotide",
+      "lamin A"
+    ],
+    "conditions": [
+      "splicing correction in HGPS fibroblasts"
+    ],
+    "evidence_type": "circumstantial",
+    "tier2_enriched": true
+  }
+}

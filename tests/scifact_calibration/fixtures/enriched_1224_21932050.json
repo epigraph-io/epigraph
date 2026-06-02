@@ -1,0 +1,23 @@
+{
+  "scifact_id": 1224,
+  "claim": "The latent infection of myeloid cells with human cytomegalovirus induces a number of changes in gene expression.",
+  "evidence_sentences": [
+    "Microarray-based studies of HCMV have provided useful information about genes that are transcriptionally active during both productive and latent phases of infection."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "21932050",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.4,
+    "supports_claim": true,
+    "instruments_used": [
+      "microarray"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "productive infection",
+      "latent infection"
+    ],
+    "evidence_type": "circumstantial"
+  }
+}

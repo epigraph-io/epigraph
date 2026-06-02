@@ -1,0 +1,25 @@
+{
+  "scifact_id": 863,
+  "claim": "Notch signaling occurs between tumor cells and stromal cells.",
+  "evidence_sentences": [
+    "Here, we report that the Notch ligand Jagged1 induced by growth factors via mitogen-activating protein kinase (MAPK) in head and neck squamous cell carcinoma (HNSCC) cells triggered Notch activation in neighboring endothelial cells (ECs) and promoted capillary-like sprout formation.",
+    "Our results elucidate a novel mechanism by which the direct interplay between tumor cells and ECs promotes angiogenesis through MAPK and Notch signaling pathways."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "20568364",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Jagged1",
+      "MAPK"
+    ],
+    "conditions": [
+      "head and neck squamous cell carcinoma cells co-cultured with endothelial cells",
+      "growth factor stimulation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

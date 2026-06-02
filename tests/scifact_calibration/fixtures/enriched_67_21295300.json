@@ -1,0 +1,26 @@
+{
+  "scifact_id": 67,
+  "claim": "Activated Cdk5 phosphorylates the ATM protein in response to DNA damage.",
+  "evidence_sentences": [
+    "Here we show that Cdk5 (cyclin-dependent kinase 5), activated by DNA damage, directly phosphorylates ATM at Ser 794 in post-mitotic neurons.",
+    "Thus, activation of Cdk5 by DNA damage serves as a critical signal to initiate the ATM response and regulate ATM-dependent cellular processes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "21295300",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Cdk5",
+      "ATM",
+      "cyclin-dependent kinase 5"
+    ],
+    "conditions": [
+      "DNA damage",
+      "post-mitotic neurons"
+    ],
+    "evidence_type": "empirical"
+  }
+}

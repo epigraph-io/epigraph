@@ -36,6 +36,25 @@ async fn insert_claim(pool: &PgPool, agent: Uuid) -> Uuid {
     id
 }
 
+/// Insert a claim with `is_current = false` — a retired endpoint (superseded
+/// or marked-duplicate) that the `are_all_current` guard must refuse to
+/// promote an edge onto.
+async fn insert_retired_claim(pool: &PgPool, agent: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    let content = format!("t19 retired {id}");
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current)
+         VALUES ($1, $2, sha256($2::bytea), 0.5, $3, false)",
+    )
+    .bind(id)
+    .bind(&content)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("retired claim");
+    id
+}
+
 async fn insert_agent(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -280,5 +299,49 @@ async fn decide_match_candidate_rejected_in_read_only_mode(pool: PgPool) {
     assert!(
         format!("{err:?}").to_lowercase().contains("read-only"),
         "expected read-only refusal: {err:?}"
+    );
+}
+
+/// Guard survives the refactor: `are_all_current` lives at the MCP call site,
+/// NOT inside `EdgeRepository::create_symmetric_if_absent`. When one endpoint
+/// is `is_current = false`, promote must refuse and write NO edge. If a future
+/// edit folded the guard into the repo method (or dropped it), this catches it
+/// because the repo method has no notion of current-ness — backlog bug
+/// 5c7fc645 would re-open.
+#[sqlx::test(migrations = "../../migrations")]
+async fn decide_match_candidate_promote_blocked_when_endpoint_not_current(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await; // write-enabled
+    let agent = insert_agent(&pool).await;
+    let live = insert_claim(&pool, agent).await;
+    let retired = insert_retired_claim(&pool, agent).await; // is_current = false
+    let cand = insert_candidate(&pool, live, retired, 0.97, "pending").await;
+
+    let err = tools::matching::decide_match_candidate(
+        &server,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+    )
+    .await
+    .expect_err("promote must be refused when an endpoint is not current");
+    assert!(
+        format!("{err:?}").to_lowercase().contains("current"),
+        "refusal must cite the current-ness guard: {err:?}"
+    );
+
+    // The guard must short-circuit BEFORE any edge write.
+    let edge_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint FROM edges WHERE relationship = 'CORROBORATES'
+         AND ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))",
+    )
+    .bind(live)
+    .bind(retired)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        edge_count.0, 0,
+        "no CORROBORATES edge may be written onto a retired claim"
     );
 }

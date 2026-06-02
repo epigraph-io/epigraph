@@ -1,0 +1,16 @@
+{
+  "scifact_id": 655,
+  "claim": "Intra-cerebroventricular infusion of amyloid-\u03b2 oligomers reduces expression of fibronectin type-III domain-containing protein 5 mRNA in mice hippocampi.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

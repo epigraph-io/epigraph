@@ -1,0 +1,28 @@
+{
+  "scifact_id": 108,
+  "claim": "Amitriptyline is an effective treatment for chronic tension-type headaches.",
+  "evidence_sentences": [
+    "Amitriptyline is the medication of first choice in the treatment of chronic tension-type headache.",
+    "The primary study endpoint was a reduction of at least 50% of the product of headache duration and frequency and a reduction of at least 50% in headache intensity.",
+    "A reduction in headache duration and frequency of at least 50% was found in 39.4% on AO, in 25.4% on AM and in 26.6% on PL (PAO-PL = .1384, PAM-PL = 1.000, PAO-AM = .0973).",
+    "A reduction in headache intensity of at least 50% was found in 31.8% on AO, in 26.9% on AM and in 26.6% on PL (PAO-PL = .5657, PAM-PL = 1.000, PAO-AM = .5715)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "23865182",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.88,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "amitriptyline"
+    ],
+    "conditions": [
+      "chronic tension-type headache",
+      "50% reduction threshold for headache duration and frequency",
+      "50% reduction threshold for headache intensity"
+    ],
+    "evidence_type": "statistical",
+    "tier3_enriched": true
+  }
+}

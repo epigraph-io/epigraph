@@ -1,0 +1,24 @@
+{
+  "scifact_id": 3,
+  "claim": "1,000 genomes project enables mapping of genetic sequence variation consisting of rare variants with larger penetrance effects than common variants.",
+  "evidence_sentences": [
+    "We propose as an alternative explanation that variants much less common than the associated one may create \"synthetic associations\" by occurring, stochastically, more often in association with one of the alleles at the common site versus the other allele.",
+    "We show that they are not only possible, but inevitable, and that under simple but reasonable genetic models, they are likely to account for or contribute to many of the recently identified signals reported in genome-wide association studies.",
+    "In conclusion, uncommon or rare genetic variants can easily create synthetic associations that are credited to common variants, and this possibility requires careful consideration in the interpretation and follow up of GWAS signals."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "14717500",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.55,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "genome-wide association studies",
+      "simple genetic models",
+      "synthetic associations with common variant alleles"
+    ],
+    "evidence_type": "statistical"
+  }
+}

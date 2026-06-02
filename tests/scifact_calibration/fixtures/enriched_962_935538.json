@@ -1,0 +1,21 @@
+{
+  "scifact_id": 962,
+  "claim": "Post-transcriptional handling of mitochondrial transcripts occurs in mitochondrial RNA granules.",
+  "evidence_sentences": [
+    "We show here that GRSF1, previously implicated in the binding and selective translation of influenza mRNAs, is targeted to mitochondria where it forms granules that colocalize with foci of newly synthesized mtRNA next to mitochondrial nucleoids.",
+    "These data implicate GRSF1 as a key regulator of posttranscriptional mitochondrial gene expression."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "935538",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "GRSF1"
+    ],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

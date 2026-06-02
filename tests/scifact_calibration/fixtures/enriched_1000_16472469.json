@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1000,
+  "claim": "Pyridostatin stabilizes the G - quadruplex in the telomeric region.",
+  "evidence_sentences": [
+    "Treatment with the G4-stabilizing compound pyridostatin (PDS) increases telomere fragility in BRCA2-deficient cells, suggesting that G4 formation drives telomere instability."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16472469",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

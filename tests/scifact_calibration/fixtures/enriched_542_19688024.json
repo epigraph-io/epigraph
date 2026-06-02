@@ -1,0 +1,19 @@
+{
+  "scifact_id": 542,
+  "claim": "IFI16 impedes STING phosphorylation and translocation, resulting in reduced activation of STING.",
+  "evidence_sentences": [
+    "IFI16 is also required for the cGAMP-induced activation of STING, and interacts with STING to promote STING phosphorylation and translocation."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "19688024",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

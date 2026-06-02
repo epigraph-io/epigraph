@@ -1,0 +1,20 @@
+{
+  "scifact_id": 635,
+  "claim": "Inhibiting glucose-6-phospate dehydrogenase improves lipogenesis by deactivating LKB1-AMPK signaling.",
+  "evidence_sentences": [
+    "We found that suppression of 6PGD decreased lipogenesis and RNA biosynthesis and elevated ROS levels in cancer cells, attenuating cell proliferation and tumour growth.",
+    "6PGD-mediated production of ribulose-5-phosphate (Ru-5-P) inhibits AMPK activation by disrupting the active LKB1 complex, thereby activating acetyl-CoA carboxylase 1 and lipogenesis."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "1686997",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.7,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

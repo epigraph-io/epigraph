@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1381,
+  "claim": "YAP/TAZ is required in intestinal regeneration in mouse models of ulcerative colitis.",
+  "evidence_sentences": [
+    "The fate change is orchestrated by remodeling the extracellular matrix (ECM), increased FAK/Src signaling, and ultimately YAP/TAZ activation.",
+    "In a defined cell culture system recapitulating the extracellular matrix remodeling observed in vivo, we show that a collagen 3D matrix supplemented with Wnt ligands is sufficient to sustain endogenous YAP/TAZ and induce conversion of cell fate."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13481880",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.3,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "collagen 3D matrix",
+      "Wnt ligands"
+    ],
+    "conditions": [
+      "extracellular matrix remodeling",
+      "FAK/Src signaling activation",
+      "3D cell culture system supplemented with Wnt ligands"
+    ],
+    "evidence_type": "empirical"
+  }
+}

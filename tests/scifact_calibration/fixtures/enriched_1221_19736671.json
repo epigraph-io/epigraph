@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1221,
+  "claim": "The genomic aberrations found in matasteses are very similar to those found in the primary tumor.",
+  "evidence_sentences": [
+    "Shared mutations between primary carcinomas and their matched metastases have the distinct A-to-T signature of the initiating carcinogen dimethylbenzanthracene, but non-shared mutations are primarily G-to-T, a signature associated with oxidative stress."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "19736671",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.65,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "dimethylbenzanthracene"
+    ],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

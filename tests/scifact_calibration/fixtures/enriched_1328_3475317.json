@@ -1,0 +1,27 @@
+{
+  "scifact_id": 1328,
+  "claim": "Tuberculosis-induced granulomas express different immune system protein signatures than the surrounding tissue.",
+  "evidence_sentences": [
+    "We found that the centers of granulomas have a pro-inflammatory environment that is characterized by the presence of antimicrobial peptides, reactive oxygen species and pro-inflammatory eicosanoids.",
+    "Conversely, the tissue surrounding the caseum has a comparatively anti-inflammatory signature.",
+    "Although the balance between systemic pro- and anti-inflammatory signals is crucial to TB disease outcome, here we find that these signals are physically segregated within each granuloma."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "3475317",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "antimicrobial peptides",
+      "reactive oxygen species",
+      "pro-inflammatory eicosanoids"
+    ],
+    "conditions": [
+      "pro-inflammatory environment in granuloma centers",
+      "anti-inflammatory signature in surrounding tissue"
+    ],
+    "evidence_type": "empirical"
+  }
+}

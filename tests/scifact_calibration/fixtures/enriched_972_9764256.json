@@ -1,0 +1,19 @@
+{
+  "scifact_id": 972,
+  "claim": "Primary cervical cancer screening with HPV detection has lower longitudinal sensitivity than conventional cytology to detect cervical intraepithelial neoplasia grade 2.",
+  "evidence_sentences": [
+    "Furthermore, significantly more cases of CIN grade 2 or worse were detected in the intervention group than in the control group (267 of 19 999 vs 215 of 20,106; 1\u00b725, 1\u00b705-1\u00b750; p=0\u00b7015)."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "9764256",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

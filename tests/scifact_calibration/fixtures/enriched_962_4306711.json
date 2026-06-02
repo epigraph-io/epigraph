@@ -1,0 +1,20 @@
+{
+  "scifact_id": 962,
+  "claim": "Post-transcriptional handling of mitochondrial transcripts occurs in mitochondrial RNA granules.",
+  "evidence_sentences": [
+    "Here, we have identified the DEAD-box protein DDX28 as an RNA granule component essential for the biogenesis of the mitoribosome large subunit (mt-LSU).",
+    "Our findings identify DDX28 as essential during the early stages of mitoribosome mt-LSU biogenesis, a process that takes place mainly near the mitochondrial nucleoids, in the compartment defined by the RNA granules."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4306711",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

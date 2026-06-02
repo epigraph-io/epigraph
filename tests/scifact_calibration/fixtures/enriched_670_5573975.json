@@ -1,0 +1,26 @@
+{
+  "scifact_id": 670,
+  "claim": "Knockout proximal tubule-specific deletion of the BMP receptor Alk3 causes epithelial damage.",
+  "evidence_sentences": [
+    "We also found that its deletion in the tubular epithelium leads to enhanced TGF-\u03b21-Smad family member 3 (Smad3) signaling, epithelial damage and fibrosis, suggesting a protective role for Alk3-mediated signaling in the kidney.",
+    "Combining THR-123 and the angiotensin-converting enzyme inhibitor captopril had an additive therapeutic benefit in controlling renal fibrosis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5573975",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "TGF-\u03b21",
+      "THR-123",
+      "captopril"
+    ],
+    "conditions": [
+      "proximal tubule-specific Alk3 deletion",
+      "angiotensin-converting enzyme inhibition"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1334,
+  "claim": "Type 1 Diabetes is associated with subtle perturbations in T reg development.",
+  "evidence_sentences": [
+    "Here, we have localized the type 1 diabetes (T1D) association in the interleukin 2 receptor alpha (IL2RA) gene region to two independent groups of SNPs, spanning overlapping regions of 14 and 40 kb, encompassing IL2RA intron 1 and the 5\u2032 regions of IL2RA and RBM17 (odds ratio = 2.04, 95% confidence interval = 1.70\u20132.45; P = 1.92 \u00d7 10\u221228; control frequency = 0.635).",
+    "Furthermore, we have associated IL2RA T1D susceptibility genotypes with lower circulating levels of the biomarker, soluble IL-2RA (P = 6.28 \u00d7 10\u221228), suggesting that an inherited lower immune responsiveness predisposes to T1D."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13940200",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.4,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

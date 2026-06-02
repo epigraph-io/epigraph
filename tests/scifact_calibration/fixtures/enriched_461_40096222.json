@@ -1,0 +1,19 @@
+{
+  "scifact_id": 461,
+  "claim": "Genetic deletion of JAM-A increases gut permeability.",
+  "evidence_sentences": [
+    "Mice lacking junctional adhesion molecule A (JAM-A, encoded by F11r) exhibit enhanced intestinal epithelial permeability, bacterial translocation, and elevated colonic lymphocyte numbers, yet do not develop colitis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "40096222",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

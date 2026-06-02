@@ -1,0 +1,9 @@
+# Append into the VM Caddyfile (Caddy listens on :80; the VPC firewall
+# blocks direct container ports -- see memory feedback_caddy_proxy).
+# Assumes the nli container is reachable at nli:8000 (compose service name)
+# or 127.0.0.1:8000 (host-run). NLI_SERVICE_URL for the Rust client is then
+# http://<vm-host>/nli (or http://localhost/nli on-box).
+
+handle_path /nli* {
+    reverse_proxy 127.0.0.1:8000
+}

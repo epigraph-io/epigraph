@@ -1,0 +1,24 @@
+{
+  "scifact_id": 965,
+  "claim": "Prescribed exercise training improves quality of life.",
+  "evidence_sentences": [
+    "At 3 months, usual care plus exercise training led to greater improvement in the KCCQ overall summary score (mean, 5.21; 95% confidence interval, 4.42 to 6.00) compared with usual care alone (3.28; 95% confidence interval, 2.48 to 4.09).",
+    "After 3 months, there were no further significant changes in KCCQ score for either group (P = .85 for the difference between slopes), resulting in a sustained, greater improvement overall for the exercise group (P < .001).",
+    "CONCLUSIONS Exercise training conferred modest but statistically significant improvements in self-reported health status compared with usual care without training."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "40817021",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "usual care plus exercise training",
+      "usual care alone",
+      "3-month intervention period"
+    ],
+    "evidence_type": "statistical"
+  }
+}

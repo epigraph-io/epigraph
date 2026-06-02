@@ -1,0 +1,23 @@
+{
+  "scifact_id": 394,
+  "claim": "Excess gestational weight gain is associated with obesity-related pregnancy outcomes.",
+  "evidence_sentences": [
+    "Interventions were associated with a reduced the risk of pre-eclampsia (0.74, 0.60 to 0.92) and shoulder dystocia (0.39, 0.22 to 0.70), with no significant effect on other critically important outcomes.",
+    "CONCLUSIONS Dietary and lifestyle interventions in pregnancy can reduce maternal gestational weight gain and improve outcomes for both mother and baby.",
+    "Among the interventions, those based on diet are the most effective and are associated with reductions in maternal gestational weight gain and improved obstetric outcomes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11360768",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "dietary interventions in pregnancy",
+      "lifestyle interventions in pregnancy"
+    ],
+    "evidence_type": "statistical"
+  }
+}

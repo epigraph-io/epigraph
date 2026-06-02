@@ -1,0 +1,24 @@
+{
+  "scifact_id": 1073,
+  "claim": "Sepsis related mortality has risen from 2009 to 2014.",
+  "evidence_sentences": [
+    "In-hospital mortality using clinical criteria declined (\u22123.3%/y [95% CI, \u22125.6% to \u22121.0%], P = .004), but there was no significant change in the combined outcome of death or discharge to hospice (\u22121.3%/y [95% CI, \u22123.2% to 0.6%], P = .19).",
+    "Conclusions and Relevance In clinical data from 409 hospitals, sepsis was present in 6% of adult hospitalizations, and in contrast to claims-based analyses, neither the incidence of sepsis nor the combined outcome of death or discharge to hospice changed significantly between 2009-2014."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "4824840",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "409 hospitals",
+      "adult hospitalizations",
+      "2009-2014",
+      "clinical criteria"
+    ],
+    "evidence_type": "statistical"
+  }
+}

@@ -9,7 +9,7 @@
 use crate::matching::scorer::MatchFeatures;
 use crate::matching::verifier::{map_relationship, Verdict};
 use epigraph_db::repos::match_candidate::MatchCandidateRepo;
-use sqlx::types::Json;
+use epigraph_db::EdgeRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -54,6 +54,19 @@ impl Policy {
         // doesn't accept these as args yet; we patch them in below.
         let features_json = serde_json::to_value(f)?;
 
+        // `auto_promote` gates BOTH the edge write (below) AND whether the
+        // candidate is committed (`promoted`) or staged for human review
+        // (`pending`). Before this, `auto_promote=false` left the row as
+        // `promoted` with no edge — a half-state — and the `pending` review
+        // queue (`decide_match_candidate`, `MatchCandidateRepo::list_pending`,
+        // the API `pending[]` array) had no producer at all, so the whole
+        // human-review surface was dead in normal operation.
+        let promote_status = if self.auto_promote {
+            "promoted"
+        } else {
+            "pending"
+        };
+
         match action {
             PolicyAction::AutoPromote => {
                 let id = self
@@ -63,7 +76,7 @@ impl Policy {
                         hi,
                         f.score,
                         features_json,
-                        "promoted",
+                        promote_status,
                         Some(self.run_id),
                     )
                     .await?;
@@ -83,7 +96,7 @@ impl Policy {
                         hi,
                         f.score,
                         features_json,
-                        "promoted",
+                        promote_status,
                         Some(self.run_id),
                     )
                     .await?;
@@ -136,11 +149,12 @@ impl Policy {
         Ok(())
     }
 
-    /// Insert a claim→claim edge, skipping if the same (source, target,
-    /// relationship) triple already exists. The unique index
-    /// `idx_edges_unique_triple_non_authored` (migration 108) covers this for
-    /// CORROBORATES/contradicts; we still do an explicit existence check so
-    /// we don't depend on partial-index ON-CONFLICT inference quirks.
+    /// Insert a claim→claim edge, skipping if the same relationship already
+    /// connects the two claims in either direction. Delegates the dedup SQL to
+    /// [`EdgeRepository::create_symmetric_if_absent`] so the bidirectional
+    /// `WHERE NOT EXISTS` form lives in one place. Migrations 017/018 dropped
+    /// the unique triple index, so the explicit existence check (not
+    /// `ON CONFLICT`) is what prevents duplicates on re-run.
     async fn write_edge(
         &self,
         a: Uuid,
@@ -159,23 +173,7 @@ impl Policy {
             "verifier_rationale": v.map(|x| &x.rationale),
             "source":             "cross_source_matcher",
         });
-        sqlx::query(
-            "INSERT INTO edges (source_id, source_type, target_id, target_type,
-                                relationship, properties)
-             SELECT $1, 'claim', $2, 'claim', $3, $4
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM edges
-                 WHERE ((source_id = $1 AND target_id = $2)
-                     OR (source_id = $2 AND target_id = $1))
-                   AND relationship = $3
-             )",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .bind(Json(props))
-        .execute(&self.pool)
-        .await?;
+        EdgeRepository::create_symmetric_if_absent(&self.pool, a, b, relationship, props).await?;
         Ok(())
     }
 }

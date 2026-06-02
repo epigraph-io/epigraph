@@ -81,6 +81,16 @@ path = "src/bin/reembed.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "decompose_claims"
+path = "src/bin/decompose_claims.rs"
+required-features = ["db"]
+
+[[bin]]
+name = "embed_backfill"
+path = "src/bin/embed_backfill.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "cross_source_sweep"
 path = "src/bin/cross_source_sweep.rs"
 required-features = ["genai"]

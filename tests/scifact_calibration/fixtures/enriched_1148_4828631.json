@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1148,
+  "claim": "Ten percent (10%) of kidney cancers in the UK are attributable to excess weight.",
+  "evidence_sentences": [
+    "Assuming causality, 41% of uterine and 10% or more of gallbladder, kidney, liver, and colon cancers could be attributable to excess weight."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4828631",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

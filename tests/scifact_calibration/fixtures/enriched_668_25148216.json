@@ -1,0 +1,22 @@
+{
+  "scifact_id": 668,
+  "claim": "Klf4 is important for proper myeloid cell differentiation.",
+  "evidence_sentences": [
+    "Several members of the Kruppel-like factor (KLF) family of transcription factors play important roles in differentiation, survival, and trafficking of blood and immune cell types.",
+    "Thus, our in vivo loss-of-function studies demonstrate that KLF4, previously shown to mediate proinflammatory signaling in human macrophages in vitro, is essential for differentiation of mouse inflammatory monocytes, and is involved in the differentiation of resident monocytes.",
+    "In addition, inducible expression of KLF4 in the HL60 human acute myeloid leukemia cell line stimulated monocytic differentiation and enhanced 12-O-tetradecanoylphorbol 13-acetate induced macrophage differentiation, but blocked all-trans-retinoic acid induced granulocytic differentiation of HL60 cells.",
+    "The inflammation-selective effects of loss-of-KLF4 and the gain-of-KLF4-induced monocytic differentiation in HL60 cells identify KLF4 as a key regulator of monocytic differentiation and a potential target for translational immune modulation."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "25148216",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

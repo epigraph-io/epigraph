@@ -1,0 +1,25 @@
+{
+  "scifact_id": 152,
+  "claim": "B cells go though plasmablast differentiation and antibody production by continuous expression of EBI2.",
+  "evidence_sentences": [
+    "Here, we show that expression of the orphan G protein-coupled receptor Epstein-Barr virus-induced gene 2 (EBI2, also known as GPR183) by activated B cells was essential for their movement to extrafollicular sites and induction of early plasmablast responses.",
+    "EBI2 therefore provides a previously uncharacterized dimension to B cell migration that is crucial for coordinating rapid versus long-term antibody responses."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "15488881",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.72,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "EBI2",
+      "GPR183"
+    ],
+    "conditions": [
+      "activated B cells",
+      "extrafollicular sites"
+    ],
+    "evidence_type": "empirical"
+  }
+}

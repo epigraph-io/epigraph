@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1065,
+  "claim": "Satellite cell dysfunction is a key factor in sarcopenia development.",
+  "evidence_sentences": [
+    "A detailed analysis of multiple muscles harvested at various time points during aging in different cohorts of these mice showed that the muscles were of normal size, despite low regenerative capacity, but did have increased fibrosis.",
+    "These results suggest that lifelong reduction of satellite cells neither accelerated nor exacerbated sarcopenia and that satellite cells did not contribute to the maintenance of muscle size or fiber type composition during aging, but that their loss may contribute to age-related muscle fibrosis."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "20418809",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

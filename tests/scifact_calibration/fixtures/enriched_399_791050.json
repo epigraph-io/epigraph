@@ -1,0 +1,24 @@
+{
+  "scifact_id": 399,
+  "claim": "Exposure to fine particulate air pollution is relate to anxiety prevalence.",
+  "evidence_sentences": [
+    "Significantly increased odds of high anxiety symptoms were observed with higher exposure to PM2.5 for multiple averaging periods (for example, odds ratio per 10 \u00b5g/m(3) increase in prior one month average PM2.5: 1.12, 95% confidence interval 1.06 to 1.19; in prior 12 month average PM2.5: 1.15, 1.06 to 1.26).",
+    "CONCLUSIONS Exposure to fine particulate matter (PM2.5) was associated with high symptoms of anxiety, with more recent exposures potentially more relevant than more distant exposures."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "791050",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "PM2.5 exposure",
+      "one month averaging period",
+      "12 month averaging period",
+      "10 \u00b5g/m\u00b3 increment"
+    ],
+    "evidence_type": "statistical"
+  }
+}

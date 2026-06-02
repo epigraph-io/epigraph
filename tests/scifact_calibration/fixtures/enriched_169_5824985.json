@@ -1,0 +1,19 @@
+{
+  "scifact_id": 169,
+  "claim": "Bariatric surgery reduces postmenopausal breast cancer.",
+  "evidence_sentences": [
+    "No association was detected between bariatric surgery and fractures, cancer, or stroke."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "5824985",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

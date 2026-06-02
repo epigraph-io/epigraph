@@ -1,0 +1,26 @@
+{
+  "scifact_id": 883,
+  "claim": "Omnivores produce more trimethylamine N-oxide from dietary I-carnitine than vegans.",
+  "evidence_sentences": [
+    "Omnivorous human subjects produced more TMAO than did vegans or vegetarians following ingestion of L-carnitine through a microbiota-dependent mechanism."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "14803797",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.9,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "L-carnitine",
+      "trimethylamine N-oxide"
+    ],
+    "conditions": [
+      "omnivorous human subjects",
+      "vegans",
+      "vegetarians",
+      "microbiota-dependent mechanism"
+    ],
+    "evidence_type": "empirical"
+  }
+}

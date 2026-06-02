@@ -96,6 +96,21 @@ pub struct RecallWithContextParams {
     /// [`MAX_CANDIDATE_POOL`](epigraph_engine::diverse_retrieval::MAX_CANDIDATE_POOL)
     /// (1000) to keep the matrix bounded. Ignored when `diverse=false`.
     pub candidate_pool: Option<u32>,
+    /// When `true`, widen the flat-ANN candidate pool and re-rank it with a
+    /// cross-encoder before structural enrichment. Degrades to plain flat ANN
+    /// (a warn, not an error) when no `RERANK_API_KEY` is configured. Default
+    /// `false`. Independent of `diverse`; if both set, rerank runs on the
+    /// diverse selection's output.
+    pub rerank: Option<bool>,
+    /// Pool-widening multiplier for `rerank`. Final pool = `limit *
+    /// rerank_pool_factor`, clamped to `[limit, 200]`. Default 5. Ignored when
+    /// `rerank=false`.
+    pub rerank_pool_factor: Option<u32>,
+    /// When `true` (and `rerank=true`), run the MiniCheck-style groundedness
+    /// gate and DROP passages judged ungrounded. Requires a registered
+    /// `LlmProvider`; degrades to annotate-only when none is active. Default
+    /// `false`.
+    pub groundedness_gate: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +125,13 @@ pub struct RecallHit {
     pub paragraph_id: Uuid,
     pub paragraph_content: String,
     pub similarity: f64,
+    /// Cross-encoder relevance score; `None` when rerank was off/skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f64>,
+    /// Groundedness verdict (`"grounded"`/`"ungrounded"`); `None` when the gate
+    /// was off/skipped. Surfaced alongside, NOT instead of, belief/truth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<epigraph_engine::rerank::Groundedness>,
     pub truth_value: f64,
     pub paper: PaperMeta,
     pub section: Option<SectionMeta>,
@@ -290,7 +312,20 @@ async fn recall_with_context_post_embed(
     // paper_doi_filter into candidates_in_themes_at_dim or reject the
     // combination at param-parse time.
     let diverse = params.diverse.unwrap_or(false);
-    let raw_hits = if diverse {
+    // Stage 3 sizing. When rerank is on, OVER-FETCH the flat candidate pool
+    // (`want * pool_factor`, clamped to [want, 200]) so the cross-encoder has a
+    // surplus to re-rank before truncation; otherwise fetch exactly `want`.
+    // This is the seed's root-cause fix: flat recall previously fetched only
+    // `limit`, leaving nothing to re-rank.
+    let want = limit as usize;
+    let pool = if params.rerank.unwrap_or(false) {
+        let factor = params.rerank_pool_factor.unwrap_or(5).max(1) as usize;
+        (want.saturating_mul(factor)).clamp(want, 200)
+    } else {
+        want
+    };
+    let flat_limit = pool as i64;
+    let mut raw_hits = if diverse {
         let max_themes = params.max_themes.unwrap_or(5).clamp(1, 50) as i32;
         let alpha = params.diversity_weight.unwrap_or(0.4);
         // Clamp candidate_pool at the request boundary so the caller sees
@@ -327,7 +362,7 @@ async fn recall_with_context_post_embed(
                 &server.pool,
                 pgvec,
                 centroid_dim,
-                i64::from(limit),
+                flat_limit,
                 params.paper_doi_filter.as_deref(),
             )
             .await
@@ -349,7 +384,7 @@ async fn recall_with_context_post_embed(
             &server.pool,
             pgvec,
             centroid_dim,
-            i64::from(limit),
+            flat_limit,
             params.paper_doi_filter.as_deref(),
         )
         .await
@@ -368,6 +403,102 @@ async fn recall_with_context_post_embed(
         });
     }
 
+    // Stage 4.5: cross-encoder rerank + optional groundedness gate over the
+    // widened pool. Reorders by RELEVANCE and truncates to `want` BEFORE the
+    // expensive fetch_batched_context. Belief/truth fields are untouched here:
+    // rerank_score/verdict are surfaced as SEPARATE metadata.
+    let mut rerank_meta: std::collections::HashMap<
+        Uuid,
+        (Option<f64>, Option<epigraph_engine::rerank::Groundedness>),
+    > = std::collections::HashMap::new();
+    if params.rerank.unwrap_or(false) {
+        let ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
+        let contents = epigraph_db::ClaimRepository::contents_by_ids(&server.pool, &ids)
+            .await
+            .map_err(|e| internal_error(format!("rerank content fetch: {e}")))?;
+        let cands: Vec<epigraph_engine::rerank::RerankCandidate> = raw_hits
+            .iter()
+            .filter_map(|h| {
+                contents
+                    .get(&h.claim_id)
+                    .map(|c| epigraph_engine::rerank::RerankCandidate {
+                        id: h.claim_id,
+                        content: c.clone(),
+                    })
+            })
+            .collect();
+        match epigraph_engine::rerank::build_rerank_client_from_env() {
+            Some(Ok(client)) => {
+                use epigraph_engine::rerank::RerankClient;
+                match client.rerank(&params.query, &cands).await {
+                    Ok(scores) => {
+                        // No BetP belief is carried on this flat path yet, so
+                        // belief stays `None`; the merge preserves it untouched.
+                        let inputs: Vec<(Uuid, f64, Option<f64>)> = raw_hits
+                            .iter()
+                            .map(|h| (h.claim_id, h.similarity, None))
+                            .collect();
+                        let mut merged =
+                            epigraph_engine::rerank::merge_rerank_scores(&inputs, &scores);
+                        // Optional groundedness gate over the survivors (top `want`).
+                        if params.groundedness_gate.unwrap_or(false) {
+                            let llm = epigraph_interfaces::default_llm_provider();
+                            if llm.is_active() {
+                                let top: Vec<epigraph_engine::rerank::RerankCandidate> = merged
+                                    .iter()
+                                    .take(want)
+                                    .filter_map(|h| {
+                                        contents.get(&h.id).map(|c| {
+                                            epigraph_engine::rerank::RerankCandidate {
+                                                id: h.id,
+                                                content: c.clone(),
+                                            }
+                                        })
+                                    })
+                                    .collect();
+                                let gate = epigraph_engine::rerank::GroundednessGate::new(&*llm);
+                                if let Ok(verdicts) = gate.judge(&params.query, &top).await {
+                                    let vmap: std::collections::HashMap<
+                                        Uuid,
+                                        epigraph_engine::rerank::Groundedness,
+                                    > = top.iter().map(|c| c.id).zip(verdicts).collect();
+                                    merged = epigraph_engine::rerank::apply_groundedness(
+                                        merged, &vmap, true,
+                                    );
+                                }
+                            } else {
+                                // KNOWN LIMITATION: the deployed epigraph-mcp binary
+                                // registers no LlmProvider (epigraph-cli's AnthropicClient
+                                // cannot be reused — cli depends on mcp), so the gate is
+                                // inert here and annotates nothing. Follow-up: register a
+                                // provider directly in mcp `main`.
+                                tracing::warn!(
+                                    "groundedness_gate requested but no active LlmProvider; annotating only"
+                                );
+                            }
+                        }
+                        merged.truncate(want);
+                        for h in &merged {
+                            rerank_meta.insert(h.id, (h.rerank_score, h.verdict));
+                        }
+                        let order: Vec<Uuid> = merged.iter().map(|h| h.id).collect();
+                        let by_id: std::collections::HashMap<Uuid, epigraph_db::ClaimEmbeddingHit> =
+                            raw_hits.into_iter().map(|h| (h.claim_id, h)).collect();
+                        raw_hits = order
+                            .into_iter()
+                            .filter_map(|id| by_id.get(&id).cloned())
+                            .collect();
+                    }
+                    Err(e) => tracing::warn!("rerank failed, using flat order: {e}"),
+                }
+            }
+            _ => tracing::warn!("rerank requested but RERANK_API_KEY absent/disabled; flat order"),
+        }
+    }
+    // Cap to `want` even when rerank is off (or skipped), since the flat pool
+    // may have been widened above.
+    raw_hits.truncate(want);
+
     // Stage 5: batch context fetches.
     let paragraph_ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
     let ctx = fetch_batched_context(
@@ -383,6 +514,10 @@ async fn recall_with_context_post_embed(
     let mut results = Vec::with_capacity(raw_hits.len());
     for hit in raw_hits {
         let paragraph_id = hit.claim_id;
+        let (rerank_score, verdict) = rerank_meta
+            .get(&paragraph_id)
+            .copied()
+            .unwrap_or((None, None));
         let core = match ctx.paragraph_meta.get(&paragraph_id) {
             Some(c) => c,
             None => continue, // paragraph deleted between kNN and batch fetch
@@ -444,6 +579,8 @@ async fn recall_with_context_post_embed(
             paragraph_id,
             paragraph_content: core.content.clone(),
             similarity: hit.similarity,
+            rerank_score,
+            verdict,
             truth_value: core.truth_value,
             paper,
             section: ctx.section_meta.get(&paragraph_id).cloned(),

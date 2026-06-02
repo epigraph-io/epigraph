@@ -1,0 +1,26 @@
+{
+  "scifact_id": 241,
+  "claim": "Cellular clocks are associated with mitosis timing in NIH 3T3 cells.",
+  "evidence_sentences": [
+    "The analysis of thousands of circadian cycles in dividing cells clearly indicated that both oscillators tick in a 1:1 mode-locked state, with cell divisions occurring tightly 5 h before the peak in circadian Rev-Erb\u03b1-YFP reporter expression."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2212067",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [
+      "circadian Rev-Erb\u03b1-YFP reporter"
+    ],
+    "reagents_involved": [
+      "Rev-Erb\u03b1-YFP"
+    ],
+    "conditions": [
+      "dividing cells",
+      "1:1 mode-locked state",
+      "cell divisions 5 h before peak in circadian reporter expression"
+    ],
+    "evidence_type": "empirical"
+  }
+}

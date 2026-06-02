@@ -1,0 +1,25 @@
+{
+  "scifact_id": 721,
+  "claim": "Lupus-prone mice infected with curliproducing bacteria have higher autoantibody titers compared to controls.",
+  "evidence_sentences": [
+    "We also found that the infection of lupus-prone mice with curli-producing bacteria triggered higher autoantibody titers compared to curli-deficient bacteria."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1834762",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "curli-producing bacteria",
+      "curli-deficient bacteria"
+    ],
+    "conditions": [
+      "lupus-prone mice",
+      "infection with curli-producing bacteria",
+      "infection with curli-deficient bacteria"
+    ],
+    "evidence_type": "empirical"
+  }
+}

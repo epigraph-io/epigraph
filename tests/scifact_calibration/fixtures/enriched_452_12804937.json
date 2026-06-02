@@ -1,0 +1,18 @@
+{
+  "scifact_id": 452,
+  "claim": "Gene expression does not vary appreciably across genetically identical cells.",
+  "evidence_sentences": [
+    "Gene expression is a fundamentally stochastic process, with randomness in transcription and translation leading to cell-to-cell variations in mRNA and protein levels."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "12804937",
+  "enrichment": {
+    "methodology": "deductive_logic",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "logical"
+  }
+}

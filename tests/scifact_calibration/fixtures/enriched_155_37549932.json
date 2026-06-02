@@ -1,0 +1,23 @@
+{
+  "scifact_id": 155,
+  "claim": "BCL-2 activation antagonizes the apoptotic effects of c-Myc.",
+  "evidence_sentences": [
+    "Eliminating BCL-2 yielded rapid loss of leukemic cells and significantly prolonged survival, formally validating BCL-2 as a rational target for cancer therapy."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "37549932",
+  "enrichment": {
+    "methodology": "deductive_logic",
+    "confidence": 0.4,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "BCL-2"
+    ],
+    "conditions": [
+      "BCL-2 elimination",
+      "leukemic cell survival assay"
+    ],
+    "evidence_type": "empirical"
+  }
+}

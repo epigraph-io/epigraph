@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1341,
+  "claim": "Ultrasound guidance significantly reduces the number of traumatic procedures when attempting needle insertion.",
+  "evidence_sentences": [
+    "Ultrasound imaging reduced the risk of failed procedures (risk ratio 0.21 (95% confidence interval 0.10 to 0.43), P<0.001).",
+    "Risk reduction was similar when subgroup analysis was performed for lumbar punctures (risk ratio 0.19 (0.07 to 0.56), P=0.002) or epidural catheterisations (0.23 (0.09 to 0.60), P=0.003).",
+    "Ultrasound imaging also significantly reduced the risk of traumatic procedures (risk ratio 0.27 (0.11 to 0.67), P=0.005), the number of insertion attempts (mean difference -0.44 (-0.64 to -0.24), P<0.001), and the number of needle redirections (mean difference -1.00 (-1.24 to -0.75), P<0.001).   \n",
+    "CONCLUSIONS Ultrasound imaging can reduce the risk of failed or traumatic lumbar punctures and epidural catheterisations, as well as the number of needle insertions and redirections."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "15482274",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [
+      "ultrasound imaging"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "lumbar punctures",
+      "epidural catheterisations"
+    ],
+    "evidence_type": "statistical"
+  }
+}

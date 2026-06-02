@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1023,
+  "claim": "Recognition of start codons depends on the translation initiation factor IF3.",
+  "evidence_sentences": [
+    "IF3 and tRNA undergo large conformational changes to facilitate the accommodation of the formylmethionyl-tRNA (fMet-tRNA(fMet)) into the P site for start codon recognition."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16927286",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

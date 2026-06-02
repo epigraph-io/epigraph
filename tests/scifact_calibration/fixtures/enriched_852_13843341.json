@@ -1,0 +1,20 @@
+{
+  "scifact_id": 852,
+  "claim": "Non-invasive ventilation use should be decreased if there is inadequate response to conventional treatment.",
+  "evidence_sentences": [
+    "Modelling of these data indicates that a typical UK hospital providing a non-invasive ventilation service will avoid six deaths and three to nine admissions to intensive care units per year, with an associated cost reduction of 12000-53000 pounds sterling per year.   \n",
+    "CONCLUSIONS Non-invasive ventilation is a highly cost effective treatment that both reduced total costs and improved mortality in hospital."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "13843341",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.75,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

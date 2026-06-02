@@ -1,0 +1,20 @@
+{
+  "scifact_id": 972,
+  "claim": "Primary cervical cancer screening with HPV detection has lower longitudinal sensitivity than conventional cytology to detect cervical intraepithelial neoplasia grade 2.",
+  "evidence_sentences": [
+    "BACKGROUND Screening for cervical cancer based on testing for human papillomavirus (HPV) increases the sensitivity of detection of high-grade (grade 2 or 3) cervical intraepithelial neoplasia, but whether this gain represents overdiagnosis or protection against future high-grade cervical epithelial neoplasia or cervical cancer is unknown.   \n",
+    "CONCLUSIONS The addition of an HPV test to the Pap test to screen women in their mid-30s for cervical cancer reduces the incidence of grade 2 or 3 cervical intraepithelial neoplasia or cancer detected by subsequent screening examinations."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "46695481",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

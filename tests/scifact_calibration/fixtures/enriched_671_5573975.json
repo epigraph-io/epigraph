@@ -1,0 +1,25 @@
+{
+  "scifact_id": 671,
+  "claim": "Knockout proximal tubule-specific deletion of the BMP receptor Alk3 causes fibrosis.",
+  "evidence_sentences": [
+    "We also found that its deletion in the tubular epithelium leads to enhanced TGF-\u03b21-Smad family member 3 (Smad3) signaling, epithelial damage and fibrosis, suggesting a protective role for Alk3-mediated signaling in the kidney."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5573975",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.88,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "TGF-\u03b21",
+      "Smad3",
+      "Alk3"
+    ],
+    "conditions": [
+      "proximal tubule-specific deletion",
+      "tubular epithelium deletion"
+    ],
+    "evidence_type": "empirical"
+  }
+}

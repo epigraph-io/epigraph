@@ -1,0 +1,23 @@
+{
+  "scifact_id": 378,
+  "claim": "Energy balance requires hypothalamic glutamate neurotransmission.",
+  "evidence_sentences": [
+    "Thus, glutamate release from VMH neurons is an important component of the neurocircuitry that functions to prevent hypoglycemia."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11886686",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.45,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "glutamate"
+    ],
+    "conditions": [
+      "VMH neurons",
+      "hypoglycemia prevention"
+    ],
+    "evidence_type": "empirical"
+  }
+}

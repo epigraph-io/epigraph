@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1050,
+  "claim": "Risedronate increases risk of vertebral and non-vertebral fractures.",
+  "evidence_sentences": [
+    "Treatment with 5 mg/d of risedronate, compared with placebo, decreased the cumulative incidence of new vertebral fractures by 41 % (95% confidence interval [CI], 18%-58%) over 3 years (11.3 % vs 16.3%; P= .003).",
+    "The cumulative incidence of nonvertebral fractures over 3 years was reduced by 39% (95% CI, 6%-61 %) (5.2 % vs 8.4%; P = .02)."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "19878070",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "scifact_id": 873,
+  "claim": "Obesity is determined solely by environmental factors.",
+  "evidence_sentences": [
+    "In full siblings body mass index (kg/m2) significantly increased with weight of the adoptees.",
+    "Body mass index of the half siblings showed a steady but weaker increase across the four weight groups of adoptees.",
+    "In contrast with the findings in half siblings and (previously) the natural parents there was a striking, significant increase in body mass index between full siblings of overweight and obese adoptees.",
+    "The degree of fatness in adults living in the same environment appears to be influenced by genetic factors independent of sex, which may include polygenic as well as major gene effects on obesity."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "1180972",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "adoption study design",
+      "full siblings vs half siblings comparison",
+      "four weight groups of adoptees"
+    ],
+    "evidence_type": "statistical"
+  }
+}

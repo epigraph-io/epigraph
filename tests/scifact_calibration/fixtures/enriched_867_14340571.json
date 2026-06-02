@@ -1,0 +1,19 @@
+{
+  "scifact_id": 867,
+  "claim": "Oat tolerant coeliac patients may have oat specific inflammatory cells in their small bowel mucosa.",
+  "evidence_sentences": [
+    "We established oats-avenin-specific and -reactive intestinal T-cell lines from these three patients, as well as from two other patients who appeared to tolerate oats."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "14340571",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

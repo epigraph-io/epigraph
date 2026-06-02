@@ -1,0 +1,21 @@
+{
+  "scifact_id": 69,
+  "claim": "Activation of PPM1D enhances p53 function.",
+  "evidence_sentences": [
+    "PPM1D mutations were mutually exclusive with TP53 mutations in BSG and attenuated p53 activation in vitro.",
+    "PPM1D mutations were truncating alterations in exon 6 that enhanced the ability of PPM1D to suppress the activation of the DNA damage response checkpoint protein CHK2."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "5956380",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "in vitro"
+    ],
+    "evidence_type": "empirical"
+  }
+}

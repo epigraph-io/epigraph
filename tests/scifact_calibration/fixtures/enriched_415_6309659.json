@@ -1,0 +1,19 @@
+{
+  "scifact_id": 415,
+  "claim": "Female carriers of the Apolipoprotein E4 (APOE4) allele have increased risk for dementia.",
+  "evidence_sentences": [
+    "Risk of dementia associated with a longer reproductive period was most pronounced in APOE epsilon4 carriers (adjusted RR for >39 reproductive years compared with <34 reproductive years, 4.20 [95% CI, 1.97-8.92] for dementia and 3.42 [95% CI, 1.51-7.75] for AD), whereas in noncarriers, no clear association with dementia or AD was observed.   \n"
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6309659",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

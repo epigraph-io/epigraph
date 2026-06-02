@@ -1,0 +1,24 @@
+{
+  "scifact_id": 613,
+  "claim": "Increased microtubule acetylation repairs LRRK2 Roc-COR domain mutation induced locomotor deficits.",
+  "evidence_sentences": [
+    "In vitro, increasing microtubule acetylation using deacetylase inhibitors or the tubulin acetylase \u03b1TAT1 prevents association of mutant LRRK2 with microtubules, and the deacetylase inhibitor trichostatin A (TSA) restores axonal transport."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9638032",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.6,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "deacetylase inhibitors",
+      "trichostatin A (TSA)",
+      "\u03b1TAT1"
+    ],
+    "conditions": [
+      "in vitro"
+    ],
+    "evidence_type": "empirical"
+  }
+}

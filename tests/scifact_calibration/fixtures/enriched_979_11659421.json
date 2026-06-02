@@ -1,0 +1,20 @@
+{
+  "scifact_id": 979,
+  "claim": "Progerin induces premature aging in stem cells.",
+  "evidence_sentences": [
+    "We found that expression of progerin in iPSC-derived fibroblasts and neurons induces multiple aging-related markers and characteristics, including dopamine-specific phenotypes such as neuromelanin accumulation.",
+    "Thus, our study suggests that progerin-induced aging can be used to reveal late-onset age-related disease features in hiPSC-based disease models."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11659421",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

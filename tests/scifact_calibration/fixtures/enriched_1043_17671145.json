@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1043,
+  "claim": "Retinoic acid receptor-related orphan receptor gamma (ROR\u03b3) is a therapeutic target for castration-resistant prostate cancer (CRPC)",
+  "evidence_sentences": [
+    "Finally, ROR-\u03b3 antagonists suppressed tumor growth in multiple AR-expressing, but not AR-negative, xenograft PCa models, and they effectively sensitized CRPC tumors to enzalutamide, without overt toxicity, in mice.",
+    "Taken together, these results establish ROR-\u03b3 as a key player in CRPC by acting upstream of AR and as a potential therapeutic target for advanced PCa."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "17671145",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

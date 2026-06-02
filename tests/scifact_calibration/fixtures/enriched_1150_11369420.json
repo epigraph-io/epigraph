@@ -1,0 +1,25 @@
+{
+  "scifact_id": 1150,
+  "claim": "Tetraspanin-3 is a causative factor in the development of acute myelogenous leukemia",
+  "evidence_sentences": [
+    "However, Tspan3 deletion impaired leukemia stem cell self-renewal and disease propagation and markedly improved survival in mouse models of AML.",
+    "Additionally, Tspan3 inhibition blocked growth of AML patient samples, suggesting that Tspan3 is also important in human disease.",
+    "These identify Tspan3 as an important regulator of aggressive leukemias and highlight a role for Tspan3 in oncogenesis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11369420",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "mouse models of AML",
+      "Tspan3 deletion",
+      "Tspan3 inhibition",
+      "AML patient samples"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "scifact_id": 548,
+  "claim": "IL-6 signaling plays a major role in atherosclerotic cardiovascular disease.",
+  "evidence_sentences": [
+    "By contrast, for every copy of 358Ala inherited, mean concentration of IL6R increased by 34\u00b73% (95% CI 30\u00b74-38\u00b72) and of interleukin 6 by 14\u00b76% (10\u00b77-18\u00b74), and mean concentration of C-reactive protein was reduced by 7\u00b75% (5\u00b79-9\u00b71) and of fibrinogen by 1\u00b70% (0\u00b77-1\u00b73).",
+    "For every copy of 358Ala inherited, risk of coronary heart disease was reduced by 3\u00b74% (1\u00b78-5\u00b70).",
+    "INTERPRETATION Large-scale human genetic and biomarker data are consistent with a causal association between IL6R-related pathways and coronary heart disease.   \n"
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "18199839",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "interleukin 6",
+      "IL6R",
+      "C-reactive protein",
+      "fibrinogen"
+    ],
+    "conditions": [
+      "large-scale human genetic study",
+      "per-copy 358Ala inheritance analysis"
+    ],
+    "evidence_type": "statistical"
+  }
+}

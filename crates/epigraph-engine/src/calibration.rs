@@ -64,6 +64,14 @@ pub struct CalibrationConfig {
 
     /// Classifier decision thresholds (NEI, support, conflict).
     pub classifier_thresholds: ClassifierThresholds,
+
+    /// Split-conformal per-class nonconformity quantiles (issue: backlog
+    /// d5ba91a5). Optional: absent `[conformal]` parses to the default
+    /// (every quantile 1.0 -> include-always, i.e. the trivial coverage-1
+    /// set), so the set-valued classifier degrades to "return all classes"
+    /// rather than panicking when calibration.toml predates this feature.
+    #[serde(default)]
+    pub conformal: ConformalConfig,
 }
 
 /// Multiplicative locality factor for intra-source evidential BBAs.
@@ -92,6 +100,66 @@ pub struct ClassifierThresholds {
     pub support_threshold: f64,
     pub conflict_threshold: f64,
     pub has_opposing_threshold: f64,
+}
+
+/// Split-conformal calibration for set-valued classification.
+///
+/// `quantiles.<class>` is the calibrated nonconformity threshold q_c fit
+/// offline by `scripts/calibrate_conformal.py` over the labelled SciFact
+/// fixtures. The set-valued classifier includes class c iff its
+/// nonconformity score `score_c <= q_c`. With the conventional
+/// nonconformity score `score_c = 1 - BetP_c` (or `1 - theta` for NEI),
+/// this yields marginal (1 - alpha) coverage on the calibration
+/// distribution.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConformalConfig {
+    /// Target miscoverage rate the quantiles were fit at (informational;
+    /// the quantiles already encode it). 0.1 => 90% marginal coverage.
+    #[serde(default = "default_conformal_alpha")]
+    pub alpha: f64,
+    /// Per-class nonconformity quantiles q_c, keyed by the classifier's
+    /// label string (`supported` | `contradicted` | `not_enough_info`).
+    #[serde(default)]
+    pub quantiles: ConformalQuantiles,
+}
+
+/// Per-class conformal quantiles. Default 1.0 = include-always (trivial
+/// coverage-1 set), the safe degenerate value when `[conformal]` is absent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConformalQuantiles {
+    #[serde(default = "default_quantile")]
+    pub supported: f64,
+    #[serde(default = "default_quantile")]
+    pub contradicted: f64,
+    #[serde(default = "default_quantile")]
+    pub not_enough_info: f64,
+}
+
+fn default_conformal_alpha() -> f64 {
+    0.1
+}
+
+fn default_quantile() -> f64 {
+    1.0
+}
+
+impl Default for ConformalQuantiles {
+    fn default() -> Self {
+        Self {
+            supported: default_quantile(),
+            contradicted: default_quantile(),
+            not_enough_info: default_quantile(),
+        }
+    }
+}
+
+impl Default for ConformalConfig {
+    fn default() -> Self {
+        Self {
+            alpha: default_conformal_alpha(),
+            quantiles: ConformalQuantiles::default(),
+        }
+    }
 }
 
 // ── Implementation ──────────────────────────────────────────────────────────
@@ -293,6 +361,7 @@ impl CalibrationConfig {
                 conflict_threshold: 0.05,
                 has_opposing_threshold: 0.1,
             },
+            conformal: ConformalConfig::default(),
         }
     }
 

@@ -1,0 +1,20 @@
+{
+  "scifact_id": 903,
+  "claim": "PD-1 triggering on monocytes reduces IL-10 production by monocytes.",
+  "evidence_sentences": [
+    "Triggering of PD-1 expressed on monocytes by PD-L1 expressed on various cell types induced IL-10 production and led to reversible CD4+ T cell dysfunction.",
+    "We describe a new function for PD-1 whereby microbial products inhibit T cell expansion and function by upregulating PD-1 levels and IL-10 production by monocytes after binding of PD-1 by PD-L1."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "10648422",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

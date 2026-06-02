@@ -1,0 +1,19 @@
+{
+  "scifact_id": 208,
+  "claim": "CHEK2 is not associated with breast cancer.",
+  "evidence_sentences": [
+    "We genotyped these six tagSNPs in 1,577 postmenopausal breast cancer cases and 1,513 population controls, but found no convincing association between any common CHEK2 haplotype and breast cancer risk."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13519661",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

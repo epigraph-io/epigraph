@@ -1,0 +1,20 @@
+{
+  "scifact_id": 521,
+  "claim": "High-sensitivity cardiac troponin T (HSCT-T) dosage may not be diagnostic if the onset of symptoms occurs less than 3 hours before acute myocardial injury (AMI).",
+  "evidence_sentences": [
+    "However, this method should be part of a comprehensive triage strategy and may not be appropriate for patients who present less than three hours after symptom onset."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "34873974",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "symptom onset less than three hours"
+    ],
+    "evidence_type": "logical"
+  }
+}

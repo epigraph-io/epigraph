@@ -1,0 +1,27 @@
+{
+  "scifact_id": 1220,
+  "claim": "The generation of reactive oxygen species by activated oncogenes contributes to the increased genomic instability of leukaemia cells.",
+  "evidence_sentences": [
+    "The oncogenic BCR/ABL tyrosine kinase induces constitutive DNA damage in Philadelphia chromosome (Ph)-positive leukemia cells.",
+    "We find that BCR/ABL-induced reactive oxygen species (ROSs) cause chronic oxidative DNA damage resulting in double-strand breaks (DSBs) in S and G(2)/M cell cycle phases.",
+    "We propose that the following series of events may contribute to genomic instability of Ph-positive leukemias: BCR/ABL --> ROSs --> oxidative DNA damage --> DSBs in proliferating cells --> unfaithful HRR and NHEJ repair."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13023410",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.88,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "reactive oxygen species",
+      "BCR/ABL tyrosine kinase"
+    ],
+    "conditions": [
+      "S cell cycle phase",
+      "G2/M cell cycle phase",
+      "Philadelphia chromosome-positive leukemia cells"
+    ],
+    "evidence_type": "empirical"
+  }
+}
