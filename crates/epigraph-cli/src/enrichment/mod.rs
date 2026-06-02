@@ -5,4 +5,5 @@
 
 pub mod confidence;
 pub mod llm_client;
+pub mod nli_client;
 pub mod prompts;
