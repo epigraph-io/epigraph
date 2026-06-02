@@ -49,6 +49,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("query_claims_by_methodology", "claims:read"),
     ("query_paper", "claims:read"),
     ("query_triples", "claims:read"),
+    ("query_undecomposed_claims", "claims:read"),
     ("recall", "claims:read"),
     ("recall_with_context", "claims:read"),
     ("scoped_belief", "claims:read"),
