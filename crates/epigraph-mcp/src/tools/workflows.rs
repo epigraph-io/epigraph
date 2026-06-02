@@ -386,13 +386,11 @@ pub async fn find_workflow(
     server: &EpiGraphMcpFull,
     params: FindWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
-    let limit = params.limit.unwrap_or(5).clamp(1, 20);
-    let min_truth = params.min_truth.unwrap_or(0.3);
-
     // Generate embedding once — reused for both semantic search and behavioral
     // affinity. Failure here is non-fatal: we still want the ILIKE fallback to
-    // run (workflows commonly lack evidence embeddings, and offline embedders
-    // shouldn't blank the whole tool).
+    // run (offline embedders shouldn't blank the whole tool). The post-embed
+    // pipeline (extracted to mirror recall.rs's recall_with_context split) lets
+    // integration tests skip the OpenAI embedder via `__test_only`.
     let pgvec_opt = match server.embedder.generate(&params.goal).await {
         Ok(v) => Some(format_pgvector(&v)),
         Err(e) => {
@@ -401,11 +399,38 @@ pub async fn find_workflow(
         }
     };
 
-    // Semantic search via evidence embeddings (only when embedding is available).
+    find_workflow_post_embed(server, &params, pgvec_opt).await
+}
+
+/// Post-embedding pipeline: shared by `find_workflow` and the
+/// `__test_only::find_workflow_with_pgvec` entry point that lets integration
+/// tests skip the OpenAI embedder (no API key available in CI / sandbox).
+///
+/// Recomputes `limit`/`min_truth` from `params` internally (rather than taking
+/// them as args) so the public wrapper stays minimal and the two extraction
+/// sites cannot drift, mirroring recall.rs's wrapper pattern.
+async fn find_workflow_post_embed(
+    server: &EpiGraphMcpFull,
+    params: &FindWorkflowParams,
+    pgvec_opt: Option<String>,
+) -> Result<CallToolResult, McpError> {
+    let limit = params.limit.unwrap_or(5).clamp(1, 20);
+    let min_truth = params.min_truth.unwrap_or(0.3);
+
+    // Semantic search over claims.embedding (workflow vectors live on claims,
+    // not evidence; evidence.embedding is 100% empty in prod). Scoped to the
+    // "workflow" label so only workflow claims compete for the budget.
+    let workflow_tag = vec!["workflow".to_string()];
     let semantic_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
-        epigraph_db::EvidenceRepository::search_by_embedding(&server.pool, pgvec, limit * 3)
-            .await
-            .map_err(internal_error)?
+        ClaimRepository::search_by_embedding_scoped(
+            &server.pool,
+            pgvec,
+            limit * 3,
+            Some(&workflow_tag),
+            None,
+        )
+        .await
+        .map_err(internal_error)?
     } else {
         Vec::new()
     };
@@ -892,4 +917,24 @@ pub async fn deprecate_workflow(
         deprecated_ids,
         reason: params.reason,
     })
+}
+
+#[doc(hidden)]
+pub mod __test_only {
+    use super::{find_workflow_post_embed, EpiGraphMcpFull, FindWorkflowParams, McpError};
+    use rmcp::model::CallToolResult;
+
+    /// Integration-test entry point that skips the OpenAI embedder.
+    ///
+    /// Tests cannot call the real embedder (no API key in CI / sandbox),
+    /// so they pre-format a known pgvector literal and dispatch directly
+    /// into the post-embed pipeline. This is the same code that
+    /// `find_workflow` runs after `embedder.generate`.
+    pub async fn find_workflow_with_pgvec(
+        server: &EpiGraphMcpFull,
+        params: FindWorkflowParams,
+        pgvec: Option<String>,
+    ) -> Result<CallToolResult, McpError> {
+        find_workflow_post_embed(server, &params, pgvec).await
+    }
 }
