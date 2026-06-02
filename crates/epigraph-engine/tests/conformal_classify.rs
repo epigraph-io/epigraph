@@ -54,7 +54,10 @@ fn high_ignorance_includes_nei() {
 fn all_scores_above_quantile_yields_empty_set() {
     // Every betp/theta moderate so every score ~0.5 > tight quantiles 0.05.
     let set = classify_conformal(0.5, 0.5, 0.5, &cfg(0.05, 0.05, 0.05));
-    assert!(set.is_empty(), "expected abstention (empty set), got {set:?}");
+    assert!(
+        set.is_empty(),
+        "expected abstention (empty set), got {set:?}"
+    );
 }
 
 /// The default ConformalConfig (quantiles all 1.0 = include-always) is the
