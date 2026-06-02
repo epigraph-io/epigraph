@@ -5,12 +5,38 @@
 //! - refresh_token (all client types)
 //! - external provider grant types (registered via providers.toml; e.g. google_id_token, cloudflare_access_jwt)
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
+    Json,
+};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::ApiError;
 use crate::state::AppState;
+
+/// Parse a token request from either `application/x-www-form-urlencoded` — the OAuth 2.0
+/// standard body for the token endpoint (RFC 6749 §4.1.3), sent by claude.ai and other
+/// RFC 6749 / remote-MCP clients — or `application/json`, used by EpiGraph's own agents.
+/// Defaults to form-encoded when the Content-Type is absent, per the spec.
+#[cfg(feature = "db")]
+fn parse_token_request(headers: &HeaderMap, body: &[u8]) -> Result<TokenRequest, ApiError> {
+    let ct = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if ct.starts_with("application/json") {
+        serde_json::from_slice(body).map_err(|e| ApiError::BadRequest {
+            message: format!("invalid JSON token request: {e}"),
+        })
+    } else {
+        serde_urlencoded::from_bytes(body).map_err(|e| ApiError::BadRequest {
+            message: format!("invalid form-encoded token request: {e}"),
+        })
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct TokenRequest {
@@ -52,8 +78,10 @@ pub struct TokenResponse {
 #[cfg(feature = "db")]
 pub async fn token_endpoint(
     State(state): State<AppState>,
-    Json(req): Json<TokenRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
+    let req = parse_token_request(&headers, &body)?;
     match req.grant_type.as_str() {
         "client_credentials" => handle_client_credentials(&state, &req).await,
         "refresh_token" => handle_refresh_token(&state, &req).await,
@@ -74,7 +102,8 @@ pub async fn token_endpoint(
 #[cfg(not(feature = "db"))]
 pub async fn token_endpoint(
     State(_state): State<AppState>,
-    Json(_req): Json<TokenRequest>,
+    _headers: HeaderMap,
+    _body: Bytes,
 ) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
     Err(ApiError::ServiceUnavailable {
         service: "database required for OAuth2".to_string(),
