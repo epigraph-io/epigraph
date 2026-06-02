@@ -2457,7 +2457,11 @@ mod tests {
             !map.contains_key(&absent_id),
             "id with no matching row must be absent from the map"
         );
-        assert_eq!(map.len(), 1, "only the single current claim should be present");
+        assert_eq!(
+            map.len(),
+            1,
+            "only the single current claim should be present"
+        );
 
         // Empty input short-circuits to an empty map without touching the DB.
         let empty = ClaimRepository::contents_by_ids(&pool, &[]).await.unwrap();

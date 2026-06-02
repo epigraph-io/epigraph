@@ -419,10 +419,12 @@ async fn recall_with_context_post_embed(
         let cands: Vec<epigraph_engine::rerank::RerankCandidate> = raw_hits
             .iter()
             .filter_map(|h| {
-                contents.get(&h.claim_id).map(|c| epigraph_engine::rerank::RerankCandidate {
-                    id: h.claim_id,
-                    content: c.clone(),
-                })
+                contents
+                    .get(&h.claim_id)
+                    .map(|c| epigraph_engine::rerank::RerankCandidate {
+                        id: h.claim_id,
+                        content: c.clone(),
+                    })
             })
             .collect();
         match epigraph_engine::rerank::build_rerank_client_from_env() {
@@ -460,8 +462,9 @@ async fn recall_with_context_post_embed(
                                         Uuid,
                                         epigraph_engine::rerank::Groundedness,
                                     > = top.iter().map(|c| c.id).zip(verdicts).collect();
-                                    merged =
-                                        epigraph_engine::rerank::apply_groundedness(merged, &vmap, true);
+                                    merged = epigraph_engine::rerank::apply_groundedness(
+                                        merged, &vmap, true,
+                                    );
                                 }
                             } else {
                                 // KNOWN LIMITATION: the deployed epigraph-mcp binary
@@ -511,8 +514,10 @@ async fn recall_with_context_post_embed(
     let mut results = Vec::with_capacity(raw_hits.len());
     for hit in raw_hits {
         let paragraph_id = hit.claim_id;
-        let (rerank_score, verdict) =
-            rerank_meta.get(&paragraph_id).copied().unwrap_or((None, None));
+        let (rerank_score, verdict) = rerank_meta
+            .get(&paragraph_id)
+            .copied()
+            .unwrap_or((None, None));
         let core = match ctx.paragraph_meta.get(&paragraph_id) {
             Some(c) => c,
             None => continue, // paragraph deleted between kNN and batch fetch

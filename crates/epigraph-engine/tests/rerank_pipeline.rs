@@ -1,19 +1,25 @@
-use std::collections::HashMap;
-use uuid::Uuid;
 use async_trait::async_trait;
-use epigraph_interfaces::{LlmError, LlmProvider};
 use epigraph_engine::rerank::{
-    apply_groundedness, merge_rerank_scores, GroundednessGate, Groundedness, MockRerankClient,
+    apply_groundedness, merge_rerank_scores, Groundedness, GroundednessGate, MockRerankClient,
     RerankCandidate, RerankClient, RerankScore,
 };
+use epigraph_interfaces::{LlmError, LlmProvider};
+use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Minimal in-test LlmProvider that returns a fixed groundedness JSON array.
 struct FixedGate(serde_json::Value);
 #[async_trait]
 impl LlmProvider for FixedGate {
-    fn name(&self) -> &str { "fixed" }
-    fn model_name(&self) -> &str { "fixed" }
-    fn is_active(&self) -> bool { true }
+    fn name(&self) -> &str {
+        "fixed"
+    }
+    fn model_name(&self) -> &str {
+        "fixed"
+    }
+    fn is_active(&self) -> bool {
+        true
+    }
     async fn complete_json(&self, _p: &str) -> Result<serde_json::Value, LlmError> {
         Ok(self.0.clone())
     }
@@ -25,9 +31,18 @@ async fn pipeline_reranks_then_gates_dropping_ungrounded_relevant_hit() {
     let relevant_grounded = Uuid::new_v4();
     let irrelevant = Uuid::new_v4();
     let cands = vec![
-        RerankCandidate { id: irrelevant, content: "unrelated boilerplate".into() },
-        RerankCandidate { id: relevant_but_ungrounded, content: "shares words only".into() },
-        RerankCandidate { id: relevant_grounded, content: "directly answers the query".into() },
+        RerankCandidate {
+            id: irrelevant,
+            content: "unrelated boilerplate".into(),
+        },
+        RerankCandidate {
+            id: relevant_but_ungrounded,
+            content: "shares words only".into(),
+        },
+        RerankCandidate {
+            id: relevant_grounded,
+            content: "directly answers the query".into(),
+        },
     ];
     // Cross-encoder ranks the two 'relevant' ones above the irrelevant one,
     // and puts the ungrounded-but-vocabulary-matching one HIGHEST (the exact
@@ -61,9 +76,13 @@ async fn pipeline_reranks_then_gates_dropping_ungrounded_relevant_hit() {
     ]);
     let llm = FixedGate(gate_json);
     let gate = GroundednessGate::new(&llm);
-    let top: Vec<RerankCandidate> = merged.iter().map(|h| RerankCandidate {
-        id: h.id, content: "x".into()
-    }).collect();
+    let top: Vec<RerankCandidate> = merged
+        .iter()
+        .map(|h| RerankCandidate {
+            id: h.id,
+            content: "x".into(),
+        })
+        .collect();
     let verdicts = gate.judge("the query", &top).await.unwrap();
     let vmap: HashMap<Uuid, Groundedness> = top.iter().map(|c| c.id).zip(verdicts).collect();
 

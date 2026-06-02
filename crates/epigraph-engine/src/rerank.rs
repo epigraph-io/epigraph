@@ -177,7 +177,10 @@ pub fn parse_rerank_response(
                 continue;
             }
         };
-        let score = match item.get("relevance_score").and_then(serde_json::Value::as_f64) {
+        let score = match item
+            .get("relevance_score")
+            .and_then(serde_json::Value::as_f64)
+        {
             Some(s) => s,
             None => {
                 tracing::warn!(idx, "rerank result missing `relevance_score`, skipping");
@@ -271,11 +274,12 @@ impl RerankClient for HttpRerankClient {
 /// `Some(Err)` only on construction failure (feature off).
 #[must_use]
 pub fn build_rerank_client_from_env() -> Option<Result<HttpRerankClient, RerankError>> {
-    let api_key = std::env::var("RERANK_API_KEY").ok().filter(|k| !k.is_empty())?;
+    let api_key = std::env::var("RERANK_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())?;
     let endpoint = std::env::var("RERANK_ENDPOINT")
         .unwrap_or_else(|_| "https://api.cohere.com/v2/rerank".to_string());
-    let model =
-        std::env::var("RERANK_MODEL").unwrap_or_else(|_| "rerank-english-v3.0".to_string());
+    let model = std::env::var("RERANK_MODEL").unwrap_or_else(|_| "rerank-english-v3.0".to_string());
     Some(HttpRerankClient::new(RerankProviderConfig {
         endpoint,
         model,
@@ -304,7 +308,12 @@ impl RerankClient for MockRerankClient {
     ) -> Result<Vec<RerankScore>, RerankError> {
         Ok(candidates
             .iter()
-            .filter_map(|c| self.scores.get(&c.id).map(|s| RerankScore { id: c.id, score: *s }))
+            .filter_map(|c| {
+                self.scores.get(&c.id).map(|s| RerankScore {
+                    id: c.id,
+                    score: *s,
+                })
+            })
             .collect())
     }
 }
@@ -365,18 +374,32 @@ pub fn parse_groundedness_response(
     };
     let mut out = Vec::new();
     for item in arr {
-        let idx = match item.get("passage_index").and_then(serde_json::Value::as_u64) {
+        let idx = match item
+            .get("passage_index")
+            .and_then(serde_json::Value::as_u64)
+        {
             Some(i) => i as usize,
             None => continue,
         };
         if idx >= count {
-            tracing::warn!(idx, count, "groundedness passage_index out of range, skipping");
+            tracing::warn!(
+                idx,
+                count,
+                "groundedness passage_index out of range, skipping"
+            );
             continue;
         }
-        let grounded = item.get("grounded").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let grounded = item
+            .get("grounded")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         out.push((
             idx,
-            if grounded { Groundedness::Grounded } else { Groundedness::Ungrounded },
+            if grounded {
+                Groundedness::Grounded
+            } else {
+                Groundedness::Ungrounded
+            },
         ));
     }
     out
@@ -520,7 +543,10 @@ mod tests {
 
     #[test]
     fn parse_rerank_drops_out_of_range_index() {
-        let cands = vec![RerankCandidate { id: Uuid::new_v4(), content: "x".into() }];
+        let cands = vec![RerankCandidate {
+            id: Uuid::new_v4(),
+            content: "x".into(),
+        }];
         let json = serde_json::json!({"results": [
             {"index": 0, "relevance_score": 0.7},
             {"index": 5, "relevance_score": 0.9}
@@ -549,7 +575,10 @@ mod tests {
         ]);
         let out = parse_groundedness_response(&json, 2);
         // idx 9 dropped (oob); idx 1 missing `grounded` => defaults ungrounded.
-        assert_eq!(out, vec![(0, Groundedness::Grounded), (1, Groundedness::Ungrounded)]);
+        assert_eq!(
+            out,
+            vec![(0, Groundedness::Grounded), (1, Groundedness::Ungrounded)]
+        );
     }
 
     #[test]
@@ -557,8 +586,20 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let hits = vec![
-            RerankedHit { id: a, similarity: 0.9, belief: None, rerank_score: Some(0.9), verdict: None },
-            RerankedHit { id: b, similarity: 0.8, belief: None, rerank_score: Some(0.8), verdict: None },
+            RerankedHit {
+                id: a,
+                similarity: 0.9,
+                belief: None,
+                rerank_score: Some(0.9),
+                verdict: None,
+            },
+            RerankedHit {
+                id: b,
+                similarity: 0.8,
+                belief: None,
+                rerank_score: Some(0.8),
+                verdict: None,
+            },
         ];
         let mut v = std::collections::HashMap::new();
         v.insert(a, Groundedness::Grounded);
