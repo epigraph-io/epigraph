@@ -276,10 +276,7 @@ mod tests {
     fn aggregate_support_downgrades_on_conflict() {
         // A source that strongly supports AND another that contradicts is
         // NOT reported as StrongSupport -- conflict downgrades to Weak.
-        let pairs = [
-            EvidenceSupport::StrongSupport,
-            EvidenceSupport::Contradicts,
-        ];
+        let pairs = [EvidenceSupport::StrongSupport, EvidenceSupport::Contradicts];
         assert_eq!(aggregate_support(&pairs), EvidenceSupport::WeakSupport);
     }
 }

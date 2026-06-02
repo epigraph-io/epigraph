@@ -303,8 +303,7 @@ mod tests {
     async fn test_skeptic_unrelated_evidence_flags_low_confidence() {
         let client =
             MockLlmClient::with_responses(vec![serde_json::json!({"rating": "UNRELATED"})]);
-        let result =
-            skeptic_probe(&client, None, "fix bug", &["updated README".to_string()]).await;
+        let result = skeptic_probe(&client, None, "fix bug", &["updated README".to_string()]).await;
         assert_eq!(result, EvidenceSupport::Unrelated);
         assert!((result.factor() - 0.4).abs() < f64::EPSILON);
     }
