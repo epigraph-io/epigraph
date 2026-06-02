@@ -221,7 +221,14 @@ def html_to_document_extraction(html: str, url: str = "") -> DocumentExtractionO
         sections_out.append(
             SectionOut(
                 title=s.title,
-                summary=first_sentence(s.text),
+                # Derive the L1 summary from the section TITLE, not the body's
+                # first sentence. The body first sentence is verbatim the first
+                # paragraph's `compound`; since compound_claim_id hashes content
+                # with no level in the material, an identical string collides the
+                # section (L1) and its first paragraph (L2) onto the SAME UUID,
+                # producing a decomposes_to self-loop and a duplicate-id insert
+                # (backlog b5518801). A title-derived summary is hash-distinct.
+                summary=f"Section: {s.title}",
                 paragraphs=[
                     ParagraphOut(
                         compound=first_sentence(s.text),

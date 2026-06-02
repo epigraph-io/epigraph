@@ -38,7 +38,7 @@
   "sections": [
     {
       "title": "Introduction",
-      "summary": "Scientific HTML such as ar5iv pages carries explicit section structure.",
+      "summary": "Section: Introduction",
       "paragraphs": [
         {
           "compound": "Scientific HTML such as ar5iv pages carries explicit section structure.",
@@ -52,7 +52,7 @@
     },
     {
       "title": "Method",
-      "summary": "The parser tracks a heading stack and flushes a section when a new heading of level two or greater begins.",
+      "summary": "Section: Method",
       "paragraphs": [
         {
           "compound": "The parser tracks a heading stack and flushes a section when a new heading of level two or greater begins.",

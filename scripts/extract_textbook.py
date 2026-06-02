@@ -300,7 +300,14 @@ def _module_to_section(module: Module, chapter: Chapter, book_title: str) -> Sec
             ))
     if not paragraphs:
         return None
-    return SectionOut(title=sect_title, summary=first_sentence(paragraphs[0].supporting_text),
+    # Derive the L1 summary from the section TITLE, not the first paragraph's
+    # supporting_text. first_sentence(paragraphs[0].supporting_text) is verbatim
+    # paragraphs[0].compound; since compound_claim_id hashes content with no
+    # level in the material, that identical string collides the section (L1) and
+    # its first paragraph (L2) onto the SAME UUID — a decomposes_to self-loop and
+    # a duplicate-id insert (backlog b5518801). A title-derived summary is
+    # hash-distinct from every child compound.
+    return SectionOut(title=sect_title, summary=f"Section: {sect_title}",
                       paragraphs=paragraphs)
 
 

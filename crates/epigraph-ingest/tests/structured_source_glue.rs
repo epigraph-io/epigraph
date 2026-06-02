@@ -1,5 +1,29 @@
 use epigraph_ingest::builder::build_ingest_plan;
 use epigraph_ingest::schema::{DocumentExtraction, SourceType};
+use std::collections::HashSet;
+
+/// Regression guard for backlog b5518801: every planned claim must have a
+/// DISTINCT id and no `decomposes_to` edge may be a self-loop. The original
+/// emitters set a section's `summary` to the verbatim text of its first
+/// paragraph's `compound`; since `compound_claim_id` hashes content with no
+/// level in the material, the L1 section and its first L2 paragraph collapsed
+/// onto the SAME UUID — a self-loop `decomposes_to(section, section)` and a
+/// duplicate-id insert. Claim/edge COUNTS are blind to this (the builder pushes
+/// both colliding claims regardless), so we assert id distinctness directly.
+fn assert_no_collisions(plan: &epigraph_ingest::builder::IngestPlan) {
+    let ids: HashSet<uuid::Uuid> = plan.claims.iter().map(|c| c.id).collect();
+    assert_eq!(
+        ids.len(),
+        plan.claims.len(),
+        "every planned claim id must be distinct (no L1 section == L2 paragraph collision)"
+    );
+    for e in plan.edges.iter().filter(|e| e.relationship == "decomposes_to") {
+        assert_ne!(
+            e.source_id, e.target_id,
+            "decomposes_to must never be a self-loop (section id == paragraph id)"
+        );
+    }
+}
 
 // The fixtures are the VERBATIM output of the Python preprocessors:
 //   sample_arxiv_extraction.json      <- scripts/extract_html.py on sample_arxiv.html
@@ -52,6 +76,7 @@ fn arxiv_html_maps_to_valid_document_extraction_hierarchy() {
     // Now the actual glue->builder contract: a thesis(L0) + 2 sections(L1) +
     // 2 paragraphs(L2), zero atoms(L3), and the structural edges.
     let plan = build_ingest_plan(&doc);
+    assert_no_collisions(&plan);
     let by_level = |l: u8| plan.claims.iter().filter(|c| c.level == l).count();
     assert_eq!(by_level(0), 1, "thesis");
     assert_eq!(by_level(1), 2, "sections");
@@ -99,6 +124,7 @@ fn openstax_cnxml_maps_to_valid_document_extraction_hierarchy() {
     );
 
     let plan = build_ingest_plan(&doc);
+    assert_no_collisions(&plan);
     let by_level = |l: u8| plan.claims.iter().filter(|c| c.level == l).count();
     assert_eq!(by_level(1), 1, "one module -> one section");
     assert_eq!(by_level(2), 2, "two surviving paragraphs");
