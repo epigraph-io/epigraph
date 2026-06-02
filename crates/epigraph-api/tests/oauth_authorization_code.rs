@@ -10,6 +10,12 @@ use tower::ServiceExt;
 use epigraph_api::oauth::providers::ProviderRegistry;
 use epigraph_api::{create_router, ApiConfig, AppState};
 
+// Shared RSA/JWKS provider fixture (also used by oauth_redirect_flow.rs). We only
+// need build_auth_url here (no network I/O), so a real GoogleProvider registered
+// against a wiremock JWKS is the lightest way to make `redirect_flow("google")`
+// resolve in the authorize handler without mocking the registry.
+mod oauth_providers;
+
 fn config() -> ApiConfig {
     ApiConfig {
         require_signatures: false,
@@ -428,4 +434,349 @@ async fn authorize_without_pkce_is_rejected() {
         .unwrap();
     let resp = app().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── DB-seeded authorize → consent → mint → redeem integration tests ──────────
+//
+// These exercise the handlers from commit 5f02e3c against the real test DB
+// (oauth_authorize_sessions + oauth_authorization_codes + oauth_clients), with
+// Google's network legs avoided rather than mocked:
+//   * /authorize only needs build_auth_url (pure string), so a real GoogleProvider
+//     registered against a wiremock JWKS suffices.
+//   * /authorize/consent reads the user + scopes from the server-side session row
+//     (recorded by the Google callback) and never touches Google, so we seed an
+//     ALREADY-transitioned session via the repo and drive consent directly. This
+//     proves authorize→consent→mint→redeem end to end WITHOUT mocking the Google
+//     callback (the callback leg is covered by manual E2E — see Task 10).
+use epigraph_api::oauth::providers::config::{ProviderConfig, ProviderFlow};
+use epigraph_api::oauth::providers::google::GoogleProvider;
+use epigraph_api::oauth::providers::jwks::JwksCache;
+use epigraph_db::repos::authorize_session::AuthorizeSessionRepository;
+use oauth_providers::fixtures::ProviderFixture;
+
+const GOOGLE_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+
+/// A real GoogleProvider config pointed at the fixture's wiremock JWKS. Only
+/// build_auth_url is exercised by /authorize (no network I/O), so the JWKS/token
+/// endpoints are never hit. Mirrors the helper in oauth_redirect_flow.rs.
+fn google_cfg(jwks_url: &str) -> ProviderConfig {
+    std::env::set_var("AC_GOOGLE_CLIENT_ID", "test-google-audience");
+    std::env::set_var("AC_GOOGLE_CLIENT_SECRET", "test-google-secret");
+    ProviderConfig {
+        name: "google".into(),
+        flow: ProviderFlow::Redirect,
+        grant_type: "google_id_token".into(),
+        issuer: "https://accounts.google.com".into(),
+        extra_issuers: vec!["accounts.google.com".into()],
+        jwks_url: jwks_url.into(),
+        audience: None,
+        audience_env: Some("AC_GOOGLE_CLIENT_ID".into()),
+        client_id_env: Some("AC_GOOGLE_CLIENT_ID".into()),
+        client_secret_env: Some("AC_GOOGLE_CLIENT_SECRET".into()),
+        auth_endpoint: Some(GOOGLE_AUTH_ENDPOINT.into()),
+        token_endpoint: Some("https://oauth2.googleapis.com/token".into()),
+        redirect_uri: None,
+        redirect_uri_env: None,
+        auto_provision: true,
+        default_scopes: vec!["claims:read".into()],
+    }
+}
+
+/// db_app variant whose ProviderRegistry has a real 'google' redirect provider, so
+/// the authorize handler's `redirect_flow("google")` resolves. Returns the fixture
+/// too (its wiremock server must outlive the app).
+async fn db_app_with_google() -> (axum::Router, PgPool, ProviderFixture) {
+    let fx = ProviderFixture::new().await;
+    let provider = Arc::new(
+        GoogleProvider::from_config(&google_cfg(&fx.jwks_url), JwksCache::new())
+            .expect("build GoogleProvider"),
+    );
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            provider.clone() as Arc<dyn epigraph_api::oauth::providers::ExternalIdentityProvider>,
+            Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
+        )
+        .expect("register google");
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let state = AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry));
+    let app = create_router(state);
+    (app, pool, fx)
+}
+
+/// Seed an active 'human' oauth_client (returns its varchar client_id + UUID).
+async fn seed_active_human_client(pool: &PgPool, scopes: &[String]) -> (String, Uuid) {
+    let unique = Uuid::new_v4().simple().to_string();
+    let client_id = format!("epigraph_test_{unique}");
+    let uuid = OAuthClientRepository::create(
+        pool,
+        &client_id,
+        None, // client_secret_hash
+        "Claude Connector Consent Test",
+        "human",
+        scopes, // allowed_scopes
+        scopes, // granted_scopes
+        "active",
+        None, // agent_id
+        None, // owner_id (self-FK; NULL is valid for 'human')
+        None, // legal_entity_name
+        None, // legal_contact_email
+    )
+    .await
+    .expect("seed oauth_client");
+    (client_id, uuid)
+}
+
+/// GET that returns (status, Location header) — for redirect assertions.
+async fn get_redirect(app: axum::Router, uri: &str) -> (StatusCode, Option<String>) {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let loc = resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    (status, loc)
+}
+
+/// POST application/x-www-form-urlencoded (the consent endpoint uses axum Form,
+/// NOT JSON) and return (status, Location header).
+async fn post_consent(app: axum::Router, body: &str) -> (StatusCode, Option<String>) {
+    use axum::http::header;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/authorize/consent")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let loc = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    (status, loc)
+}
+
+/// Seed an authorize session ALREADY transitioned to consent: create() it keyed by
+/// a throwaway Google-CSRF state, then transition_to_consent() to bind the resolved
+/// user + granted scopes under a fresh unique consent nonce — exactly the row state
+/// the Google callback leaves behind, but without invoking Google. Returns the
+/// consent ticket (nonce). The session carries the claude redirect_uri, the PKCE
+/// challenge over VERIFIER, and a known claude_state to round-trip.
+async fn seed_consent_session(
+    pool: &PgPool,
+    client_id: &str,
+    resolved_user: Uuid,
+    granted_scopes: &[String],
+    claude_state: &str,
+) -> String {
+    let unique = Uuid::new_v4().simple().to_string();
+    let google_state = format!("gstate_{unique}");
+    let consent_nonce = format!("consent_{unique}");
+    AuthorizeSessionRepository::create(
+        pool,
+        &google_state,
+        client_id,
+        REDIRECT_URI,
+        &pkce_challenge(VERIFIER),
+        Some("claims:read"),
+        Some(claude_state),
+        "google-verifier-unused-here",
+        Utc::now() + Duration::minutes(10),
+    )
+    .await
+    .expect("seed authorize session");
+    AuthorizeSessionRepository::transition_to_consent(
+        pool,
+        &google_state,
+        &consent_nonce,
+        resolved_user,
+        granted_scopes,
+    )
+    .await
+    .expect("transition session to consent")
+    .expect("transition returns the rotated row");
+    consent_nonce
+}
+
+/// Pull the `code` and `state` query params out of a redirect Location.
+fn parse_redirect_params(loc: &str) -> std::collections::HashMap<String, String> {
+    let q = loc.split_once('?').map(|(_, q)| q).unwrap_or("");
+    q.split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
+async fn authorize_redirects_to_google() {
+    // An active client whose redirect_uris contains exactly the claude callback.
+    let (app, pool, _fx) = db_app_with_google().await;
+    let scopes = vec!["claims:read".to_string()];
+    let (client_id, _uuid) = seed_active_human_client(&pool, &scopes).await;
+    // OAuthClientRepository::create does NOT persist redirect_uris (it has no such
+    // parameter), but the authorize handler validates the request's redirect_uri
+    // against client.redirect_uris. Seed the column directly so the handler accepts
+    // the exact claude callback. (See concerns: register.rs accepts redirect_uris in
+    // the request body but likewise never persists it — a separate gap.)
+    sqlx::query("UPDATE oauth_clients SET redirect_uris = $2 WHERE client_id = $1")
+        .bind(&client_id)
+        .bind(&[REDIRECT_URI.to_string()][..])
+        .execute(&pool)
+        .await
+        .expect("seed redirect_uris");
+
+    let uri = format!(
+        "/oauth/authorize?response_type=code&client_id={client_id}\
+         &redirect_uri={REDIRECT_URI}&code_challenge={}&code_challenge_method=S256&state=abc",
+        pkce_challenge(VERIFIER)
+    );
+    let (status, loc) = get_redirect(app, &uri).await;
+
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "expected 303/302, got {status}"
+    );
+    let loc = loc.expect("redirect must carry a Location header");
+    assert!(
+        loc.starts_with(GOOGLE_AUTH_ENDPOINT),
+        "Location must be the Google authorize URL, got: {loc}"
+    );
+
+    // A pending authorize session row must now exist for this client. The handler
+    // keys it by a server-generated Google-CSRF state we don't see, so assert by
+    // client_id (UUID-unique to this test, so the count is exactly 1).
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM oauth_authorize_sessions WHERE client_id = $1",
+    )
+    .bind(&client_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count sessions");
+    assert_eq!(count, 1, "authorize must persist exactly one pending session");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
+async fn consent_allow_mints_redeemable_code() {
+    // End-to-end without Google: seed an active human client + an already-consented
+    // session, POST Allow, follow the redirect's code, then redeem it at /oauth/token.
+    let scopes = vec!["claims:read".to_string()];
+    let (app, pool, jwt) = db_app().await;
+    let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
+    let claude_state = "claude-roundtrip-state-xyz";
+    let ticket =
+        seed_consent_session(&pool, &client_id, client_uuid, &scopes, claude_state).await;
+
+    let (status, loc) =
+        post_consent(app.clone(), &format!("ticket={ticket}&decision=allow")).await;
+    // axum's Redirect::to emits 303 See Other (the correct POST→GET redirect).
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "Allow must 303-redirect to the client redirect_uri"
+    );
+    let loc = loc.expect("Allow must carry a Location header");
+    assert!(
+        loc.starts_with(REDIRECT_URI),
+        "redirect must target the claude callback, got: {loc}"
+    );
+    let params = parse_redirect_params(&loc);
+    let code = params.get("code").expect("redirect must carry a code");
+    assert_eq!(
+        params.get("state").map(String::as_str),
+        Some(claude_state),
+        "client's original state must round-trip"
+    );
+
+    // The minted code must be looked up under blake3(code_bytes) — the SAME hash the
+    // redeem path computes. (This is what binds mint and redeem; a mismatch here is
+    // a code that can never be redeemed.)
+    let code_hash = blake3::hash(code.as_bytes());
+    let row_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM oauth_authorization_codes WHERE code_hash = $1)",
+    )
+    .bind(code_hash.as_bytes().as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("query code row");
+    assert!(row_exists, "an authorization_code row must exist for blake3(code)");
+
+    // Redeem end-to-end: matching verifier + redirect_uri + client_id → 200 + JWT.
+    let (rstatus, rbody) =
+        post_form(app, "/oauth/token", &token_body(code, VERIFIER, &client_id)).await;
+    assert_eq!(rstatus, StatusCode::OK, "redeem must succeed, body: {rbody}");
+    let access_token = rbody["access_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no access_token in {rbody}"));
+    let claims = jwt
+        .validate_token(access_token)
+        .expect("issued token must validate");
+    assert_eq!(claims.aud, "epigraph-api");
+    assert_eq!(
+        claims.scopes, scopes,
+        "token scopes must equal the session's granted scopes"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
+async fn consent_deny_redirects_with_error() {
+    let scopes = vec!["claims:read".to_string()];
+    let (app, pool, _jwt) = db_app().await;
+    let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
+    let ticket =
+        seed_consent_session(&pool, &client_id, client_uuid, &scopes, "deny-state").await;
+
+    let (status, loc) =
+        post_consent(app, &format!("ticket={ticket}&decision=deny")).await;
+
+    assert_eq!(status, StatusCode::SEE_OTHER, "Deny must 303-redirect back to the client");
+    let loc = loc.expect("Deny must carry a Location header");
+    assert!(
+        loc.starts_with(REDIRECT_URI),
+        "deny redirect must target the claude callback, got: {loc}"
+    );
+    let params = parse_redirect_params(&loc);
+    assert_eq!(
+        params.get("error").map(String::as_str),
+        Some("access_denied"),
+        "deny must carry error=access_denied, got: {loc}"
+    );
+    assert!(
+        !params.contains_key("code"),
+        "deny must NOT mint a code, got: {loc}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
+async fn consent_ticket_is_single_use() {
+    // take() deletes the session row, so a replayed ticket cannot mint a second code.
+    let scopes = vec!["claims:read".to_string()];
+    let (app, pool, _jwt) = db_app().await;
+    let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
+    let ticket =
+        seed_consent_session(&pool, &client_id, client_uuid, &scopes, "single-use-state").await;
+
+    let (status1, _loc1) =
+        post_consent(app.clone(), &format!("ticket={ticket}&decision=allow")).await;
+    assert_eq!(status1, StatusCode::SEE_OTHER, "first Allow must succeed");
+
+    let (status2, _loc2) =
+        post_consent(app, &format!("ticket={ticket}&decision=allow")).await;
+    assert!(
+        status2.is_client_error(),
+        "a replayed consent ticket must be rejected (4xx), got {status2}"
+    );
 }
