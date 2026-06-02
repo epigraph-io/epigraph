@@ -8,10 +8,10 @@
 //! without verification — see `high_band_pair_is_verified_not_blindly_corroborated`.
 
 use async_trait::async_trait;
+use epigraph_db::repos::match_candidate::MatchCandidateRepo;
 use epigraph_engine::matching::calibration::MatcherConfig;
 use epigraph_engine::matching::pipeline::{run_pipeline, RunInputs};
 use epigraph_engine::matching::verifier::{Verdict, VerifierClient};
-use epigraph_db::repos::match_candidate::MatchCandidateRepo;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -125,8 +125,7 @@ struct SpyVerifier {
 #[async_trait]
 impl VerifierClient for SpyVerifier {
     async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Verdict>> {
-        self.called
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.called.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(pairs
             .iter()
             .map(|(a, b)| Verdict {
@@ -418,7 +417,10 @@ async fn auto_promote_false_populates_pending_review_queue(pool: PgPool) {
     // The fresh per-test DB starts with an empty review queue.
     let repo = MatchCandidateRepo::new(pool.clone());
     assert!(
-        repo.list_pending(50).await.expect("list_pending").is_empty(),
+        repo.list_pending(50)
+            .await
+            .expect("list_pending")
+            .is_empty(),
         "review queue must start empty before the pipeline runs"
     );
 
@@ -432,8 +434,10 @@ async fn auto_promote_false_populates_pending_review_queue(pool: PgPool) {
 
     let pending = repo.list_pending(50).await.expect("list_pending");
     assert!(
-        pending.iter().any(|r| (r.claim_a == seed && r.claim_b == peer)
-            || (r.claim_a == peer && r.claim_b == seed)),
+        pending
+            .iter()
+            .any(|r| (r.claim_a == seed && r.claim_b == peer)
+                || (r.claim_a == peer && r.claim_b == seed)),
         "high-band pair must surface in the pending review queue under auto_promote=false"
     );
     assert!(

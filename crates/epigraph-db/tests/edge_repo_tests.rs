@@ -124,15 +124,24 @@ async fn reverse_direction_dedup_returns_false(pool: PgPool) {
     let agent_row = AgentRepository::create(&pool, &agent).await.unwrap();
     let claim_a = make_claim(agent_row.id, "claim A for symmetric dedup", 0.5);
     let claim_b = make_claim(agent_row.id, "claim B for symmetric dedup", 0.5);
-    let a: uuid::Uuid = ClaimRepository::create(&pool, &claim_a).await.unwrap().id.into();
-    let b: uuid::Uuid = ClaimRepository::create(&pool, &claim_b).await.unwrap().id.into();
+    let a: uuid::Uuid = ClaimRepository::create(&pool, &claim_a)
+        .await
+        .unwrap()
+        .id
+        .into();
+    let b: uuid::Uuid = ClaimRepository::create(&pool, &claim_b)
+        .await
+        .unwrap()
+        .id
+        .into();
 
     let props = serde_json::json!({"source": "cross_source_matcher", "score": 0.91});
 
     // Forward A→B: first edge of this relationship → inserts.
-    let inserted = EdgeRepository::create_symmetric_if_absent(&pool, a, b, "CORROBORATES", props.clone())
-        .await
-        .expect("forward insert");
+    let inserted =
+        EdgeRepository::create_symmetric_if_absent(&pool, a, b, "CORROBORATES", props.clone())
+            .await
+            .expect("forward insert");
     assert!(inserted, "first call must insert and return true");
     assert_eq!(
         incident_edge_count(&pool, a, b, "CORROBORATES").await,
@@ -165,21 +174,34 @@ async fn create_symmetric_if_absent_distinguishes_by_relationship(pool: PgPool) 
     let agent_row = AgentRepository::create(&pool, &agent).await.unwrap();
     let claim_a = make_claim(agent_row.id, "claim A for rel discrimination", 0.5);
     let claim_b = make_claim(agent_row.id, "claim B for rel discrimination", 0.5);
-    let a: uuid::Uuid = ClaimRepository::create(&pool, &claim_a).await.unwrap().id.into();
-    let b: uuid::Uuid = ClaimRepository::create(&pool, &claim_b).await.unwrap().id.into();
+    let a: uuid::Uuid = ClaimRepository::create(&pool, &claim_a)
+        .await
+        .unwrap()
+        .id
+        .into();
+    let b: uuid::Uuid = ClaimRepository::create(&pool, &claim_b)
+        .await
+        .unwrap()
+        .id
+        .into();
 
     let props = serde_json::json!({"source": "cross_source_matcher"});
 
-    let first = EdgeRepository::create_symmetric_if_absent(&pool, a, b, "CORROBORATES", props.clone())
-        .await
-        .expect("corroborates insert");
+    let first =
+        EdgeRepository::create_symmetric_if_absent(&pool, a, b, "CORROBORATES", props.clone())
+            .await
+            .expect("corroborates insert");
     assert!(first, "CORROBORATES must insert");
 
     // A→B with a DIFFERENT relationship is a different edge → must insert.
-    let second = EdgeRepository::create_symmetric_if_absent(&pool, a, b, "contradicts", props.clone())
-        .await
-        .expect("contradicts insert");
-    assert!(second, "contradicts is a distinct relationship → must insert");
+    let second =
+        EdgeRepository::create_symmetric_if_absent(&pool, a, b, "contradicts", props.clone())
+            .await
+            .expect("contradicts insert");
+    assert!(
+        second,
+        "contradicts is a distinct relationship → must insert"
+    );
 
     assert_eq!(
         incident_edge_count(&pool, a, b, "CORROBORATES").await,
@@ -200,5 +222,8 @@ async fn create_symmetric_if_absent_distinguishes_by_relationship(pool: PgPool) 
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(total.0, 2, "two distinct edges total (one per relationship)");
+    assert_eq!(
+        total.0, 2,
+        "two distinct edges total (one per relationship)"
+    );
 }
