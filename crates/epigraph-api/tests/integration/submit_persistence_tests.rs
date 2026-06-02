@@ -252,6 +252,7 @@ fn create_test_router(pool: PgPool) -> Router {
     let config = ApiConfig {
         require_signatures: false,
         max_request_size: 1024 * 1024,
+        public_base_url: "http://localhost:8080".to_string(),
     };
     // Bypass signature verification for all routes in tests
     let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);

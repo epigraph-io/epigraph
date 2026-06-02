@@ -11,7 +11,7 @@ pub mod provision;
 mod registry;
 pub use registry::ProviderRegistry;
 mod traits;
-pub use provision::provision_external_user;
+pub use provision::{provision_external_user, provision_external_user_client};
 pub use traits::{ExternalIdentity, ExternalIdentityProvider, OidcRedirectFlow, ProviderError};
 
 use std::path::Path;

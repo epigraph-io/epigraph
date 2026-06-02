@@ -7,6 +7,8 @@ pub mod activity;
 pub mod agent;
 pub mod agent_key;
 pub mod analysis;
+pub mod authorization_code;
+pub mod authorize_session;
 pub mod behavioral_execution;
 pub mod challenge;
 pub mod claim;

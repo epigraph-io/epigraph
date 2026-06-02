@@ -86,6 +86,7 @@ async fn boot_router() -> axum::Router {
 
     let state = McpAuthState {
         jwt_config: Arc::new(JwtConfig::from_secret(SECRET)),
+        resource_metadata_url: None,
     };
 
     axum::Router::new()

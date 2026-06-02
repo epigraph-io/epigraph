@@ -31,6 +31,12 @@ pub struct TokenRequest {
     pub id_token: Option<String>,
     /// Generic external-provider assertion (preferred over id_token for non-Google).
     pub assertion: Option<String>,
+    /// For authorization_code grant: the code returned to the client.
+    pub code: Option<String>,
+    /// For authorization_code grant: PKCE verifier.
+    pub code_verifier: Option<String>,
+    /// For authorization_code grant: must equal the redirect_uri used at /authorize.
+    pub redirect_uri: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,6 +57,7 @@ pub async fn token_endpoint(
     match req.grant_type.as_str() {
         "client_credentials" => handle_client_credentials(&state, &req).await,
         "refresh_token" => handle_refresh_token(&state, &req).await,
+        "authorization_code" => handle_authorization_code(&state, &req).await,
         other => {
             // Look up an external provider by grant_type.
             if let Some(provider) = state.providers.by_grant_type(other) {
@@ -476,6 +483,156 @@ async fn handle_refresh_token(
             token_type: "Bearer".to_string(),
             expires_in: ttl.num_seconds(),
             refresh_token: Some(new_refresh),
+            scope: effective_scopes.join(" "),
+        }),
+    ))
+}
+
+#[cfg(feature = "db")]
+async fn handle_authorization_code(
+    state: &AppState,
+    req: &TokenRequest,
+) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
+    use base64::Engine;
+    use epigraph_db::repos::authorization_code::AuthorizationCodeRepository;
+    use epigraph_db::repos::oauth_client::OAuthClientRepository;
+    use sha2::Digest;
+
+    let code = req.code.as_deref().ok_or(ApiError::BadRequest {
+        message: "missing code".into(),
+    })?;
+    let verifier = req.code_verifier.as_deref().ok_or(ApiError::BadRequest {
+        message: "missing code_verifier".into(),
+    })?;
+    let redirect_uri = req.redirect_uri.as_deref().ok_or(ApiError::BadRequest {
+        message: "missing redirect_uri".into(),
+    })?;
+    // RFC 9700 §4.1.3 / OAuth 2.1: client_id validation in the authorization_code
+    // grant is a MUST. Extract presence here, alongside the other required-param
+    // checks and BEFORE consume(), so an omitted client_id is rejected without
+    // burning the single-use code. The value-vs-row binding check is below (needs
+    // the consumed row). Making this unconditional closes the binding-bypass where
+    // a captured/replayed code could be redeemed by any caller that simply leaves
+    // client_id out of the token request.
+    let req_client_id = req.client_id.as_deref().ok_or(ApiError::BadRequest {
+        message: "missing client_id".into(),
+    })?;
+
+    // Single-use consume (atomic; rejects used/expired).
+    let raw = code.as_bytes();
+    let code_hash = blake3::hash(raw);
+    let row = AuthorizationCodeRepository::consume(&state.db_pool, code_hash.as_bytes())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?
+        .ok_or(ApiError::BadRequest {
+            message: "invalid_grant: code invalid, used, or expired".into(),
+        })?;
+
+    // PKCE S256: base64url(SHA256(verifier)) == stored challenge.
+    // We assume S256 (we never compute the "plain" transform). That assumption is
+    // safe by construction: oauth_authorization_codes.code_challenge_method defaults
+    // to 'S256' (migration 049), AuthorizationCodeRepository::create never sets a
+    // different value, and Task 7's /authorize will reject any method != "S256"
+    // before a code is ever minted. consume() therefore omits the method column
+    // rather than carrying an always-'S256' field through this hot path.
+    let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()));
+    if computed != row.code_challenge {
+        return Err(ApiError::BadRequest {
+            message: "invalid_grant: PKCE mismatch".into(),
+        });
+    }
+    // Binding checks.
+    if redirect_uri != row.redirect_uri {
+        return Err(ApiError::BadRequest {
+            message: "invalid_grant: redirect_uri mismatch".into(),
+        });
+    }
+    if req_client_id != row.client_id {
+        return Err(ApiError::BadRequest {
+            message: "invalid_grant: client mismatch".into(),
+        });
+    }
+
+    // Load the per-user client to populate token claims (type/owner/agent).
+    let client = OAuthClientRepository::get_by_id(&state.db_pool, row.oauth_client_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?
+        .ok_or(ApiError::BadRequest {
+            message: "invalid_grant: unknown user".into(),
+        })?;
+
+    // get_by_id returns suspended/revoked clients, so gate on status here — same as
+    // handle_client_credentials and handle_refresh_token. Without this, a user whose
+    // client was suspended/revoked could still redeem a valid code for a fresh 1h
+    // access token + 30d refresh token (a 30-day blast radius).
+    if client.status != "active" {
+        return Err(ApiError::Forbidden {
+            reason: format!("Client status is '{}', must be 'active'", client.status),
+        });
+    }
+
+    // TTLs by client type, matching the sibling grant handlers' tables. Per-user
+    // clients are always client_type="human" (1h access / 30d refresh); keying off
+    // client_type keeps the values coupled to type rather than hardcoded.
+    let ttl = match client.client_type.as_str() {
+        "agent" => Duration::minutes(15),
+        "human" => Duration::hours(1),
+        "service" => Duration::hours(1),
+        _ => Duration::minutes(15),
+    };
+    let effective_scopes = row.scopes.clone();
+    let (access_token, _jti) = state
+        .jwt_config
+        .issue_access_token(
+            client.id,
+            effective_scopes.clone(),
+            &client.client_type,
+            client.owner_id,
+            client.agent_id,
+            ttl,
+        )
+        .map_err(|e| ApiError::InternalError {
+            message: format!("JWT signing failed: {e}"),
+        })?;
+
+    // Refresh token (reuse the existing rotation pattern).
+    let refresh_token = {
+        use rand::Rng;
+        let raw: [u8; 32] = rand::thread_rng().gen();
+        let token_str = hex::encode(raw);
+        let hash = blake3::hash(&raw);
+        let refresh_ttl = match client.client_type.as_str() {
+            "agent" => Duration::hours(24),
+            "human" => Duration::days(30),
+            "service" => Duration::days(90),
+            _ => Duration::hours(24),
+        };
+        epigraph_db::repos::refresh_token::RefreshTokenRepository::create(
+            &state.db_pool,
+            hash.as_bytes(),
+            client.id,
+            &effective_scopes,
+            Utc::now() + refresh_ttl,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
+        token_str
+    };
+
+    Ok((
+        StatusCode::OK,
+        Json(TokenResponse {
+            access_token,
+            token_type: "Bearer".to_string(),
+            expires_in: ttl.num_seconds(),
+            refresh_token: Some(refresh_token),
             scope: effective_scopes.join(" "),
         }),
     ))

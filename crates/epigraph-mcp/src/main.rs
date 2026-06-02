@@ -81,6 +81,11 @@ struct Cli {
     /// Start in read-only mode (query tools only, write operations return errors)
     #[arg(long)]
     read_only: bool,
+
+    /// Absolute URL of the protected-resource metadata document, advertised in 401
+    /// WWW-Authenticate challenges so MCP clients can discover the auth server.
+    #[arg(long, env = "EPIGRAPH_RESOURCE_METADATA_URL")]
+    resource_metadata_url: Option<String>,
 }
 
 #[tokio::main]
@@ -124,6 +129,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 std::process::exit(1);
             }
+        }
+    }
+
+    // Fail fast on a malformed --resource-metadata-url. The value is interpolated
+    // into the 401 WWW-Authenticate challenge (an HTTP header), which rejects
+    // control chars / non-ASCII. Validating here surfaces an operator typo at boot
+    // instead of letting it fail to attach the header on every 401.
+    if let Some(url) = cli.resource_metadata_url.as_deref() {
+        if let Err(reason) = epigraph_mcp::auth::validate_resource_metadata_url(url) {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
         }
     }
 
@@ -201,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let state = McpAuthState {
                 jwt_config: Arc::new(JwtConfig::from_secret(secret.as_bytes())),
+                resource_metadata_url: cli.resource_metadata_url.clone(),
             };
             router.layer(axum::middleware::from_fn_with_state(
                 state,

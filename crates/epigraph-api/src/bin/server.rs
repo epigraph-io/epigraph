@@ -185,9 +185,15 @@ async fn main() {
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
+    // Public HTTPS base URL this API is reachable at externally (no trailing
+    // slash), used to build OAuth discovery documents and consent/redirect
+    // links. Defaults to localhost for local dev/CI.
+    let public_base_url = std::env::var("EPIGRAPH_PUBLIC_BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:8080".to_string());
     let config = ApiConfig {
         require_signatures,
         max_request_size: 10 * 1024 * 1024, // 10MB — figure evidence carries base64 images
+        public_base_url,
     };
 
     // Create embedding service for semantic search
