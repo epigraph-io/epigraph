@@ -41,6 +41,31 @@ async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
+async fn post_form(app: axum::Router, uri: &str, body: &str) -> (StatusCode, Value) {
+    use axum::http::header;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn authorization_code_missing_code_is_invalid_request() {
+    let (status, _body) = post_form(
+        app(),
+        "/oauth/token",
+        r#"{"grant_type":"authorization_code","code_verifier":"x","redirect_uri":"https://claude.ai/api/mcp/auth_callback"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn authorization_server_metadata_has_required_fields() {
     let (status, body) = get_json(app(), "/.well-known/oauth-authorization-server").await;
