@@ -64,6 +64,7 @@ tower = { version = "0.5", features = ["util", "timeout"] }  # Service abstracti
 tower-http = { version = "0.5", features = ["trace", "cors"] }  # HTTP middleware
 serde = { workspace = true }  # Serialization
 serde_json = { workspace = true }  # JSON support
+serde_urlencoded = "0.7"  # OAuth token endpoint body (application/x-www-form-urlencoded, RFC 6749)
 serde_with = { workspace = true }  # Helper macros for serde
 toml = "0.8"  # provider config parsing
 uuid = { workspace = true }  # UUID support

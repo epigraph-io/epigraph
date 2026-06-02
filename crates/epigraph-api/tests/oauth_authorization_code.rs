@@ -397,6 +397,29 @@ async fn authorization_code_missing_code_is_invalid_request() {
 }
 
 #[tokio::test]
+async fn token_endpoint_accepts_form_urlencoded_body() {
+    // OAuth 2.0 token requests are application/x-www-form-urlencoded (RFC 6749 §4.1.3) —
+    // what claude.ai and other remote-MCP clients send. Regression for the 415
+    // Unsupported Media Type that broke the live connector when the handler was JSON-only:
+    // a form body must REACH the handler (missing `code` -> 400), not be rejected at 415.
+    use axum::http::header;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(
+            "grant_type=authorization_code&code_verifier=x&redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback",
+        ))
+        .unwrap();
+    let resp = app().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "form-encoded token request must reach the handler (400 missing code), not 415"
+    );
+}
+
+#[tokio::test]
 async fn authorization_server_metadata_has_required_fields() {
     let (status, body) = get_json(app(), "/.well-known/oauth-authorization-server").await;
     assert_eq!(status, StatusCode::OK);
