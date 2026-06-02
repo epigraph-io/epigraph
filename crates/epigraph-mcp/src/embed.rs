@@ -11,6 +11,16 @@ pub struct McpEmbedder {
     http: reqwest::Client,
 }
 
+/// Whether an OpenAI API key string is unusable for embedding generation:
+/// absent, empty, or the literal `"mock"`. Mirrors the disabled-condition that
+/// `generate`/`generate_at_dim` apply inline (`.filter(|k| !k.is_empty() && *k
+/// != "mock")`); `embeddings_disabled` delegates here so the backfill guard and
+/// the generate path agree. Kept free-standing so it is unit-testable without a
+/// `PgPool`.
+fn key_disabled(key: Option<&str>) -> bool {
+    !matches!(key, Some(k) if !k.is_empty() && k != "mock")
+}
+
 /// Map a centroid dimension to the OpenAI model that produces it.
 /// Returns None for unsupported dims (caller treats as InvalidParams).
 #[must_use]
@@ -35,6 +45,17 @@ impl McpEmbedder {
     #[must_use]
     pub const fn is_mock(&self) -> bool {
         self.api_key.is_none()
+    }
+
+    /// True when no usable API key is configured, so `generate`/`generate_at_dim`
+    /// will reject every call. Mirrors their disabled-condition exactly — a
+    /// `None`, empty, or literal `"mock"` key — so batch callers (e.g.
+    /// `backfill_embeddings`) can fail loudly up front instead of churning a
+    /// whole batch into all-failed. Stricter than [`is_mock`](Self::is_mock),
+    /// which only catches the `None` case.
+    #[must_use]
+    pub fn embeddings_disabled(&self) -> bool {
+        key_disabled(self.api_key.as_deref())
     }
 
     /// Generate an embedding vector without storing it.
@@ -305,5 +326,26 @@ mod tests {
     fn model_for_dim_rejects_unknown_dim() {
         assert!(model_for_dim(1024).is_none());
         assert!(model_for_dim(0).is_none());
+    }
+
+    // `key_disabled` is the shared disabled-condition behind both `generate`
+    // and `embeddings_disabled`; pinning it keeps the backfill fail-loud guard
+    // from being bypassed by an empty or "mock" key.
+    #[test]
+    fn key_disabled_catches_none_empty_and_mock() {
+        assert!(super::key_disabled(None), "no key => disabled");
+        assert!(super::key_disabled(Some("")), "empty key => disabled");
+        assert!(
+            super::key_disabled(Some("mock")),
+            "literal mock => disabled"
+        );
+    }
+
+    #[test]
+    fn key_disabled_allows_a_real_key() {
+        assert!(
+            !super::key_disabled(Some("sk-real-key")),
+            "a real key => enabled"
+        );
     }
 }
