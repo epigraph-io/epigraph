@@ -761,6 +761,50 @@ async fn consent_deny_redirects_with_error() {
 
 #[tokio::test]
 #[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
+async fn consent_control_byte_state_does_not_panic() {
+    // Regression for the panic-on-attacker-input finding: axum's Query extractor
+    // percent-DECODES the OAuth `state` before it lands in `claude_state`, so a client
+    // that began /oauth/authorize with `state=%0A` makes the stored value a literal
+    // control byte. The old `format!` + `Redirect::to` path fed that raw byte to
+    // `HeaderValue::try_from`, whose `.expect()` PANICS. Seed the decoded value
+    // directly (it is the exact row state the authorize step would leave) and assert a
+    // clean 303 whose Location percent-encodes the byte instead of panicking.
+    let scopes = vec!["claims:read".to_string()];
+    let (app, pool, _jwt) = db_app().await;
+    let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
+    // A literal newline (0x0A) — the post-percent-decode value of `state=%0A`.
+    let evil_state = "before\nafter";
+    let ticket =
+        seed_consent_session(&pool, &client_id, client_uuid, &scopes, evil_state).await;
+
+    // Deny path (does not mint a code, isolating the redirect construction).
+    let (status, loc) =
+        post_consent(app, &format!("ticket={ticket}&decision=deny")).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "control-byte state must produce a clean redirect, not a panic"
+    );
+    let loc = loc.expect("redirect must carry a Location header");
+    assert!(
+        loc.starts_with(REDIRECT_URI),
+        "redirect must still target the claude callback, got: {loc}"
+    );
+    // The byte must be percent-encoded in the Location (a valid header value), never
+    // emitted raw. `%0A` is the encoding of the newline.
+    assert!(
+        loc.contains("state=before%0Aafter"),
+        "control byte must be percent-encoded in the redirect, got: {loc}"
+    );
+    assert!(
+        !loc.contains('\n'),
+        "Location must not contain a raw control byte, got: {loc:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
 async fn consent_ticket_is_single_use() {
     // take() deletes the session row, so a replayed ticket cannot mint a second code.
     let scopes = vec!["claims:read".to_string()];
