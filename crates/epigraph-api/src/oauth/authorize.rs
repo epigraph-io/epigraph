@@ -313,7 +313,12 @@ pub async fn consent_endpoint(
     use rand::Rng;
     let raw: [u8; 32] = rand::thread_rng().gen();
     let code = hex::encode(raw);
-    let code_hash = blake3::hash(&raw);
+    // Hash the SAME string we emit as `code`. The authorization_code redeem path
+    // (`handle_authorization_code` in token.rs) computes `blake3::hash(code.as_bytes())`
+    // over the received string — it does NOT hex-decode first (unlike the refresh-token
+    // path). Hashing the raw 32 bytes here instead would store a digest the redeem path
+    // can never reproduce, making every minted code unredeemable.
+    let code_hash = blake3::hash(code.as_bytes());
     AuthorizationCodeRepository::create(
         &state.db_pool,
         code_hash.as_bytes(),
