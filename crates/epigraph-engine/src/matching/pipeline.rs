@@ -44,7 +44,14 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         Box::new(SharedTripleBlocker::new(fan_out)),
         Box::new(ContentHashBlocker),
     ];
-    let pairs = union_block(pool, &blockers, &inputs.seeds, inputs.cfg.filter).await?;
+    let pairs = union_block(
+        pool,
+        &blockers,
+        &inputs.seeds,
+        inputs.cfg.filter,
+        &inputs.cfg.eligibility,
+    )
+    .await?;
 
     let mut promoted = 0usize;
     let mut mid_band = 0usize;
