@@ -157,11 +157,23 @@ pub async fn recall(
     let scoped = tags_opt.is_some() || agent_filter.is_some();
 
     // Try semantic search first, with any scope pushed into the query.
-    let results = if let Ok(hits) = server
+    let semantic = server
         .embedder
         .search_scoped(&params.query, limit, tags_opt, agent_filter)
-        .await
-    {
+        .await;
+    if let Err(ref e) = semantic {
+        // Surface the otherwise-swallowed semantic-search error: when this Errs,
+        // recall silently degrades to the empty/text-fallback path below and
+        // returns [] for queries that DO have matches (backlog 1564bdaf). Logging
+        // the runtime cause (embedder failure vs DB/query error) makes it diagnosable.
+        tracing::warn!(
+            error = %e,
+            query = %params.query,
+            scoped,
+            "recall: semantic search_scoped failed; degrading to text/empty fallback"
+        );
+    }
+    let results = if let Ok(hits) = semantic {
         let mut results = Vec::new();
         for (claim_id, similarity) in hits {
             if let Ok(Some(claim)) =
