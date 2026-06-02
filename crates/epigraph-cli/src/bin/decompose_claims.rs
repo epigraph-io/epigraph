@@ -19,7 +19,10 @@ use epigraph_cli::decompose::{build_batch_prompt, parse_batch_response, persist_
 use epigraph_db::ClaimRepository;
 
 #[derive(Parser)]
-#[command(name = "decompose_claims", about = "Decompose undecomposed compound claims into atoms")]
+#[command(
+    name = "decompose_claims",
+    about = "Decompose undecomposed compound claims into atoms"
+)]
 struct Cli {
     /// Max claims to process this run.
     #[arg(long, default_value_t = 200)]
@@ -55,8 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let embedder = epigraph_cli::embedding_service();
 
     // API submit closure — canonical claim create (embed + DS + sign on write).
-    let api_base = std::env::var("EPIGRAPH_API")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let api_base =
+        std::env::var("EPIGRAPH_API").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
     let token = std::env::var("EPIGRAPH_TOKEN").unwrap_or_default();
     let http = reqwest::Client::new();
 
@@ -79,7 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let parsed = parse_batch_response(&raw);
         for (local_idx, decomp) in parsed {
-            let Some(parent) = chunk.get(local_idx) else { continue; };
+            let Some(parent) = chunk.get(local_idx) else {
+                continue;
+            };
             let parent_id = parent.id.as_uuid();
             let http = http.clone();
             let api_base = api_base.clone();
@@ -108,7 +113,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .send()
                             .await?;
                         let v: serde_json::Value = resp.error_for_status()?.json().await?;
-                        let id = v.get("id").or_else(|| v.get("claim_id"))
+                        let id = v
+                            .get("id")
+                            .or_else(|| v.get("claim_id"))
                             .and_then(|x| x.as_str())
                             .ok_or("API create returned no claim id")?;
                         Ok(uuid::Uuid::parse_str(id)?)

@@ -242,7 +242,10 @@ mod tests {
         let raw = r#"{"0": {"atoms": ["X is Y", "X causes Z"], "generality": [0, 1]}}"#;
         let out = parse_batch_response(raw);
         let d = out.get(&0).expect("index 0 parsed");
-        assert_eq!(d.atoms, vec!["X is Y".to_string(), "X causes Z".to_string()]);
+        assert_eq!(
+            d.atoms,
+            vec!["X is Y".to_string(), "X causes Z".to_string()]
+        );
         assert_eq!(d.generality, vec![0, 1]);
     }
 
@@ -250,7 +253,10 @@ mod tests {
     fn recovers_json_from_markdown_fence_with_prose() {
         let raw = "Here you go:\n```json\n{\"2\": {\"atoms\": [\"A\", \"B\"], \"generality\": [1, 2]}}\n```\nDone.";
         let out = parse_batch_response(raw);
-        assert!(out.contains_key(&2), "must recover the fenced object despite surrounding prose");
+        assert!(
+            out.contains_key(&2),
+            "must recover the fenced object despite surrounding prose"
+        );
         assert_eq!(out.get(&2).unwrap().atoms.len(), 2);
     }
 
@@ -267,14 +273,22 @@ mod tests {
         let d = parse_batch_response(raw);
         let entry = d.get(&0).unwrap();
         assert_eq!(entry.atoms.len(), 2);
-        assert_eq!(entry.generality, vec![-1, -1], "bare array has no generality => all -1");
+        assert_eq!(
+            entry.generality,
+            vec![-1, -1],
+            "bare array has no generality => all -1"
+        );
     }
 
     #[test]
     fn generality_length_mismatch_falls_back_to_unknown() {
         let raw = r#"{"0": {"atoms": ["a", "b"], "generality": [0]}}"#;
         let d = parse_batch_response(raw).remove(&0).unwrap();
-        assert_eq!(d.generality, vec![-1, -1], "mismatched generality length must be discarded, not zip-truncated");
+        assert_eq!(
+            d.generality,
+            vec![-1, -1],
+            "mismatched generality length must be discarded, not zip-truncated"
+        );
     }
 
     #[test]
@@ -289,6 +303,10 @@ mod tests {
     fn out_of_range_generality_clamped_to_unknown() {
         let raw = r#"{"0": {"atoms": ["a", "b", "c"], "generality": [0, 7, -3]}}"#;
         let d = parse_batch_response(raw).remove(&0).unwrap();
-        assert_eq!(d.generality, vec![0, -1, -1], "only 0/1/2 are valid tiers; others -> -1");
+        assert_eq!(
+            d.generality,
+            vec![0, -1, -1],
+            "only 0/1/2 are valid tiers; others -> -1"
+        );
     }
 }
