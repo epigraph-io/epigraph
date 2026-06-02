@@ -1076,6 +1076,39 @@ impl ClaimRepository {
         Ok(live as usize == distinct.len())
     }
 
+    /// Fetch `(id, content)` for a batch of claim ids, current rows only.
+    ///
+    /// Lightweight companion to the structural enrichment in
+    /// `epigraph-mcp`'s `fetch_batched_context`: the rerank pipeline needs
+    /// the candidate *text* to score query-relevance, but must NOT pay for
+    /// siblings/corroborates/neighbor joins until AFTER it has truncated the
+    /// widened pool down to the final `limit`. Returns a `HashMap` so the
+    /// caller can look up content by id in any order (ANN result order is
+    /// not preserved by `id = ANY(...)`). Missing/non-current ids are simply
+    /// absent from the map.
+    ///
+    /// Uses the runtime `query_as` form (no compile-time `.sqlx` cache entry)
+    /// to keep `cargo sqlx prepare` out of this change's footprint.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    pub async fn contents_by_ids(
+        pool: &PgPool,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, String>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String)>(
+            "SELECT id, content FROM claims \
+             WHERE id = ANY($1) AND COALESCE(is_current, true) = true",
+        )
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// List claims that contain ALL of the specified labels.
     ///
     /// Uses the GIN index on `claims.labels` for efficient `@>` containment queries.
@@ -2517,6 +2550,72 @@ mod tests {
             !missing.iter().any(|(id, _)| *id == tele_event_prop),
             "event-property telemetry claim must be excluded"
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn contents_by_ids_returns_current_only_and_skips_missing(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'test-contents-by-ids', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let current_text = format!("current-claim-{}", Uuid::new_v4());
+        let current_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, true)
+             RETURNING id",
+        )
+        .bind(&current_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // A superseded (is_current = false) row must NOT be returned — the
+        // rerank pool must never score retired claim text.
+        let stale_text = format!("stale-claim-{}", Uuid::new_v4());
+        let stale_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, false)
+             RETURNING id",
+        )
+        .bind(&stale_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let absent_id = Uuid::new_v4();
+        let map = ClaimRepository::contents_by_ids(&pool, &[current_id, stale_id, absent_id])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            map.get(&current_id).map(String::as_str),
+            Some(current_text.as_str()),
+            "current claim content must be returned verbatim"
+        );
+        assert!(
+            !map.contains_key(&stale_id),
+            "non-current (superseded) claim must be absent from the map"
+        );
+        assert!(
+            !map.contains_key(&absent_id),
+            "id with no matching row must be absent from the map"
+        );
+        assert_eq!(
+            map.len(),
+            1,
+            "only the single current claim should be present"
+        );
+
+        // Empty input short-circuits to an empty map without touching the DB.
+        let empty = ClaimRepository::contents_by_ids(&pool, &[]).await.unwrap();
+        assert!(empty.is_empty());
     }
 
     #[sqlx::test(migrations = "../../migrations")]

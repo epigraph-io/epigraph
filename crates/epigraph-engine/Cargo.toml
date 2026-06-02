@@ -24,11 +24,19 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+epigraph-interfaces = { workspace = true }
 # Theme k-means helper (shared by the HTTP route and the scheduled job).
 linfa = { workspace = true }
 linfa-clustering = { workspace = true }
 ndarray = { workspace = true }
 sqlx = { workspace = true }
+
+[features]
+# Enables the live HTTP cross-encoder rerank client (Cohere/Voyage/Jina-style).
+# Mirrors the embeddings crate's `jina` feature gate: without it, the real
+# client compiles to a stub that reports unavailable, so the keyless box still
+# builds and the unit tests (mock client) still run.
+rerank = []
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -97,6 +105,10 @@ path = "tests/diverse_retrieval_integration.rs"
 [[test]]
 name = "diverse_retrieval_layering"
 path = "tests/diverse_retrieval_layering.rs"
+
+[[test]]
+name = "rerank_pipeline"
+path = "tests/rerank_pipeline.rs"
 
 [[test]]
 name = "alt_set_cdst_integration"
