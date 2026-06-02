@@ -552,6 +552,16 @@ async fn handle_authorization_code(
             message: "invalid_grant: unknown user".into(),
         })?;
 
+    // get_by_id returns suspended/revoked clients, so gate on status here — same as
+    // handle_client_credentials and handle_refresh_token. Without this, a user whose
+    // client was suspended/revoked could still redeem a valid code for a fresh 1h
+    // access token + 30d refresh token (a 30-day blast radius).
+    if client.status != "active" {
+        return Err(ApiError::Forbidden {
+            reason: format!("Client status is '{}', must be 'active'", client.status),
+        });
+    }
+
     let ttl = Duration::hours(1);
     let effective_scopes = row.scopes.clone();
     let (access_token, _jti) = state

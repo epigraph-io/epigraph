@@ -98,13 +98,15 @@ async fn db_app() -> (axum::Router, PgPool, Arc<JwtConfig>) {
     (app, pool, jwt)
 }
 
-/// Seed an active 'human' oauth_client and a fresh single-use authorization code.
-/// Returns (varchar client_id used at /authorize, raw code, granted scopes).
-/// `expires_at` lets callers seed an already-expired code for the expiry test.
+/// Seed a 'human' oauth_client with the given status and a fresh single-use
+/// authorization code. Returns (varchar client_id used at /authorize, raw code).
+/// `expires_at` lets callers seed an already-expired code for the expiry test;
+/// `status` lets callers seed a non-active client for the status-gate test.
 async fn seed_client_and_code(
     pool: &PgPool,
     scopes: &[String],
     expires_at: chrono::DateTime<Utc>,
+    status: &str,
 ) -> (String, String) {
     let unique = Uuid::new_v4().simple().to_string();
     let client_id = format!("epigraph_test_{unique}");
@@ -126,7 +128,7 @@ async fn seed_client_and_code(
         "human",
         &client_scopes, // allowed_scopes (superset)
         &client_scopes, // granted_scopes (superset — must NOT leak into the token)
-        "active",
+        status,
         None,
         // owner_id: NULL. It is a self-FK to oauth_clients(id) (a random UUID
         // would violate oauth_clients_owner_id_fkey), and the agents_must_have_owner
@@ -169,7 +171,7 @@ fn token_body(grant_code: &str, verifier: &str, client_id: &str) -> String {
 async fn db_authorization_code_happy_path_issues_valid_jwt() {
     let scopes = vec!["claims:read".to_string(), "claims:write".to_string()];
     let (app, pool, jwt) = db_app().await;
-    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1)).await;
+    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
     let (status, body) = post_form(
         app,
@@ -200,7 +202,7 @@ async fn db_authorization_code_happy_path_issues_valid_jwt() {
 async fn db_authorization_code_wrong_verifier_is_rejected() {
     let scopes = vec!["claims:read".to_string()];
     let (app, pool, _jwt) = db_app().await;
-    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1)).await;
+    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
     // Identical to happy path except the PKCE verifier is wrong → challenge
     // mismatch → 400. (One factor varied vs the happy path.)
@@ -219,7 +221,7 @@ async fn db_authorization_code_wrong_verifier_is_rejected() {
 async fn db_authorization_code_is_single_use() {
     let scopes = vec!["claims:read".to_string()];
     let (app, pool, _jwt) = db_app().await;
-    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1)).await;
+    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
     // First redeem succeeds (consume marks used_at atomically).
     let (status1, body1) = post_form(
@@ -246,7 +248,7 @@ async fn db_authorization_code_expired_is_rejected() {
     let scopes = vec!["claims:read".to_string()];
     let (app, pool, _jwt) = db_app().await;
     // expires_at in the past → consume's `expires_at > now()` guard rejects it.
-    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() - Duration::hours(1)).await;
+    let (client_id, code) = seed_client_and_code(&pool, &scopes, Utc::now() - Duration::hours(1), "active").await;
 
     let (status, _body) = post_form(
         app,
@@ -256,6 +258,29 @@ async fn db_authorization_code_expired_is_rejected() {
     .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "expired code must be rejected");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL test DB; run with --ignored"]
+async fn db_authorization_code_suspended_client_is_forbidden() {
+    // A valid, unexpired code with the correct PKCE verifier + redirect_uri +
+    // client_id — the ONLY varied factor vs the happy path is that the per-user
+    // oauth_client is 'suspended', not 'active'. Without the status gate the
+    // handler would mint a fresh 1h access token + 30d refresh token for a
+    // suspended client (a 30-day blast radius). With the gate it must 403, like
+    // the sibling client_credentials/refresh_token handlers.
+    let scopes = vec!["claims:read".to_string()];
+    let (app, pool, _jwt) = db_app().await;
+    let (client_id, code) =
+        seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "suspended").await;
+
+    let (status, _body) = post_form(app, "/oauth/token", &token_body(&code, VERIFIER, &client_id)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "suspended client must not redeem a valid code"
+    );
 }
 
 #[tokio::test]
