@@ -61,7 +61,11 @@ impl Policy {
         // queue (`decide_match_candidate`, `MatchCandidateRepo::list_pending`,
         // the API `pending[]` array) had no producer at all, so the whole
         // human-review surface was dead in normal operation.
-        let promote_status = if self.auto_promote { "promoted" } else { "pending" };
+        let promote_status = if self.auto_promote {
+            "promoted"
+        } else {
+            "pending"
+        };
 
         match action {
             PolicyAction::AutoPromote => {
