@@ -72,9 +72,18 @@ async fn returns_level_less_and_non_level_2_claims(pool: PgPool) {
         .expect("search_claims_by_embedding");
     let ids: Vec<Uuid> = hits.iter().map(|h| h.claim_id).collect();
 
-    assert!(ids.contains(&memorized), "level-less memorized claim must be returned");
-    assert!(ids.contains(&atom), "level=3 atom must be returned (no level gate)");
-    assert!(ids.contains(&para), "level=2 paragraph must still be returned");
+    assert!(
+        ids.contains(&memorized),
+        "level-less memorized claim must be returned"
+    );
+    assert!(
+        ids.contains(&atom),
+        "level=3 atom must be returned (no level gate)"
+    );
+    assert!(
+        ids.contains(&para),
+        "level=2 paragraph must still be returned"
+    );
 }
 
 /// label_filter=Some scopes results to the overlap set — find_workflow's
@@ -107,8 +116,14 @@ async fn label_filter_restricts_to_overlapping_labels(pool: PgPool) {
         .expect("search with label filter");
     let ids: Vec<Uuid> = hits.iter().map(|h| h.claim_id).collect();
 
-    assert!(ids.contains(&wf), "workflow-labeled claim must be returned under filter");
-    assert!(!ids.contains(&other), "non-workflow claim must be excluded by label filter");
+    assert!(
+        ids.contains(&wf),
+        "workflow-labeled claim must be returned under filter"
+    );
+    assert!(
+        !ids.contains(&other),
+        "non-workflow claim must be excluded by label filter"
+    );
 }
 
 /// COALESCE(is_current, true) = true must exclude superseded claims, matching
@@ -140,8 +155,14 @@ async fn excludes_non_current_claims(pool: PgPool) {
         .expect("search");
     let ids: Vec<Uuid> = hits.iter().map(|h| h.claim_id).collect();
 
-    assert!(ids.contains(&live), "is_current=true claim must be returned");
-    assert!(!ids.contains(&stale), "is_current=false claim must be excluded");
+    assert!(
+        ids.contains(&live),
+        "is_current=true claim must be returned"
+    );
+    assert!(
+        !ids.contains(&stale),
+        "is_current=false claim must be excluded"
+    );
 }
 
 /// Unsupported dim is an explicit InvalidData error, never a silent wrong-column query.

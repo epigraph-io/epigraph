@@ -83,7 +83,8 @@ pub async fn recall(
         // label filter (library recall spans the whole corpus). dim comes from
         // the injected embedder so a 3072d provider still routes correctly.
         let dim = embedder.dimension() as u32;
-        match ClaimRepository::search_claims_by_embedding(pool, &pgvec, dim, limit_i64, None).await {
+        match ClaimRepository::search_claims_by_embedding(pool, &pgvec, dim, limit_i64, None).await
+        {
             Ok(hits) => {
                 let mut results = Vec::new();
                 for hit in hits {
