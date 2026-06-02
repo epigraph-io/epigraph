@@ -166,6 +166,15 @@ fn token_body(grant_code: &str, verifier: &str, client_id: &str) -> String {
     )
 }
 
+/// Same as `token_body` but OMITS `client_id` entirely — used to prove the
+/// client-binding check is unconditional (RFC 9700 §4.1.3: client_id validation
+/// in the authorization_code grant is a MUST).
+fn token_body_no_client_id(grant_code: &str, verifier: &str) -> String {
+    format!(
+        r#"{{"grant_type":"authorization_code","code":"{grant_code}","code_verifier":"{verifier}","redirect_uri":"{REDIRECT_URI}"}}"#
+    )
+}
+
 #[tokio::test]
 #[ignore = "requires DATABASE_URL test DB; run with --ignored"]
 async fn db_authorization_code_happy_path_issues_valid_jwt() {
@@ -280,6 +289,62 @@ async fn db_authorization_code_suspended_client_is_forbidden() {
         status,
         StatusCode::FORBIDDEN,
         "suspended client must not redeem a valid code"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL test DB; run with --ignored"]
+async fn db_authorization_code_omitted_client_id_is_rejected() {
+    // Identical to the happy path in EVERY factor except one: the token request
+    // OMITS `client_id`. The code is valid + unexpired, the PKCE verifier is
+    // correct, the redirect_uri matches, and the client is 'active' — so the ONLY
+    // thing that can drive a rejection is an unconditional client-binding check.
+    //
+    // Before the fix: `if let Some(cid) = req.client_id` skips the binding check
+    // entirely when client_id is absent, so this redeems to a 200 token (a code
+    // captured/replayed for the legitimate Claude client could be redeemed by any
+    // caller that simply leaves client_id out). RFC 9700 §4.1.3 makes client_id
+    // validation in the authorization_code grant a MUST → this must be 4xx.
+    let scopes = vec!["claims:read".to_string()];
+    let (app, pool, _jwt) = db_app().await;
+    let (_client_id, code) =
+        seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
+
+    let (status, _body) =
+        post_form(app, "/oauth/token", &token_body_no_client_id(&code, VERIFIER)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a token request that omits client_id must be rejected (RFC 9700 §4.1.3)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL test DB; run with --ignored"]
+async fn db_authorization_code_wrong_client_id_is_rejected() {
+    // Regression coverage for the cross-client binding path: a code minted for
+    // client A is redeemed with a present-but-wrong client_id (B). This path was
+    // already rejected (the `if let Some(cid)` mismatch branch), so it is NOT the
+    // RED→GREEN driver for the unconditional-binding fix — it guards against a
+    // future regression that weakens the value-vs-row comparison. One factor
+    // varied vs the happy path: client_id is wrong.
+    let scopes = vec!["claims:read".to_string()];
+    let (app, pool, _jwt) = db_app().await;
+    let (_client_id, code) =
+        seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
+
+    let (status, _body) = post_form(
+        app,
+        "/oauth/token",
+        &token_body(&code, VERIFIER, "epigraph_test_some_other_client"),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a code minted for one client must not be redeemed with a different client_id"
     );
 }
 

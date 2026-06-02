@@ -507,6 +507,16 @@ async fn handle_authorization_code(
     let redirect_uri = req.redirect_uri.as_deref().ok_or(ApiError::BadRequest {
         message: "missing redirect_uri".into(),
     })?;
+    // RFC 9700 §4.1.3 / OAuth 2.1: client_id validation in the authorization_code
+    // grant is a MUST. Extract presence here, alongside the other required-param
+    // checks and BEFORE consume(), so an omitted client_id is rejected without
+    // burning the single-use code. The value-vs-row binding check is below (needs
+    // the consumed row). Making this unconditional closes the binding-bypass where
+    // a captured/replayed code could be redeemed by any caller that simply leaves
+    // client_id out of the token request.
+    let req_client_id = req.client_id.as_deref().ok_or(ApiError::BadRequest {
+        message: "missing client_id".into(),
+    })?;
 
     // Single-use consume (atomic; rejects used/expired).
     let raw = code.as_bytes();
@@ -540,12 +550,10 @@ async fn handle_authorization_code(
             message: "invalid_grant: redirect_uri mismatch".into(),
         });
     }
-    if let Some(cid) = req.client_id.as_deref() {
-        if cid != row.client_id {
-            return Err(ApiError::BadRequest {
-                message: "invalid_grant: client mismatch".into(),
-            });
-        }
+    if req_client_id != row.client_id {
+        return Err(ApiError::BadRequest {
+            message: "invalid_grant: client mismatch".into(),
+        });
     }
 
     // Load the per-user client to populate token claims (type/owner/agent).
