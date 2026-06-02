@@ -1,0 +1,21 @@
+{
+  "scifact_id": 443,
+  "claim": "GATA-3 is important for hematopoietic stem cell (HSC) function.",
+  "evidence_sentences": [
+    "In the present study, we show that Gata3-null mutant mice generate fewer LT-HSCs and that fewer Gata3-null LT-HSCs are in cycle.",
+    "Furthermore, Gata3 mutant hematopoietic progenitor cells fail to be recruited into an increased cycling state after 5-fluorouracil-induced myelosuppression.",
+    "Therefore, GATA-3 is required for the maintenance of a normal number of LT-HSCs and for their entry into the cell cycle."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "10165258",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

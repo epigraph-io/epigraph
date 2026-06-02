@@ -1,0 +1,19 @@
+{
+  "scifact_id": 453,
+  "claim": "General exercise therapy is more effective than rotator cuff exercises in reducing pain and improving function of the shoulder.",
+  "evidence_sentences": [
+    "There was a significantly greater improvement in the Constant-Murley score in the specific exercise group than in the control exercise group (24 points (95% confidence interval 19 to 28.0) v 9 points (5 to 13); mean difference between group: 15 points (8.5 to 20.6))."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "4200695",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

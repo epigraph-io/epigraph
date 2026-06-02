@@ -1,0 +1,21 @@
+{
+  "scifact_id": 1110,
+  "claim": "Suboptimal nutrition is not predictive of chronic disease",
+  "evidence_sentences": [
+    "In 2015, the ten largest contributors to global DALYs among Level 3 risks were high systolic blood pressure (211\u00b78 million [192\u00b77 million to 231\u00b71 million] global DALYs), smoking (148\u00b76 million [134\u00b72 million to 163\u00b71 million]), high fasting plasma glucose (143\u00b71 million [125\u00b71 million to 163\u00b75 million]), high BMI (120\u00b71 million [83\u00b78 million to 158\u00b74 million]), childhood undernutrition (113\u00b73 million [103\u00b79 million to 123\u00b74 million]), ambient particulate matter (103\u00b71 million [90\u00b78 million to 115\u00b71 million]), high total cholesterol (88\u00b77 million [74\u00b76 million to 105\u00b77 million]), household air pollution (85\u00b76 million [66\u00b77 million to 106\u00b71 million]), alcohol use (85\u00b70 million [77\u00b72 million to 93\u00b70 million]), and diets high in sodium (83\u00b70 million [49\u00b73 million to 127\u00b75 million])."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "13770184",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.82,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "global DALYs assessment 2015",
+      "Level 3 risk factors"
+    ],
+    "evidence_type": "statistical"
+  }
+}

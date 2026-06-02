@@ -1,0 +1,27 @@
+{
+  "scifact_id": 1404,
+  "claim": "siRNA knockdown of A20 slows tumor progression in an in vivo murine xenograft model.",
+  "evidence_sentences": [
+    "Inhibiting A20 expression by siRNAs in vitro reduced the growth rates of glioma cells and resulted in G1/S arrest and increased apoptosis.",
+    "In a mouse tumor model, local administration of siRNA significantly suppressed solid tumor growth.   \n",
+    "CONCLUSIONS A20 was overexpressed both in human glioma tissues and cell lines, and inhibiting A20 expression greatly slowed tumor cell growth in culture and in mice."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "38355793",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "siRNA",
+      "A20"
+    ],
+    "conditions": [
+      "in vitro glioma cell culture",
+      "in vivo murine xenograft model",
+      "local administration of siRNA"
+    ],
+    "evidence_type": "empirical"
+  }
+}

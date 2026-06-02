@@ -1,0 +1,31 @@
+{
+  "scifact_id": 228,
+  "claim": "Cardiac tissue-resident macrophages directly contribute to electrical activity.",
+  "evidence_sentences": [
+    "Here, we show that cardiac macrophages facilitate electrical conduction through the distal atrioventricular node, where conducting cells densely intersperse with elongated macrophages expressing connexin 43.",
+    "Conversely, macrophages render the resting membrane potential of cardiomyocytes more positive and, according to computational modeling, accelerate their repolarization.",
+    "Photostimulation of channelrhodopsin-2-expressing macrophages improves atrioventricular conduction, whereas conditional deletion of connexin 43 in macrophages and congenital lack of macrophages delay atrioventricular conduction.",
+    "These observations implicate macrophages in normal and aberrant cardiac conduction."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4928057",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [
+      "channelrhodopsin-2",
+      "computational modeling"
+    ],
+    "reagents_involved": [
+      "connexin 43",
+      "channelrhodopsin-2"
+    ],
+    "conditions": [
+      "photostimulation of channelrhodopsin-2-expressing macrophages",
+      "conditional deletion of connexin 43 in macrophages",
+      "congenital lack of macrophages"
+    ],
+    "evidence_type": "empirical"
+  }
+}

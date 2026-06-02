@@ -1,0 +1,16 @@
+{
+  "scifact_id": 1235,
+  "claim": "The morphology change from large white adipocytes to small brown adipocytes is a sign of decreased energy expenditure potential in white adipose tissue.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "scifact_id": 122,
+  "claim": "Antimicrobial agents are more effective due to the pressure of antimicrobial usage.",
+  "evidence_sentences": [
+    "Overusing antibiotics is not the only cause and reducing use is not the only solution   W arning signs of antimicrobial resistance, chinks in the antimicrobial armour, began to appear in the middle of the last century, and by the 1990s various reports had signalled the dangers of excessive or inappropriate use of antibiotics in clinical medicine and of the use of antibiotics in animal feed as growth promoters.1\u20133 Overuse of antimicrobials emerged as the main culprit, and reducing their use was seen as the answer."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "31460499",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.45,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "testimonial",
+    "tier2_enriched": true
+  }
+}

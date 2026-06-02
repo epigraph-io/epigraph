@@ -1,0 +1,24 @@
+{
+  "scifact_id": 982,
+  "claim": "Proteins synthesized at the growth cone are ubiquitinated at a higher rate than proteins from the cell body.",
+  "evidence_sentences": [
+    "We find that growth cones exhibit high levels of ubiquitination and that local signalling pathways trigger the ubiquitination and degradation of RhoA, a mediator of Sema3A-induced growth cone collapse."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2988714",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.55,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "RhoA",
+      "Sema3A"
+    ],
+    "conditions": [
+      "growth cone collapse",
+      "local signalling pathways"
+    ],
+    "evidence_type": "empirical"
+  }
+}

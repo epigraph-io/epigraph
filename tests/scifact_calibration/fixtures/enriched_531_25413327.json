@@ -1,0 +1,20 @@
+{
+  "scifact_id": 531,
+  "claim": "Human embryonic stem cells have the capacity to give rise to differentiated progeny representative of all three embryonic germ layers.",
+  "evidence_sentences": [
+    "Embryonic stem (ES) cell lines derived from human blastocysts have the developmental potential to form derivatives of all three embryonic germ layers even after prolonged culture."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "25413327",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "prolonged culture"
+    ],
+    "evidence_type": "empirical"
+  }
+}

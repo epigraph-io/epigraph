@@ -1,0 +1,21 @@
+{
+  "scifact_id": 1312,
+  "claim": "Transcription factor EB induces transcription of pro-inflammatory cytokines in macrophages infected with Staphylococcus aureus.",
+  "evidence_sentences": [
+    "TFEB was also rapidly activated in murine macrophages upon S. aureus infection and was required for proper transcriptional induction of several proinflammatory cytokines and chemokines."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "24177706",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "S. aureus infection",
+      "murine macrophages"
+    ],
+    "evidence_type": "empirical"
+  }
+}

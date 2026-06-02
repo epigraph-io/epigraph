@@ -1,0 +1,25 @@
+{
+  "scifact_id": 1298,
+  "claim": "Thigh-length graduated compression stockings (GCS) did not reduce deep vein thrombosis in patients admitted to hospital who are immobile because of acute stroke.",
+  "evidence_sentences": [
+    "The primary outcome occurred in 126 (10.0%) patients allocated to thigh-length GCS and in 133 (10.5%) allocated to avoid GCS, resulting in a non-significant absolute reduction in risk of 0.5% (95% CI -1.9% to 2.9%).",
+    "INTERPRETATION These data do not lend support to the use of thigh-length GCS in patients admitted to hospital with acute stroke."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11718220",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "thigh-length graduated compression stockings"
+    ],
+    "conditions": [
+      "patients admitted to hospital",
+      "acute stroke",
+      "immobility"
+    ],
+    "evidence_type": "statistical"
+  }
+}

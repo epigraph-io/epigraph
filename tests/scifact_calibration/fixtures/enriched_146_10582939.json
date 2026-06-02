@@ -1,0 +1,32 @@
+{
+  "scifact_id": 146,
+  "claim": "Autologous transplantation of mesenchymal stem cells has lower rates of rejection than induction therapy with anti-interleukin-2 receptor antibodies.",
+  "evidence_sentences": [
+    "After 6 months, 4 of 53 patients (7.5%) in the autologous MSC plus standard-dose CNI group (95% CI, 0.4%-14.7%; P = .04) and 4 of 52 patients (7.7%) in the low-dose group (95% CI, 0.5%-14.9%; P = .046) compared with 11 of 51 controls (21.6%; 95% CI, 10.5%-32.6%) had biopsy-confirmed acute rejection.",
+    "Also, during the 1-year follow-up, combined analysis of MSC-treated groups revealed significantly decreased risk of opportunistic infections than the control group (hazard ratio, 0.42; 95% CI, 0.20-0.85, P=.02)   CONCLUSION Among patients undergoing renal transplant, the use of autologous MSCs compared with anti-IL-2 receptor antibody induction therapy resulted in lower incidence of acute rejection, decreased risk of opportunistic infection, and better estimated renal function at 1 year.   \n"
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "10582939",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [
+      "biopsy"
+    ],
+    "reagents_involved": [
+      "mesenchymal stem cells",
+      "anti-IL-2 receptor antibody",
+      "calcineurin inhibitors"
+    ],
+    "conditions": [
+      "autologous MSC plus standard-dose CNI group",
+      "autologous MSC plus low-dose CNI group",
+      "control group with anti-IL-2 receptor antibody induction",
+      "6-month follow-up",
+      "1-year follow-up",
+      "renal transplant patients"
+    ],
+    "evidence_type": "statistical"
+  }
+}

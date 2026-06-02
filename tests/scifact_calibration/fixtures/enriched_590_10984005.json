@@ -1,0 +1,25 @@
+{
+  "scifact_id": 590,
+  "claim": "In young and middle-aged adults, current or remote uses of ADHD medications increase the risk of serious cardiovascular events.",
+  "evidence_sentences": [
+    "The multivariable-adjusted rate ratio (RR) of serious cardiovascular events for current use vs nonuse of ADHD medications was 0.83 (95% CI, 0.72-0.96).",
+    "Among new users of ADHD medications, the adjusted RR was 0.77 (95% CI, 0.63-0.94).",
+    "CONCLUSIONS Among young and middle-aged adults, current or new use of ADHD medications, compared with nonuse or remote use, was not associated with an increased risk of serious cardiovascular events."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "10984005",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "young and middle-aged adults",
+      "current use vs nonuse of ADHD medications",
+      "new users of ADHD medications",
+      "multivariable-adjusted analysis"
+    ],
+    "evidence_type": "statistical"
+  }
+}

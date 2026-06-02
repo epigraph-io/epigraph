@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1346,
+  "claim": "Upon developing tyrosine-kinase inhibitor resistance, new mutations in epidermal growth factor receptors emerge and cause treatment failure.",
+  "evidence_sentences": [
+    "We first performed next-generation sequencing of cfDNA from seven subjects and detected an acquired EGFR C797S mutation in one; expression of this mutant EGFR construct in a cell line rendered it resistant to AZD9291.",
+    "All were positive for the T790M mutation before treatment, but upon developing AZD9291 resistance three molecular subtypes emerged: six cases acquired the C797S mutation, five cases maintained the T790M mutation but did not acquire the C797S mutation and four cases lost the T790M mutation despite the presence of the underlying EGFR activating mutation."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9505402",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "scifact_id": 1183,
+  "claim": "The TRaF1/C5 rs10818488 allele polymorphism regulates the neighboring C5 gene.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

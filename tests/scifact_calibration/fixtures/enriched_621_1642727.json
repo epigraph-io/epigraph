@@ -1,0 +1,26 @@
+{
+  "scifact_id": 621,
+  "claim": "Individuals with Alzheimers who participate in six months of physical activity improve cognitive function for up to 18 months.",
+  "evidence_sentences": [
+    "RESULTS In an intent-to-treat analysis, participants in the intervention group improved 0.26 points (95% confidence interval, -0.89 to 0.54) and those in the usual care group deteriorated 1.04 points (95% confidence interval, 0.32 to 1.82) on the ADAS-Cog at the end of the intervention.",
+    "CONCLUSIONS In this study of adults with subjective memory impairment, a 6-month program of physical activity provided a modest improvement in cognition over an 18-month follow-up period.   \n"
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1642727",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [
+      "ADAS-Cog"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "6-month physical activity program",
+      "18-month follow-up period",
+      "intent-to-treat analysis",
+      "subjective memory impairment"
+    ],
+    "evidence_type": "statistical"
+  }
+}

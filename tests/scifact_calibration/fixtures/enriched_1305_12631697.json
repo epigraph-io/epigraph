@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1305,
+  "claim": "Tirasemtiv targets fast-twitch muscle.",
+  "evidence_sentences": [
+    "We developed a small-molecule fast-skeletal-troponin activator, CK-2017357, as a means to increase muscle strength by amplifying the response of muscle when neural input is otherwise diminished secondary to neuromuscular disease.",
+    "Binding selectively to the fast-skeletal-troponin complex, CK-2017357 slows the rate of calcium release from troponin C and sensitizes muscle to calcium."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "12631697",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "CK-2017357",
+      "calcium",
+      "troponin C",
+      "fast-skeletal-troponin complex"
+    ],
+    "conditions": [
+      "diminished neural input secondary to neuromuscular disease"
+    ],
+    "evidence_type": "empirical"
+  }
+}

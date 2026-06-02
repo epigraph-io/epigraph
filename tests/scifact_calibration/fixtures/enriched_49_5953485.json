@@ -1,0 +1,24 @@
+{
+  "scifact_id": 49,
+  "claim": "ADAR1 binds to Dicer to cleave pre-miRNA.",
+  "evidence_sentences": [
+    "In this study, we investigated the interaction of the RNA editing mechanism with the RNA interference (RNAi) machinery and found that ADAR1 forms a complex with Dicer through direct protein-protein interaction.",
+    "Most importantly, ADAR1 increases the maximum rate (Vmax) of pre-microRNA (miRNA) cleavage by Dicer and facilitates loading of miRNA onto RNA-induced silencing complexes, identifying a new role of ADAR1 in miRNA processing and RNAi mechanisms."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5953485",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "ADAR1",
+      "Dicer",
+      "pre-miRNA",
+      "RNA-induced silencing complexes"
+    ],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

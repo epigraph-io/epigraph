@@ -1,0 +1,20 @@
+{
+  "scifact_id": 807,
+  "claim": "Most termination events in Okazaki fragments are dictated by initiation patterns.",
+  "evidence_sentences": [
+    "The replication profile is predominantly determined by the kinetics of origin firing, allowing us to reconstruct chromosome-wide timing profiles from an asynchronous culture."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "36606083",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.35,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "asynchronous culture"
+    ],
+    "evidence_type": "empirical"
+  }
+}

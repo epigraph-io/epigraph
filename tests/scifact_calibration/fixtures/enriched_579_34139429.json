@@ -1,0 +1,23 @@
+{
+  "scifact_id": 579,
+  "claim": "In patients with congenital heart defects, \u03b2-blockers significantly improve clinical heart failure outcomes.",
+  "evidence_sentences": [
+    "CONCLUSIONS These preliminary results suggest that carvedilol does not significantly improve clinical heart failure outcomes in children and adolescents with symptomatic systolic heart failure."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "34139429",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "carvedilol"
+    ],
+    "conditions": [
+      "children and adolescents",
+      "symptomatic systolic heart failure"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "scifact_id": 133,
+  "claim": "Assembly of invadopodia is triggered by focal generation of phosphatidylinositol-3,4-biphosphate and the activation of the nonreceptor tyrosine kinase Src.",
+  "evidence_sentences": [
+    "The expression of various phosphoinositide-binding domains revealed that the podosomes in Src-transformed NIH3T3 (NIH-src) cells are enriched with PtdIns(3,4)P2, suggesting an important role of this phosphoinositide in podosome formation.",
+    "Live-cell imaging analysis revealed that Src-expression stimulated podosome formation at focal adhesions of NIH3T3 cells after PtdIns(3,4)P2 accumulation."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16280642",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.72,
+    "supports_claim": true,
+    "instruments_used": [
+      "live-cell imaging"
+    ],
+    "reagents_involved": [
+      "phosphoinositide-binding domains",
+      "PtdIns(3,4)P2",
+      "Src"
+    ],
+    "conditions": [
+      "Src-transformed NIH3T3 cells",
+      "NIH-src cells",
+      "focal adhesions"
+    ],
+    "evidence_type": "empirical"
+  }
+}

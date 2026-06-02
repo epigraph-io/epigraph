@@ -1,0 +1,21 @@
+{
+  "scifact_id": 663,
+  "claim": "KLF4 is necessary for VSMCs to gain genetic characteristics of other cell types within atherosclerotic lesions.",
+  "evidence_sentences": [
+    "Our findings indicate that the contribution of SMCs to atherosclerotic plaques has been greatly underestimated, and that KLF4-dependent transitions in SMC phenotype are critical in lesion pathogenesis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "22080671",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "atherosclerotic plaques",
+      "SMC phenotype transitions"
+    ],
+    "evidence_type": "empirical"
+  }
+}

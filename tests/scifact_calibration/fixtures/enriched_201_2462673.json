@@ -1,0 +1,27 @@
+{
+  "scifact_id": 201,
+  "claim": "CD28 signals regulate trafficking of murine auto-reactive T cells into target tissues.",
+  "evidence_sentences": [
+    "Here, we demonstrate that the CD28 co-stimulatory pathway regulates the trafficking of self-reactive Ctla4(-/-) T cells to tissues.",
+    "Concurrent ablation of the CD28-activated Tec family kinase ITK does not block spontaneous T cell activation but instead causes self-reactive Ctla4(-/-) T cells to accumulate in secondary lymphoid organs."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2462673",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "CD28",
+      "CTLA4",
+      "ITK"
+    ],
+    "conditions": [
+      "Ctla4(-/-) knockout",
+      "concurrent ITK ablation",
+      "trafficking to target tissues vs accumulation in secondary lymphoid organs"
+    ],
+    "evidence_type": "empirical"
+  }
+}

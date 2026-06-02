@@ -1,0 +1,18 @@
+{
+  "scifact_id": 1109,
+  "claim": "Suboptimal nutrition is a leading cause of premature death",
+  "evidence_sentences": [
+    "The leading risk factors related to DALYs were dietary risks, tobacco smoking, high body mass index, high blood pressure, high fasting plasma glucose, physical inactivity, and alcohol use."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "8582337",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical"
+  }
+}

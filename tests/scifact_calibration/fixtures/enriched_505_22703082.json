@@ -1,0 +1,28 @@
+{
+  "scifact_id": 505,
+  "claim": "Helicobacter pylori-induced aberrant NF-kB-dependent expression of activation-induced cytidine deaminase contributes to the mutagenesis of host DNA.",
+  "evidence_sentences": [
+    "Here we show that infection of gastric epithelial cells with 'cag' pathogenicity island (cagPAI)-positive H. pylori induced aberrant expression of activation-induced cytidine deaminase (AID), a member of the cytidine-deaminase family that acts as a DNA- and RNA-editing enzyme, via the I\u03baB kinase\u2013dependent nuclear factor-\u03baB activation pathway.",
+    "Our findings provide evidence that aberrant AID expression caused by H. pylori infection might be a mechanism of mutation accumulation in the gastric mucosa during H. pylori\u2013associated gastric carcinogenesis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "22703082",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.88,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "cagPAI-positive H. pylori",
+      "activation-induced cytidine deaminase (AID)",
+      "I\u03baB kinase",
+      "nuclear factor-\u03baB"
+    ],
+    "conditions": [
+      "gastric epithelial cell infection",
+      "cag pathogenicity island-positive H. pylori strain",
+      "I\u03baB kinase-dependent NF-\u03baB activation pathway"
+    ],
+    "evidence_type": "empirical"
+  }
+}

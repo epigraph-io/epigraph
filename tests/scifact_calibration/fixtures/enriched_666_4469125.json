@@ -1,0 +1,26 @@
+{
+  "scifact_id": 666,
+  "claim": "Kir7.1 modulates channel activity by the G protein-coupled melanocortin-4 receptor (MC4R) in the paraventricular nucleus of the hypothalamus.",
+  "evidence_sentences": [
+    "Here we show that, in mice, regulation of firing activity of neurons from the paraventricular nucleus of the hypothalamus (PVN) by \u03b1-MSH and AgRP can be mediated independently of G\u03b1s signalling by ligand-induced coupling of MC4R to closure of inwardly rectifying potassium channel, Kir7.1."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4469125",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "\u03b1-MSH",
+      "AgRP"
+    ],
+    "conditions": [
+      "paraventricular nucleus of the hypothalamus (PVN) neurons",
+      "mice",
+      "independent of G\u03b1s signalling",
+      "ligand-induced coupling"
+    ],
+    "evidence_type": "empirical"
+  }
+}

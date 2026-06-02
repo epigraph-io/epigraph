@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1120,
+  "claim": "Sympathetic nerve activity is reduced throughout normal pregnancy.",
+  "evidence_sentences": [
+    "The s-MSNA in NP (38+/-6.6 impulses/100 beats) was greater (P<0.05) than in NN women (19+/-1.8 impulses/100 beats) despite similar age and body weight but less than in PIH women (P<0.001) (146+/-23.5 impulses/100 beats).",
+    "The findings suggest that the moderate sympathetic hyperactivity during the latter months of normal pregnancy may help to return the arterial pressure to nonpregnant levels, although when the increase in activity is excessive, hypertension may ensue."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "5323845",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

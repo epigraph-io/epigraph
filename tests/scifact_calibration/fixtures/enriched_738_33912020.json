@@ -1,0 +1,31 @@
+{
+  "scifact_id": 738,
+  "claim": "MICAL redox enzymes regulate actin dynamics.",
+  "evidence_sentences": [
+    "Sema3A stimulation generated hydrogen peroxide (H2O2) through MICAL (molecule interacting with CasL) and oxidized CRMP2, enabling it to form a disulfide-linked homodimer through cysteine-504.",
+    "Oxidized CRMP2 then formed a transient disulfide-linked complex with TRX, which stimulated CRMP2 phosphorylation by glycogen synthase kinase-3, leading to growth cone collapse.",
+    "Our results not only clarify the importance of H2O2 and CRMP2 oxidation in Sema3A-induced growth cone collapse but also indicate an unappreciated role for TRX in linking CRMP2 oxidation to phosphorylation."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "33912020",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.35,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "hydrogen peroxide (H2O2)",
+      "MICAL (molecule interacting with CasL)",
+      "CRMP2",
+      "thioredoxin (TRX)",
+      "glycogen synthase kinase-3",
+      "Sema3A"
+    ],
+    "conditions": [
+      "Sema3A stimulation",
+      "disulfide-linked homodimer formation through cysteine-504",
+      "CRMP2 phosphorylation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

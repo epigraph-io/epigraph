@@ -1,0 +1,23 @@
+{
+  "scifact_id": 563,
+  "claim": "In British Men, haplogroup I decreases risk of cardiovascular disease.",
+  "evidence_sentences": [
+    "Carriers of haplogroup I had about a 50% higher age-adjusted risk of coronary artery disease than did men with other Y chromosome lineages in BHF-FHS (odds ratio 1\u00b775, 95% CI 1\u00b720-2\u00b754, p=0\u00b7004), WOSCOPS (1\u00b745, 1\u00b708-1\u00b795, p=0\u00b7012), and joint analysis of both populations (1\u00b756, 1\u00b724-1\u00b797, p=0\u00b70002)."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "2867345",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "age-adjusted",
+      "BHF-FHS cohort",
+      "WOSCOPS cohort",
+      "joint analysis"
+    ],
+    "evidence_type": "statistical"
+  }
+}

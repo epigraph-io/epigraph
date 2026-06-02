@@ -1,0 +1,19 @@
+{
+  "scifact_id": 998,
+  "claim": "Pyridostatin prevents double-strand breaks accumulation.",
+  "evidence_sentences": [
+    "Remarkably, PDS reduces proliferation of HR-defective cells by inducing DSB accumulation, checkpoint activation, and deregulated G2/M progression and by enhancing the replication defect intrinsic to HR deficiency."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "16472469",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

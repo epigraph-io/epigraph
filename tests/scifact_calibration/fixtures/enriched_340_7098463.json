@@ -1,0 +1,24 @@
+{
+  "scifact_id": 340,
+  "claim": "Diabetes remission occurs less in people treated with conventional therapy than in people treated with laparoscopic adjustable gastric banding surgery.",
+  "evidence_sentences": [
+    "Remission of type 2 diabetes was achieved by 22 (73%) in the surgical group and 4 (13%) in the conventional-therapy group.",
+    "Relative risk of remission for the surgical group was 5.5 (95% confidence interval, 2.2-14.0).",
+    "CONCLUSIONS Participants randomized to surgical therapy were more likely to achieve remission of type 2 diabetes through greater weight loss."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "7098463",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "laparoscopic adjustable gastric banding surgery",
+      "conventional therapy",
+      "randomized controlled trial"
+    ],
+    "evidence_type": "statistical"
+  }
+}

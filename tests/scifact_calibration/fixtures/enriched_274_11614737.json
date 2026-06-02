@@ -1,0 +1,28 @@
+{
+  "scifact_id": 274,
+  "claim": "Combination nicotine replacement therapies with varenicline or bupropion lead to significantly higher long-term abstinence rates at 52 weeks than varenicline monotherapy.",
+  "evidence_sentences": [
+    "At 52 weeks, 30.9% of the combination therapy group achieved prolonged and 36.6% achieved 7-day point-prevalence smoking abstinence compared with 24.5% and 29.2% in varenicline monotherapy (OR, 1.39; 95% CI, 0.93-2.07; P = .11 and OR, 1.40; 95% CI, 0.96-2.05; P = .08, respectively).",
+    "Neither outcome was significantly different at 52 weeks."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "11614737",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "nicotine replacement therapy",
+      "varenicline",
+      "bupropion"
+    ],
+    "conditions": [
+      "52-week follow-up",
+      "combination therapy vs varenicline monotherapy",
+      "prolonged abstinence outcome",
+      "7-day point-prevalence abstinence outcome"
+    ],
+    "evidence_type": "statistical"
+  }
+}

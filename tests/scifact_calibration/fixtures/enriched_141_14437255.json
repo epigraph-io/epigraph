@@ -1,0 +1,32 @@
+{
+  "scifact_id": 141,
+  "claim": "Auditory entrainment is strengthened when people see congruent visual and auditory information.",
+  "evidence_sentences": [
+    "UNLABELLED Congruent audiovisual speech enhances our ability to comprehend a speaker, even in noise-free conditions.",
+    "When incongruent auditory and visual information is presented concurrently, it can hinder a listener's perception and even cause him or her to perceive information that was not presented in either modality.",
+    "We demonstrate that the cortical representation of the speech envelope is enhanced by the presentation of congruent audiovisual speech in noise-free conditions.",
+    "Finally, our data suggest that neural entrainment to the speech envelope is inhibited when the auditory and visual streams are incongruent both temporally and contextually.   ",
+    "SIGNIFICANCE STATEMENT Seeing a speaker's face as he or she talks can greatly help in understanding what the speaker is saying.",
+    "Specifically, we show that the brain's representation of auditory speech is enhanced when the accompanying visual speech signal shares the same timing."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "14437255",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [
+      "EEG",
+      "cortical entrainment measurement"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "congruent audiovisual speech",
+      "incongruent audiovisual speech",
+      "noise-free conditions",
+      "temporal congruence",
+      "contextual congruence"
+    ],
+    "evidence_type": "empirical"
+  }
+}

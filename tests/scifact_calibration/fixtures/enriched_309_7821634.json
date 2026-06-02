@@ -1,0 +1,23 @@
+{
+  "scifact_id": 309,
+  "claim": "DUSP4 increases apoptosis.",
+  "evidence_sentences": [
+    "DUSP4 overexpression increased chemotherapy-induced apoptosis, whereas DUSP4 depletion dampened the response to chemotherapy."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "7821634",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "chemotherapy"
+    ],
+    "conditions": [
+      "DUSP4 overexpression",
+      "DUSP4 depletion"
+    ],
+    "evidence_type": "empirical"
+  }
+}

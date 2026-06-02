@@ -1,0 +1,26 @@
+{
+  "scifact_id": 780,
+  "claim": "Mice that lack Interferon-\u03b3 or its receptor are highly susceptible to experimental autoimmune myocarditis.",
+  "evidence_sentences": [
+    "Lack of IFN-gamma due to either depletion with an antibody or a genetic deficiency exacerbated myocarditis.",
+    "In contrast, IFN-gamma plays a protective role."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "8246922",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "IFN-gamma",
+      "anti-IFN-gamma antibody"
+    ],
+    "conditions": [
+      "antibody depletion of IFN-gamma",
+      "genetic IFN-gamma deficiency",
+      "experimental autoimmune myocarditis model"
+    ],
+    "evidence_type": "empirical"
+  }
+}

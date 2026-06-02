@@ -1,0 +1,23 @@
+{
+  "scifact_id": 880,
+  "claim": "Occupancy of ribosomes by IncRNAs mirror 5 0-UTRs",
+  "evidence_sentences": [
+    "Here, we show that classical noncoding RNAs and 5' UTRs show the same ribosome occupancy as lincRNAs, demonstrating that ribosome occupancy alone is not sufficient to classify transcripts as coding or noncoding."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "8426046",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [
+      "ribosomes"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "ribosome occupancy measurement",
+      "comparison of lincRNAs vs 5' UTRs vs classical noncoding RNAs"
+    ],
+    "evidence_type": "empirical"
+  }
+}

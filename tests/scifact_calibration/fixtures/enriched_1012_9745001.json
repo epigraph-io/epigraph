@@ -1,0 +1,29 @@
+{
+  "scifact_id": 1012,
+  "claim": "Radioiodine treatment of non-toxic multinodular goitre reduces thyroid volume.",
+  "evidence_sentences": [
+    "In 45 patients treated with one dose and remaining euthyroid the median thyroid volume was reduced from 73 (interquartile range 50-106) ml to 29 (23-48) ml at 24 months in the 39 patients in whom this was measured during follow up.",
+    "CONCLUSIONS A substantial reduction in thyroid volume accompanied by a low incidence of hypothyroidism and few side effects makes the use of radioactive iodine an attractive alternative to surgery in selected cases of non-toxic multinodular goitre."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9745001",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [
+      "ultrasound"
+    ],
+    "reagents_involved": [
+      "radioactive iodine"
+    ],
+    "conditions": [
+      "non-toxic multinodular goitre",
+      "euthyroid patients",
+      "single dose treatment",
+      "24-month follow-up",
+      "n=45"
+    ],
+    "evidence_type": "empirical"
+  }
+}

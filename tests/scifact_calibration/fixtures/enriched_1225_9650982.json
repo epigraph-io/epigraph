@@ -1,0 +1,21 @@
+{
+  "scifact_id": 1225,
+  "claim": "The locus rs647161 is associated with colorectal carcinoma.",
+  "evidence_sentences": [
+    "Three of the four were                 replicated in a study conducted in 26,060 individuals of European descent, with                 combined P values of 1.22 \u00d7 10(-10) for                 rs647161 (5q31.1), 6.64 \u00d7 10(-9) for rs2423279                 (20p12.3) and 3.06 \u00d7 10(-8) for rs10774214                 (12p13.32 near the CCND2 gene), derived from meta-analysis of data from both                 east Asian and European-ancestry populations."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9650982",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "26,060 individuals of European descent",
+      "east Asian and European-ancestry populations combined"
+    ],
+    "evidence_type": "statistical"
+  }
+}

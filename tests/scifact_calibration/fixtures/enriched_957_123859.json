@@ -1,0 +1,24 @@
+{
+  "scifact_id": 957,
+  "claim": "Podocytes are motile and migrate in the presence of injury.",
+  "evidence_sentences": [
+    "In podocin-GFP mice, podocytes formed sporadic multicellular clusters after unilateral ureteral ligation and migrated into the parietal Bowman's capsule."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "123859",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [
+      "fluorescence microscopy"
+    ],
+    "reagents_involved": [
+      "podocin-GFP"
+    ],
+    "conditions": [
+      "unilateral ureteral ligation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "scifact_id": 513,
+  "claim": "High cardiopulmonary fitness causes increased mortality rate.",
+  "evidence_sentences": [
+    "CONCLUSION Low fitness in adolescents and adults is common in the US population and is associated with an increased prevalence of CVD risk factors."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "13230773",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "US population",
+      "adolescents and adults"
+    ],
+    "evidence_type": "statistical",
+    "tier3_enriched": true
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "scifact_id": 148,
+  "claim": "Autophagy declines in aged organisms.",
+  "evidence_sentences": [
+    "We have previously found that CMA activity declines in aged organisms and have proposed that this failure in cellular clearance could contribute to the accumulation of altered proteins, the abnormal cellular homeostasis and, eventually, the functional loss characteristic of aged organisms."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1084345",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "aged organisms"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "scifact_id": 942,
+  "claim": "Phase information is useful for predicting donor-recipient matches in organ transplantation.",
+  "evidence_sentences": [
+    "Genes that influence transplantation outcome could be identified by using linkage disequilibrium (LD)-mapping approaches, if the extended MHC haplotypes of the unrelated donor and recipient could be defined."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11527199",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.6,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "logical",
+    "tier2_enriched": true
+  }
+}

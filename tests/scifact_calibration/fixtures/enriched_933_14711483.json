@@ -1,0 +1,19 @@
+{
+  "scifact_id": 933,
+  "claim": "Pediatric SCD patients with vaso-occlusive crisis show increased morphine use after breathing 80 ppm iNO for 4 hours.",
+  "evidence_sentences": [
+    "Morphine use over 6 hours was significantly less in the INO group (mean cumulative use, 0.29 vs 0.44 mg/kg; P =.03) but was not different over 4 hours (0.26 vs 0.32 mg/kg; P =.21) or 24 hours (0.63 vs 0.91 mg/kg; P =.15)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "14711483",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.9,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "scifact_id": 386,
+  "claim": "Errors in peripheral IV drug administration are most common during bolus administration and multiple-step medicine preparations.",
+  "evidence_sentences": [
+    "Most errors occurred when giving bolus doses or making up drugs that required multiple step preparation.   \n",
+    "A combination of reducing the amount of preparation on the ward, training, and technology to administer slow bolus doses would probably have the greatest effect on error rates."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16495649",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "bolus administration",
+      "multiple-step medicine preparations",
+      "peripheral IV drug administration"
+    ],
+    "evidence_type": "empirical"
+  }
+}

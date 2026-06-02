@@ -1,0 +1,20 @@
+{
+  "scifact_id": 973,
+  "claim": "Primary cervical cytology screening with HPV detection has higher longitudinal sensitivity to detect severe cervical intraepithelial neoplasia than conventional cytology.",
+  "evidence_sentences": [
+    "The relative rate of CIN III+ in the HPV arm versus the conventional arm was 1.44 (95% confidence interval 1.01 to 2.05) among all women invited for screening and 1.77 (1.16 to 2.74) among those who attended.",
+    "CONCLUSIONS When incorporated into a well established organised screening programme, primary HPV screening with cytology triage was more sensitive than conventional cytology in detecting CIN III+ lesions."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "27446873",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

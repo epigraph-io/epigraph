@@ -1,0 +1,24 @@
+{
+  "scifact_id": 1042,
+  "claim": "Repressing IL-18 has negative effects on atherosclerotic lesion composition and progression.",
+  "evidence_sentences": [
+    "Interestingly, significantly higher levels of IL-18 mRNA were found in symptomatic (unstable) plaques than asymptomatic (stable) plaques (P<0.01).   \n",
+    "CONCLUSIONS These results suggest, for the first time, a major role for IL-18 in atherosclerotic plaque destabilization leading to acute ischemic syndromes."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "17421851",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.55,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "IL-18"
+    ],
+    "conditions": [
+      "symptomatic (unstable) plaques",
+      "asymptomatic (stable) plaques"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "scifact_id": 578,
+  "claim": "In mouse models, the loss of CSF1R facilitates MOZ-TIF2-induced leuekmogenesis.",
+  "evidence_sentences": [
+    "Cells expressing high amounts of CSF1R (CSF1Rhigh cells), but not those expressing low amounts of CSF1R (CSF1Rlow cells), showed potent leukemia-initiating activity.",
+    "Moreover, induction of AML was suppressed in CSF1R-deficient mice and CSF1R inhibitors slowed the progression of MOZ-TIF2\u2013induced leukemia.",
+    "Thus, in this subtype of AML, leukemia stem cells are contained within the CSF1Rhigh cell population, and we suggest that targeting of PU.1-mediated upregulation of CSF1R expression might be a useful therapeutic approach."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "8764879",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "CSF1R",
+      "CSF1R inhibitors",
+      "MOZ-TIF2"
+    ],
+    "conditions": [
+      "CSF1R-deficient mice",
+      "CSF1Rhigh cell population",
+      "CSF1Rlow cell population"
+    ],
+    "evidence_type": "empirical"
+  }
+}

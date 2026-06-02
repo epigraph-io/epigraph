@@ -1,0 +1,20 @@
+{
+  "scifact_id": 239,
+  "claim": "Cellular aging closely links to an older appearance.",
+  "evidence_sentences": [
+    "Perceived age, controlled for chronological age and sex, also correlated significantly with physical and cognitive functioning as well as with leucocyte telomere length.   \n",
+    "CONCLUSION Perceived age-which is widely used by clinicians as a general indication of a patient's health-is a robust biomarker of ageing that predicts survival among those aged >or=70 and correlates with important functional and molecular ageing phenotypes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "14079881",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

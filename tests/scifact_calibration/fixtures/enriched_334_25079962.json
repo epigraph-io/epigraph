@@ -1,0 +1,29 @@
+{
+  "scifact_id": 334,
+  "claim": "Depletion of nitric oxide is responsible for vasospasm.",
+  "evidence_sentences": [
+    "Decreased bioavailability of nitric oxide has been associated with the development of cerebral vasospasm.   \n",
+    "All 8 control monkeys developed significant vasospasm of the right middle cerebral artery, which was complicated by stroke and death in 1 animal.",
+    "Nitrite infusion prevented development of vasospasm (no animals developed significant vasospasm; mean [SD] reduction in right middle cerebral artery area on day 7 after subarachnoid hemorrhage of 8% [9%] in nitrite-treated monkeys vs 47% [5%] in saline-treated controls; P<.001)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "25079962",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "nitric oxide",
+      "nitrite",
+      "saline"
+    ],
+    "conditions": [
+      "subarachnoid hemorrhage",
+      "day 7 post-subarachnoid hemorrhage",
+      "right middle cerebral artery monitoring",
+      "primate model (monkeys)"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "scifact_id": 179,
+  "claim": "Birth-weight is positively associated with breast cancer.",
+  "evidence_sentences": [
+    "RESULTS We found that heavier birth weights were associated with increased breast cancer risk, with studies involving five categories of birth weight identifying odds ratios (ORs) of 1.24 (95% confidence interval [CI] 1.04 to 1.48) for 4,000 g or more and 1.15 (95% CI 1.04 to 1.26) for 3,500 g to 3,999 g, relative to a birth weight of 2,500 to 2,599 g. These studies provided no support for a J-shaped relationship of birthweight to risk.",
+    "CONCLUSION Our findings provide some support for the hypothesis that in utero exposures reflective of higher endogenous hormone levels could affect risk for development of breast cancer in adulthood."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "17450673",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.88,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "birth weight \u22654000 g vs 2500\u20132599 g reference",
+      "birth weight 3500\u20133999 g vs 2500\u20132599 g reference",
+      "95% confidence intervals"
+    ],
+    "evidence_type": "statistical"
+  }
+}

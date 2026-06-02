@@ -1,0 +1,19 @@
+{
+  "scifact_id": 448,
+  "claim": "Gastric infection with Helicobacter pylori increases risk of gastric cancer in humans.",
+  "evidence_sentences": [
+    "The estimated odds ratio for the risk of gastric cancer in those with a history of infection with H pylori was 2.77 (95% confidence interval 1.04 to 7.97, 2p = 0.039).   \n",
+    "CONCLUSIONS H pylori infection may be an important cause of gastric cancer; between 35% and 55% of all cases may be associated with such an infection."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2052720",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical"
+  }
+}

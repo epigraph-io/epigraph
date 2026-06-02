@@ -1,0 +1,26 @@
+{
+  "scifact_id": 106,
+  "claim": "Ambulatory blood pressure monitoring is inaccurate at diagnosing hypertension.",
+  "evidence_sentences": [
+    "BACKGROUND The diagnosis of hypertension has traditionally been based on blood-pressure measurements in the clinic, but home and ambulatory measurements better correlate with cardiovascular outcome, and ambulatory monitoring is more accurate than both clinic and home monitoring in diagnosing hypertension.",
+    "INTERPRETATION Ambulatory monitoring as a diagnostic strategy for hypertension after an initial raised reading in the clinic would reduce misdiagnosis and save costs."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "5151024",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [
+      "ambulatory blood pressure monitor",
+      "clinic blood pressure monitor",
+      "home blood pressure monitor"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "initial raised reading in clinic",
+      "ambulatory monitoring as diagnostic strategy"
+    ],
+    "evidence_type": "empirical"
+  }
+}

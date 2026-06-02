@@ -1,0 +1,16 @@
+{
+  "scifact_id": 623,
+  "claim": "Individuals with low serum vitamin D concentrations have increased risk of multiple sclerosis.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

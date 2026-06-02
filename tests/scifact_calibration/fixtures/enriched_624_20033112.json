@@ -1,0 +1,21 @@
+{
+  "scifact_id": 624,
+  "claim": "Induced hepatic stem cells possess the potential to differentiate into cholangiocytic cells.",
+  "evidence_sentences": [
+    "iHepSCs can be stably expanded in vitro and possess the potential of bidirectional differentiation into both hepatocytic and cholangiocytic lineages.",
+    "Lineage conversion into bipotential expandable iHepSCs provides a strategy to enable efficient derivation of both hepatocytes and cholangiocytes for use in disease modeling and tissue engineering."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "20033112",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "in vitro expansion"
+    ],
+    "evidence_type": "empirical"
+  }
+}

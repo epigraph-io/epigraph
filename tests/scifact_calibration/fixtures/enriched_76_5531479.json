@@ -1,0 +1,25 @@
+{
+  "scifact_id": 76,
+  "claim": "Active Ly49Q induces neutrophil polarization.",
+  "evidence_sentences": [
+    "Here, we show that an inhibitory MHC I receptor, Ly49Q, was crucial for the swift polarization of and tissue infiltration by neutrophils.",
+    "We propose that Ly49Q is pivotal in switching neutrophils to their polarized morphology and rapid migration upon inflammation, through its spatiotemporal regulation of membrane rafts and raft-associated signaling molecules."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5531479",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Ly49Q",
+      "MHC I"
+    ],
+    "conditions": [
+      "inflammation",
+      "membrane raft regulation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

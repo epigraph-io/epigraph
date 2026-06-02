@@ -1,0 +1,29 @@
+{
+  "scifact_id": 263,
+  "claim": "Citrullinated proteins externalized in neutrophil extracellular traps act indirectly to disrupt the inflammatory cycle.",
+  "evidence_sentences": [
+    "Indeed, during NETosis, neutrophils externalized the citrullinated autoantigens implicated in RA pathogenesis, and anti-citrullinated vimentin antibodies potently induced NET formation.",
+    "In turn, NETs significantly augmented inflammatory responses in RA and OA synovial fibroblasts, including induction of IL-6, IL-8, chemokines, and adhesion molecules."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "11328820",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "anti-citrullinated vimentin antibodies",
+      "IL-6",
+      "IL-8",
+      "chemokines",
+      "adhesion molecules"
+    ],
+    "conditions": [
+      "NETosis",
+      "RA synovial fibroblasts",
+      "OA synovial fibroblasts"
+    ],
+    "evidence_type": "empirical"
+  }
+}

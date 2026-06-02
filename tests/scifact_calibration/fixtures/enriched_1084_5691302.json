@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1084,
+  "claim": "Side effects associated with antidepressants increases risk of stroke.",
+  "evidence_sentences": [
+    "The group of other antidepressants was associated with the highest adjusted hazard ratios for all cause mortality (1.66, 1.56 to 1.77), attempted suicide/self harm (5.16, 3.90 to 6.83), stroke/transient ischaemic attack (1.37, 1.22 to 1.55), fracture (1.64, 1.46 to 1.84), and epilepsy/seizures (2.24, 1.60 to 3.15), compared with when antidepressants were not being used."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5691302",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

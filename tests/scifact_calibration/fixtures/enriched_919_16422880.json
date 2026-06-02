@@ -1,0 +1,23 @@
+{
+  "scifact_id": 919,
+  "claim": "Participants who quit smoking reduce lung cancer risk by approximately 50%.",
+  "evidence_sentences": [
+    "The HR for light smokers was 0.44 (95% CI, 0.35-0.56); for quitters, HR 0.50 (95% CI, 0.36-0.69), for stable ex-smokers, HR 0.17 (95% CI, 0.13-0.23), and for never smokers, HR 0.09 (95% CI, 0.06-0.13).   \n"
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16422880",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "light smokers",
+      "quitters",
+      "stable ex-smokers",
+      "never smokers"
+    ],
+    "evidence_type": "statistical"
+  }
+}

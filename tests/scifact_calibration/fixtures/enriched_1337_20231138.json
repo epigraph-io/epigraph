@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1337,
+  "claim": "Ubiquitin ligase UBC13 generates a K63-linked polyubiquitin moiety at PCNA K164.",
+  "evidence_sentences": [
+    "Here we show that damage-induced fork reversal in mammalian cells requires PCNA ubiquitination, UBC13, and K63-linked polyubiquitin chains, previously involved in error-free damage tolerance."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "20231138",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.65,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "PCNA",
+      "UBC13",
+      "K63-linked polyubiquitin chains",
+      "ubiquitin"
+    ],
+    "conditions": [
+      "damage-induced fork reversal",
+      "mammalian cells"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "scifact_id": 736,
+  "claim": "MFGE8 regulates fat absorption by binding to av-Beta3 and av-Beta5 integrins.",
+  "evidence_sentences": [
+    "Mechanistically, we found that Mfge8 coordinates fatty acid uptake through \u03b1v\u03b23 integrin\u2013 and \u03b1v\u03b25 integrin\u2013dependent phosphorylation of Akt by phosphatidylinositide-3 kinase and mTOR complex 2, leading to translocation of Cd36 and Fatp1 from cytoplasmic vesicles to the cell surface."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5389095",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Mfge8",
+      "\u03b1v\u03b23 integrin",
+      "\u03b1v\u03b25 integrin",
+      "Akt",
+      "phosphatidylinositide-3 kinase",
+      "mTOR complex 2",
+      "Cd36",
+      "Fatp1"
+    ],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

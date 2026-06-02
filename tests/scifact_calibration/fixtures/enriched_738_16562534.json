@@ -1,0 +1,27 @@
+{
+  "scifact_id": 738,
+  "claim": "MICAL redox enzymes regulate actin dynamics.",
+  "evidence_sentences": [
+    "Consistent with high expression of MICAL in somatic muscles, immunohistochemical stainings reveal that the subcellular localization and architecture of contractile muscle filaments are dramatically disturbed in mical mutants.",
+    "Transgenic expression of interfering RNA molecules demonstrates that MICAL is required in muscles for the higher order arrangement of myofilaments."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16562534",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.65,
+    "supports_claim": true,
+    "instruments_used": [
+      "immunohistochemistry"
+    ],
+    "reagents_involved": [
+      "interfering RNA molecules"
+    ],
+    "conditions": [
+      "mical mutant background",
+      "somatic muscle tissue",
+      "transgenic expression system"
+    ],
+    "evidence_type": "empirical"
+  }
+}

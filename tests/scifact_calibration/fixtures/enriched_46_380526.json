@@ -1,0 +1,22 @@
+{
+  "scifact_id": 46,
+  "claim": "A single nucleotide variant the gene DGKK is strongly associated with increased risk of hypospadias.",
+  "evidence_sentences": [
+    "Individual genotyping of two SNPs (rs1934179 and rs7063116) in DGKK, encoding diacylglycerol kinase \u03ba, produced compelling evidence for association with hypospadias in the discovery sample (allele-specific odds ratio (OR) = 2.5, P = 2.5 \u00d7 10\u221211 and OR = 2.3, P = 2.9 \u00d7 10\u22129, respectively) and in the Dutch (OR = 3.9, P = 2.4 \u00d7 10\u22125 and OR = 3.8, P = 3.4 \u00d7 10\u22125) and Swedish (OR = 2.5, P = 2.6 \u00d7 10\u22128 and OR = 2.2, P = 2.7 \u00d7 10\u22126) replication samples."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "380526",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "discovery sample",
+      "Dutch replication sample",
+      "Swedish replication sample"
+    ],
+    "evidence_type": "statistical"
+  }
+}

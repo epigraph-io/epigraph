@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1246,
+  "claim": "The one-child policy has created a hospitable environment for female infants.",
+  "evidence_sentences": [
+    "The early neonatal mortality was 29 in boys and 69 in girls per 1000 live births."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "7662395",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

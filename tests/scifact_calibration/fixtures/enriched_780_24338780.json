@@ -1,0 +1,29 @@
+{
+  "scifact_id": 780,
+  "claim": "Mice that lack Interferon-\u03b3 or its receptor are highly susceptible to experimental autoimmune myocarditis.",
+  "evidence_sentences": [
+    "METHODS AND RESULTS We showed that IFN-gamma receptor-deficient mice (IFN-gammaR(-/-)) on a BALB/c background immunized with a peptide derived from cardiac alpha-myosin heavy chain develop severe myocarditis with high mortality.",
+    "Although myocarditis subsided in wild-type mice after 3 weeks, IFN-gammaR(-/-) mice showed persistent disease.",
+    "CONCLUSIONS Our data provide evidence that IFN-gamma protects mice from lethal autoimmune myocarditis by inducing the expression of inducible nitric oxide synthase followed by the downregulation of T-cell responses."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "24338780",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "cardiac alpha-myosin heavy chain peptide",
+      "IFN-gamma",
+      "inducible nitric oxide synthase"
+    ],
+    "conditions": [
+      "IFN-gamma receptor-deficient mice (IFN-gammaR(-/-))",
+      "BALB/c background",
+      "immunization with cardiac alpha-myosin heavy chain peptide",
+      "3-week observation period"
+    ],
+    "evidence_type": "empirical"
+  }
+}

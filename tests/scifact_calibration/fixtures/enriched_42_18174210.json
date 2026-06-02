@@ -1,0 +1,24 @@
+{
+  "scifact_id": 42,
+  "claim": "A high microerythrocyte count raises vulnerability to severe anemia in homozygous alpha (+)- thalassemia trait subjects.",
+  "evidence_sentences": [
+    "Individuals homozygous for alpha(+)-thalassaemia have microcytosis and an increased erythrocyte count.",
+    "We estimated that the haematological profile in children homozygous for alpha(+)-thalassaemia reduces the risk of SMA during acute malaria compared to children of normal genotype (relative risk 0.52; 95% confidence interval [CI] 0.24-1.12, p = 0.09).   \n",
+    "CONCLUSIONS The increased erythrocyte count and microcytosis in children homozygous for alpha(+)-thalassaemia may contribute substantially to their protection against SMA."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "18174210",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.9,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "acute malaria",
+      "homozygous alpha(+)-thalassaemia genotype",
+      "normal genotype comparison"
+    ],
+    "evidence_type": "statistical"
+  }
+}

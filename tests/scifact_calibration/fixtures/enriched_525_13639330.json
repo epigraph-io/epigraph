@@ -1,0 +1,24 @@
+{
+  "scifact_id": 525,
+  "claim": "Histone demethylase recruitment and a transient decrease in histone methylation is necessary for ligand-dependent induction of transcription by nuclear receptors.",
+  "evidence_sentences": [
+    "This strategy, based at least in part on an HMT-dependent inhibitory histone code, imposes a requirement for specific histone demethylases, including LSD1, to permit ligand- and signal-dependent activation of regulated gene expression."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13639330",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "LSD1"
+    ],
+    "conditions": [
+      "ligand-dependent activation",
+      "signal-dependent activation",
+      "HMT-dependent inhibitory histone code"
+    ],
+    "evidence_type": "empirical"
+  }
+}

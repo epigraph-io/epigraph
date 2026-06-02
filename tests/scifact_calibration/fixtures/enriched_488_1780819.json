@@ -1,0 +1,30 @@
+{
+  "scifact_id": 488,
+  "claim": "HAND2 methylation is a key step in early endometrial carcinogenesis.",
+  "evidence_sentences": [
+    "METHODS AND FINDINGS Epigenome-wide methylation analysis of >27,000 CpG sites in endometrial cancer tissue samples (n = 64) and control samples (n = 23) revealed that HAND2 (a gene encoding a transcription factor expressed in the endometrial stroma) is one of the most commonly hypermethylated and silenced genes in endometrial cancer.",
+    "Increased HAND2 methylation was a feature of premalignant endometrial lesions and was seen to parallel a decrease in RNA and protein levels.",
+    "HAND2 methylation analysis of endometrial secretions collected using high vaginal swabs taken from women with postmenopausal bleeding specifically identified those patients with early stage endometrial cancer with both high sensitivity and high specificity (receiver operating characteristics area under the curve = 0.91 for stage 1A and 0.97 for higher than stage 1A).",
+    "CONCLUSIONS HAND2 methylation is a common and crucial molecular alteration in endometrial cancer that could potentially be employed as a biomarker for early detection of endometrial cancer and as a predictor of treatment response."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1780819",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [
+      "high vaginal swabs",
+      "methylation array"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "endometrial cancer tissue samples (n=64)",
+      "control samples (n=23)",
+      ">27,000 CpG sites analyzed",
+      "premalignant endometrial lesions",
+      "postmenopausal bleeding patients"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "scifact_id": 854,
+  "claim": "Nonhypertensive people who are 55 years old have a 90% chance of developing hypertension during their lifetime.",
+  "evidence_sentences": [
+    "RESULTS The residual lifetime risks for developing hypertension and stage 1 high blood pressure or higher (greater-than-or-equal to 140/90 mm Hg regardless of treatment) were 90% in both 55- and 65-year-old participants.",
+    "CONCLUSION The residual lifetime risk for hypertension for middle-aged and elderly individuals is 90%, indicating a huge public health burden."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "12206390",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "scifact_id": 305,
+  "claim": "DRD1 proteins enable Pol V transcription in vivo.",
+  "evidence_sentences": [
+    "Pol IVb/Pol V transcription requires the chromatin-remodeling protein DRD1 but is independent of siRNA biogenesis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "14797520",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "DRD1"
+    ],
+    "conditions": [
+      "in vivo"
+    ],
+    "evidence_type": "empirical"
+  }
+}

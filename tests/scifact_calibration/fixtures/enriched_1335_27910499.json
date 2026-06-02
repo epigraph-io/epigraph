@@ -1,0 +1,22 @@
+{
+  "scifact_id": 1335,
+  "claim": "UCB T cells maintain high TCR diversity after transplantation.",
+  "evidence_sentences": [
+    "After 6 months, cord blood-graft recipients approximated the TCR diversity of healthy individuals, whereas recipients of T cell-depleted peripheral-blood stem cell grafts had 28-fold and 14-fold lower CD4(+) and CD8(+) T cell diversities, respectively."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "27910499",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "6 months post-transplantation",
+      "cord blood-graft recipients",
+      "T cell-depleted peripheral-blood stem cell graft recipients"
+    ],
+    "evidence_type": "empirical"
+  }
+}

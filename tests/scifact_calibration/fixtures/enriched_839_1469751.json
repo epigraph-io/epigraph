@@ -1,0 +1,28 @@
+{
+  "scifact_id": 839,
+  "claim": "Nanoparticles can be targeted against specific cell types by incorporating aptamers into lipid nanoparticles.",
+  "evidence_sentences": [
+    "Our results showed that CH6 facilitated in vitro osteoblast-selective uptake of Plekho1 siRNA, mainly via macropinocytosis, and boosted in vivo osteoblast-specific Plekho1 gene silencing, which promoted bone formation, improved bone microarchitecture, increased bone mass and enhanced mechanical properties in both osteopenic and healthy rodents.",
+    "These results indicate that osteoblast-specific aptamer-functionalized LNPs could act as a new RNAi-based bone anabolic strategy, advancing the targeted delivery selectivity of osteogenic siRNAs from the tissue level to the cellular level."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1469751",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "CH6 aptamer",
+      "Plekho1 siRNA",
+      "lipid nanoparticles"
+    ],
+    "conditions": [
+      "in vitro osteoblast-selective uptake",
+      "in vivo osteoblast-specific gene silencing",
+      "osteopenic rodents",
+      "healthy rodents"
+    ],
+    "evidence_type": "empirical"
+  }
+}

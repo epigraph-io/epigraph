@@ -1,0 +1,22 @@
+{
+  "scifact_id": 109,
+  "claim": "An M2-like phenotype in brown adipose tissue macrophages is quickly induced by cold exposure.",
+  "evidence_sentences": [
+    "Exposure to cold temperature rapidly promoted alternative activation of adipose tissue macrophages, which secrete catecholamines to induce thermogenic gene expression in brown adipose tissue and lipolysis in white adipose tissue."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4319174",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "catecholamines"
+    ],
+    "conditions": [
+      "cold temperature exposure"
+    ],
+    "evidence_type": "empirical"
+  }
+}

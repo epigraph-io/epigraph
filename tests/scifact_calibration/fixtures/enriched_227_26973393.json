@@ -1,0 +1,25 @@
+{
+  "scifact_id": 227,
+  "claim": "Cancers that initially benefit from epidermal growth factor receptor targeted therapies later become refractory through several mechanisms.",
+  "evidence_sentences": [
+    "All patients with metastatic lung, colorectal, pancreatic or head and neck cancers who initially benefit from epidermal growth factor receptor (EGFR)-targeted therapies eventually develop resistance."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "26973393",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "epidermal growth factor receptor (EGFR)-targeted therapies"
+    ],
+    "conditions": [
+      "metastatic lung cancer",
+      "metastatic colorectal cancer",
+      "metastatic pancreatic cancer",
+      "metastatic head and neck cancer"
+    ],
+    "evidence_type": "empirical"
+  }
+}

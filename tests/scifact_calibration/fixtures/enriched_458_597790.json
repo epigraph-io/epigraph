@@ -1,0 +1,27 @@
+{
+  "scifact_id": 458,
+  "claim": "Genetic deficiency of mast cells leads to decreased weight gain in a mouse model of diet-induced obesity.",
+  "evidence_sentences": [
+    "Furthermore, in the context of mice on a Western diet, genetically induced deficiency of mast cells, or their pharmacological stabilization, reduces body weight gain and levels of inflammatory cytokines, chemokines and proteases in serum and WAT, in concert with improved glucose homeostasis and energy expenditure."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "597790",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Western diet",
+      "inflammatory cytokines",
+      "chemokines",
+      "proteases"
+    ],
+    "conditions": [
+      "Western diet",
+      "genetically induced deficiency of mast cells",
+      "pharmacological stabilization of mast cells"
+    ],
+    "evidence_type": "empirical"
+  }
+}

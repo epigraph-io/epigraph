@@ -1,0 +1,26 @@
+{
+  "scifact_id": 893,
+  "claim": "Osteocytes have an essential role in G-CSF induced HSPC mobilization.",
+  "evidence_sentences": [
+    "Granulocyte colony-stimulating factor (G-CSF), used clinically to mobilize HSPCs, induces changes in the morphology and gene expression of the osteocytic network that precedes changes in osteoblasts.",
+    "Mice with targeted ablation of osteocytes or a disrupted osteocyte network have comparable numbers of HSPCs in the BM but fail to mobilize HSPCs in response to G-CSF."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13509809",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "G-CSF",
+      "granulocyte colony-stimulating factor"
+    ],
+    "conditions": [
+      "targeted ablation of osteocytes",
+      "disrupted osteocyte network",
+      "G-CSF induced HSPC mobilization"
+    ],
+    "evidence_type": "empirical"
+  }
+}

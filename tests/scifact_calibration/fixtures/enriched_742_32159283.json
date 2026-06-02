@@ -1,0 +1,26 @@
+{
+  "scifact_id": 742,
+  "claim": "Macrolides have no protective effect against myocardial infarction.",
+  "evidence_sentences": [
+    "No effect was found for previous use of macrolides (primarily erythromycin), sulfonamides, penicillins, or cephalosporins.   \n"
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "32159283",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "macrolides",
+      "erythromycin",
+      "sulfonamides",
+      "penicillins",
+      "cephalosporins"
+    ],
+    "conditions": [
+      "previous use of antibiotics"
+    ],
+    "evidence_type": "statistical"
+  }
+}

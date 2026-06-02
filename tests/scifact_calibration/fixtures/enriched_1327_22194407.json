@@ -1,0 +1,22 @@
+{
+  "scifact_id": 1327,
+  "claim": "Tuberculosis incidence occurs at higher rates in more sparsely populated areas in the UK.",
+  "evidence_sentences": [
+    "A strong association was found between all TB mortality groups and overcrowding at the household level.",
+    "Regression analysis indicates that it is the overcrowding and poverty among ethnic populations that is significant for their tuberculosis mortality."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "22194407",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "household-level overcrowding",
+      "poverty among ethnic populations"
+    ],
+    "evidence_type": "statistical"
+  }
+}

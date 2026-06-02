@@ -1,0 +1,26 @@
+{
+  "scifact_id": 619,
+  "claim": "Increased vessel density along with a reduction in fibrosis decreases the efficacy of chemotherapy treatments.",
+  "evidence_sentences": [
+    "We tested whether the delivery and efficacy of gemcitabine in the mice could be improved by coadministration of IPI-926, a drug that depletes tumor-associated stromal tissue by inhibition of the Hedgehog cellular signaling pathway.",
+    "The combination therapy produced a transient increase in intratumoral vascular density and intratumoral concentration of gemcitabine, leading to transient stabilization of disease."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "20888849",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "gemcitabine",
+      "IPI-926"
+    ],
+    "conditions": [
+      "coadministration of IPI-926 and gemcitabine",
+      "Hedgehog signaling pathway inhibition",
+      "tumor-associated stromal tissue depletion"
+    ],
+    "evidence_type": "empirical"
+  }
+}

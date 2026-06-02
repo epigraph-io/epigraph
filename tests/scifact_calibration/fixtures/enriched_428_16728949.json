@@ -1,0 +1,19 @@
+{
+  "scifact_id": 428,
+  "claim": "Forkhead 0 (fox0) transcription factors are involved in cellular differentiation.",
+  "evidence_sentences": [
+    "The forkhead O (FoxO) family of transcription factors participates in diverse physiologic processes, including induction of cell-cycle arrest, stress resistance, differentiation, apoptosis, and metabolism."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16728949",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "logical",
+    "tier2_enriched": true
+  }
+}

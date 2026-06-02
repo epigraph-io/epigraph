@@ -1,0 +1,21 @@
+{
+  "scifact_id": 1224,
+  "claim": "The latent infection of myeloid cells with human cytomegalovirus induces a number of changes in gene expression.",
+  "evidence_sentences": [
+    "We found that HCMV significantly up-regulated 583 (5.2%) of the total genes and down-regulated 621 (5.5%) of the total genes>or=1.5-fold at 4 h postinfection.",
+    "Further ontology analysis revealed that genes implicated in classical M1 macrophage activation were stimulated by HCMV infection.",
+    "Overall, the results identify that the HCMV-infected monocyte transcriptome displayed a unique M1/M2 polarization signature that was skewed toward the classical M1 activation phenotype."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "34016987",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.9,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

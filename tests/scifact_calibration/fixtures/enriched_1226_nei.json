@@ -1,0 +1,16 @@
+{
+  "scifact_id": 1226,
+  "claim": "The loss of the TET protein functions may have dire biological consequences, such as myeloid cancers.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

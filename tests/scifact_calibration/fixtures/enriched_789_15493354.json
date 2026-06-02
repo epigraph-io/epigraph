@@ -1,0 +1,20 @@
+{
+  "scifact_id": 789,
+  "claim": "Microglia are an innate immune cell type of the central nervous system.",
+  "evidence_sentences": [
+    "These physiological functions of microglia in the normal CNS begin during development and persist into maturity.",
+    "Here, we develop a conceptual framework for functions of microglia beyond neuroinflammation and discuss the rich repertoire of signaling and communication motifs in microglia that are critical both in pathology and for the normal physiology of the CNS."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "15493354",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.6,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial",
+    "tier2_enriched": true
+  }
+}

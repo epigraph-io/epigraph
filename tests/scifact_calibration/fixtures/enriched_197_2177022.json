@@ -1,0 +1,22 @@
+{
+  "scifact_id": 197,
+  "claim": "CCL19 is a ligand for CCR7.",
+  "evidence_sentences": [
+    "Soluble CCL21 functionally resembles the second CCR7 ligand, CCL19, which lacks anchoring residues and forms soluble gradients."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2177022",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "CCL21",
+      "CCL19",
+      "CCR7"
+    ],
+    "conditions": [],
+    "evidence_type": "logical"
+  }
+}

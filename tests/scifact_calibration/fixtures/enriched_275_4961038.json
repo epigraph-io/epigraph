@@ -1,0 +1,29 @@
+{
+  "scifact_id": 275,
+  "claim": "Combining phosphatidylinositide 3-kinase and MEK 1/2 inhibitors is effective at treating KRAS mutant tumors.",
+  "evidence_sentences": [
+    "However, when NVP-BEZ235 was combined with a mitogen-activated protein kinase kinase (MEK) inhibitor, ARRY-142886, there was marked synergy in shrinking these Kras-mutant cancers.",
+    "These in vivo studies suggest that inhibitors of the PI3K-mTOR pathway may be active in cancers with PIK3CA mutations and, when combined with MEK inhibitors, may effectively treat KRAS mutated lung cancers."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4961038",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "NVP-BEZ235",
+      "ARRY-142886",
+      "MEK inhibitor",
+      "PI3K-mTOR pathway inhibitor"
+    ],
+    "conditions": [
+      "in vivo",
+      "Kras-mutant cancers",
+      "KRAS mutated lung cancers",
+      "PIK3CA mutations"
+    ],
+    "evidence_type": "empirical"
+  }
+}

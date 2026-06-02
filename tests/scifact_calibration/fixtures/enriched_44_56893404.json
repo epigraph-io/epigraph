@@ -1,0 +1,25 @@
+{
+  "scifact_id": 44,
+  "claim": "A mutation in HNF4A leads to an increased risk of developing diabetes by the age of 14 years.",
+  "evidence_sentences": [
+    "We assessed the in utero and neonatal role of two key regulators of pancreatic insulin secretion by studying birthweight and the incidence of neonatal hypoglycaemia in patients with heterozygous mutations in the maturity-onset diabetes of the young (MODY) genes HNF4A (encoding HNF-4\u03b1) and HNF1A/TCF1 (encoding HNF-1\u03b1), and the effect of pancreatic deletion of Hnf4a on foetal and neonatal insulin secretion in mice."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "56893404",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.4,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "heterozygous mutations in HNF4A",
+      "heterozygous mutations in HNF1A/TCF1",
+      "pancreatic deletion of Hnf4a in mice",
+      "in utero assessment",
+      "neonatal assessment"
+    ],
+    "evidence_type": "circumstantial",
+    "tier2_enriched": true
+  }
+}

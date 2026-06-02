@@ -1,0 +1,30 @@
+{
+  "scifact_id": 533,
+  "claim": "Hyperfibrinogenemia increases rates of femoropopliteal bypass thrombosis.",
+  "evidence_sentences": [
+    "RESULTS Markers for smoking (blood carboxyhaemoglobin concentration (p less than 0.05) and plasma thiocyanate concentration (p less than 0.01) and plasma concentrations of fibrinogen (p less than 0.001) and apolipoproteins AI (p less than 0.04) and (a) (p less than 0.05) were significantly higher in patients with occluded grafts.",
+    "Patency was significantly higher by life table analysis in patients with a plasma fibrinogen concentration below the median than in those with a concentration above (90% v 57%, p less than 0.0002).",
+    "CONCLUSIONS Plasma fibrinogen concentration was the most important variable predicting graft occlusion, followed by smoking markers.",
+    "A more forceful approach is needed to stop patients smoking; therapeutic measures to improve patency of vein grafts should focus on decreasing plasma fibrinogen concentration rather than serum cholesterol concentration."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "12991445",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "fibrinogen",
+      "carboxyhaemoglobin",
+      "thiocyanate",
+      "apolipoprotein AI",
+      "apolipoprotein (a)"
+    ],
+    "conditions": [
+      "femoropopliteal vein graft patency follow-up",
+      "plasma fibrinogen concentration above vs below median"
+    ],
+    "evidence_type": "statistical"
+  }
+}

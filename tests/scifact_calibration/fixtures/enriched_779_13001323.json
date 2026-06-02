@@ -1,0 +1,25 @@
+{
+  "scifact_id": 779,
+  "claim": "Mice lacking Sirt1 in Sf1-expressing neurons have increased susceptibility to diet-induced obesity and insulin resistance.",
+  "evidence_sentences": [
+    "Here, we show that mice lacking SIRT1 in steroidogenic factor 1 (SF1) neurons are hypersensitive to dietary obesity owing to maladaptive energy expenditure.",
+    "Also, mutant mice have increased susceptibility to developing dietary T2DM due to insulin resistance in skeletal muscle.",
+    "Conversely, mice overexpressing SIRT1 in SF1 neurons are more resistant to diet-induced obesity and insulin resistance due to increased energy expenditure and enhanced skeletal muscle insulin sensitivity."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13001323",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "dietary obesity",
+      "high-fat diet",
+      "SIRT1 knockout in SF1 neurons",
+      "SIRT1 overexpression in SF1 neurons"
+    ],
+    "evidence_type": "empirical"
+  }
+}

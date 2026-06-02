@@ -1,0 +1,19 @@
+{
+  "scifact_id": 844,
+  "claim": "Neutrophil extracellular trap (NET) antigens may contain the targeted autoantigens PR3 and MPO.",
+  "evidence_sentences": [
+    "Here we show that chromatin fibers, so-called neutrophil extracellular traps (NETs), are released by ANCA-stimulated neutrophils and contain the targeted autoantigens proteinase-3 (PR3) and myeloperoxidase (MPO)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "17741440",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

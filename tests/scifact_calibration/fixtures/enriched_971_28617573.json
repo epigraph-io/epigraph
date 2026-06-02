@@ -1,0 +1,21 @@
+{
+  "scifact_id": 971,
+  "claim": "Primary cervical cancer screening with HPV detection has higher longitudinal sensitivity than conventional cytology to detect cervical intraepithelial neoplasia grade 2.",
+  "evidence_sentences": [
+    "Primary screening for hrHPV generally detects more CIN2, CIN3 or cancer compared to cytology at cut-off atypical squamous cells of undetermined significance (ASC-US) or LSIL, but is less specific."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "28617573",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "cut-off atypical squamous cells of undetermined significance (ASC-US)",
+      "LSIL"
+    ],
+    "evidence_type": "statistical"
+  }
+}

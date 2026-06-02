@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1263,
+  "claim": "The repeat-variable diresidue (RVD) in the loop of Transcription-Activator Like (TAL) effectors specifies the nucleotides-amino acid contact at the target promoter element.",
+  "evidence_sentences": [
+    "TAL (transcription activator-like) effectors, secreted by phytopathogenic bacteria, recognize host DNA sequences through a central domain of tandem repeats.",
+    "Each repeat comprises 33 to 35 conserved amino acids and targets a specific base pair by using two hypervariable residues [known as repeat variable diresidues (RVDs)] at positions 12 and 13."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "3981729",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "logical"
+  }
+}
