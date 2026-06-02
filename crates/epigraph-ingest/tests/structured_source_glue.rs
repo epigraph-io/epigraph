@@ -17,7 +17,11 @@ fn assert_no_collisions(plan: &epigraph_ingest::builder::IngestPlan) {
         plan.claims.len(),
         "every planned claim id must be distinct (no L1 section == L2 paragraph collision)"
     );
-    for e in plan.edges.iter().filter(|e| e.relationship == "decomposes_to") {
+    for e in plan
+        .edges
+        .iter()
+        .filter(|e| e.relationship == "decomposes_to")
+    {
         assert_ne!(
             e.source_id, e.target_id,
             "decomposes_to must never be a self-loop (section id == paragraph id)"
@@ -45,7 +49,11 @@ fn arxiv_html_maps_to_valid_document_extraction_hierarchy() {
         Some("10.48550/arXiv.2603.04139"),
         "arXiv id must derive the 10.48550 DOI"
     );
-    assert_eq!(doc.source.authors.len(), 3, "joined author blob split into 3");
+    assert_eq!(
+        doc.source.authors.len(),
+        3,
+        "joined author blob split into 3"
+    );
     assert!(doc.thesis.is_some(), "abstract becomes the thesis");
 
     // Two h2 sections, each exactly one paragraph (HTML loses intra-section
@@ -106,20 +114,25 @@ fn openstax_cnxml_maps_to_valid_document_extraction_hierarchy() {
     // transitional para is dropped.
     assert_eq!(doc.sections.len(), 1);
     let paras = &doc.sections[0].paragraphs;
-    assert_eq!(paras.len(), 2, "1 real para + 1 definition; transitional dropped");
+    assert_eq!(
+        paras.len(),
+        2,
+        "1 real para + 1 definition; transitional dropped"
+    );
     assert!(
         paras.iter().all(|p| p.atoms.is_empty()),
         "no atoms in structure recovery"
     );
     assert!(
-        paras.iter().any(|p| p.supporting_text.contains("[equation]")),
+        paras
+            .iter()
+            .any(|p| p.supporting_text.contains("[equation]")),
         "inline MathML must be rendered as the [equation] placeholder"
     );
     assert!(
-        doc.sections[0]
-            .paragraphs
-            .iter()
-            .all(|p| !p.supporting_text.contains("In this section, we will explore")),
+        doc.sections[0].paragraphs.iter().all(|p| !p
+            .supporting_text
+            .contains("In this section, we will explore")),
         "transitional paragraph must be filtered out"
     );
 
@@ -129,11 +142,18 @@ fn openstax_cnxml_maps_to_valid_document_extraction_hierarchy() {
     assert_eq!(by_level(1), 1, "one module -> one section");
     assert_eq!(by_level(2), 2, "two surviving paragraphs");
     assert_eq!(by_level(3), 0, "no atoms yet");
-    let dec = plan.edges.iter().filter(|e| e.relationship == "decomposes_to").count();
+    let dec = plan
+        .edges
+        .iter()
+        .filter(|e| e.relationship == "decomposes_to")
+        .count();
     assert_eq!(dec, 2, "section->para x2 (no thesis in this fixture)");
     // 2 paragraphs in one section -> exactly 1 continues_argument edge.
     assert_eq!(
-        plan.edges.iter().filter(|e| e.relationship == "continues_argument").count(),
+        plan.edges
+            .iter()
+            .filter(|e| e.relationship == "continues_argument")
+            .count(),
         1
     );
 }
