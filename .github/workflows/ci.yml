@@ -66,18 +66,26 @@ jobs:
             echo 'rustflags = ["-C", "link-arg=-fuse-ld=mold"]'
           } >> .cargo/config.toml
           mold --version
-      - name: Relocate cargo target/ to the large ephemeral disk
-        # The runner's root volume (/) has only ~14 GB free; this workspace's
-        # debug target/ tree plus the per-crate #[sqlx::test] integration test
-        # binaries exceed that, ENOSPC-killing the run partway through the
-        # serialized test suites (observed: dies at "Test (epigraph-api)",
-        # _diag log write fails with "No space left on device"). The runner's
-        # /mnt ephemeral disk has ~70 GB free, so point CARGO_TARGET_DIR there.
-        # Must run BEFORE rust-cache so the cache restores/saves at this path.
+      - name: Free disk space on /
+        # Runs intermittently ENOSPC'd on / during the serialized test phase
+        # (observed: "Test (epigraph-api)" → "No space left on device" writing
+        # the runner _diag log) at a high enough rate (~85% of PRs) to be
+        # systematic, not flaky infra. A df at THIS point shows / with ~107 GB
+        # bytes and ~94% inodes free, so the volume is not full pre-build — the
+        # consumption happens DURING the per-test #[sqlx::test] phase (postgres
+        # template/test DBs in the docker overlay on /, plus test-binary link
+        # artifacts), which a pre-build df cannot see. Reclaiming the ~24 GB of
+        # preinstalled Android/.NET/GHC/Haskell/hosted-toolcache trees this
+        # build never touches gives the test phase enough headroom to finish.
+        #
+        # NOTE: an earlier attempt set CARGO_TARGET_DIR=/mnt — inert, because the
+        # mount table shows no separate /mnt disk (/mnt is a dir on /dev/root).
+        # The df -ih / df -h lines record the headroom actually reclaimed.
         run: |
-          sudo mkdir -p /mnt/cargo-target
-          sudo chown "$USER:$USER" /mnt/cargo-target
-          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
+          df -ih / ; df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost || true
+          df -ih / ; df -h /
       - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
       # --locked: Cargo.lock is committed; enforce it so CI builds the exact
       # locked dependency graph and fails loudly if the lock is stale rather
