@@ -8,6 +8,7 @@
 //! The final confidence is always ≤ the parser's value — LLM can only lower, never raise.
 
 use super::llm_client::LlmProvider;
+use super::nli_client::{mapping, NliClassifier};
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -98,11 +99,35 @@ Example: {{"rating": "STRONG_SUPPORT"}}"#
 /// Run the skeptic probe to assess evidence quality
 pub async fn skeptic_probe(
     client: &dyn LlmProvider,
+    nli: Option<&dyn NliClassifier>,
     claim: &str,
     evidence: &[String],
 ) -> EvidenceSupport {
     if evidence.is_empty() {
         return EvidenceSupport::Unrelated;
+    }
+
+    // Cheap/deterministic alternate producer: if an NLI service is wired and
+    // active, classify each (evidence -> claim) pair and aggregate, skipping
+    // the LLM round-trip entirely. Any per-pair NLI error falls back to the
+    // LLM path for the whole probe (do not silently mix producers).
+    if let Some(nli) = nli {
+        if nli.is_active() {
+            let mut per_pair = Vec::with_capacity(evidence.len());
+            let mut ok = true;
+            for e in evidence {
+                match nli.classify(e, claim).await {
+                    Ok(s) => per_pair.push(mapping::support_of_pair(&s)),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                return mapping::aggregate_support(&per_pair);
+            }
+        }
     }
 
     let prompt = build_skeptic_prompt(claim, evidence);
@@ -168,6 +193,7 @@ Example: {{"rating": "CONSISTENT"}}"#
 /// Run the coherence probe to check cross-claim consistency
 pub async fn coherence_probe(
     client: &dyn LlmProvider,
+    nli: Option<&dyn NliClassifier>,
     claim: &str,
     scope: &str,
     prior_claims: &[(String, f64)],
@@ -175,6 +201,28 @@ pub async fn coherence_probe(
     // First claim in a scope is always consistent
     if prior_claims.is_empty() {
         return CoherenceResult::Consistent;
+    }
+
+    // NLI alternate producer: classify each (prior claim -> new claim) pair
+    // and aggregate (contradiction dominates). Falls back to the LLM path on
+    // any NLI error.
+    if let Some(nli) = nli {
+        if nli.is_active() {
+            let mut per_pair = Vec::with_capacity(prior_claims.len());
+            let mut ok = true;
+            for (text, _truth) in prior_claims {
+                match nli.classify(text, claim).await {
+                    Ok(s) => per_pair.push(mapping::coherence_of_pair(&s)),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                return mapping::aggregate_coherence(&per_pair);
+            }
+        }
     }
 
     let prompt = build_coherence_prompt(claim, scope, prior_claims);
@@ -232,6 +280,7 @@ mod tests {
             MockLlmClient::with_responses(vec![serde_json::json!({"rating": "STRONG_SUPPORT"})]);
         let result = skeptic_probe(
             &client,
+            None,
             "add truth validation",
             &["Plan requires it".to_string()],
         )
@@ -244,7 +293,8 @@ mod tests {
     async fn test_skeptic_weak_support_lowers_confidence() {
         let client =
             MockLlmClient::with_responses(vec![serde_json::json!({"rating": "WEAK_SUPPORT"})]);
-        let result = skeptic_probe(&client, "add feature", &["some evidence".to_string()]).await;
+        let result =
+            skeptic_probe(&client, None, "add feature", &["some evidence".to_string()]).await;
         assert_eq!(result, EvidenceSupport::WeakSupport);
         assert!((result.factor() - 0.7).abs() < f64::EPSILON);
     }
@@ -253,7 +303,8 @@ mod tests {
     async fn test_skeptic_unrelated_evidence_flags_low_confidence() {
         let client =
             MockLlmClient::with_responses(vec![serde_json::json!({"rating": "UNRELATED"})]);
-        let result = skeptic_probe(&client, "fix bug", &["updated README".to_string()]).await;
+        let result =
+            skeptic_probe(&client, None, "fix bug", &["updated README".to_string()]).await;
         assert_eq!(result, EvidenceSupport::Unrelated);
         assert!((result.factor() - 0.4).abs() < f64::EPSILON);
     }
@@ -261,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn test_skeptic_handles_no_evidence_commits() {
         let client = MockLlmClient::new(); // Won't be called
-        let result = skeptic_probe(&client, "chore: update deps", &[]).await;
+        let result = skeptic_probe(&client, None, "chore: update deps", &[]).await;
         assert_eq!(result, EvidenceSupport::Unrelated);
     }
 
@@ -269,7 +320,7 @@ mod tests {
     async fn test_skeptic_handles_api_failure() {
         let client = MockLlmClient::new();
         client.set_malformed(true);
-        let result = skeptic_probe(&client, "claim", &["evidence".to_string()]).await;
+        let result = skeptic_probe(&client, None, "claim", &["evidence".to_string()]).await;
         // Should default to WeakSupport on failure
         assert_eq!(result, EvidenceSupport::WeakSupport);
     }
@@ -281,7 +332,7 @@ mod tests {
         let client =
             MockLlmClient::with_responses(vec![serde_json::json!({"rating": "CONSISTENT"})]);
         let prior = vec![("define Claim model".to_string(), 0.6)];
-        let result = coherence_probe(&client, "add truth validation", "core", &prior).await;
+        let result = coherence_probe(&client, None, "add truth validation", "core", &prior).await;
         assert_eq!(result, CoherenceResult::Consistent);
         assert!((result.factor() - 1.0).abs() < f64::EPSILON);
     }
@@ -291,7 +342,8 @@ mod tests {
         let client =
             MockLlmClient::with_responses(vec![serde_json::json!({"rating": "CONTRADICTION"})]);
         let prior = vec![("add truth validation".to_string(), 0.6)];
-        let result = coherence_probe(&client, "remove truth validation", "core", &prior).await;
+        let result =
+            coherence_probe(&client, None, "remove truth validation", "core", &prior).await;
         assert_eq!(result, CoherenceResult::Contradiction);
         assert!((result.factor() - 0.5).abs() < f64::EPSILON);
     }
@@ -299,7 +351,7 @@ mod tests {
     #[tokio::test]
     async fn test_coherence_first_claim_in_scope_always_passes() {
         let client = MockLlmClient::new(); // Won't be called
-        let result = coherence_probe(&client, "first claim", "core", &[]).await;
+        let result = coherence_probe(&client, None, "first claim", "core", &[]).await;
         assert_eq!(result, CoherenceResult::Consistent);
     }
 
@@ -373,5 +425,94 @@ mod tests {
             (result - expected).abs() < 1e-10,
             "Expected {expected}, got {result}"
         );
+    }
+
+    // --- NLI alternate-producer routing (BONUS path; backlog 97244690) ---
+
+    use crate::enrichment::nli_client::{NliClassifier, NliError, NliScores};
+    use async_trait::async_trait;
+
+    /// Deterministic in-process NLI fake: returns scripted scores per call,
+    /// or signals inactive / error. No network, no model.
+    struct FakeNli {
+        scripted: std::sync::Mutex<Vec<Result<NliScores, ()>>>,
+        active: bool,
+    }
+    impl FakeNli {
+        fn active(scripted: Vec<Result<NliScores, ()>>) -> Self {
+            Self {
+                scripted: std::sync::Mutex::new(scripted),
+                active: true,
+            }
+        }
+    }
+    #[async_trait]
+    impl NliClassifier for FakeNli {
+        fn is_active(&self) -> bool {
+            self.active
+        }
+        async fn classify(&self, _p: &str, _h: &str) -> Result<NliScores, NliError> {
+            let mut g = self.scripted.lock().unwrap();
+            match g.remove(0) {
+                Ok(s) => Ok(s),
+                Err(()) => Err(NliError::RequestFailed("boom".into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn coherence_routes_to_nli_and_contradiction_dominates() {
+        // Two prior claims: first consistent (entailment), second contradicting.
+        // Aggregation must report Contradiction WITHOUT any LLM call (mock has
+        // no scripted response, so if the LLM path fired it would default to
+        // Tension -- a different value -- making this non-tautological).
+        let llm = MockLlmClient::new();
+        let nli = FakeNli::active(vec![
+            Ok(NliScores {
+                entailment: 0.85,
+                neutral: 0.10,
+                contradiction: 0.05,
+            }),
+            Ok(NliScores {
+                entailment: 0.05,
+                neutral: 0.15,
+                contradiction: 0.80,
+            }),
+        ]);
+        let prior = vec![
+            ("x is true".to_string(), 0.6),
+            ("x is true".to_string(), 0.6),
+        ];
+        let r = coherence_probe(&llm, Some(&nli), "x is false", "core", &prior).await;
+        assert_eq!(r, CoherenceResult::Contradiction);
+    }
+
+    #[tokio::test]
+    async fn skeptic_nli_error_falls_back_to_llm_path() {
+        // NLI errors on the only pair -> probe must use the LLM mock, which is
+        // scripted to STRONG_SUPPORT. StrongSupport is NOT skeptic_probe's
+        // WeakSupport error/parse-failure default, so a pass proves the LLM
+        // path actually consumed the scripted response (required_fix #4: the
+        // earlier WEAK_SUPPORT script was tautological with the default).
+        let llm =
+            MockLlmClient::with_responses(vec![serde_json::json!({"rating": "STRONG_SUPPORT"})]);
+        let nli = FakeNli::active(vec![Err(())]);
+        let r = skeptic_probe(&llm, Some(&nli), "claim", &["some evidence".to_string()]).await;
+        assert_eq!(r, EvidenceSupport::StrongSupport);
+    }
+
+    #[tokio::test]
+    async fn skeptic_routes_to_nli_when_active() {
+        // NLI strong-entailment -> StrongSupport; the LLM mock is scripted to
+        // CONTRADICTS, so if the probe wrongly used the LLM it would return
+        // Contradicts. Asserting StrongSupport proves NLI took precedence.
+        let llm = MockLlmClient::with_responses(vec![serde_json::json!({"rating": "CONTRADICTS"})]);
+        let nli = FakeNli::active(vec![Ok(NliScores {
+            entailment: 0.90,
+            neutral: 0.07,
+            contradiction: 0.03,
+        })]);
+        let r = skeptic_probe(&llm, Some(&nli), "claim", &["strong proof".to_string()]).await;
+        assert_eq!(r, EvidenceSupport::StrongSupport);
     }
 }
