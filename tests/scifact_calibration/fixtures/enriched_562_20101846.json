@@ -1,0 +1,20 @@
+{
+  "scifact_id": 562,
+  "claim": "Improvements in OER catalysts show stable activity over several hundred hours.",
+  "evidence_sentences": [
+    "The catalyst shows no evidence of degradation after more than 500 hours of operation."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "20101846",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "more than 500 hours of operation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

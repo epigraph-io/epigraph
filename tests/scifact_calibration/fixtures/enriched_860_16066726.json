@@ -1,0 +1,20 @@
+{
+  "scifact_id": 860,
+  "claim": "Normal granulomas form in the absence of TNF in Zebrafish.",
+  "evidence_sentences": [
+    "In the absence of TNF, intracellular bacterial growth and granuloma formation were accelerated and was followed by necrotic death of overladen macrophages and granuloma breakdown.",
+    "Thus, TNF is not required for tuberculous granuloma formation, but maintains granuloma integrity indirectly by restricting mycobacterial growth within macrophages and preventing their necrosis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16066726",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.75,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "scifact_id": 370,
+  "claim": "Egr2 regulates the homeostasis of B and T cells.",
+  "evidence_sentences": [
+    "Here, we report that deletion of both transcription factors Egr2 and Egr3 in lymphocytes resulted in a lethal autoimmune syndrome with excessive serum proinflammatory cytokines but also impaired antigen receptor-induced proliferation of B and T cells.",
+    "Egr2- and Egr3-defective B and T cells had hyperactive signal transducer and activator of transcription-1 (STAT1) and STAT3 while antigen receptor-induced activation of transcription factor AP-1 was severely impaired.",
+    "We discovered that Egr2 and/or Egr3 directly induced expression of suppressor of cytokine signaling-1 (SOCS1) and SOCS3, inhibitors of STAT1 and STAT3, and also blocked the function of Batf, an AP-1 inhibitor, in B and T cells.",
+    "Thus, Egr2 and Egr3 regulate B and T cell function in adaptive immune responses and homeostasis by promoting antigen receptor signaling and controlling inflammation."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1550937",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.7,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

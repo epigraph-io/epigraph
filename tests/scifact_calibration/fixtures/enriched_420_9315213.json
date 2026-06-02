@@ -1,0 +1,19 @@
+{
+  "scifact_id": 420,
+  "claim": "Fibroblast growth factor 21 protects against atherosclerosis by modulating adiponectin and SREBP2 levels.",
+  "evidence_sentences": [
+    "Replenishment of FGF21 protects against atherosclerosis in apolipoprotein E(-/-)mice via 2 independent mechanisms, inducing the adipocyte production of adiponectin, which in turn acts on the blood vessels to inhibit neointima formation and macrophage inflammation, and suppressing the hepatic expression of the transcription factor sterol regulatory element-binding protein-2, thereby leading to reduced cholesterol synthesis and attenuation of hypercholesterolemia."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9315213",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

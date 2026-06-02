@@ -1,0 +1,18 @@
+{
+  "scifact_id": 1006,
+  "claim": "RTEL1 interacts with TRF2 through a C4C4 motif",
+  "evidence_sentences": [
+    "We show that the TRF2-RTEL1 interaction is mediated by a metal-coordinating C4C4 motif in RTEL1, which is compromised by the Hoyeraal-Hreidarsson syndrome (HHS) mutation, RTEL1(R1264H)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4926049",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

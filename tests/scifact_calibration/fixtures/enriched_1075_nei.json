@@ -1,0 +1,16 @@
+{
+  "scifact_id": 1075,
+  "claim": "Sequence conservation in gene regulatory regions between species is a poor predictor of conserved functionality.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

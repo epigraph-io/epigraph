@@ -1,0 +1,19 @@
+{
+  "scifact_id": 272,
+  "claim": "Combination nicotine replacement therapies with varenicline or bupropion are more effective after 12 weeks of reatment compared to varenicline monotherapy.",
+  "evidence_sentences": [
+    "RESULTS At 12 weeks, 53.0% of the combination therapy group achieved prolonged smoking abstinence and 56.2% achieved 7-day point-prevalence smoking abstinence compared with 43.2% and 48.6% in varenicline monotherapy (odds ratio [OR], 1.49; 95% CI, 1.05-2.12; P = .03 and OR, 1.36; 95% CI, 0.95-1.93; P = .09, respectively)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11614737",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

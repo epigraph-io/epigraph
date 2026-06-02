@@ -1,0 +1,18 @@
+{
+  "scifact_id": 744,
+  "claim": "Macropinocytosis contributes to a cell's supply of amino acids via the intracellular uptake of protein.",
+  "evidence_sentences": [
+    "Here, we demonstrate that protein macropinocytosis can also serve as an essential amino acid source."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "8460275",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

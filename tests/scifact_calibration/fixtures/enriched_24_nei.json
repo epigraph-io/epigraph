@@ -1,0 +1,16 @@
+{
+  "scifact_id": 24,
+  "claim": "90% of patients with melanoma and an objective response to PD-1 blockade will experience a progression in their melanoma.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

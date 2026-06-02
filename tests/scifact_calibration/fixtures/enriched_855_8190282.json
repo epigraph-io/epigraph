@@ -1,0 +1,22 @@
+{
+  "scifact_id": 855,
+  "claim": "Noninvasive positive pressure ventilation is not predictive of acute respiratory failure after solid organ transplantation.",
+  "evidence_sentences": [
+    "Within the first hour of treatment, 14 patients (70%) in the NIV group, and 5 patients (25%) in the standard treatment group improved their ratio of the PaO2 to the fraction of inspired oxygen (FIO2).",
+    "Over time, a sustained improvement in PaO2 to FIO2 was noted in 12 patients (60%) in the NIV group, and in 5 patients (25%) randomized to standard treatment (P = .03).",
+    "The use of NIV was associated with a significant reduction in the rate of endotracheal intubation (20% vs 70%; P = .002), rate of fatal complications (20% vs 50%; P = .05), length of stay in the intensive care unit by survivors (mean [SD] days, 5.5 [3] vs 9 [4]; P = .03), and intensive care unit mortality (20% vs 50%; P = .05).",
+    "CONCLUSIONS These results indicate that transplantation programs should consider NIV in the treatment of selected recipients of transplantation with acute respiratory failure."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "8190282",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

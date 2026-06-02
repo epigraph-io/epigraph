@@ -1,0 +1,29 @@
+{
+  "scifact_id": 653,
+  "claim": "Interleukin-18 plays an important role in the pathogenesis of atherosclerosis.",
+  "evidence_sentences": [
+    "Interleukin-18 (IL18) participates in atherogenesis through several putative mechanisms.",
+    "Interruption of IL18 action reduces atherosclerosis in mice.",
+    "In Apoe\u2212/\u2212 mice, combined deficiency of IL18r and NCC, but not single deficiency of either protein, protects mice from atherosclerosis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "24384587",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Interleukin-18",
+      "IL18r",
+      "NCC"
+    ],
+    "conditions": [
+      "Apoe-/- mice",
+      "combined deficiency of IL18r and NCC",
+      "single deficiency of IL18r",
+      "single deficiency of NCC"
+    ],
+    "evidence_type": "empirical"
+  }
+}

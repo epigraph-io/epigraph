@@ -1,0 +1,27 @@
+{
+  "scifact_id": 181,
+  "claim": "Blocking the interaction between TDP-43 and respiratory complex I proteins ND3 and ND6 prevents TDP-43-induced neuronal loss.",
+  "evidence_sentences": [
+    "The suppression of TDP-43 mitochondrial localization abolishes WT and mutant TDP-43-induced mitochondrial dysfunction and neuronal loss, and improves phenotypes of transgenic mutant TDP-43 mice."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16966326",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.65,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "TDP-43",
+      "ND3",
+      "ND6"
+    ],
+    "conditions": [
+      "suppression of TDP-43 mitochondrial localization",
+      "wild-type TDP-43 expression",
+      "mutant TDP-43 expression",
+      "transgenic mutant TDP-43 mice"
+    ],
+    "evidence_type": "empirical"
+  }
+}

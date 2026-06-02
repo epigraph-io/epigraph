@@ -1,0 +1,20 @@
+{
+  "scifact_id": 941,
+  "claim": "Pharmacist attendance at ward rounds reduces adverse events in wards.",
+  "evidence_sentences": [
+    "RESULTS The rate of preventable ordering ADEs decreased by 66% from 10.4 per 1000 patient-days (95% confidence interval [CI], 7-14) before the intervention to 3.5 (95% CI, 1-5; P<.001) after the intervention.",
+    "CONCLUSIONS The presence of a pharmacist on rounds as a full member of the patient care team in a medical ICU was associated with a substantially lower rate of ADEs caused by prescribing errors."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "12258338",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

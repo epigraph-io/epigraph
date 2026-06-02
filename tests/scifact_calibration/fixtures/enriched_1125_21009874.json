@@ -1,0 +1,29 @@
+{
+  "scifact_id": 1125,
+  "claim": "Systemic immunosuppressive (IS) therapy does not enhance the chance of cancer mortality in patients with inflammatory eye disease (IED)",
+  "evidence_sentences": [
+    "Patients who used azathioprine, methotrexate, mycophenolate mofetil, ciclosporin, systemic corticosteroids, or dapsone had overall and cancer mortality similar to that of patients who never took immunosuppressive drugs.",
+    "CONCLUSIONS Most commonly used immunosuppressive drugs do not seem to increase overall or cancer mortality."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "21009874",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "azathioprine",
+      "methotrexate",
+      "mycophenolate mofetil",
+      "ciclosporin",
+      "systemic corticosteroids",
+      "dapsone"
+    ],
+    "conditions": [
+      "patients with inflammatory eye disease",
+      "comparison with patients who never took immunosuppressive drugs"
+    ],
+    "evidence_type": "statistical"
+  }
+}

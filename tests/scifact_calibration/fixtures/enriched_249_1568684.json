@@ -1,0 +1,27 @@
+{
+  "scifact_id": 249,
+  "claim": "Chenodeosycholic acid treatment reduces whole-body energy expenditure.",
+  "evidence_sentences": [
+    "In rodents, BAT can be activated by bile acids, which activate type 2 iodothyronine deiodinase (D2) in BAT via the G-coupled protein receptor TGR5, resulting in increased oxygen consumption and energy expenditure.",
+    "Treatment of 12 healthy female subjects with CDCA for 2 days resulted in increased BAT activity.",
+    "Whole-body energy expenditure was also increased upon CDCA treatment."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "1568684",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "chenodeoxycholic acid",
+      "bile acids",
+      "type 2 iodothyronine deiodinase"
+    ],
+    "conditions": [
+      "12 healthy female subjects",
+      "CDCA treatment for 2 days"
+    ],
+    "evidence_type": "empirical"
+  }
+}

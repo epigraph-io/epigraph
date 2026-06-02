@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1169,
+  "claim": "The M2-phenotype in brown adipose tissue macrophages increases brown adipose tissue thermogenic activity.",
+  "evidence_sentences": [
+    "Exposure to cold temperature rapidly promoted alternative activation of adipose tissue macrophages, which secrete catecholamines to induce thermogenic gene expression in brown adipose tissue and lipolysis in white adipose tissue.",
+    "Absence of alternatively activated macrophages impaired metabolic adaptations to cold, whereas administration of IL-4 increased thermogenic gene expression, fatty acid mobilization and energy expenditure, all in a macrophage-dependent manner."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4319174",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "IL-4",
+      "catecholamines"
+    ],
+    "conditions": [
+      "cold temperature exposure",
+      "absence of alternatively activated macrophages",
+      "IL-4 administration"
+    ],
+    "evidence_type": "empirical"
+  }
+}

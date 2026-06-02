@@ -1,0 +1,23 @@
+{
+  "scifact_id": 251,
+  "claim": "Chenodeoxycholic acid treatment increases brown adipose tissue activity.",
+  "evidence_sentences": [
+    "Treatment of 12 healthy female subjects with CDCA for 2 days resulted in increased BAT activity."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1568684",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "chenodeoxycholic acid"
+    ],
+    "conditions": [
+      "12 healthy female subjects",
+      "2-day treatment duration"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "scifact_id": 873,
+  "claim": "Obesity is determined solely by environmental factors.",
+  "evidence_sentences": [
+    "Our conclusions are that genetic factors are certainly present.",
+    "Several analyses suggest the presence of a dominant major gene with weak effect."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "3315558",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical"
+  }
+}

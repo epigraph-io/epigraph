@@ -1,0 +1,25 @@
+{
+  "scifact_id": 290,
+  "claim": "Cost effectiveness evaluations based on cRCT data accurately reflect prices for patients in actual clinical practice.",
+  "evidence_sentences": [
+    "The mean costs (for GPRD events) over calendar time were US$58k during 1990-1993 and US$174k during 2002-2005.",
+    "Using RCT data rather than GPRD data for event probabilities, the mean cost was US$16k with the VIGOR RCT and US$20k with the CLASS RCT.   \n",
+    "CONCLUSIONS The published cost-effectiveness analyses of coxibs lacked external validity, did not represent patients in actual clinical practice, and should not have been used to inform prescribing policies."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "15048300",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "GPRD data 1990-1993",
+      "GPRD data 2002-2005",
+      "VIGOR RCT data",
+      "CLASS RCT data"
+    ],
+    "evidence_type": "statistical"
+  }
+}

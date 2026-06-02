@@ -1,0 +1,23 @@
+{
+  "scifact_id": 823,
+  "claim": "N348I mutations cause resistance to zidovudine (AZT).",
+  "evidence_sentences": [
+    "Biochemical analyses of recombinant RT containing N348I provide supporting evidence for the role of this mutation in zidovudine and NNRTI resistance and give some insight into the molecular mechanism of resistance."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "15319019",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "recombinant RT",
+      "zidovudine"
+    ],
+    "conditions": [
+      "N348I mutation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

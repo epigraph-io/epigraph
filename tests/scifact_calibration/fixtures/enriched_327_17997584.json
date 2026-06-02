@@ -1,0 +1,22 @@
+{
+  "scifact_id": 327,
+  "claim": "Deletion of \u03b1v\u03b28 does not result in a spontaneous inflammatory phenotype.",
+  "evidence_sentences": [
+    "Treg-cell-specific deletion of integrin \u03b1v\u03b28 did not result in a spontaneous inflammatory phenotype, suggesting that this pathway is not important in Treg-cell-mediated maintenance of immune homeostasis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "17997584",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "integrin \u03b1v\u03b28"
+    ],
+    "conditions": [
+      "Treg-cell-specific deletion"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "scifact_id": 129,
+  "claim": "Articles published in open access format are less likely to be cited than traditional journals.",
+  "evidence_sentences": [
+    "It provides robust evidence that open-access articles (OA articles) are more immediately recognized and cited than non-OA articles.",
+    "The results of this natural experiment are clear: in the 4 to 16 months following publication, OA articles gained a significant citation advantage over non-OA articles during the same period.",
+    "They are twice as likely to be cited 4 to 10 months after publication and almost three times as likely between 10 and 16 months.",
+    "Moreover, although the evidence from the current analysis argues most strongly for a time advantage in citation for OA articles, a study over longer periods will reveal whether this translates into a sustained increase in the number of citations."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "27768226",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

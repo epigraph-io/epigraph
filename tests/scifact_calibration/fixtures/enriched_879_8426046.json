@@ -1,0 +1,22 @@
+{
+  "scifact_id": 879,
+  "claim": "Occupancy of ribosomes by IncRNAs do not make functional peptides.",
+  "evidence_sentences": [
+    "Here, we show that classical noncoding RNAs and 5' UTRs show the same ribosome occupancy as lincRNAs, demonstrating that ribosome occupancy alone is not sufficient to classify transcripts as coding or noncoding."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "8426046",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [
+      "ribosome profiling"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "comparison of ribosome occupancy across classical noncoding RNAs, 5' UTRs, and lincRNAs"
+    ],
+    "evidence_type": "empirical"
+  }
+}

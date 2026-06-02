@@ -1,0 +1,24 @@
+{
+  "scifact_id": 808,
+  "claim": "Most termination events in Okazaki fragments are sequence specific.",
+  "evidence_sentences": [
+    "Via the deep sequencing of Okazaki fragments, we comprehensively document replication fork directionality throughout the S. cerevisiae genome, which permits the systematic analysis of initiation, origin efficiency, fork progression, and termination."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "36606083",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [
+      "deep sequencing"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "S. cerevisiae genome",
+      "Okazaki fragment sequencing"
+    ],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

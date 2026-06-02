@@ -1,0 +1,24 @@
+{
+  "scifact_id": 111,
+  "claim": "Androgenetic haploid mouse embryonic stem cells (ESCs) can be derived and genetically manipulated in vitro.",
+  "evidence_sentences": [
+    "Strikingly, live mice can be obtained upon injection of AG-haESCs into MII oocytes, and these mice bear haESC-carried genetic traits and develop into fertile adults.",
+    "Our results demonstrate that AG-haESCs can be used as a genetically tractable fertilization agent for the production of live animals via injection into oocytes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13513790",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "MII oocytes",
+      "AG-haESCs"
+    ],
+    "conditions": [
+      "injection of AG-haESCs into MII oocytes"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "scifact_id": 626,
+  "claim": "Induction of urokinase receptor signaling in podocytes causes foot process effacement and proteinuria.",
+  "evidence_sentences": [
+    "Here we show that induction of urokinase receptor (uPAR) signaling in podocytes leads to foot process effacement and urinary protein loss via a mechanism that includes lipid-dependent activation of \u03b1v\u03b23 integrin."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16355392",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "urokinase receptor (uPAR)",
+      "\u03b1v\u03b23 integrin"
+    ],
+    "conditions": [
+      "lipid-dependent activation of \u03b1v\u03b23 integrin",
+      "induction of uPAR signaling in podocytes"
+    ],
+    "evidence_type": "empirical"
+  }
+}

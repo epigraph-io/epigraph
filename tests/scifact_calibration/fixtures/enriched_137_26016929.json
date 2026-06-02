@@ -1,0 +1,22 @@
+{
+  "scifact_id": 137,
+  "claim": "Asymptomatic visual impairment screening in elderly populations does not lead to improved vision.",
+  "evidence_sentences": [
+    "The inclusion of a visual screening component in the assessment did not result in improvements in self reported visual problems (pooled odds ratio 1.04:95% confidence interval 0.89 to 1.22).",
+    "CONCLUSIONS Screening of asymptomatic older people in the community is not justified on present evidence."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "26016929",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "asymptomatic elderly populations",
+      "community screening"
+    ],
+    "evidence_type": "statistical"
+  }
+}

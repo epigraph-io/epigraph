@@ -1,0 +1,21 @@
+{
+  "scifact_id": 1105,
+  "claim": "Students who perform poorly in the early years of medical school are at increased risk for professional misconduct later in their careers.",
+  "evidence_sentences": [
+    "RESULTS Univariate conditional logistic regression analysis found that cases were more likely to be men, to be of lower estimated social class, and to have had academic difficulties during their medical course, especially in the early years.",
+    "Multivariable analysis showed that male sex (odds ratio 9.80, 95% confidence interval 2.43 to 39.44, P=0.001), lower social class (4.28, 1.52 to 12.09, P=0.006), and failure of early or preclinical examinations (5.47, 2.17 to 13.79, P<0.001) were independently associated with being a case.   \n",
+    "CONCLUSIONS This small study suggests that male sex, a lower socioeconomic background, and early academic difficulties at medical school could be risk factors for subsequent professional misconduct."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6710713",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

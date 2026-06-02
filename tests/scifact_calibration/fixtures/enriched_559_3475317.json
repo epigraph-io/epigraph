@@ -1,0 +1,20 @@
+{
+  "scifact_id": 559,
+  "claim": "Immune responses in immune cells are geographically segregated.",
+  "evidence_sentences": [
+    "Although the balance between systemic pro- and anti-inflammatory signals is crucial to TB disease outcome, here we find that these signals are physically segregated within each granuloma."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "3475317",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.65,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "TB granuloma"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "scifact_id": 990,
+  "claim": "Pyridostatin decreases telomere fragility in BRCA2-deficient cells.",
+  "evidence_sentences": [
+    "Treatment with the G4-stabilizing compound pyridostatin (PDS) increases telomere fragility in BRCA2-deficient cells, suggesting that G4 formation drives telomere instability."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "16472469",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "pyridostatin",
+      "PDS"
+    ],
+    "conditions": [
+      "BRCA2-deficient cells",
+      "G4-stabilizing compound treatment"
+    ],
+    "evidence_type": "empirical"
+  }
+}

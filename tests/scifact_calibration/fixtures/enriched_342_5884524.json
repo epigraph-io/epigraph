@@ -1,0 +1,22 @@
+{
+  "scifact_id": 342,
+  "claim": "Diabetic patients with acute coronary syndrome experience decreased short-term and long-term risk for bleeding events.",
+  "evidence_sentences": [
+    "Diabetes independently predicted mortality (relative risk [RR], 1.57; 95% CI, 1.38 to 1.81; P:<0.001), as well as cardiovascular death, new myocardial infarction, stroke, and new congestive heart failure."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "5884524",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.35,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "acute coronary syndrome",
+      "diabetes mellitus"
+    ],
+    "evidence_type": "circumstantial",
+    "tier2_enriched": true
+  }
+}

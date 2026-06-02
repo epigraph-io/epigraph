@@ -1,0 +1,28 @@
+{
+  "scifact_id": 106,
+  "claim": "Ambulatory blood pressure monitoring is inaccurate at diagnosing hypertension.",
+  "evidence_sentences": [
+    "Compared with ambulatory monitoring thresholds of 135/85 mm Hg, clinic measurements over 140/90 mm Hg had mean sensitivity and specificity of 74.6% (95% confidence interval 60.7% to 84.8%) and 74.6% (47.9% to 90.4%), respectively, whereas home measurements over 135/85 mm Hg had mean sensitivity and specificity of 85.7% (78.0% to 91.0%) and 62.4% (48.0% to 75.0%).   \n",
+    "If ambulatory monitoring is taken as the reference standard, then treatment decisions based on clinic or home blood pressure alone might result in substantial overdiagnosis.",
+    "Ambulatory monitoring before the start of lifelong drug treatment might lead to more appropriate targeting of treatment, particularly around the diagnostic threshold."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "25515907",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [
+      "ambulatory blood pressure monitor",
+      "clinic blood pressure monitor",
+      "home blood pressure monitor"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "ambulatory monitoring threshold 135/85 mm Hg",
+      "clinic measurement threshold 140/90 mm Hg",
+      "home measurement threshold 135/85 mm Hg"
+    ],
+    "evidence_type": "statistical"
+  }
+}

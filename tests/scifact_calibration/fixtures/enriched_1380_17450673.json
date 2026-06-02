@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1380,
+  "claim": "Women with a lower birth weight are more likely to develop breast cancer later in life.",
+  "evidence_sentences": [
+    "RESULTS We found that heavier birth weights were associated with increased breast cancer risk, with studies involving five categories of birth weight identifying odds ratios (ORs) of 1.24 (95% confidence interval [CI] 1.04 to 1.48) for 4,000 g or more and 1.15 (95% CI 1.04 to 1.26) for 3,500 g to 3,999 g, relative to a birth weight of 2,500 to 2,599 g. These studies provided no support for a J-shaped relationship of birthweight to risk."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "17450673",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

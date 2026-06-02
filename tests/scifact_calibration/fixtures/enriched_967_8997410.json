@@ -1,0 +1,28 @@
+{
+  "scifact_id": 967,
+  "claim": "Pretreatment with the Arp2/3 inhibitor CK-666 affects lamelliopodia formation.",
+  "evidence_sentences": [
+    "Using light and electron microscopy, we demonstrate that Arp2/3 complex inhibition via the drug CK666 dramatically altered LP actin architecture, slowed centripetal flow, drove a lamellipodial-to-filopodial shape change in suspended cells, and induced a novel actin structural organization during cell spreading."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "8997410",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [
+      "light microscope",
+      "electron microscope"
+    ],
+    "reagents_involved": [
+      "CK-666",
+      "Arp2/3 inhibitor"
+    ],
+    "conditions": [
+      "Arp2/3 complex inhibition",
+      "suspended cells",
+      "cell spreading"
+    ],
+    "evidence_type": "empirical"
+  }
+}

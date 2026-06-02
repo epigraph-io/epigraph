@@ -1,0 +1,24 @@
+{
+  "scifact_id": 469,
+  "claim": "Glial calcium waves influence seizures.",
+  "evidence_sentences": [
+    "We found that a Ca2+ elevation in astrocytes correlates with both the initial development and the maintenance of a focal, seizure-like discharge.",
+    "Our data reveal that neurons engage astrocytes in a recurrent excitatory loop (possibly involving gliotransmission) that promotes seizure ignition and sustains the ictal discharge."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1410197",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Ca2+"
+    ],
+    "conditions": [
+      "focal seizure-like discharge",
+      "ictal discharge"
+    ],
+    "evidence_type": "empirical"
+  }
+}

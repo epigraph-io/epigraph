@@ -1,0 +1,24 @@
+{
+  "total_fixtures": 1189,
+  "label_distribution": {
+    "NOT_ENOUGH_INFO": 416,
+    "SUPPORT": 508,
+    "CONTRADICT": 265
+  },
+  "methodology_distribution": {
+    "extraction": 895,
+    "statistical_analysis": 135,
+    "inductive_generalization": 125,
+    "meta_analysis": 22,
+    "deductive_logic": 12
+  },
+  "evidence_type_distribution": {
+    "circumstantial": 762,
+    "empirical": 279,
+    "conversational": 1,
+    "statistical": 124,
+    "logical": 22,
+    "testimonial": 1
+  },
+  "supports_claim_vs_ground_truth_agreement": 530
+}

@@ -1,0 +1,21 @@
+{
+  "scifact_id": 463,
+  "claim": "Genomic aberrations of metastases provide information for targeted therapy.",
+  "evidence_sentences": [
+    "Mouse tumors that mimic the genetic heterogeneity of human cancers can aid our understanding of the clonal evolution of metastasis and provide a realistic model for the testing of novel therapies."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "19736671",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.35,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "mouse tumor models",
+      "genetic heterogeneity mimicking human cancers"
+    ],
+    "evidence_type": "logical"
+  }
+}

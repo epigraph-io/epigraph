@@ -1,0 +1,28 @@
+{
+  "scifact_id": 818,
+  "claim": "Myelin sheaths play a role in action potential propagation.",
+  "evidence_sentences": [
+    "We report a newly developed technique for high-resolution in vivo imaging of myelinated axons in the brain, spinal cord and peripheral nerve that requires no fluorescent labeling.",
+    "Striking color patterns unique to individual myelinated fibers are generated that facilitate their tracing in dense axonal areas."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "17814815",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.3,
+    "supports_claim": true,
+    "instruments_used": [
+      "in vivo imaging system"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "in vivo",
+      "brain tissue",
+      "spinal cord tissue",
+      "peripheral nerve tissue",
+      "no fluorescent labeling"
+    ],
+    "evidence_type": "circumstantial",
+    "tier2_enriched": true
+  }
+}

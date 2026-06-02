@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1273,
+  "claim": "The sliding activity of kinesin-8 protein Kip3 promotes bipolar spindle assembly.",
+  "evidence_sentences": [
+    "In conjunction with Cin8, a kinesin-5 family member, the sliding activity of Kip3 promotes bipolar spindle assembly and the maintenance of genome stability."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11041152",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "in conjunction with Cin8, a kinesin-5 family member"
+    ],
+    "evidence_type": "empirical"
+  }
+}

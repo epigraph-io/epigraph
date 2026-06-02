@@ -1,0 +1,23 @@
+{
+  "scifact_id": 100,
+  "claim": "All hematopoietic stem cells segregate their chromosomes randomly.",
+  "evidence_sentences": [
+    "Sequential administration of 5-chloro-2-deoxyuridine and 5-iodo-2-deoxyuridine indicated that all HSCs segregate their chromosomes randomly."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4381486",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "5-chloro-2-deoxyuridine",
+      "5-iodo-2-deoxyuridine"
+    ],
+    "conditions": [
+      "sequential administration"
+    ],
+    "evidence_type": "empirical"
+  }
+}

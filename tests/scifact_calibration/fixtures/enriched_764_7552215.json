@@ -1,0 +1,20 @@
+{
+  "scifact_id": 764,
+  "claim": "Medications to treat obesity are highly effective.",
+  "evidence_sentences": [
+    "Compared with placebo, orlistat reduced weight by 2.9 kg (95% confidence interval 2.5 kg to 3.2 kg), sibutramine by 4.2 kg (3.6 kg to 4.7 kg), and rimonabant by 4.7 kg (4.1 kg to 5.3 kg).",
+    "CONCLUSIONS Orlistat, sibutramine, and rimonabant modestly reduce weight, have differing effects on cardiovascular risk profiles, and have specific adverse effects."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "7552215",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1029,
+  "claim": "Reduced responsiveness to interleukin-2 in regulatory T cells is associated with greater resistance to autoimmune diseases such as Type 1 Diabetes.",
+  "evidence_sentences": [
+    "Furthermore, we have associated IL2RA T1D susceptibility genotypes with lower circulating levels of the biomarker, soluble IL-2RA (P = 6.28 \u00d7 10\u221228), suggesting that an inherited lower immune responsiveness predisposes to T1D."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "13940200",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

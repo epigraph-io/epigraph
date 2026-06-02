@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1020,
+  "claim": "Rapid up-regulation and higher basal expression of interferon-induced genes increase survival of granule cell neurons that are infected by West Nile virus.",
+  "evidence_sentences": [
+    "By transducing cortical neurons with genes that were expressed more highly in granule cell neurons, we identified three interferon-stimulated genes (ISGs; Ifi27, Irg1 and Rsad2 (also known as Viperin)) that mediated the antiviral effects against different neurotropic viruses."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9433958",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.65,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Ifi27",
+      "Irg1",
+      "Rsad2",
+      "Viperin"
+    ],
+    "conditions": [
+      "transduction of cortical neurons with granule cell neuron genes",
+      "neurotropic virus infection"
+    ],
+    "evidence_type": "empirical"
+  }
+}

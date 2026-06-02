@@ -1,0 +1,22 @@
+{
+  "scifact_id": 598,
+  "claim": "Incidence rates of cervical cancer have increased due to nationwide screening programs based primarily on cytology to detect uterine cervical cancer.",
+  "evidence_sentences": [
+    "Incidence and mortality rates have declined more in Finland.",
+    "The decline in mortality in Finland seems to be almost completely related to the screening programme whereas in the Netherlands it was initially considered to be a natural decline."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "25742130",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.75,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "nationwide screening programmes",
+      "cytology-based screening"
+    ],
+    "evidence_type": "statistical"
+  }
+}

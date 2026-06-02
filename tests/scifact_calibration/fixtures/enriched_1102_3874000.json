@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1102,
+  "claim": "Stiff substrates inhibit mesodermal differentiation by degrading beta-catenin in an integrin-dependent manner.",
+  "evidence_sentences": [
+    "By contrast, on a stiff hydrogel matrix, hESCs show elevated integrin-dependent GSK3 and Src activity that promotes \u03b2-catenin degradation and inhibits differentiation."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "3874000",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "beta-catenin",
+      "GSK3",
+      "Src",
+      "integrin"
+    ],
+    "conditions": [
+      "stiff hydrogel matrix",
+      "hESCs"
+    ],
+    "evidence_type": "empirical"
+  }
+}

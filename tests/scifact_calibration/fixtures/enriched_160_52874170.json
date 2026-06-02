@@ -1,0 +1,19 @@
+{
+  "scifact_id": 160,
+  "claim": "Bacterial meningitis can be diagnosed on the basis of positive cerebrospinal fluid (CSF) cultures.",
+  "evidence_sentences": [
+    "A CSF-blood glucose ratio of 0.4 or less (likelihood ratio [LR], 18; 95% CI, 12-27]), CSF white blood cell count of 500/muL or higher (LR, 15; 95% CI, 10-22), and CSF lactate level of 31.53 mg/dL or more (> or =3.5 mmol/L; LR, 21; 95% CI, 14-32) accurately diagnosed bacterial meningitis.   \n"
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "52874170",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.65,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

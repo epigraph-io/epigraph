@@ -196,3 +196,17 @@ max_per_claim = 32
 
 [evidence_locality]
 intra_evidence_locality_factor = 0.3
+
+# ── Split-Conformal Prediction Sets ────────────────
+# Per-class nonconformity quantiles q_c, fit by scripts/calibrate_conformal.py
+# over 1189 labelled SciFact fixtures (split-conformal, alpha=0.1,
+# seed=42). score_c = 1 - BetP_c (supported/contradicted) or 1 - theta (NEI);
+# class c is in the prediction set iff score_c <= q_c. Calibration n per class:
+# supported=508 contradicted=265 not_enough_info=416.
+[conformal]
+alpha = 0.1
+
+[conformal.quantiles]
+supported        = 0.414726
+contradicted     = 0.367560
+not_enough_info  = 0.117009

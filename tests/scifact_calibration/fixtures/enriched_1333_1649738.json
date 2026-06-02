@@ -1,0 +1,22 @@
+{
+  "scifact_id": 1333,
+  "claim": "Two variants of chromosome 6q21 are associated with radiation therapy-induced second malignancies in pediatric Hodgkin lymphoma patients.",
+  "evidence_sentences": [
+    "We identified two variants at chromosome 6q21 associated with SMNs in survivors of Hodgkin's lymphoma treated with radiation therapy as children but not as adults."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1649738",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "radiation therapy",
+      "pediatric Hodgkin lymphoma",
+      "childhood treatment"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "scifact_id": 1385,
+  "claim": "cSMAC formation enhances weak ligand signalling.",
+  "evidence_sentences": [
+    "This conclusion was supported by experiments that showed that enhancing cSMAC formation reduced stimulatory capacity of the weak peptide."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "306006",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "weak peptide"
+    ],
+    "conditions": [
+      "enhancing cSMAC formation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

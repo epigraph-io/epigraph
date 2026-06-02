@@ -1,0 +1,23 @@
+{
+  "scifact_id": 745,
+  "claim": "MafA phosphorylation decreases its ubiquitination.",
+  "evidence_sentences": [
+    "We also demonstrate that GSK-3 triggers MafA sequential phosphorylation on residues S61, T57, T53, and S49, inducing its ubiquitination and degradation."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "11291348",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.92,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "GSK-3",
+      "MafA"
+    ],
+    "conditions": [
+      "sequential phosphorylation on residues S61, T57, T53, S49"
+    ],
+    "evidence_type": "empirical"
+  }
+}

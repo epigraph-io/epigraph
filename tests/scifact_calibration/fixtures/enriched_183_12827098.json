@@ -1,0 +1,21 @@
+{
+  "scifact_id": 183,
+  "claim": "Bone marrow cells contribute to adult macrophage compartments.",
+  "evidence_sentences": [
+    "We also found that after bone marrow transplantation, host macrophages retained the capacity to expand when the development of donor macrophages was compromised."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "12827098",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.55,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "bone marrow transplantation",
+      "compromised donor macrophage development"
+    ],
+    "evidence_type": "empirical"
+  }
+}

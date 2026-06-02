@@ -1,0 +1,20 @@
+{
+  "scifact_id": 885,
+  "claim": "One in five surgical randomized controlled trials are discontinued early.",
+  "evidence_sentences": [
+    "Of these, 21% (81/395) were discontinued early, most commonly owing to poor recruitment (44%, 36/81).",
+    "CONCLUSIONS One in five surgical randomised controlled trials are discontinued early, one in three completed trials remain unpublished, and investigators of unpublished studies are frequently not contactable."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6477536",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

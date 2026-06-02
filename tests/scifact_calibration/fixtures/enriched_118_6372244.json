@@ -1,0 +1,23 @@
+{
+  "scifact_id": 118,
+  "claim": "Antibiotic induced alterations in the gut microbiome reduce resistance against Clostridium difficile",
+  "evidence_sentences": [
+    "Antibiotics can have significant and long-lasting effects on the gastrointestinal tract microbiota, reducing colonization resistance against pathogens including Clostridium difficile.",
+    "Our results indicate that antibiotic-mediated alteration of the gut microbiome converts the global metabolic profile to one that favours C. difficile germination and growth."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6372244",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "antibiotics"
+    ],
+    "conditions": [
+      "antibiotic-mediated alteration of gut microbiome"
+    ],
+    "evidence_type": "empirical"
+  }
+}

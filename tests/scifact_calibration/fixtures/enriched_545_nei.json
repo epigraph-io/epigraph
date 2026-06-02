@@ -1,0 +1,16 @@
+{
+  "scifact_id": 545,
+  "claim": "IFIT1 speeds viral replication by allowing for the proliferation of mis-capped viral RNAs.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

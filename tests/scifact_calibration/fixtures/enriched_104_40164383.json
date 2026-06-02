@@ -1,0 +1,29 @@
+{
+  "scifact_id": 104,
+  "claim": "Allogeneic mechanical circulatory support is not as effective as autologous mechanical circulatory support for treating acute myocardial infarction.",
+  "evidence_sentences": [
+    "The 1-year incidence of SAEs was 33.3% (n = 5) in the allogeneic group and 53.3% (n = 8) in the autologous group (P = .46).",
+    "At 1 year, there were no ventricular arrhythmia SAEs observed among allogeneic recipients compared with 4 patients (26.7%) in the autologous group (P = .10).",
+    "Allogeneic and autologous MSCs reduced mean EED by \u221233.21% (95% CI, \u221243.61% to \u221222.81%; P < .001) and sphericity index but did not increase EF.",
+    "CONCLUSIONS In this early-stage study of patients with ICM, transendocardial injection of allogeneic and autologous MSCs without a placebo control were both associated with low rates of treatment-emergent SAEs, including immunologic reactions."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "40164383",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.65,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "allogeneic MSCs",
+      "autologous MSCs"
+    ],
+    "conditions": [
+      "transendocardial injection",
+      "ischemic cardiomyopathy (ICM)",
+      "1-year follow-up",
+      "no placebo control"
+    ],
+    "evidence_type": "statistical"
+  }
+}

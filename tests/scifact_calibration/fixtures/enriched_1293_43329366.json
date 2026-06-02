@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1293,
+  "claim": "There is no increased risk of hypospadias with clomiphene.",
+  "evidence_sentences": [
+    "The adverse effect is less severe in sons, although links to testicular cancer and urogenital anomalies, such as epididymal cysts, have been reported.2 3 A recent study also found an increased risk of hypospadias in the sons of women exposed to diethylstilbestrol in utero.4 Clomifene has a half life of about five days, but its metabolites have been found in blood samples on day 22 of the menstrual cycle and in faeces up to six weeks after administration.5 The occurrence of hypospadias may be increasing."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "43329366",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.35,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial",
+    "tier2_enriched": true,
+    "tier3_enriched": true
+  }
+}

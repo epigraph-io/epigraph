@@ -1,0 +1,21 @@
+{
+  "scifact_id": 375,
+  "claim": "Elevated cell-free mitochondrial DNA levels are associated with mortality.",
+  "evidence_sentences": [
+    "Medical ICU patients with an elevated mtDNA level (\u22653,200 copies/\u00b5l plasma) had increased odds of dying within 28 d of ICU admission in both the BWH RoCI (odds ratio [OR] 7.5, 95% CI 3.6-15.8, p = 1\u00d710(-7)) and ME ARDS (OR 8.4, 95% CI 2.9-24.2, p = 9\u00d710(-5)) cohorts, while no evidence for association was noted in non-medical ICU patients.",
+    "In the BWH RoCI cohort, those with an elevated mtDNA level had an increased risk of death, even in analyses limited to patients with sepsis or acute respiratory distress syndrome.",
+    "CONCLUSIONS Increased mtDNA levels are associated with ICU mortality, and inclusion of mtDNA level improves risk prediction in medical ICU patients."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1522647",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

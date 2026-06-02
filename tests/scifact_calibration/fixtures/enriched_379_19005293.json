@@ -1,0 +1,23 @@
+{
+  "scifact_id": 379,
+  "claim": "Enhanced early production of inflammatory chemokines damages viral control in the lung.",
+  "evidence_sentences": [
+    "We found that the response of memory, but not naive, CD4+ T cells enhances production of multiple innate inflammatory cytokines and chemokines (IICs) in the lung and that, during influenza infection, this leads to early control of virus."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "19005293",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "influenza infection",
+      "lung",
+      "memory CD4+ T cells",
+      "naive CD4+ T cells"
+    ],
+    "evidence_type": "empirical"
+  }
+}

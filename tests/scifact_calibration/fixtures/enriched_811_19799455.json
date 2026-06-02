@@ -1,0 +1,28 @@
+{
+  "scifact_id": 811,
+  "claim": "Mutant mice lacking SVCT2 have greatly increased ascorbic acid levels in both brain and adrenals.",
+  "evidence_sentences": [
+    "Ascorbic-acid levels were undetectable or markedly reduced in the blood and tissues of Slc23a1\u2212/\u2212 mice.",
+    "Brain hemorrhage was unlikely to be simply a form of scurvy since Slc23a1\u2212/\u2212 mice showed no hemorrhage in any other tissues and their skin had normal skin 4-hydroxyproline levels despite low ascorbic-acid content."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "19799455",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "ascorbic acid",
+      "4-hydroxyproline"
+    ],
+    "conditions": [
+      "Slc23a1\u2212/\u2212 mice",
+      "brain tissue",
+      "blood",
+      "adrenal tissue",
+      "skin"
+    ],
+    "evidence_type": "empirical"
+  }
+}

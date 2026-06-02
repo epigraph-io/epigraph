@@ -1,0 +1,23 @@
+{
+  "scifact_id": 1211,
+  "claim": "The density of cytokine receptor bearing cells has no effect on the distance over which cytokines act.",
+  "evidence_sentences": [
+    "HighlightsCytokine penetration in tissues is governed by a diffusion\u2010consumption mechanismSpherical cytokine niches are generated around cytokine\u2010producing cellsThe characteristic niche size depends on the density of cytokine consumersCytokine niches are a source of variability in otherwise identical cells &NA; Cytokine\u2010mediated communication allows immune cells to achieve a context\u2010appropriate response, but the distance over which this communication happens is unclear."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "4928282",
+  "enrichment": {
+    "methodology": "deductive_logic",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "cytokines"
+    ],
+    "conditions": [
+      "diffusion-consumption mechanism",
+      "spherical cytokine niches around cytokine-producing cells"
+    ],
+    "evidence_type": "logical"
+  }
+}

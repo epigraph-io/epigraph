@@ -1,0 +1,26 @@
+{
+  "scifact_id": 536,
+  "claim": "Hypocretin neurones induce panicprone state in rats.",
+  "evidence_sentences": [
+    "Here we show that activation of ORX-synthesizing neurons is necessary for developing a panic-prone state in the rat panic model, and either silencing of the hypothalamic gene encoding ORX (Hcrt) with RNAi or systemic ORX-1 receptor antagonists blocks the panic responses."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16056514",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "RNAi",
+      "ORX-1 receptor antagonists"
+    ],
+    "conditions": [
+      "activation of ORX-synthesizing neurons",
+      "silencing of hypothalamic Hcrt gene",
+      "systemic ORX-1 receptor antagonist administration",
+      "rat panic model"
+    ],
+    "evidence_type": "empirical"
+  }
+}

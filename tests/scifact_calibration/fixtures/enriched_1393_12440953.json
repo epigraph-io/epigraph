@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1393,
+  "claim": "miRNAs enforce homeostasis by suppressing low-level ''leaky'' transcription.",
+  "evidence_sentences": [
+    "Increasing evidence suggests that, among their roles as posttranscriptional repressors of gene expression, microRNAs (miRNAs) help to confer robustness to biological processes by reinforcing transcriptional programs and attenuating aberrant transcripts, and they may in some network contexts help suppress random fluctuations in transcript copy number."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "12440953",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.7,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "logical",
+    "tier2_enriched": true
+  }
+}

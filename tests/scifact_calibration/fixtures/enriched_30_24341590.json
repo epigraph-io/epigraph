@@ -1,0 +1,29 @@
+{
+  "scifact_id": 30,
+  "claim": "A breast cancer patient's capacity to metabolize tamoxifen influences treatment outcome.",
+  "evidence_sentences": [
+    "At 9 years of follow-up, the recurrence rates were 14.9% for extensive metabolizers, 20.9% for heterozygous extensive/intermediate metabolizers, and 29.0% for poor metabolizers, and all-cause mortality rates were 16.7%, 18.0%, and 22.8%, respectively.",
+    "Compared with extensive metabolizers, there was a significantly increased risk of recurrence for heterozygous extensive/intermediate metabolizers (time to recurrence adjusted hazard ratio [HR], 1.40; 95% confidence interval [CI], 1.04-1.90) and for poor metabolizers (time to recurrence HR, 1.90; 95% CI, 1.10-3.28).",
+    "Compared with extensive metabolizers, those with decreased CYP2D6 activity (heterozygous extensive/intermediate and poor metabolism) had worse event-free survival (HR, 1.33; 95% CI, 1.06-1.68) and disease-free survival (HR, 1.29; 95% CI, 1.03-1.61), but there was no significant difference in overall survival (HR, 1.15; 95% CI, 0.88-1.51).   \n",
+    "CONCLUSION Among women with breast cancer treated with tamoxifen, there was an association between CYP2D6 variation and clinical outcomes, such that the presence of 2 functional CYP2D6 alleles was associated with better clinical outcomes and the presence of nonfunctional or reduced-function alleles with worse outcomes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "24341590",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "tamoxifen"
+    ],
+    "conditions": [
+      "9 years of follow-up",
+      "CYP2D6 extensive metabolizers",
+      "CYP2D6 heterozygous extensive/intermediate metabolizers",
+      "CYP2D6 poor metabolizers",
+      "breast cancer treated with tamoxifen"
+    ],
+    "evidence_type": "statistical"
+  }
+}

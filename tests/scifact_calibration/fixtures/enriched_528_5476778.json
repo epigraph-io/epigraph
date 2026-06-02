@@ -1,0 +1,21 @@
+{
+  "scifact_id": 528,
+  "claim": "Human T-lymphotropic virus type-I-associated myelopathy / tropical spastic paraparesis (HAM/TSP) patients produce Immunoglobulin G (IgG) antibodies which cross-react with an immunodominant epitope in Tax.",
+  "evidence_sentences": [
+    "Antibodies to hnRNP-A1 cross-reacted with HTLV-1-tax, the immune response to which is associated with HAM/TSP (refs."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5476778",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.55,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "antibodies to hnRNP-A1",
+      "HTLV-1-tax"
+    ],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

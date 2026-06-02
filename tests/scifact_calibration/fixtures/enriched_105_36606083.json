@@ -1,0 +1,21 @@
+{
+  "scifact_id": 105,
+  "claim": "Alteration of origin firing causes changes in termination zones of Okazaki fragments.",
+  "evidence_sentences": [
+    "Using a strain in which late origins can be induced to fire early, we show that replication termination is a largely passive phenomenon that does not rely on cis-acting sequences or replication fork pausing."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "36606083",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "late origins induced to fire early"
+    ],
+    "evidence_type": "empirical",
+    "tier3_enriched": true
+  }
+}

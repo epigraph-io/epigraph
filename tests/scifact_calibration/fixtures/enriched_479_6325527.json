@@ -1,0 +1,25 @@
+{
+  "scifact_id": 479,
+  "claim": "Gpr124 increases BBB breakdown in mouse models of ischemic stroke.",
+  "evidence_sentences": [
+    "Here Gpr124 conditional knockout (CKO) in the endothelia of adult mice did not affect homeostatic BBB integrity, but resulted in BBB disruption and microvascular hemorrhage in mouse models of both ischemic stroke and glioblastoma, accompanied by reduced cerebrovascular canonical Wnt\u2013\u03b2-catenin signaling."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "6325527",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Gpr124 conditional knockout (CKO)"
+    ],
+    "conditions": [
+      "endothelial-specific knockout in adult mice",
+      "ischemic stroke model",
+      "glioblastoma model",
+      "homeostatic conditions"
+    ],
+    "evidence_type": "empirical"
+  }
+}

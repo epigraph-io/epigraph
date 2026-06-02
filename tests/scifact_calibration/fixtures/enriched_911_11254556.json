@@ -1,0 +1,25 @@
+{
+  "scifact_id": 911,
+  "claim": "PKG-la plays an essential role in expression of pain hypersensitivity in PGK-la knockout mice.",
+  "evidence_sentences": [
+    "Here, we found that Protein Kinase G1 (PKG-I) localized presynaptically in nociceptor terminals plays an essential role in the expression of spinal LTP.",
+    "Our results thus indicate that presynaptic mechanisms involving an increase in release probability from nociceptors are operational in the expression of synaptic LTP on spinal-PAG projection neurons and that PKG-I localized in presynaptic nociceptor terminals plays an essential role in this process to regulate pain sensitivity."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11254556",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.45,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Protein Kinase G1 (PKG-I)"
+    ],
+    "conditions": [
+      "presynaptic localization in nociceptor terminals",
+      "spinal LTP expression",
+      "spinal-PAG projection neurons"
+    ],
+    "evidence_type": "empirical"
+  }
+}

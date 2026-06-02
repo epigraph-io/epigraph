@@ -1,0 +1,21 @@
+{
+  "scifact_id": 263,
+  "claim": "Citrullinated proteins externalized in neutrophil extracellular traps act indirectly to disrupt the inflammatory cycle.",
+  "evidence_sentences": [
+    "BACKGROUND Histone deimination regulates gene function and contributes to antimicrobial response, allowing the formation of neutrophil extracellular traps (NETs).",
+    "Deiminated proteins are target of anti-citrullinated peptides antibodies (ACPA) in rheumatoid arthritis (RA).   \n",
+    "CONCLUSIONS Citrullinated H4 from activated neutrophils and NETs is a target of antibodies in RA, and synthetic citrullinated H4-derived peptides are a new substrate for ACPA detection."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "30041340",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.2,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

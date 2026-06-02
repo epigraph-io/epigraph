@@ -1,0 +1,23 @@
+{
+  "scifact_id": 159,
+  "claim": "BRCA 1 mutation carriers' risk of breast and ovarian cancer depends on where the mutation is located.",
+  "evidence_sentences": [
+    "Mutations conferring nonsense-mediated decay were associated with differential breast or ovarian cancer risks and an earlier age of breast cancer diagnosis for both BRCA1 and BRCA2 mutation carriers.   \n",
+    "CONCLUSIONS AND RELEVANCE Breast and ovarian cancer risks varied by type and location of BRCA1/2 mutations."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9394119",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "nonsense-mediated decay mutations",
+      "BRCA1 mutation carriers",
+      "BRCA2 mutation carriers"
+    ],
+    "evidence_type": "statistical"
+  }
+}

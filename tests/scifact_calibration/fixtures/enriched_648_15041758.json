@@ -1,0 +1,21 @@
+{
+  "scifact_id": 648,
+  "claim": "Integrated care is successful at tackling multiple comorbidities.",
+  "evidence_sentences": [
+    "Improvements from baseline on the Sheehan disability scale (-0.9, 95% confidence interval -1.5 to -0.2; P = 0.006) and global quality of life rating (0.7, 0.2 to 1.2; P = 0.005) were significantly greater at six and 12 months in patients in the intervention group.",
+    "There was a trend toward greater improvement in disabilities in activities of daily living (-1.5, -3.3 to 0.4; P = 0.10).   \n",
+    "CONCLUSIONS Integrated care that covers chronic physical disease and comorbid depression can reduce social role disability and enhance global quality of life."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "15041758",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.72,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

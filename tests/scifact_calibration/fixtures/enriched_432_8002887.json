@@ -1,0 +1,25 @@
+{
+  "scifact_id": 432,
+  "claim": "Foxk2 regulates autophagy genes in muscle cells and fibroblast cells.",
+  "evidence_sentences": [
+    "Here, we identify Foxk proteins (Foxk1 and Foxk2) as transcriptional repressors of autophagy in muscle cells and fibroblasts.",
+    "Foxk1/2 specifically recruits Sin3A-HDAC complexes to restrict acetylation of histone H4 and expression of critical autophagy genes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "8002887",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Sin3A-HDAC complexes",
+      "histone H4"
+    ],
+    "conditions": [
+      "muscle cells",
+      "fibroblasts"
+    ],
+    "evidence_type": "empirical"
+  }
+}

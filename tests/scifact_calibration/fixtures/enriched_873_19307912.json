@@ -1,0 +1,22 @@
+{
+  "scifact_id": 873,
+  "claim": "Obesity is determined solely by environmental factors.",
+  "evidence_sentences": [
+    "Suspected familial obesity was observed in 2.4 percent and 6 percent respectively of random and hyperlipidemic recall group whites.",
+    "Nearly all subjects with familial obesity or leanness had no overt metabolic or pharmacological explanations for their body habitus."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "19307912",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.65,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "random recall group",
+      "hyperlipidemic recall group"
+    ],
+    "evidence_type": "empirical"
+  }
+}

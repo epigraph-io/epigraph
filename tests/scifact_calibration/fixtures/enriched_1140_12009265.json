@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1140,
+  "claim": "Taking 400mg of \u03b1-tocopheryl acetate helps to prevent prostate cancer.",
+  "evidence_sentences": [
+    "Compared with placebo, vitamin E had no effect on the incidence of prostate cancer (active and placebo vitamin E groups, 9.1 and 9.5 events per 1000 person-years; hazard ratio [HR], 0.97; 95% confidence interval [CI], 0.85-1.09; P = .58) or total cancer (active and placebo vitamin E groups, 17.8 and 17.3 cases per 1000 person-years; HR, 1.04; 95% CI, 0.95-1.13; P = .41).",
+    "CONCLUSIONS In this large, long-term trial of male physicians, neither vitamin E nor C supplementation reduced the risk of prostate or total cancer."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "12009265",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "\u03b1-tocopheryl acetate",
+      "placebo"
+    ],
+    "conditions": [
+      "400mg dosage",
+      "large long-term trial",
+      "male physicians"
+    ],
+    "evidence_type": "statistical"
+  }
+}

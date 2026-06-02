@@ -1,0 +1,23 @@
+{
+  "scifact_id": 597,
+  "claim": "Incidence rates of cervical cancer have decreased.",
+  "evidence_sentences": [
+    "RESULTS The mean incidence of cervical carcinoma in the early 1960s was 15.4 per 10(5) woman-years.",
+    "In 1991, it was only 2.7 per 10(5) woman-years."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "36355784",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "early 1960s baseline period",
+      "1991 comparison period",
+      "incidence measured per 100000 woman-years"
+    ],
+    "evidence_type": "statistical"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "scifact_id": 1041,
+  "claim": "Replacement of histone H2A with H2A.Z slows gene activation in yeasts by stabilizing +1 nucleosomes.",
+  "evidence_sentences": [
+    "Immunoprecipitation studies of nucleosome core particles (NCPs) show that NCPs that contain both H3.3 and H2A.Z are even less stable than NCPs containing H3.3 and H2A."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "25254425",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.55,
+    "supports_claim": false,
+    "instruments_used": [
+      "immunoprecipitation"
+    ],
+    "reagents_involved": [
+      "histone H2A",
+      "H2A.Z",
+      "H3.3",
+      "nucleosome core particles"
+    ],
+    "conditions": [
+      "in vitro nucleosome core particle analysis"
+    ],
+    "evidence_type": "empirical"
+  }
+}

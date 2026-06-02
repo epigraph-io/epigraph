@@ -1,0 +1,20 @@
+{
+  "scifact_id": 177,
+  "claim": "Binding of p53 to enhancer regions (p53BERs) regulates the activity of p53 transcription and cell cycle arrest through the production of p53-dependent eRNAs.",
+  "evidence_sentences": [
+    "Furthermore, p53BERs produce, in a p53-dependent manner, enhancer RNAs (eRNAs) that are required for efficient transcriptional enhancement of interacting target genes and induction of a p53-dependent cell-cycle arrest.",
+    "Moreover, eRNA production from p53BERs is required for efficient p53 transcription enhancement."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9669099",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "scifact_id": 726,
+  "claim": "Ly6C hi monocytes have a higher inflammatory capacity than Ly6C lo monocytes.",
+  "evidence_sentences": [
+    "Under inflammatory conditions elicited either by acute infection with Listeria monocytogenes or chronic infection with Leishmania major, there was a significant increase in immature Ly-6C(high) monocytes, resembling the inflammatory left shift of granulocytes.",
+    "In addition, acute peritoneal inflammation recruited preferentially Ly-6C(med-high) monocytes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "36444198",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.55,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Listeria monocytogenes",
+      "Leishmania major"
+    ],
+    "conditions": [
+      "acute infection with Listeria monocytogenes",
+      "chronic infection with Leishmania major",
+      "acute peritoneal inflammation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

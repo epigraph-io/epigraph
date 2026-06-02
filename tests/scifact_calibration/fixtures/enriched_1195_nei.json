@@ -1,0 +1,16 @@
+{
+  "scifact_id": 1195,
+  "claim": "The artifactual C-terminal helix swapping in the StART domain is observed in the Ups1-Mdm35 heterodimer of the StARkin superfamily.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

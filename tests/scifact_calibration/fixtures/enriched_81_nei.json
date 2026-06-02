@@ -1,0 +1,16 @@
+{
+  "scifact_id": 81,
+  "claim": "Acute ablation of Snail in the embryonic cortex affects the proliferation and number of embryonic cortical precursors.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

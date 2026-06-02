@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1229,
+  "claim": "The microtubule-dependent delivery and secretion of matrix metalloproteases (MMPs) is partially responsible for the disassembly of adhesion sites.",
+  "evidence_sentences": [
+    "CLASPs are further required for FA-associated ECM degradation, and matrix metalloprotease inhibition slows FA disassembly similarly to CLASP or PHLDB2 (LL5\u03b2) depletion."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1676568",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

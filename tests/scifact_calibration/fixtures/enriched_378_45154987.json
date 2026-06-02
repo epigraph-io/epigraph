@@ -1,0 +1,21 @@
+{
+  "scifact_id": 378,
+  "claim": "Energy balance requires hypothalamic glutamate neurotransmission.",
+  "evidence_sentences": [
+    "The anti-obesity effect was completely reversed by selective disruption of glutamate release from those same Sim1 neurons.",
+    "Corroboratively, selective disruption of glutamate release from adult PVH neurons led to rapid obesity development via reduced energy expenditure and hyperphagia.",
+    "Thus, this study establishes glutamate as the primary neurotransmitter that mediates MC4Rs on Sim1 neurons in body weight regulation."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "45154987",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

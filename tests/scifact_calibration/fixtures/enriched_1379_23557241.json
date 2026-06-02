@@ -1,0 +1,23 @@
+{
+  "scifact_id": 1379,
+  "claim": "Women with a higher birth weight are more likely to develop breast cancer later in life.",
+  "evidence_sentences": [
+    "Increased risk of breast cancer was noted with increased birthweight (relative risk [RR] 1.15 [95% CI 1.09-1.21]), birth length (1.28 [1.11-1.48]), higher maternal age (1.13 [1.02-1.25]), and paternal age (1.12 [1.05-1.19])."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "23557241",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "increased birthweight",
+      "birth length",
+      "higher maternal age",
+      "paternal age"
+    ],
+    "evidence_type": "statistical"
+  }
+}

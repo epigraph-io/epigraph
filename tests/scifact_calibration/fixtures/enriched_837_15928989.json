@@ -1,0 +1,24 @@
+{
+  "scifact_id": 837,
+  "claim": "NR5A2 is important in development of endometrial tissues.",
+  "evidence_sentences": [
+    "Lrh-1 is also expressed in the mouse and human endometrium, and in a primary culture of human endometrial stromal cells, reduction of NR5A2 transcript abundance by RNA interference abrogated decidualization.",
+    "These findings show that Lrh-1 is necessary for maintenance of the corpus luteum, for promotion of decidualization and for formation of the placenta."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "15928989",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "RNA interference"
+    ],
+    "conditions": [
+      "primary culture of human endometrial stromal cells",
+      "reduction of NR5A2 transcript abundance"
+    ],
+    "evidence_type": "empirical"
+  }
+}

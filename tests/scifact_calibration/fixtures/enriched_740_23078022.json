@@ -1,0 +1,26 @@
+{
+  "scifact_id": 740,
+  "claim": "MUC1-C activates the NF-\u03baB p65 signaling pathway by interacting with I\u03baB kinase \u00df.",
+  "evidence_sentences": [
+    "These findings indicate that MUC1 is important for physiological activation of IKK\u03b2 and that overexpression of MUC1, as found in human cancers, confers sustained induction of the IKK\u03b2\u2013NF-\u03baB p65 pathway."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "23078022",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "MUC1",
+      "MUC1-C",
+      "IKK\u03b2",
+      "NF-\u03baB p65"
+    ],
+    "conditions": [
+      "overexpression of MUC1 in human cancers",
+      "physiological activation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

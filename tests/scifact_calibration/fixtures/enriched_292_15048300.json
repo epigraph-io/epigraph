@@ -1,0 +1,22 @@
+{
+  "scifact_id": 292,
+  "claim": "Cost effectiveness evaluations based on cRCT data lack external validity.",
+  "evidence_sentences": [
+    "Only a minority of patients used the drugs long-term and daily (34.5% of conventional NSAIDs and 44.2% of coxibs), whereas coxib RCTs required daily use for at least 6-9 months.",
+    "The mean costs (for GPRD events) over calendar time were US$58k during 1990-1993 and US$174k during 2002-2005.",
+    "Using RCT data rather than GPRD data for event probabilities, the mean cost was US$16k with the VIGOR RCT and US$20k with the CLASS RCT.   \n",
+    "CONCLUSIONS The published cost-effectiveness analyses of coxibs lacked external validity, did not represent patients in actual clinical practice, and should not have been used to inform prescribing policies."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "15048300",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

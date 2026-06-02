@@ -1,0 +1,22 @@
+{
+  "scifact_id": 584,
+  "claim": "In rhesus macaques, daily subcutaneous injections of tenofovir protects against rectally transmitted simian-human immunodeficiency virus.",
+  "evidence_sentences": [
+    "All six macaques in group 3 were protected."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "14260013",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.4,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "daily subcutaneous injections",
+      "rectal transmission",
+      "group 3"
+    ],
+    "evidence_type": "empirical"
+  }
+}

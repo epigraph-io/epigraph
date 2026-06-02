@@ -1,0 +1,23 @@
+{
+  "scifact_id": 51,
+  "claim": "ALDH1 expression is associated with better breast cancer outcomes.",
+  "evidence_sentences": [
+    "In a series of 577 breast carcinomas, expression of ALDH1 detected by immunostaining correlated with poor prognosis."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "45638119",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "ALDH1 antibody"
+    ],
+    "conditions": [
+      "immunostaining",
+      "577 breast carcinomas"
+    ],
+    "evidence_type": "empirical"
+  }
+}

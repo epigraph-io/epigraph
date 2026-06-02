@@ -1,0 +1,25 @@
+{
+  "scifact_id": 840,
+  "claim": "Natriuretic peptides increase susceptibility to diabetes.",
+  "evidence_sentences": [
+    "In participants of our case-cohort study who were free of T2D and cardiovascular disease at baseline, we observed a 21% (95% CI 3%-36%) decreased risk of incident T2D per one standard deviation (SD) higher log-transformed NT-pro-BNP levels in analysis adjusted for age, sex, body mass index, systolic blood pressure, smoking, family history of T2D, history of hypertension, and levels of triglycerides, high-density lipoprotein cholesterol, and low-density lipoprotein cholesterol.",
+    "CONCLUSIONS Our results provide evidence for a potential causal role of the BNP system in the aetiology of T2D."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "15663829",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "NT-pro-BNP"
+    ],
+    "conditions": [
+      "case-cohort study",
+      "adjusted for age, sex, BMI, systolic blood pressure, smoking, family history of T2D, history of hypertension, triglycerides, HDL cholesterol, LDL cholesterol",
+      "participants free of T2D and cardiovascular disease at baseline"
+    ],
+    "evidence_type": "statistical"
+  }
+}

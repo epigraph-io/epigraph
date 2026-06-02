@@ -1,0 +1,21 @@
+{
+  "scifact_id": 904,
+  "claim": "PDPN promotes efficient motility along stromal surfaces by activating the C-type lectin receptor to rearrange the actin cytoskeleton in dendritic cells.",
+  "evidence_sentences": [
+    "Thus, activation of CLEC-2 by PDPN rearranges the actin cytoskeleton in DCs to promote efficient motility along stromal surfaces."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "7370282",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "PDPN",
+      "CLEC-2"
+    ],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

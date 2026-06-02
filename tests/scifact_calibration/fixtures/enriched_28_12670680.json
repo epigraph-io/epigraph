@@ -1,0 +1,31 @@
+{
+  "scifact_id": 28,
+  "claim": "A T helper 2 cell (Th2) environment impedes disease development in patients with systemic lupus erythematosus (SLE).",
+  "evidence_sentences": [
+    "We report that activation of basophils by autoreactive IgE causes their homing to lymph nodes, promoting T helper type 2 (T(H)2) cell differentiation and enhancing the production of self-reactive antibodies that cause lupus-like nephritis in mice lacking the Src family protein tyrosine kinase Lyn (Lyn(-/-) mice).",
+    "Individuals with SLE also have elevated serum IgE, self-reactive IgEs and activated basophils that express CD62 ligand (CD62L) and the major histocompatibility complex (MHC) class II molecule human leukocyte antigen-DR (HLA-DR), parameters that are associated with increased disease activity and active lupus nephritis.",
+    "Thus, in Lyn(-/-) mice, basophils and IgE autoantibodies amplify autoantibody production that leads to lupus nephritis, and in individuals with SLE IgE autoantibodies and activated basophils are factors associated with disease activity and nephritis."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "12670680",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.82,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "IgE",
+      "autoreactive IgE",
+      "CD62L",
+      "HLA-DR",
+      "MHC class II"
+    ],
+    "conditions": [
+      "Lyn-/- mice",
+      "lupus-like nephritis",
+      "elevated serum IgE",
+      "activated basophils"
+    ],
+    "evidence_type": "empirical"
+  }
+}

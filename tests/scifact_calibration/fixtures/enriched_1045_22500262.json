@@ -1,0 +1,34 @@
+{
+  "scifact_id": 1045,
+  "claim": "Rhythmic expression of Cry1 translates directly into a circadian regulation of cAMP signaling in hepatic glucose metabolism.",
+  "evidence_sentences": [
+    "Although the underlying mechanism is unclear, hepatic gluconeogenesis is also regulated by the circadian clock, which coordinates glucose metabolism with changes in the external environment.",
+    "Circadian control of gene expression is achieved by two transcriptional activators, Clock and Bmal1, which stimulate cryptochrome (Cry1 and Cry2) and Period (Per1, Per2 and Per3) repressors that feed back on Clock-Bmal1 activity.",
+    "Here we show that Creb activity during fasting is modulated by Cry1 and Cry2, which are rhythmically expressed in the liver.",
+    "Cry1 expression was elevated during the night-day transition, when it reduced fasting gluconeogenic gene expression by blocking glucagon-mediated increases in intracellular cAMP concentrations and in the protein kinase A-mediated phosphorylation of Creb."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "22500262",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Cry1",
+      "Cry2",
+      "cAMP",
+      "glucagon",
+      "protein kinase A",
+      "Creb",
+      "Clock",
+      "Bmal1"
+    ],
+    "conditions": [
+      "fasting",
+      "night-day transition",
+      "hepatic gluconeogenesis"
+    ],
+    "evidence_type": "empirical"
+  }
+}

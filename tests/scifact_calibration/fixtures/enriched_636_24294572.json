@@ -1,0 +1,24 @@
+{
+  "scifact_id": 636,
+  "claim": "Inositol lipid 3-phosphatase PTEN converts Ptdlns(3,4)P 2 into phosphatidylinositol 4-phosphate.",
+  "evidence_sentences": [
+    "Here we show that PTEN also functions as a PI(3,4)P2 3-phosphatase, both in vitro and in vivo."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "24294572",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "PTEN",
+      "PI(3,4)P2"
+    ],
+    "conditions": [
+      "in vitro",
+      "in vivo"
+    ],
+    "evidence_type": "empirical"
+  }
+}

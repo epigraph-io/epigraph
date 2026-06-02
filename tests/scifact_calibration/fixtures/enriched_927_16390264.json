@@ -1,0 +1,21 @@
+{
+  "scifact_id": 927,
+  "claim": "Patients with common epithelial cancers are less likely to have an emergency event as their first hospital admission if they live in resource-deprived areas.",
+  "evidence_sentences": [
+    "For example, the adjusted odds ratio for patients with breast cancer in the least compared with most deprived fifth of deprivation was 0.63 (95% confidence interval 0.60 to 0.66) and the adjusted odds ratio for patients with lung cancer aged 80-89 compared with those aged 50-59 was 3.13 (2.93 to 3.34).",
+    "There were some improvements in disparities between age groups but not for patients living in deprived areas over time.",
+    "For example, 67.4% (3529/5237) of patients in the most deprived fifth of deprivation had anterior resection for rectal cancer compared with 75.5% (4497/5959) of patients in the least deprived fifth (1.34, 1.22 to 1.47)."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "16390264",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

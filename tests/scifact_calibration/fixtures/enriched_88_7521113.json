@@ -1,0 +1,22 @@
+{
+  "scifact_id": 88,
+  "claim": "Adult tissue-resident macrophages possess a self-renewing capacity.",
+  "evidence_sentences": [
+    "We have demonstrated that major tissue-resident macrophage populations, including liver Kupffer cells and lung alveolar, splenic, and peritoneal macrophages, are established prior to birth and maintain themselves subsequently during adulthood independent of replenishment by blood monocytes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "7521113",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "prior to birth establishment",
+      "adulthood maintenance",
+      "independent of blood monocyte replenishment"
+    ],
+    "evidence_type": "empirical"
+  }
+}

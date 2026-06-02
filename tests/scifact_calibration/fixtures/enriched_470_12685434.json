@@ -1,0 +1,18 @@
+{
+  "scifact_id": 470,
+  "claim": "Glioblastoma multiforme (GBM) is characterized by extensive invasion, rapid growth, necrosis, and angiogenesis.",
+  "evidence_sentences": [
+    "These include glioblastoma multiforme (GBM), which is characterized by independent but interrelated features of extensive invasion into normal brain parenchyma, rapid growth, necrosis, and angiogenesis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "12685434",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.98,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "logical"
+  }
+}

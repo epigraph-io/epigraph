@@ -1,0 +1,30 @@
+{
+  "scifact_id": 1086,
+  "claim": "Sildenafil improves erectile function in men who experience sexual dysfunction as a result of the use of SSRI antidepressants.",
+  "evidence_sentences": [
+    "At a CGI-SF score of 2 or lower, 54.5% (24/44) of sildenafil compared with 4.4% (2/45) of placebo patients were much or very much improved (P<.001).",
+    "Erectile function, arousal, ejaculation, orgasm, and overall satisfaction domain measures improved significantly in sildenafil compared with placebo patients.",
+    "CONCLUSION In our study, sildenafil effectively improved erectile function and other aspects of sexual function in men with sexual dysfunction associated with the use of SRI antidepressants."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "39281140",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [
+      "CGI-SF (Clinical Global Impression - Sexual Function)"
+    ],
+    "reagents_involved": [
+      "sildenafil",
+      "placebo",
+      "SRI antidepressants"
+    ],
+    "conditions": [
+      "double-blind placebo-controlled trial",
+      "men with SRI-associated sexual dysfunction",
+      "CGI-SF score of 2 or lower"
+    ],
+    "evidence_type": "statistical"
+  }
+}

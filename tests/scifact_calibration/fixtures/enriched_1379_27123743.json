@@ -1,0 +1,23 @@
+{
+  "scifact_id": 1379,
+  "claim": "Women with a higher birth weight are more likely to develop breast cancer later in life.",
+  "evidence_sentences": [
+    "The majority of studies identified a positive link between birthweight and premenopausal, but not postmenopausal, breast cancer.",
+    "The relative risk estimate for breast cancer comparing women with high birthweight to women with low birthweight combining all studies including both pre- and postmenopausal breast cancer was 1.23 (95% confidence interval 1.13-1.34)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "27123743",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "premenopausal breast cancer",
+      "postmenopausal breast cancer",
+      "high birthweight vs low birthweight"
+    ],
+    "evidence_type": "statistical"
+  }
+}
