@@ -209,3 +209,7 @@ path = "tests/integration/embed_on_create_claim.rs"
 [[test]]
 name = "skip_embed_host_telemetry"
 path = "tests/integration/skip_embed_host_telemetry.rs"
+
+[[test]]
+name = "idempotency_2p5_tests"
+path = "tests/integration/idempotency_2p5_tests.rs"
