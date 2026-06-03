@@ -283,6 +283,17 @@ pub async fn get_claim(
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
     let claim_id = ClaimId::from_uuid(id);
+
+    // Resolve the optional (frame, perspective) lens up front (both-or-neither,
+    // parse, existence) so a bad lens fails fast before any belief compute.
+    let lens = crate::tools::lens::resolve_lens(
+        params.frame_id.as_deref(),
+        params.perspective_id.as_deref(),
+    )?;
+    if let Some((frame_id, perspective_id)) = lens {
+        crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
+    }
+
     let claim = ClaimRepository::get_by_id(&server.pool, claim_id)
         .await
         .map_err(internal_error)?
@@ -297,11 +308,44 @@ pub async fn get_claim(
         .await
         .map_err(internal_error)?;
 
+    // Additive lensed belief: compute the claim's belief under the chosen lens.
+    // Frame/perspective existence is already validated, so a compute failure
+    // here is a genuine internal error (single-claim tool → propagate, no
+    // page-degrade semantics).
+    let lensed_belief = match lens {
+        Some((frame_id, perspective_id)) => {
+            let interval = epigraph_engine::belief_query::get_perspective_belief(
+                &server.pool,
+                id,
+                frame_id,
+                perspective_id,
+            )
+            .await
+            .map_err(|e| match e {
+                epigraph_engine::BeliefQueryError::FrameNotFound(fid) => {
+                    invalid_params(format!("frame {fid} not found"))
+                }
+                epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
+                    invalid_params(format!("invalid mass function: {msg}"))
+                }
+                other => internal_error(other),
+            })?;
+            Some(LensedBelief::from_interval(
+                frame_id,
+                perspective_id,
+                &interval,
+            ))
+        }
+        None => None,
+    };
+
     #[derive(serde::Serialize)]
     struct GetClaimResponse {
         #[serde(flatten)]
         claim: ClaimResponse,
         classification: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lensed_belief: Option<LensedBelief>,
     }
 
     success_json(&GetClaimResponse {
@@ -317,6 +361,7 @@ pub async fn get_claim(
             supersedes: claim.supersedes.map(|s| s.as_uuid().to_string()),
         },
         classification,
+        lensed_belief,
     })
 }
 

@@ -550,6 +550,8 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
         rerank: None,
         rerank_pool_factor: None,
         groundedness_gate: None,
+        frame_id: None,
+        perspective_id: None,
     };
 
     let result = recall_with_context(&server, params).await;
@@ -940,6 +942,8 @@ fn diverse_params_with_pool(
         rerank: None,
         rerank_pool_factor: None,
         groundedness_gate: None,
+        frame_id: None,
+        perspective_id: None,
     }
 }
 
