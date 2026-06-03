@@ -1553,82 +1553,90 @@ pub async fn submit_packet(
     //
     // This creates an in-memory representation of the claim for the
     // propagation orchestrator to track truth value updates.
-    let content_hash = ContentHasher::hash(packet.claim.content.as_bytes());
-    let claim = Claim::with_id(
-        ClaimId::from_uuid(claim_id),
-        packet.claim.content.clone(),
-        AgentId::from_uuid(packet.claim.agent_id),
-        [0u8; 32], // Placeholder public key - actual verification done in middleware
-        content_hash,
-        Some(TraceId::from_uuid(trace_id)),
-        None, // Signature verified in middleware
-        TruthValue::new(truth_value).unwrap_or_else(|_| TruthValue::uncertain()),
-        chrono::Utc::now(),
-        chrono::Utc::now(),
-    );
-
-    // 7. Register claim in the propagation orchestrator and trigger propagation
     //
-    // This step:
-    //    a. Registers the new claim in the in-memory DAG
-    //    b. Triggers propagation to any dependent claims
-    //    c. Updates truth values throughout the graph
-    //    d. Records audit trail for forensic analysis
-    //
-    // CRITICAL: Propagation NEVER uses agent reputation to influence truth values.
-    // Only evidence strength and source claim truth affect the calculation.
-    {
-        let mut orchestrator = state.propagation_orchestrator.write().await;
-
-        // Register the new claim in the orchestrator
-        if let Err(e) = orchestrator.register_claim(claim) {
-            tracing::warn!(
-                claim_id = %claim_id,
-                error = %e,
-                "Failed to register claim in propagation orchestrator"
-            );
-            // Continue anyway - claim submission shouldn't fail due to propagation issues
-        }
-
-        // Trigger propagation from this claim to any dependents
-        // Note: A newly created claim typically has no dependents yet, but this
-        // sets up the infrastructure for when dependencies are added later.
-        let propagation_result = state.propagator.propagate_from(
-            &mut orchestrator,
+    // Skip on a duplicate submit (B5): the canonical claim was inserted by an
+    // earlier submit and is already tracked in the in-memory DAG; re-registering
+    // it (and re-running propagation) would only churn the orchestrator for a
+    // claim that did not change. The in-memory `claim` is built *inside* this
+    // guard so it is never constructed on the dedup path.
+    if !was_duplicate {
+        let content_hash = ContentHasher::hash(packet.claim.content.as_bytes());
+        let claim = Claim::with_id(
             ClaimId::from_uuid(claim_id),
-            None, // Use the claim's current truth value
+            packet.claim.content.clone(),
+            AgentId::from_uuid(packet.claim.agent_id),
+            [0u8; 32], // Placeholder public key - actual verification done in middleware
+            content_hash,
+            Some(TraceId::from_uuid(trace_id)),
+            None, // Signature verified in middleware
+            TruthValue::new(truth_value).unwrap_or_else(|_| TruthValue::uncertain()),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
         );
 
-        match propagation_result {
-            Ok(result) => {
-                if !result.updated_claims.is_empty() {
-                    tracing::info!(
-                        claim_id = %claim_id,
-                        updated_count = result.updated_claims.len(),
-                        depth = result.depth_reached,
-                        converged = result.converged,
-                        depth_limited = result.depth_limited,
-                        "Propagation completed after claim submission"
-                    );
+        // 7. Register claim in the propagation orchestrator and trigger propagation
+        //
+        // This step:
+        //    a. Registers the new claim in the in-memory DAG
+        //    b. Triggers propagation to any dependent claims
+        //    c. Updates truth values throughout the graph
+        //    d. Records audit trail for forensic analysis
+        //
+        // CRITICAL: Propagation NEVER uses agent reputation to influence truth values.
+        // Only evidence strength and source claim truth affect the calculation.
+        {
+            let mut orchestrator = state.propagation_orchestrator.write().await;
 
-                    // In production with database, persist the updated truth values:
-                    // for updated_id in &result.updated_claims {
-                    //     if let Some(updated_truth) = orchestrator.get_truth(*updated_id) {
-                    //         ClaimRepository::update_truth_value(pool, *updated_id, updated_truth).await?;
-                    //     }
-                    // }
-                }
-            }
-            Err(e) => {
+            // Register the new claim in the orchestrator
+            if let Err(e) = orchestrator.register_claim(claim) {
                 tracing::warn!(
                     claim_id = %claim_id,
                     error = %e,
-                    "Propagation failed after claim submission"
+                    "Failed to register claim in propagation orchestrator"
                 );
-                // Continue anyway - claim was already created successfully
+                // Continue anyway - claim submission shouldn't fail due to propagation issues
+            }
+
+            // Trigger propagation from this claim to any dependents
+            // Note: A newly created claim typically has no dependents yet, but this
+            // sets up the infrastructure for when dependencies are added later.
+            let propagation_result = state.propagator.propagate_from(
+                &mut orchestrator,
+                ClaimId::from_uuid(claim_id),
+                None, // Use the claim's current truth value
+            );
+
+            match propagation_result {
+                Ok(result) => {
+                    if !result.updated_claims.is_empty() {
+                        tracing::info!(
+                            claim_id = %claim_id,
+                            updated_count = result.updated_claims.len(),
+                            depth = result.depth_reached,
+                            converged = result.converged,
+                            depth_limited = result.depth_limited,
+                            "Propagation completed after claim submission"
+                        );
+
+                        // In production with database, persist the updated truth values:
+                        // for updated_id in &result.updated_claims {
+                        //     if let Some(updated_truth) = orchestrator.get_truth(*updated_id) {
+                        //         ClaimRepository::update_truth_value(pool, *updated_id, updated_truth).await?;
+                        //     }
+                        // }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        claim_id = %claim_id,
+                        error = %e,
+                        "Propagation failed after claim submission"
+                    );
+                    // Continue anyway - claim was already created successfully
+                }
             }
         }
-    }
+    } // end `if !was_duplicate` (skip register + propagation on dedup)
 
     // 8. Generate and store embedding for the claim content
     //
@@ -1659,109 +1667,21 @@ pub async fn submit_packet(
             )
         });
 
+    // Skip re-embedding on a duplicate submit (§5): the canonical claim already
+    // carries its embedding from the create path; re-running the (paid) embed
+    // and overwriting the column for an unchanged claim is wasted work.
     #[cfg(feature = "db")]
-    if let Some(ref embedding_service) = state.embedding_service {
-        if is_host_telemetry {
-            tracing::debug!(
-                claim_id = %claim_id,
-                "Skipping embedding for host-provenance telemetry claim"
-            );
-        } else {
-            match embedding_service.generate(&packet.claim.content).await {
-                Ok(embedding) => {
-                    // Store directly via SQL (provider-agnostic — works with Jina, OpenAI, etc.)
-                    let pgvector_str = format!(
-                        "[{}]",
-                        embedding
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
-                    if let Err(e) =
-                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                            .bind(&pgvector_str)
-                            .bind(claim_id)
-                            .execute(&state.db_pool)
-                            .await
-                    {
-                        tracing::warn!(
-                            claim_id = %claim_id,
-                            error = %e,
-                            "Failed to store claim embedding"
-                        );
-                    } else {
-                        tracing::debug!(
-                            claim_id = %claim_id,
-                            embedding_dim = embedding.len(),
-                            "Generated and stored embedding for claim"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        claim_id = %claim_id,
-                        error = %e,
-                        "Failed to generate embedding for claim"
-                    );
-                    // Continue anyway - claim submission shouldn't fail due to embedding issues
-                }
-            }
-        }
-    }
-    #[cfg(not(feature = "db"))]
-    if let Some(ref embedding_service) = state.embedding_service {
-        if is_host_telemetry {
-            tracing::debug!(
-                claim_id = %claim_id,
-                "Skipping embedding for host-provenance telemetry claim"
-            );
-        } else {
-            match embedding_service.generate(&packet.claim.content).await {
-                Ok(embedding) => {
-                    if let Err(e) = embedding_service.store(claim_id, &embedding).await {
-                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store claim embedding");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for claim");
-                }
-            }
-        }
-    }
-
-    // 8a. Generate and store embeddings for figure evidence
-    //
-    // When the embedding service supports multimodal (e.g., Jina v4), figure
-    // evidence gets image embeddings via generate_from_image(). When multimodal
-    // is unavailable, falls back to embedding the figure caption text.
-    // This is non-blocking: failures don't affect claim submission.
-    #[cfg(feature = "db")]
-    if let Some(ref embedding_service) = state.embedding_service {
-        for (i, evidence_submission) in packet.evidence.iter().enumerate() {
-            if let EvidenceTypeSubmission::Figure { ref caption, .. } =
-                evidence_submission.evidence_type
-            {
-                let evidence_id = evidence_ids[i];
-
-                let embedding_result =
-                    if let Some(ref raw_content) = evidence_submission.raw_content {
-                        // Try multimodal image embedding first
-                        if let Some(multimodal) = embedding_service.as_multimodal() {
-                            multimodal.generate_from_image(raw_content).await
-                        } else {
-                            // Fall back to caption text embedding
-                            let text = caption.as_deref().unwrap_or("scientific figure");
-                            embedding_service.generate(text).await
-                        }
-                    } else {
-                        // No image data — embed caption text
-                        let text = caption.as_deref().unwrap_or("scientific figure");
-                        embedding_service.generate(text).await
-                    };
-
-                match embedding_result {
+    if !was_duplicate {
+        if let Some(ref embedding_service) = state.embedding_service {
+            if is_host_telemetry {
+                tracing::debug!(
+                    claim_id = %claim_id,
+                    "Skipping embedding for host-provenance telemetry claim"
+                );
+            } else {
+                match embedding_service.generate(&packet.claim.content).await {
                     Ok(embedding) => {
+                        // Store directly via SQL (provider-agnostic — works with Jina, OpenAI, etc.)
                         let pgvector_str = format!(
                             "[{}]",
                             embedding
@@ -1771,42 +1691,146 @@ pub async fn submit_packet(
                                 .join(",")
                         );
                         if let Err(e) =
-                            sqlx::query("UPDATE evidence SET embedding = $1::vector WHERE id = $2")
+                            sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
                                 .bind(&pgvector_str)
-                                .bind(evidence_id)
+                                .bind(claim_id)
                                 .execute(&state.db_pool)
                                 .await
                         {
                             tracing::warn!(
-                                evidence_id = %evidence_id,
+                                claim_id = %claim_id,
                                 error = %e,
-                                "Failed to store figure evidence embedding"
+                                "Failed to store claim embedding"
                             );
                         } else {
-                            let mode = if embedding_service.as_multimodal().is_some() {
-                                "image"
-                            } else {
-                                "caption"
-                            };
                             tracing::debug!(
-                                evidence_id = %evidence_id,
+                                claim_id = %claim_id,
                                 embedding_dim = embedding.len(),
-                                mode,
-                                "Generated and stored figure evidence embedding"
+                                "Generated and stored embedding for claim"
                             );
                         }
                     }
                     Err(e) => {
                         tracing::warn!(
-                            evidence_id = %evidence_id,
+                            claim_id = %claim_id,
                             error = %e,
-                            "Failed to generate figure evidence embedding"
+                            "Failed to generate embedding for claim"
                         );
+                        // Continue anyway - claim submission shouldn't fail due to embedding issues
                     }
                 }
             }
         }
-    }
+    } // end `if !was_duplicate` (skip claim re-embed on dedup)
+    #[cfg(not(feature = "db"))]
+    if !was_duplicate {
+        if let Some(ref embedding_service) = state.embedding_service {
+            if is_host_telemetry {
+                tracing::debug!(
+                    claim_id = %claim_id,
+                    "Skipping embedding for host-provenance telemetry claim"
+                );
+            } else {
+                match embedding_service.generate(&packet.claim.content).await {
+                    Ok(embedding) => {
+                        if let Err(e) = embedding_service.store(claim_id, &embedding).await {
+                            tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store claim embedding");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for claim");
+                    }
+                }
+            }
+        }
+    } // end `if !was_duplicate` (skip claim re-embed on dedup, non-db twin)
+
+    // 8a. Generate and store embeddings for figure evidence
+    //
+    // When the embedding service supports multimodal (e.g., Jina v4), figure
+    // evidence gets image embeddings via generate_from_image(). When multimodal
+    // is unavailable, falls back to embedding the figure caption text.
+    // This is non-blocking: failures don't affect claim submission.
+    //
+    // Skip on a duplicate submit (§5): the create path's evidence rows already
+    // carry their embeddings, and on dedup no new evidence was inserted
+    // (`outcome.evidence_ids` is empty) — re-embedding by the pre-generated
+    // `evidence_ids` would only churn paid embed calls against rows that either
+    // already have an embedding or do not exist.
+    #[cfg(feature = "db")]
+    if !was_duplicate {
+        if let Some(ref embedding_service) = state.embedding_service {
+            for (i, evidence_submission) in packet.evidence.iter().enumerate() {
+                if let EvidenceTypeSubmission::Figure { ref caption, .. } =
+                    evidence_submission.evidence_type
+                {
+                    let evidence_id = evidence_ids[i];
+
+                    let embedding_result =
+                        if let Some(ref raw_content) = evidence_submission.raw_content {
+                            // Try multimodal image embedding first
+                            if let Some(multimodal) = embedding_service.as_multimodal() {
+                                multimodal.generate_from_image(raw_content).await
+                            } else {
+                                // Fall back to caption text embedding
+                                let text = caption.as_deref().unwrap_or("scientific figure");
+                                embedding_service.generate(text).await
+                            }
+                        } else {
+                            // No image data — embed caption text
+                            let text = caption.as_deref().unwrap_or("scientific figure");
+                            embedding_service.generate(text).await
+                        };
+
+                    match embedding_result {
+                        Ok(embedding) => {
+                            let pgvector_str = format!(
+                                "[{}]",
+                                embedding
+                                    .iter()
+                                    .map(|v| v.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            );
+                            if let Err(e) = sqlx::query(
+                                "UPDATE evidence SET embedding = $1::vector WHERE id = $2",
+                            )
+                            .bind(&pgvector_str)
+                            .bind(evidence_id)
+                            .execute(&state.db_pool)
+                            .await
+                            {
+                                tracing::warn!(
+                                    evidence_id = %evidence_id,
+                                    error = %e,
+                                    "Failed to store figure evidence embedding"
+                                );
+                            } else {
+                                let mode = if embedding_service.as_multimodal().is_some() {
+                                    "image"
+                                } else {
+                                    "caption"
+                                };
+                                tracing::debug!(
+                                    evidence_id = %evidence_id,
+                                    embedding_dim = embedding.len(),
+                                    mode,
+                                    "Generated and stored figure evidence embedding"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                evidence_id = %evidence_id,
+                                error = %e,
+                                "Failed to generate figure evidence embedding"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    } // end `if !was_duplicate` (skip figure-evidence re-embed on dedup)
 
     let response = SubmitPacketResponse {
         claim_id,

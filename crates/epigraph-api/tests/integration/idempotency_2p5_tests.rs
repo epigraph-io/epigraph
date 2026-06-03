@@ -21,7 +21,9 @@ use epigraph_api::middleware::SignatureVerificationState;
 use epigraph_api::{create_router, ApiConfig, AppState};
 use epigraph_core::{Agent, ClaimId, TruthValue};
 use epigraph_db::{AgentRepository, ClaimRepository, PgPool};
+use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use http_body_util::BodyExt;
+use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -626,5 +628,225 @@ async fn submit_packet_dedup_onto_null_trace_claim_returns_null_trace(pool: PgPo
     assert!(
         json["trace_id"].is_null(),
         "dedup onto a NULL-trace claim must return trace_id: null (no phantom), got {body}"
+    );
+}
+
+// =============================================================================
+// Task 5: caller rewiring — was_duplicate, propagation skip, embedding guards.
+// =============================================================================
+
+/// Build a router on `pool` with signature verification bypassed AND a
+/// deterministic `MockProvider` embedding service attached. Test (a) below
+/// requires a *configured* embedding service: without one the claim-embed
+/// block in `submit_packet` short-circuits at `if let Some(ref
+/// embedding_service)` and any "did it re-embed?" assertion would pass
+/// vacuously — even unfixed.
+fn create_test_router_with_embedder(pool: PgPool) -> Router {
+    let config = ApiConfig {
+        require_signatures: false,
+        max_request_size: 1024 * 1024,
+        public_base_url: "http://localhost:8080".to_string(),
+    };
+    let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
+    let service: Arc<dyn EmbeddingService> =
+        Arc::new(MockProvider::new(EmbeddingConfig::local(1536)));
+    let state = AppState::with_db_and_signature_state(pool, config, signature_state)
+        .with_embedding_service(service);
+    create_router(state)
+}
+
+/// **Task 5 driver (a) — no re-embed on dedup (B5 / §5 embedding guard).**
+///
+/// A duplicate submit must NOT re-run the `UPDATE claims SET embedding` for the
+/// existing claim: re-embedding a deduped claim is a wasted (paid) embedding
+/// call and churns the canonical row for no reason.
+///
+/// The discriminator is a NULL sentinel, not a value comparison: `MockProvider`
+/// is deterministic, so a stray re-embed on the dedup path writes back the
+/// *same* vector the create path wrote — "embedding unchanged" would be a false
+/// green. Instead we (1) submit (create → embedded), (2) NULL the embedding
+/// directly, (3) resubmit (dedup). If the dedup path re-embeds, the column goes
+/// non-null again (RED); if it is correctly guarded by `if !was_duplicate`, the
+/// column stays NULL (GREEN).
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_dedup_does_not_re_embed(pool: PgPool) {
+    let agent = fixed_agent(46, "no-reembed-agent");
+    let created_agent = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed");
+    let agent_uuid: Uuid = created_agent.id.into();
+
+    let claim_content = "A claim that should be embedded once and never re-embedded on dedup";
+    let packet = evidence_packet(agent_uuid, claim_content);
+
+    let router = create_test_router_with_embedder(pool.clone());
+
+    // 1. Create path → claim is embedded.
+    let (status_1, body_1) = post_packet(&router, packet.clone()).await;
+    assert_eq!(
+        status_1,
+        StatusCode::CREATED,
+        "first submit should be 201, got {status_1}: {body_1}"
+    );
+    let json_1: serde_json::Value =
+        serde_json::from_str(&body_1).expect("first response should be JSON");
+    let canonical_id = Uuid::parse_str(json_1["claim_id"].as_str().expect("claim_id present"))
+        .expect("claim_id should parse as uuid");
+
+    // Proves the embedding service is actually wired (guards the vacuous-pass:
+    // if no service were attached this would already be NULL).
+    let embedded_after_create: bool =
+        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(canonical_id)
+            .fetch_one(&pool)
+            .await
+            .expect("embedding presence query should succeed");
+    assert!(
+        embedded_after_create,
+        "the create path must embed the claim (else the dedup test is vacuous)"
+    );
+
+    // 2. NULL the embedding so a dedup re-embed is detectable as non-null.
+    sqlx::query("UPDATE claims SET embedding = NULL WHERE id = $1")
+        .bind(canonical_id)
+        .execute(&pool)
+        .await
+        .expect("nulling the embedding should succeed");
+
+    // 3. Dedup path (same router, no idempotency_key) → must NOT re-embed.
+    let (status_2, body_2) = post_packet(&router, packet).await;
+    assert_eq!(
+        status_2,
+        StatusCode::CREATED,
+        "dedup submit should be 201, got {status_2}: {body_2}"
+    );
+
+    let embedded_after_dedup: bool =
+        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(canonical_id)
+            .fetch_one(&pool)
+            .await
+            .expect("embedding presence query should succeed");
+    assert!(
+        !embedded_after_dedup,
+        "the dedup path must NOT re-embed the existing claim — embedding column \
+         was NULLed and must stay NULL (was_duplicate embedding guard)"
+    );
+}
+
+/// **Task 5 driver (b) — response `was_duplicate` reflects create vs dedup.**
+///
+/// Regression guard: the create response must carry `was_duplicate=false` and
+/// the dedup response `was_duplicate=true`. (Wired in Task 3/4; this pins it.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_response_was_duplicate_flag(pool: PgPool) {
+    let agent = fixed_agent(47, "was-dup-flag-agent");
+    let created_agent = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed");
+    let agent_uuid: Uuid = created_agent.id.into();
+
+    let claim_content = "A claim used to verify the was_duplicate response flag";
+    let packet = evidence_packet(agent_uuid, claim_content);
+
+    let router = create_test_router(pool.clone());
+
+    let (status_1, body_1) = post_packet(&router, packet.clone()).await;
+    assert_eq!(
+        status_1,
+        StatusCode::CREATED,
+        "first submit should be 201: {body_1}"
+    );
+    let json_1: serde_json::Value =
+        serde_json::from_str(&body_1).expect("first response should be JSON");
+    assert_eq!(
+        json_1["was_duplicate"], false,
+        "create path must report was_duplicate=false"
+    );
+
+    let (status_2, body_2) = post_packet(&router, packet).await;
+    assert_eq!(
+        status_2,
+        StatusCode::CREATED,
+        "dedup submit should be 201: {body_2}"
+    );
+    let json_2: serde_json::Value =
+        serde_json::from_str(&body_2).expect("second response should be JSON");
+    assert_eq!(
+        json_2["was_duplicate"], true,
+        "dedup path must report was_duplicate=true"
+    );
+}
+
+/// **Task 5 driver (c) — idempotency cache keys on the canonical id.**
+///
+/// After a dedup, a *third* same-process submit carrying the same
+/// `idempotency_key` must return the canonical claim id from the in-memory
+/// cache — proving the cache write (submit.rs:1850) stores the canonical id,
+/// not a stale pre-generated one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_idempotency_cache_holds_canonical_id(pool: PgPool) {
+    let agent = fixed_agent(48, "cache-canonical-agent");
+    let created_agent = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed");
+    let agent_uuid: Uuid = created_agent.id.into();
+
+    // Carry an idempotency_key so the in-memory cache participates.
+    let claim_content = "A claim used to verify the idempotency cache canonical id";
+    let mut packet = evidence_packet(agent_uuid, claim_content);
+    packet["claim"]["idempotency_key"] = serde_json::json!("idem-task5-cache-key");
+
+    // Use a *fresh* router for the create submit and a *second fresh* router for
+    // the dedup submit (each with an empty cache, so both reach persist_packet),
+    // then a third submit on the second router (cache now warm) to exercise the
+    // cache-hit path that must return the canonical id.
+    let router_a = create_test_router(pool.clone());
+    let (status_1, body_1) = post_packet(&router_a, packet.clone()).await;
+    assert_eq!(
+        status_1,
+        StatusCode::CREATED,
+        "first submit should be 201: {body_1}"
+    );
+    let json_1: serde_json::Value =
+        serde_json::from_str(&body_1).expect("first response should be JSON");
+    let canonical_id = json_1["claim_id"]
+        .as_str()
+        .expect("first response must carry claim_id")
+        .to_string();
+
+    let router_b = create_test_router(pool.clone());
+    let (status_2, body_2) = post_packet(&router_b, packet.clone()).await;
+    assert_eq!(
+        status_2,
+        StatusCode::CREATED,
+        "dedup submit should be 201: {body_2}"
+    );
+    let json_2: serde_json::Value =
+        serde_json::from_str(&body_2).expect("second response should be JSON");
+    assert_eq!(
+        json_2["claim_id"].as_str(),
+        Some(canonical_id.as_str()),
+        "dedup must resolve to the canonical claim id"
+    );
+
+    // Third submit on router_b: now served from its in-memory cache (cache-hit
+    // path). It must echo the canonical id stored on the previous (dedup) write.
+    let (status_3, body_3) = post_packet(&router_b, packet).await;
+    assert_eq!(
+        status_3,
+        StatusCode::CREATED,
+        "cache-hit submit should be 201: {body_3}"
+    );
+    let json_3: serde_json::Value =
+        serde_json::from_str(&body_3).expect("third response should be JSON");
+    assert_eq!(
+        json_3["claim_id"].as_str(),
+        Some(canonical_id.as_str()),
+        "the idempotency cache must hold the canonical claim id"
+    );
+    assert_eq!(
+        json_3["was_duplicate"], true,
+        "a cache-hit must report was_duplicate=true"
     );
 }
