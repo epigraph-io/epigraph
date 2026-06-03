@@ -10,6 +10,18 @@ use uuid::Uuid;
 /// Repository for Claim operations
 pub struct ClaimRepository;
 
+/// Cached Dempster–Shafer belief columns for a claim, as read by
+/// [`ClaimRepository::get_belief_columns`].
+///
+/// Each field is `Option` because the column is NULL on claims that have never
+/// had a BBA combined onto them (the edge-wiring recompute populates them).
+#[derive(Debug, Clone, Copy, sqlx::FromRow, serde::Serialize)]
+pub struct ClaimBeliefColumns {
+    pub belief: Option<f64>,
+    pub plausibility: Option<f64>,
+    pub pignistic_prob: Option<f64>,
+}
+
 /// Result row for [`ClaimRepository::search_by_embedding`].
 ///
 /// `similarity` is `1 - cosine_distance`, in `[0, 1]` for non-degenerate
@@ -266,6 +278,37 @@ impl ClaimRepository {
         .fetch_optional(pool)
         .await?;
         Ok(flag.flatten())
+    }
+
+    /// Read a claim's cached Dempster–Shafer belief columns
+    /// (`belief`, `plausibility`, `pignistic_prob`).
+    ///
+    /// These are the columns the edge-wiring recompute path
+    /// (`MassFunctionRepository::update_claim_belief`) writes — distinct from
+    /// `truth_value`, which the recompute leaves untouched. Callers that need
+    /// the *post-wire* combined belief (e.g. the MCP `link_epistemic` readback)
+    /// must read these columns, NOT `truth_value`; the unframed
+    /// `belief_query::get_belief` path reads `truth_value` and so does not
+    /// reflect a recompute.
+    ///
+    /// Returns `Ok(None)` when the claim does not exist; the columns inside
+    /// [`ClaimBeliefColumns`] are individually `Option` (NULL when the claim
+    /// has never had a BBA combined onto it).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_belief_columns(
+        pool: &PgPool,
+        claim_id: ClaimId,
+    ) -> Result<Option<ClaimBeliefColumns>, DbError> {
+        let id: Uuid = claim_id.into();
+        let row: Option<ClaimBeliefColumns> =
+            sqlx::query_as("SELECT belief, plausibility, pignistic_prob FROM claims WHERE id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        Ok(row)
     }
 
     /// Shallow-merge `patch` into the claim's `properties` JSONB (`||`),

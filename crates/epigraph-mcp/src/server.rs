@@ -392,6 +392,17 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent for re-runs at the same pipeline version."
+    )]
+    async fn ingest_document_inline(
+        &self,
+        Parameters(params): Parameters<IngestDocumentInlineParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::ingestion::ingest_document_inline(self, params).await
+    }
+
+    #[tool(
         description = "Create a cross-tier structural edge between two existing claims (decomposes_to, section_follows, or continues_argument). Purpose-built for per-chapter ingest wire-ups (chapter thesis -> book thesis, chapter[N] -> chapter[N+1]). Idempotent on (source, target, relationship): re-runs return the existing edge_id with created=false. Bypasses HTTP and goes straight through the repo layer."
     )]
     async fn link_hierarchical(
@@ -400,6 +411,17 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
         tools::link_hierarchical::link_hierarchical(self, params).await
+    }
+
+    #[tool(
+        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it). On first creation, builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief, then emits an edge.added event; the response reports was_created, belief_wired, and the target's resulting {belief, plausibility, pignistic_prob}. Idempotent on (source, target, relationship): a re-hit returns the existing edge with was_created=false and belief_wired=false (no re-wire). For supersedes use supersede_claim instead."
+    )]
+    async fn link_epistemic(
+        &self,
+        Parameters(params): Parameters<LinkEpistemicParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::link_epistemic::link_epistemic(self, params).await
     }
 
     // ── Paper Queries (3 tools) ──

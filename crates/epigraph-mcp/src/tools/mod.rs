@@ -10,6 +10,7 @@ pub mod events;
 pub mod evolve_step;
 pub mod graph;
 pub mod ingestion;
+pub mod link_epistemic;
 pub mod link_hierarchical;
 pub mod matching;
 pub mod memory;

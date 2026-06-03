@@ -751,6 +751,19 @@ pub struct IngestDocumentParams {
     pub file_path: String,
 }
 
+/// Inline counterpart to `IngestDocumentParams`. Where `ingest_document`
+/// takes a `file_path` to an opaque JSON file, this carries the typed
+/// `DocumentExtraction` directly, so the full hierarchical shape is
+/// self-documenting in the tool schema — the fix for MCP-only agents that
+/// cannot write a file first and otherwise have to guess the JSON shape.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IngestDocumentInlineParams {
+    #[schemars(
+        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with title/summary/paragraphs, where each paragraph has compound, supporting_text, atoms, generality, confidence, methodology, evidence_type), and relationships. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms."
+    )]
+    pub extraction: epigraph_ingest::schema::DocumentExtraction,
+}
+
 /// Parameters for the `link_hierarchical` MCP tool.
 ///
 /// Wires two existing claims with one of the structural relationships emitted
@@ -786,6 +799,64 @@ pub struct LinkHierarchicalParams {
 pub struct LinkHierarchicalResponse {
     pub edge_id: String,
     pub created: bool,
+}
+
+/// Parameters for the `link_epistemic` MCP tool.
+///
+/// Wires two existing claims with a **belief-affecting** epistemic relationship
+/// (`supports`, `corroborates`, `elaborates`, `generalizes`, `specializes`,
+/// `contradicts`, `refutes`) and triggers Dempster–Shafer recomputation on the
+/// **target** claim. Direction is `source -> target` ("source `relationship`
+/// target"). Unlike `link_hierarchical` (which is deliberately inert), this
+/// tool mirrors `POST /api/v1/edges`'s create→wire path: on first creation it
+/// builds a BBA from the source claim's belief interval and recomputes the
+/// target's combined belief. Idempotent on `(source, target, relationship)`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LinkEpistemicParams {
+    #[schemars(description = "UUID of the source claim (the evidence / asserting side)")]
+    pub source_claim_id: String,
+
+    #[schemars(description = "UUID of the target claim (the side whose belief is recomputed)")]
+    pub target_claim_id: String,
+
+    #[schemars(
+        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes. (supersedes is intentionally NOT accepted — use supersede_claim.)"
+    )]
+    pub relationship: String,
+
+    #[schemars(description = "Optional arbitrary JSON object attached to the edge.")]
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
+}
+
+/// Belief interval echoed back in [`LinkEpistemicResponse`] so the caller can
+/// observe the target claim's combined belief after the wire.
+#[derive(Debug, Serialize)]
+pub struct LinkEpistemicBelief {
+    pub belief: f64,
+    pub plausibility: f64,
+    pub pignistic_prob: f64,
+}
+
+/// Response for the `link_epistemic` MCP tool.
+///
+/// `was_created=true` means a new edge row was inserted and belief wiring was
+/// attempted; `false` means an edge with the same `(source, target,
+/// relationship)` already existed (idempotent re-hit — no re-wire). `belief_wired`
+/// is `true` only when the engine actually materialized a BBA and recomputed
+/// the target (engine outcome `Wired`); it is `false` for idempotent re-hits and
+/// for the no-op wiring outcomes (source has no belief interval, vacuous
+/// transfer, or a recompute error). `target_belief` is a best-effort read of the
+/// target's cached DS columns after the recompute (`None` if the target carries
+/// no belief yet or the read failed).
+#[derive(Debug, Serialize)]
+pub struct LinkEpistemicResponse {
+    pub edge_id: String,
+    pub was_created: bool,
+    pub relationship: String,
+    pub belief_wired: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_belief: Option<LinkEpistemicBelief>,
 }
 
 #[derive(Debug, Serialize)]
