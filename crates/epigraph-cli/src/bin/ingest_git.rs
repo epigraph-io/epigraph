@@ -961,6 +961,40 @@ fn resolve_orchestrator_agent(pr_body: &str, commit_msgs: &[String]) -> Result<U
         })
 }
 
+/// Candidate resolution references extracted from PR body + commit text.
+#[derive(Debug, Default, PartialEq)]
+struct References {
+    claim_uuids: Vec<Uuid>,
+    pr_numbers: Vec<u64>,
+}
+
+/// Extract resolution references from PR body + commit text:
+/// - any token parseable as a UUID that appears after "Resolves" or in a
+///   "Resolves-Claim:" trailer;
+/// - any `#<n>` token (PR/issue numbers).
+///
+/// This deliberately treats *any* UUID in the text as a candidate claim
+/// reference (the `Resolves`/`Resolves-Claim:` context is human convention);
+/// existence is validated before any edge is created (`link_resolutions`), so a
+/// stray UUID that isn't a claim is simply dropped at lookup time.
+#[allow(dead_code)]
+fn extract_references(text: &str) -> References {
+    let mut r = References::default();
+    for raw in text.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+        let tok = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '#');
+        if let Ok(id) = tok.parse::<Uuid>() {
+            if !r.claim_uuids.contains(&id) {
+                r.claim_uuids.push(id);
+            }
+        } else if let Some(num) = tok.strip_prefix('#').and_then(|n| n.parse::<u64>().ok()) {
+            if !r.pr_numbers.contains(&num) {
+                r.pr_numbers.push(num);
+            }
+        }
+    }
+    r
+}
+
 /// Per-author agent state: each unique git author gets their own signer and agent ID
 struct AuthorAgent {
     signer: AgentSigner,
@@ -5167,5 +5201,25 @@ crates/epigraph-core/src/domain/mod.rs",
             tokens,
             total_chars
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Reference-resolver tests (UUID trailers/free-text + PR-number)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn extracts_uuid_and_pr_references() {
+        let text = "Resolves d531c585-0214-4fad-972b-10c7aa039984\n\
+                    Resolves-Claim: 9699e396-380b-4105-99c3-e4938dc3e156\n\
+                    see also PR #219 and #237";
+        let refs = extract_references(text);
+        assert!(refs
+            .claim_uuids
+            .contains(&"d531c585-0214-4fad-972b-10c7aa039984".parse().unwrap()));
+        assert!(refs
+            .claim_uuids
+            .contains(&"9699e396-380b-4105-99c3-e4938dc3e156".parse().unwrap()));
+        assert!(refs.pr_numbers.contains(&219));
+        assert!(refs.pr_numbers.contains(&237));
     }
 }
