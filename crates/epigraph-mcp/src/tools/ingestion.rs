@@ -77,6 +77,18 @@ pub async fn ingest_document(
     do_ingest_document(server, &extraction).await
 }
 
+/// Inline (typed-param) counterpart to [`ingest_document`]. Takes a
+/// `DocumentExtraction` directly instead of a file path and routes it through
+/// the same [`do_ingest_document`] core, so an MCP client can produce the
+/// hierarchy in-band — without first writing a file it then can't reference.
+/// Identical graph result and idempotency gate as the file-path path.
+pub async fn ingest_document_inline(
+    server: &EpiGraphMcpFull,
+    params: IngestDocumentInlineParams,
+) -> Result<CallToolResult, McpError> {
+    do_ingest_document(server, &params.extraction).await
+}
+
 /// Core ingestion logic factored out so integration tests can drive a parsed
 /// `DocumentExtraction` without round-tripping through the file-path validation
 /// in `ingest_document`.

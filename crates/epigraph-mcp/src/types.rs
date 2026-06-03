@@ -751,6 +751,19 @@ pub struct IngestDocumentParams {
     pub file_path: String,
 }
 
+/// Inline counterpart to `IngestDocumentParams`. Where `ingest_document`
+/// takes a `file_path` to an opaque JSON file, this carries the typed
+/// `DocumentExtraction` directly, so the full hierarchical shape is
+/// self-documenting in the tool schema — the fix for MCP-only agents that
+/// cannot write a file first and otherwise have to guess the JSON shape.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IngestDocumentInlineParams {
+    #[schemars(
+        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with title/summary/paragraphs, where each paragraph has compound, supporting_text, atoms, generality, confidence, methodology, evidence_type), and relationships. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms."
+    )]
+    pub extraction: epigraph_ingest::schema::DocumentExtraction,
+}
+
 /// Parameters for the `link_hierarchical` MCP tool.
 ///
 /// Wires two existing claims with one of the structural relationships emitted
