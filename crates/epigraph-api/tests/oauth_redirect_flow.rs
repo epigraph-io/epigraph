@@ -31,6 +31,8 @@ fn google_cfg(jwks_url: &str, token_endpoint: &str) -> ProviderConfig {
         redirect_uri_env: None,
         auto_provision: true,
         default_scopes: vec!["claims:read".into()],
+        allowed_emails: vec![],
+        allowed_domains: vec![],
     }
 }
 

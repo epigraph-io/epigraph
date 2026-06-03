@@ -58,6 +58,8 @@ fn google_cfg() -> ProviderConfig {
         redirect_uri_env: None,
         auto_provision: true,
         default_scopes: vec![],
+        allowed_emails: vec![],
+        allowed_domains: vec![],
     }
 }
 
@@ -79,6 +81,8 @@ fn cf_cfg() -> ProviderConfig {
         redirect_uri_env: None,
         auto_provision: true,
         default_scopes: vec![],
+        allowed_emails: vec![],
+        allowed_domains: vec![],
     }
 }
 
