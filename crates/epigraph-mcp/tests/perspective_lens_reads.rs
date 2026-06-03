@@ -674,6 +674,115 @@ async fn plain_recall_lens_attaches_diverging_belief(pool: PgPool) {
     );
 }
 
+// ── plain recall (memory.rs) per-claim degrade-not-fail ─────────────────────
+
+/// Mirror of `recall_lens_degrades_one_bad_claim_without_failing_page` for the
+/// PLAIN `recall` (memory.rs lexical leg) path — which has its OWN lens
+/// post-pass loop, so the degrade-not-fail guarantee (spec §8/§9) must be pinned
+/// here too, not only on `recall_with_context`. Two lexically-recallable claims
+/// share a frame; one claim's stored `masses` is corrupted so
+/// `get_perspective_belief` returns `ParseMasses` for it only. `recall` with a
+/// lens must return `Ok` with the healthy claim carrying `lensed_belief` and the
+/// corrupted one omitting the key (page still served, not aborted).
+#[sqlx::test(migrations = "../../migrations")]
+async fn plain_recall_lens_degrades_one_bad_claim_without_failing_page(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let frame_row = FrameRepository::create(
+        &pool,
+        "ff_deg_plain",
+        None,
+        &["H0".to_string(), "H1".to_string()],
+    )
+    .await
+    .expect("frame");
+    let frame =
+        FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone()).unwrap();
+    let pgvec = unit_pgvec();
+
+    let good = insert_paragraph_claim(&pool, agent, &pgvec).await;
+    let bad = insert_paragraph_claim(&pool, agent, &pgvec).await;
+    store_bba(
+        &pool,
+        good,
+        frame_row.id,
+        agent,
+        &frame,
+        "western_clinical",
+        0.6,
+    )
+    .await;
+    store_bba(
+        &pool,
+        bad,
+        frame_row.id,
+        agent,
+        &frame,
+        "western_clinical",
+        0.6,
+    )
+    .await;
+
+    // Corrupt ONLY the bad claim's stored masses → from_json_masses fails →
+    // get_perspective_belief returns ParseMasses for this claim only.
+    sqlx::query("UPDATE mass_functions SET masses = '[1,2,3]'::jsonb WHERE claim_id = $1")
+        .bind(bad)
+        .execute(&pool)
+        .await
+        .expect("corrupt bad claim masses");
+
+    let persp = PerspectiveRepository::create(
+        &pool,
+        "deg-persp-plain",
+        None,
+        None,
+        Some("analytical"),
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("perspective");
+
+    let server = build_test_server(pool.clone());
+    let result = recall(
+        &server,
+        RecallParams {
+            query: "lens".to_string(),
+            min_truth: Some(0.0),
+            limit: Some(20),
+            tags: vec![],
+            agent_id: None,
+            frame_id: Some(frame_row.id.to_string()),
+            perspective_id: Some(persp.id.to_string()),
+        },
+    )
+    .await
+    .expect("recall must return Ok — one bad claim must not abort the whole page");
+
+    let arr = parse_json(&result);
+    let hits = arr.as_array().expect("recall returns an array");
+    let find = |id: Uuid| {
+        hits.iter()
+            .find(|h| h["claim_id"].as_str() == Some(&id.to_string()))
+    };
+
+    let good_hit = find(good).expect("healthy claim recalled via lexical leg");
+    assert!(
+        good_hit
+            .get("lensed_belief")
+            .and_then(|v| v.get("belief"))
+            .and_then(|b| b.as_f64())
+            .is_some(),
+        "healthy claim must carry a lensed_belief: {good_hit}"
+    );
+
+    let bad_hit = find(bad).expect("corrupted claim still recalled (page served, not aborted)");
+    assert!(
+        bad_hit.get("lensed_belief").is_none(),
+        "corrupted claim must omit lensed_belief (degraded to null) while the page is served: {bad_hit}"
+    );
+}
+
 // ── per-claim degrade-not-fail (spec §8/§9) ──────────────────────────────────
 
 /// Spec §8/§9: a lensed-compute error for ONE claim in a recall page must
