@@ -5,6 +5,7 @@
 
 pub mod cross_source_route_tests;
 pub mod db_integration_tests;
+pub mod idempotency_2p5_tests;
 pub mod lineage_integration_tests;
 pub mod middleware_integration_tests;
 pub mod rag_persistence_tests;

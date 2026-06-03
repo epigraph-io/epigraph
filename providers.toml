@@ -14,6 +14,11 @@ auth_endpoint     = "https://accounts.google.com/o/oauth2/v2/auth"
 token_endpoint    = "https://oauth2.googleapis.com/token"
 redirect_uri_env  = "EPIGRAPH_REDIRECT_URI"
 auto_provision    = true
+# authorized external users; empty list = allow ALL (insecure). Add emails/domains
+# before relying on this in prod. With auto_provision=true, any identity NOT on this
+# allowlist is refused (HTTP 403) before any client is created.
+allowed_emails    = ["jeremy.barton@gmail.com"]
+# allowed_domains = ["baros.associates"]
 default_scopes = [
   "claims:read", "claims:write", "claims:challenge",
   "evidence:read", "evidence:submit",
@@ -36,3 +41,7 @@ default_scopes = [
 # audience_env   = "CF_ACCESS_AUD"
 # auto_provision = true
 # default_scopes = ["claims:read", "claims:write", "evidence:read", "evidence:submit"]
+# # authorized external users; empty list = allow ALL (insecure). The same gate
+# # applies to every provider, so populate this before enabling CF in prod.
+# allowed_emails = []
+# allowed_domains = []

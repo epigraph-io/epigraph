@@ -47,6 +47,21 @@ pub trait ExternalIdentityProvider: Send + Sync {
 
     fn auto_provision(&self) -> bool;
     fn default_scopes(&self) -> &[String];
+
+    /// Exact email addresses permitted to auto-provision through this provider.
+    /// An empty slice together with an empty [`Self::allowed_domains`] means
+    /// allow-all (the gate is opt-in). Default impl returns `&[]` so existing
+    /// and test providers keep compiling without edits.
+    fn allowed_emails(&self) -> &[String] {
+        &[]
+    }
+
+    /// Email domains (the part after the last `@`) permitted to auto-provision
+    /// through this provider. Empty together with [`Self::allowed_emails`] means
+    /// allow-all. Default impl returns `&[]`.
+    fn allowed_domains(&self) -> &[String] {
+        &[]
+    }
 }
 
 #[async_trait]

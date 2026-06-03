@@ -32,7 +32,10 @@ use serde::{Deserialize, Serialize};
 pub struct CachedSubmission {
     pub claim_id: Uuid,
     pub truth_value: f64,
-    pub trace_id: Uuid,
+    /// The trace bound to the canonical claim, or `None` when the deduped claim
+    /// has no trace (`trace_id IS NULL`). Mirrors `SubmitPacketResponse::trace_id`
+    /// so a cache hit replays the exact (non-phantom) response.
+    pub trace_id: Option<Uuid>,
     pub evidence_ids: Vec<Uuid>,
     /// Timestamp when this entry was created, used for LRU eviction
     pub created_at: Instant,

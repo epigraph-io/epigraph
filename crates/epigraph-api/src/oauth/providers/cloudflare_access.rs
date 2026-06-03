@@ -30,6 +30,8 @@ pub struct CloudflareAccessProvider {
     audience: String,
     auto_provision: bool,
     default_scopes: Vec<String>,
+    allowed_emails: Vec<String>,
+    allowed_domains: Vec<String>,
     jwks: JwksCache,
 }
 
@@ -55,6 +57,8 @@ impl CloudflareAccessProvider {
             audience,
             auto_provision: cfg.auto_provision,
             default_scopes: cfg.default_scopes.clone(),
+            allowed_emails: cfg.allowed_emails.clone(),
+            allowed_domains: cfg.allowed_domains.clone(),
             jwks,
         })
     }
@@ -140,5 +144,11 @@ impl ExternalIdentityProvider for CloudflareAccessProvider {
     }
     fn default_scopes(&self) -> &[String] {
         &self.default_scopes
+    }
+    fn allowed_emails(&self) -> &[String] {
+        &self.allowed_emails
+    }
+    fn allowed_domains(&self) -> &[String] {
+        &self.allowed_domains
     }
 }

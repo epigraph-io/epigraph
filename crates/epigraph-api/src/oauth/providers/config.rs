@@ -54,6 +54,12 @@ pub struct ProvidersConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+// Reject unknown keys so a misspelled allowlist key (e.g. `allowed_email`
+// singular, or wrong nesting) fails the parse LOUDLY rather than silently
+// deserializing to an empty Vec via `#[serde(default)]` — which the allow-all
+// default in `email_is_allowed` would then treat as "permit everyone",
+// re-opening the exact over-broad default this allowlist exists to close.
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     pub name: String,
     pub flow: ProviderFlow,
@@ -76,10 +82,78 @@ pub struct ProviderConfig {
     pub auto_provision: bool,
     #[serde(default)]
     pub default_scopes: Vec<String>,
+    /// Allowlist of exact email addresses permitted to auto-provision.
+    /// Empty (the serde default) together with `allowed_domains` empty means
+    /// allow-all (backward compatible). See [`email_is_allowed`].
+    #[serde(default)]
+    pub allowed_emails: Vec<String>,
+    /// Allowlist of email domains (the part after the last `@`) permitted to
+    /// auto-provision. Empty together with `allowed_emails` empty means allow-all.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Decide whether `email` is permitted by the configured allowlists.
+///
+/// Semantics (deliberately conservative — this gate is security-sensitive):
+/// * Both lists empty -> `true` (allow-all; the gate is opt-in and backward
+///   compatible with the serde-default-empty config).
+/// * Otherwise -> `true` iff the trimmed, lowercased email EXACTLY matches some
+///   `allowed_emails` entry (compared case-insensitively after trimming the
+///   entry too) OR its domain (the substring after the LAST `@`, lowercased)
+///   matches some `allowed_domains` entry.
+/// * An empty email while an allowlist IS configured -> `false` (deny). This
+///   prevents an absent/`""` email (provision uses `unwrap_or_default()`) from
+///   slipping past a malformed empty allowlist entry.
+///
+/// `email_verified` is intentionally NOT a parameter: it is a call-site concern
+/// (provision checks it only when an allowlist is configured, and only for
+/// providers that don't already hardcode verification). Keeping it out keeps
+/// this helper a pure, total string predicate that is trivial to unit-test.
+pub fn email_is_allowed(
+    email: &str,
+    allowed_emails: &[String],
+    allowed_domains: &[String],
+) -> bool {
+    // Both empty => allow-all (opt-in gate, backward compatible).
+    if allowed_emails.is_empty() && allowed_domains.is_empty() {
+        return true;
+    }
+
+    let email = email.trim().to_ascii_lowercase();
+    // An allowlist is configured but the email is empty/absent => deny.
+    if email.is_empty() {
+        return false;
+    }
+
+    // Exact-address match (case-insensitive; trim the configured entries too so
+    // stray whitespace in TOML doesn't create a never-matching entry, and an
+    // empty/blank entry can never match the already-non-empty email).
+    if allowed_emails
+        .iter()
+        .any(|e| e.trim().to_ascii_lowercase() == email)
+    {
+        return true;
+    }
+
+    // Domain match on the substring after the LAST '@'. Without an '@' there is
+    // no domain to compare, so domain rules cannot match.
+    if let Some(idx) = email.rfind('@') {
+        let domain = &email[idx + 1..];
+        if !domain.is_empty()
+            && allowed_domains
+                .iter()
+                .any(|d| d.trim().to_ascii_lowercase() == domain)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +309,107 @@ default_scopes = ["claims:read"]
             cfg.validate(),
             Err(ProviderConfigError::InvalidName(_))
         ));
+    }
+
+    #[test]
+    fn allowlist_keys_parse_and_default_empty() {
+        // Absent keys default to empty (allow-all).
+        let cfg = ProvidersConfig::parse(sample_redirect()).unwrap();
+        assert!(cfg.providers[0].allowed_emails.is_empty());
+        assert!(cfg.providers[0].allowed_domains.is_empty());
+
+        // Present keys parse into the vecs.
+        let text = format!(
+            "{sample}allowed_emails = [\"jeremy.barton@gmail.com\"]\nallowed_domains = [\"baros.associates\"]\n",
+            sample = sample_redirect()
+        );
+        let cfg = ProvidersConfig::parse(&text).unwrap();
+        assert_eq!(
+            cfg.providers[0].allowed_emails,
+            vec!["jeremy.barton@gmail.com".to_string()]
+        );
+        assert_eq!(
+            cfg.providers[0].allowed_domains,
+            vec!["baros.associates".to_string()]
+        );
+    }
+
+    fn emails(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn both_lists_empty_allows_all() {
+        // Allow-all is the opt-in default; even an empty email is permitted when
+        // no allowlist is configured (matches pre-gate provisioning behavior).
+        assert!(email_is_allowed("anyone@example.com", &[], &[]));
+        assert!(email_is_allowed("", &[], &[]));
+    }
+
+    #[test]
+    fn exact_email_match_is_case_insensitive() {
+        let allowed = emails(&["jeremy.barton@gmail.com"]);
+        assert!(email_is_allowed("Jeremy.Barton@GMAIL.com", &allowed, &[]));
+    }
+
+    #[test]
+    fn email_whitespace_is_trimmed_before_match() {
+        let allowed = emails(&["jeremy.barton@gmail.com"]);
+        assert!(email_is_allowed(
+            "  jeremy.barton@gmail.com\t",
+            &allowed,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn unlisted_email_is_denied_when_allowlist_present() {
+        let allowed = emails(&["jeremy.barton@gmail.com"]);
+        assert!(!email_is_allowed("evil@attacker.com", &allowed, &[]));
+    }
+
+    #[test]
+    fn domain_allow_permits_any_address_in_domain() {
+        let domains = emails(&["baros.associates"]);
+        assert!(email_is_allowed("anyone@baros.associates", &[], &domains));
+        assert!(email_is_allowed("Someone@Baros.Associates", &[], &domains));
+    }
+
+    #[test]
+    fn domain_allow_does_not_permit_other_domains() {
+        // Allowed only via domain, not exact: an address in a DIFFERENT domain
+        // whose exact form is not listed must be denied.
+        let domains = emails(&["baros.associates"]);
+        assert!(!email_is_allowed("jeremy@gmail.com", &[], &domains));
+        // And a substring/suffix attack must not match: "evilbaros.associates"
+        // and "baros.associates.attacker.com" are different domains.
+        assert!(!email_is_allowed("x@evilbaros.associates", &[], &domains));
+        assert!(!email_is_allowed(
+            "x@baros.associates.attacker.com",
+            &[],
+            &domains
+        ));
+    }
+
+    #[test]
+    fn empty_email_denied_when_allowlist_configured() {
+        let allowed = emails(&["jeremy.barton@gmail.com"]);
+        assert!(!email_is_allowed("", &allowed, &[]));
+        assert!(!email_is_allowed("   ", &allowed, &[]));
+        // Also when only a domain allowlist is configured.
+        let domains = emails(&["baros.associates"]);
+        assert!(!email_is_allowed("", &[], &domains));
+    }
+
+    #[test]
+    fn domain_split_uses_last_at_sign() {
+        // Plus-addressing / multiple '@' (quoted local parts): the domain is the
+        // part after the LAST '@', so this resolves to "gmail.com".
+        let domains = emails(&["gmail.com"]);
+        assert!(email_is_allowed("weird@local@gmail.com", &[], &domains));
+        // And exact-match must NOT be fooled into treating a malformed address
+        // with no domain as allowed by a domain rule.
+        assert!(!email_is_allowed("nodomain", &[], &domains));
     }
 
     #[test]
