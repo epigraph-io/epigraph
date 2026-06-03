@@ -4075,8 +4075,8 @@ crates/epigraph-core/src/domain/mod.rs",
     #[test]
     fn test_edge_submission_skips_unresolved_source() {
         // When a commit's hash isn't in the tracker, edges should be skipped
-        let _commits = vec![make_commit("aaa", CommitType::Feat, "core", vec![])];
-        let _enrichments = vec![EnrichedData {
+        let _commits = [make_commit("aaa", CommitType::Feat, "core", vec![])];
+        let _enrichments = [EnrichedData {
             semantic_edges: vec![SemanticEdge {
                 target_hash: "bbb".to_string(),
                 relationship: "supports".to_string(),
@@ -4088,16 +4088,16 @@ crates/epigraph-core/src/domain/mod.rs",
 
         let tracker = RelationshipTracker::new();
         // tracker has no entries — source hash "aaa" won't resolve
-        assert!(tracker.hash_to_claim.get("aaa").is_none());
+        assert!(!tracker.hash_to_claim.contains_key("aaa"));
     }
 
     #[test]
     fn test_edge_submission_skips_unresolved_target() {
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
         ];
-        let _enrichments = vec![
+        let _enrichments = [
             EnrichedData {
                 semantic_edges: vec![SemanticEdge {
                     target_hash: "zzz".to_string(), // Not in our batch
@@ -4115,17 +4115,17 @@ crates/epigraph-core/src/domain/mod.rs",
         tracker.record(&commits[0], claim_a);
 
         // Source "aaa" resolves, but target "zzz" won't
-        assert!(tracker.hash_to_claim.get(&commits[0].hash).is_some());
-        assert!(tracker.hash_to_claim.get("zzz").is_none());
+        assert!(tracker.hash_to_claim.contains_key(&commits[0].hash));
+        assert!(!tracker.hash_to_claim.contains_key("zzz"));
     }
 
     #[test]
     fn test_edge_submission_resolves_both_hashes() {
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
         ];
-        let enrichments = vec![
+        let enrichments = [
             EnrichedData {
                 semantic_edges: vec![SemanticEdge {
                     target_hash: "bbb".to_string(),
@@ -4159,11 +4159,11 @@ crates/epigraph-core/src/domain/mod.rs",
     #[test]
     fn test_dry_run_shows_semantic_edges() {
         // Verify that enrichment edges are accessible by index during dry-run display
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
         ];
-        let enrichments = vec![
+        let enrichments = [
             EnrichedData {
                 semantic_edges: vec![SemanticEdge {
                     target_hash: "bbb".to_string(),
@@ -4212,7 +4212,7 @@ crates/epigraph-core/src/domain/mod.rs",
     #[test]
     fn test_embedding_only_for_submitted_commits() {
         // Only commits with claim IDs in the tracker should get embeddings
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
             make_commit("ccc", CommitType::Docs, "", vec![]),
@@ -4224,9 +4224,9 @@ crates/epigraph-core/src/domain/mod.rs",
         tracker.record(&commits[0], claim_a);
 
         // "aaa" should be embeddable, "bbb" and "ccc" should not
-        assert!(tracker.hash_to_claim.get("aaa").is_some());
-        assert!(tracker.hash_to_claim.get("bbb").is_none());
-        assert!(tracker.hash_to_claim.get("ccc").is_none());
+        assert!(tracker.hash_to_claim.contains_key("aaa"));
+        assert!(!tracker.hash_to_claim.contains_key("bbb"));
+        assert!(!tracker.hash_to_claim.contains_key("ccc"));
     }
 
     #[test]
@@ -4251,7 +4251,7 @@ crates/epigraph-core/src/domain/mod.rs",
 
     #[test]
     fn test_record_evidence_stores_evidence_ids() {
-        let commits = vec![make_commit("aaa", CommitType::Feat, "core", vec![])];
+        let commits = [make_commit("aaa", CommitType::Feat, "core", vec![])];
         let mut tracker = RelationshipTracker::new();
         let evidence_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
         tracker.record_evidence(&commits[0], evidence_ids.clone());
@@ -4261,16 +4261,16 @@ crates/epigraph-core/src/domain/mod.rs",
 
     #[test]
     fn test_record_evidence_skips_empty() {
-        let commits = vec![make_commit("aaa", CommitType::Feat, "core", vec![])];
+        let commits = [make_commit("aaa", CommitType::Feat, "core", vec![])];
         let mut tracker = RelationshipTracker::new();
         tracker.record_evidence(&commits[0], vec![]);
 
-        assert!(tracker.hash_to_evidence.get("aaa").is_none());
+        assert!(!tracker.hash_to_evidence.contains_key("aaa"));
     }
 
     #[test]
     fn test_record_evidence_independent_of_claim() {
-        let commits = vec![make_commit("aaa", CommitType::Feat, "core", vec![])];
+        let commits = [make_commit("aaa", CommitType::Feat, "core", vec![])];
         let mut tracker = RelationshipTracker::new();
         let claim_id = Uuid::new_v4();
         let evidence_ids = vec![Uuid::new_v4()];
@@ -4307,7 +4307,7 @@ crates/epigraph-core/src/domain/mod.rs",
 
     #[test]
     fn test_evidence_embedding_only_for_tracked_evidence() {
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
         ];
@@ -4317,13 +4317,13 @@ crates/epigraph-core/src/domain/mod.rs",
         tracker.record_evidence(&commits[0], ev_ids_a.clone());
         // commit "bbb" has no evidence tracked
 
-        assert!(tracker.hash_to_evidence.get("aaa").is_some());
-        assert!(tracker.hash_to_evidence.get("bbb").is_none());
+        assert!(tracker.hash_to_evidence.contains_key("aaa"));
+        assert!(!tracker.hash_to_evidence.contains_key("bbb"));
     }
 
     #[test]
     fn test_evidence_count_aggregation() {
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
         ];
@@ -4420,7 +4420,7 @@ crates/epigraph-core/src/domain/mod.rs",
         // Build all packets — verify enrichment is applied
         let mut packets_with_edges = 0;
         for (commit, enrichment) in commits.iter().zip(enrichments.iter()) {
-            let _packet = build_packet(commit, &signer, agent_id, Some(&enrichment));
+            let _packet = build_packet(commit, &signer, agent_id, Some(enrichment));
             if !enrichment.semantic_edges.is_empty() {
                 packets_with_edges += 1;
             }
@@ -4779,7 +4779,7 @@ crates/epigraph-core/src/domain/mod.rs",
         let n = token_estimates.len();
 
         // Median
-        let median = if n % 2 == 0 {
+        let median = if n.is_multiple_of(2) {
             (token_estimates[n / 2 - 1] + token_estimates[n / 2]) / 2
         } else {
             token_estimates[n / 2]
