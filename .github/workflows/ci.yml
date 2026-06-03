@@ -131,8 +131,10 @@ jobs:
   # open PR the moment a new advisory lands on any transitive dependency —
   # and Foreman auto-merges epigraph PRs, so unrelated red CI is actively
   # harmful. continue-on-error keeps the result visible without blocking.
-  # The lockfile currently carries known advisories (bytes, rsa, rustls-webpki,
-  # sqlx, instant, …); flip this to a gate only once that backlog is triaged.
+  # Known advisories are triaged in `.cargo/audit.toml` (tracked: EpiGraph
+  # backlog a2fa31b1 — sqlx 0.7->0.8 + reqwest 0.11->0.12 migrations), so the
+  # job is GREEN on current advisories and a genuinely NEW one still turns it
+  # red. It stays advisory (continue-on-error) by design — not a gate.
   audit:
     name: Security audit (advisory)
     runs-on: ubuntu-latest
