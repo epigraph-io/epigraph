@@ -1440,6 +1440,62 @@ struct CreateEdgeRequest {
     properties: Option<serde_json::Value>,
 }
 
+/// Build a generic POST /api/v1/edges body. Uses the generic endpoint (not
+/// /edges/hierarchical) because only this one accepts `valid_from` +
+/// `if_not_exists`, which the hierarchy needs for datestamping and re-run safety.
+#[allow(dead_code)]
+fn edge_body(
+    source_id: Uuid,
+    target_id: Uuid,
+    relationship: &str,
+    valid_from: Option<&str>,
+) -> serde_json::Value {
+    let mut b = serde_json::json!({
+        "source_id": source_id,
+        "target_id": target_id,
+        "source_type": "claim",
+        "target_type": "claim",
+        "relationship": relationship,
+        "if_not_exists": true,
+        "properties": { "source": "git-history" },
+    });
+    if let Some(ts) = valid_from {
+        b["valid_from"] = serde_json::json!(ts);
+    }
+    b
+}
+
+/// Create an idempotent, datestamped edge via POST /api/v1/edges. Both 200 and
+/// 201 mean success (existing edge returned vs newly created).
+#[allow(dead_code)]
+async fn link_edge(
+    client: &reqwest::Client,
+    endpoint: &str,
+    source_id: Uuid,
+    target_id: Uuid,
+    relationship: &str,
+    valid_from: Option<&str>,
+) -> Result<(), String> {
+    let url = format!("{endpoint}/api/v1/edges");
+    let resp = client
+        .post(&url)
+        .json(&edge_body(source_id, target_id, relationship, valid_from))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("edge POST failed: {e}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "edge {}: {}",
+            status,
+            resp.text().await.unwrap_or_default()
+        ))
+    }
+}
+
 /// Resolve semantic edges from enrichment data and submit them as API edges.
 ///
 /// For each commit's enrichment, maps `target_hash` → `claim_id` via the
@@ -2482,6 +2538,25 @@ mod tests {
         assert_eq!(props["node"], "pr");
         assert_eq!(props["pr_number"], 252);
         assert_eq!(props["merge_sha"], "2a31f8d");
+    }
+
+    // -------------------------------------------------------------------------
+    // Datestamped edge body tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn edge_body_uses_generic_endpoint_fields() {
+        let body = edge_body(
+            Uuid::nil(),
+            Uuid::nil(),
+            "decomposes_to",
+            Some("2026-06-02T15:10:01Z"),
+        );
+        assert_eq!(body["source_type"], "claim");
+        assert_eq!(body["target_type"], "claim");
+        assert_eq!(body["relationship"], "decomposes_to");
+        assert_eq!(body["valid_from"], "2026-06-02T15:10:01Z");
+        assert_eq!(body["if_not_exists"], true);
     }
 
     // -------------------------------------------------------------------------
