@@ -119,5 +119,28 @@ class MirrorTests(unittest.TestCase):
             mirror2 = gir.ensure_mirror(remote, state, {})        # second call fetches
             self.assertEqual(mirror, mirror2)
 
+class ArgvTests(unittest.TestCase):
+    def test_build_ingest_argv(self):
+        pr = gir.PullRequest(number=252, title="fix(api): x", body="Resolves d531c585",
+                             merge_sha="2a31f8d", base_sha="b72e271", author="tylorsama",
+                             merged_at="2026-06-02T15:10:01Z")
+        argv = gir.build_ingest_argv(pr, mirror="/m", endpoint="http://127.0.0.1:8080",
+                                     rev_range="2a31f8d^1..2a31f8d^2", slug="epigraph-io/epigraph",
+                                     default_orchestrator_id="7b3a0c1e-0000-4000-8000-000000000001",
+                                     ingest_git_bin="ingest_git", dry_run=True)
+        self.assertEqual(argv[0], "ingest_git")
+        self.assertIn("--pr-ingest", argv)
+        # spot-check key flag/value pairs:
+        def val(flag): return argv[argv.index(flag)+1]
+        self.assertEqual(val("--repo-slug"), "epigraph-io/epigraph")
+        self.assertEqual(val("--pr-number"), "252")
+        self.assertEqual(val("--merge-sha"), "2a31f8d")
+        self.assertEqual(val("--rev-range"), "2a31f8d^1..2a31f8d^2")
+        self.assertEqual(val("--merged-at"), "2026-06-02T15:10:01Z")
+        self.assertEqual(val("--orchestrator-id"), "7b3a0c1e-0000-4000-8000-000000000001")
+        self.assertEqual(val("--repo"), "/m")
+        self.assertEqual(val("--endpoint"), "http://127.0.0.1:8080")
+        self.assertIn("--dry-run", argv)
+
 if __name__ == "__main__":
     unittest.main()

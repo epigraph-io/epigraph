@@ -135,3 +135,37 @@ def ensure_mirror(clone_url: str, state_dir: str, env: dict, slug_key: str | Non
         subprocess.run(["git", "clone", "--quiet", clone_url, str(d)],
                        check=True, capture_output=True, env=env)
     return str(d)
+
+def build_ingest_argv(pr, mirror, endpoint, rev_range, slug, *,
+                      default_orchestrator_id=None, ingest_git_bin="ingest_git", dry_run=False):
+    """Assemble the `ingest_git --pr-ingest` argv for one merged PR. `slug` is
+    the repo slug (`owner/repo`), `mirror` the local clone the binary reads, and
+    `rev_range` the PR's own commit range (from `compute_rev_range`). The
+    `--orchestrator-id` flag is only emitted when configured; otherwise the
+    ingester resolves the trailer / `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` itself."""
+    argv = [ingest_git_bin, "--pr-ingest",
+            "--repo-slug", slug, "--pr-number", str(pr.number),
+            "--pr-title", pr.title, "--pr-body", pr.body,
+            "--merge-sha", pr.merge_sha, "--merged-at", pr.merged_at,
+            "--pr-author", pr.author, "--rev-range", rev_range,
+            "--repo", mirror, "--endpoint", endpoint]
+    if default_orchestrator_id:
+        argv += ["--orchestrator-id", default_orchestrator_id]
+    if dry_run:
+        argv += ["--dry-run"]
+    return argv
+
+def ingest_pr(pr, mirror, endpoint, slug, *, default_orchestrator_id=None,
+              ingest_git_bin="ingest_git", dry_run=False) -> int:
+    """Compute the PR's commit range from the mirror, build the argv, and run
+    `ingest_git`. Returns the subprocess return code; logs (not raises) on a
+    non-zero exit so the caller can isolate per-PR failures."""
+    rng = compute_rev_range(mirror, pr.merge_sha)
+    argv = build_ingest_argv(pr, mirror, endpoint, rng, slug,
+                             default_orchestrator_id=default_orchestrator_id,
+                             ingest_git_bin=ingest_git_bin, dry_run=dry_run)
+    LOG.info("ingest PR #%s (%s): %s", pr.number, slug, " ".join(argv))
+    res = subprocess.run(argv, capture_output=True, text=True)
+    if res.returncode != 0:
+        LOG.error("ingest PR #%s failed (%s): %s", pr.number, res.returncode, res.stderr.strip()[:500])
+    return res.returncode
