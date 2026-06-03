@@ -155,6 +155,14 @@ pub struct ClaimSubmission {
     /// Optional JSONB properties for extensible metadata (e.g., files_changed, commit_date)
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
+
+    /// Optional labels to set on the claim at creation. Lets a multi-principal
+    /// writer (e.g. the git ingester, which creates claims under system/author/
+    /// orchestrator agents) label them atomically as the creator, instead of a
+    /// separate ownership-gated `PATCH /claims/{id}/labels` that would require
+    /// `claims:admin`. Applied only on the create path (mirrors `properties`).
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// Submission structure for evidence
@@ -1096,6 +1104,27 @@ async fn persist_packet(
                     ErrorResponse::new(
                         "DatabaseError",
                         format!("Failed to set claim properties: {}", e),
+                    ),
+                )
+            })?;
+    }
+
+    // Set labels at creation (parity with `claims.rs::create_claim`), so a
+    // multi-principal writer labels the claim it just created as the creator —
+    // no separate ownership-gated label PATCH (which would need `claims:admin`).
+    // Guarded on creation: a duplicate submit must not relabel another run's claim.
+    if was_created && !packet.claim.labels.is_empty() {
+        sqlx::query("UPDATE claims SET labels = $1 WHERE id = $2")
+            .bind(&packet.claim.labels)
+            .bind(claim_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        format!("Failed to set claim labels: {}", e),
                     ),
                 )
             })?;
@@ -2246,6 +2275,7 @@ mod signature_verification_tests {
             agent_id,
             idempotency_key: None,
             properties: None,
+            labels: Vec::new(),
         }
     }
 

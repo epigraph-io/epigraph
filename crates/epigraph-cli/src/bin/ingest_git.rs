@@ -981,6 +981,10 @@ struct ClaimSubmission {
     idempotency_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub properties: Option<serde_json::Value>,
+    /// Labels set on the claim AT CREATION by the server (creator-owned), so a
+    /// multi-principal writer needs no ownership-gated label PATCH / claims:admin.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1408,6 +1412,7 @@ fn build_packet(
         agent_id,
         idempotency_key: Some(format!("git:{}", commit.hash)),
         properties: Some(properties),
+        labels: Vec::new(), // set by submit_find_or_create at creation
     };
 
     // Use placeholder signature — the API server does not yet verify real Ed25519
@@ -1465,6 +1470,7 @@ fn build_repo_packet(repo_slug: &str, agent_id: Uuid, signer: &AgentSigner) -> E
             properties: Some(serde_json::json!({
                 "source": "git-history", "node": "repo", "repo": repo_slug
             })),
+            labels: Vec::new(), // set by submit_find_or_create at creation
         },
         evidence: vec![ev],
         reasoning_trace: ReasoningTraceSubmission {
@@ -1530,6 +1536,7 @@ fn build_pr_packet(meta: &PrMeta, orchestrator_id: Uuid) -> EpistemicPacket {
                 "url": url,
                 "author_login": meta.author_login, "orchestrator_agent_id": orchestrator_id,
             })),
+            labels: Vec::new(), // set by submit_find_or_create at creation
         },
         evidence: vec![ev],
         reasoning_trace: ReasoningTraceSubmission {
@@ -1543,52 +1550,28 @@ fn build_pr_packet(meta: &PrMeta, orchestrator_id: Uuid) -> EpistemicPacket {
     }
 }
 
-/// Add labels to an existing claim via `PATCH /api/v1/claims/{id}/labels`.
-///
-/// Route confirmed against `routes/claims.rs::update_labels`: the dedicated
-/// label endpoint takes `{ "add": [...], "remove": [...] }` (NOT the generic
-/// `patch_claim` body, which nests under `add_labels`). Idempotent server-side:
-/// re-adding an existing label is a no-op.
-#[allow(dead_code)]
-async fn apply_labels(
-    client: &reqwest::Client,
-    endpoint: &str,
-    id: Uuid,
-    labels: &[&str],
-) -> Result<(), String> {
-    let url = format!("{endpoint}/api/v1/claims/{id}/labels");
-    let resp = client
-        .patch(&url)
-        .json(&serde_json::json!({ "add": labels }))
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| format!("label PATCH: {e}"))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "label PATCH {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        ))
-    }
-}
-
 /// Submit a packet and return its claim id. Because the packet carries a stable
 /// `idempotency_key`, a second call returns the same `claim_id` (`was_duplicate=true`),
 /// making this the find-or-create primitive for the hierarchy's nodes.
+///
+/// Labels are baked into the packet's claim so the SERVER sets them AT CREATION
+/// (as the creating principal), instead of a separate ownership-gated
+/// `PATCH /claims/{id}/labels` that would require `claims:admin` — the ingester
+/// creates claims under system/author/orchestrator agents it does not "own", so
+/// a post-hoc relabel would be rejected. Labels are applied only on the create
+/// path server-side; a duplicate submit leaves the existing claim's labels intact.
 #[allow(dead_code)]
 async fn submit_find_or_create(
     client: &reqwest::Client,
     endpoint: &str,
-    packet: &EpistemicPacket,
+    mut packet: EpistemicPacket,
     labels: &[&str],
 ) -> Result<Uuid, String> {
+    packet.claim.labels = labels.iter().map(|s| s.to_string()).collect();
     let url = format!("{endpoint}/api/v1/submit/packet");
     let resp = client
         .post(&url)
-        .json(packet)
+        .json(&packet)
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
@@ -1604,9 +1587,6 @@ async fn submit_find_or_create(
         .json()
         .await
         .map_err(|e| format!("decode submit resp: {e}"))?;
-    if !labels.is_empty() {
-        apply_labels(client, endpoint, parsed.claim_id, labels).await?;
-    }
     Ok(parsed.claim_id)
 }
 
@@ -1625,7 +1605,7 @@ async fn ensure_repo_node(
     submit_find_or_create(
         client,
         endpoint,
-        &packet,
+        packet,
         &["source:git-history", "node:repo", &label],
     )
     .await
@@ -2198,7 +2178,7 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
     let pr_id = submit_find_or_create(
         &client,
         &args.endpoint,
-        &pr_packet,
+        pr_packet,
         &["source:git-history", "node:pr", &pr_label],
     )
     .await?;
@@ -2229,7 +2209,7 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         let commit_id = submit_find_or_create(
             &client,
             &args.endpoint,
-            &packet,
+            packet,
             &["source:git-history", "node:commit", &commit_label],
         )
         .await?;

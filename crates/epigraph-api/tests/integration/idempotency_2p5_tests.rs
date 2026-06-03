@@ -1109,3 +1109,57 @@ async fn submit_packet_claim_created_event_fires_once_not_on_dedup(pool: PgPool)
          (create_or_get's find branch never reaches create_strict)"
     );
 }
+
+/// Labels in the submit packet are applied AT CREATION (parity with
+/// `POST /claims`), so a multi-principal writer (e.g. the git ingester, which
+/// creates claims under system/author/orchestrator agents) labels them as the
+/// creator and needs no ownership-gated `PATCH /claims/{id}/labels` /
+/// `claims:admin`. Without this, the only way to label a not-owned claim was
+/// admin — the exact 403 the dev-DB e2e hit.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_sets_labels_at_creation(pool: PgPool) {
+    let agent = fixed_agent(57, "labels-at-creation-agent");
+    let created = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed");
+    let agent_uuid: Uuid = created.id.into();
+
+    let mut packet = evidence_packet(agent_uuid, "Claim labelled at creation, not via PATCH");
+    packet["claim"]["labels"] = serde_json::json!([
+        "source:git-history",
+        "node:commit",
+        "repo:epigraph-io/epigraph"
+    ]);
+
+    let router = create_test_router(pool.clone());
+    let (status, body) = post_packet(&router, packet).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "submit with labels should be 201, got {status}: {body}"
+    );
+    let claim_id = Uuid::parse_str(
+        serde_json::from_str::<serde_json::Value>(&body).expect("json")["claim_id"]
+            .as_str()
+            .expect("claim_id present"),
+    )
+    .expect("claim_id parses");
+
+    // Read labels straight from the DB — proves they were set on the row, not
+    // just echoed in a response projection.
+    let labels: Vec<String> = sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("labels query should succeed");
+    for expected in [
+        "source:git-history",
+        "node:commit",
+        "repo:epigraph-io/epigraph",
+    ] {
+        assert!(
+            labels.contains(&expected.to_string()),
+            "label '{expected}' must be set at creation; got {labels:?}"
+        );
+    }
+}
