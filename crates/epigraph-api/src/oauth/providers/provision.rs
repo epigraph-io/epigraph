@@ -28,6 +28,49 @@ pub async fn provision_external_user_client(
     let email = identity.email.clone().unwrap_or_default();
     let name = identity.name.clone().unwrap_or_else(|| email.clone());
 
+    // Email-allowlist gate. Placed at the TOP of the find-or-create path — BEFORE
+    // get_by_client_id — so it covers BOTH the new-provision branch AND the
+    // existing-client branch (an identity provisioned once then later removed from
+    // the allowlist must stop authenticating), and ALL three call sites
+    // (token.rs, device.rs, and authorize.rs which calls this inner fn directly
+    // for the consent screen, bypassing the token-minting wrapper).
+    //
+    // Semantics: when the provider configures no allowlist (both lists empty) the
+    // gate is allow-all and the original behavior is preserved. When an allowlist
+    // IS configured we additionally require a verified email (Google may assert an
+    // unverified address; CloudflareAccess hardcodes email_verified=true so it is
+    // unaffected) and a case-insensitive match against the allowlist.
+    let allowed_emails = provider.allowed_emails();
+    let allowed_domains = provider.allowed_domains();
+    let allowlist_configured = !allowed_emails.is_empty() || !allowed_domains.is_empty();
+    if allowlist_configured {
+        let denied = !identity.email_verified
+            || !super::config::email_is_allowed(&email, allowed_emails, allowed_domains);
+        if denied {
+            tracing::warn!(
+                provider = provider.name(),
+                email = %email,
+                email_verified = identity.email_verified,
+                "Denied external provisioning: identity not in provider email allowlist"
+            );
+            emit_oauth_audit(
+                &state.db_pool,
+                "oauth_provision_denied",
+                false,
+                serde_json::json!({
+                    "provider": provider.name(),
+                    "subject": identity.subject,
+                    "email": email,
+                    "email_verified": identity.email_verified,
+                    "reason": "email_not_in_allowlist",
+                }),
+            );
+            return Err(ApiError::Forbidden {
+                reason: "email not authorized for this provider".into(),
+            });
+        }
+    }
+
     let oauth_client_id = format!("{}:{}", provider.name(), identity.subject);
 
     match OAuthClientRepository::get_by_client_id(&state.db_pool, &oauth_client_id).await {
