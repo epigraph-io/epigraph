@@ -874,7 +874,7 @@ impl EpiGraphMcpFull {
         tools::sheaf::reconcile_sheaf(self, params).await
     }
 
-    // ── Embeddings (1 tool) ──
+    // ── Embeddings (2 tools) ──
 
     #[tool(
         description = "Aggregate claim count + similarity stats for the embedding ball around a free-text query. Mirrors POST /api/v1/embeddings/neighborhood-density. Returns n_claims, mean/median cosine similarity, a squashed sparsity score, and breakdowns by level + source_type. Defaults: radius=0.30 (cosine distance), max_sample=500 (clamped to [1, 5000]). Use this to detect dense regions that warrant theme sub-splitting and to drive the nightly theme-maintenance workflow."
@@ -886,6 +886,17 @@ impl EpiGraphMcpFull {
         >,
     ) -> Result<CallToolResult, McpError> {
         crate::tools::embeddings::embedding_neighborhood_density(self, params).await
+    }
+
+    #[tool(
+        description = "Generate and store the missing claims.embedding vector for current, non-telemetry claims that lack one (the is_current AND embedding IS NULL gap the CLAUDE.md embedding-policy invariant tracks). Server-side, MCP-executable counterpart to the embed_backfill CLI: the embed stage of the decomposition-cycle's decompose→embed→cross-source-match pipeline. Selection is oldest-first so repeated runs drain the backlog monotonically. Params: limit (default 200, clamped 1..=2000), dry_run (default false — count candidates without writing; safe with no OpenAI key). Returns {candidates, embedded, failed, dry_run}. Errors if the server has no OPENAI_API_KEY and dry_run is false. Requires claims:write."
+    )]
+    async fn backfill_embeddings(
+        &self,
+        Parameters(params): Parameters<crate::tools::embeddings::BackfillEmbeddingsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::embeddings::backfill_embeddings(self, params).await
     }
 
     // ── Themes (1 tool) ──
