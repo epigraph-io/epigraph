@@ -920,6 +920,47 @@ async fn resolve_author_agent(
     Ok((signer, agent_id))
 }
 
+/// Parse an `Epigraph-Orchestrator-Id: <uuid>` trailer from a PR body or commit message.
+/// Case-insensitive key match; last occurrence wins (trailers live at the bottom).
+fn parse_orchestrator_trailer(text: &str) -> Option<Uuid> {
+    text.lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("Epigraph-Orchestrator-Id") {
+                v.trim().parse::<Uuid>().ok()
+            } else {
+                None
+            }
+        })
+        .next_back()
+}
+
+/// Resolve the implementing orchestrator agent id for a PR:
+/// 1) `Epigraph-Orchestrator-Id:` trailer in the PR body or any commit message;
+/// 2) else `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` env var.
+///
+/// Returns an error if neither is present (the PR claim MUST have an author).
+/// Existence of the resolved agent is verified by the caller (Task 8 / `run_pr_ingest`)
+/// via the registration route; this resolver only determines the id, never mints one.
+#[allow(dead_code)]
+fn resolve_orchestrator_agent(pr_body: &str, commit_msgs: &[String]) -> Result<Uuid, String> {
+    if let Some(id) = parse_orchestrator_trailer(pr_body) {
+        return Ok(id);
+    }
+    for m in commit_msgs {
+        if let Some(id) = parse_orchestrator_trailer(m) {
+            return Ok(id);
+        }
+    }
+    std::env::var("EPIGRAPH_DEFAULT_ORCHESTRATOR_ID")
+        .ok()
+        .and_then(|s| s.trim().parse::<Uuid>().ok())
+        .ok_or_else(|| {
+            "no Epigraph-Orchestrator-Id trailer and EPIGRAPH_DEFAULT_ORCHESTRATOR_ID unset"
+                .to_string()
+        })
+}
+
 /// Per-author agent state: each unique git author gets their own signer and agent ID
 struct AuthorAgent {
     signer: AgentSigner,
@@ -2156,6 +2197,20 @@ mod tests {
             b.public_key(),
             "case/space-insensitive email"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Orchestrator-agent resolution tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parses_orchestrator_trailer() {
+        let body = "fix(api): x\n\nEvidence:\n- y\n\nEpigraph-Orchestrator-Id: 7b3a0c1e-0000-4000-8000-000000000001\nCo-Authored-By: Claude <a@b>";
+        assert_eq!(
+            parse_orchestrator_trailer(body),
+            Some("7b3a0c1e-0000-4000-8000-000000000001".parse().unwrap())
+        );
+        assert_eq!(parse_orchestrator_trailer("no trailer here"), None);
     }
 
     // -------------------------------------------------------------------------
