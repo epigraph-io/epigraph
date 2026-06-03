@@ -978,7 +978,7 @@ async fn persist_packet(
     trace_id: TraceId,
     evidence_ids: &[EvidenceId],
     truth_value: f64,
-) -> Result<(), (StatusCode, ErrorResponse)> {
+) -> Result<(ClaimId, bool /* was_duplicate */), (StatusCode, ErrorResponse)> {
     let agent_id = AgentId::from_uuid(packet.claim.agent_id);
 
     // 1. Verify agent exists (FK constraint check)
@@ -1013,59 +1013,97 @@ async fn persist_packet(
         )
     })?;
 
-    // 3. Insert claim (without trace_id initially)
-    let _truth = TruthValue::new(truth_value).map_err(|e| {
+    // 3. Find-or-create the claim keyed on (content_hash, agent_id).
+    //
+    // The claim is created with trace_id = NULL: the FK
+    // `claims_trace_id_fkey` forbids referencing a reasoning_trace row that
+    // does not exist yet, so we keep the NULL-then-UPDATE dance below. The
+    // canonical content_hash is computed inside `create_strict`; the hash and
+    // public_key we pass to `with_id` only satisfy the constructor.
+    let truth = TruthValue::new(truth_value).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorResponse::new("InternalError", format!("Invalid truth value: {}", e)),
         )
     })?;
 
-    let claim_uuid: Uuid = claim_id.into();
     let agent_uuid: Uuid = agent_id.into();
     let content_hash = ContentHasher::hash(packet.claim.content.as_bytes());
     let now = chrono::Utc::now();
 
-    sqlx::query!(
-        r#"
-        INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, properties, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, NULL, COALESCE($6, '{}'::jsonb), $7, $7)
-        "#,
-        claim_uuid,
-        packet.claim.content,
-        content_hash.as_slice(),
-        truth_value,
-        agent_uuid,
-        packet.claim.properties,
-        now
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new("DatabaseError", format!("Failed to insert claim: {}", e)),
-        )
-    })?;
+    let claim = Claim::with_id(
+        claim_id,
+        packet.claim.content.clone(),
+        agent_id,
+        [0u8; 32],    // placeholder public key (verification done in middleware)
+        content_hash, // ignored by create_strict, which recomputes the hash
+        None,         // trace_id = None: link after the trace exists (FK)
+        None,         // signature verified in middleware
+        truth,
+        now,
+        now,
+    );
 
-    // 4. Insert reasoning trace (with claim_id)
-    let trace_uuid: Uuid = trace_id.into();
-    let methodology = convert_methodology(packet.reasoning_trace.methodology);
-    let methodology_str = match methodology {
-        Methodology::Deductive | Methodology::FormalProof => "deductive",
-        Methodology::Inductive => "inductive",
-        Methodology::Abductive | Methodology::Heuristic => "abductive",
-        _ => "statistical",
-    };
+    let (persisted, was_created) = epigraph_db::ClaimRepository::create_or_get(&mut tx, &claim)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new("DatabaseError", format!("Failed to insert claim: {}", e)),
+            )
+        })?;
+    let canonical_id = persisted.id;
+    // All dependent rows hang off the canonical claim id, not the
+    // pre-generated one (which differs on a duplicate submit).
+    let claim_uuid: Uuid = canonical_id.into();
 
-    // Convert evidence IDs for trace inputs
-    let domain_evidence_ids: Vec<EvidenceId> = evidence_ids.to_vec();
-    let trace_inputs = convert_trace_inputs(&packet.reasoning_trace.inputs, &domain_evidence_ids);
-    let properties_json = serde_json::json!({
-        "inputs": trace_inputs,
-    });
+    // Port the `properties` write to the create path (B1): `create_strict`
+    // omits `properties`, mirroring `claims.rs::create_claim`. On a duplicate
+    // we must not mutate another run's canonical claim, so guard on creation.
+    if was_created {
+        sqlx::query("UPDATE claims SET properties = COALESCE($1, properties) WHERE id = $2")
+            .bind(&packet.claim.properties)
+            .bind(claim_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        format!("Failed to set claim properties: {}", e),
+                    ),
+                )
+            })?;
+    }
 
-    sqlx::query!(
+    // Short-circuit all dependent writes on a duplicate. On a duplicate the
+    // evidence INSERT would hit `evidence_content_hash_claim_unique` → 500;
+    // the `trace_id` UPDATE would mutate another run's canonical noun-claim
+    // (forbidden, see claim.rs noun-claim invariant); and post-018 the edges
+    // have no triple-unique, so re-inserting would silently duplicate the
+    // graph. The trace/edge/evidence rows below all reference `claim_uuid`
+    // (== canonical id) and `trace_uuid`.
+    if was_created {
+        // 4. Insert reasoning trace (with claim_id)
+        let trace_uuid: Uuid = trace_id.into();
+        let methodology = convert_methodology(packet.reasoning_trace.methodology);
+        let methodology_str = match methodology {
+            Methodology::Deductive | Methodology::FormalProof => "deductive",
+            Methodology::Inductive => "inductive",
+            Methodology::Abductive | Methodology::Heuristic => "abductive",
+            _ => "statistical",
+        };
+
+        // Convert evidence IDs for trace inputs
+        let domain_evidence_ids: Vec<EvidenceId> = evidence_ids.to_vec();
+        let trace_inputs =
+            convert_trace_inputs(&packet.reasoning_trace.inputs, &domain_evidence_ids);
+        let properties_json = serde_json::json!({
+            "inputs": trace_inputs,
+        });
+
+        sqlx::query!(
         r#"
         INSERT INTO reasoning_traces (id, claim_id, reasoning_type, confidence, explanation, properties, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -1087,29 +1125,29 @@ async fn persist_packet(
         )
     })?;
 
-    // 5. Update claim with trace_id
-    sqlx::query!(
-        r#"
+        // 5. Update claim with trace_id
+        sqlx::query!(
+            r#"
         UPDATE claims SET trace_id = $1, updated_at = $2 WHERE id = $3
         "#,
-        trace_uuid,
-        now,
-        claim_uuid
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new(
-                "DatabaseError",
-                format!("Failed to update claim with trace_id: {}", e),
-            ),
+            trace_uuid,
+            now,
+            claim_uuid
         )
-    })?;
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new(
+                    "DatabaseError",
+                    format!("Failed to update claim with trace_id: {}", e),
+                ),
+            )
+        })?;
 
-    // 5b. Materialize structural edges: agent --AUTHORED--> claim, claim --HAS_TRACE--> trace
-    sqlx::query_scalar::<_, i32>(
+        // 5b. Materialize structural edges: agent --AUTHORED--> claim, claim --HAS_TRACE--> trace
+        sqlx::query_scalar::<_, i32>(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
          VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', '{}'::jsonb) \
          RETURNING 1"
@@ -1125,7 +1163,7 @@ async fn persist_packet(
         )
     })?;
 
-    sqlx::query_scalar::<_, i32>(
+        sqlx::query_scalar::<_, i32>(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
          VALUES ($1, 'claim', $2, 'trace', 'HAS_TRACE', '{}'::jsonb) \
          RETURNING 1"
@@ -1141,7 +1179,7 @@ async fn persist_packet(
         )
     })?;
 
-    sqlx::query_scalar::<_, i32>(
+        sqlx::query_scalar::<_, i32>(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
          VALUES ($1, 'trace', $2, 'claim', 'TRACES', '{}'::jsonb) \
          RETURNING 1"
@@ -1157,57 +1195,57 @@ async fn persist_packet(
         )
     })?;
 
-    // 6. Insert evidence records
-    for (i, evidence_submission) in packet.evidence.iter().enumerate() {
-        let evidence_id = evidence_ids[i];
-        let evidence_uuid: Uuid = evidence_id.into();
+        // 6. Insert evidence records
+        for (i, evidence_submission) in packet.evidence.iter().enumerate() {
+            let evidence_id = evidence_ids[i];
+            let evidence_uuid: Uuid = evidence_id.into();
 
-        // Parse content hash from hex
-        let content_hash_bytes = ContentHasher::from_hex(&evidence_submission.content_hash)
-            .map_err(|_| {
+            // Parse content hash from hex
+            let content_hash_bytes = ContentHasher::from_hex(&evidence_submission.content_hash)
+                .map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorResponse::new("InternalError", "Invalid content hash format"),
+                    )
+                })?;
+
+            // Determine evidence type string
+            let evidence_type_str = match &evidence_submission.evidence_type {
+                EvidenceTypeSubmission::Document { .. } => "document",
+                EvidenceTypeSubmission::Observation { .. } => "observation",
+                EvidenceTypeSubmission::Testimony { .. } => "testimony",
+                EvidenceTypeSubmission::Literature { .. } => "reference",
+                EvidenceTypeSubmission::Figure { .. } => "figure",
+            };
+
+            // Convert evidence type to JSONB
+            let evidence_type_domain = convert_evidence_type(&evidence_submission.evidence_type);
+            let evidence_type_json = serde_json::to_value(&evidence_type_domain).map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new("InternalError", "Invalid content hash format"),
+                    ErrorResponse::new(
+                        "InternalError",
+                        format!("Failed to serialize evidence type: {}", e),
+                    ),
                 )
             })?;
 
-        // Determine evidence type string
-        let evidence_type_str = match &evidence_submission.evidence_type {
-            EvidenceTypeSubmission::Document { .. } => "document",
-            EvidenceTypeSubmission::Observation { .. } => "observation",
-            EvidenceTypeSubmission::Testimony { .. } => "testimony",
-            EvidenceTypeSubmission::Literature { .. } => "reference",
-            EvidenceTypeSubmission::Figure { .. } => "figure",
-        };
+            // Parse signature if provided
+            let signature_bytes: Option<Vec<u8>> = evidence_submission
+                .signature
+                .as_ref()
+                .and_then(|s| parse_signature_hex(s))
+                .map(|arr| arr.to_vec());
 
-        // Convert evidence type to JSONB
-        let evidence_type_domain = convert_evidence_type(&evidence_submission.evidence_type);
-        let evidence_type_json = serde_json::to_value(&evidence_type_domain).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new(
-                    "InternalError",
-                    format!("Failed to serialize evidence type: {}", e),
-                ),
-            )
-        })?;
+            // Signer ID must be present if and only if signature is present
+            // (DB CHECK constraint: evidence_signature_requires_signer)
+            let signer_id: Option<Uuid> = if signature_bytes.is_some() {
+                Some(agent_uuid)
+            } else {
+                None
+            };
 
-        // Parse signature if provided
-        let signature_bytes: Option<Vec<u8>> = evidence_submission
-            .signature
-            .as_ref()
-            .and_then(|s| parse_signature_hex(s))
-            .map(|arr| arr.to_vec());
-
-        // Signer ID must be present if and only if signature is present
-        // (DB CHECK constraint: evidence_signature_requires_signer)
-        let signer_id: Option<Uuid> = if signature_bytes.is_some() {
-            Some(agent_uuid)
-        } else {
-            None
-        };
-
-        sqlx::query!(
+            sqlx::query!(
             r#"
             INSERT INTO evidence (id, content_hash, evidence_type, source_url, raw_content, claim_id, signature, signer_id, properties, created_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -1232,8 +1270,8 @@ async fn persist_packet(
             )
         })?;
 
-        // Materialize graph edges: evidence --SUPPORTS--> claim
-        sqlx::query_scalar::<_, i32>(
+            // Materialize graph edges: evidence --SUPPORTS--> claim
+            sqlx::query_scalar::<_, i32>(
             "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
              VALUES ($1, 'evidence', $2, 'claim', 'SUPPORTS', '{}'::jsonb) \
              RETURNING 1"
@@ -1249,8 +1287,8 @@ async fn persist_packet(
             )
         })?;
 
-        // Materialize graph edges: trace --USES_EVIDENCE--> evidence
-        sqlx::query_scalar::<_, i32>(
+            // Materialize graph edges: trace --USES_EVIDENCE--> evidence
+            sqlx::query_scalar::<_, i32>(
             "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
              VALUES ($1, 'trace', $2, 'evidence', 'USES_EVIDENCE', '{}'::jsonb) \
              RETURNING 1"
@@ -1265,7 +1303,8 @@ async fn persist_packet(
                 ErrorResponse::new("DatabaseError", format!("Failed to create USES_EVIDENCE edge: {}", e)),
             )
         })?;
-    }
+        }
+    } // end `if was_created`
 
     // 7. Commit transaction
     tx.commit().await.map_err(|e| {
@@ -1278,7 +1317,7 @@ async fn persist_packet(
         )
     })?;
 
-    Ok(())
+    Ok((canonical_id, !was_created))
 }
 
 // =============================================================================
@@ -1364,8 +1403,15 @@ pub async fn submit_packet(
     //    - Inserts evidence records
     //    - Commits transaction
     //    - On any failure, rolls back (no partial state)
+    //
+    // Shadow the pre-generated `claim_id` with the *canonical* id returned by
+    // `persist_packet`: on a duplicate submit the find-or-create resolves to
+    // an existing row, so every downstream user (in-memory claim, response,
+    // event, idempotency store) must carry the canonical id, not the
+    // throwaway pre-gen UUID. (Full `was_duplicate` threading — propagation
+    // skip, embedding guards, response flag — is Task 5.)
     #[cfg(feature = "db")]
-    {
+    let claim_id = {
         let domain_claim_id = ClaimId::from_uuid(claim_id);
         let domain_trace_id = TraceId::from_uuid(trace_id);
         let domain_evidence_ids: Vec<EvidenceId> = evidence_ids
@@ -1373,7 +1419,7 @@ pub async fn submit_packet(
             .map(|id| EvidenceId::from_uuid(*id))
             .collect();
 
-        if let Err((status, error)) = persist_packet(
+        match persist_packet(
             &state.db_pool,
             &packet,
             domain_claim_id,
@@ -1383,9 +1429,10 @@ pub async fn submit_packet(
         )
         .await
         {
-            return (status, Json(error)).into_response();
+            Ok((canonical_id, _was_duplicate)) => canonical_id.as_uuid(),
+            Err((status, error)) => return (status, Json(error)).into_response(),
         }
-    }
+    };
 
     // 6. Create the claim object and register it for propagation
     //
