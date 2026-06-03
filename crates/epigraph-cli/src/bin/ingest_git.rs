@@ -2127,6 +2127,30 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         .map(|c| format!("[{}][{}] {}", c.commit_type, c.scope, c.claim_text))
         .collect();
 
+    // Resolution references (PR-level): UUID refs + PR-number citations from the
+    // PR body and commit messages. Computed up front so --dry-run can show the
+    // planned resolution targets, and reused by section 5 below.
+    let mut ref_text = meta.body.clone();
+    for c in &commits {
+        ref_text.push('\n');
+        ref_text.push_str(&c.claim_text);
+    }
+    let refs = extract_references(&ref_text);
+
+    // --dry-run: parse + print the planned hierarchy and resolution targets, then
+    // return BEFORE any POST (the first write is register_agent in section 2).
+    // Safe to run on untrusted/unmerged PRs since it makes no network calls.
+    if args.dry_run {
+        println!(
+            "[dry-run] repo={} pr=#{} commits={} refs={:?}",
+            meta.repo_slug,
+            meta.number,
+            commits.len(),
+            refs
+        );
+        return Ok(());
+    }
+
     // 1) Resolve the implementing orchestrator agent: explicit flag, then trailer
     //    (PR body / commits), then EPIGRAPH_DEFAULT_ORCHESTRATOR_ID. The resolver
     //    only reads an id (never mints one); a bogus id surfaces at submit time.
@@ -2204,14 +2228,8 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         .await?;
     }
 
-    // 5) Resolution links (PR-level): UUID refs + PR-number citations from the
-    //    PR body and commit messages.
-    let mut ref_text = meta.body.clone();
-    for c in &commits {
-        ref_text.push('\n');
-        ref_text.push_str(&c.claim_text);
-    }
-    let refs = extract_references(&ref_text);
+    // 5) Resolution links (PR-level): create the RESOLVED_BY edges for the
+    //    references gathered above (UUID refs + PR-number citations).
     let linked = link_resolutions(&client, &args.endpoint, pr_id, &refs, &meta.merged_at).await?;
     println!(
         "PR #{}: repo={repo_id} pr={pr_id} commits={} resolved_links={linked}",
