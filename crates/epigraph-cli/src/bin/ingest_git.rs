@@ -1056,6 +1056,15 @@ fn author_signer(_display_name: &str, email: &str) -> AgentSigner {
     AgentSigner::from_bytes(&key).expect("32-byte blake3 hash is a valid Ed25519 seed")
 }
 
+/// Derive the STABLE signer for the single repo-root *system* agent, derived from
+/// a constant identity (independent of repo or orchestrator). Every repo-root node
+/// is authored by this agent so that `(content_hash, agent_id)` is constant across
+/// every PR/orchestrator and the server's find-or-create collapses it to one node.
+/// Reuses the `author_signer` derivation so the key is a deterministic Ed25519 seed.
+fn repo_root_signer() -> AgentSigner {
+    author_signer("git-ingester-system", "git-ingester@epigraph.system")
+}
+
 /// Resolve (and register if needed) the stable agent id for a git author.
 /// Caches the resolved agent id per email within a run to avoid duplicate POSTs.
 ///
@@ -2159,19 +2168,27 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         None => resolve_orchestrator_agent(&meta.body, &commit_msgs)?,
     };
 
-    // 2) Repo root node (authored by the orchestrator for attribution consistency).
-    //    The synthetic repo-root signer just satisfies the packet's evidence
-    //    signature; registering it is best-effort (a duplicate public_key is
-    //    tolerated per Task 0).
-    let repo_signer = author_signer("repo-root", &format!("repo+{repo_slug}@git"));
-    let _ =
-        AgentRegistry::register_agent(&client, &args.endpoint, &repo_signer, "git-ingester").await;
+    // 2) Repo root node, attributed to a fixed system agent (NOT the per-PR
+    //    orchestrator). Keying on the orchestrator made the repo node's
+    //    (content_hash, agent_id) vary per PR, defeating the server's find-or-create
+    //    and re-creating the repo node every run. We register the system agent and
+    //    use its returned id as the node's author. Registration is now `.await?`
+    //    (not best-effort) because create_agent is idempotent on public_key
+    //    (Plan 2.5 Tasks 1-2): a re-run returns the same id instead of a 400.
+    let repo_root_signer = repo_root_signer();
+    let repo_root_id = AgentRegistry::register_agent(
+        &client,
+        &args.endpoint,
+        &repo_root_signer,
+        "git-ingester-system",
+    )
+    .await?;
     let repo_id = ensure_repo_node(
         &client,
         &args.endpoint,
         &repo_slug,
-        orchestrator_id,
-        &repo_signer,
+        repo_root_id,
+        &repo_root_signer,
     )
     .await?;
 
@@ -2910,6 +2927,29 @@ mod tests {
             a.public_key(),
             b.public_key(),
             "case/space-insensitive email"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Repo-root system-agent identity tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn repo_root_agent_is_fixed_and_orchestrator_independent() {
+        // The repo-root node must be attributed to a single, stable system agent
+        // derived from a constant — never the per-PR orchestrator — so that
+        // `create_or_get` collapses the repo node across every PR/orchestrator.
+        // `orchestrator_id` is not even an input to the repo-root signer, so two
+        // different orchestrators necessarily resolve the same repo-root key.
+        assert_eq!(
+            repo_root_signer().public_key(),
+            repo_root_signer().public_key(),
+            "repo-root signer is deterministic from a constant"
+        );
+        assert_ne!(
+            repo_root_signer().public_key(),
+            author_signer("x", "someone@example.com").public_key(),
+            "repo-root system agent is distinct from any git author"
         );
     }
 
