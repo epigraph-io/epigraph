@@ -1530,6 +1530,104 @@ async fn link_edge(
     }
 }
 
+// =============================================================================
+// RESOLUTION LINKING
+// =============================================================================
+
+/// Confirm a claim exists (GET returns 200). `properties` are not exposed by the
+/// read endpoint, but existence is all we need before creating a resolution edge.
+#[allow(dead_code)]
+async fn claim_exists(client: &reqwest::Client, endpoint: &str, id: Uuid) -> bool {
+    let url = format!("{endpoint}/api/v1/claims/{id}");
+    matches!(
+        client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await,
+        Ok(r) if r.status().is_success()
+    )
+}
+
+/// Find existing resolution/backlog claims whose CONTENT cites "PR #<n>".
+#[allow(dead_code)]
+async fn find_claims_citing_pr(client: &reqwest::Client, endpoint: &str, n: u64) -> Vec<Uuid> {
+    let needle = format!("PR #{n}");
+    let url = format!("{endpoint}/api/v1/claims");
+    let resp = client
+        .get(&url)
+        .query(&[
+            ("content_contains", needle.as_str()),
+            ("is_current", "true"),
+            ("limit", "25"),
+        ])
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await;
+    let Ok(resp) = resp else { return vec![] };
+    if !resp.status().is_success() {
+        return vec![];
+    }
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return vec![];
+    };
+    v["claims"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c["id"].as_str()?.parse::<Uuid>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// For each resolved target, create `target --RESOLVED_BY--> PR`, datestamped at
+/// merge time. Direction reads "X was resolved by this PR". `RESOLVED_BY` is in
+/// `VALID_RELATIONSHIPS` and non-evidential (no DS recompute). Self-references and
+/// the PR's own claim are skipped; UUID refs are validated for existence first, so
+/// stray tokens from `extract_references` are harmless.
+#[allow(dead_code)]
+async fn link_resolutions(
+    client: &reqwest::Client,
+    endpoint: &str,
+    pr_claim_id: Uuid,
+    refs: &References,
+    merged_at: &str,
+) -> Result<usize, String> {
+    let mut linked = 0;
+    for uuid in &refs.claim_uuids {
+        if *uuid != pr_claim_id && claim_exists(client, endpoint, *uuid).await {
+            link_edge(
+                client,
+                endpoint,
+                *uuid,
+                pr_claim_id,
+                "RESOLVED_BY",
+                Some(merged_at),
+            )
+            .await?;
+            linked += 1;
+        }
+    }
+    for n in &refs.pr_numbers {
+        for target in find_claims_citing_pr(client, endpoint, *n).await {
+            if target != pr_claim_id {
+                link_edge(
+                    client,
+                    endpoint,
+                    target,
+                    pr_claim_id,
+                    "RESOLVED_BY",
+                    Some(merged_at),
+                )
+                .await?;
+                linked += 1;
+            }
+        }
+    }
+    Ok(linked)
+}
+
 /// Resolve semantic edges from enrichment data and submit them as API edges.
 ///
 /// For each commit's enrichment, maps `target_hash` → `claim_id` via the
