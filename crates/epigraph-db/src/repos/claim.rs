@@ -677,6 +677,50 @@ impl ClaimRepository {
         Ok(rows)
     }
 
+    /// Lexical-only retrieval over current claims (`content_tsv` / GIN), ranked
+    /// by `ts_rank_cd`. Returns `HybridHit`s with `dense_similarity = None` and
+    /// `in_lexical = true`; `rrf_score = 1/(k_rrf + rank)` keeps the score scale
+    /// consistent with the hybrid path. Used as `recall`'s embedder-down
+    /// fallback — unlike an ILIKE scan it honors the tag/agent scope in SQL.
+    pub async fn search_lexical_scoped(
+        pool: &PgPool,
+        query_text: &str,
+        k_rrf: i64,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
+        let tags_owned: Option<Vec<String>> = match tags {
+            Some(t) if !t.is_empty() => Some(t.to_vec()),
+            _ => None,
+        };
+
+        let rows = sqlx::query_as::<_, HybridHit>(
+            r#"
+            SELECT c.id AS claim_id,
+                   (1.0 / ($2 + row_number() OVER (
+                       ORDER BY ts_rank_cd(c.content_tsv, q) DESC)))::float8 AS rrf_score,
+                   NULL::float8 AS dense_similarity,
+                   true AS in_lexical
+            FROM claims c, websearch_to_tsquery('english', $1) q
+            WHERE c.content_tsv @@ q AND c.is_current
+              AND ($4::text[] IS NULL OR c.labels @> $4::text[])
+              AND ($5::uuid IS NULL OR c.agent_id = $5::uuid)
+            ORDER BY ts_rank_cd(c.content_tsv, q) DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(query_text) // $1
+        .bind(k_rrf) // $2
+        .bind(limit) // $3
+        .bind(tags_owned) // $4
+        .bind(agent_id) // $5
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Get all claims by an agent
     ///
     /// # Errors

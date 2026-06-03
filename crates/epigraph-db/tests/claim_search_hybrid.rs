@@ -255,3 +255,76 @@ async fn hybrid_excludes_non_current_and_honors_tag_scope(pool: PgPool) {
         "out-of-scope (tag) excluded on both legs"
     );
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn lexical_scoped_ranks_matches_and_honors_scope(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+
+    let hit = Uuid::new_v4();
+    insert_claim(
+        &pool,
+        hit,
+        agent,
+        1,
+        "zubuzonium reactor design",
+        &vec_hot(0),
+        true,
+        &["keep"],
+    )
+    .await;
+    let miss = Uuid::new_v4();
+    insert_claim(
+        &pool,
+        miss,
+        agent,
+        2,
+        "unrelated weather prose",
+        &vec_hot(0),
+        true,
+        &["keep"],
+    )
+    .await;
+    let stale = Uuid::new_v4();
+    insert_claim(
+        &pool,
+        stale,
+        agent,
+        3,
+        "zubuzonium stale",
+        &vec_hot(0),
+        false,
+        &["keep"],
+    )
+    .await;
+    let oos = Uuid::new_v4();
+    insert_claim(
+        &pool,
+        oos,
+        agent,
+        4,
+        "zubuzonium other",
+        &vec_hot(0),
+        true,
+        &["other"],
+    )
+    .await;
+
+    let tags = vec!["keep".to_string()];
+    let hits =
+        ClaimRepository::search_lexical_scoped(&pool, "zubuzonium", 60, 10, Some(&tags), None)
+            .await
+            .expect("lexical search");
+
+    let ids: Vec<Uuid> = hits.iter().map(|h| h.claim_id).collect();
+    assert!(ids.contains(&hit), "lexical match in scope present");
+    assert!(!ids.contains(&miss), "non-matching content excluded");
+    assert!(!ids.contains(&stale), "non-current excluded");
+    assert!(!ids.contains(&oos), "out-of-scope tag excluded");
+
+    let h = hits.iter().find(|h| h.claim_id == hit).unwrap();
+    assert!(
+        h.dense_similarity.is_none() && h.in_lexical,
+        "lexical-only shape"
+    );
+    assert!(h.rrf_score > 0.0);
+}
