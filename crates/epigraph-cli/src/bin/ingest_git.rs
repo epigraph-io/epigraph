@@ -57,6 +57,26 @@ struct Args {
     embed: bool,
     /// Bearer token for agent registration (required for /agents endpoint)
     token: Option<String>,
+    /// PR-hierarchical ingestion mode (repo → PR → commit hierarchy)
+    pr_mode: bool,
+    /// Repository slug `owner/name` (PR mode)
+    repo_slug: Option<String>,
+    /// Pull-request number (PR mode)
+    pr_number: Option<u64>,
+    /// Pull-request title (PR mode)
+    pr_title: Option<String>,
+    /// Pull-request body / description (PR mode)
+    pr_body: Option<String>,
+    /// Merge commit SHA of the PR (PR mode)
+    merge_sha: Option<String>,
+    /// ISO-8601 merge timestamp (PR mode)
+    merged_at: Option<String>,
+    /// GitHub login of the PR author (PR mode)
+    pr_author: Option<String>,
+    /// Git revision range `A..B` for the PR's commits (PR mode)
+    rev_range: Option<String>,
+    /// Explicit orchestrator agent id, overriding trailer/env resolution (PR mode)
+    orchestrator_id: Option<Uuid>,
 }
 
 impl Args {
@@ -72,6 +92,16 @@ impl Args {
         let mut enricher = EnricherMode::Noop;
         let mut embed = false;
         let mut token = None;
+        let mut pr_mode = false;
+        let mut repo_slug = None;
+        let mut pr_number = None;
+        let mut pr_title = None;
+        let mut pr_body = None;
+        let mut merge_sha = None;
+        let mut merged_at = None;
+        let mut pr_author = None;
+        let mut rev_range = None;
+        let mut orchestrator_id = None;
 
         let mut i = 1;
         while i < args.len() {
@@ -131,6 +161,81 @@ impl Args {
                             .clone(),
                     );
                 }
+                "--pr-ingest" => {
+                    pr_mode = true;
+                }
+                "--repo-slug" => {
+                    i += 1;
+                    repo_slug = Some(
+                        args.get(i)
+                            .ok_or("--repo-slug requires an owner/name argument")?
+                            .clone(),
+                    );
+                }
+                "--pr-number" => {
+                    i += 1;
+                    let val = args.get(i).ok_or("--pr-number requires a number")?;
+                    pr_number = Some(
+                        val.parse::<u64>()
+                            .map_err(|_| format!("--pr-number must be a number, got: {val}"))?,
+                    );
+                }
+                "--pr-title" => {
+                    i += 1;
+                    pr_title = Some(
+                        args.get(i)
+                            .ok_or("--pr-title requires a string argument")?
+                            .clone(),
+                    );
+                }
+                "--pr-body" => {
+                    i += 1;
+                    pr_body = Some(
+                        args.get(i)
+                            .ok_or("--pr-body requires a string argument")?
+                            .clone(),
+                    );
+                }
+                "--merge-sha" => {
+                    i += 1;
+                    merge_sha = Some(
+                        args.get(i)
+                            .ok_or("--merge-sha requires a SHA argument")?
+                            .clone(),
+                    );
+                }
+                "--merged-at" => {
+                    i += 1;
+                    merged_at = Some(
+                        args.get(i)
+                            .ok_or("--merged-at requires an ISO-8601 timestamp argument")?
+                            .clone(),
+                    );
+                }
+                "--pr-author" => {
+                    i += 1;
+                    pr_author = Some(
+                        args.get(i)
+                            .ok_or("--pr-author requires a login argument")?
+                            .clone(),
+                    );
+                }
+                "--rev-range" => {
+                    i += 1;
+                    rev_range = Some(
+                        args.get(i)
+                            .ok_or("--rev-range requires an A..B revision range")?
+                            .clone(),
+                    );
+                }
+                "--orchestrator-id" => {
+                    i += 1;
+                    let val = args.get(i).ok_or("--orchestrator-id requires a UUID")?;
+                    orchestrator_id =
+                        Some(val.parse::<Uuid>().map_err(|_| {
+                            format!("--orchestrator-id must be a UUID, got: {val}")
+                        })?);
+                }
                 "--help" | "-h" => {
                     return Err(USAGE.to_string());
                 }
@@ -151,6 +256,16 @@ impl Args {
             enricher,
             embed,
             token,
+            pr_mode,
+            repo_slug,
+            pr_number,
+            pr_title,
+            pr_body,
+            merge_sha,
+            merged_at,
+            pr_author,
+            rev_range,
+            orchestrator_id,
         })
     }
 }
@@ -168,7 +283,19 @@ Options:
       --enricher <MODE>   Enrichment mode: noop (default) or llm
       --embed             Generate and store embeddings for submitted claims
   -t, --token <TOKEN>     Bearer token for agent registration
-  -h, --help              Show this help message";
+  -h, --help              Show this help message
+
+PR-hierarchical mode (build a repo -> PR -> commit claim hierarchy):
+      --pr-ingest             Enable PR-hierarchical ingestion mode
+      --repo-slug <OWNER/NAME>  Repository slug (e.g. epigraph-io/epigraph)
+      --pr-number <N>         Pull-request number
+      --pr-title <TITLE>      Pull-request title
+      --pr-body <BODY>        Pull-request body / description
+      --merge-sha <SHA>       Merge commit SHA
+      --merged-at <ISO8601>   Merge timestamp (ISO-8601)
+      --pr-author <LOGIN>     GitHub login of the PR author
+      --rev-range <A..B>      Git revision range covering the PR's commits
+      --orchestrator-id <UUID>  Explicit orchestrator agent id (overrides trailer/env)";
 
 // =============================================================================
 // COMMIT TYPES & PARSING
@@ -710,6 +837,42 @@ fn parse_git_log(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git log failed: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_git_log_output(&stdout)
+}
+
+/// Run `git log <rev_range> --no-merges` and parse the output into ParsedCommits.
+///
+/// PR mode supplies an explicit revision range (e.g. `base..head`) instead of a
+/// `--since` date so exactly the PR's own commits are ingested. `--no-merges`
+/// keeps merge commits out of the claim hierarchy (design §4.2: only real work
+/// commits become claims). Reuses the same format string and `parse_git_log_output`
+/// as `parse_git_log` so both paths produce identical `ParsedCommit`s.
+#[allow(dead_code)]
+fn parse_git_log_range(
+    repo: &std::path::Path,
+    rev_range: &str,
+) -> Result<Vec<ParsedCommit>, String> {
+    let format = format!(
+        "{RECORD_SEP}%H{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%aI{FIELD_SEP}%P{FIELD_SEP}%B"
+    );
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("log")
+        .arg(format!("--format={format}"))
+        .arg("--name-only")
+        .arg("--no-merges")
+        .arg(rev_range)
+        .output()
+        .map_err(|e| format!("Failed to run git log: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git log {rev_range} failed: {stderr}"));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1916,6 +2079,149 @@ async fn submit_evidence_embeddings(
 }
 
 // =============================================================================
+// PR-HIERARCHICAL INGESTION
+// =============================================================================
+
+/// Build a reqwest client, attaching `Authorization: Bearer <token>` when a
+/// token is configured. Required because the label PATCH route
+/// (`PATCH /api/v1/claims/{id}/labels`) demands `claims:write`; a tokenless
+/// client would 401 on every label application.
+fn build_http_client(token: Option<&str>) -> reqwest::Client {
+    if let Some(tok) = token {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {tok}"))
+                .expect("bearer token is a valid header value"),
+        );
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("client builder with bearer header")
+    } else {
+        reqwest::Client::new()
+    }
+}
+
+/// Assemble the `repo → PR → commit` claim hierarchy for one merged PR:
+/// find-or-create the repo root + PR node, attribute the PR to the orchestrator
+/// agent and each commit to its (stable) git-author agent, stamp the
+/// `decomposes_to` edges at merge/commit time, and link the PR to any backlog /
+/// resolution claims it resolves via `RESOLVED_BY` (design §4, §6, §7).
+async fn run_pr_ingest(args: &Args) -> Result<(), String> {
+    let client = build_http_client(args.token.as_deref());
+    let repo_slug = args.repo_slug.clone().ok_or("--repo-slug required")?;
+    let meta = PrMeta {
+        repo_slug: repo_slug.clone(),
+        number: args.pr_number.ok_or("--pr-number required")?,
+        title: args.pr_title.clone().ok_or("--pr-title required")?,
+        body: args.pr_body.clone().unwrap_or_default(),
+        merge_sha: args.merge_sha.clone().ok_or("--merge-sha required")?,
+        merged_at: args.merged_at.clone().ok_or("--merged-at required")?,
+        author_login: args.pr_author.clone().unwrap_or_default(),
+    };
+    let rev_range = args.rev_range.clone().ok_or("--rev-range required")?;
+    let commits = parse_git_log_range(&args.repo, &rev_range)?;
+    let commit_msgs: Vec<String> = commits
+        .iter()
+        .map(|c| format!("[{}][{}] {}", c.commit_type, c.scope, c.claim_text))
+        .collect();
+
+    // 1) Resolve the implementing orchestrator agent: explicit flag, then trailer
+    //    (PR body / commits), then EPIGRAPH_DEFAULT_ORCHESTRATOR_ID. The resolver
+    //    only reads an id (never mints one); a bogus id surfaces at submit time.
+    let orchestrator_id = match args.orchestrator_id {
+        Some(id) => id,
+        None => resolve_orchestrator_agent(&meta.body, &commit_msgs)?,
+    };
+
+    // 2) Repo root node (authored by the orchestrator for attribution consistency).
+    //    The synthetic repo-root signer just satisfies the packet's evidence
+    //    signature; registering it is best-effort (a duplicate public_key is
+    //    tolerated per Task 0).
+    let repo_signer = author_signer("repo-root", &format!("repo+{repo_slug}@git"));
+    let _ =
+        AgentRegistry::register_agent(&client, &args.endpoint, &repo_signer, "git-ingester").await;
+    let repo_id = ensure_repo_node(
+        &client,
+        &args.endpoint,
+        &repo_slug,
+        orchestrator_id,
+        &repo_signer,
+    )
+    .await?;
+
+    // 3) PR node, attributed to the orchestrator.
+    let pr_packet = build_pr_packet(&meta, orchestrator_id);
+    let pr_label = format!("repo:{repo_slug}");
+    let pr_id = submit_find_or_create(
+        &client,
+        &args.endpoint,
+        &pr_packet,
+        &["source:git-history", "node:pr", &pr_label],
+    )
+    .await?;
+    // repo --decomposes_to--> PR, stamped at merge time.
+    link_edge(
+        &client,
+        &args.endpoint,
+        repo_id,
+        pr_id,
+        "decomposes_to",
+        Some(&meta.merged_at),
+    )
+    .await?;
+
+    // 4) Commit children, attributed to their (stable) git-author agents.
+    let mut author_cache = std::collections::HashMap::new();
+    for commit in &commits {
+        let (signer, author_id) = resolve_author_agent(
+            &client,
+            &args.endpoint,
+            &mut author_cache,
+            &commit.author_name,
+            &commit.author_email,
+        )
+        .await?;
+        let packet = build_packet(commit, &signer, author_id, None);
+        let commit_label = format!("repo:{repo_slug}");
+        let commit_id = submit_find_or_create(
+            &client,
+            &args.endpoint,
+            &packet,
+            &["source:git-history", "node:commit", &commit_label],
+        )
+        .await?;
+        // PR --decomposes_to--> commit, stamped at commit time.
+        link_edge(
+            &client,
+            &args.endpoint,
+            pr_id,
+            commit_id,
+            "decomposes_to",
+            Some(&commit.date),
+        )
+        .await?;
+    }
+
+    // 5) Resolution links (PR-level): UUID refs + PR-number citations from the
+    //    PR body and commit messages.
+    let mut ref_text = meta.body.clone();
+    for c in &commits {
+        ref_text.push('\n');
+        ref_text.push_str(&c.claim_text);
+    }
+    let refs = extract_references(&ref_text);
+    let linked = link_resolutions(&client, &args.endpoint, pr_id, &refs, &meta.merged_at).await?;
+    println!(
+        "PR #{}: repo={repo_id} pr={pr_id} commits={} resolved_links={linked}",
+        meta.number,
+        commits.len()
+    );
+    Ok(())
+}
+
+// =============================================================================
 // MAIN
 // =============================================================================
 
@@ -1934,6 +2240,16 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
+
+    // PR-hierarchical ingestion is a distinct mode: it builds a repo -> PR ->
+    // commit hierarchy from the supplied PR metadata + rev-range and returns.
+    if args.pr_mode {
+        if let Err(e) = run_pr_ingest(&args).await {
+            eprintln!("pr-ingest failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Parse git log
     println!("Parsing git log from: {}", args.repo.display());
