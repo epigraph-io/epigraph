@@ -1,0 +1,7 @@
+# scripts/git_ingest_reconciler.config.example.toml — copy to the state dir as config.toml
+repos = ["epigraph-io/epigraph"]   # pilot: epigraph only; add slugs to expand
+endpoint = "http://127.0.0.1:8080"
+window_minutes = 240               # generous overlap; idempotency (Plan 2.5) tolerates re-scan
+state_dir = "/var/lib/epiclaw/git-ingest"
+ingest_git_bin = "/home/jeremy/.cargo-target/debug/ingest_git"  # or the deployed release path
+# default_orchestrator_id = "<uuid of a registered agent>"  # used when a PR lacks the trailer
