@@ -84,8 +84,17 @@ Exposed set = the engine's non-neutral epistemic relations **minus `supersedes`*
 | negative (weaken target)     | `contradicts`, `refutes` |
 
 Define these as a constant `EPISTEMIC_RELATIONSHIPS` in the MCP crate (mirror of how
-`link_hierarchical` defines `HIERARCHICAL_RELATIONSHIPS`). Validation rejects anything else
-(structural types, unknown strings, and `supersedes`) with an error that lists the valid set.
+`link_hierarchical` defines `HIERARCHICAL_RELATIONSHIPS`), using the **lowercase canonical**
+strings (matching the `epigraph-core::relationships` constants and the engine's internal
+`to_ascii_lowercase`). Validation rejects anything else (structural types, unknown strings, and
+`supersedes`) with an error that lists the valid set.
+
+> **Case note (resolved):** the MCP tool owns this constant and does **not** route through
+> `routes/edges.rs::is_valid_relationship`. That HTTP whitelist (`VALID_RELATIONSHIPS`) stores
+> only UPPER-CASE `CONTRADICTS`/`CORROBORATES` and is case-sensitive, whereas the engine
+> lowercases internally — so a "must be in `VALID_RELATIONSHIPS`" check would spuriously fail.
+> The coverage guard (§8) therefore asserts the **non-Neutral engine mapping only**, which is
+> the property that actually governs belief.
 
 ### `supersedes` exclusion (deliberate)
 The engine treats `supersedes` as a negative restriction, but `supersedes` has dedicated
@@ -154,9 +163,11 @@ edge exists-but-unwired; v1 relies on `recompute_beliefs`.)
 ## 8. Testing
 
 - **Coverage guard (most important):** a test asserting **every** `EPISTEMIC_RELATIONSHIPS`
-  entry (a) is present in `routes/edges.rs::VALID_RELATIONSHIPS`, and (b) maps to a
-  **non-Neutral** `RestrictionKind` via the engine's `restriction_kind_with_profile`. This makes
-  it impossible to expose an inert relationship, and catches drift if either list changes.
+  entry maps to a **non-Neutral** `RestrictionKind` via the engine's
+  `restriction_kind_with_profile` (with the default `RestrictionProfile::scientific()`). This
+  makes it impossible to expose an inert relationship and catches drift if the engine mapping
+  changes. (We do **not** assert membership in `routes/edges.rs::VALID_RELATIONSHIPS` — see the
+  case note in §4; the engine mapping, not the HTTP whitelist, is the real invariant.)
 - **Validation unit tests:** accept each of the 7 epistemic types; reject `decomposes_to`,
   an unknown string, and `supersedes`; reject self-loop.
 - **DB integration** (small DB per CLAUDE.md — `epigraph_db_repo_test` or `#[sqlx::test]`):
