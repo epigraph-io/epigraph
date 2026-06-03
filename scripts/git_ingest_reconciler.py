@@ -54,3 +54,18 @@ def load_config_str(text: str) -> Config:
 
 def load_config(path: str) -> Config:
     return load_config_str(Path(path).read_text())
+
+def compute_rev_range(mirror: str, merge_sha: str) -> str:
+    """The PR's own commits. For a --merge commit (2 parents): base..head =
+    `M^1..M^2`. For a squash (1 parent): the single commit `M~1..M`. Rebase
+    merges (the PR's commits as a linear run with one parent each) are not
+    distinguishable from a single squash here; logged by the caller and handled
+    as the squash case for the tip commit."""
+    out = subprocess.run(
+        ["git", "-C", mirror, "rev-list", "--parents", "-n", "1", merge_sha],
+        check=True, capture_output=True, text=True,
+    ).stdout.split()
+    n_parents = len(out) - 1  # first token is the commit itself
+    if n_parents >= 2:
+        return f"{merge_sha}^1..{merge_sha}^2"
+    return f"{merge_sha}~1..{merge_sha}"
