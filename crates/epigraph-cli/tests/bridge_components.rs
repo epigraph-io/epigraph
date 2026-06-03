@@ -21,7 +21,7 @@ async fn seed_claim(pool: &PgPool, agent_id: Uuid, level: i32) -> Uuid {
         .as_bytes()
         .iter()
         .copied()
-        .chain(std::iter::repeat(0).take(16))
+        .chain(std::iter::repeat_n(0, 16))
         .take(32)
         .collect();
     sqlx::query(

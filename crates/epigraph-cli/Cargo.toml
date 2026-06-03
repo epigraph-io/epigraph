@@ -156,6 +156,12 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 sqlx = { workspace = true }
+# PR-hierarchical ingest integration test (tests/pr_hierarchical_ingest_test.rs):
+# oneshot the real epigraph-api handlers the CLI hits against epigraph_db_repo_test.
+epigraph-api = { workspace = true }
+axum = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [lints]
 workspace = true
