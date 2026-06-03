@@ -52,24 +52,48 @@ model so recall/GUI/MCP/matcher all consume it.
 | Run versioning | **One consolidated `cluster_run_id` per grow-cycle** (improves on V2's per-refine fragmentation) |
 | Runtime budget | Multi-hour off-hours batch is acceptable; no first-cut sampling cap required |
 
-## Architecture
+## Current state on origin/main (correction to first draft)
+
+Most of the V2 engine is **already ported** on `origin/main` — but the scripts
+are orphaned (nothing schedules or invokes them; the only scheduled theme job is
+the paused Rust `theme_cluster_rebuild`), and they are **disconnected in the
+middle**: nothing bridges Model B → Model A.
+
+| Script (exists on main) | Does | Model | Gap |
+|---|---|---|---|
+| `cluster_claims.py` | seed→assign→discover, full boundary signal | **B** (writes) | no projection to A; no statement_timeout; per-run centroid/label rows accumulate |
+| `subcluster_outliers.py` | UMAP+k-means on boundary claims | **B** (read-only) | only *reports* candidates — never actuates a split |
+| `refine_clusters.py` | logreg split of one cluster | **B** (writes) | interactive `input()` only — no `--auto`, not batchable |
+| `label_themes_llm.py` | claude-CLI labels (nested file-write pattern) | **A** (writes) | `--model` not pinned (spec wants haiku) |
+| `maintain_themes.py` | assign-unthemed, reassign, one-pass auto-split, recompute — via HTTP API | **A** (writes) | steady-state only; **cannot bootstrap** an empty `claim_themes` |
+| `_api_client.py`, `scripts/lib/claude_cli.py` | shared HTTP/JWT + claude helpers | — | no shared memory-safe embedding loader |
+
+**The break:** `cluster_claims.py` fills Model B; `maintain_themes.py`/
+`label_themes_llm.py` operate on Model A and presuppose themes already exist.
+Nothing turns clusters into themes. That missing link is the core of this work.
+
+## Architecture (reuse / modify / create)
 
 ```
 scripts/
-  theme_pipeline.py    orchestrator: grow-loop + discrete subcommands + --dry-run
-  cluster_base.py      seed → assign → discover   (writes Model B; revives V2 cluster_claims.py)
-  subcluster.py        find isolated sub-structure in boundary claims (proposes/writes splits)
-  refine.py            split a cluster: --auto (LLM) | interactive (logreg, faithful V2 port)
-  project_to_themes.py B → claim_themes + claims.theme_id (true 1536-d centroids)
-  label_themes_llm.py  LLM labels clusters/themes (salvage existing port)
-  theme_lib.py         shared: memory-safe load, embedding parse, DB + run-id helpers
+  REUSE   cluster_claims.py     base seed→assign→discover (Model B) — keep; minor hardening only
+  REUSE   maintain_themes.py    Model-A steady-state reconciler — keep as post-projection step
+  REUSE   subcluster_outliers.py  read-only boundary analysis — keep (faithful V2 report)
+  MODIFY  refine_clusters.py    add --auto (embedding-subcluster + LLM label) alongside interactive
+  MODIFY  label_themes_llm.py   pin --model claude-haiku-4-5-20251001
+  CREATE  project_to_themes.py  B → claim_themes + claims.theme_id (true 1536-d centroids)  ← missing link
+  CREATE  theme_pipeline.py     orchestrator: grow-loop + discrete subcommands + --dry-run
+  CREATE  theme_lib.py          shared memory-safe embedding loader + DB/run-id/statement_timeout helpers
 migrations/
-  NNN_formalize_cluster_labels.sql   CREATE TABLE IF NOT EXISTS cluster_labels (matches prod)
+  CREATE  051_formalize_cluster_labels.sql   CREATE TABLE IF NOT EXISTS cluster_labels (matches prod)
 ```
 
-Each unit has one purpose and a defined interface (CLI args + the DB tables it
-reads/writes). `theme_lib.py` removes the load/parse duplication the V2 scripts
-each carried.
+Grow happens in **Model B** (consolidated `cluster_run_id`): base → discover →
+`refine_clusters.py --auto` splits until stable/target, then `project_to_themes.py`
+materialises Model A, then `label_themes_llm.py` names it and `maintain_themes.py`
+takes over steady-state. Each unit has one purpose and a defined interface (CLI
+args + the DB tables it reads/writes). `theme_lib.py` removes the per-script
+load/parse duplication.
 
 ### Data flow
 
