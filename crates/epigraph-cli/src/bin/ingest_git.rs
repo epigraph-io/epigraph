@@ -2213,6 +2213,34 @@ mod tests {
         assert_eq!(parse_orchestrator_trailer("no trailer here"), None);
     }
 
+    #[test]
+    fn orchestrator_trailer_key_match_is_case_insensitive() {
+        // The doc comment promises a case-insensitive key match; assert lower- and
+        // upper-cased trailer keys both resolve to the same id.
+        let id = "7b3a0c1e-0000-4000-8000-000000000001";
+        assert_eq!(
+            parse_orchestrator_trailer(&format!("epigraph-orchestrator-id: {id}")),
+            Some(id.parse().unwrap())
+        );
+        assert_eq!(
+            parse_orchestrator_trailer(&format!("EPIGRAPH-ORCHESTRATOR-ID: {id}")),
+            Some(id.parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn orchestrator_trailer_last_occurrence_wins() {
+        // The doc comment promises last-occurrence-wins (trailers live at the bottom),
+        // so a later trailer must override an earlier one.
+        let first = "7b3a0c1e-0000-4000-8000-000000000001";
+        let last = "7b3a0c1e-0000-4000-8000-00000000ffff";
+        let body = format!("Epigraph-Orchestrator-Id: {first}\nEpigraph-Orchestrator-Id: {last}");
+        assert_eq!(
+            parse_orchestrator_trailer(&body),
+            Some(last.parse().unwrap())
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Header parsing tests
     // -------------------------------------------------------------------------
