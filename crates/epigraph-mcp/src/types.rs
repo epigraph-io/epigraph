@@ -729,7 +729,12 @@ pub struct RecallResult {
     pub claim_id: String,
     pub content: String,
     pub truth_value: f64,
+    /// Dense cosine similarity in `[0,1]`; `0.0` for a lexical-only hit.
     pub similarity: f64,
+    /// Reciprocal Rank Fusion score (primary ordering).
+    pub rrf_score: f64,
+    /// Which legs matched: subset of `["dense","lexical"]`.
+    pub matched_via: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

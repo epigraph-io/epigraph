@@ -5,6 +5,11 @@ use epigraph_embeddings::{
 };
 use sqlx::PgPool;
 
+/// Per-leg candidate pool size before RRF fusion in hybrid recall.
+pub const HYBRID_CANDIDATE_POOL: i64 = 50;
+/// Reciprocal Rank Fusion constant `k` (canonical default 60).
+pub const HYBRID_RRF_K: i64 = 60;
+
 pub struct McpEmbedder {
     api_key: Option<String>,
     pool: PgPool,
@@ -151,6 +156,32 @@ impl McpEmbedder {
             .into_iter()
             .map(|r| (r.claim_id, r.similarity))
             .collect())
+    }
+
+    /// Hybrid retrieval: embed the query (1536d), then RRF-fuse the dense and
+    /// lexical legs via [`ClaimRepository::search_hybrid_scoped`]. Returns the
+    /// fused hits; the caller (`recall`) degrades to lexical-only on `Err`.
+    pub async fn search_hybrid_scoped(
+        &self,
+        query: &str,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<epigraph_db::HybridHit>, String> {
+        let embedding = self.generate(query).await?;
+        let pgvec = format_pgvector(&embedding);
+        epigraph_db::ClaimRepository::search_hybrid_scoped(
+            &self.pool,
+            &pgvec,
+            query,
+            HYBRID_CANDIDATE_POOL,
+            HYBRID_RRF_K,
+            limit,
+            tags,
+            agent_id,
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
 }
 

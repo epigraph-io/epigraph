@@ -12,7 +12,9 @@ use epigraph_core::{
     TruthValue,
 };
 use epigraph_crypto::ContentHasher;
-use epigraph_db::{ClaimRepository, EvidenceRepository, ReasoningTraceRepository};
+use epigraph_db::{ClaimRepository, EvidenceRepository, HybridHit, ReasoningTraceRepository};
+
+use crate::embed::HYBRID_RRF_K;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -154,69 +156,60 @@ pub async fn recall(
     let agent_filter = parse_agent_filter(params.agent_id.as_deref()).map_err(invalid_params)?;
     let tags = params.tags;
     let tags_opt: Option<&[String]> = if tags.is_empty() { None } else { Some(&tags) };
-    let scoped = tags_opt.is_some() || agent_filter.is_some();
 
-    // Try semantic search first, with any scope pushed into the query.
-    let semantic = server
+    // Hybrid retrieval: dense (claims.embedding) + lexical (content_tsv), RRF-fused.
+    // On embedder failure, degrade to lexical-only — which, unlike the old ILIKE
+    // fallback, still honors tag/agent scope because it filters in SQL.
+    let hits: Vec<HybridHit> = match server
         .embedder
-        .search_scoped(&params.query, limit, tags_opt, agent_filter)
-        .await;
-    if let Err(ref e) = semantic {
-        // Surface the otherwise-swallowed semantic-search error: when this Errs,
-        // recall silently degrades to the empty/text-fallback path below and
-        // returns [] for queries that DO have matches (backlog 1564bdaf). Logging
-        // the runtime cause (embedder failure vs DB/query error) makes it diagnosable.
-        tracing::warn!(
-            error = %e,
-            query = %params.query,
-            scoped,
-            "recall: semantic search_scoped failed; degrading to text/empty fallback"
-        );
-    }
-    let results = if let Ok(hits) = semantic {
-        let mut results = Vec::new();
-        for (claim_id, similarity) in hits {
-            if let Ok(Some(claim)) =
-                ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id)).await
-            {
-                let tv = claim.truth_value.value();
-                if tv >= min_truth {
-                    results.push(RecallResult {
-                        claim_id: claim_id.to_string(),
-                        content: claim.content,
-                        truth_value: tv,
-                        similarity,
-                    });
+        .search_hybrid_scoped(&params.query, limit, tags_opt, agent_filter)
+        .await
+    {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                query = %params.query,
+                "recall: hybrid embed leg failed; serving scope-honoring lexical-only"
+            );
+            ClaimRepository::search_lexical_scoped(
+                &server.pool,
+                &params.query,
+                HYBRID_RRF_K,
+                limit,
+                tags_opt,
+                agent_filter,
+            )
+            .await
+            .map_err(internal_error)?
+        }
+    };
+
+    let mut results = Vec::new();
+    for hit in hits {
+        if let Ok(Some(claim)) =
+            ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(hit.claim_id)).await
+        {
+            let tv = claim.truth_value.value();
+            if tv >= min_truth {
+                let mut matched_via = Vec::new();
+                if hit.dense_similarity.is_some() {
+                    matched_via.push("dense".to_string());
                 }
+                if hit.in_lexical {
+                    matched_via.push("lexical".to_string());
+                }
+                results.push(RecallResult {
+                    claim_id: hit.claim_id.to_string(),
+                    content: claim.content,
+                    truth_value: tv,
+                    similarity: hit.dense_similarity.unwrap_or(0.0),
+                    rrf_score: hit.rrf_score,
+                    matched_via,
+                });
             }
         }
-        results
-    } else if scoped {
-        // Degraded path: the embedder failed, so scoped semantic recall is
-        // unavailable. The text fallback (ILIKE over content) cannot enforce a
-        // tag scope — `Claim` carries no labels — so serving it would silently
-        // drop or bypass the requested scope. Return empty + warn rather than
-        // lie about what was searched.
-        tracing::warn!(
-            "recall: embedder unavailable; scoped recall (tags/agent_id) cannot be served by the unscoped text fallback — returning no results"
-        );
-        Vec::new()
-    } else {
-        // Fallback to unscoped text search (unchanged behaviour).
-        let claims = ClaimRepository::list(&server.pool, limit, 0, Some(&params.query))
-            .await
-            .map_err(internal_error)?;
-        claims
-            .into_iter()
-            .filter(|c| c.truth_value.value() >= min_truth)
-            .map(|c| RecallResult {
-                claim_id: c.id.as_uuid().to_string(),
-                content: c.content,
-                truth_value: c.truth_value.value(),
-                similarity: 0.0,
-            })
-            .collect()
-    };
+    }
 
     success_json(&results)
 }
