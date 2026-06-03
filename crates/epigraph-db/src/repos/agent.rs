@@ -144,6 +144,37 @@ impl AgentRepository {
         ))
     }
 
+    /// Find an agent by public key, else create it. Idempotent on `public_key`.
+    ///
+    /// Returns the resolved agent and `true` if it was freshly created, `false`
+    /// if an existing row was found. Assumes the only realistic unique collision
+    /// is `agents_public_key_unique` (the `id` is a fresh UUID). Narrow this
+    /// match if a future migration adds another unique constraint on `agents`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if a lookup or insert fails for reasons
+    /// other than the public-key uniqueness race, and `DbError::InvalidData`
+    /// if a raced-in row cannot be re-found after a `DuplicateKey`.
+    #[instrument(skip(pool, agent))]
+    pub async fn create_or_get(pool: &PgPool, agent: &Agent) -> Result<(Agent, bool), DbError> {
+        if let Some(existing) = Self::get_by_public_key(pool, &agent.public_key).await? {
+            return Ok((existing, false));
+        }
+        match Self::create(pool, agent).await {
+            Ok(created) => Ok((created, true)),
+            Err(DbError::DuplicateKey { .. }) => {
+                // Lost a concurrent registration race — re-find.
+                match Self::get_by_public_key(pool, &agent.public_key).await? {
+                    Some(existing) => Ok((existing, false)),
+                    None => Err(DbError::InvalidData {
+                        reason: "agent disappeared after DuplicateKey".to_string(),
+                    }),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Get an agent by ID
     ///
     /// # Errors
