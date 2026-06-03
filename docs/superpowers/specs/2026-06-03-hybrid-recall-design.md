@@ -26,7 +26,26 @@ fusion**; this spec adds that to `recall`.
 |---|---|---|
 | Target | The plain `recall` MCP tool (`tools/memory.rs`) | User scope; smallest surface. |
 | Candidate scope | All current claims (level-agnostic) | Already what the dense leg does; covers memorized/workflow claims (no `level`). |
-| Lexical engine | Native Postgres FTS over existing `content_tsv`, behind a swappable seam | `content_tsv` is a `GENERATED ALWAYS AS to_tsvector('english', content) STORED` column, GIN-indexed (`idx_claims_content_tsv`), **fully populated (432,054/432,054)** and proven (`ts_rank_cd` returns relevant hits live). Zero schema change. |
+| Lexical engine | Native Postgres FTS over `content_tsv`, behind a swappable seam | `content_tsv` is a `GENERATED ALWAYS AS to_tsvector('english', content) STORED` column, GIN-indexed (`idx_claims_content_tsv`), **fully populated (432,054/432,054)** and proven (`ts_rank_cd` returns relevant hits live). |
+
+### Schema / migration — reconcile `content_tsv` drift
+
+`content_tsv` + `idx_claims_content_tsv` **exist on prod but are absent from
+`migrations/`** (latest tracked migration is `049`) and unreferenced by any
+code — undocumented manual drift. Because `#[sqlx::test]` builds fresh DBs *from
+`migrations/`*, and fresh deploys must be reproducible, this work adds an
+**idempotent** migration `050_claims_content_tsv.sql`:
+
+```sql
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS content_tsv tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
+CREATE INDEX IF NOT EXISTS idx_claims_content_tsv ON claims USING gin (content_tsv);
+```
+
+`IF NOT EXISTS` makes it a no-op on prod (column/index already there) while
+creating both on fresh DBs. Deploy ordering caveat (per
+`feedback_spec_branch_migrations`): do **not** apply `050` to prod before the
+binary that includes it ships — the boot-time migrator handles it.
 | Fusion | **Reciprocal Rank Fusion (RRF) in SQL** (Approach A) | Rank-based → no cross-scale normalization; single round-trip; both legs index-backed; keeps SQL in `repos/` per repo convention. |
 | Response shape | Additive: keep `similarity` = dense cosine; add `rrf_score` + `matched_via` | Non-breaking for existing clients. |
 
