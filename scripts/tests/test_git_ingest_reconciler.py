@@ -142,5 +142,19 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(val("--endpoint"), "http://127.0.0.1:8080")
         self.assertIn("--dry-run", argv)
 
+class MainLoopTests(unittest.TestCase):
+    def test_runs_all_prs_and_isolates_failures(self):
+        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir="/tmp/st",
+                         default_orchestrator_id=None)
+        prs = [gir.PullRequest(1,"a","",f"s1","b","u","2026-06-03T11:59:00Z"),
+               gir.PullRequest(2,"b","",f"s2","b","u","2026-06-03T11:59:00Z")]
+        calls = []
+        with mock.patch.object(gir,"ensure_mirror",return_value="/m"), \
+             mock.patch.object(gir,"discover_merged_prs",return_value=prs), \
+             mock.patch.object(gir,"ingest_pr",side_effect=lambda pr,*a,**k:(calls.append(pr.number) or (1 if pr.number==1 else 0))):
+            n_ok, n_fail = gir.run_once(cfg, dry_run=False)
+        self.assertEqual(calls, [1,2])          # both attempted (failure isolated)
+        self.assertEqual((n_ok,n_fail),(1,1))
+
 if __name__ == "__main__":
     unittest.main()

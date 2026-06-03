@@ -169,3 +169,49 @@ def ingest_pr(pr, mirror, endpoint, slug, *, default_orchestrator_id=None,
     if res.returncode != 0:
         LOG.error("ingest PR #%s failed (%s): %s", pr.number, res.returncode, res.stderr.strip()[:500])
     return res.returncode
+
+def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None) -> tuple[int, int]:
+    """Reconcile every configured repo once. Repo-level failures (mirror/discovery)
+    and per-PR failures are both logged and isolated — one bad repo or PR never
+    aborts the rest — and counted into the failure tally. Returns (ok, fail)."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    env = gh_env()
+    ok = fail = 0
+    for slug in cfg.repos:
+        try:
+            mirror = ensure_mirror(f"https://github.com/{slug}.git", cfg.state_dir, env, slug_key=slug)
+            prs = discover_merged_prs(slug, env, cfg.window_minutes, now)
+        except Exception as e:  # repo-level failure: log + continue
+            LOG.error("repo %s discovery failed: %s", slug, e); fail += 1; continue
+        for pr in prs:
+            try:
+                rc = ingest_pr(pr, mirror, cfg.endpoint, slug,
+                               default_orchestrator_id=cfg.default_orchestrator_id,
+                               ingest_git_bin=cfg.ingest_git_bin, dry_run=dry_run)
+                ok += (rc == 0); fail += (rc != 0)
+            except Exception as e:
+                LOG.error("PR #%s (%s) ingest raised: %s", pr.number, slug, e); fail += 1
+    return ok, fail
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Server-side git-ingest reconciler (Plan 3)")
+    ap.add_argument("--config", default=os.environ.get("GIT_INGEST_CONFIG",
+                    str(Path(DEFAULT_STATE_DIR) / "config.toml")))
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--log-level", default="INFO")
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s")
+    cfg = load_config(args.config)
+    lock_path = Path(cfg.state_dir) / ".lock"; lock_path.parent.mkdir(parents=True, exist_ok=True)
+    import fcntl
+    with open(lock_path, "w") as lf:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            LOG.warning("another run holds the lock; exiting"); return 0
+        ok, fail = run_once(cfg, dry_run=args.dry_run)
+        LOG.info("done: %s ingested, %s failed", ok, fail)
+        return 1 if fail else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
