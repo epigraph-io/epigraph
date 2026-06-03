@@ -882,6 +882,44 @@ struct CreateAgentRequest {
 // AGENT MANAGEMENT
 // =============================================================================
 
+/// Derive a STABLE Ed25519 signer for a git author from their email, so the same
+/// human maps to the same agent identity across every run and repo. Email is
+/// normalized (trimmed + lowercased). This is the interim author-DID scheme
+/// pending the project's real DID system (spec §6.3).
+fn author_signer(_display_name: &str, email: &str) -> AgentSigner {
+    let normalized = email.trim().to_ascii_lowercase();
+    let seed = blake3::hash(format!("epigraph-git-author-v1:{normalized}").as_bytes());
+    let key: [u8; 32] = *seed.as_bytes();
+    AgentSigner::from_bytes(&key).expect("32-byte blake3 hash is a valid Ed25519 seed")
+}
+
+/// Resolve (and register if needed) the stable agent id for a git author.
+/// Caches the resolved agent id per email within a run to avoid duplicate POSTs.
+///
+/// `AgentSigner` is not `Clone` and the key is fully derived from the (normalized)
+/// email, so the cache stores only the `Uuid`; the signer is rebuilt deterministically
+/// via `author_signer` on every call. Per Task 0, agent registration is NOT idempotent
+/// on `public_key` (a UNIQUE constraint makes a repeated POST error), so the in-run cache
+/// is what prevents the duplicate registration; cross-run find-or-create is a server
+/// concern tracked for Task 8.
+#[allow(dead_code)]
+async fn resolve_author_agent(
+    client: &reqwest::Client,
+    endpoint: &str,
+    cache: &mut std::collections::HashMap<String, Uuid>,
+    display_name: &str,
+    email: &str,
+) -> Result<(AgentSigner, Uuid), String> {
+    let key = email.trim().to_ascii_lowercase();
+    let signer = author_signer(display_name, email);
+    if let Some(&agent_id) = cache.get(&key) {
+        return Ok((signer, agent_id));
+    }
+    let agent_id = AgentRegistry::register_agent(client, endpoint, &signer, display_name).await?;
+    cache.insert(key, agent_id);
+    Ok((signer, agent_id))
+}
+
 /// Per-author agent state: each unique git author gets their own signer and agent ID
 struct AuthorAgent {
     signer: AgentSigner,
@@ -2091,6 +2129,34 @@ async fn create_prov_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------------------------------
+    // Deterministic per-author agent identity tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn author_signer_is_deterministic_per_email() {
+        let a = author_signer("Jeremy Barton", "jeremy.barton@gmail.com");
+        let b = author_signer("J. Barton", "jeremy.barton@gmail.com"); // name differs, email same
+        let c = author_signer("Someone", "other@example.com");
+        assert_eq!(a.public_key(), b.public_key(), "same email => same key");
+        assert_ne!(
+            a.public_key(),
+            c.public_key(),
+            "different email => different key"
+        );
+    }
+
+    #[test]
+    fn author_email_is_normalized() {
+        let a = author_signer("x", "Jeremy.Barton@Gmail.com  ");
+        let b = author_signer("x", "jeremy.barton@gmail.com");
+        assert_eq!(
+            a.public_key(),
+            b.public_key(),
+            "case/space-insensitive email"
+        );
+    }
 
     // -------------------------------------------------------------------------
     // Header parsing tests
