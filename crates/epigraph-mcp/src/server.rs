@@ -979,13 +979,46 @@ impl EpiGraphMcpFull {
     // ── Meta (1 tool) ──
 
     #[tool(
-        description = "List all MCP tools available on this server. Returns the name, description, and JSON Schema for every registered tool. Use this for runtime tool discovery — the list reflects the live server state, including newly deployed tools not yet stored in the knowledge graph."
+        description = "List all MCP tools available on this server. Returns the name, description, and full JSON Schema for every registered tool — including tools your client may have DEFERRED (name visible but schema not loaded). Use this for runtime tool discovery and to load the schema of any tool your client could not call directly. The list reflects the live server state, including newly deployed tools not yet stored in the knowledge graph."
     )]
     async fn list_mcp_tools(&self) -> Result<CallToolResult, McpError> {
         let tools = self.tool_router.list_all();
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&tools).map_err(crate::errors::internal_error)?,
         )]))
+    }
+}
+
+impl EpiGraphMcpFull {
+    /// Build the `instructions` string surfaced in the MCP `initialize`
+    /// payload (`ServerInfo.instructions`).
+    ///
+    /// This is the ALWAYS-shown, never-deferred handshake text — clients
+    /// (including the claude.ai web connector) render it verbatim before
+    /// any `tools/list` page-in. We therefore use it to advertise the
+    /// deferred-tool / tool-search gate: many clients list a tool's *name*
+    /// but defer its *schema*, so a direct call fails with "not loaded
+    /// yet / call tool-search first". That is client-side deferral, NOT a
+    /// missing server tool — `tools/list` returns every registered tool.
+    ///
+    /// `tool_count` is derived from the live tool router (`all_tools_json`),
+    /// so it can never drift from the registered tool set the way a
+    /// hardcoded constant would.
+    #[must_use]
+    pub fn server_instructions(read_only: bool) -> String {
+        let mode = if read_only { "read-only" } else { "full" };
+        let tool_count = Self::all_tools_json().as_array().map_or(0, Vec::len);
+        format!(
+            "EpiGraph {mode} MCP server with {tool_count} epistemic tools. \
+             Many EpiGraph tools are DEFERRED by your client — their names may appear but \
+             their schemas are not loaded, so a direct call can fail with \
+             \"not loaded yet / call tool-search first\". This is NOT a missing tool. \
+             Use your client's tool-search mechanism (e.g. tool_search / ToolSearch) to load \
+             a tool's schema by name before calling it (the edge-writers submit_claim, \
+             link_hierarchical, supersede_claim and the graph reads get_neighborhood, traverse, \
+             query_claims are all available this way), or call list_mcp_tools to enumerate every \
+             tool with its full schema."
+        )
     }
 }
 
@@ -1001,12 +1034,8 @@ impl EpiGraphMcpFull {
 // dispatch.
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
-        let mode = if self.read_only { "read-only" } else { "full" };
-        let tool_count = Self::all_tools_json().as_array().map_or(0, Vec::len);
         ServerInfo {
-            instructions: Some(format!(
-                "EpiGraph {mode} MCP server with {tool_count} epistemic tools."
-            )),
+            instructions: Some(Self::server_instructions(self.read_only)),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
@@ -1148,5 +1177,63 @@ mod scope_guard_tests {
             "error should indicate the tool isn't authorized; got: {}",
             err.message
         );
+    }
+}
+
+#[cfg(test)]
+mod instructions_tests {
+    use super::*;
+
+    /// The `initialize` instructions are the only EpiGraph text a client (incl.
+    /// the claude.ai web connector) is GUARANTEED to render before any tool
+    /// schema is paged in. This guards that the deferred-tool / tool-search
+    /// gate guidance is present there, so an agent that sees a tool name but no
+    /// schema knows how to load it (rather than reporting the tool "missing").
+    ///
+    /// No DB: `server_instructions` is a pure function of `read_only` + the
+    /// static tool router, so it exercises the real production code path.
+    #[test]
+    fn instructions_advertise_the_tool_search_gate() {
+        let s = EpiGraphMcpFull::server_instructions(false);
+
+        // The gate must name a tool-search mechanism the client can act on.
+        assert!(
+            s.contains("tool_search") || s.contains("tool-search"),
+            "instructions must point at the tool-search gate; got: {s}"
+        );
+        // ...and the always-available enumerate-every-schema escape hatch.
+        assert!(
+            s.contains("list_mcp_tools"),
+            "instructions must mention list_mcp_tools as the schema-enumeration fallback; got: {s}"
+        );
+        // It must frame deferral as client-side, NOT a missing server tool —
+        // that framing is the whole point (an agent reported tools "absent").
+        assert!(
+            s.contains("DEFERRED"),
+            "instructions must explain tools are DEFERRED (not missing); got: {s}"
+        );
+    }
+
+    /// The tool count in the instructions must equal the LIVE registered tool
+    /// count, computed dynamically here (never a hardcoded literal) — that is
+    /// exactly what stops it going stale. If a tool is added/removed and this
+    /// substring stops matching, the production string is wrong.
+    #[test]
+    fn instructions_tool_count_matches_live_router() {
+        let n = EpiGraphMcpFull::tool_router().list_all().len();
+        let s = EpiGraphMcpFull::server_instructions(false);
+        assert!(
+            s.contains(&format!("{n} epistemic tools")),
+            "instructions must report the live tool count ({n}); got: {s}"
+        );
+    }
+
+    /// `read_only` only changes the human-readable mode label, not the
+    /// registered tool set (read-only is enforced at call time, not
+    /// registration), so the count is identical across modes.
+    #[test]
+    fn instructions_reflect_mode_label() {
+        assert!(EpiGraphMcpFull::server_instructions(true).contains("read-only"));
+        assert!(EpiGraphMcpFull::server_instructions(false).contains("full"));
     }
 }
