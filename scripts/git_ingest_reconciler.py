@@ -69,3 +69,49 @@ def compute_rev_range(mirror: str, merge_sha: str) -> str:
     if n_parents >= 2:
         return f"{merge_sha}^1..{merge_sha}^2"
     return f"{merge_sha}~1..{merge_sha}"
+
+@dataclass
+class PullRequest:
+    number: int; title: str; body: str; merge_sha: str
+    base_sha: str; author: str; merged_at: str
+
+def _gh_json(args: list[str], env: dict) -> list | dict:
+    """Run `gh api ...` and parse JSON stdout.
+
+    With `--paginate` alone, `gh` emits one separate JSON array/object PER page
+    (concatenated, e.g. `[...]\n[...]`), which a single `json.loads` cannot
+    parse (raises `Extra data`). `--slurp` (gh >= 2.83) wraps all pages in one
+    outer JSON array, so the whole stdout is a single valid document. When
+    `--slurp` is in args we therefore flatten the outer page array back into
+    the flat list of rows the callers expect; otherwise we return the parsed
+    document as-is."""
+    res = subprocess.run(["gh", "api", *args], check=True, capture_output=True, text=True, env=env)
+    data = json.loads(res.stdout)
+    if "--slurp" in args:
+        return [row for page in data for row in (page if isinstance(page, list) else [page])]
+    return data
+
+def discover_merged_prs(slug: str, env: dict, window_minutes: int, now: datetime.datetime) -> list[PullRequest]:
+    cutoff = now - datetime.timedelta(minutes=window_minutes)
+    rows = _gh_json(
+        [f"repos/{slug}/pulls", "-X", "GET",
+         "--field", "state=closed", "--field", "sort=updated",
+         "--field", "direction=desc", "--field", "per_page=50",
+         "--paginate", "--slurp"],
+        env,
+    )
+    out = []
+    for r in rows:
+        ma = r.get("merged_at")
+        if not ma or not r.get("merge_commit_sha"):
+            continue
+        when = datetime.datetime.fromisoformat(ma.replace("Z", "+00:00"))
+        if when < cutoff:
+            continue
+        out.append(PullRequest(
+            number=int(r["number"]), title=r.get("title") or "",
+            body=r.get("body") or "", merge_sha=r["merge_commit_sha"],
+            base_sha=(r.get("base") or {}).get("sha") or "",
+            author=(r.get("user") or {}).get("login") or "", merged_at=ma,
+        ))
+    return out
