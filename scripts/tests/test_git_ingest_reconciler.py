@@ -105,5 +105,19 @@ class DiscoverTests(unittest.TestCase):
         with self.assertRaises(json.JSONDecodeError):
             json.loads(concatenated)
 
+class MirrorTests(unittest.TestCase):
+    def test_clone_then_fetch(self):
+        with tempfile.TemporaryDirectory() as remote, tempfile.TemporaryDirectory() as state:
+            subprocess.run(["git","init","-qb","main",remote],check=True,capture_output=True)
+            for cmd in (["config","user.email","t@t"],["config","user.name","t"]):
+                subprocess.run(["git","-C",remote,*cmd],check=True,capture_output=True)
+            Path(remote,"a").write_text("1")
+            subprocess.run(["git","-C",remote,"add","."],check=True,capture_output=True)
+            subprocess.run(["git","-C",remote,"commit","-qm","c1"],check=True,capture_output=True)
+            mirror = gir.ensure_mirror(remote, state, {})         # first call clones
+            self.assertTrue(Path(mirror, ".git").exists() or Path(mirror, "HEAD").exists())
+            mirror2 = gir.ensure_mirror(remote, state, {})        # second call fetches
+            self.assertEqual(mirror, mirror2)
+
 if __name__ == "__main__":
     unittest.main()

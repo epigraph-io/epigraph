@@ -115,3 +115,23 @@ def discover_merged_prs(slug: str, env: dict, window_minutes: int, now: datetime
             author=(r.get("user") or {}).get("login") or "", merged_at=ma,
         ))
     return out
+
+def _mirror_dir(state_dir: str, slug_key: str) -> Path:
+    return Path(state_dir) / slug_key.replace("/", "__")
+
+def ensure_mirror(clone_url: str, state_dir: str, env: dict, slug_key: str | None = None) -> str:
+    """Maintain a per-repo local clone under `state_dir`. First call clones;
+    subsequent calls fetch+prune. `slug_key` (the repo slug) names the dir
+    (sanitised); defaults to `clone_url` so callers that pass a path can use it
+    directly. Production `clone_url` = `https://github.com/<slug>.git`; `gh`'s
+    credential helper or a PAT in `GH_TOKEN` (via `gh_env`) covers private
+    fetch. For the public-`epigraph` pilot no creds are needed."""
+    Path(state_dir).mkdir(parents=True, exist_ok=True)
+    d = _mirror_dir(state_dir, slug_key or clone_url)
+    if (d / "HEAD").exists() or (d / ".git").exists():
+        subprocess.run(["git", "-C", str(d), "fetch", "--prune", "origin"],
+                       check=True, capture_output=True, env=env)
+    else:
+        subprocess.run(["git", "clone", "--quiet", clone_url, str(d)],
+                       check=True, capture_output=True, env=env)
+    return str(d)
