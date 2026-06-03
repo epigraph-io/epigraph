@@ -322,8 +322,12 @@ pub struct SubmitPacketResponse {
     /// The calculated truth value (from evidence, NOT from reputation)
     pub truth_value: f64,
 
-    /// The created trace ID
-    pub trace_id: Uuid,
+    /// The trace bound to the canonical claim. `Some` on the create path
+    /// (a fresh reasoning trace was inserted) and on a dedup onto a claim that
+    /// already carries a trace; `None` when the deduped claim has no trace
+    /// (`trace_id IS NULL`). Never a fabricated id the caller would then try to
+    /// operate on (B2 — no phantom trace).
+    pub trace_id: Option<Uuid>,
 
     /// IDs of created evidence items
     pub evidence_ids: Vec<Uuid>,
@@ -970,6 +974,26 @@ fn parse_signature_hex(hex: &str) -> Option<[u8; 64]> {
 /// 7. Commit transaction
 ///
 /// On any failure, the transaction is rolled back automatically.
+///
+/// The canonical ids the caller must use downstream (response body, in-memory
+/// claim, event, idempotency cache, embedding loops). On the create path these
+/// are the freshly inserted trace + evidence ids; on the dedup path the trace
+/// id of the existing claim and an **empty** evidence list — the existing
+/// claim's evidence already lives in the graph and the caller must not echo
+/// phantom ids it would then try to embed against non-existent rows (B2).
+#[cfg(feature = "db")]
+struct PersistOutcome {
+    /// The canonical claim id — equal to the pre-generated id on a create,
+    /// or the existing row's id on a dedup.
+    claim_id: ClaimId,
+    /// `true` when the submit collapsed onto an existing claim.
+    was_duplicate: bool,
+    /// The trace bound to the canonical claim (create: fresh; dedup: existing).
+    trace_id: Option<TraceId>,
+    /// Evidence ids written on this submit — empty on a dedup.
+    evidence_ids: Vec<EvidenceId>,
+}
+
 #[cfg(feature = "db")]
 async fn persist_packet(
     pool: &epigraph_db::PgPool,
@@ -978,7 +1002,7 @@ async fn persist_packet(
     trace_id: TraceId,
     evidence_ids: &[EvidenceId],
     truth_value: f64,
-) -> Result<(ClaimId, bool /* was_duplicate */), (StatusCode, ErrorResponse)> {
+) -> Result<PersistOutcome, (StatusCode, ErrorResponse)> {
     let agent_id = AgentId::from_uuid(packet.claim.agent_id);
 
     // 1. Verify agent exists (FK constraint check)
@@ -1306,6 +1330,53 @@ async fn persist_packet(
         }
     } // end `if was_created`
 
+    // On a duplicate, resolve the canonical ids the caller will echo and reject
+    // tombstones (B3). `find_by_content_hash_and_agent` (used by
+    // `create_or_get`) has no `is_current` predicate, so a superseded /
+    // marked-duplicate row collides on `(content_hash, agent_id)` just like a
+    // live one. `get_by_id` returns the *real* `is_current`; attaching new
+    // ingestion data to a tombstone (or returning it as if live) is forbidden.
+    //
+    // Invariant: structural ingestion nodes (repo/PR/commit) are never
+    // superseded, so a 409 here is an operational anomaly, not a normal path.
+    // (A partial `UNIQUE … WHERE is_current` index would enforce this in the
+    // schema, but that is a migration and out of scope for 2.5.)
+    let dedup_trace_id = if was_created {
+        None
+    } else {
+        let existing = epigraph_db::ClaimRepository::get_by_id(pool, canonical_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        format!("Failed to load existing claim: {}", e),
+                    ),
+                )
+            })?
+            .ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        "claim for (content_hash, agent_id) vanished after find-or-create",
+                    ),
+                )
+            })?;
+        if !existing.is_current {
+            return Err((
+                StatusCode::CONFLICT,
+                ErrorResponse::new(
+                    "DuplicateNotCurrent",
+                    "claim for (content_hash, agent_id) exists but is not current \
+                     (superseded/duplicate); refusing to attach to a tombstone",
+                ),
+            ));
+        }
+        existing.trace_id
+    };
+
     // 7. Commit transaction
     tx.commit().await.map_err(|e| {
         (
@@ -1317,7 +1388,25 @@ async fn persist_packet(
         )
     })?;
 
-    Ok((canonical_id, !was_created))
+    // Carry the canonical ids for the response (B2). On the create path the
+    // freshly inserted trace + evidence ids; on the dedup path the existing
+    // claim's trace and an empty evidence list (its evidence is already in the
+    // graph — echoing the pre-generated ids would make the caller embed against
+    // non-existent rows).
+    Ok(PersistOutcome {
+        claim_id: canonical_id,
+        was_duplicate: !was_created,
+        trace_id: if was_created {
+            Some(trace_id)
+        } else {
+            dedup_trace_id
+        },
+        evidence_ids: if was_created {
+            evidence_ids.to_vec()
+        } else {
+            Vec::new()
+        },
+    })
 }
 
 // =============================================================================
@@ -1404,14 +1493,16 @@ pub async fn submit_packet(
     //    - Commits transaction
     //    - On any failure, rolls back (no partial state)
     //
-    // Shadow the pre-generated `claim_id` with the *canonical* id returned by
-    // `persist_packet`: on a duplicate submit the find-or-create resolves to
-    // an existing row, so every downstream user (in-memory claim, response,
-    // event, idempotency store) must carry the canonical id, not the
-    // throwaway pre-gen UUID. (Full `was_duplicate` threading — propagation
-    // skip, embedding guards, response flag — is Task 5.)
+    // Persist and resolve the *canonical* ids the response and downstream
+    // bookkeeping must carry. On a duplicate submit the find-or-create resolves
+    // to an existing row, so the response/idempotency-cache must report that
+    // claim's id, its trace, an empty evidence list (B2 — no phantom ids), and
+    // `was_duplicate = true`. The pre-generated `trace_id` / `evidence_ids`
+    // locals are kept intact for the in-memory propagation claim and the
+    // figure-embedding loop (which indexes `evidence_ids[i]`); the full
+    // propagation/embedding skip on dedup is Task 5.
     #[cfg(feature = "db")]
-    let claim_id = {
+    let (claim_id, was_duplicate, response_trace_id, response_evidence_ids) = {
         let domain_claim_id = ClaimId::from_uuid(claim_id);
         let domain_trace_id = TraceId::from_uuid(trace_id);
         let domain_evidence_ids: Vec<EvidenceId> = evidence_ids
@@ -1429,10 +1520,34 @@ pub async fn submit_packet(
         )
         .await
         {
-            Ok((canonical_id, _was_duplicate)) => canonical_id.as_uuid(),
+            Ok(outcome) => {
+                // Carry the canonical claim's *actual* trace, faithfully `None`
+                // when the deduped claim has no trace. No fallback to the
+                // pre-generated `trace_id`: it was never inserted into
+                // `reasoning_traces` (the trace INSERT is gated on `was_created`),
+                // so echoing it would advertise a phantom trace id the caller
+                // would then try to operate on (B2 — no phantom trace/evidence).
+                let response_trace_id: Option<Uuid> = outcome.trace_id.map(|tid| tid.as_uuid());
+                let response_evidence_ids: Vec<Uuid> = outcome
+                    .evidence_ids
+                    .iter()
+                    .map(EvidenceId::as_uuid)
+                    .collect();
+                (
+                    outcome.claim_id.as_uuid(),
+                    outcome.was_duplicate,
+                    response_trace_id,
+                    response_evidence_ids,
+                )
+            }
             Err((status, error)) => return (status, Json(error)).into_response(),
         }
     };
+    // Without the db feature there is no persistence step; the response simply
+    // echoes the pre-generated ids and is never a duplicate.
+    #[cfg(not(feature = "db"))]
+    let (was_duplicate, response_trace_id, response_evidence_ids) =
+        (false, Some(trace_id), evidence_ids.clone());
 
     // 6. Create the claim object and register it for propagation
     //
@@ -1696,9 +1811,9 @@ pub async fn submit_packet(
     let response = SubmitPacketResponse {
         claim_id,
         truth_value,
-        trace_id,
-        evidence_ids: evidence_ids.clone(),
-        was_duplicate: false,
+        trace_id: response_trace_id,
+        evidence_ids: response_evidence_ids.clone(),
+        was_duplicate,
     };
 
     // 9. Publish ClaimSubmitted event (fire-and-forget)
@@ -1737,8 +1852,8 @@ pub async fn submit_packet(
             CachedSubmission {
                 claim_id,
                 truth_value,
-                trace_id,
-                evidence_ids,
+                trace_id: response_trace_id,
+                evidence_ids: response_evidence_ids,
                 created_at: Instant::now(),
             },
         );

@@ -19,8 +19,8 @@ use axum::{
 };
 use epigraph_api::middleware::SignatureVerificationState;
 use epigraph_api::{create_router, ApiConfig, AppState};
-use epigraph_core::Agent;
-use epigraph_db::{AgentRepository, PgPool};
+use epigraph_core::{Agent, ClaimId, TruthValue};
+use epigraph_db::{AgentRepository, ClaimRepository, PgPool};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -354,5 +354,277 @@ async fn submit_packet_durable_idempotency_across_processes(pool: PgPool) {
         files_changed.as_deref(),
         Some("3"),
         "properties from the create path must be persisted"
+    );
+}
+
+// =============================================================================
+// Task 4: dead-node guard (B3) + correct dedup return data (B2).
+// =============================================================================
+
+/// Build a submit packet with one document-evidence item and the given
+/// `agent_uuid`/`claim_content`. No `idempotency_key`: the in-memory cache
+/// (submit.rs:1361) short-circuits before `persist_packet` when a key is
+/// present, which would mask the duplicate path under test. Without a key
+/// every submit reaches `persist_packet`.
+fn evidence_packet(agent_uuid: Uuid, claim_content: &str) -> serde_json::Value {
+    let evidence_content = "Empirical data backing the claim under dedup test";
+    let evidence_hash = epigraph_crypto::ContentHasher::to_hex(
+        &epigraph_crypto::ContentHasher::hash(evidence_content.as_bytes()),
+    );
+    serde_json::json!({
+        "claim": {
+            "content": claim_content,
+            "initial_truth": 0.5,
+            "agent_id": agent_uuid,
+            "properties": { "kind": "dedup-test" }
+        },
+        "evidence": [{
+            "content_hash": evidence_hash,
+            "evidence_type": { "type": "document", "source_url": null, "mime_type": "text/plain" },
+            "raw_content": evidence_content,
+            "signature": null
+        }],
+        "reasoning_trace": {
+            "methodology": "inductive",
+            "inputs": [{ "type": "evidence", "index": 0 }],
+            "confidence": 0.8,
+            "explanation": "Based on the provided evidence, this conclusion follows.",
+            "signature": null
+        },
+        "signature": "0".repeat(128)
+    })
+}
+
+/// **Task 4 driver — dead-node guard (B3).**
+///
+/// If the claim for `(content_hash, agent_id)` exists but is no longer current
+/// (superseded / marked duplicate), resubmitting the same content must be
+/// rejected with **409 Conflict** rather than silently attaching dependent
+/// rows to a tombstone or returning the dead node as if it were live.
+///
+/// `find_by_content_hash_and_agent` (and therefore `create_or_get`) has no
+/// `is_current` predicate, so without the guard the duplicate branch returns
+/// the tombstone as if current. We supersede with *different* content so the
+/// original `(content_hash, agent_id)` row flips to `is_current = false` while
+/// its content hash is unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_rejects_tombstone_duplicate_with_409(pool: PgPool) {
+    let agent = fixed_agent(43, "tombstone-agent");
+    let created_agent = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed");
+    let agent_uuid: Uuid = created_agent.id.into();
+
+    let claim_content = "Claim destined to be superseded then resubmitted";
+    let packet = evidence_packet(agent_uuid, claim_content);
+
+    // Create claim C.
+    let router = create_test_router(pool.clone());
+    let (status_1, body_1) = post_packet(&router, packet.clone()).await;
+    assert_eq!(
+        status_1,
+        StatusCode::CREATED,
+        "first submit should be 201, got {status_1}: {body_1}"
+    );
+    let json_1: serde_json::Value =
+        serde_json::from_str(&body_1).expect("first response should be JSON");
+    let claim_id_1 = Uuid::parse_str(json_1["claim_id"].as_str().expect("claim_id present"))
+        .expect("claim_id should parse as uuid");
+
+    // Supersede C with *different* content → C.is_current = false, content_hash
+    // unchanged, so resubmitting the original content re-finds the tombstone.
+    ClaimRepository::supersede(
+        &pool,
+        ClaimId::from_uuid(claim_id_1),
+        "A corrected, different claim that replaces the original",
+        TruthValue::new(0.6).expect("valid truth value"),
+        "test: retire the original to create a tombstone",
+    )
+    .await
+    .expect("supersede should succeed");
+
+    // Resubmit the original packet → must be 409 (refusing the tombstone).
+    let (status_2, body_2) = post_packet(&router, packet).await;
+    assert_eq!(
+        status_2,
+        StatusCode::CONFLICT,
+        "resubmitting content whose (content_hash, agent_id) row is a tombstone \
+         must be 409, got {status_2}: {body_2}"
+    );
+    // Pin the 409 to the dead-node guard specifically, not any future 409 on
+    // this path: the body must carry the `DuplicateNotCurrent` error code.
+    let json_2: serde_json::Value =
+        serde_json::from_str(&body_2).expect("409 response should be JSON");
+    assert_eq!(
+        json_2["error"], "DuplicateNotCurrent",
+        "tombstone rejection must carry the DuplicateNotCurrent error code, got {body_2}"
+    );
+}
+
+/// **Task 4 driver — correct dedup return data (B2).**
+///
+/// A *normal* dedup (the existing claim is still current) returns 201 with
+/// `was_duplicate = true`, the **same canonical `claim_id`**, and an **empty
+/// `evidence_ids`** list — the server must not echo phantom evidence ids the
+/// caller would then try to embed against non-existent evidence rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_dedup_returns_canonical_id_and_empty_evidence(pool: PgPool) {
+    let agent = fixed_agent(44, "normal-dedup-agent");
+    let created_agent = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed");
+    let agent_uuid: Uuid = created_agent.id.into();
+
+    let claim_content = "Claim submitted twice while remaining current";
+    let packet = evidence_packet(agent_uuid, claim_content);
+
+    let router = create_test_router(pool.clone());
+
+    // First submit → create path.
+    let (status_1, body_1) = post_packet(&router, packet.clone()).await;
+    assert_eq!(
+        status_1,
+        StatusCode::CREATED,
+        "first submit should be 201, got {status_1}: {body_1}"
+    );
+    let json_1: serde_json::Value =
+        serde_json::from_str(&body_1).expect("first response should be JSON");
+    assert_eq!(
+        json_1["was_duplicate"], false,
+        "create path must report was_duplicate=false"
+    );
+    let claim_id_1 = json_1["claim_id"]
+        .as_str()
+        .expect("first response must carry claim_id")
+        .to_string();
+    // The create path inserted a reasoning trace, so the first response carries
+    // a concrete trace id we expect the dedup to echo verbatim.
+    let trace_id_1 = json_1["trace_id"]
+        .as_str()
+        .expect("create response must carry a trace_id")
+        .to_string();
+
+    // Second submit (same router, no idempotency_key) → reaches persist_packet,
+    // finds the still-current claim → dedup path.
+    let (status_2, body_2) = post_packet(&router, packet).await;
+    assert_eq!(
+        status_2,
+        StatusCode::CREATED,
+        "dedup submit should be 201, got {status_2}: {body_2}"
+    );
+    let json_2: serde_json::Value =
+        serde_json::from_str(&body_2).expect("second response should be JSON");
+    assert_eq!(
+        json_2["was_duplicate"], true,
+        "dedup path must report was_duplicate=true"
+    );
+    assert_eq!(
+        json_2["claim_id"].as_str(),
+        Some(claim_id_1.as_str()),
+        "dedup must return the same canonical claim id"
+    );
+    let evidence_ids = json_2["evidence_ids"]
+        .as_array()
+        .expect("evidence_ids must be an array");
+    assert!(
+        evidence_ids.is_empty(),
+        "dedup must return empty evidence_ids (no phantom ids), got {evidence_ids:?}"
+    );
+    // B2 (trace dimension): the dedup response's trace_id must equal the
+    // existing claim's *actual* trace — never the fresh, never-persisted
+    // pre-generated trace id of the second submit. Since the existing claim was
+    // created via submit/packet it carries the trace from the first response.
+    assert_eq!(
+        json_2["trace_id"].as_str(),
+        Some(trace_id_1.as_str()),
+        "dedup must echo the existing claim's trace, not a phantom id, got {body_2}"
+    );
+}
+
+/// **B2 regression — dedup onto a NULL-trace claim returns `trace_id: null`,
+/// never a phantom id.**
+///
+/// `submit/packet`'s own create path always inserts a reasoning trace, so the
+/// existing dedup test can only exercise the `Some(trace)` branch. But several
+/// repo insert paths create claims with `trace_id IS NULL` that share the
+/// `(content_hash, agent_id)` key (e.g. `create_with_id_if_absent`, used by
+/// workflow-ingest). A same-agent cross-path collision (a NULL-trace claim
+/// later resubmitted via submit/packet) drives the dedup branch with
+/// `existing.trace_id == None`.
+///
+/// Before the fix the caller fell back to the pre-generated `trace_id` (a fresh
+/// UUID never inserted into `reasoning_traces`), advertising a phantom trace the
+/// CLI would then try to operate on. The response's `trace_id` must instead be
+/// `null` — faithfully reflecting that the canonical claim has no trace.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_dedup_onto_null_trace_claim_returns_null_trace(pool: PgPool) {
+    use epigraph_core::Claim;
+
+    let agent = fixed_agent(45, "null-trace-dedup-agent");
+    let created_agent = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed");
+    let agent_uuid: Uuid = created_agent.id.into();
+    let agent_id = created_agent.id;
+
+    // Content the packet will carry; the pre-seeded claim must share its
+    // `(content_hash, agent_id)` so the submit collapses onto it.
+    let claim_content = "A claim first ingested with no reasoning trace";
+
+    // Seed a *current* claim with trace_id = None directly via the repo,
+    // mimicking a NULL-trace cross-path insert (e.g. workflow ingest). The
+    // content hash is computed inside `create_strict` from the content, so it
+    // matches the packet's content hash for the same agent.
+    let content_hash = epigraph_crypto::ContentHasher::hash(claim_content.as_bytes());
+    let seeded = Claim::with_id(
+        ClaimId::new(),
+        claim_content.to_string(),
+        agent_id,
+        [0u8; 32],
+        content_hash,
+        None, // trace_id IS NULL — the branch under test
+        None,
+        TruthValue::new(0.5).expect("valid truth value"),
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+    );
+    let mut conn = pool.acquire().await.expect("acquire conn");
+    let (persisted, created) = ClaimRepository::create_or_get(&mut conn, &seeded)
+        .await
+        .expect("seeding the null-trace claim should succeed");
+    assert!(created, "seed must be a fresh create");
+    assert!(
+        persisted.trace_id.is_none(),
+        "seeded claim must have a NULL trace_id"
+    );
+    drop(conn);
+    let seeded_id = persisted.id.as_uuid().to_string();
+
+    // Resubmit the same content via submit/packet → dedup branch with
+    // existing.trace_id == None.
+    let router = create_test_router(pool.clone());
+    let packet = evidence_packet(agent_uuid, claim_content);
+    let (status, body) = post_packet(&router, packet).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "dedup onto a current null-trace claim should be 201, got {status}: {body}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&body).expect("response should be JSON");
+    assert_eq!(
+        json["was_duplicate"], true,
+        "must report was_duplicate=true (collapsed onto the seeded claim)"
+    );
+    assert_eq!(
+        json["claim_id"].as_str(),
+        Some(seeded_id.as_str()),
+        "dedup must return the seeded claim's canonical id"
+    );
+    // The whole point: no phantom trace. The seeded claim has no trace, so the
+    // response must report `trace_id: null`, not the second submit's fresh,
+    // never-persisted pre-generated trace id.
+    assert!(
+        json["trace_id"].is_null(),
+        "dedup onto a NULL-trace claim must return trace_id: null (no phantom), got {body}"
     );
 }
