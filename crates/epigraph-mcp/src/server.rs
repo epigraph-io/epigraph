@@ -392,6 +392,17 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent for re-runs at the same pipeline version."
+    )]
+    async fn ingest_document_inline(
+        &self,
+        Parameters(params): Parameters<IngestDocumentInlineParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::ingestion::ingest_document_inline(self, params).await
+    }
+
+    #[tool(
         description = "Create a cross-tier structural edge between two existing claims (decomposes_to, section_follows, or continues_argument). Purpose-built for per-chapter ingest wire-ups (chapter thesis -> book thesis, chapter[N] -> chapter[N+1]). Idempotent on (source, target, relationship): re-runs return the existing edge_id with created=false. Bypasses HTTP and goes straight through the repo layer."
     )]
     async fn link_hierarchical(

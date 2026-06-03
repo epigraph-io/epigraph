@@ -87,3 +87,49 @@ python3 scripts/backfill_source_strength.py --execute
 After --execute, run `reconcile_sheaf` (or wait for the next nightly
 graph-integrity task) so beliefs re-aggregate against the new
 discount weights. Idempotent — re-runs only touch rows still NULL.
+
+## git_ingest_reconciler.py
+
+Server-side git-ingest reconciler (Plan 3). Discovers newly-merged PRs
+across configured repos (read-only GitHub access via the `gh` CLI) and
+runs `ingest_git --pr-ingest` against the localhost EpiGraph API for
+each — continuous, cross-repo, idempotent commit ingestion with no
+external CI and no write-token spray. Stdlib-only; idempotent (Plan
+2.5) and stateless, so it is safe to run repeatedly on a cron.
+
+**Auth:** set `EPIGRAPH_GIT_INGEST_GITHUB_PAT` to a *read-only* PAT
+(injected as `GH_TOKEN` for the `gh` subprocesses), or leave it unset to
+fall back to the host's own `gh auth` token. Writes go to the localhost
+API, not GitHub — **no GitHub write scope is ever used**.
+
+**Install:**
+
+```bash
+# 1. Copy the template into the state dir and edit it (repos, endpoint, bin path):
+sudo mkdir -p /var/lib/epiclaw/git-ingest
+sudo cp scripts/git_ingest_reconciler.config.example.toml \
+        /var/lib/epiclaw/git-ingest/config.toml
+sudo $EDITOR /var/lib/epiclaw/git-ingest/config.toml
+
+# 2. Build the ingester this config points at (or use the deployed release path):
+cargo build --bin ingest_git   # → .cargo-target/debug/ingest_git
+
+# 3. Dry-run first (no API writes; proves discovery + range + argv end to end):
+EPIGRAPH_GIT_INGEST_GITHUB_PAT=ghp_readonly... \
+  python3 scripts/git_ingest_reconciler.py \
+    --config /var/lib/epiclaw/git-ingest/config.toml --dry-run
+```
+
+**Cron** (every 15 min; a `fcntl` lock in `state_dir/.lock` prevents
+overlapping runs):
+
+```
+*/15 * * * *  EPIGRAPH_GIT_INGEST_GITHUB_PAT=... /usr/bin/python3 /home/jeremy/epigraph/scripts/git_ingest_reconciler.py --config /var/lib/epiclaw/git-ingest/config.toml >> /var/log/git-ingest.log 2>&1
+```
+
+**Hard rule — do NOT enable the cron until Plan 2.5 is in prod**
+(`dev → main` merge + redeploy of the `ingest_git --pr-ingest`
+find-or-create / idempotency path). Until then, run the reconciler
+**only with `--dry-run`**. Enabling the live cron against a server that
+predates Plan 2.5 risks duplicate or malformed claim writes.
+

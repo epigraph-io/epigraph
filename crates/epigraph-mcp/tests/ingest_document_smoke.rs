@@ -7,7 +7,8 @@ use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
-use epigraph_mcp::tools::ingestion::do_ingest_document;
+use epigraph_mcp::tools::ingestion::{do_ingest_document, ingest_document_inline};
+use epigraph_mcp::types::IngestDocumentInlineParams;
 use sqlx::PgPool;
 
 const FIXTURE: &str = r#"{
@@ -505,6 +506,161 @@ async fn ingest_tags_bbas_with_normalized_evidence_type(pool: sqlx::PgPool) {
     assert_eq!(
         raw_case, 0,
         "raw 'Empirical' should have been normalized to lowercase"
+    );
+}
+
+// ── Typed-inline ingest variant (for MCP-only agents) ──────────────────────
+
+/// Recursively collect every `$ref` string value in a JSON schema.
+fn collect_refs(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                if k == "$ref" {
+                    if let Some(s) = val.as_str() {
+                        out.push(s.to_string());
+                    }
+                } else {
+                    collect_refs(val, out);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => arr.iter().for_each(|val| collect_refs(val, out)),
+        _ => {}
+    }
+}
+
+/// The deliverable, verified on the wire (not just the param type): the live
+/// tool router must expose `ingest_document_inline` with a self-contained
+/// `inputSchema` — the nested hierarchy inlined in `$defs` down to the atom
+/// layer, and every `$ref` resolvable within that same block. A `$ref` with
+/// no matching `$defs` entry would hand an MCP client an unusable schema while
+/// the param-type schema test stayed green, so this is the assertion that
+/// actually guards the feature.
+#[test]
+fn inline_tool_wire_schema_is_self_contained() {
+    let tools = epigraph_mcp::server::EpiGraphMcpFull::all_tools_json();
+    let arr = tools.as_array().expect("tool array");
+    let tool = arr
+        .iter()
+        .find(|t| t["name"] == "ingest_document_inline")
+        .expect("ingest_document_inline registered in live tool router");
+    let input_schema = &tool["inputSchema"];
+
+    let defs = input_schema["$defs"]
+        .as_object()
+        .expect("inputSchema carries a $defs block");
+    for ty in [
+        "DocumentExtraction",
+        "DocumentSource",
+        "Section",
+        "Paragraph",
+    ] {
+        assert!(
+            defs.contains_key(ty),
+            "$defs must inline `{ty}`; got keys {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    let schema_str = serde_json::to_string(input_schema).unwrap();
+    for field in [
+        "sections",
+        "paragraphs",
+        "compound",
+        "atoms",
+        "evidence_type",
+    ] {
+        assert!(
+            schema_str.contains(field),
+            "wire schema must expose `{field}` so an MCP client sees the shape"
+        );
+    }
+
+    // Decisive: every $ref resolves within this schema's own $defs.
+    let mut refs = Vec::new();
+    collect_refs(input_schema, &mut refs);
+    assert!(
+        !refs.is_empty(),
+        "expected nested $ref pointers in the schema"
+    );
+    for r in &refs {
+        let key = r
+            .strip_prefix("#/$defs/")
+            .unwrap_or_else(|| panic!("unexpected $ref form: {r}"));
+        assert!(
+            defs.contains_key(key),
+            "dangling $ref `{r}` — not present in $defs"
+        );
+    }
+}
+
+/// The discoverability fix: the typed inline param must expose the full
+/// hierarchical `DocumentExtraction` shape as a JSON schema, so an MCP client
+/// can introspect exactly what to produce — down to atoms — instead of
+/// guessing at the opaque `file_path` contract `ingest_document` exposes.
+#[test]
+fn inline_params_expose_hierarchical_json_schema() {
+    let schema = schemars::schema_for!(IngestDocumentInlineParams);
+    let s = serde_json::to_string(&schema).expect("schema serializes");
+    for needle in [
+        "extraction",
+        "source",
+        "thesis",
+        "sections",
+        "paragraphs",
+        "compound",
+        "atoms",
+        "evidence_type",
+        "relationships",
+    ] {
+        assert!(
+            s.contains(needle),
+            "inline-ingest JSON schema must expose `{needle}` so an MCP client can see the shape; schema was: {s}"
+        );
+    }
+}
+
+/// Parity: the typed-inline path lands the identical full hierarchy as the
+/// file-path `do_ingest_document` — thesis + section + paragraph + 2 atoms —
+/// with the atoms persisted as their own claim nodes (the "down to atomic
+/// claims" resolution the inline variant exists to provide for MCP-only
+/// agents).
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
+    let server = make_server(pool.clone());
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+    let params = IngestDocumentInlineParams { extraction };
+
+    let result = ingest_document_inline(&server, params)
+        .await
+        .expect("inline ingest succeeds");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    assert_eq!(json["already_ingested"], serde_json::json!(false));
+    assert_eq!(
+        json["claims_ingested"].as_u64().unwrap(),
+        5,
+        "typed-inline path lands the same thesis + section + paragraph + 2 atoms as the file path"
+    );
+
+    // Atoms landed as their own claim rows — the atomic resolution.
+    let atom_count: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM claims
+        WHERE content IN (
+            'Atomization aids cross-source matching',
+            'Explicit decomposition is necessary for hierarchical reasoning'
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        atom_count.0, 2,
+        "both atoms persisted as claim nodes via the inline path"
     );
 }
 

@@ -1,11 +1,12 @@
 //! Schema types for document (paper) extraction.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::common::schema::{AuthorEntry, ClaimRelationship, ThesisDerivation};
 
 /// Top-level extraction result from a document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentExtraction {
     pub source: DocumentSource,
     #[serde(default)]
@@ -19,7 +20,7 @@ pub struct DocumentExtraction {
 }
 
 /// Metadata about the source document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentSource {
     pub title: String,
     #[serde(default)]
@@ -39,7 +40,7 @@ pub struct DocumentSource {
 }
 
 /// The type of source document.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub enum SourceType {
     #[default]
     Paper,
@@ -52,7 +53,7 @@ pub enum SourceType {
 }
 
 /// A section within the document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Section {
     pub title: String,
     #[serde(default)]
@@ -62,7 +63,7 @@ pub struct Section {
 }
 
 /// A paragraph containing atomic claims.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Paragraph {
     pub compound: String,
     #[serde(default)]
