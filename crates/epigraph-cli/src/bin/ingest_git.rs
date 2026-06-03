@@ -1272,6 +1272,71 @@ fn build_repo_packet(repo_slug: &str, agent_id: Uuid, signer: &AgentSigner) -> E
     }
 }
 
+/// Metadata describing a single merged pull request, supplied by the CI caller.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct PrMeta {
+    repo_slug: String,
+    number: u64,
+    title: String,
+    body: String,
+    merge_sha: String,
+    merged_at: String, // ISO-8601
+    author_login: String,
+}
+
+/// Build the find-or-create packet for a PR node. `orchestrator_id` is the
+/// implementing orchestrator agent (resolved upstream), which authors the PR
+/// claim per the design's attribution rule (§6.1).
+///
+/// Keyed on a stable `pr:{slug}#{number}` idempotency_key so re-runs of the same
+/// PR resolve to one claim. The PR body is carried as evidence; the merge sha,
+/// merge time, url, and number live in `properties` for downstream datestamped
+/// edge linking and resolution lookup.
+#[allow(dead_code)]
+fn build_pr_packet(meta: &PrMeta, orchestrator_id: Uuid) -> EpistemicPacket {
+    let content = format!("[PR #{}] {}", meta.number, meta.title);
+    let body = if meta.body.trim().is_empty() {
+        meta.title.clone()
+    } else {
+        meta.body.clone()
+    };
+    let url = format!("https://github.com/{}/pull/{}", meta.repo_slug, meta.number);
+    let ev = EvidenceSubmission {
+        content_hash: hex::encode(ContentHasher::hash(body.as_bytes())),
+        evidence_type: EvidenceTypeSubmission::Document {
+            source_url: Some(url.clone()),
+            mime_type: "text/markdown".into(),
+        },
+        raw_content: Some(body),
+        signature: None,
+    };
+    EpistemicPacket {
+        claim: ClaimSubmission {
+            content,
+            initial_truth: Some(0.8),
+            agent_id: orchestrator_id,
+            idempotency_key: Some(format!("pr:{}#{}", meta.repo_slug, meta.number)),
+            properties: Some(serde_json::json!({
+                "source": "git-history", "node": "pr",
+                "repo": meta.repo_slug, "pr_number": meta.number,
+                "merge_sha": meta.merge_sha, "merged_at": meta.merged_at,
+                "url": url,
+                "author_login": meta.author_login, "orchestrator_agent_id": orchestrator_id,
+            })),
+        },
+        evidence: vec![ev],
+        reasoning_trace: ReasoningTraceSubmission {
+            methodology: "heuristic".into(),
+            inputs: vec![TraceInputSubmission::Evidence { index: 0 }],
+            confidence: 0.8,
+            explanation: format!("PR #{} merged at {}", meta.number, meta.merged_at),
+            signature: None,
+        },
+        signature: "0".repeat(128),
+    }
+}
+
 /// Add labels to an existing claim via `PATCH /api/v1/claims/{id}/labels`.
 ///
 /// Route confirmed against `routes/claims.rs::update_labels`: the dedicated
@@ -2385,6 +2450,38 @@ mod tests {
         assert_eq!(props["source"], "git-history");
         assert_eq!(props["node"], "repo");
         assert_eq!(props["repo"], "epigraph-io/epiclaw-host");
+    }
+
+    // -------------------------------------------------------------------------
+    // PR-node find-or-create packet tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn pr_packet_keys_on_repo_and_number_and_carries_properties() {
+        // build_pr_packet takes only the orchestrator agent_id; the PR node carries
+        // no per-author evidence signature (unlike build_repo_packet).
+        let meta = PrMeta {
+            repo_slug: "epigraph-io/epigraph".into(),
+            number: 252,
+            title: "fix(api): stop auto-enqueueing cluster jobs".into(),
+            body: "## Summary\nResolves d531c585".into(),
+            merge_sha: "2a31f8d".into(),
+            merged_at: "2026-06-02T15:10:01Z".into(),
+            author_login: "tylorsama".into(),
+        };
+        let p = build_pr_packet(&meta, Uuid::nil());
+        assert_eq!(
+            p.claim.idempotency_key.as_deref(),
+            Some("pr:epigraph-io/epigraph#252")
+        );
+        assert!(p
+            .claim
+            .content
+            .contains("stop auto-enqueueing cluster jobs"));
+        let props = p.claim.properties.as_ref().unwrap();
+        assert_eq!(props["node"], "pr");
+        assert_eq!(props["pr_number"], 252);
+        assert_eq!(props["merge_sha"], "2a31f8d");
     }
 
     // -------------------------------------------------------------------------
