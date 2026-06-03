@@ -20,6 +20,22 @@ pub struct ClaimEmbeddingHit {
     pub similarity: f64,
 }
 
+/// One fused hit from [`ClaimRepository::search_hybrid_scoped`] /
+/// [`ClaimRepository::search_lexical_scoped`].
+///
+/// `rrf_score` is the Reciprocal Rank Fusion score (higher = better; sums
+/// `1/(k+rank)` across the legs the claim appeared in). `dense_similarity` is
+/// `Some(1 - cosine_distance)` when the claim was in the dense (embedding) leg,
+/// `None` for lexical-only hits. `in_lexical` is true when it appeared in the
+/// lexical (`content_tsv`) leg.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct HybridHit {
+    pub claim_id: Uuid,
+    pub rrf_score: f64,
+    pub dense_similarity: Option<f64>,
+    pub in_lexical: bool,
+}
+
 /// Result row for [`ClaimRepository::latest_in_lineage`].
 ///
 /// Represents a head of a step lineage: a claim with `step_lineage_id = $1`
@@ -587,6 +603,74 @@ impl ClaimRepository {
         .bind(limit)
         .bind(tags_owned)
         .bind(agent_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Hybrid retrieval over current claims: RRF-fuse a dense
+    /// (`claims.embedding`, HNSW) leg and a lexical (`content_tsv`, GIN) leg in
+    /// one round-trip. Both legs share the `is_current` / `labels @> tags` /
+    /// `agent_id` predicates, so the only difference is the relevance signal.
+    /// `candidate_pool` caps each leg before fusion; `k_rrf` is the RRF constant.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_scoped(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        query_text: &str,
+        candidate_pool: i64,
+        k_rrf: i64,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
+        let tags_owned: Option<Vec<String>> = match tags {
+            Some(t) if !t.is_empty() => Some(t.to_vec()),
+            _ => None,
+        };
+
+        let rows = sqlx::query_as::<_, HybridHit>(
+            r#"
+            WITH dense AS (
+                SELECT c.id,
+                       row_number() OVER (ORDER BY c.embedding <=> $1::vector) AS rank,
+                       1 - (c.embedding <=> $1::vector) AS cos
+                FROM claims c
+                WHERE c.embedding IS NOT NULL AND c.is_current
+                  AND ($6::text[] IS NULL OR c.labels @> $6::text[])
+                  AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
+                ORDER BY c.embedding <=> $1::vector
+                LIMIT $3
+            ),
+            lex AS (
+                SELECT c.id,
+                       row_number() OVER (ORDER BY ts_rank_cd(c.content_tsv, q) DESC) AS rank
+                FROM claims c, websearch_to_tsquery('english', $2) q
+                WHERE c.content_tsv @@ q AND c.is_current
+                  AND ($6::text[] IS NULL OR c.labels @> $6::text[])
+                  AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
+                ORDER BY ts_rank_cd(c.content_tsv, q) DESC
+                LIMIT $3
+            )
+            SELECT COALESCE(d.id, l.id) AS claim_id,
+                   (COALESCE(1.0/($4 + d.rank), 0)
+                    + COALESCE(1.0/($4 + l.rank), 0))::float8 AS rrf_score,
+                   d.cos::float8 AS dense_similarity,
+                   (l.rank IS NOT NULL) AS in_lexical
+            FROM dense d
+            FULL OUTER JOIN lex l ON d.id = l.id
+            ORDER BY rrf_score DESC
+            LIMIT $5
+            "#,
+        )
+        .bind(query_embedding_pgvector) // $1
+        .bind(query_text) // $2
+        .bind(candidate_pool) // $3
+        .bind(k_rrf) // $4
+        .bind(limit) // $5
+        .bind(tags_owned) // $6
+        .bind(agent_id) // $7
         .fetch_all(pool)
         .await?;
 
