@@ -240,6 +240,19 @@ pub async fn get_belief(
     let claim_id = parse_uuid(&params.claim_id)?;
     let frame_id = params.frame_id.as_deref().map(parse_uuid).transpose()?;
 
+    // Optional (frame, perspective) lens. For get_belief the rule is one-sided:
+    // frame_id may legitimately appear alone (the existing framed-but-unlensed
+    // path); only perspective_id present requires frame_id. Validate + check
+    // existence up front so a bad lens fails fast.
+    let lens = crate::tools::lens::resolve_lens_get_belief(
+        params.frame_id.as_deref(),
+        params.perspective_id.as_deref(),
+    )?;
+    if let Some((lens_frame, lens_perspective)) = lens {
+        crate::tools::lens::validate_lens_exists(&server.pool, lens_frame, lens_perspective)
+            .await?;
+    }
+
     let interval = epigraph_engine::belief_query::get_belief(&server.pool, claim_id, frame_id)
         .await
         .map_err(|e| match e {
@@ -255,6 +268,36 @@ pub async fn get_belief(
             other => internal_error(other),
         })?;
 
+    // Additive lensed interval, computed under the chosen (frame, perspective).
+    // The top-level belief/plausibility/etc above stay the global (unlensed)
+    // values. Existence already validated → a compute failure is internal.
+    let lensed_belief = match lens {
+        Some((lens_frame, lens_perspective)) => {
+            let lensed = epigraph_engine::belief_query::get_perspective_belief(
+                &server.pool,
+                claim_id,
+                lens_frame,
+                lens_perspective,
+            )
+            .await
+            .map_err(|e| match e {
+                epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
+                    invalid_params(format!("frame {id} not found"))
+                }
+                epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
+                    invalid_params(format!("invalid mass function: {msg}"))
+                }
+                other => internal_error(other),
+            })?;
+            Some(LensedBelief::from_interval(
+                lens_frame,
+                lens_perspective,
+                &lensed,
+            ))
+        }
+        None => None,
+    };
+
     let ignorance = interval.plausibility - interval.belief;
     success_json(&BeliefResponse {
         claim_id: claim_id.to_string(),
@@ -265,6 +308,7 @@ pub async fn get_belief(
         mass_on_conflict: interval.mass_on_conflict,
         mass_on_missing: interval.mass_on_missing,
         source: interval.source,
+        lensed_belief,
     })
 }
 

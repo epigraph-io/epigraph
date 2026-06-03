@@ -157,6 +157,18 @@ pub async fn recall(
     let tags = params.tags;
     let tags_opt: Option<&[String]> = if tags.is_empty() { None } else { Some(&tags) };
 
+    // Resolve the optional (frame, perspective) lens up front (both-or-neither,
+    // parse, existence) so the bulk retrieval / ranking / min_truth path — all
+    // unchanged on the global truth_value — is never entered with a bad lens,
+    // and the existence round-trips run ONCE, not per claim.
+    let lens = crate::tools::lens::resolve_lens(
+        params.frame_id.as_deref(),
+        params.perspective_id.as_deref(),
+    )?;
+    if let Some((frame_id, perspective_id)) = lens {
+        crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
+    }
+
     // Hybrid retrieval: dense (claims.embedding) + lexical (content_tsv), RRF-fused.
     // On embedder failure, degrade to lexical-only — which, unlike the old ILIKE
     // fallback, still honors tag/agent scope because it filters in SQL.
@@ -199,6 +211,38 @@ pub async fn recall(
                 if hit.in_lexical {
                     matched_via.push("lexical".to_string());
                 }
+
+                // Additive lensed belief per returned claim. Degrade-not-fail:
+                // a compute error for ONE claim yields null + a warn, never an
+                // aborted page (spec §8). min_truth/ranking stay on `tv`.
+                let lensed_belief = match lens {
+                    Some((frame_id, perspective_id)) => {
+                        match epigraph_engine::belief_query::get_perspective_belief(
+                            &server.pool,
+                            hit.claim_id,
+                            frame_id,
+                            perspective_id,
+                        )
+                        .await
+                        {
+                            Ok(interval) => Some(LensedBelief::from_interval(
+                                frame_id,
+                                perspective_id,
+                                &interval,
+                            )),
+                            Err(e) => {
+                                tracing::warn!(
+                                    claim_id = %hit.claim_id,
+                                    error = %e,
+                                    "lensed belief compute failed; serving null lens for this claim"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+
                 results.push(RecallResult {
                     claim_id: hit.claim_id.to_string(),
                     content: claim.content,
@@ -206,6 +250,7 @@ pub async fn recall(
                     similarity: hit.dense_similarity.unwrap_or(0.0),
                     rrf_score: hit.rrf_score,
                     matched_via,
+                    lensed_belief,
                 });
             }
         }
