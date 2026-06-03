@@ -231,6 +231,77 @@ async fn contradicts_lowers_target_belief(pool: PgPool) {
     );
 }
 
+// ── SourceFactorless: durable edge written even when belief is NOT wired ─────
+
+/// The common production case: the SOURCE claim has an agent but no stored
+/// belief interval (NULL DS columns), so `auto_wire_ds_for_edge` short-circuits
+/// to `SourceFactorless` and materializes no BBA. The key resilience guarantee
+/// (spec §7) is that the durable edge row + `edge.added` event are STILL written
+/// and the call still succeeds — `was_created=true` WITH `belief_wired=false` —
+/// while the target's belief is left untouched. The other belief tests only
+/// reach `belief_wired=false` via the idempotent re-hit (where `was_created` is
+/// also false), so this pins the distinct created-but-not-wired branch.
+#[sqlx::test(migrations = "../../migrations")]
+async fn factorless_source_writes_durable_edge_without_wiring(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+    // `seed_claim` plants an agent_id but leaves belief/plausibility/pignistic
+    // NULL → the engine finds no source interval → SourceFactorless.
+    let source = seed_claim(&pool, "factorless source", 0.5).await;
+    let target = seed_claim(&pool, "untouched target", 0.5).await;
+
+    let resp = parse_response(
+        &do_link_epistemic(
+            &server,
+            LinkEpistemicParams {
+                source_claim_id: source.to_string(),
+                target_claim_id: target.to_string(),
+                relationship: "supports".to_string(),
+                properties: Some(serde_json::json!({"note": "no source belief"})),
+            },
+        )
+        .await
+        .expect("link must succeed even when the source has no belief interval"),
+    );
+
+    assert!(
+        resp.was_created,
+        "the durable edge must be created even though belief is not wired"
+    );
+    assert!(
+        !resp.belief_wired,
+        "a source with no stored belief interval must short-circuit to \
+         SourceFactorless — no BBA, no wire"
+    );
+    assert!(
+        resp.target_belief.is_none(),
+        "no BBA combined → response target_belief must be None"
+    );
+    assert!(
+        read_betp(&pool, target).await.is_none(),
+        "the target's pignistic_prob must remain NULL — no recompute happened"
+    );
+    assert_eq!(
+        edge_count(&pool, source, target, "supports").await,
+        1,
+        "the durable edge row must persist exactly once despite the no-op wire"
+    );
+
+    // Properties still round-trip onto the durable edge.
+    let props: serde_json::Value = sqlx::query_scalar(
+        "SELECT properties FROM edges WHERE source_id = $1 AND target_id = $2 AND relationship = 'supports'",
+    )
+    .bind(source)
+    .bind(target)
+    .fetch_one(&pool)
+    .await
+    .expect("edge row");
+    assert_eq!(
+        props,
+        serde_json::json!({"note": "no source belief"}),
+        "properties must round-trip even when belief is not wired"
+    );
+}
+
 // ── validation: relationship not in the epistemic set ───────────────────────
 
 #[sqlx::test(migrations = "../../migrations")]
