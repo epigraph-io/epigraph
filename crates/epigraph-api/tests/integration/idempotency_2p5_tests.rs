@@ -850,3 +850,262 @@ async fn submit_packet_idempotency_cache_holds_canonical_id(pool: PgPool) {
         "a cache-hit must report was_duplicate=true"
     );
 }
+
+// =============================================================================
+// Task 6: regression coverage — keying semantics + dedup side-effect counts.
+// =============================================================================
+
+/// **Task 6.1 — distinct agents, identical content → two distinct claims.**
+///
+/// Pins that `submit/packet` dedup keys on `(content_hash, agent_id)`, NOT on
+/// `content_hash` alone. The same content submitted under two *different*
+/// agents must create two distinct claim rows (each agent owns its own
+/// assertion of the same proposition). A regression that keyed on content
+/// alone would collapse them into one row and silently drop the second agent's
+/// claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_keys_on_content_hash_and_agent_not_content_alone(pool: PgPool) {
+    let agent_a = fixed_agent(60, "keying-agent-a");
+    let created_a = AgentRepository::create(&pool, &agent_a)
+        .await
+        .expect("agent A creation should succeed");
+    let agent_a_uuid: Uuid = created_a.id.into();
+
+    let agent_b = fixed_agent(61, "keying-agent-b");
+    let created_b = AgentRepository::create(&pool, &agent_b)
+        .await
+        .expect("agent B creation should succeed");
+    let agent_b_uuid: Uuid = created_b.id.into();
+
+    // Identical content under two agents.
+    let claim_content = "An identical proposition asserted independently by two agents";
+    let packet_a = evidence_packet(agent_a_uuid, claim_content);
+    let packet_b = evidence_packet(agent_b_uuid, claim_content);
+
+    let router = create_test_router(pool.clone());
+
+    let (status_a, body_a) = post_packet(&router, packet_a).await;
+    assert_eq!(
+        status_a,
+        StatusCode::CREATED,
+        "agent A submit should be 201, got {status_a}: {body_a}"
+    );
+    let json_a: serde_json::Value =
+        serde_json::from_str(&body_a).expect("agent A response should be JSON");
+    let claim_id_a = json_a["claim_id"]
+        .as_str()
+        .expect("agent A response must carry claim_id");
+
+    let (status_b, body_b) = post_packet(&router, packet_b).await;
+    assert_eq!(
+        status_b,
+        StatusCode::CREATED,
+        "agent B submit should be 201, got {status_b}: {body_b}"
+    );
+    let json_b: serde_json::Value =
+        serde_json::from_str(&body_b).expect("agent B response should be JSON");
+    let claim_id_b = json_b["claim_id"]
+        .as_str()
+        .expect("agent B response must carry claim_id");
+
+    // Neither submit may be reported as a dedup of the other.
+    assert_eq!(
+        json_a["was_duplicate"], false,
+        "agent A submit must be a fresh create"
+    );
+    assert_eq!(
+        json_b["was_duplicate"], false,
+        "agent B submit must be a fresh create (different agent, not a dup)"
+    );
+    assert_ne!(
+        claim_id_a, claim_id_b,
+        "identical content under different agents must yield distinct claim ids"
+    );
+
+    // Exactly two claim rows for this content hash, one per agent.
+    let content_hash = epigraph_crypto::ContentHasher::hash(claim_content.as_bytes());
+    let total_for_hash: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM claims WHERE content_hash = $1")
+            .bind(content_hash.as_slice())
+            .fetch_one(&pool)
+            .await
+            .expect("content-hash count query should succeed");
+    assert_eq!(
+        total_for_hash, 2,
+        "two agents asserting the same content must produce two claim rows"
+    );
+    for (label, agent_uuid) in [("A", agent_a_uuid), ("B", agent_b_uuid)] {
+        let per_agent: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM claims WHERE content_hash = $1 AND agent_id = $2",
+        )
+        .bind(content_hash.as_slice())
+        .bind(agent_uuid)
+        .fetch_one(&pool)
+        .await
+        .expect("per-agent count query should succeed");
+        assert_eq!(
+            per_agent, 1,
+            "agent {label} must own exactly one row for this (content_hash, agent_id)"
+        );
+    }
+}
+
+/// **Task 6.2 — resubmit with evidence does not duplicate dependent rows.**
+///
+/// A duplicate submit of a packet *carrying evidence and a reasoning trace*
+/// must not 500 and must not duplicate the dependent `evidence` or
+/// `reasoning_traces` rows: the create path inserts exactly one of each, and
+/// the dedup path short-circuits all dependent writes (Task 3 step 6).
+///
+/// The `reasoning_traces` count is the dimension not already covered by the
+/// durable-idempotency / canonical-id tests (which assert the `evidence`
+/// count): without the short-circuit the dedup path would re-INSERT a second
+/// reasoning trace (the trace INSERT has no `(content, agent)` unique key, so
+/// it would silently duplicate rather than 500).
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_dedup_does_not_duplicate_evidence_or_trace(pool: PgPool) {
+    let agent = fixed_agent(62, "dedup-side-effects-agent");
+    let created_agent = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed");
+    let agent_uuid: Uuid = created_agent.id.into();
+
+    let claim_content = "A claim resubmitted with evidence to check dependent-row counts";
+    // No idempotency_key (evidence_packet), so the second submit reaches
+    // persist_packet rather than the in-memory cache.
+    let packet = evidence_packet(agent_uuid, claim_content);
+
+    let router = create_test_router(pool.clone());
+
+    // Create path: one claim, one evidence, one reasoning trace.
+    let (status_1, body_1) = post_packet(&router, packet.clone()).await;
+    assert_eq!(
+        status_1,
+        StatusCode::CREATED,
+        "first submit should be 201, got {status_1}: {body_1}"
+    );
+    let json_1: serde_json::Value =
+        serde_json::from_str(&body_1).expect("first response should be JSON");
+    let canonical_id = Uuid::parse_str(json_1["claim_id"].as_str().expect("claim_id present"))
+        .expect("claim_id should parse as uuid");
+
+    // Dedup path: must return 201 (no 500) and add no dependent rows.
+    let (status_2, body_2) = post_packet(&router, packet).await;
+    assert_eq!(
+        status_2,
+        StatusCode::CREATED,
+        "dedup submit with evidence must be 201 (no 500), got {status_2}: {body_2}"
+    );
+    let json_2: serde_json::Value =
+        serde_json::from_str(&body_2).expect("second response should be JSON");
+    assert_eq!(
+        json_2["was_duplicate"], true,
+        "the second submit must be reported as a dedup"
+    );
+
+    let evidence_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM evidence WHERE claim_id = $1")
+            .bind(canonical_id)
+            .fetch_one(&pool)
+            .await
+            .expect("evidence count query should succeed");
+    assert_eq!(
+        evidence_count, 1,
+        "dedup must not duplicate evidence rows (short-circuited evidence loop)"
+    );
+
+    // Reasoning traces, counted GLOBALLY (each #[sqlx::test] gets a fresh
+    // migrated DB, so the whole-table count is exactly scoped to this test —
+    // and only the create path inserts a trace here). A *global* count is the
+    // assertion that actually catches the regression: `claims.trace_id` is a
+    // single scalar pointer, so a JOIN through it can only ever return 0 or 1
+    // and would NOT detect a duplicate. If the dedup short-circuit broke and
+    // re-ran the trace INSERT, a second `reasoning_traces` row (with the claim
+    // repointed at it) would appear — caught here as count == 2.
+    let trace_count: i64 = sqlx::query_scalar("SELECT count(*) FROM reasoning_traces")
+        .fetch_one(&pool)
+        .await
+        .expect("reasoning trace count query should succeed");
+    assert_eq!(
+        trace_count, 1,
+        "dedup must not duplicate the reasoning trace (short-circuited trace INSERT)"
+    );
+}
+
+/// **Task 6.3 — `claim.created` fires exactly once across create + dedup.**
+///
+/// `create_strict` emits a `claim.created` event inside the caller's
+/// transaction (`claim.rs` ~1989). `create_or_get`'s find branch returns
+/// *before* `create_strict`, so a dedup submit must NOT emit a second
+/// `claim.created` for the same canonical claim. We scope the count to
+/// `payload->>'claim_id'` (the create path also publishes other event types we
+/// must not count) and assert it is 1 after the create AND still 1 after the
+/// dedup.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_claim_created_event_fires_once_not_on_dedup(pool: PgPool) {
+    let agent = fixed_agent(63, "event-once-agent");
+    let created_agent = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed");
+    let agent_uuid: Uuid = created_agent.id.into();
+
+    let claim_content = "A claim whose creation event must fire exactly once";
+    let packet = evidence_packet(agent_uuid, claim_content);
+
+    let router = create_test_router(pool.clone());
+
+    // Create path → one claim.created event.
+    let (status_1, body_1) = post_packet(&router, packet.clone()).await;
+    assert_eq!(
+        status_1,
+        StatusCode::CREATED,
+        "first submit should be 201, got {status_1}: {body_1}"
+    );
+    let json_1: serde_json::Value =
+        serde_json::from_str(&body_1).expect("first response should be JSON");
+    let canonical_id = json_1["claim_id"]
+        .as_str()
+        .expect("first response must carry claim_id")
+        .to_string();
+
+    let created_events_after_create: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'claim.created' \
+         AND payload->>'claim_id' = $1",
+    )
+    .bind(&canonical_id)
+    .fetch_one(&pool)
+    .await
+    .expect("claim.created count query should succeed");
+    assert_eq!(
+        created_events_after_create, 1,
+        "the create path must emit exactly one claim.created event"
+    );
+
+    // Dedup path (same router, no idempotency_key) → find branch, no new event.
+    let (status_2, body_2) = post_packet(&router, packet).await;
+    assert_eq!(
+        status_2,
+        StatusCode::CREATED,
+        "dedup submit should be 201, got {status_2}: {body_2}"
+    );
+    let json_2: serde_json::Value =
+        serde_json::from_str(&body_2).expect("second response should be JSON");
+    assert_eq!(
+        json_2["was_duplicate"], true,
+        "the second submit must be a dedup (find branch, no create_strict)"
+    );
+
+    let created_events_after_dedup: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'claim.created' \
+         AND payload->>'claim_id' = $1",
+    )
+    .bind(&canonical_id)
+    .fetch_one(&pool)
+    .await
+    .expect("claim.created count query should succeed");
+    assert_eq!(
+        created_events_after_dedup, 1,
+        "a dedup submit must NOT emit a second claim.created event \
+         (create_or_get's find branch never reaches create_strict)"
+    );
+}
