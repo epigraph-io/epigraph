@@ -1233,6 +1233,133 @@ fn build_all_packets(
         .collect()
 }
 
+/// Build the find-or-create packet for a repository's root node.
+///
+/// Keyed on a stable `repo:{slug}` idempotency_key so re-runs across every PR
+/// resolve to the same persistent root claim (the hierarchy's anchor). The
+/// `node`/`repo` properties let downstream queries find the root by repository.
+fn build_repo_packet(repo_slug: &str, agent_id: Uuid, signer: &AgentSigner) -> EpistemicPacket {
+    let content = format!("Repository {repo_slug} — development history (commits and PRs).");
+    let evidence_text = format!("Repository slug: {repo_slug}");
+    let ev = EvidenceSubmission {
+        content_hash: hex::encode(ContentHasher::hash(evidence_text.as_bytes())),
+        evidence_type: EvidenceTypeSubmission::Document {
+            source_url: Some(format!("repo://{repo_slug}")),
+            mime_type: "text/plain".into(),
+        },
+        raw_content: Some(evidence_text.clone()),
+        signature: Some(hex::encode(signer.sign(evidence_text.as_bytes()))),
+    };
+    EpistemicPacket {
+        claim: ClaimSubmission {
+            content,
+            initial_truth: Some(0.95),
+            agent_id,
+            idempotency_key: Some(format!("repo:{repo_slug}")),
+            properties: Some(serde_json::json!({
+                "source": "git-history", "node": "repo", "repo": repo_slug
+            })),
+        },
+        evidence: vec![ev],
+        reasoning_trace: ReasoningTraceSubmission {
+            methodology: "heuristic".into(),
+            inputs: vec![TraceInputSubmission::Evidence { index: 0 }],
+            confidence: 0.95,
+            explanation: format!("Root node for repository {repo_slug}"),
+            signature: None,
+        },
+        signature: "0".repeat(128),
+    }
+}
+
+/// Add labels to an existing claim via `PATCH /api/v1/claims/{id}/labels`.
+///
+/// Route confirmed against `routes/claims.rs::update_labels`: the dedicated
+/// label endpoint takes `{ "add": [...], "remove": [...] }` (NOT the generic
+/// `patch_claim` body, which nests under `add_labels`). Idempotent server-side:
+/// re-adding an existing label is a no-op.
+#[allow(dead_code)]
+async fn apply_labels(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: Uuid,
+    labels: &[&str],
+) -> Result<(), String> {
+    let url = format!("{endpoint}/api/v1/claims/{id}/labels");
+    let resp = client
+        .patch(&url)
+        .json(&serde_json::json!({ "add": labels }))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("label PATCH: {e}"))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "label PATCH {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ))
+    }
+}
+
+/// Submit a packet and return its claim id. Because the packet carries a stable
+/// `idempotency_key`, a second call returns the same `claim_id` (`was_duplicate=true`),
+/// making this the find-or-create primitive for the hierarchy's nodes.
+#[allow(dead_code)]
+async fn submit_find_or_create(
+    client: &reqwest::Client,
+    endpoint: &str,
+    packet: &EpistemicPacket,
+    labels: &[&str],
+) -> Result<Uuid, String> {
+    let url = format!("{endpoint}/api/v1/submit/packet");
+    let resp = client
+        .post(&url)
+        .json(packet)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("submit failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "submit {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let parsed: SubmitResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("decode submit resp: {e}"))?;
+    if !labels.is_empty() {
+        apply_labels(client, endpoint, parsed.claim_id, labels).await?;
+    }
+    Ok(parsed.claim_id)
+}
+
+/// Find-or-create the repository's root node and return its claim id, labelled
+/// `source:git-history` / `node:repo` / `repo:<slug>`.
+#[allow(dead_code)]
+async fn ensure_repo_node(
+    client: &reqwest::Client,
+    endpoint: &str,
+    repo_slug: &str,
+    agent_id: Uuid,
+    signer: &AgentSigner,
+) -> Result<Uuid, String> {
+    let packet = build_repo_packet(repo_slug, agent_id, signer);
+    let label = format!("repo:{repo_slug}");
+    submit_find_or_create(
+        client,
+        endpoint,
+        &packet,
+        &["source:git-history", "node:repo", &label],
+    )
+    .await
+}
+
 // =============================================================================
 // EDGE SUBMISSION
 // =============================================================================
@@ -2239,6 +2366,25 @@ mod tests {
             parse_orchestrator_trailer(&body),
             Some(last.parse().unwrap())
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Repo-node find-or-create packet tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn repo_node_packet_has_stable_idempotency_and_label() {
+        let signer = AgentSigner::generate();
+        let p = build_repo_packet("epigraph-io/epiclaw-host", Uuid::nil(), &signer);
+        assert_eq!(
+            p.claim.idempotency_key.as_deref(),
+            Some("repo:epigraph-io/epiclaw-host")
+        );
+        assert!(p.claim.content.contains("epigraph-io/epiclaw-host"));
+        let props = p.claim.properties.as_ref().unwrap();
+        assert_eq!(props["source"], "git-history");
+        assert_eq!(props["node"], "repo");
+        assert_eq!(props["repo"], "epigraph-io/epiclaw-host");
     }
 
     // -------------------------------------------------------------------------
