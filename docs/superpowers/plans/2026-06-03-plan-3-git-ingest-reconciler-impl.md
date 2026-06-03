@@ -209,16 +209,24 @@ class PullRequest:
     base_sha: str; author: str; merged_at: str
 
 def _gh_json(args: list[str], env: dict) -> list | dict:
-    """Run `gh api ...` and parse JSON stdout."""
+    """Run `gh api ...` and parse JSON stdout. With `--paginate` alone, `gh`
+    emits one separate JSON array/object PER page (concatenated, `[...]\n[...]`),
+    which a single `json.loads` cannot parse (raises `Extra data`). `--slurp`
+    (verified on gh 2.93) wraps all pages in ONE outer array; we then flatten
+    that page array back into the flat rows callers expect."""
     res = subprocess.run(["gh", "api", *args], check=True, capture_output=True, text=True, env=env)
-    return json.loads(res.stdout)
+    data = json.loads(res.stdout)
+    if "--slurp" in args:
+        return [row for page in data for row in (page if isinstance(page, list) else [page])]
+    return data
 
 def discover_merged_prs(slug: str, env: dict, window_minutes: int, now: datetime.datetime) -> list[PullRequest]:
     cutoff = now - datetime.timedelta(minutes=window_minutes)
     rows = _gh_json(
         [f"repos/{slug}/pulls", "-X", "GET",
          "--field", "state=closed", "--field", "sort=updated",
-         "--field", "direction=desc", "--field", "per_page=50", "--paginate"],
+         "--field", "direction=desc", "--field", "per_page=50",
+         "--paginate", "--slurp"],
         env,
     )
     out = []
@@ -237,7 +245,7 @@ def discover_merged_prs(slug: str, env: dict, window_minutes: int, now: datetime
         ))
     return out
 ```
-> `--paginate` with `--field direction=desc` over `state=closed` can be large; `per_page=50` + the window filter keeps it bounded for the pilot. If a repo's volume makes this heavy, the spec's optional cursor (deferred) is the mitigation. Note it in the commit body.
+> `--paginate` MUST be paired with `--slurp` (verified on gh 2.93): `--paginate` alone emits one JSON array per page, concatenated, and a single `json.loads` raises `JSONDecodeError: Extra data`. `--slurp` wraps all pages in one outer array; `_gh_json` flattens it. The pilot repo `epigraph-io/epigraph` has >50 closed PRs (per_page=50) so multiple pages are guaranteed — without `--slurp` discovery crashes and zero PRs ingest. `--paginate` with `--field direction=desc` over `state=closed` can be large; `per_page=50` + the window filter keeps it bounded for the pilot. If a repo's volume makes this heavy, the spec's optional cursor (deferred) is the mitigation. Note it in the commit body.
 - [ ] **Step 4: Run → passes.**
 - [ ] **Step 5: Commit** (`feat(scripts): discover merged PRs in a time window via gh api`).
 
