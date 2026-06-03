@@ -156,5 +156,47 @@ class MainLoopTests(unittest.TestCase):
         self.assertEqual(calls, [1,2])          # both attempted (failure isolated)
         self.assertEqual((n_ok,n_fail),(1,1))
 
+def _resolve_ingest_git():
+    """Locate the built `ingest_git` binary across the tree's possible target
+    dirs. The global ~/.cargo/config.toml sets build.target-dir to
+    /home/jeremy/.cargo-target, so the binary is OUTSIDE both REPO/.cargo-target
+    and an unset $CARGO_TARGET_DIR. `cargo metadata`'s target_directory honors
+    both the global config and $CARGO_TARGET_DIR, so it is the one authoritative
+    source; the remaining candidates are belt-and-suspenders for CI variants."""
+    cands = []
+    try:
+        md = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=str(REPO), capture_output=True, text=True, check=True,
+        )
+        cands.append(Path(json.loads(md.stdout)["target_directory"]) / "debug" / "ingest_git")
+    except Exception:
+        pass
+    if os.environ.get("CARGO_TARGET_DIR"):
+        cands.append(Path(os.environ["CARGO_TARGET_DIR"]) / "debug" / "ingest_git")
+    cands.append(REPO / ".cargo-target" / "debug" / "ingest_git")
+    cands.append(REPO / "target" / "debug" / "ingest_git")
+    return next((c for c in cands if c.exists()), None)
+
+class IntegrationTest(unittest.TestCase):
+    def test_dry_run_against_real_repo_and_binary(self):
+        binp = _resolve_ingest_git()
+        if binp is None:
+            self.skipTest("ingest_git binary not built (run cargo build --bin ingest_git)")
+        with tempfile.TemporaryDirectory() as d:
+            g = lambda *a: subprocess.run(["git","-C",d,*a],check=True,capture_output=True)
+            subprocess.run(["git","init","-qb","main",d],check=True,capture_output=True)
+            g("config","user.email","t@t"); g("config","user.name","t")
+            Path(d,"a").write_text("1"); g("add","."); g("commit","-qm","base")
+            g("checkout","-qb","feat")
+            Path(d,"b").write_text("2"); g("add","."); g("commit","-qm","feat(x): add b\n\nEvidence:\n- e")
+            g("checkout","-q","main")
+            g("merge","--no-ff","-qm","Merge pull request #1 from feat","feat")
+            sha = subprocess.run(["git","-C",d,"rev-parse","HEAD"],capture_output=True,text=True).stdout.strip()
+            pr = gir.PullRequest(1,"feat(x): add b","Evidence: x",sha,"","t","2026-06-03T12:00:00Z")
+            rc = gir.ingest_pr(pr, d, "http://127.0.0.1:8080", "test/repo",
+                               ingest_git_bin=str(binp), dry_run=True)
+            self.assertEqual(rc, 0, "ingest_git --pr-ingest --dry-run should parse the real repo and exit 0")
+
 if __name__ == "__main__":
     unittest.main()
