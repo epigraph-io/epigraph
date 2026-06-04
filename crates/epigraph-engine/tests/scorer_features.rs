@@ -684,3 +684,68 @@ async fn no_shared_neighbor_drops_graph_overlap_from_denominator(pool: PgPool) {
         f.score
     );
 }
+
+/// belief_alignment fires only when both claims have a mass function. When it
+/// fires with opposite stances it is a real negative and lowers the score
+/// relative to an aligned pair with the same embeddings.
+#[sqlx::test(migrations = "../../migrations")]
+async fn opposite_stance_belief_lowers_score(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    // Identical embeddings on all three so cosine is constant (≈1.0) and the
+    // only differentiator is belief_alignment.
+    let a = insert_claim_with_embedding(&pool, agent).await;
+    let b = insert_claim_with_embedding(&pool, agent).await;
+    let c = insert_claim_with_embedding(&pool, agent).await;
+
+    let frame_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses)
+         VALUES ('binary', ARRAY['supported', 'unsupported'])
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert binary frame");
+
+    // a, b strongly supported (BetP 0.9); c strongly unsupported (BetP 0.1).
+    for &claim in &[a, b] {
+        sqlx::query(
+            "INSERT INTO mass_functions (claim_id, frame_id, masses)
+             VALUES ($1, $2, '{\"0\": 0.8, \"0,1\": 0.2}')",
+        )
+        .bind(claim)
+        .bind(frame_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO mass_functions (claim_id, frame_id, masses)
+         VALUES ($1, $2, '{\"1\": 0.8, \"0,1\": 0.2}')",
+    )
+    .bind(c)
+    .bind(frame_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let aligned = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score a,b");
+    let opposed = score_pair(&pool, a, c, &Weights::default())
+        .await
+        .expect("score a,c");
+
+    // aligned: (0.35·1.0 + 0.10·~1.0)/(0.45) ≈ 1.0
+    // opposed: (0.35·1.0 + 0.10·~0.0)/(0.45) ≈ 0.778
+    assert!(
+        opposed.score < aligned.score - 0.1,
+        "opposite stance must lower score (aligned {} vs opposed {})",
+        aligned.score,
+        opposed.score
+    );
+    assert!(
+        opposed.score < 0.85,
+        "opposed-stance pair should drop well below cosine, got {}",
+        opposed.score
+    );
+}
