@@ -749,3 +749,28 @@ async fn opposite_stance_belief_lowers_score(pool: PgPool) {
         opposed.score
     );
 }
+
+/// A pair with no embeddings (embedding-invariant violation) must be suppressed:
+/// embed_cosine is always applicable at 0.0, so with nothing else firing the
+/// score is 0.0 — it can never reach a verifier band.
+#[sqlx::test(migrations = "../../migrations")]
+async fn null_embedding_pair_is_suppressed(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await; // no embedding
+    let b = insert_claim(&pool, agent).await; // no embedding
+
+    let f = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+
+    assert_eq!(
+        f.embed_cosine, 0.0,
+        "no embedding → embed_cosine 0.0, got {}",
+        f.embed_cosine
+    );
+    assert!(
+        f.score < 0.01,
+        "null-embedding pair must be suppressed near 0, got {}",
+        f.score
+    );
+}
