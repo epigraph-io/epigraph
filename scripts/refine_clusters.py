@@ -279,14 +279,15 @@ def llm_label_subcluster(samples, idx):
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return ""
-    for _ in range(10):
-        if os.path.exists(result_path):
-            import json as _json
-            try:
-                return parse_subcluster_label(_json.load(open(result_path)).get("label", ""))
-            except Exception:  # noqa: BLE001
-                return ""
-        time.sleep(1)
+    # subprocess.run is synchronous — the process has already exited and either
+    # wrote the file or did not.  A post-process delay is not needed.
+    if os.path.exists(result_path):
+        import json as _json
+        try:
+            with open(result_path) as fh:
+                return parse_subcluster_label(_json.load(fh).get("label", ""))
+        except Exception:  # noqa: BLE001
+            return ""
     return ""
 
 
@@ -345,6 +346,14 @@ def auto_refine(conn, cluster_id, run_id, min_sub_size=50, min_silhouette=0.15):
                 DO UPDATE SET label = EXCLUDED.label, sample_count = EXCLUDED.sample_count
             """, (run_id, new_cid, label, len(members)))
             written += 1
+    # Only persist when at least 2 subclusters were written: a single-subcluster
+    # result means one group passed min_sub_size and the rest didn't — the cluster
+    # was not actually split.  Roll back and report split=False so an orchestrator
+    # can distinguish "fully resolved" from "partially split / structural noise".
+    if written < 2:
+        conn.rollback()
+        return {"split": False, "reason": f"only {written} subcluster(s) met min_sub_size",
+                "n_subclusters": written}
     conn.commit()
     return {"split": True, "n_subclusters": written, "silhouette": float(best_score)}
 
@@ -372,6 +381,9 @@ def main():
                 print("No clusters found", file=sys.stderr)
                 sys.exit(1)
             args.run_id = str(row[0])
+
+    if not args.auto and args.cluster_id is None:
+        parser.error("--cluster-id is required without --auto")
 
     if args.auto:
         if args.cluster_id is None:
