@@ -326,13 +326,25 @@ def auto_refine(conn, cluster_id, run_id, min_sub_size=50, min_silhouette=0.15):
     if best_k < 2 or best_score < min_silhouette:
         return {"split": False, "reason": f"no structure (sil={best_score:.3f})", "n_subclusters": 0}
 
+    # Allocate new cluster ids monotonically above the run's current max so a
+    # split can NEVER collide with a sibling cluster in the same consolidated
+    # run (the V2 `cluster_id*100+sub` scheme only worked because V2 wrote each
+    # refine to its own run_id; here all splits share one run). Claims of subs
+    # too small to keep simply retain the parent id.
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(max(cluster_id), -1) + 1 FROM claim_clusters WHERE cluster_run_id = %s",
+            (run_id,),
+        )
+        next_id = cur.fetchone()[0]
+
     written = 0
     with conn.cursor() as cur:
         for sub in range(best_k):
             members = [ids[i] for i in range(len(ids)) if best_labels[i] == sub]
             if len(members) < min_sub_size:
                 continue
-            new_cid = cluster_id * 100 + sub
+            new_cid = next_id + written
             samples = [contents[i] for i in range(len(ids)) if best_labels[i] == sub][:10]
             label = llm_label_subcluster(samples, sub) or f"cluster-{new_cid}"
             cur.execute("""

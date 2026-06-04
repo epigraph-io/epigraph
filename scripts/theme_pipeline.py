@@ -64,11 +64,17 @@ def current_k(conn, run_id):
 
 
 def grow(conn, args):
-    run_id = theme_lib.new_run_id()
-    print(f"== base clustering (run {run_id}) ==", file=sys.stderr)
-    reducer, centroids, k = cluster_claims.seed_phase(
-        conn, args.sample_size, args.k, run_id, all_claims=args.all_claims)
-    cluster_claims.assign_batch(conn, reducer, centroids, run_id, batch_size=args.batch_size)
+    # --from-run-id resumes the split/project/label phases on an existing base
+    # run (skips the ~40-min base assign); otherwise start a fresh consolidated run.
+    if getattr(args, "from_run_id", None):
+        run_id = args.from_run_id
+        print(f"== resuming run {run_id} (skipping base clustering) ==", file=sys.stderr)
+    else:
+        run_id = theme_lib.new_run_id()
+        print(f"== base clustering (run {run_id}) ==", file=sys.stderr)
+        reducer, centroids, k = cluster_claims.seed_phase(
+            conn, args.sample_size, args.k, run_id, all_claims=args.all_claims)
+        cluster_claims.assign_batch(conn, reducer, centroids, run_id, batch_size=args.batch_size)
 
     iterations = 0
     while True:
@@ -108,6 +114,8 @@ def main():
     p.add_argument("--min-size", type=int, default=2000)
     p.add_argument("--max-iter", type=int, default=8)
     p.add_argument("--run-id", default=None)
+    p.add_argument("--from-run-id", default=None,
+                   help="grow: resume split/project/label on an existing base run (skip base)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
