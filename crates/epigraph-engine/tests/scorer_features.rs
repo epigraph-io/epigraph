@@ -642,3 +642,45 @@ async fn fired_zero_jaccard_pulls_score_below_cosine(pool: PgPool) {
         f.score
     );
 }
+
+/// graph_overlap with no shared neighbor is NOT applicable: it must be dropped
+/// from the denominator, not held at 0.0 (which would dilute). Two claims with
+/// identical embeddings and disjoint graph neighbors must still score ≈ cosine.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_shared_neighbor_drops_graph_overlap_from_denominator(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim_with_embedding(&pool, agent).await;
+    let b = insert_claim_with_embedding(&pool, agent).await;
+    // Each has a graph edge, but to DIFFERENT neighbors → no common neighbor.
+    let only_a = insert_claim(&pool, agent).await;
+    let only_b = insert_claim(&pool, agent).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship)
+         VALUES ($1, 'claim', $2, 'claim', 'supports'),
+                ($3, 'claim', $4, 'claim', 'supports')",
+    )
+    .bind(a)
+    .bind(only_a)
+    .bind(b)
+    .bind(only_b)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let f = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+
+    assert_eq!(
+        f.graph_overlap, 0.0,
+        "reported graph_overlap stays 0.0 (telemetry), got {}",
+        f.graph_overlap
+    );
+    // If graph_overlap were kept in the denom at 0.0:
+    //   score = 0.35·1.0 / (0.35 + 0.10) ≈ 0.778. Dropping it → ≈ 1.0.
+    assert!(
+        f.score > 0.99,
+        "graph_overlap must be dropped (not held at 0) → score ≈ cosine, got {}",
+        f.score
+    );
+}
