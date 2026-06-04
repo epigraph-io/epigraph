@@ -581,3 +581,29 @@ async fn combined_score_in_unit_interval(pool: PgPool) {
         features.score
     );
 }
+
+/// Cross-source bootstrap case: two claims with identical embeddings and NO
+/// structural data, no mass function, unthemed. Only embed_cosine fires, so
+/// the renormalized score must ≈ embed_cosine (≈1.0) — NOT the old diluted
+/// 0.425 (= 0.35·1.0 + 0.10·0.5 + 0.05·0.5 over denom 1.0).
+#[sqlx::test(migrations = "../../migrations")]
+async fn renormalized_score_is_cosine_when_only_embedding_fires(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim_with_embedding(&pool, agent).await;
+    let b = insert_claim_with_embedding(&pool, agent).await;
+
+    let f = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+
+    assert!(
+        f.embed_cosine > 0.99,
+        "precondition: embed_cosine ≈ 1.0, got {}",
+        f.embed_cosine
+    );
+    assert!(
+        f.score > 0.99,
+        "only embed_cosine fired → score must ≈ embed_cosine, got {}",
+        f.score
+    );
+}
