@@ -29,10 +29,17 @@ import os
 import sys
 import uuid
 
+import subprocess
+import time
+
 import numpy as np
 import psycopg2
 import psycopg2.extras
+from sklearn.cluster import MiniBatchKMeans
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import normalize
+import umap
 
 psycopg2.extras.register_uuid()
 
@@ -232,6 +239,116 @@ def train_and_apply(conn, cluster_id: int, run_id: str,
     print(json.dumps(result))
 
 
+REFINE_RESULT_DIR = "/tmp/refine_labels"
+
+
+def build_subcluster_label_prompt(samples):
+    """Prompt asking the LLM for a concise theme name from sample claims."""
+    body = "\n".join(f"- {s[:200]}" for s in samples[:10])
+    return (
+        "You are naming a sub-theme in a scientific knowledge graph.\n"
+        "Representative claims:\n" + body +
+        "\n\nReply with ONLY the theme name: 4-8 words, Title Case, no quotes, "
+        "no punctuation, no explanation.\nTheme name:"
+    )
+
+
+def parse_subcluster_label(raw):
+    """First non-empty line, stripped of quotes and trailing punctuation."""
+    line = next((l.strip() for l in raw.splitlines() if l.strip()), "")
+    return line.strip('"\'').rstrip(".,;:").strip()
+
+
+def llm_label_subcluster(samples, idx):
+    """Label one subcluster via the claude CLI (nested file-write pattern).
+    Falls back to '' on any failure so a CLI outage cannot block a split."""
+    os.makedirs(REFINE_RESULT_DIR, exist_ok=True)
+    result_path = os.path.join(REFINE_RESULT_DIR, f"sub_{idx}.json")
+    if os.path.exists(result_path):
+        os.remove(result_path)
+    prompt = build_subcluster_label_prompt(samples) + (
+        f"\n\nWrite your answer as JSON {{\"label\": \"...\"}} to the file "
+        f"{result_path} using the Write tool."
+    )
+    try:
+        subprocess.run(
+            ["claude", "-p", prompt, "--output-format", "json", "--max-turns", "1",
+             "--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"],
+            stdin=subprocess.DEVNULL, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            timeout=120, capture_output=True,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+    for _ in range(10):
+        if os.path.exists(result_path):
+            import json as _json
+            try:
+                return parse_subcluster_label(_json.load(open(result_path)).get("label", ""))
+            except Exception:  # noqa: BLE001
+                return ""
+        time.sleep(1)
+    return ""
+
+
+def auto_refine(conn, cluster_id, run_id, min_sub_size=50, min_silhouette=0.15):
+    """Embedding-subcluster one cluster and write the split into the same run."""
+    import json as _json
+    import numpy as np
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT c.id::text, c.content, c.embedding::text
+            FROM claim_clusters cc JOIN claims c ON c.id = cc.claim_id
+            WHERE cc.cluster_run_id = %s AND cc.cluster_id = %s AND c.embedding IS NOT NULL
+        """, (run_id, cluster_id))
+        rows = cur.fetchall()
+    if len(rows) < 2 * min_sub_size:
+        return {"split": False, "reason": "too few claims", "n_subclusters": 0}
+
+    ids = [r[0] for r in rows]
+    contents = [r[1] for r in rows]
+    embs = np.array([_json.loads(r[2]) for r in rows], dtype=np.float32)
+
+    reduced = umap.UMAP(n_components=16, metric="cosine", n_neighbors=15,
+                        min_dist=0.0, random_state=42).fit_transform(embs)
+    reduced = normalize(reduced.astype(np.float32), norm="l2")
+
+    best_k, best_score, best_labels = 1, -1.0, None
+    for k in range(2, min(8, len(rows) // min_sub_size) + 1):
+        km = MiniBatchKMeans(n_clusters=k, n_init=5, random_state=42,
+                             batch_size=min(512, len(reduced)))
+        labels = km.fit_predict(reduced)
+        score = silhouette_score(reduced, labels, sample_size=min(1000, len(reduced)))
+        if score > best_score:
+            best_k, best_score, best_labels = k, score, labels
+
+    if best_k < 2 or best_score < min_silhouette:
+        return {"split": False, "reason": f"no structure (sil={best_score:.3f})", "n_subclusters": 0}
+
+    written = 0
+    with conn.cursor() as cur:
+        for sub in range(best_k):
+            members = [ids[i] for i in range(len(ids)) if best_labels[i] == sub]
+            if len(members) < min_sub_size:
+                continue
+            new_cid = cluster_id * 100 + sub
+            samples = [contents[i] for i in range(len(ids)) if best_labels[i] == sub][:10]
+            label = llm_label_subcluster(samples, sub) or f"cluster-{new_cid}"
+            cur.execute("""
+                UPDATE claim_clusters SET cluster_id = %s, computed_at = NOW()
+                WHERE cluster_run_id = %s AND claim_id = ANY(%s::uuid[])
+            """, (new_cid, run_id, members))
+            cur.execute("""
+                INSERT INTO cluster_labels (cluster_run_id, cluster_id, label, sample_count)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (cluster_run_id, cluster_id)
+                DO UPDATE SET label = EXCLUDED.label, sample_count = EXCLUDED.sample_count
+            """, (run_id, new_cid, label, len(members)))
+            written += 1
+    conn.commit()
+    return {"split": True, "n_subclusters": written, "silhouette": float(best_score)}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Interactive cluster refinement")
     parser.add_argument(
@@ -239,8 +356,10 @@ def main():
         default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
         help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
     )
-    parser.add_argument("--cluster-id", type=int, required=True)
+    parser.add_argument("--cluster-id", type=int, required=False)
     parser.add_argument("--run-id", default=None, help="Cluster run ID (default: latest)")
+    parser.add_argument("--auto", action="store_true",
+                        help="Non-interactive: embedding-subcluster + LLM label")
     args = parser.parse_args()
 
     conn = get_connection(args.database_url)
@@ -253,6 +372,13 @@ def main():
                 print("No clusters found", file=sys.stderr)
                 sys.exit(1)
             args.run_id = str(row[0])
+
+    if args.auto:
+        if args.cluster_id is None:
+            print("ERROR: --auto requires --cluster-id", file=sys.stderr); sys.exit(1)
+        import json as _json
+        print(_json.dumps(auto_refine(conn, args.cluster_id, args.run_id)))
+        conn.close(); return
 
     labeled_ids, labels, sublabel_names = interactive_label(conn, args.cluster_id, args.run_id)
 
