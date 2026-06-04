@@ -607,3 +607,38 @@ async fn renormalized_score_is_cosine_when_only_embedding_fires(pool: PgPool) {
         f.score
     );
 }
+
+/// A fired structural with empty intersection but non-empty UNION is a genuine
+/// negative: it stays in the denominator and pulls the score below pure cosine.
+/// (Contrast: a structural with no data at all is dropped — Task 1.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn fired_zero_jaccard_pulls_score_below_cosine(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    // Both claims carry identical embeddings → embed_cosine ≈ 1.0.
+    let a = insert_claim_with_embedding(&pool, agent).await;
+    let b = insert_claim_with_embedding(&pool, agent).await;
+
+    // Each claim has its OWN triple (disjoint subjects) → triple/entity unions
+    // are non-empty, intersections empty → those features fire at 0.0.
+    let subj_a = insert_entity(&pool).await;
+    let subj_b = insert_entity(&pool).await;
+    insert_triple(&pool, a, subj_a, "p").await;
+    insert_triple(&pool, b, subj_b, "p").await;
+
+    let f = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+
+    assert!(
+        f.embed_cosine > 0.99,
+        "precondition: cosine ≈ 1.0, got {}",
+        f.embed_cosine
+    );
+    // With embed=1.0, triple_overlap=0, entity_jaccard=0 in the denominator:
+    // score = 0.35·1.0 / (0.35 + 0.15 + 0.10) = 0.35/0.60 ≈ 0.583.
+    assert!(
+        f.score < 0.70 && f.score > 0.45,
+        "fired zero-Jaccards must pull score to ~0.58, got {}",
+        f.score
+    );
+}
