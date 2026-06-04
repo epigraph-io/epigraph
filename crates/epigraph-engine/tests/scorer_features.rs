@@ -103,6 +103,36 @@ async fn insert_claim_with_method(pool: &PgPool, agent: Uuid, method_id: &str) -
     id
 }
 
+/// Insert a claim whose 1536-dim embedding is 1.0 on `[start, start+len)` and
+/// 0 elsewhere. Lets a test construct two claims with a chosen cosine: two
+/// ranges overlapping in `k` of `len` positions give cosine ≈ k/len.
+async fn insert_claim_with_binary_embedding(
+    pool: &PgPool,
+    agent: Uuid,
+    start: usize,
+    len: usize,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let content = format!("claim {}", id);
+    let mut v = vec!["0"; 1536];
+    for slot in v.iter_mut().skip(start).take(len) {
+        *slot = "1";
+    }
+    let vec_literal = format!("[{}]", v.join(","));
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, embedding)
+         VALUES ($1, $2, sha256($2::bytea), 0.5, $3, $4::vector)",
+    )
+    .bind(id)
+    .bind(&content)
+    .bind(agent)
+    .bind(vec_literal)
+    .execute(pool)
+    .await
+    .expect("insert claim with binary embedding");
+    id
+}
+
 async fn insert_entity(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -772,5 +802,39 @@ async fn null_embedding_pair_is_suppressed(pool: PgPool) {
         f.score < 0.01,
         "null-embedding pair must be suppressed near 0, got {}",
         f.score
+    );
+}
+
+/// Post-renormalization the cross-source score ≈ embed_cosine, so the provisional
+/// mid=0.80 band (calibration.toml) cleanly separates genuine high-cosine
+/// restatements (reach the verifier) from topical lower-cosine pairs (dropped).
+#[sqlx::test(migrations = "../../migrations")]
+async fn renormalized_score_separates_at_mid_band(pool: PgPool) {
+    const MID: f32 = 0.80; // mirrors [matcher.bands].mid in calibration.toml
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim_with_binary_embedding(&pool, agent, 0, 1000).await;
+    // identical range → cosine ≈ 1.0
+    let high = insert_claim_with_binary_embedding(&pool, agent, 0, 1000).await;
+    // overlap 500 of 1000 → cosine ≈ 0.5
+    let low = insert_claim_with_binary_embedding(&pool, agent, 500, 1000).await;
+
+    let hi = score_pair(&pool, a, high, &Weights::default())
+        .await
+        .expect("score high");
+    let lo = score_pair(&pool, a, low, &Weights::default())
+        .await
+        .expect("score low");
+
+    assert!(
+        hi.score >= MID,
+        "high-cosine cross-source pair must reach mid={}, got {}",
+        MID,
+        hi.score
+    );
+    assert!(
+        lo.score < MID,
+        "topical low-cosine pair must stay below mid={}, got {}",
+        MID,
+        lo.score
     );
 }
