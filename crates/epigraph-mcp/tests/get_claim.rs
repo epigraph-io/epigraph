@@ -30,6 +30,8 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
         &server,
         GetClaimParams {
             claim_id: open_id.as_uuid().to_string(),
+            frame_id: None,
+            perspective_id: None,
         },
     )
     .await
@@ -55,6 +57,8 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
         &server,
         GetClaimParams {
             claim_id: superseded_id.as_uuid().to_string(),
+            frame_id: None,
+            perspective_id: None,
         },
     )
     .await

@@ -111,6 +111,15 @@ pub struct RecallWithContextParams {
     /// `LlmProvider`; degrades to annotate-only when none is active. Default
     /// `false`.
     pub groundedness_gate: Option<bool>,
+    /// Optional lens frame UUID (from `list_frames`). Must be paired with
+    /// `perspective_id`. When both are set, each returned hit carries an
+    /// additive `lensed_belief` computed under that `(frame, perspective)` lens;
+    /// retrieval, rerank, and `min_truth` stay on the global `truth_value`.
+    pub frame_id: Option<String>,
+    /// Optional lens perspective UUID (from `list_perspectives`). Must be paired
+    /// with `frame_id`. The perspective's source/locality reliability re-weights
+    /// each hit's BBAs on-read.
+    pub perspective_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -132,6 +141,12 @@ pub struct RecallHit {
     /// was off/skipped. Surfaced alongside, NOT instead of, belief/truth.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<epigraph_engine::rerank::Groundedness>,
+    /// Per-hit belief under the requested `(frame, perspective)` lens. Present
+    /// only when a lens was supplied; omitted (not null) otherwise so a
+    /// lens-free recall is byte-identical to today. Surfaced ALONGSIDE the
+    /// global `truth_value`, not instead of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lensed_belief: Option<crate::types::LensedBelief>,
     pub truth_value: f64,
     pub paper: PaperMeta,
     pub section: Option<SectionMeta>,
@@ -261,6 +276,17 @@ pub async fn recall_with_context(
         .map_err(|e| internal_error(format!("embed query: {e}")))?;
     let pgvec = crate::embed::format_pgvector(&query_embedding);
 
+    // Resolve + existence-check the optional (frame, perspective) lens ONCE,
+    // before the page loop, so a bad lens fails fast and the bounded post-pass
+    // never round-trips the repo per claim for existence.
+    let lens = crate::tools::lens::resolve_lens(
+        params.frame_id.as_deref(),
+        params.perspective_id.as_deref(),
+    )?;
+    if let Some((frame_id, perspective_id)) = lens {
+        crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
+    }
+
     recall_with_context_post_embed(
         server,
         &params,
@@ -271,6 +297,7 @@ pub async fn recall_with_context(
         siblings_limit,
         corroborates_limit,
         neighbor_paragraphs_limit,
+        lens,
     )
     .await
 }
@@ -292,6 +319,7 @@ async fn recall_with_context_post_embed(
     siblings_limit: u32,
     corroborates_limit: u32,
     neighbor_paragraphs_limit: u32,
+    lens: Option<(Uuid, Uuid)>,
 ) -> Result<CallToolResult, McpError> {
     // Stage 3: candidate retrieval. Two paths:
     //
@@ -581,6 +609,9 @@ async fn recall_with_context_post_embed(
             similarity: hit.similarity,
             rerank_score,
             verdict,
+            // Populated by the bounded lens post-pass below (after the loop),
+            // once per page, keyed by paragraph_id. None until then.
+            lensed_belief: None,
             truth_value: core.truth_value,
             paper,
             section: ctx.section_meta.get(&paragraph_id).cloned(),
@@ -597,6 +628,39 @@ async fn recall_with_context_post_embed(
             neighbor_paragraphs_total,
             neighbor_paragraphs_truncated,
         });
+    }
+
+    // Bounded lens post-pass: when a lens is active, annotate each already-built
+    // hit with its lensed belief, keyed by paragraph_id. This does NOT touch
+    // retrieval, rerank, diverse selection, or min_truth (all on the global
+    // value). Per-claim degrade-not-fail: a compute error for ONE hit yields
+    // null + a warn, never an aborted page (spec §8).
+    if let Some((frame_id, perspective_id)) = lens {
+        for hit in &mut results {
+            match epigraph_engine::belief_query::get_perspective_belief(
+                &server.pool,
+                hit.paragraph_id,
+                frame_id,
+                perspective_id,
+            )
+            .await
+            {
+                Ok(interval) => {
+                    hit.lensed_belief = Some(crate::types::LensedBelief::from_interval(
+                        frame_id,
+                        perspective_id,
+                        &interval,
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        claim_id = %hit.paragraph_id,
+                        error = %e,
+                        "lensed belief compute failed; serving null lens for this claim"
+                    );
+                }
+            }
+        }
     }
 
     let corpus_scope = compute_corpus_scope(&server.pool)
@@ -1280,6 +1344,16 @@ pub mod __test_only {
         let siblings_limit = params.siblings_limit.unwrap_or(8);
         let corroborates_limit = params.corroborates_limit.unwrap_or(4);
         let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
+        // Mirror the real entry: resolve + existence-check the lens up front so
+        // integration tests exercise the same validation path.
+        let lens = crate::tools::lens::resolve_lens(
+            params.frame_id.as_deref(),
+            params.perspective_id.as_deref(),
+        )?;
+        if let Some((frame_id, perspective_id)) = lens {
+            crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id)
+                .await?;
+        }
         recall_with_context_post_embed(
             server,
             &params,
@@ -1290,6 +1364,7 @@ pub mod __test_only {
             siblings_limit,
             corroborates_limit,
             neighbor_paragraphs_limit,
+            lens,
         )
         .await
     }

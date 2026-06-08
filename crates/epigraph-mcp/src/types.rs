@@ -106,6 +106,65 @@ pub struct QueryUndecomposedClaimsParams {
 pub struct GetClaimParams {
     #[schemars(description = "The UUID of the claim to retrieve")]
     pub claim_id: String,
+
+    #[schemars(
+        description = "Optional lens frame UUID (from list_frames). Must be paired with perspective_id. \
+                       When both are set, the response carries an additive lensed_belief computed under that (frame, perspective) lens; the global truth_value is unchanged."
+    )]
+    #[serde(default)]
+    pub frame_id: Option<String>,
+
+    #[schemars(
+        description = "Optional lens perspective UUID (from list_perspectives). Must be paired with frame_id. \
+                       The perspective's source/locality reliability re-weights the claim's BBAs on-read."
+    )]
+    #[serde(default)]
+    pub perspective_id: Option<String>,
+}
+
+/// Additive per-claim belief computed under a `(frame, perspective)` lens.
+///
+/// Attached as an `Option<LensedBelief>` on the four context-delivery read
+/// tools (`recall`, `recall_with_context`, `get_claim`, `get_belief`) ONLY when
+/// a valid lens is supplied. Serialize-only with
+/// `#[serde(skip_serializing_if = "Option::is_none")]` on the field so a
+/// lens-free call is byte-identical to today (the key is omitted, never `null`).
+///
+/// Source: `epigraph_engine::belief_query::get_perspective_belief` —
+/// recomputes the claim's belief on-read, re-discounting every stored BBA by
+/// the perspective's reliability maps. Order claims by `pignistic_prob` (BetP).
+#[derive(Debug, Clone, Serialize)]
+pub struct LensedBelief {
+    /// Echoes the lens frame UUID.
+    pub frame_id: String,
+    /// Echoes the lens perspective UUID.
+    pub perspective_id: String,
+    /// Dempster-Shafer belief (lower probability bound) under the lens.
+    pub belief: f64,
+    /// Dempster-Shafer plausibility (upper probability bound) under the lens.
+    pub plausibility: f64,
+    /// Pignistic probability (BetP) under the lens — use for ordering.
+    pub pignistic_prob: f64,
+}
+
+impl LensedBelief {
+    /// Build from a computed `BeliefInterval`, carrying only the three lens
+    /// fields (spec §5 names exactly frame_id, perspective_id, belief,
+    /// plausibility, pignistic_prob — not mass/source/framed).
+    #[must_use]
+    pub fn from_interval(
+        frame_id: uuid::Uuid,
+        perspective_id: uuid::Uuid,
+        interval: &epigraph_engine::BeliefInterval,
+    ) -> Self {
+        Self {
+            frame_id: frame_id.to_string(),
+            perspective_id: perspective_id.to_string(),
+            belief: interval.belief,
+            plausibility: interval.plausibility,
+            pignistic_prob: interval.pignistic_prob,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -188,6 +247,20 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub agent_id: Option<String>,
+
+    #[schemars(
+        description = "Optional lens frame UUID (from list_frames). Must be paired with perspective_id. \
+                       When both are set, each returned claim carries an additive lensed_belief computed under that (frame, perspective) lens. Ranking and min_truth stay on the global truth_value."
+    )]
+    #[serde(default)]
+    pub frame_id: Option<String>,
+
+    #[schemars(
+        description = "Optional lens perspective UUID (from list_perspectives). Must be paired with frame_id. \
+                       The perspective's source/locality reliability re-weights each claim's BBAs on-read."
+    )]
+    #[serde(default)]
+    pub perspective_id: Option<String>,
 }
 
 // ── Ingestion ──
@@ -602,6 +675,13 @@ pub struct GetBeliefParams {
         description = "Optional frame UUID. If provided, recomputes Bel/Pl/BetP from stored BBAs. If omitted, returns cached DS columns."
     )]
     pub frame_id: Option<String>,
+
+    #[schemars(
+        description = "Optional lens perspective UUID (from list_perspectives). Requires frame_id. \
+                       When set, the response also carries an additive lensed_belief computed under that (frame, perspective) lens; the existing global belief is unchanged."
+    )]
+    #[serde(default)]
+    pub perspective_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -735,6 +815,11 @@ pub struct RecallResult {
     pub rrf_score: f64,
     /// Which legs matched: subset of `["dense","lexical"]`.
     pub matched_via: Vec<String>,
+    /// Per-claim belief under the requested `(frame, perspective)` lens.
+    /// Present only when a lens was supplied; omitted (not null) otherwise, so
+    /// a lens-free recall is byte-identical to today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lensed_belief: Option<LensedBelief>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1016,6 +1101,12 @@ pub struct BeliefResponse {
     pub mass_on_conflict: f64,
     pub mass_on_missing: f64,
     pub source: String,
+    /// Belief under the requested `(frame, perspective)` lens. Present only when
+    /// a perspective_id was supplied (frame_id required); omitted (not null)
+    /// otherwise so a lens-free get_belief is byte-identical to today. The
+    /// top-level belief/plausibility/etc remain the global (unlensed) values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lensed_belief: Option<LensedBelief>,
 }
 
 #[derive(Debug, Serialize)]

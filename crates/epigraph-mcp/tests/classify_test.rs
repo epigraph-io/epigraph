@@ -138,6 +138,8 @@ async fn get_claim_exposes_classification(pool: PgPool) {
         &server,
         GetClaimParams {
             claim_id: claim.to_string(),
+            frame_id: None,
+            perspective_id: None,
         },
     )
     .await

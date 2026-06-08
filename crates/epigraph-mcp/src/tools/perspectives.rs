@@ -134,6 +134,12 @@ pub async fn list_perspectives(
                 "perspective_type": r.perspective_type,
                 "confidence_calibration": r.confidence_calibration,
                 "created_at": r.created_at.to_rfc3339(),
+                // Lens maps so an agent can SEE what a perspective up/down-weights
+                // before choosing it as a (frame, perspective) lens. Serialize as
+                // a JSON object when present, `null` when the perspective sets no
+                // override (Option<HashMap> → object/null).
+                "source_reliability": r.source_reliability(),
+                "locality_reliability": r.locality_reliability(),
             })
         })
         .collect();
