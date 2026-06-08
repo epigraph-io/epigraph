@@ -291,14 +291,23 @@ def llm_label_subcluster(samples, idx):
     return ""
 
 
-def auto_refine(conn, cluster_id, run_id, min_sub_size=50, min_silhouette=0.15):
-    """Embedding-subcluster one cluster and write the split into the same run."""
-    import json as _json
-    import numpy as np
+def auto_refine(conn, cluster_id, run_id, min_sub_size=50, min_silhouette=0.15,
+                fit_sample=10000):
+    """Embedding-subcluster one cluster and write the split into the same run.
 
+    Memory-bounded for production cluster sizes (tens of thousands of members):
+    ids+content are fetched first (small), embeddings are loaded in id-chunks via
+    theme_lib (no multi-GB parse transient), and UMAP is FIT on a capped random
+    sample then used to TRANSFORM all members — so peak memory does not grow with
+    cluster size. (A full fit on ~57K members OOM'd a 1.9GB cgroup cap.)
+    """
+    import numpy as np
+    import theme_lib
+
+    # ids + content only (small); embeddings loaded separately, memory-safe.
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT c.id::text, c.content, c.embedding::text
+            SELECT c.id::text, c.content
             FROM claim_clusters cc JOIN claims c ON c.id = cc.claim_id
             WHERE cc.cluster_run_id = %s AND cc.cluster_id = %s AND c.embedding IS NOT NULL
         """, (run_id, cluster_id))
@@ -308,11 +317,19 @@ def auto_refine(conn, cluster_id, run_id, min_sub_size=50, min_silhouette=0.15):
 
     ids = [r[0] for r in rows]
     contents = [r[1] for r in rows]
-    embs = np.array([_json.loads(r[2]) for r in rows], dtype=np.float32)
+    embs = theme_lib.load_embeddings_for_ids(conn, ids)
 
-    reduced = umap.UMAP(n_components=16, metric="cosine", n_neighbors=15,
-                        min_dist=0.0, random_state=42).fit_transform(embs)
-    reduced = normalize(reduced.astype(np.float32), norm="l2")
+    # Fit UMAP on a capped sample, then transform every member into that frame —
+    # bounds the fit cost regardless of cluster size.
+    reducer = umap.UMAP(n_components=16, metric="cosine", n_neighbors=15,
+                        min_dist=0.0, random_state=42)
+    if len(ids) > fit_sample:
+        fit_idx = np.random.RandomState(42).choice(len(ids), fit_sample, replace=False)
+        reducer.fit(embs[fit_idx])
+        reduced = reducer.transform(embs).astype(np.float32)
+    else:
+        reduced = reducer.fit_transform(embs).astype(np.float32)
+    reduced = normalize(reduced, norm="l2")
 
     best_k, best_score, best_labels = 1, -1.0, None
     for k in range(2, min(8, len(rows) // min_sub_size) + 1):

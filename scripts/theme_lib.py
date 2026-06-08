@@ -53,6 +53,27 @@ def parse_embeddings(text_rows):
     return out
 
 
+def load_embeddings_for_ids(conn, ids, dim=1536, chunk=5000):
+    """Load embeddings for a list of claim ids into an (n, dim) float32 array,
+    preserving the order of `ids`. Fetches in id-chunks so only `chunk` rows of
+    embedding text are resident at once — avoids the multi-GB transient that
+    fetching+parsing tens of thousands of embeddings at once produces.
+    """
+    out = np.empty((len(ids), dim), dtype=np.float32)
+    pos = {cid: i for i, cid in enumerate(ids)}
+    for start in range(0, len(ids), chunk):
+        sub = ids[start:start + chunk]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id::text, embedding::text FROM claims "
+                "WHERE id = ANY(%s::uuid[]) AND embedding IS NOT NULL",
+                (sub,),
+            )
+            for cid, etext in cur.fetchall():
+                out[pos[cid]] = json.loads(etext)
+    return out
+
+
 def iter_claim_embeddings(conn, batch_size=50000, where="c.embedding IS NOT NULL AND c.is_current = true"):
     """Yield (claim_ids, embeddings) chunks over claims matching `where`,
     ordered by id (stable OFFSET paging). Memory-safe: one batch resident."""
