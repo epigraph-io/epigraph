@@ -181,3 +181,31 @@ engine relies on (`claim_clusters(cluster_run_id, cluster_id)`,
   claims_in_themes_at_dim, recompute_all_centroids}`, recall MCP,
   `GET /clusters/boundary-claims`, theme HTTP routes.
 ```
+
+## Run log — clone validation (2026-06-08)
+
+Validated end-to-end on `epigraph_theme_dev`, a `pg_dump`/`pg_restore` clone of
+prod (433,606 claims; the 3 pgvector indexes didn't restore under parallel
+`-j4` shared-memory limits but are not needed by the pipeline). Prod untouched.
+
+- **Step A (base→project→label):** k=14, 430,456 themed, **0 unthemed**, 13/14
+  LLM-labeled. Validated the missing B→A projection on real data.
+- **Step B (auto_refine scaling):** first probe OOM'd a 1.9 GB cgroup cap on a
+  ~57K-member cluster (inline `json.loads` transient + full UMAP fit). Fixed via
+  `theme_lib.load_embeddings_for_ids` (chunked) + sample-fit-then-transform
+  (commit e31b3fc). Re-probe: split into 7, no OOM, 14→20 clusters, no id
+  collision.
+- **Step C (full grow):** resumed the run, k climbed 20→41→88, stopped at
+  target_k. **88 themes, 430,456 themed, 0 unthemed, 88 distinct clusters == 88
+  themes, 0 cluster_id→multi-theme collisions** (monotonic-id fix holds across
+  the full grow). 82/88 LLM-labeled; ~6 claude-CLI flakes re-runnable via the
+  `label` step.
+
+**Memory note:** the host (7.6 GB, no swap, shared with prod + agents) requires
+small assign batches (`--batch-size 2000`) under a ~1.9 GB cgroup cap; 20K
+batches caused a global OOM. A swapfile would relax this but was not authorized.
+
+**Known follow-ups (non-blocking):** `grow --dry-run` still writes a base run
+(misleading name); `cluster_centroids` holds only base centroids (cosmetic —
+projection recomputes true 1536-d centroids, matcher reads `claim_clusters`);
+re-run `label` to clear the ~6 fallback labels.
