@@ -165,8 +165,13 @@ belief_alignment = 0.10
 theme_proximity  = 0.05
 
 [matcher.bands]
-high = 0.85
-mid  = 0.60
+# Provisional bootstrap bands for the renormalized (≈cosine) cross-source score
+# (backlog 27bc9754). mid is grounded in resolved item 4a715300 ("real
+# corroboration clusters >0.85 cosine; 0.70–0.79 is topical noise"); high is set
+# unreachable so EVERY candidate routes to the LLM verifier (the precision gate)
+# rather than auto-promoting. Final calibrated values → #239 precision sweep.
+high = 1.01
+mid  = 0.80
 
 [matcher.embedding]
 model_version = "v1"
