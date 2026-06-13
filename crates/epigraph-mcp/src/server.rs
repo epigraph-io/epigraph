@@ -400,6 +400,16 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Check whether a paper with the given DOI has already been ingested at the specified pipeline version. Returns {already_ingested, paper_id?, doi, pipeline_version}. Use as a pre-flight before invoking expensive extract-claims work — `ingest_document` runs the same gate internally, but only after the LLM call. Read-only."
+    )]
+    async fn check_already_ingested(
+        &self,
+        Parameters(params): Parameters<CheckAlreadyIngestedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ingestion::check_already_ingested(self, params).await
+    }
+
+    #[tool(
         description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent for re-runs at the same pipeline version."
     )]
     async fn ingest_document_inline(

@@ -23,6 +23,7 @@ pub fn required_scope(tool_name: &str) -> Option<&'static str> {
 /// coverage test will fail until you do.
 pub const SCOPE_MAP: &[(&str, &str)] = &[
     // ─── claims:read ───────────────────────────────────────────────────
+    ("check_already_ingested", "claims:read"),
     ("check_sheaf_consistency", "claims:read"),
     ("compare_methods", "claims:read"),
     ("embedding_neighborhood_density", "claims:read"),
