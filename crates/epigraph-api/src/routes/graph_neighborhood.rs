@@ -610,7 +610,7 @@ pub async fn claim_compound_neighborhood(
         });
     }
     let mut nodes: Vec<CompoundNeighborNode> = nodes_by_id.into_values().collect();
-    nodes.sort_by(|a, b| b.atom_link_count.cmp(&a.atom_link_count));
+    nodes.sort_by_key(|n| std::cmp::Reverse(n.atom_link_count));
 
     // Push the center node first
     nodes.insert(
