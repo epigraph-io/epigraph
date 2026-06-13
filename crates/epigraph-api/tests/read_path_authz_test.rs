@@ -9,7 +9,11 @@ mod common;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
-async fn pool_and_app() -> (sqlx::PgPool, std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+async fn pool_and_app() -> (
+    sqlx::PgPool,
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+) {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let pool = PgPoolOptions::new()
         .max_connections(4)
@@ -54,7 +58,11 @@ async fn get_claim_no_token_spoofed_owner_is_redacted() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "private claim still returns 200, just redacted");
+    assert_eq!(
+        resp.status(),
+        200,
+        "private claim still returns 200, just redacted"
+    );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
         content_of(&body),
@@ -140,7 +148,11 @@ async fn get_claim_invalid_token_is_401() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 401, "present-but-invalid Bearer must 401 even on a public read");
+    assert_eq!(
+        resp.status(),
+        401,
+        "present-but-invalid Bearer must 401 even on a public read"
+    );
 }
 
 /// list_claims (GET /claims) must redact a private claim's content for a
@@ -167,7 +179,10 @@ async fn list_claims_no_token_spoofed_owner_is_redacted() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    let items = body.get("items").and_then(|i| i.as_array()).expect("items array");
+    let items = body
+        .get("items")
+        .and_then(|i| i.as_array())
+        .expect("items array");
     let found = items
         .iter()
         .find(|it| it.get("id").and_then(|v| v.as_str()) == Some(claim_id.to_string().as_str()))
@@ -344,8 +359,7 @@ async fn frame_claims_sorted_owner_token_ignores_wire_param_and_sees_full() {
 async fn claim_provenance_no_token_spoofed_owner_is_redacted() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
-    let claim_id =
-        common::seed_claim_with_agent(&pool, "PROV private secret body", owner).await;
+    let claim_id = common::seed_claim_with_agent(&pool, "PROV private secret body", owner).await;
     common::seed_private_ownership(&pool, claim_id, owner).await;
 
     // Force a provenance chain so the claim step is emitted and the label is
@@ -355,7 +369,13 @@ async fn claim_provenance_no_token_spoofed_owner_is_redacted() {
     // schema (\d evidence on epigraph_db_repo_test) in addition to the
     // properties.evidence_type/doi read by build_evidence_chains.
     let evidence_id = uuid::Uuid::new_v4();
-    let ev_hash: Vec<u8> = evidence_id.as_bytes().iter().copied().cycle().take(32).collect();
+    let ev_hash: Vec<u8> = evidence_id
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(32)
+        .collect();
     sqlx::query(
         "INSERT INTO evidence (id, raw_content, content_hash, evidence_type, claim_id, properties) \
          VALUES ($1, 'ev', $2, 'document', $3, '{\"evidence_type\":\"document\",\"doi\":\"10.1/x\"}'::jsonb)",
@@ -366,7 +386,15 @@ async fn claim_provenance_no_token_spoofed_owner_is_redacted() {
     .execute(&pool)
     .await
     .unwrap();
-    common::insert_edge(&pool, claim_id, evidence_id, "claim", "evidence", "DERIVED_FROM").await;
+    common::insert_edge(
+        &pool,
+        claim_id,
+        evidence_id,
+        "claim",
+        "evidence",
+        "DERIVED_FROM",
+    )
+    .await;
 
     let resp = reqwest::Client::new()
         .get(format!(
@@ -382,7 +410,10 @@ async fn claim_provenance_no_token_spoofed_owner_is_redacted() {
     // an empty `chains` array but the claim is still redacted via the same
     // check, so assert no chain leaks the secret and that if a claim step is
     // present it is redacted.
-    let chains = body.get("chains").and_then(|c| c.as_array()).expect("chains array");
+    let chains = body
+        .get("chains")
+        .and_then(|c| c.as_array())
+        .expect("chains array");
     for chain in chains {
         if let Some(path) = chain.get("path").and_then(|p| p.as_array()) {
             for step in path {
@@ -402,7 +433,10 @@ async fn claim_provenance_no_token_spoofed_owner_is_redacted() {
             for step in path {
                 if step.get("entity_type").and_then(|t| t.as_str()) == Some("claim") {
                     saw_claim_step = true;
-                    assert_eq!(step.get("label").and_then(|l| l.as_str()), Some("[REDACTED]"));
+                    assert_eq!(
+                        step.get("label").and_then(|l| l.as_str()),
+                        Some("[REDACTED]")
+                    );
                 }
             }
         }
@@ -426,13 +460,18 @@ async fn claim_provenance_no_token_spoofed_owner_is_redacted() {
 async fn claim_provenance_owner_token_ignores_wire_param_and_sees_full() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
-    let claim_id =
-        common::seed_claim_with_agent(&pool, "PROV private secret body", owner).await;
+    let claim_id = common::seed_claim_with_agent(&pool, "PROV private secret body", owner).await;
     common::seed_private_ownership(&pool, claim_id, owner).await;
 
     // Same chain seeding as the redacted test so a claim-typed step is emitted.
     let evidence_id = uuid::Uuid::new_v4();
-    let ev_hash: Vec<u8> = evidence_id.as_bytes().iter().copied().cycle().take(32).collect();
+    let ev_hash: Vec<u8> = evidence_id
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(32)
+        .collect();
     sqlx::query(
         "INSERT INTO evidence (id, raw_content, content_hash, evidence_type, claim_id, properties) \
          VALUES ($1, 'ev', $2, 'document', $3, '{\"evidence_type\":\"document\",\"doi\":\"10.1/x\"}'::jsonb)",
@@ -443,7 +482,15 @@ async fn claim_provenance_owner_token_ignores_wire_param_and_sees_full() {
     .execute(&pool)
     .await
     .unwrap();
-    common::insert_edge(&pool, claim_id, evidence_id, "claim", "evidence", "DERIVED_FROM").await;
+    common::insert_edge(
+        &pool,
+        claim_id,
+        evidence_id,
+        "claim",
+        "evidence",
+        "DERIVED_FROM",
+    )
+    .await;
 
     let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
     let random = Uuid::new_v4();
@@ -457,7 +504,10 @@ async fn claim_provenance_owner_token_ignores_wire_param_and_sees_full() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    let chains = body.get("chains").and_then(|c| c.as_array()).expect("chains array");
+    let chains = body
+        .get("chains")
+        .and_then(|c| c.as_array())
+        .expect("chains array");
     // The claim step label is the (un-truncated, < 60 char) content for an
     // owner. Find a claim-typed step and assert it shows the secret in full.
     let mut saw_claim_step = false;
@@ -498,7 +548,13 @@ async fn list_edges_no_token_spoofed_owner_omits_private_edge() {
     // An edge whose source is the private claim. When the source claim is
     // redacted for the requester, list_edges drops the whole edge.
     let evidence_id = uuid::Uuid::new_v4();
-    let ev_hash: Vec<u8> = evidence_id.as_bytes().iter().copied().cycle().take(32).collect();
+    let ev_hash: Vec<u8> = evidence_id
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(32)
+        .collect();
     sqlx::query(
         "INSERT INTO evidence (id, raw_content, content_hash, evidence_type, claim_id, properties) \
          VALUES ($1, 'ev', $2, 'document', $3, '{}'::jsonb)",
@@ -509,8 +565,15 @@ async fn list_edges_no_token_spoofed_owner_omits_private_edge() {
     .execute(&pool)
     .await
     .unwrap();
-    let edge_id =
-        common::insert_edge(&pool, claim_id, evidence_id, "claim", "evidence", "DERIVED_FROM").await;
+    let edge_id = common::insert_edge(
+        &pool,
+        claim_id,
+        evidence_id,
+        "claim",
+        "evidence",
+        "DERIVED_FROM",
+    )
+    .await;
 
     let url = format!(
         "http://{addr}/api/v1/edges?source_id={claim_id}&source_type=claim&agent_id={owner}"
@@ -572,7 +635,13 @@ async fn supporting_evidence_no_token_spoofed_owner_sees_empty_owner_sees_eviden
     // evidence_by_relationship JOIN requires (ev.id = e.source_id,
     // e.target_id = claim, e.source_type='evidence', e.relationship='SUPPORTS').
     let evidence_id = uuid::Uuid::new_v4();
-    let ev_hash: Vec<u8> = evidence_id.as_bytes().iter().copied().cycle().take(32).collect();
+    let ev_hash: Vec<u8> = evidence_id
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(32)
+        .collect();
     sqlx::query(
         "INSERT INTO evidence (id, raw_content, content_hash, evidence_type, claim_id, properties) \
          VALUES ($1, 'supporting evidence body', $2, 'document', $3, '{}'::jsonb)",
@@ -583,7 +652,15 @@ async fn supporting_evidence_no_token_spoofed_owner_sees_empty_owner_sees_eviden
     .execute(&pool)
     .await
     .unwrap();
-    common::insert_edge(&pool, evidence_id, claim_id, "evidence", "claim", "SUPPORTS").await;
+    common::insert_edge(
+        &pool,
+        evidence_id,
+        claim_id,
+        "evidence",
+        "claim",
+        "SUPPORTS",
+    )
+    .await;
 
     // No-token spoof of the owner agent_id: claim is redacted → empty list.
     let resp = reqwest::Client::new()
@@ -600,8 +677,14 @@ async fn supporting_evidence_no_token_spoofed_owner_sees_empty_owner_sees_eviden
         Some(0),
         "no-token spoof of owner agent_id must NOT see evidence for a private claim"
     );
-    let ev = body.get("evidence").and_then(|e| e.as_array()).expect("evidence array");
-    assert!(ev.is_empty(), "evidence list must be empty for a redacted claim");
+    let ev = body
+        .get("evidence")
+        .and_then(|e| e.as_array())
+        .expect("evidence array");
+    assert!(
+        ev.is_empty(),
+        "evidence list must be empty for a redacted claim"
+    );
 
     // Owner token (with a RANDOM spoofed wire agent_id): claim is Full → the
     // evidence is returned. total==1 also proves the stranger half above was
@@ -623,10 +706,14 @@ async fn supporting_evidence_no_token_spoofed_owner_sees_empty_owner_sees_eviden
         Some(1),
         "owner token must see the supporting evidence even with a spoofed wire agent_id"
     );
-    let ev = body.get("evidence").and_then(|e| e.as_array()).expect("evidence array");
+    let ev = body
+        .get("evidence")
+        .and_then(|e| e.as_array())
+        .expect("evidence array");
     assert!(
-        ev.iter().any(|e| e.get("evidence_id").and_then(|v| v.as_str())
-            == Some(evidence_id.to_string().as_str())),
+        ev.iter()
+            .any(|e| e.get("evidence_id").and_then(|v| v.as_str())
+                == Some(evidence_id.to_string().as_str())),
         "owner must see the seeded evidence_id"
     );
 }
@@ -651,7 +738,13 @@ async fn get_evidence_no_token_spoofed_owner_redacts_content_caption_and_url() {
     // Evidence with a non-null source_url column AND a caption in properties so
     // the field-gating assertions are not vacuous (None == None).
     let evidence_id = uuid::Uuid::new_v4();
-    let ev_hash: Vec<u8> = evidence_id.as_bytes().iter().copied().cycle().take(32).collect();
+    let ev_hash: Vec<u8> = evidence_id
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(32)
+        .collect();
     sqlx::query(
         "INSERT INTO evidence (id, raw_content, content_hash, evidence_type, claim_id, source_url, properties) \
          VALUES ($1, 'evidence body text', $2, 'figure', $3, 'https://secret.example/leak', \
@@ -665,7 +758,15 @@ async fn get_evidence_no_token_spoofed_owner_redacts_content_caption_and_url() {
     .unwrap();
     // claim -> evidence link edge (get_evidence reads source_type='claim',
     // target_type='evidence' to find the linked claim for the access check).
-    common::insert_edge(&pool, claim_id, evidence_id, "claim", "evidence", "DERIVED_FROM").await;
+    common::insert_edge(
+        &pool,
+        claim_id,
+        evidence_id,
+        "claim",
+        "evidence",
+        "DERIVED_FROM",
+    )
+    .await;
 
     // No-token spoof of the owner agent_id: claim redacted → content, caption,
     // and source_url all gated.
@@ -735,7 +836,8 @@ async fn get_evidence_no_token_spoofed_owner_redacts_content_caption_and_url() {
 async fn graph_full_no_token_spoofed_owner_redacts_node_label() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
-    let claim_id = common::seed_claim_with_agent(&pool, "GRAPHFULL private secret body", owner).await;
+    let claim_id =
+        common::seed_claim_with_agent(&pool, "GRAPHFULL private secret body", owner).await;
     common::seed_private_ownership(&pool, claim_id, owner).await;
 
     // An edge incident to the private claim so it surfaces as a graph node.
@@ -747,8 +849,9 @@ async fn graph_full_no_token_spoofed_owner_redacts_node_label() {
             .and_then(|n| n.as_array())
             .and_then(|arr| {
                 arr.iter()
-                    .find(|n| n.get("id").and_then(|v| v.as_str())
-                        == Some(claim_id.to_string().as_str()))
+                    .find(|n| {
+                        n.get("id").and_then(|v| v.as_str()) == Some(claim_id.to_string().as_str())
+                    })
                     .and_then(|n| n.get("label").and_then(|l| l.as_str()))
                     .map(|s| s.to_string())
             })
@@ -804,8 +907,7 @@ async fn graph_full_no_token_spoofed_owner_redacts_node_label() {
 async fn graph_query_no_token_spoofed_owner_is_redacted() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
-    let claim_id =
-        common::seed_claim_with_agent(&pool, "GQL private secret body", owner).await;
+    let claim_id = common::seed_claim_with_agent(&pool, "GQL private secret body", owner).await;
     common::seed_private_ownership(&pool, claim_id, owner).await;
 
     let find_node_label = |body: &serde_json::Value| -> Option<String> {
@@ -813,8 +915,9 @@ async fn graph_query_no_token_spoofed_owner_is_redacted() {
             .and_then(|n| n.as_array())
             .and_then(|arr| {
                 arr.iter()
-                    .find(|n| n.get("id").and_then(|v| v.as_str())
-                        == Some(claim_id.to_string().as_str()))
+                    .find(|n| {
+                        n.get("id").and_then(|v| v.as_str()) == Some(claim_id.to_string().as_str())
+                    })
                     .and_then(|n| n.get("label").and_then(|l| l.as_str()))
                     .map(|s| s.to_string())
             })

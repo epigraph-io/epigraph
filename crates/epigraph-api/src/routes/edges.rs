@@ -1532,10 +1532,10 @@ pub async fn graph_edges(
         if r.source_type != "claim" || r.target_type != "claim" {
             continue;
         }
-        let source_redacted = check_content_access(pool, r.source_id, requester).await
-            == ContentAccess::Redacted;
-        let target_redacted = check_content_access(pool, r.target_id, requester).await
-            == ContentAccess::Redacted;
+        let source_redacted =
+            check_content_access(pool, r.source_id, requester).await == ContentAccess::Redacted;
+        let target_redacted =
+            check_content_access(pool, r.target_id, requester).await == ContentAccess::Redacted;
         if !source_redacted && !target_redacted {
             filtered.push(r);
         }

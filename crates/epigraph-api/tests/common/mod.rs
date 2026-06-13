@@ -399,10 +399,12 @@ pub fn mint_token_with_agent(scopes: &[&str], agent_id: Uuid) -> String {
 /// `ensure_claim_encryption_table`: `IF NOT EXISTS` makes it a no-op on a DB
 /// where 044 has already run.
 pub async fn ensure_frame_properties_column(pool: &PgPool) {
-    sqlx::query("ALTER TABLE frames ADD COLUMN IF NOT EXISTS properties JSONB NOT NULL DEFAULT '{}'::jsonb")
-        .execute(pool)
-        .await
-        .expect("ensure frames.properties column");
+    sqlx::query(
+        "ALTER TABLE frames ADD COLUMN IF NOT EXISTS properties JSONB NOT NULL DEFAULT '{}'::jsonb",
+    )
+    .execute(pool)
+    .await
+    .expect("ensure frames.properties column");
 }
 
 /// Create a frame (≥2 hypotheses, per the `frames_not_empty` CHECK) and assign
