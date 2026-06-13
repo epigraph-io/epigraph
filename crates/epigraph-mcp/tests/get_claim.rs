@@ -106,6 +106,8 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
             &server,
             GetClaimParams {
                 claim_id: claim_id.as_uuid().to_string(),
+                frame_id: None,
+                perspective_id: None,
             },
             Some(owner),
         )
@@ -133,6 +135,8 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
             &server,
             GetClaimParams {
                 claim_id: claim_id.as_uuid().to_string(),
+                frame_id: None,
+                perspective_id: None,
             },
             Some(stranger),
         )

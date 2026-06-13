@@ -235,6 +235,8 @@ async fn get_claim_as(
         server,
         GetClaimParams {
             claim_id: claim_id.as_uuid().to_string(),
+            frame_id: None,
+            perspective_id: None,
         },
         requester,
     )
