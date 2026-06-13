@@ -203,8 +203,12 @@ impl EpiGraphMcpFull {
     async fn query_claims(
         &self,
         Parameters(params): Parameters<QueryClaimsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::claims::query_claims(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::claims::query_claims(self, params, requester).await
     }
 
     #[tool(
@@ -223,8 +227,12 @@ impl EpiGraphMcpFull {
     async fn get_claim(
         &self,
         Parameters(params): Parameters<GetClaimParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::claims::get_claim(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::claims::get_claim(self, params, requester).await
     }
 
     #[tool(
@@ -430,8 +438,12 @@ impl EpiGraphMcpFull {
     async fn query_paper(
         &self,
         Parameters(params): Parameters<QueryPaperParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_paper(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_paper(self, params, requester).await
     }
 
     #[tool(
@@ -440,8 +452,12 @@ impl EpiGraphMcpFull {
     async fn query_claims_by_evidence(
         &self,
         Parameters(params): Parameters<QueryClaimsByEvidenceParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_claims_by_evidence(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_claims_by_evidence(self, params, requester).await
     }
 
     #[tool(
@@ -450,8 +466,12 @@ impl EpiGraphMcpFull {
     async fn query_claims_by_methodology(
         &self,
         Parameters(params): Parameters<QueryClaimsByMethodologyParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_claims_by_methodology(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_claims_by_methodology(self, params, requester).await
     }
 
     #[tool(
@@ -460,8 +480,12 @@ impl EpiGraphMcpFull {
     async fn query_claims_by_label(
         &self,
         Parameters(params): Parameters<QueryClaimsByLabelParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_claims_by_label(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_claims_by_label(self, params, requester).await
     }
 
     #[tool(

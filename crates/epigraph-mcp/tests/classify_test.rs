@@ -141,6 +141,7 @@ async fn get_claim_exposes_classification(pool: PgPool) {
             frame_id: None,
             perspective_id: None,
         },
+        None,
     )
     .await
     .expect("get_claim");

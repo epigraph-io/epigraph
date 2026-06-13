@@ -20,6 +20,7 @@ pub mod perspectives;
 pub mod provenance;
 pub mod rdf;
 pub mod recall;
+pub mod redaction;
 pub mod sheaf;
 pub mod step_ops;
 pub mod supersede;
