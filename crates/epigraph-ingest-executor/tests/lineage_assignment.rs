@@ -36,6 +36,7 @@ fn build_one_of_each_extraction(canonical_name: &str, op_text: &str) -> Workflow
                 operations: vec![op_text.to_string()],
                 generality: vec![1],
                 confidence: 0.9,
+                evidence_type: None,
             }],
         }],
         relationships: vec![],

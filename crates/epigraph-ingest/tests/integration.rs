@@ -40,6 +40,53 @@ fn evidence_type_normalized_and_inherited_by_atoms() {
     assert_eq!(etype("a4"), None);
 }
 
+/// Workflow `Step::evidence_type` is normalised to a canonical key and
+/// inherited by its operation atoms; an unrecognised value is dropped to
+/// `None`. Thesis (L0) and phase (L1) claims are structural and stay untagged,
+/// mirroring document thesis/section claims. Parity with #208 (document side).
+#[test]
+fn workflow_evidence_type_normalized_and_inherited_by_atoms() {
+    use epigraph_ingest::workflow::{build_ingest_plan, WorkflowExtraction};
+
+    let json = r#"{
+      "source": { "canonical_name": "wf-evtype", "goal": "G", "generation": 0, "authors": [] },
+      "thesis": "T",
+      "phases": [{
+        "title": "P",
+        "summary": "phase summary",
+        "steps": [
+          { "compound": "s1", "evidence_type": "Empirical", "operations": ["op1", "op2"], "confidence": 0.9 },
+          { "compound": "s2", "evidence_type": "made_up_type", "operations": ["op3"], "confidence": 0.9 },
+          { "compound": "s3", "operations": ["op4"], "confidence": 0.9 }
+        ]
+      }]
+    }"#;
+    let extraction: WorkflowExtraction = serde_json::from_str(json).unwrap();
+    let plan = build_ingest_plan(&extraction);
+
+    let etype = |content: &str| {
+        plan.claims
+            .iter()
+            .find(|c| c.content == content)
+            .unwrap_or_else(|| panic!("no claim with content {content}"))
+            .evidence_type
+            .clone()
+    };
+
+    // Canonical (case-insensitive) value propagates to the step and its atoms.
+    assert_eq!(etype("s1").as_deref(), Some("empirical"));
+    assert_eq!(etype("op1").as_deref(), Some("empirical"));
+    assert_eq!(etype("op2").as_deref(), Some("empirical"));
+    // Unrecognised value is dropped on both the step and its atom.
+    assert_eq!(etype("s2"), None);
+    assert_eq!(etype("op3"), None);
+    // Absent value stays None.
+    assert_eq!(etype("op4"), None);
+    // Structural thesis (L0) and phase (L1) claims never carry a tag.
+    assert_eq!(etype("T"), None);
+    assert_eq!(etype("phase summary"), None);
+}
+
 #[test]
 fn test_full_extraction_from_fixture() {
     let json = include_str!("fixtures/sample_hierarchical.json");

@@ -109,6 +109,10 @@ pub async fn store_workflow(
                     operations: vec![],
                     generality: vec![],
                     confidence: 0.8,
+                    // Flat store_workflow steps have no operation atoms, so no
+                    // evidence_type source; the BBA-wiring loop only fires for
+                    // level-3 atoms.
+                    evidence_type: None,
                 })
                 .collect(),
         }]

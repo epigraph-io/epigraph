@@ -58,7 +58,7 @@ pub struct Phase {
 }
 
 /// A step within a phase (analog of `document::schema::Paragraph`).
-/// Paper-specific fields (methodology, evidence_type, page, instruments_used,
+/// Remaining paper-specific fields (methodology, page, instruments_used,
 /// reagents_involved, conditions) are intentionally absent.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -72,4 +72,13 @@ pub struct Step {
     pub generality: Vec<i32>,
     #[serde(default = "default_confidence")]
     pub confidence: f64,
+    /// Evidence type for this step and its operation atoms. The extractor picks
+    /// ONE canonical value from [`crate::common::evidence_type::EVIDENCE_TYPES`]
+    /// (regulatory, empirical, statistical, logical, testimonial,
+    /// circumstantial, conversational). Normalised at plan-build time; any
+    /// unrecognised value is dropped to `None`. Mirrors
+    /// `document::schema::Paragraph::evidence_type` so workflow-ingested
+    /// operation BBAs participate in the evidence-type reliability tier.
+    #[serde(default)]
+    pub evidence_type: Option<String>,
 }

@@ -33,6 +33,7 @@ fn build_extraction(canonical_name: &str) -> WorkflowExtraction {
                 ],
                 generality: vec![2, 1],
                 confidence: 0.9,
+                evidence_type: None,
             }],
         }],
         relationships: vec![],

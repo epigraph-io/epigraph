@@ -33,6 +33,7 @@ fn parent_extraction(canonical: &str) -> WorkflowExtraction {
                 operations: vec!["step 1".to_string()],
                 generality: vec![1],
                 confidence: 0.5,
+                evidence_type: None,
             }],
         }],
         relationships: vec![],
@@ -54,6 +55,7 @@ fn improved_extraction() -> WorkflowExtraction {
                 operations: vec!["pip install".to_string()],
                 generality: vec![2],
                 confidence: 0.9,
+                evidence_type: None,
             }],
         },
         Phase {
@@ -65,6 +67,7 @@ fn improved_extraction() -> WorkflowExtraction {
                 operations: vec!["./run.sh".to_string()],
                 generality: vec![2],
                 confidence: 0.9,
+                evidence_type: None,
             }],
         },
     ];
