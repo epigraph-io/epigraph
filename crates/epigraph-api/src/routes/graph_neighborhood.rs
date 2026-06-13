@@ -485,12 +485,11 @@ pub async fn claim_compound_neighborhood(
     let budget = params.budget.clamp(1, 200);
 
     // Fetch center claim content + verify it exists.
-    let center: Option<(String,)> =
-        sqlx::query_as("SELECT content FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(internal)?;
+    let center: Option<(String,)> = sqlx::query_as("SELECT content FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(internal)?;
     let Some((center_content,)) = center else {
         return Err((StatusCode::NOT_FOUND, "claim not found".into()));
     };
@@ -636,4 +635,3 @@ pub async fn claim_compound_neighborhood(
 fn internal<E: std::fmt::Display>(e: E) -> (axum::http::StatusCode, String) {
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
-
