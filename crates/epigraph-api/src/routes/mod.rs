@@ -99,7 +99,10 @@ pub mod webhooks;
 pub mod workflows;
 
 use crate::metrics;
-use crate::middleware::{bearer_auth_middleware, rate_limit_middleware, require_signature};
+use crate::middleware::{
+    bearer_auth_middleware, optional_bearer_auth_middleware, rate_limit_middleware,
+    require_signature,
+};
 use crate::state::AppState;
 use axum::{
     extract::DefaultBodyLimit,
@@ -544,6 +547,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/claims/:id/neighborhood",
             get(edges::claim_neighborhood),
         )
+        .route(
+            "/api/v1/claims/:id/compound_neighborhood",
+            get(graph_neighborhood::claim_compound_neighborhood),
+        )
         .route("/api/v1/admin/stats", get(admin::system_stats))
         .route(
             "/api/v1/clusters/boundary-claims",
@@ -757,6 +764,27 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/tasks/:id", get(tasks::get_task))
         // MCP tool discovery — no auth required
         .route("/api/v1/mcp/tools", get(mcp_tools::list_mcp_tools));
+
+    // Inject authenticated identity on public reads (no 401 when absent;
+    // 401 on a present-but-invalid token). This makes auth_ctx AVAILABLE to
+    // every public read handler so partition-aware redaction
+    // (check_content_access) can trust it instead of the spoofable ?agent_id
+    // wire param. (A3, spec §7.2)
+    //
+    // NOTE: availability != adoption. As of A3 Tasks 4-7 the following read
+    // handlers now consume auth_ctx (deriving the requester from the
+    // authenticated agent_id, client_id fallback) instead of trusting the
+    // spoofable params.agent_id:
+    //   - claims::{get_claim,list_claims}                     (A3 Tasks 4-5)
+    //   - belief::{claims_by_belief,frame_claims_sorted}      (A3 Task 6)
+    //   - edges.rs read handlers + evidence_by_relationship   (A3 Task 7)
+    // The one remaining read handler still passing the spoofable
+    // params.agent_id (a live bypass until migrated) is:
+    //   - graph_query::execute_graph_query                    -> A3 Task 8
+    let public = public.layer(middleware::from_fn_with_state(
+        state.clone(),
+        optional_bearer_auth_middleware,
+    ));
 
     // OAuth2 endpoints (public, no auth required)
     let oauth = Router::new()
@@ -1009,6 +1037,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/claims/:id/neighborhood",
             get(edges::claim_neighborhood),
         )
+        .route(
+            "/api/v1/claims/:id/compound_neighborhood",
+            get(graph_neighborhood::claim_compound_neighborhood),
+        )
         .route("/api/v1/admin/stats", get(admin::system_stats))
         .route(
             "/api/v1/clusters/boundary-claims",
@@ -1148,6 +1180,13 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/mirror-narratives",
             get(political::mirror_narratives),
         );
+
+    // Inject authenticated identity on public reads (no 401 when absent;
+    // 401 on a present-but-invalid token). (A3, spec §7.2)
+    let public = public.layer(middleware::from_fn_with_state(
+        state.clone(),
+        optional_bearer_auth_middleware,
+    ));
 
     // OAuth2 endpoints (public, no auth required)
     let oauth = Router::new()

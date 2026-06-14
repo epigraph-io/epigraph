@@ -203,8 +203,12 @@ impl EpiGraphMcpFull {
     async fn query_claims(
         &self,
         Parameters(params): Parameters<QueryClaimsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::claims::query_claims(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::claims::query_claims(self, params, requester).await
     }
 
     #[tool(
@@ -223,8 +227,12 @@ impl EpiGraphMcpFull {
     async fn get_claim(
         &self,
         Parameters(params): Parameters<GetClaimParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::claims::get_claim(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::claims::get_claim(self, params, requester).await
     }
 
     #[tool(
@@ -392,6 +400,16 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Check whether a paper with the given DOI has already been ingested at the specified pipeline version. Returns {already_ingested, paper_id?, doi, pipeline_version}. Use as a pre-flight before invoking expensive extract-claims work — `ingest_document` runs the same gate internally, but only after the LLM call. Read-only."
+    )]
+    async fn check_already_ingested(
+        &self,
+        Parameters(params): Parameters<CheckAlreadyIngestedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ingestion::check_already_ingested(self, params).await
+    }
+
+    #[tool(
         description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent for re-runs at the same pipeline version."
     )]
     async fn ingest_document_inline(
@@ -430,8 +448,12 @@ impl EpiGraphMcpFull {
     async fn query_paper(
         &self,
         Parameters(params): Parameters<QueryPaperParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_paper(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_paper(self, params, requester).await
     }
 
     #[tool(
@@ -440,8 +462,12 @@ impl EpiGraphMcpFull {
     async fn query_claims_by_evidence(
         &self,
         Parameters(params): Parameters<QueryClaimsByEvidenceParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_claims_by_evidence(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_claims_by_evidence(self, params, requester).await
     }
 
     #[tool(
@@ -450,8 +476,12 @@ impl EpiGraphMcpFull {
     async fn query_claims_by_methodology(
         &self,
         Parameters(params): Parameters<QueryClaimsByMethodologyParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_claims_by_methodology(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_claims_by_methodology(self, params, requester).await
     }
 
     #[tool(
@@ -460,8 +490,12 @@ impl EpiGraphMcpFull {
     async fn query_claims_by_label(
         &self,
         Parameters(params): Parameters<QueryClaimsByLabelParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_claims_by_label(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_claims_by_label(self, params, requester).await
     }
 
     #[tool(

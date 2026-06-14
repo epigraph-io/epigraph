@@ -1836,6 +1836,7 @@ pub async fn submit_evidence(
 pub async fn claims_by_belief(
     State(state): State<AppState>,
     Query(params): Query<BeliefFilterQuery>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<Vec<BeliefClaimRow>>, ApiError> {
     let pool = &state.db_pool;
     let min_bel = params.min_belief.unwrap_or(0.0);
@@ -1885,10 +1886,12 @@ pub async fn claims_by_belief(
         )
         .collect();
 
-    // Apply partition-aware content filtering
+    // SECURITY (A3): use the authenticated requester, not params.agent_id.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
     for row in &mut result {
-        let access =
-            crate::access_control::check_content_access(pool, row.id, params.agent_id).await;
+        let access = crate::access_control::check_content_access(pool, row.id, requester).await;
         if access == crate::access_control::ContentAccess::Redacted {
             crate::access_control::redact_claim_content(&mut row.content);
         }
@@ -1906,6 +1909,7 @@ pub async fn frame_claims_sorted(
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
     Query(params): Query<FrameClaimsQuery>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<Vec<FrameClaimBeliefRow>>, ApiError> {
     let pool = &state.db_pool;
 
@@ -1991,10 +1995,13 @@ pub async fn frame_claims_sorted(
         )
         .collect();
 
-    // Apply partition-aware content filtering
+    // SECURITY (A3): use the authenticated requester, not params.agent_id.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
     for row in &mut result {
         let access =
-            crate::access_control::check_content_access(pool, row.claim_id, params.agent_id).await;
+            crate::access_control::check_content_access(pool, row.claim_id, requester).await;
         if access == crate::access_control::ContentAccess::Redacted {
             crate::access_control::redact_claim_content(&mut row.content);
         }

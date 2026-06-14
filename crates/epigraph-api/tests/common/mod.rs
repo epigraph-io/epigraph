@@ -331,3 +331,125 @@ pub async fn test_bearer_token_with_seeded_client(
         .expect("test JWT issued");
     (token, client_id)
 }
+
+/// Ensure the `claim_encryption` table exists in the test database.
+///
+/// `claim_encryption` is an enterprise / out-of-tree table: it is queried by
+/// `get_claim` (`ClaimEncryptionRepository::get_by_claim_id_conn`) on every
+/// read, but NO migration in `/migrations` creates it. On the standard
+/// `epigraph_db_repo_test` DB the column is therefore absent, so `get_claim`
+/// errors -> HTTP 500 *before* it ever reaches the redaction branch — which
+/// silently turns the A3 read-path regression guard RED in CI.
+///
+/// This creates a minimal table (columns matching `ClaimEncryptionRow`, the
+/// shape `get_by_claim_id_conn` SELECTs) so the encryption query returns zero
+/// rows for an unencrypted test claim instead of erroring. The A3 tests never
+/// INSERT here, so no FKs/CHECKs are needed; `IF NOT EXISTS` makes it a no-op
+/// when the table is already present (e.g. a prod-shaped DB).
+pub async fn ensure_claim_encryption_table(pool: &PgPool) {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS claim_encryption ( \
+             claim_id uuid PRIMARY KEY, \
+             group_id uuid NOT NULL, \
+             epoch integer NOT NULL, \
+             privacy_tier varchar(20) NOT NULL, \
+             encrypted_content bytea NOT NULL, \
+             encrypted_labels bytea, \
+             created_at timestamptz NOT NULL DEFAULT now() \
+         )",
+    )
+    .execute(pool)
+    .await
+    .expect("ensure claim_encryption table");
+}
+
+/// Mint a real JWT whose `agent_id` claim equals `agent_id`. Used by A3
+/// read-path tests to produce OWNER (agent_id == ownership.owner_id) and
+/// STRANGER (random agent_id) tokens. The production
+/// optional_bearer_auth_middleware accepts the token and injects it as
+/// `AuthContext`; the redaction handlers (`get_claim`, `list_claims`) derive
+/// the requester from `auth_ctx.agent_id` (falling back to `client_id`), NOT
+/// the query-string `agent_id`, so this token — and only this token — drives
+/// the OWNER (Full) vs STRANGER (Redacted) distinction.
+pub fn mint_token_with_agent(scopes: &[&str], agent_id: Uuid) -> String {
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (token, _jti) = cfg
+        .issue_access_token(
+            Uuid::new_v4(),
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+            "agent",
+            None,
+            Some(agent_id),
+            chrono::Duration::minutes(60),
+        )
+        .expect("test JWT issued");
+    token
+}
+
+/// Ensure `frames.properties` (JSONB) exists in the test database.
+///
+/// `migrations/044_frames_properties.sql` adds this column, and
+/// `FrameRepository::get_by_id` (called by `frame_claims_sorted` to verify the
+/// frame exists) SELECTs it on every read. The shared `epigraph_db_repo_test`
+/// DB may predate migration 044, so without the column `get_by_id` errors →
+/// HTTP 500 *before* the handler reaches the redaction branch — silently
+/// turning the A3 `frame_claims_sorted` regression guard RED. Mirrors
+/// `ensure_claim_encryption_table`: `IF NOT EXISTS` makes it a no-op on a DB
+/// where 044 has already run.
+pub async fn ensure_frame_properties_column(pool: &PgPool) {
+    sqlx::query(
+        "ALTER TABLE frames ADD COLUMN IF NOT EXISTS properties JSONB NOT NULL DEFAULT '{}'::jsonb",
+    )
+    .execute(pool)
+    .await
+    .expect("ensure frames.properties column");
+}
+
+/// Create a frame (≥2 hypotheses, per the `frames_not_empty` CHECK) and assign
+/// `claim_id` to it via `claim_frames`. Returns the new frame's id. Used by the
+/// A3 `frame_claims_sorted` (`GET /api/v1/frames/:id/claims`) tests: that handler
+/// 404s on a missing frame and JOINs `claim_frames cf JOIN claims c`, so the
+/// claim must be in the frame for it to appear in the page at all. Scoping the
+/// query to a fresh per-test frame also makes the seeded claim the only row,
+/// avoiding paging flakiness on the shared test DB.
+pub async fn seed_frame_with_claim(pool: &PgPool, claim_id: Uuid) -> Uuid {
+    let frame_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO frames (id, name, hypotheses) \
+         VALUES ($1, $2, ARRAY['h0','h1']::text[])",
+    )
+    .bind(frame_id)
+    .bind(format!("a3-test-frame-{frame_id}"))
+    .execute(pool)
+    .await
+    .expect("seed frame");
+
+    sqlx::query("INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2)")
+        .bind(claim_id)
+        .bind(frame_id)
+        .execute(pool)
+        .await
+        .expect("assign claim to frame");
+    frame_id
+}
+
+/// Mark `node_id` (a claim) as a `private` partition owned by `owner_id`.
+/// `check_content_access` returns Full only to a requester equal to
+/// `owner_id`; everyone else gets Redacted. `node_type` is NOT NULL with a
+/// CHECK constraint, so it must be 'claim'. Create the claim first with
+/// `seed_claim_with_agent(pool, content, owner_id)` so the owner agent row
+/// exists.
+pub async fn seed_private_ownership(pool: &PgPool, node_id: Uuid, owner_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
+         VALUES ($1, 'claim', 'private', $2) \
+         ON CONFLICT (node_id) DO UPDATE SET partition_type = 'private', owner_id = $2",
+    )
+    .bind(node_id)
+    .bind(owner_id)
+    .execute(pool)
+    .await
+    .expect("seed private ownership");
+}

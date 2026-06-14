@@ -866,7 +866,13 @@ pub async fn get_claim(
         response.group_id = Some(enc.group_id);
     }
 
-    let access = check_content_access(&state.db_pool, id, params.agent_id).await;
+    // SECURITY (A3): derive the requester from the authenticated AuthContext
+    // (agent_id, falling back to client_id), NEVER the spoofable
+    // params.agent_id wire value. params.agent_id stays parsed-but-ignored.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    let access = check_content_access(&state.db_pool, id, requester).await;
     if access == ContentAccess::Redacted {
         crate::access_control::redact_claim_content(&mut response.content);
     }
@@ -1005,8 +1011,12 @@ pub async fn list_claims(
     // Transaction auto-rolls-back on drop (read-only, no commit needed)
     drop(tx);
 
+    // SECURITY (A3): use the authenticated requester, not params.agent_id.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
     for item in &mut items {
-        let access = check_content_access(&state.db_pool, item.id, params.agent_id).await;
+        let access = check_content_access(&state.db_pool, item.id, requester).await;
         if access == ContentAccess::Redacted {
             crate::access_control::redact_claim_content(&mut item.content);
         }

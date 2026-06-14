@@ -103,6 +103,36 @@ async fn insert_claim_with_method(pool: &PgPool, agent: Uuid, method_id: &str) -
     id
 }
 
+/// Insert a claim whose 1536-dim embedding is 1.0 on `[start, start+len)` and
+/// 0 elsewhere. Lets a test construct two claims with a chosen cosine: two
+/// ranges overlapping in `k` of `len` positions give cosine ≈ k/len.
+async fn insert_claim_with_binary_embedding(
+    pool: &PgPool,
+    agent: Uuid,
+    start: usize,
+    len: usize,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let content = format!("claim {}", id);
+    let mut v = vec!["0"; 1536];
+    for slot in v.iter_mut().skip(start).take(len) {
+        *slot = "1";
+    }
+    let vec_literal = format!("[{}]", v.join(","));
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, embedding)
+         VALUES ($1, $2, sha256($2::bytea), 0.5, $3, $4::vector)",
+    )
+    .bind(id)
+    .bind(&content)
+    .bind(agent)
+    .bind(vec_literal)
+    .execute(pool)
+    .await
+    .expect("insert claim with binary embedding");
+    id
+}
+
 async fn insert_entity(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -579,5 +609,232 @@ async fn combined_score_in_unit_interval(pool: PgPool) {
         features.score <= 1.0,
         "expected score <= 1.0, got {}",
         features.score
+    );
+}
+
+/// Cross-source bootstrap case: two claims with identical embeddings and NO
+/// structural data, no mass function, unthemed. Only embed_cosine fires, so
+/// the renormalized score must ≈ embed_cosine (≈1.0) — NOT the old diluted
+/// 0.425 (= 0.35·1.0 + 0.10·0.5 + 0.05·0.5 over denom 1.0).
+#[sqlx::test(migrations = "../../migrations")]
+async fn renormalized_score_is_cosine_when_only_embedding_fires(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim_with_embedding(&pool, agent).await;
+    let b = insert_claim_with_embedding(&pool, agent).await;
+
+    let f = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+
+    assert!(
+        f.embed_cosine > 0.99,
+        "precondition: embed_cosine ≈ 1.0, got {}",
+        f.embed_cosine
+    );
+    assert!(
+        f.score > 0.99,
+        "only embed_cosine fired → score must ≈ embed_cosine, got {}",
+        f.score
+    );
+}
+
+/// A fired structural with empty intersection but non-empty UNION is a genuine
+/// negative: it stays in the denominator and pulls the score below pure cosine.
+/// (Contrast: a structural with no data at all is dropped — Task 1.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn fired_zero_jaccard_pulls_score_below_cosine(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    // Both claims carry identical embeddings → embed_cosine ≈ 1.0.
+    let a = insert_claim_with_embedding(&pool, agent).await;
+    let b = insert_claim_with_embedding(&pool, agent).await;
+
+    // Each claim has its OWN triple (disjoint subjects) → triple/entity unions
+    // are non-empty, intersections empty → those features fire at 0.0.
+    let subj_a = insert_entity(&pool).await;
+    let subj_b = insert_entity(&pool).await;
+    insert_triple(&pool, a, subj_a, "p").await;
+    insert_triple(&pool, b, subj_b, "p").await;
+
+    let f = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+
+    assert!(
+        f.embed_cosine > 0.99,
+        "precondition: cosine ≈ 1.0, got {}",
+        f.embed_cosine
+    );
+    // With embed=1.0, triple_overlap=0, entity_jaccard=0 in the denominator:
+    // score = 0.35·1.0 / (0.35 + 0.15 + 0.10) = 0.35/0.60 ≈ 0.583.
+    assert!(
+        f.score < 0.70 && f.score > 0.45,
+        "fired zero-Jaccards must pull score to ~0.58, got {}",
+        f.score
+    );
+}
+
+/// graph_overlap with no shared neighbor is NOT applicable: it must be dropped
+/// from the denominator, not held at 0.0 (which would dilute). Two claims with
+/// identical embeddings and disjoint graph neighbors must still score ≈ cosine.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_shared_neighbor_drops_graph_overlap_from_denominator(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim_with_embedding(&pool, agent).await;
+    let b = insert_claim_with_embedding(&pool, agent).await;
+    // Each has a graph edge, but to DIFFERENT neighbors → no common neighbor.
+    let only_a = insert_claim(&pool, agent).await;
+    let only_b = insert_claim(&pool, agent).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship)
+         VALUES ($1, 'claim', $2, 'claim', 'supports'),
+                ($3, 'claim', $4, 'claim', 'supports')",
+    )
+    .bind(a)
+    .bind(only_a)
+    .bind(b)
+    .bind(only_b)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let f = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+
+    assert_eq!(
+        f.graph_overlap, 0.0,
+        "reported graph_overlap stays 0.0 (telemetry), got {}",
+        f.graph_overlap
+    );
+    // If graph_overlap were kept in the denom at 0.0:
+    //   score = 0.35·1.0 / (0.35 + 0.10) ≈ 0.778. Dropping it → ≈ 1.0.
+    assert!(
+        f.score > 0.99,
+        "graph_overlap must be dropped (not held at 0) → score ≈ cosine, got {}",
+        f.score
+    );
+}
+
+/// belief_alignment fires only when both claims have a mass function. When it
+/// fires with opposite stances it is a real negative and lowers the score
+/// relative to an aligned pair with the same embeddings.
+#[sqlx::test(migrations = "../../migrations")]
+async fn opposite_stance_belief_lowers_score(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    // Identical embeddings on all three so cosine is constant (≈1.0) and the
+    // only differentiator is belief_alignment.
+    let a = insert_claim_with_embedding(&pool, agent).await;
+    let b = insert_claim_with_embedding(&pool, agent).await;
+    let c = insert_claim_with_embedding(&pool, agent).await;
+
+    let frame_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses)
+         VALUES ('binary', ARRAY['supported', 'unsupported'])
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert binary frame");
+
+    // a, b strongly supported (BetP 0.9); c strongly unsupported (BetP 0.1).
+    for &claim in &[a, b] {
+        sqlx::query(
+            "INSERT INTO mass_functions (claim_id, frame_id, masses)
+             VALUES ($1, $2, '{\"0\": 0.8, \"0,1\": 0.2}')",
+        )
+        .bind(claim)
+        .bind(frame_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO mass_functions (claim_id, frame_id, masses)
+         VALUES ($1, $2, '{\"1\": 0.8, \"0,1\": 0.2}')",
+    )
+    .bind(c)
+    .bind(frame_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let aligned = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score a,b");
+    let opposed = score_pair(&pool, a, c, &Weights::default())
+        .await
+        .expect("score a,c");
+
+    // aligned: (0.35·1.0 + 0.10·~1.0)/(0.45) ≈ 1.0
+    // opposed: (0.35·1.0 + 0.10·~0.0)/(0.45) ≈ 0.778
+    assert!(
+        opposed.score < aligned.score - 0.1,
+        "opposite stance must lower score (aligned {} vs opposed {})",
+        aligned.score,
+        opposed.score
+    );
+    assert!(
+        opposed.score < 0.85,
+        "opposed-stance pair should drop well below cosine, got {}",
+        opposed.score
+    );
+}
+
+/// A pair with no embeddings (embedding-invariant violation) must be suppressed:
+/// embed_cosine is always applicable at 0.0, so with nothing else firing the
+/// score is 0.0 — it can never reach a verifier band.
+#[sqlx::test(migrations = "../../migrations")]
+async fn null_embedding_pair_is_suppressed(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await; // no embedding
+    let b = insert_claim(&pool, agent).await; // no embedding
+
+    let f = score_pair(&pool, a, b, &Weights::default())
+        .await
+        .expect("score_pair");
+
+    assert_eq!(
+        f.embed_cosine, 0.0,
+        "no embedding → embed_cosine 0.0, got {}",
+        f.embed_cosine
+    );
+    assert!(
+        f.score < 0.01,
+        "null-embedding pair must be suppressed near 0, got {}",
+        f.score
+    );
+}
+
+/// Post-renormalization the cross-source score ≈ embed_cosine, so the provisional
+/// mid=0.80 band (calibration.toml) cleanly separates genuine high-cosine
+/// restatements (reach the verifier) from topical lower-cosine pairs (dropped).
+#[sqlx::test(migrations = "../../migrations")]
+async fn renormalized_score_separates_at_mid_band(pool: PgPool) {
+    const MID: f32 = 0.80; // mirrors [matcher.bands].mid in calibration.toml
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim_with_binary_embedding(&pool, agent, 0, 1000).await;
+    // identical range → cosine ≈ 1.0
+    let high = insert_claim_with_binary_embedding(&pool, agent, 0, 1000).await;
+    // overlap 500 of 1000 → cosine ≈ 0.5
+    let low = insert_claim_with_binary_embedding(&pool, agent, 500, 1000).await;
+
+    let hi = score_pair(&pool, a, high, &Weights::default())
+        .await
+        .expect("score high");
+    let lo = score_pair(&pool, a, low, &Weights::default())
+        .await
+        .expect("score low");
+
+    assert!(
+        hi.score >= MID,
+        "high-cosine cross-source pair must reach mid={}, got {}",
+        MID,
+        hi.score
+    );
+    assert!(
+        lo.score < MID,
+        "topical low-cosine pair must stay below mid={}, got {}",
+        MID,
+        lo.score
     );
 }

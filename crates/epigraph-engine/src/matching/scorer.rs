@@ -95,6 +95,34 @@ impl Default for Weights {
     }
 }
 
+/// Weighted average over only the features that produced a real signal.
+///
+/// Each entry is `(weight, Some(value))` when the feature fired, or
+/// `(weight, None)` when it had no data to compare — `None` features are
+/// excluded from BOTH the numerator and the denominator (renormalization).
+/// This is the fix for cross-source score dilution (backlog 9b50c331): the
+/// old combiner divided by the sum of all nine weights even though the
+/// structural features are ~0 by construction for cross-source pairs.
+///
+/// `embed_cosine` is always passed as `Some` (its `0.0`-on-NULL is deliberate
+/// suppression, not missing data), so `denom >= w.embed_cosine > 0` always
+/// holds; the `denom == 0` branch is defensive only.
+fn renormalized_score(weighted: &[(f32, Option<f32>)]) -> f32 {
+    let mut num = 0.0_f32;
+    let mut den = 0.0_f32;
+    for (w, v) in weighted {
+        if let Some(val) = v {
+            num += w * val;
+            den += w;
+        }
+    }
+    if den == 0.0 {
+        0.0
+    } else {
+        (num / den).clamp(0.0, 1.0)
+    }
+}
+
 /// Compute all 9 features for the claim pair `(a, b)` and combine them.
 ///
 /// Uses five focused queries to keep each one readable and debuggable:
@@ -121,12 +149,13 @@ pub async fn score_pair(
                 (1.0 - ((SELECT embedding FROM a) <=> (SELECT embedding FROM b)))::real,
                 0.0::real
             ) AS embed_cosine,
-            COALESCE(
-                (SELECT properties->>'method_id' FROM a) IS NOT NULL
-                AND (SELECT properties->>'method_id' FROM a)
-                    = (SELECT properties->>'method_id' FROM b),
-                false
-            ) AS method_match,
+            CASE
+                WHEN (SELECT properties->>'method_id' FROM a) IS NULL
+                  OR (SELECT properties->>'method_id' FROM b) IS NULL
+                    THEN NULL
+                ELSE (SELECT properties->>'method_id' FROM a)
+                     = (SELECT properties->>'method_id' FROM b)
+            END AS method_match,
             COALESCE(
                 ABS(EXTRACT(DAY FROM (
                     (SELECT created_at FROM a) - (SELECT created_at FROM b)
@@ -141,7 +170,7 @@ pub async fn score_pair(
     .await?;
 
     let embed_cosine: f32 = row1.try_get("embed_cosine")?;
-    let method_match: bool = row1.try_get("method_match")?;
+    let method_match_opt: Option<bool> = row1.try_get("method_match")?;
     let temporal_dist_days: i32 = row1.try_get("temporal_dist_days")?;
 
     // ------------------------------------------------------------------
@@ -182,40 +211,36 @@ pub async fn score_pair(
             )
         SELECT
             -- triple_overlap: Jaccard(ta_sp, tb_sp)
-            COALESCE(
+            (
                 (SELECT COUNT(*)::real FROM (SELECT * FROM ta_sp INTERSECT SELECT * FROM tb_sp) i)
                 / NULLIF(
                     (SELECT COUNT(*)::real FROM (SELECT * FROM ta_sp UNION SELECT * FROM tb_sp) u),
                     0
-                ),
-                0.0
+                )
             )::real AS triple_overlap,
             -- entity_jaccard: Jaccard(ta_ent, tb_ent)
-            COALESCE(
+            (
                 (SELECT COUNT(*)::real FROM (SELECT * FROM ta_ent INTERSECT SELECT * FROM tb_ent) i)
                 / NULLIF(
                     (SELECT COUNT(*)::real FROM (SELECT * FROM ta_ent UNION SELECT * FROM tb_ent) u),
                     0
-                ),
-                0.0
+                )
             )::real AS entity_jaccard,
             -- nbhd_overlap: Jaccard(cca.cluster_id, ccb.cluster_id)
-            COALESCE(
+            (
                 (SELECT COUNT(*)::real FROM (SELECT * FROM cca INTERSECT SELECT * FROM ccb) i)
                 / NULLIF(
                     (SELECT COUNT(*)::real FROM (SELECT * FROM cca UNION SELECT * FROM ccb) u),
                     0
-                ),
-                0.0
+                )
             )::real AS nbhd_overlap,
             -- citation_overlap: Jaccard(cita.target_id, citb.target_id)
-            COALESCE(
+            (
                 (SELECT COUNT(*)::real FROM (SELECT * FROM cita INTERSECT SELECT * FROM citb) i)
                 / NULLIF(
                     (SELECT COUNT(*)::real FROM (SELECT * FROM cita UNION SELECT * FROM citb) u),
                     0
-                ),
-                0.0
+                )
             )::real AS citation_overlap
         "#,
     )
@@ -224,10 +249,10 @@ pub async fn score_pair(
     .fetch_one(pool)
     .await?;
 
-    let triple_overlap: f32 = row2.try_get("triple_overlap")?;
-    let entity_jaccard: f32 = row2.try_get("entity_jaccard")?;
-    let nbhd_overlap: f32 = row2.try_get("nbhd_overlap")?;
-    let citation_overlap: f32 = row2.try_get("citation_overlap")?;
+    let triple_overlap_opt: Option<f32> = row2.try_get("triple_overlap")?;
+    let entity_jaccard_opt: Option<f32> = row2.try_get("entity_jaccard")?;
+    let nbhd_overlap_opt: Option<f32> = row2.try_get("nbhd_overlap")?;
+    let citation_overlap_opt: Option<f32> = row2.try_get("citation_overlap")?;
 
     // ------------------------------------------------------------------
     // Query 3: Adamic-Adar on claim↔claim edges (any relationship).
@@ -266,10 +291,7 @@ pub async fn score_pair(
             ) AS d FROM common c
         )
         SELECT
-            COALESCE(
-                TANH(SUM(1.0 / GREATEST(LN(d::float8), 0.5))),
-                0.0
-            )::real AS graph_overlap
+            TANH(SUM(1.0 / GREATEST(LN(d::float8), 0.5)))::real AS graph_overlap
         FROM deg
         "#,
     )
@@ -277,7 +299,7 @@ pub async fn score_pair(
     .bind(b)
     .fetch_one(pool)
     .await?;
-    let graph_overlap: f32 = row3.try_get("graph_overlap")?;
+    let graph_overlap_opt: Option<f32> = row3.try_get("graph_overlap")?;
 
     // ------------------------------------------------------------------
     // Query 4: belief_alignment from stored CDST mass functions.
@@ -322,15 +344,12 @@ pub async fn score_pair(
     .await?;
     let betp_a: Option<f64> = row4.try_get("betp_a")?;
     let betp_b: Option<f64> = row4.try_get("betp_b")?;
-    let belief_alignment: f32 = match (betp_a, betp_b) {
-        (Some(pa), Some(pb)) => (1.0 - 2.0 * (pa - pb).abs()).clamp(0.0, 1.0) as f32,
-        // No mass function on at least one side: genuinely neutral (0.5).
-        // Picking 1.0 would silently boost every cosine-only pair by
-        // weight*1.0 — distorts band thresholds. Picking 0.0 would punish
-        // un-BP'd claims (most of them, in early CDST rollout). 0.5 is
-        // the only choice that doesn't bias the score against either
-        // missing-data state.
-        _ => 0.5,
+    let belief_alignment_opt: Option<f32> = match (betp_a, betp_b) {
+        (Some(pa), Some(pb)) => Some((1.0 - 2.0 * (pa - pb).abs()).clamp(0.0, 1.0) as f32),
+        // No mass function on at least one side → not applicable (excluded
+        // from the renormalized denominator, rather than a neutral 0.5 that
+        // would dilute the score).
+        _ => None,
     };
 
     // ------------------------------------------------------------------
@@ -374,41 +393,40 @@ pub async fn score_pair(
     .fetch_one(pool)
     .await?;
     let tp_opt: Option<f32> = row5.try_get("theme_proximity")?;
-    let theme_proximity: f32 = tp_opt.unwrap_or(0.5).clamp(0.0, 1.0);
+    let theme_proximity_opt: Option<f32> = tp_opt.map(|v| v.clamp(0.0, 1.0));
 
     // ------------------------------------------------------------------
-    // Combined score: normalized weighted sum (temporal_dist_days excluded)
+    // Combined score: renormalized weighted average over fired features.
+    // method_match contributes 1.0/0.0 when both claims have a method_id,
+    // and is excluded (None) when either lacks one.
     // ------------------------------------------------------------------
-    let raw = w.embed_cosine * embed_cosine
-        + w.triple_overlap * triple_overlap
-        + w.entity_jaccard * entity_jaccard
-        + w.method_match * if method_match { 1.0_f32 } else { 0.0_f32 }
-        + w.nbhd_overlap * nbhd_overlap
-        + w.citation_overlap * citation_overlap
-        + w.graph_overlap * graph_overlap
-        + w.belief_alignment * belief_alignment
-        + w.theme_proximity * theme_proximity;
-    let denom = w.embed_cosine
-        + w.triple_overlap
-        + w.entity_jaccard
-        + w.method_match
-        + w.nbhd_overlap
-        + w.citation_overlap
-        + w.graph_overlap
-        + w.belief_alignment
-        + w.theme_proximity;
-    let score = (raw / denom).clamp(0.0, 1.0);
+    let method_match_val: Option<f32> = method_match_opt.map(|m| if m { 1.0_f32 } else { 0.0_f32 });
+
+    let score = renormalized_score(&[
+        (w.embed_cosine, Some(embed_cosine)),
+        (w.triple_overlap, triple_overlap_opt),
+        (w.entity_jaccard, entity_jaccard_opt),
+        (w.method_match, method_match_val),
+        (w.nbhd_overlap, nbhd_overlap_opt),
+        (w.citation_overlap, citation_overlap_opt),
+        (w.graph_overlap, graph_overlap_opt),
+        (w.belief_alignment, belief_alignment_opt),
+        (w.theme_proximity, theme_proximity_opt),
+    ]);
 
     Ok(MatchFeatures {
         embed_cosine,
-        triple_overlap,
-        entity_jaccard,
-        method_match,
-        nbhd_overlap,
-        citation_overlap,
-        graph_overlap,
-        belief_alignment,
-        theme_proximity,
+        // Reported feature values keep their pre-change sentinels so the
+        // telemetry vector (match_candidates.features) is unchanged; only the
+        // `score` math changed.
+        triple_overlap: triple_overlap_opt.unwrap_or(0.0),
+        entity_jaccard: entity_jaccard_opt.unwrap_or(0.0),
+        method_match: method_match_opt.unwrap_or(false),
+        nbhd_overlap: nbhd_overlap_opt.unwrap_or(0.0),
+        citation_overlap: citation_overlap_opt.unwrap_or(0.0),
+        graph_overlap: graph_overlap_opt.unwrap_or(0.0),
+        belief_alignment: belief_alignment_opt.unwrap_or(0.5),
+        theme_proximity: theme_proximity_opt.unwrap_or(0.5),
         temporal_dist_days,
         score,
     })
