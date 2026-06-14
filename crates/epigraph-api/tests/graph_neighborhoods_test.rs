@@ -350,3 +350,208 @@ async fn neighborhoods_expand_atomic_returns_atoms_and_compound_groups() {
         "compound-A has two atom members in this neighborhood"
     );
 }
+
+/// Regression coverage for the `structural_edges` CTE in `compound_response()`
+/// (dev commits 195f521 "add structural_edges to community compound view" and
+/// 6527e41 "GET /claims/:id/compound_neighborhood"). The companion compound test
+/// above wires every atom to a single parent, so its `structural_edges` is always
+/// empty — the *populated* path (shared-atom + shared-ancestor detection) shipped
+/// untested while a live GUI consumer (`epigraph-gui` `src/api/queries.ts`) renders
+/// it. This exercises BOTH UNION branches with data that must produce rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn neighborhoods_expand_compound_populates_structural_edges() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    // Wipe local fixture rows. Run this file with `-- --test-threads=1`: all
+    // tests here DELETE the same fixture tables, so parallel execution races.
+    sqlx::query("DELETE FROM neighborhood_edges")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM claim_neighborhood_membership")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM graph_neighborhoods")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM graph_cluster_runs")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let agent_id = Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, display_name, agent_type) \
+         VALUES ($1, decode(repeat('CC', 32), 'hex'), 'compound-test', 'system') \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let run_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded) VALUES ($1, 0, FALSE)",
+    )
+    .bind(run_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let theme_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO claim_themes (id, label, description, claim_count) VALUES ($1, 'StructuralTest', '', 0)")
+        .bind(theme_id).execute(&pool).await.unwrap();
+
+    async fn ins_claim(
+        pool: &sqlx::PgPool,
+        content: &str,
+        agent: Uuid,
+        theme: Option<Uuid>,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let hash: Vec<u8> = id
+            .as_bytes()
+            .iter()
+            .chain(id.as_bytes().iter())
+            .copied()
+            .collect();
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, agent_id, pignistic_prob, theme_id) \
+             VALUES ($1, $2, $3, $4, 0.5, $5)",
+        )
+        .bind(id)
+        .bind(content)
+        .bind(hash)
+        .bind(agent)
+        .bind(theme)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn ins_edge(pool: &sqlx::PgPool, src: Uuid, tgt: Uuid, rel: &str) {
+        sqlx::query(
+            "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship) \
+             VALUES ($1, $2, 'claim', 'claim', $3)",
+        )
+        .bind(src)
+        .bind(tgt)
+        .bind(rel)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // shared_atom branch: compounds A and B BOTH decompose_to the same atom.
+    let compound_a = ins_claim(&pool, "struct-compound-A", agent_id, Some(theme_id)).await;
+    let compound_b = ins_claim(&pool, "struct-compound-B", agent_id, Some(theme_id)).await;
+    let atom_shared = ins_claim(&pool, "struct-atom-shared", agent_id, Some(theme_id)).await;
+    ins_edge(&pool, compound_a, atom_shared, "decomposes_to").await;
+    ins_edge(&pool, compound_b, atom_shared, "decomposes_to").await;
+
+    // shared_ancestor branch: ancestor decomposes_to C and D; C and D each parent
+    // a distinct atom that lands in the neighborhood (so C,D enter nbhd_compounds).
+    let ancestor = ins_claim(&pool, "struct-ancestor", agent_id, Some(theme_id)).await;
+    let compound_c = ins_claim(&pool, "struct-compound-C", agent_id, Some(theme_id)).await;
+    let compound_d = ins_claim(&pool, "struct-compound-D", agent_id, Some(theme_id)).await;
+    let atom_c = ins_claim(&pool, "struct-atom-c", agent_id, Some(theme_id)).await;
+    let atom_d = ins_claim(&pool, "struct-atom-d", agent_id, Some(theme_id)).await;
+    ins_edge(&pool, ancestor, compound_c, "decomposes_to").await;
+    ins_edge(&pool, ancestor, compound_d, "decomposes_to").await;
+    ins_edge(&pool, compound_c, atom_c, "decomposes_to").await;
+    ins_edge(&pool, compound_d, atom_d, "decomposes_to").await;
+
+    // Neighborhood membership holds ONLY the leaf atoms. The ancestor must NOT be a
+    // member: nbhd_compounds = parents of member atoms, so if `ancestor` were a
+    // member its children C,D would not be the ones detected as compounds.
+    let nbr = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO graph_neighborhoods (id, run_id, theme_id, label, size, mean_betp, dominant_frame_id) \
+         VALUES ($1, $2, $3, 'structural', 3, NULL, NULL)"
+    ).bind(nbr).bind(run_id).bind(theme_id).execute(&pool).await.unwrap();
+    for atom in [atom_shared, atom_c, atom_d] {
+        sqlx::query(
+            "INSERT INTO claim_neighborhood_membership (run_id, claim_id, neighborhood_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(run_id)
+        .bind(atom)
+        .bind(nbr)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/graph/neighborhoods/{nbr}/expand?mode=compound"
+        ))
+        .header(
+            "Authorization",
+            format!("Bearer {}", common::test_bearer_token()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "compound expand should return 200"
+    );
+    let body: Value = resp.json().await.unwrap();
+
+    let se = body["structural_edges"]
+        .as_array()
+        .expect("structural_edges present in response");
+    assert_eq!(
+        se.len(),
+        2,
+        "expected exactly one shared_atom (A,B) + one shared_ancestor (C,D) edge, got {se:?}"
+    );
+
+    // Match by UNORDERED endpoint set: the CTE emits LEAST/GREATEST over random UUIDs.
+    let connects = |edge: &Value, x: Uuid, y: Uuid| -> bool {
+        let s = edge["source"].as_str().unwrap().to_string();
+        let t = edge["target"].as_str().unwrap().to_string();
+        let (xs, ys) = (x.to_string(), y.to_string());
+        (s == xs || t == xs) && (s == ys || t == ys)
+    };
+
+    let shared_atom = se
+        .iter()
+        .find(|e| e["kind"] == "shared_atom")
+        .expect("a shared_atom structural edge");
+    assert!(
+        connects(shared_atom, compound_a, compound_b),
+        "shared_atom edge must connect A and B, got {shared_atom:?}"
+    );
+    assert_eq!(
+        shared_atom["atom_count"].as_i64().unwrap(),
+        1,
+        "A and B share exactly one atom"
+    );
+
+    let shared_anc = se
+        .iter()
+        .find(|e| e["kind"] == "shared_ancestor")
+        .expect("a shared_ancestor structural edge");
+    assert!(
+        connects(shared_anc, compound_c, compound_d),
+        "shared_ancestor edge must connect C and D, got {shared_anc:?}"
+    );
+    assert_eq!(
+        shared_anc["atom_count"].as_i64().unwrap(),
+        1,
+        "C and D share exactly one common decomposes_to ancestor"
+    );
+}
