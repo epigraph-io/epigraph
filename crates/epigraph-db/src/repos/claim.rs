@@ -1845,11 +1845,17 @@ impl ClaimRepository {
             });
         }
 
-        // Mark old claim as non-current
-        sqlx::query("UPDATE claims SET is_current = false, updated_at = NOW() WHERE id = $1")
-            .bind(old_uuid)
-            .execute(&mut *tx)
-            .await?;
+        // Mark old claim as non-current and null its embedding in one statement.
+        // Combining both in a single UPDATE is required by the CHECK constraint
+        // `chk_deprecated_no_embedding` (migration 052) which fires per-statement,
+        // not per-transaction: a two-step update would violate it between statements.
+        sqlx::query(
+            "UPDATE claims SET is_current = false, embedding = NULL, updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(old_uuid)
+        .execute(&mut *tx)
+        .await?;
 
         // Insert new claim with supersedes link, carrying forward only labels
         // from the old row. Embeddings are intentionally NOT copied: the new
@@ -1882,12 +1888,6 @@ impl ClaimRepository {
         .bind(reason)
         .execute(&mut *tx)
         .await?;
-
-        // Null old claim's embedding so it drops out of semantic search
-        sqlx::query("UPDATE claims SET embedding = NULL WHERE id = $1")
-            .bind(old_uuid)
-            .execute(&mut *tx)
-            .await?;
 
         // Migrate incoming edges: redirect edges pointing TO old claim to point to new claim
         sqlx::query(
@@ -2570,10 +2570,16 @@ impl ClaimRepository {
         .await?;
 
         if edge_type == "supersedes" {
-            sqlx::query("UPDATE claims SET is_current = false, updated_at = NOW() WHERE id = $1")
-                .bind(parent_uuid)
-                .execute(&mut *tx)
-                .await?;
+            // Also null the embedding so the retired step drops out of semantic
+            // search. Mirrors the invariant enforced by supersede() and
+            // mark_duplicate(): is_current=false → embedding=NULL.
+            sqlx::query(
+                "UPDATE claims SET is_current = false, embedding = NULL, updated_at = NOW() \
+                 WHERE id = $1",
+            )
+            .bind(parent_uuid)
+            .execute(&mut *tx)
+            .await?;
         }
 
         tx.commit().await?;
@@ -2631,17 +2637,19 @@ impl ClaimRepository {
                 )),
             });
         }
+        // Null the embedding in the same statement as is_current=false so the
+        // CHECK constraint chk_deprecated_no_embedding (migration 052) is not
+        // violated mid-transaction. Dropping it from semantic search is the same
+        // invariant as supersede() and deprecate_claim().
         sqlx::query(
-            "UPDATE claims SET supersedes = $1, is_current = false, updated_at = NOW() WHERE id = $2",
+            "UPDATE claims \
+             SET supersedes = $1, is_current = false, embedding = NULL, updated_at = NOW() \
+             WHERE id = $2",
         )
-        .bind(canon_uuid).bind(dup_uuid).execute(&mut *tx).await?;
-
-        // is_current=false invariant: drop the duplicate from semantic search.
-        // Mirrors supersede() at line 1401. See CLAUDE.md "Embedding policy".
-        sqlx::query("UPDATE claims SET embedding = NULL WHERE id = $1")
-            .bind(dup_uuid)
-            .execute(&mut *tx)
-            .await?;
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
 
         // Migrate edges off the now-non-current duplicate onto the canonical
         // claim, mirroring supersede()'s edge migration — otherwise edges to/from
