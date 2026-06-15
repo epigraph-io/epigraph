@@ -184,9 +184,14 @@ include_agent_id = false
 # scoring. `workflow_step` artifacts (e.g. content "Body") dominate the
 # high-cosine candidate pool on prod (806/838 of embed_cosine>=0.90 pairs)
 # without being substantive cross-source claims; `telemetry` is host noise.
+# 2026-06-15: extended with EpiClaw/scheduled-task self-narration labels. A prod
+# dry-run staged 31/44 pending candidates from operational self-logs (daily
+# journals, graph-integrity/theme/data-integrity maintenance runs, ingest-session
+# logs) — they share heavy boilerplate, score >0.80 cosine, and evade
+# workflow_step/telemetry because they carry date-stamps + ops tags instead.
 # Set `exclude_labels = []` to disable.
 [matcher.eligibility]
-exclude_labels = ["workflow_step", "telemetry"]
+exclude_labels = ["workflow_step", "telemetry", "maintenance", "graph-integrity", "maintenance-log", "theme-maintenance", "data-integrity", "system-health", "journal", "daily-journal", "digest", "nightly-digest", "session-log", "scheduled-task", "reconciliation-complete", "conflict-resolution", "research-ingest"]
 
 [matcher.fan_out]
 max_per_claim = 32
