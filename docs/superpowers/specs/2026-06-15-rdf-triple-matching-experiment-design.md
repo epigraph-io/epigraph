@@ -44,6 +44,13 @@ exist in this repo's migration `001_initial_schema.sql`. **No new schema migrati
 We measure (a) signal validity and (b) recall — not fixed-weight re-ranking lift, which is unsound on
 this matcher for reasons in §6c.
 
+**Non-goals (explicit):** The original ask named *entity matching* **and** cross-source claim
+matching. Per the chosen metric, **entity matching is in scope only as a canonicalization
+prerequisite (§4), not a measured objective** — we do not separately evaluate entity-dedup precision/
+recall here. Also out of scope: Dempster–Shafer/belief integration (V2 defers it), the full 436K
+backfill, and matcher weight/band recalibration (`calibrate_matcher` — would confound the in-flight
+#239 precision sweep; kept as a downstream recommendation). No writes to the production DB.
+
 ## 3. Corpus: the scientific-dense slice (measured)
 
 Selected from the live corpus by topic: the **DNA-origami / nanomachine / de-novo-protein** cluster.
@@ -54,22 +61,26 @@ Selected from the live corpus by topic: the **DNA-origami / nanomachine / de-nov
 - Entity-dense in exactly the V2 ontology's target types (Material, Molecule, Method, Instrument,
   Property) — DNA origami, staple strands, scaffold, MgCl₂, thermal annealing, nanopore, quantum
   emitter, etc.
-- **Ground-truth positives are built in:** ~8 papers appear as **same-title / different-source DOIs**
-  (journal + preprint), e.g.:
-  - "realizing mechanical frustration at the nanoscale using DNA" — 3 DOIs (NatComm + bioRxiv + `10.1038/s41467-025-60492-z`)
-  - "spring-loaded DNA origami arrays …" — sciRobotics + bioRxiv
-  - "from Brownian to deterministic motor movement in a DNA-based …" — NanoLett + bioRxiv
-  - "reconfigurable multi-component nanostructures built from DNA" — sciRobotics + bioRxiv
-  - "deterministic nanofabrication of quantum-dot circular Bragg …" — arXiv + Nature
-  - "a hybrid graphene-siliconnitride nanomembrane …" — arXiv + journal
-  - "recent advances in DNA-origami-engineered nanomaterials" — arXiv + ChemRev
-  - "DNA origami nano-mechanics" — 2 DOIs
+- **High-confidence positive anchor (P1), built in but small:** the papers table lists ~8 same-title
+  / different-DOI pairs, but only **3 have claims ingested on _both_ sides** (audited 2026-06-15):
+  - "realizing mechanical frustration at the nanoscale using DNA origami" — bioRxiv (91) + NatComm (20)
+  - "recent advances in DNA-origami-engineered nanomaterials" — 2 sources (162 claims total)
+  - "bio-to-inorganic nanomachine bootstrap" — 2 roadmap versions (98 claims; NDI-internal self-revision, weaker as a "scientific" twin)
 
-  Claims describing the same finding across the two sources **should** cross-source match,
-  **independent of embedding** — the gold positives the candidate slice never had.
+  These give cross-source claim pairs that **should** match. Crucially they are **not uniformly
+  embed-easy**: on Mechanical Frustration, per-NatComm-claim max cross-twin cosine spans 0.468–1.000
+  (median 0.818; only 8/20 ≥ 0.85). The **embed-hard reworded twins (~60%)** are the valuable
+  positives — pairs embedding alone does not already nail — which is precisely where a triple signal
+  can add marginal value. (See §6a; this is why the re-venue escapes the embed-confound that crippled
+  the candidate slice, rather than merely relocating it.)
+- **Primary positive venue (P2): cross-paper matches.** Because P1 is small (~3 pairs), the
+  statistical weight of the experiment rests on **cross-paper** pairs — different papers in the slice
+  discussing the same entities/findings (e.g. two distinct DNA-origami-motor papers both asserting an
+  MgCl₂ concentration or an annealing protocol) — labeled by the LLM verifier. P1 is the
+  high-confidence anchor/sanity-check; P2 carries the measurement.
 
 The exact curated DOI list is produced in the implementation plan (regex seed above, then manual
-trim to drop near-misses).
+trim to drop near-misses and single-side papers).
 
 ## 4. Critical-path insight: entity canonicalization is mandatory
 
@@ -95,16 +106,22 @@ it first.
 
 ## 6. Measurement
 
-### 6a. Signal validity — PRIMARY, weight-independent
-Do `triple_overlap` / `entity_jaccard` separate true matches from non-matches regardless of scorer
-weights?
-- **Positives:** (P1) same-paper cross-source claim pairs from the duplicate-DOI papers (§3),
-  aligned within a pair; (P2) cross-paper pairs the LLM verifier confirms as `same`/`paraphrase`.
-- **Negatives:** sampled claim pairs from topically-distinct papers in the slice + verifier-labeled
-  `distinct`.
-- **Report:** per-feature value distributions (positives vs negatives) and per-feature AUC / PR for
-  `triple_overlap` and `entity_jaccard` *alone*. P1 gives positives independent of embedding, so the
-  embed confound that crippled the candidate slice does not apply here.
+### 6a. Signal validity — PRIMARY, weight-independent, **marginal over embedding**
+The question is not "do triples discriminate matches" (they may merely restate what `embed_cosine`
+already knows) but "**do triples discriminate matches _that embedding alone does not_**" — triples'
+marginal value.
+- **Positives:** (P1) verifier-aligned same-paper twin claim pairs from the 3 both-sided duplicate
+  papers (§3); (P2) cross-paper pairs the LLM verifier confirms as `same`/`paraphrase` — the primary
+  positive set.
+- **Negatives:** sampled claim pairs from topically-distinct papers + verifier-labeled `distinct`.
+- **Report (marginal framing):** stratify all pairs by `embed_cosine` band and report
+  `triple_overlap`/`entity_jaccard` discrimination (distributions + per-feature AUC) **within the
+  mid/uncertain embed band** (e.g. 0.55–0.85), where embedding is ambiguous. Pooled raw AUC over all
+  pairs is reported too but flagged as embed-redundant. The headline result is: in the band where
+  embedding can't decide, do triples?
+- **Twin alignment caveat:** P1 twins are aligned by the **verifier**, not embedding — aligning by
+  embedding would circularly select the embed-easy twins and discard the embed-hard reworded ones
+  that carry the marginal signal (§3).
 
 ### 6b. Recall probe — PRIMARY
 The value triples add that embedding can't: surfacing matches embedding-blocking misses.
@@ -130,7 +147,7 @@ Metrics: entity P/R, triple P/R, cost, latency. Winner runs over all 1,590.
 
 ### 6e. Phase-0 premise spike — KILL-SWITCH before the heavy build
 Before porting two extractors and hand-annotating gold, validate the premise cheaply on **one**
-duplicate-paper pair (e.g. "mechanical frustration DNA origami": bioRxiv + NatComm, ~180 claims):
+duplicate-paper pair (e.g. "mechanical frustration DNA origami": bioRxiv 91 + NatComm 20 = 111 claims):
 1. Extract triples with the LLM extractor on both versions.
 2. Canonicalize entities across the two sources.
 3. Check two numbers: **(i)** do entities merge across sources (e.g. "DNA origami" from both → one
@@ -149,22 +166,25 @@ as labeling oracle for cross-paper pairs and negatives.
 ## 7. Data realities & caveats
 
 - **1,590 claims** across 58 papers — cheap to extract (LLM pass trivial on prepaid OAuth).
-- **Built-in positives** from ~8 duplicate-DOI paper pairs — real cross-source matches independent of
-  embedding. This is the key advantage over the candidate slice.
+- **Built-in positives (P1) are real but few:** only 3 duplicate-DOI papers have both sides ingested
+  as claims (§3), and they mix embed-easy and embed-hard twins. P1 is a high-confidence anchor, not
+  the statistical workhorse; **cross-paper P2 (verifier-labeled) carries the measurement.**
 - **Honest recall scope:** extraction covers only the slice, so the recall probe measures
   **intra-slice** recall (matches among these 58 papers). Full-corpus recall needs the deferred 436K
   backfill.
 - **Slice still contains some noise** (empty `"Body"` rows, section-fragment claims); the extractor
   skips garbage and the gold set targets substantive scientific claims.
-- **Twin-pair alignment isn't free:** journal and preprint versions are not claim-for-claim identical;
-  aligning which preprint claim corresponds to which journal claim (for P1) is itself done by
-  embedding+verifier and should be reported with its own confidence, not assumed perfect.
+- **Twin-pair alignment isn't free, and must not use embedding:** journal/preprint versions are not
+  claim-for-claim identical; alignment is done by the **verifier**, not embedding-NN — aligning by
+  embedding would circularly bias P1 toward the embed-easy twins and drop the embed-hard reworded ones
+  that carry the marginal signal. Report alignment confidence; don't assume it's perfect.
 
 ## 8. Success criteria (go / no-go)
 
 The experiment **succeeds as an experiment** if it returns a defensible verdict on each:
-1. **Signal:** `triple_overlap`/`entity_jaccard` AUC materially > 0.5 separating confirmed matches
-   from negatives (6a).
+1. **Signal (marginal):** within the mid/uncertain `embed_cosine` band, `triple_overlap`/
+   `entity_jaccard` separate confirmed matches from negatives with AUC materially > 0.5 — i.e. triples
+   add signal *where embedding is ambiguous*, not merely restate it (6a).
 2. **Recall:** `SharedTripleBlocker` surfaces ≥1 true cross-source pair absent from the embedding
    blocker's output, and recovers the known twin pairs at a measurable rate (6b).
 3. **Extractor + substrate:** a winning extractor with acceptable P/R, and a non-floor triple density
