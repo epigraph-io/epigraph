@@ -31,3 +31,44 @@ Premise holds at the floor: entities merge across sources and ≥1 cross-source 
 - The recall probe (`SharedTripleBlocker` uses `(subject_id, predicate)`) will be weak as-is; an **entity-overlap blocker** (shared canonical entity, no predicate) is the more promising recall lever and should be added.
 
 Raw data: `spike_results.json`.
+
+---
+
+## Phase-0b: DISCRIMINATION check (the real gate) — NEGATIVE
+
+Firing rate ≠ signal. Re-ran on the same twin, this time measuring whether the structural
+features *separate* verifier-confirmed matches from non-matches in the embed-MID band
+(0.50–0.80, where embedding is ambiguous — the only band a structural signal can help).
+Ground truth = LLM verifier per pair (not embed_cosine; same-paper twins are near-duplicate
+text, so labeling-by-embedding would be circular).
+
+**Mechanism** (143 entity-sharing pairs): 143 share any entity → **53** share a *subject* →
+**8** share a `(subject,predicate)`. `triple_overlap` loses signal at both stages: shared
+entities are often objects/modifiers (143→53), and shared subjects usually differ in predicate
+(53→8). Predicate canonicalization could at best lift 8→53; the subject-role constraint caps it.
+
+**Discrimination** (embed-mid band, n=50 labeled: 11 match / 39 non-match):
+
+| Feature | mean(match) | mean(non-match) | AUC |
+|---|---|---|---|
+| `entity_jaccard` | 0.073 | 0.059 | **0.573** |
+| `subject_jaccard` | 0.018 | 0.067 | **0.409** (anti-signal) |
+| `triple_overlap` | 0.000 | 0.000 | **0.500** (dead in-band) |
+| `embed_cosine` | 0.666 | 0.576 | **0.776** |
+
+**Verdict: NEGATIVE.** In the band where embedding is ambiguous, the RDF triple/entity
+structural features add no discriminative value over embedding (entity AUC 0.573 ≈ chance,
+subject AUC 0.409 below chance, triple AUC 0.500 dead; embedding AUC 0.776 carries it). The
+earlier "entity overlap is the workhorse" read was the firing-rate fallacy — entity_jaccard
+fires often (146 pairs) but those firings are mostly non-matches sharing generic entities.
+
+**Caveats:** one twin pair; n=50 labeled with only 11 matches → wide AUC confidence intervals;
+single extractor (LLM, generic predicates). But the point estimates are uniformly weak/inverted
+and embedding dominates, so tightening is unlikely to flip the conclusion to a strong positive.
+
+**Recommendation: do NOT proceed to the 58-paper build for cross-source *matching*.** The
+cheap gate says the triple layer won't earn its extraction+canonicalization cost on this corpus
+for the matching objective. Triples' value, if any, lies in the *query/discovery* use case
+(`query_triples`, `entity_neighborhood`) — a different objective the user did not pick.
+
+Raw data: `discriminate_results.json`, `extractions_cache.json`.
