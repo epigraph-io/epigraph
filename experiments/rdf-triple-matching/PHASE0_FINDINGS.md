@@ -82,3 +82,31 @@ rescue the matching objective even if it fired more triples.
 picked here, where structured triples may still pay off independent of matching.
 
 Raw data: `discriminate_results.json`, `extractions_cache.json`; auditable pairs via `recover_pairs.py`.
+
+---
+
+## Pivot pre-gate: ENTITY / QUERY use case — surface-variant census (NO WEDGE)
+
+User pivoted to the untested half of the original ask (entity matching / structured query). The
+binding baseline for entity-centric retrieval is **lexical** (grep/ILIKE/BM25), not embedding — so
+the entity layer only adds value via mentions whose claim text does **not** contain the entity name
+(synonyms, abbreviations, coreference). Censused that wedge directly from the cached extractions +
+claim texts (`census_surface_variants.py`, 0 claude calls):
+
+| Cut | Result |
+|---|---|
+| Per-mention literalness | 493/559 (**88.2%**) of (entity, claim) mentions have the name as a literal substring → lexical finds them |
+| Non-literal mentions (wedge ceiling) | 66/559 (**11.8%**) — and mostly *morphological* ("afm imaging"↔"afm images", "honeycomb pattern"↔"honeycomb-patterned", "(2hb)" insertions), which stemmed BM25 catches |
+| Cross-claim retrieval wedge | **8.0%** across 39 multi-claim entities; high-value entities (`28 nm`, `adaptable mode`, `edges`, `inadaptable state`, `MD simulations`) have **zero** wedge |
+
+**Verdict: NO MEANINGFUL WEDGE on this corpus.** The LLM extracts near-literal entity names from
+near-literal scientific text, so "claims mentioning entity X" is almost entirely recoverable by
+lexical search. The pre-gate kills the retrieval-precision check before building it. The one capability
+that is genuinely unique — `entity_neighborhood` aggregation ("everything about X") — rides on the
+noisy predicates already shown weak, so it can't be the justification.
+
+**Caveat:** one scientific-paper corpus with clean near-canonical prose. Messier corpora (heavy
+abbreviation, OCR, coreference-dense, multilingual) could show a real wedge — but this corpus, the
+one the user picked, does not.
+
+Raw data: `census_results.json`.
