@@ -49,7 +49,11 @@ async fn insert_claim(
     // Invariant chk_deprecated_no_embedding (migration 052): is_current=false rows
     // MUST have embedding=NULL. The "non-current" fixtures exercise the is_current
     // filter; a retired row carries no embedding, matching production.
-    let embedding_pgvec = if is_current { Some(embedding_pgvec) } else { None };
+    let embedding_pgvec = if is_current {
+        Some(embedding_pgvec)
+    } else {
+        None
+    };
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, is_current, labels, embedding) \
          VALUES ($1, $2, $3, $4, 0.8, $5, $6, $7::vector)",
