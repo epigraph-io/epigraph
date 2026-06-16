@@ -47,28 +47,38 @@ text, so labeling-by-embedding would be circular).
 entities are often objects/modifiers (143→53), and shared subjects usually differ in predicate
 (53→8). Predicate canonicalization could at best lift 8→53; the subject-role constraint caps it.
 
-**Discrimination** (embed-mid band, n=50 labeled: 11 match / 39 non-match):
+**Discrimination** (embed-mid band, n=50 labeled: 11 match / 39 non-match). AUC SE at n_pos=11
+is ~0.10, so the ~95% CI on each AUC is roughly ±0.20:
 
-| Feature | mean(match) | mean(non-match) | AUC |
-|---|---|---|---|
-| `entity_jaccard` | 0.073 | 0.059 | **0.573** |
-| `subject_jaccard` | 0.018 | 0.067 | **0.409** (anti-signal) |
-| `triple_overlap` | 0.000 | 0.000 | **0.500** (dead in-band) |
-| `embed_cosine` | 0.666 | 0.576 | **0.776** |
+| Feature | mean(match) | mean(non-match) | AUC | reading |
+|---|---|---|---|---|
+| `entity_jaccard` | 0.073 | 0.059 | 0.573 | within ~1 SE of chance (CI ≈ 0.40–0.74) |
+| `subject_jaccard` | 0.018 | 0.067 | 0.409 | ~0.9 SE under chance → indistinguishable from 0.5 (noise, **not** anti-signal) |
+| `triple_overlap` | 0.000 | 0.000 | 0.500 | **unevaluable** — fired 0/50 in-band (8/1820 overall); never tested, not "failed" |
+| `embed_cosine` | 0.666 | 0.576 | 0.776 | clearly separates matches |
 
-**Verdict: NEGATIVE.** In the band where embedding is ambiguous, the RDF triple/entity
-structural features add no discriminative value over embedding (entity AUC 0.573 ≈ chance,
-subject AUC 0.409 below chance, triple AUC 0.500 dead; embedding AUC 0.776 carries it). The
-earlier "entity overlap is the workhorse" read was the firing-rate fallacy — entity_jaccard
-fires often (146 pairs) but those firings are mostly non-matches sharing generic entities.
+**Human audit of the labels (50 pairs read by hand, 0 claude calls):** the verifier's matches are
+**real reworded corroborations**, not text-overlap rubber-stamps — e.g. P18 (both "actual ~15 pN,
+max ~57 pN"), P21 (both: adaptable mode = steep single free-energy minimum), P17 (both: edge ~28 nm
+2HB). So the labels carry signal. But the strongest matches (P17/P18/P21) have `ej≈0.08–0.13, sj=0,
+to=0`, while the *highest*-`ej` pairs (P02 0.29, P08 0.20, P13 0.22) are topically-related
+**non-matches**. The real cross-source matches are numeric/content corroborations embedding captures
+and structural Jaccard cannot single out.
 
-**Caveats:** one twin pair; n=50 labeled with only 11 matches → wide AUC confidence intervals;
-single extractor (LLM, generic predicates). But the point estimates are uniformly weak/inverted
-and embedding dominates, so tightening is unlikely to flip the conclusion to a strong positive.
+**Verdict: underpowered null — enough to refuse the build, not to refute triples.** At this sample
+size no structural feature is distinguishable from chance; embedding (0.776) is. This does **not**
+prove "triples don't help matching": it tested the LLM extractor with raw predicates on **one
+same-paper twin**, and skipped three levers the full design leaned on — predicate canonicalization
+(53 shared-subject pairs collapse to 8 shared-(subject,predicate); canon could recover much of that),
+the spaCy-vs-LLM benchmark, and cross-paper P2. What still kills the *matching* build regardless:
+`entity_jaccard` is predicate-independent and also indistinguishable from chance here, and the human
+audit shows the real matches don't share subjects/predicates at all — so the predicate lever wouldn't
+rescue the matching objective even if it fired more triples.
 
-**Recommendation: do NOT proceed to the 58-paper build for cross-source *matching*.** The
-cheap gate says the triple layer won't earn its extraction+canonicalization cost on this corpus
-for the matching objective. Triples' value, if any, lies in the *query/discovery* use case
-(`query_triples`, `entity_neighborhood`) — a different objective the user did not pick.
+**Recommendation: do NOT fund the 58-paper extract+canonicalize+score build for cross-source
+*matching*** on this evidence. Options for the user: (a) stop & document; (b) one cheap follow-up
+(predicate-canon on the 53 shared-subject pairs, or +2 twin pairs to tighten N); (c) pivot to the
+*query/discovery* use case (`query_triples`, `entity_neighborhood`) — a different objective not
+picked here, where structured triples may still pay off independent of matching.
 
-Raw data: `discriminate_results.json`, `extractions_cache.json`.
+Raw data: `discriminate_results.json`, `extractions_cache.json`; auditable pairs via `recover_pairs.py`.
