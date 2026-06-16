@@ -310,13 +310,27 @@ pub fn compute_cdst_edge_inconsistency_with_properties(
 
     let interval_inconsistency = target_interval.hausdorff_distance(&expected_interval);
 
-    // Conflict component: pure Bel/Pl distance (ignore open_world)
-    let conflict_component = {
-        let t_bel = target_interval.bel;
-        let t_pl = target_interval.pl;
-        let e_bel = expected_interval.bel;
-        let e_pl = expected_interval.pl;
-        (t_bel - e_bel).abs().max((t_pl - e_pl).abs())
+    // Conflict component: pure Bel/Pl distance (ignore open_world).
+    //
+    // For a `supports` edge the expected interval is a FLOOR — the target
+    // should be AT LEAST this strongly believed (`restrict_epistemic_positive`
+    // sets `expected.bel = source.bel * factor`). Only UNDER-support (the target
+    // sitting below the corroborated floor) is a genuine conflict; a strongly
+    // corroborated hub that exceeds a discounted weak supporter is benign
+    // corroboration, not contradiction, so the Positive arm is directional and
+    // only penalises the `expected.bel > target.bel` shortfall.
+    //
+    // contradicts / frame-evidence / neutral keep the symmetric Bel/Pl
+    // distance unchanged (their expected interval is not a one-sided floor).
+    let conflict_component = match kind {
+        RestrictionKind::Positive(_) => (expected_interval.bel - target_interval.bel).max(0.0),
+        _ => {
+            let t_bel = target_interval.bel;
+            let t_pl = target_interval.pl;
+            let e_bel = expected_interval.bel;
+            let e_pl = expected_interval.pl;
+            (t_bel - e_bel).abs().max((t_pl - e_pl).abs())
+        }
     };
 
     // Open-world component: divergence in open-world mass
@@ -573,6 +587,107 @@ mod tests {
             matches!(obs.obstruction_kind, ObstructionKind::BeliefConflict),
             "Stale support should classify as BeliefConflict, got {:?}",
             obs.obstruction_kind
+        );
+    }
+
+    // ── directional supports-edge conflict (backlog 69b43e94) ─────────────
+
+    #[test]
+    fn test_supports_over_support_is_benign() {
+        // A WEAK supporter (bel≈0.50) on a `supports` edge into a STRONG,
+        // independently corroborated hub (bel≈0.98). The discounted floor
+        // (expected.bel = 0.50 * 0.80 = 0.40) sits FAR below the hub. This is
+        // corroboration, not conflict: the hub merely exceeds the floor.
+        //
+        // BEFORE the directional fix the symmetric distance was
+        //   max(|0.98 - 0.40|, |1.0 - 0.68|) = max(0.58, 0.32) = 0.58,
+        // which spuriously inflated conflict-K on every belief hub each nightly
+        // scan. AFTER the fix the Positive arm is directional and only the
+        // UNDER-support shortfall counts: (0.40 - 0.98).max(0.0) = 0.0.
+        let src_id = Uuid::new_v4();
+        let tgt_id = Uuid::new_v4();
+        let weak_source = EpistemicInterval::new(0.50, 0.60, 0.0);
+        let strong_hub = EpistemicInterval::new(0.98, 1.0, 0.0);
+
+        let obs = compute_cdst_edge_inconsistency(
+            src_id,
+            tgt_id,
+            weak_source,
+            strong_hub,
+            "supports",
+            &sci(),
+        );
+
+        // Sanity: the symmetric distance we are REPLACING would have been 0.58.
+        let symmetric_before = (strong_hub.bel - obs.expected_interval.bel)
+            .abs()
+            .max((strong_hub.pl - obs.expected_interval.pl).abs());
+        assert!(
+            (symmetric_before - 0.58).abs() < 1e-9,
+            "regression baseline: symmetric conflict should be 0.58, got {symmetric_before}"
+        );
+
+        // AFTER: over-support contributes ~no conflict mass.
+        assert!(
+            obs.conflict_component < 0.05,
+            "over-support must be benign corroboration; conflict_component={} (was {symmetric_before} symmetric)",
+            obs.conflict_component
+        );
+    }
+
+    #[test]
+    fn test_supports_under_support_still_flags() {
+        // A STRONG supporter into a WEAK target: the target sits well below the
+        // corroborated floor (expected.bel = 0.90 * 0.80 = 0.72, target = 0.10).
+        // This is a real conflict and must still produce non-trivial conflict.
+        let src_id = Uuid::new_v4();
+        let tgt_id = Uuid::new_v4();
+        let strong_source = EpistemicInterval::new(0.90, 1.0, 0.0);
+        let weak_target = EpistemicInterval::new(0.10, 0.30, 0.0);
+
+        let obs = compute_cdst_edge_inconsistency(
+            src_id,
+            tgt_id,
+            strong_source,
+            weak_target,
+            "supports",
+            &sci(),
+        );
+
+        // expected.bel = 0.72, target.bel = 0.10 → shortfall = 0.62.
+        assert!(
+            obs.conflict_component > 0.0,
+            "under-support must still flag a conflict, got {}",
+            obs.conflict_component
+        );
+        assert!(
+            (obs.conflict_component - 0.62).abs() < 1e-9,
+            "under-support shortfall should be 0.72-0.10=0.62, got {}",
+            obs.conflict_component
+        );
+    }
+
+    #[test]
+    fn test_contradicts_conflict_unchanged() {
+        // The Negative (contradicts) arm must keep the symmetric Bel/Pl distance
+        // unchanged by this fix. Pin the exact pre-fix value.
+        //
+        // contradicts → Negative(0.90); restrict_epistemic_negative on
+        // source [0.80, 0.95] gives expected bel = (1-0.95)*0.90 = 0.045,
+        // pl = 1 - 0.80*0.90 = 0.28. Against target [0.70, 0.90]:
+        //   conflict = max(|0.70-0.045|, |0.90-0.28|) = max(0.655, 0.62) = 0.655.
+        let src_id = Uuid::new_v4();
+        let tgt_id = Uuid::new_v4();
+        let source = EpistemicInterval::new(0.80, 0.95, 0.0);
+        let target = EpistemicInterval::new(0.70, 0.90, 0.0);
+
+        let obs =
+            compute_cdst_edge_inconsistency(src_id, tgt_id, source, target, "contradicts", &sci());
+
+        assert!(
+            (obs.conflict_component - 0.655).abs() < 1e-9,
+            "contradicts conflict must stay symmetric at 0.655, got {}",
+            obs.conflict_component
         );
     }
 }
