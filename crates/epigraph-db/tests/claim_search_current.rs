@@ -64,6 +64,11 @@ async fn seed_claim(
         None => "{}".to_string(),
     };
     let labels_vec: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
+    // Invariant chk_deprecated_no_embedding (migration 052): is_current=false rows
+    // MUST have embedding=NULL. A non-current claim can no longer carry an embedding,
+    // so search_by_embedding_current excludes the retired row on both counts. Mirror
+    // the production invariant in the fixture rather than inserting an illegal row.
+    let emb = if is_current { Some(pgvec) } else { None };
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, properties, embedding, is_current, labels) \
          VALUES ($1, $2, $3, $4, 0.6, $5::jsonb, $6::vector, $7, $8)",
@@ -73,7 +78,7 @@ async fn seed_claim(
     .bind(distinct_hash(hash_tag))
     .bind(agent)
     .bind(props)
-    .bind(pgvec)
+    .bind(emb)
     .bind(is_current)
     .bind(&labels_vec)
     .execute(pool)

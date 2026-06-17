@@ -1315,6 +1315,12 @@ pub struct BatchClaimEntry {
 
     #[schemars(description = "Confidence 0.0-1.0")]
     pub confidence: Option<f64>,
+
+    #[schemars(
+        description = "Optional labels to attach to the new claim (e.g. ['backlog','bug'])"
+    )]
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
