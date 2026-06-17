@@ -86,6 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             };
             let parent_id = parent.id.as_uuid();
+            // Atoms inherit the parent compound claim's author. `agent_id` is a
+            // REQUIRED field of CreateClaimRequest (POST /api/v1/claims) — omitting
+            // it returns 422, which silently dropped every decomposition atom.
+            let parent_agent_id = parent.agent_id.as_uuid();
             let http = http.clone();
             let api_base = api_base.clone();
             let token = token.clone();
@@ -100,14 +104,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let token = token.clone();
                     async move {
                         // Canonical create via API: signing + DS + embed-on-write.
+                        // methodology/evidence_type belong in `properties` (JSONB);
+                        // top-level they were unknown fields and silently dropped.
                         let resp = http
                             .post(format!("{api_base}/api/v1/claims"))
                             .bearer_auth(&token)
                             .json(&serde_json::json!({
                                 "content": atom_text,
-                                "methodology": "inductive_generalization",
-                                "evidence_type": "logical",
-                                "confidence": 0.5,
+                                "agent_id": parent_agent_id,
+                                "initial_truth": 0.5,
+                                "properties": {
+                                    "methodology": "inductive_generalization",
+                                    "evidence_type": "logical"
+                                },
                                 "labels": ["atom", format!("generality:{generality}")],
                             }))
                             .send()
