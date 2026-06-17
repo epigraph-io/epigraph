@@ -201,7 +201,7 @@ impl AnthropicClient {
 
     /// Build the request body for the Anthropic Messages API
     fn build_request_body(&self, prompt: &str) -> serde_json::Value {
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "max_tokens": 4096,
             "messages": [
@@ -210,7 +210,20 @@ impl AnthropicClient {
                     "content": prompt
                 }
             ]
-        })
+        });
+        // Anthropic gates Max/Pro subscription OAuth tokens on the Claude Code
+        // identity: a `/v1/messages` request authenticated with an OAuth bearer
+        // returns `429 rate_limit_error` unless the first system block is exactly
+        // this string. Verified empirically (2026-06-17): identical request with
+        // the system prompt -> 200, without -> 429. The pay-per-token API-key path
+        // does NOT require it, so only inject it for the OAuth auth method. Without
+        // this, every OAuth-backed CLI LLM call (decompose_claims, tiered
+        // enrichment, etc.) 429s and silently produces nothing.
+        if self.is_oauth() {
+            body["system"] =
+                serde_json::json!("You are Claude Code, Anthropic's official CLI for Claude.");
+        }
+        body
     }
 }
 
@@ -505,6 +518,26 @@ mod tests {
         assert_eq!(body["max_tokens"], 4096);
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "Hello world");
+        // API-key path must NOT inject the Claude Code system prompt.
+        assert!(
+            body.get("system").is_none(),
+            "API-key requests must not carry the Claude Code system prompt"
+        );
+    }
+
+    #[test]
+    fn test_oauth_request_includes_claude_code_system_prompt() {
+        // Anthropic 429s OAuth (Max/Pro subscription) tokens on /v1/messages
+        // unless the first system block is exactly the Claude Code identity.
+        let client = AnthropicClient::with_oauth("oauth-token".to_string(), None).unwrap();
+        let body = client.build_request_body("Decompose this claim");
+        assert_eq!(
+            body["system"].as_str(),
+            Some("You are Claude Code, Anthropic's official CLI for Claude."),
+            "OAuth requests must carry the exact Claude Code identity or Anthropic returns 429"
+        );
+        // The task instructions still ride in the user message.
+        assert_eq!(body["messages"][0]["content"], "Decompose this claim");
     }
 
     #[test]
