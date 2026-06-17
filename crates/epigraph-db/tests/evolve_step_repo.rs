@@ -108,6 +108,52 @@ async fn evolve_step_rejects_bad_edge_type(pool: PgPool) {
     assert!(format!("{err:?}").contains("supersedes"), "{err:?}");
 }
 
+/// evolve_step with edge_type='supersedes' must null the parent's embedding so
+/// the retired step drops out of semantic search.  Regression test for the
+/// is_current=false → embedding=NULL invariant.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_nulls_parent_embedding(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let parent = seed_claim(&pool, agent, "parent step", 0.7).await;
+
+    // Plant a stub embedding on the parent before superseding it.
+    let stub = {
+        let mut v = vec!["0.0"; 1536];
+        v[0] = "0.1";
+        format!("[{}]", v.join(","))
+    };
+    sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+        .bind(stub.as_str())
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(parent),
+        "child step",
+        "supersedes",
+        Some("better version"),
+        2,
+        agent,
+    )
+    .await
+    .unwrap();
+
+    let parent_has_embedding: bool =
+        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(parent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert!(
+        !parent_has_embedding,
+        "parent {parent} embedding must be NULL after evolve_step(supersedes)"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_supersedes_rejects_non_current_parent(pool: PgPool) {
     // Build agent + v1 step using existing seed helpers.
