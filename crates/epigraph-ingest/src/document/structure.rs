@@ -271,10 +271,57 @@ fn trim_block(src: &str, start: usize, end: usize) -> (usize, usize) {
     (start, e)
 }
 
-/// Plaintext structurer — implemented in Task 5. Stubbed so [`parse_structure`]
-/// compiles with both [`SourceFormat`] arms wired now.
-fn parse_plaintext(_source: &str) -> StructuredDoc {
-    todo!("plaintext parser: Task 5")
+/// Split plaintext on blank-line boundaries into verbatim paragraph spans under
+/// one implicit section. Block = maximal run of non-blank lines; byte offsets are
+/// tracked exactly and trailing whitespace trimmed.
+fn parse_plaintext(source: &str) -> StructuredDoc {
+    let mut paragraphs: Vec<StructuredParagraph> = Vec::new();
+    let bytes = source.as_bytes();
+    let mut i = 0usize;
+    let n = bytes.len();
+    while i < n {
+        // skip blank/whitespace lines to the start of a block
+        while i < n && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let block_start = i;
+        // advance to a blank-line boundary ("\n\n", tolerating spaces) or EOF
+        let mut last_nonws = i;
+        while i < n {
+            if bytes[i] == b'\n' {
+                // look ahead: is the next line blank?
+                let mut j = i + 1;
+                while j < n && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\r') {
+                    j += 1;
+                }
+                if j >= n || bytes[j] == b'\n' {
+                    break; // blank line ⇒ end of block
+                }
+            }
+            if !bytes[i].is_ascii_whitespace() {
+                last_nonws = i;
+            }
+            i += 1;
+        }
+        let end = last_nonws + 1; // inclusive of last non-ws byte
+        paragraphs.push(StructuredParagraph {
+            span: Span {
+                start: block_start,
+                end,
+                text: source[block_start..end].to_string(),
+            },
+        });
+    }
+    StructuredDoc {
+        source_text: source.to_string(),
+        sections: vec![StructuredSection {
+            heading: None,
+            paragraphs,
+        }],
+    }
 }
 
 #[cfg(test)]
@@ -449,5 +496,34 @@ mod markdown_tests {
         assert!(d.sections[0].heading.is_none());
         assert_eq!(d.sections[0].paragraphs[0].span.text, "Preamble line.");
         assert_eq!(d.sections[1].heading.as_ref().unwrap().text, "Real Heading");
+    }
+}
+
+#[cfg(test)]
+mod plaintext_tests {
+    use super::*;
+
+    #[test]
+    fn splits_on_blank_lines_one_implicit_section() {
+        let src = "Para one line one.\nstill para one.\n\nPara two.";
+        let d = parse_structure(src, SourceFormat::PlainText).unwrap();
+        assert_eq!(d.sections.len(), 1);
+        assert!(d.sections[0].heading.is_none());
+        assert_eq!(d.sections[0].paragraphs.len(), 2);
+        assert_eq!(
+            d.sections[0].paragraphs[0].span.text,
+            "Para one line one.\nstill para one."
+        );
+        assert_eq!(d.sections[0].paragraphs[1].span.text, "Para two.");
+        assert_eq!(verify_verbatim(src, &d), Ok(()));
+    }
+
+    #[test]
+    fn collapses_blank_runs_and_trims() {
+        let src = "a\n\n\n\nb\n\n";
+        let d = parse_structure(src, SourceFormat::PlainText).unwrap();
+        assert_eq!(d.sections[0].paragraphs.len(), 2);
+        assert_eq!(d.sections[0].paragraphs[0].span.text, "a");
+        assert_eq!(d.sections[0].paragraphs[1].span.text, "b");
     }
 }
