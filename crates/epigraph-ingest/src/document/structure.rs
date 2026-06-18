@@ -167,6 +167,116 @@ fn max_alnum_run(s: &str) -> usize {
     max
 }
 
+use pulldown_cmark::{Event, Options, Parser, Tag};
+
+/// Parse clean markup into a verbatim [`StructuredDoc`]. Tier 1 (§2).
+pub fn parse_structure(source: &str, fmt: SourceFormat) -> Result<StructuredDoc, StructureError> {
+    let doc = match fmt {
+        SourceFormat::Markdown => parse_markdown(source),
+        SourceFormat::PlainText => parse_plaintext(source),
+    };
+    verify_verbatim(source, &doc)?;
+    Ok(doc)
+}
+
+fn parse_markdown(source: &str) -> StructuredDoc {
+    let mut sections: Vec<StructuredSection> = Vec::new();
+    let mut leading: Vec<StructuredParagraph> = Vec::new(); // pre-first-heading blocks
+    let mut depth: i32 = 0;
+
+    for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
+        match event {
+            Event::Start(tag) if depth == 0 => {
+                if let Tag::Heading { level, .. } = tag {
+                    let (s, e) =
+                        heading_content_span(source, range.start, range.end, level as usize);
+                    sections.push(StructuredSection {
+                        heading: Some(Span {
+                            start: s,
+                            end: e,
+                            text: source[s..e].to_string(),
+                        }),
+                        paragraphs: Vec::new(),
+                    });
+                } else {
+                    let (s, e) = trim_block(source, range.start, range.end);
+                    let para = StructuredParagraph {
+                        span: Span {
+                            start: s,
+                            end: e,
+                            text: source[s..e].to_string(),
+                        },
+                    };
+                    match sections.last_mut() {
+                        Some(sec) => sec.paragraphs.push(para),
+                        None => leading.push(para),
+                    }
+                }
+                depth += 1; // consume this block's inner events
+            }
+            Event::Start(_) => depth += 1,
+            Event::End(_) if depth > 0 => depth -= 1,
+            _ => {}
+        }
+    }
+
+    // Headingless or pre-heading body → synthesize a leading implicit section.
+    if !leading.is_empty() {
+        sections.insert(
+            0,
+            StructuredSection {
+                heading: None,
+                paragraphs: leading,
+            },
+        );
+    }
+    if sections.is_empty() {
+        sections.push(StructuredSection {
+            heading: None,
+            paragraphs: Vec::new(),
+        });
+    }
+    StructuredDoc {
+        source_text: source.to_string(),
+        sections,
+    }
+}
+
+/// Heading content range = block range minus leading `#`*level + spaces and
+/// trailing whitespace/newline/closing-`#`. Byte-exact; markers fall in the gap.
+fn heading_content_span(src: &str, start: usize, end: usize, _level: usize) -> (usize, usize) {
+    let b = src.as_bytes();
+    let mut s = start;
+    while s < end && b[s] == b'#' {
+        s += 1;
+    }
+    while s < end && (b[s] == b' ' || b[s] == b'\t') {
+        s += 1;
+    }
+    let mut e = end;
+    while e > s && matches!(b[e - 1], b'\n' | b'\r' | b' ' | b'\t' | b'#') {
+        e -= 1;
+    }
+    (s, e)
+}
+
+/// Trim only trailing whitespace/newlines from a block range (leading bytes of a
+/// list/code block are significant). Byte offsets stay valid (ASCII trims).
+fn trim_block(src: &str, start: usize, end: usize) -> (usize, usize) {
+    let b = src.as_bytes();
+    let mut e = end;
+    while e > start && matches!(b[e - 1], b'\n' | b'\r' | b' ' | b'\t') {
+        e -= 1;
+    }
+    (start, e)
+}
+
+/// Plaintext structurer — implemented in Task 5. Stubbed so [`parse_structure`]
+/// compiles with both [`SourceFormat`] arms wired now.
+fn parse_plaintext(_source: &str) -> StructuredDoc {
+    todo!("plaintext parser: Task 5")
+}
+
 #[cfg(test)]
 mod guard_tests {
     use super::*;
@@ -287,5 +397,57 @@ mod guard_tests {
             verify_verbatim(src, &d),
             Err(StructureError::BadSpan { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod markdown_tests {
+    use super::*;
+
+    #[test]
+    fn headings_open_sections_blocks_become_paragraphs() {
+        let src = "# Intro\n\nFirst para.\n\nSecond para.\n\n## Methods\n\nWe did things.";
+        let d = parse_structure(src, SourceFormat::Markdown).unwrap();
+        assert_eq!(d.sections.len(), 2);
+        assert_eq!(d.sections[0].heading.as_ref().unwrap().text, "Intro");
+        assert_eq!(d.sections[0].paragraphs.len(), 2);
+        assert_eq!(d.sections[0].paragraphs[0].span.text, "First para.");
+        assert_eq!(d.sections[1].heading.as_ref().unwrap().text, "Methods");
+        assert_eq!(d.sections[1].paragraphs[0].span.text, "We did things.");
+        // the parse must satisfy its own guard
+        assert_eq!(verify_verbatim(src, &d), Ok(()));
+    }
+
+    #[test]
+    fn list_and_code_and_table_are_single_spans_not_rejected() {
+        let src = "# H\n\n- a\n- b\n\n```\ncode line\n```\n\n| x | y |\n|---|---|\n| 1 | 2 |";
+        let d = parse_structure(src, SourceFormat::Markdown).unwrap();
+        assert_eq!(d.sections.len(), 1);
+        // list, code block, table => 3 paragraph-spans, each whole-block verbatim
+        assert_eq!(d.sections[0].paragraphs.len(), 3);
+        assert!(d.sections[0].paragraphs[0].span.text.contains("- a\n- b"));
+        assert!(d.sections[0].paragraphs[1].span.text.contains("code line"));
+        assert!(d.sections[0].paragraphs[2].span.text.contains("| 1 | 2 |"));
+        assert_eq!(verify_verbatim(src, &d), Ok(())); // MUST NOT reject clean markdown
+    }
+
+    #[test]
+    fn headingless_doc_gets_one_implicit_section() {
+        let src = "Just a body paragraph.\n\nAnd another.";
+        let d = parse_structure(src, SourceFormat::Markdown).unwrap();
+        assert_eq!(d.sections.len(), 1);
+        assert!(d.sections[0].heading.is_none());
+        assert_eq!(d.sections[0].paragraphs.len(), 2);
+        assert_eq!(verify_verbatim(src, &d), Ok(()));
+    }
+
+    #[test]
+    fn pre_heading_body_kept_in_leading_implicit_section() {
+        let src = "Preamble line.\n\n# Real Heading\n\nBody.";
+        let d = parse_structure(src, SourceFormat::Markdown).unwrap();
+        assert_eq!(d.sections.len(), 2);
+        assert!(d.sections[0].heading.is_none());
+        assert_eq!(d.sections[0].paragraphs[0].span.text, "Preamble line.");
+        assert_eq!(d.sections[1].heading.as_ref().unwrap().text, "Real Heading");
     }
 }
