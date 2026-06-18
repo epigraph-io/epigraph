@@ -95,6 +95,9 @@ sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio",
 # Vectors for embeddings
 pgvector = { version = "0.4", features = ["sqlx"] }
 
+# Markdown parsing (source-offset structurer)
+pulldown-cmark = { version = "0.12", default-features = false }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

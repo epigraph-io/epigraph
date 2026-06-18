@@ -1454,6 +1454,7 @@ name = "epigraph-ingest"
 version = "0.3.0"
 dependencies = [
  "blake3",
+ "pulldown-cmark",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -3302,6 +3303,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
+dependencies = [
+ "bitflags 2.10.0",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
