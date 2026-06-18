@@ -849,6 +849,32 @@ pub struct IngestDocumentInlineParams {
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
 }
 
+/// Parameters for the `structure_source` MCP tool. Deterministically slices raw
+/// markdown/plaintext (or an agent-supplied messy-input `segmentation`) into a
+/// verbatim `DocumentExtraction` — sections + paragraphs as byte-exact source
+/// slices, with `atoms` left EMPTY for the agent to fill and resubmit via
+/// `ingest_document_inline`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StructureSourceParams {
+    #[schemars(
+        description = "Raw source text to structure into a verbatim section/paragraph tree."
+    )]
+    pub text: String,
+    #[schemars(
+        description = "Document source metadata (title, doi/uri, source_type, authors, year, …) — same shape as DocumentExtraction.source."
+    )]
+    pub source: epigraph_ingest::schema::DocumentSource,
+    #[schemars(
+        description = "Format of `text`: \"markdown\" or \"plaintext\". Determines the deterministic parser."
+    )]
+    pub format: String,
+    #[schemars(
+        description = "Optional messy-input boundary segmentation: per-section heading + verbatim paragraph block strings, located in order. When present, overrides deterministic parsing."
+    )]
+    #[serde(default)]
+    pub segmentation: Option<epigraph_ingest::document::structure::SegmentationWire>,
+}
+
 /// Parameters for the `link_hierarchical` MCP tool.
 ///
 /// Wires two existing claims with one of the structural relationships emitted

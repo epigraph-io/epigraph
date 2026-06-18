@@ -5,6 +5,8 @@
 //! supplies boundary strings (`Segmentation`) that we LOCATE verbatim and slice.
 //! Every public function is pure (no I/O) and enforces [`verify_verbatim`].
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// A verbatim slice of the source: UTF-8 byte offsets + the exact text.
@@ -54,6 +56,42 @@ pub struct SegSection {
     pub heading: Option<String>,
     /// Verbatim paragraph block strings, in document order.
     pub paragraphs: Vec<String>,
+}
+
+/// Serde/JsonSchema mirror of [`Segmentation`] for the MCP/HTTP wire. The
+/// internal [`Segmentation`] deliberately does not derive serde (it is an
+/// in-process value), so this is the on-the-wire shape an agent submits;
+/// [`From<SegmentationWire>`] converts it to the internal type.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SegmentationWire {
+    /// Sections in document order, each a verbatim heading + paragraph blocks.
+    pub sections: Vec<SegSectionWire>,
+}
+
+/// Wire mirror of [`SegSection`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SegSectionWire {
+    /// Verbatim heading text, or `None` for an implicit (headingless) section.
+    #[serde(default)]
+    pub heading: Option<String>,
+    /// Verbatim paragraph block strings, in document order.
+    #[serde(default)]
+    pub paragraphs: Vec<String>,
+}
+
+impl From<SegmentationWire> for Segmentation {
+    fn from(w: SegmentationWire) -> Self {
+        Segmentation {
+            sections: w
+                .sections
+                .into_iter()
+                .map(|s| SegSection {
+                    heading: s.heading,
+                    paragraphs: s.paragraphs,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

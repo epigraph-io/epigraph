@@ -20,12 +20,99 @@ use epigraph_db::{
     ReasoningTraceRepository,
 };
 use epigraph_ingest::builder::{build_ingest_plan, PlannedClaim};
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::ByteSpan;
+use epigraph_ingest::document::structure::{
+    parse_structure, slice_segmentation, SourceFormat, StructuredDoc,
+};
+use epigraph_ingest::schema::{DocumentExtraction, DocumentSource, Paragraph, Section};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// structure_source — raw markdown/plaintext → verbatim DocumentExtraction
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Map a verbatim [`StructuredDoc`] into a [`DocumentExtraction`] with atoms
+/// EMPTY. The agent fills `atoms` per paragraph and resubmits via
+/// `ingest_document_inline`. `source_text` + per-node spans are populated so the
+/// writer's verbatim guard re-verifies the round-trip.
+fn structured_doc_to_extraction(doc: StructuredDoc, source: DocumentSource) -> DocumentExtraction {
+    let sections = doc
+        .sections
+        .into_iter()
+        .map(|s| Section {
+            title: s
+                .heading
+                .as_ref()
+                .map(|h| h.text.clone())
+                .unwrap_or_default(),
+            heading_span: s.heading.map(|h| ByteSpan {
+                start: h.start,
+                end: h.end,
+            }),
+            paragraphs: s
+                .paragraphs
+                .into_iter()
+                .map(|p| Paragraph {
+                    text: p.span.text,
+                    span: Some(ByteSpan {
+                        start: p.span.start,
+                        end: p.span.end,
+                    }),
+                    atoms: Vec::new(),
+                    generality: Vec::new(),
+                    confidence: 0.8,
+                    methodology: Some("verbatim_structurer".to_string()),
+                    evidence_type: None,
+                    page: None,
+                    instruments_used: Vec::new(),
+                    reagents_involved: Vec::new(),
+                    conditions: Vec::new(),
+                })
+                .collect(),
+        })
+        .collect();
+    DocumentExtraction {
+        source,
+        thesis: None,
+        thesis_derivation: Default::default(),
+        sections,
+        relationships: Vec::new(),
+        source_text: Some(doc.source_text),
+    }
+}
+
+/// Deterministically structure raw markdown/plaintext (or an agent-supplied
+/// messy-input `segmentation`) into a verbatim [`DocumentExtraction`].
+/// Read-only / no DB writes — pure compute, hence `clippy::unused_async`: the
+/// `#[tool]` server method must be `async`, and it `.await`s this fn.
+#[allow(clippy::unused_async)]
+pub async fn structure_source(
+    _server: &EpiGraphMcpFull,
+    params: StructureSourceParams,
+) -> Result<CallToolResult, McpError> {
+    let doc = if let Some(seg) = params.segmentation {
+        slice_segmentation(&params.text, &seg.into())
+            .map_err(|e| invalid_params(format!("segmentation failed: {e}")))?
+    } else {
+        let fmt = match params.format.as_str() {
+            "markdown" => SourceFormat::Markdown,
+            "plaintext" => SourceFormat::PlainText,
+            other => {
+                return Err(invalid_params(format!(
+                    "unknown format {other:?}; use markdown|plaintext"
+                )))
+            }
+        };
+        parse_structure(&params.text, fmt)
+            .map_err(|e| invalid_params(format!("structuring failed: {e}")))?
+    };
+    let extraction = structured_doc_to_extraction(doc, params.source);
+    success_json(&extraction)
 }
 
 // ────────────────────────────────────────────────────────────────────────────

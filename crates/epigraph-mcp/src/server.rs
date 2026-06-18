@@ -421,6 +421,16 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Deterministically structure raw markdown/plaintext into a verbatim DocumentExtraction (sections + paragraphs as byte-exact source slices, source_text + spans populated, atoms EMPTY). Fill atoms per paragraph and resubmit via ingest_document_inline. Read-only / no DB writes."
+    )]
+    async fn structure_source(
+        &self,
+        Parameters(params): Parameters<StructureSourceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ingestion::structure_source(self, params).await
+    }
+
+    #[tool(
         description = "Create a cross-tier structural edge between two existing claims (decomposes_to, section_follows, or continues_argument). Purpose-built for per-chapter ingest wire-ups (chapter thesis -> book thesis, chapter[N] -> chapter[N+1]). Idempotent on (source, target, relationship): re-runs return the existing edge_id with created=false. Bypasses HTTP and goes straight through the repo layer."
     )]
     async fn link_hierarchical(
