@@ -60,24 +60,38 @@ the one layer where generating claim text is the actual job.
 
 ---
 
-## 2. The invariant
+## 2. The invariant (two tiers)
 
-> **Every level-1 (section) and level-2 (paragraph) spine node's `content` is a
-> byte-exact slice of the source's canonical ingest bytes.**
+No spine node is ever an LLM paraphrase. *How* faithful the stored text is to
+the raw bytes depends on the backend:
 
-Scope and carve-outs:
+> **Tier 1 — byte-exact verbatim** (markdown / plaintext via the Rust
+> structurer): every level-1 (section heading) and level-2 (paragraph) node's
+> `content` is a byte-exact slice of the submitted `source_text`, enforced by
+> the §7 guard (in the structurer *and* re-run in the writer).
+>
+> **Tier 2 — faithful de-paraphrased extraction** (HTML / CNXML via the Python
+> emitters): node `content` is the full recovered element text — no LLM, no
+> `first_sentence` truncation — but DOM normalization (whitespace-collapse,
+> `<math>`→`[equation]`) means it is *not* a byte slice of the raw source. These
+> paths emit no `source_text`/spans, so the writer runs the non-empty check
+> only. True byte-spans for HTML/CNXML are a follow-up (§11).
+
+Each node records its tier in `properties.spine_text_kind ∈ {verbatim_v2,
+extracted_v2}` (and `paraphrase_v1` for the un-migrated corpus) so retrieval and
+the cross-source matcher can tell them apart (§8).
+
+Scope and carve-outs (both tiers):
 
 - **Level 0 (thesis)** is *verbatim-first* (D5): an explicit abstract/thesis
-  **span** when one exists; otherwise an LLM `BottomUp` synthesis, flagged via
-  the existing `thesis_derivation`. So level 0 is exempt from byte-exactness.
+  span when one exists; otherwise an LLM `BottomUp` synthesis, flagged via
+  `thesis_derivation`. Exempt from byte-exactness.
 - **Level 3 (atoms)** are LLM-generated claim text by design.
-- The guarantee is **byte-provenance only** — it asserts the stored text is the
-  source's bytes, *not* that segmentation/linearization is semantically correct.
-  Structure-determinism may degrade on messy input (D1); the verbatim guarantee
-  may not.
+- Even Tier 1 is **byte-provenance only** — it asserts the stored text is the
+  source's bytes, not that segmentation/linearization is semantically correct.
 
-Structure-determinism may degrade gracefully; the verbatim guarantee is
-non-negotiable.
+The non-negotiable invariant across **both** tiers: **no spine node is an LLM
+paraphrase.** Byte-exactness is the stronger property that only Tier 1 delivers.
 
 ---
 
@@ -134,9 +148,9 @@ raw source ─▶ [1] STRUCTURER (Rust md/plaintext, or Python HTML/CNXML)
 |------|--------|
 | `crates/epigraph-ingest/src/document/structure.rs` | **NEW.** `StructuredDoc`/`Span`/`Segmentation` types, markdown + plaintext block parser, offset-slicer, verbatim guard. Pure, no I/O, heavily unit-tested. |
 | `crates/epigraph-ingest/src/document/schema.rs` | `Paragraph.compound`→`text` (verbatim, required); drop schema-input `supporting_text`; add optional `start`/`end` byte span. `Section.summary` removed; `heading` span optional. `DocumentExtraction` gains optional `source_text`. |
-| `crates/epigraph-ingest/src/document/builder.rs` | node content = `paragraph.text` / `section.title`; **fold `section_path`/`para_path` into `compound_claim_id` material** (collision fix); atoms' `PlannedClaim.supporting_text` ← parent `text`. Edge windows logic unchanged. |
-| `crates/epigraph-ingest/src/common/ids.rs` | `compound_claim_id` material extended with the path index (so duplicate verbatim headings/paragraphs in one doc get distinct UUIDs). |
-| `crates/epigraph-mcp/src/tools/structure_source.rs` | **NEW tool.** `structure_source(text, source_type, format∈{markdown,plaintext}, segmentation?)` → verbatim tree + spans. Deterministic for clean markup; slices + verifies agent `segmentation` for messy. |
+| `crates/epigraph-ingest/src/document/builder.rs` | node content = `paragraph.text` / `section.title`; pass a path-qualified seed `{doc_title}\u{1f}{section_path\|para_path}` to `compound_claim_id` (collision fix; `path_index` still maps the same path→UUID so `relationships[]` resolution is unaffected); atoms' `PlannedClaim.supporting_text` ← parent `text`. Edge windows logic unchanged. |
+| `crates/epigraph-ingest/src/common/ids.rs` | **No signature change.** The document builder folds the section/paragraph path into the `artifact_seed` string (`{doc_title}\u{1f}{path}`, `\u{1f}` = unit separator, cannot occur in a title/path), so duplicate verbatim headings/paragraphs in one doc get distinct UUIDs without touching the shared `compound_claim_id` or its workflow callers. |
+| `crates/epigraph-mcp/src/tools/structure_source.rs` | **NEW tool.** `structure_source(text, source_type, format∈{markdown,plaintext}, segmentation?)` → a `DocumentExtraction` with the verbatim section/paragraph tree, `source_text`, and per-node byte spans populated and **`atoms` left empty**. The agent fills `atoms` per paragraph and resubmits via `ingest_document_inline`, so `source_text`+spans thread straight to the writer's re-verification. Deterministic for clean markup; slices + verifies agent `segmentation` for messy. |
 | `crates/epigraph-mcp/src/tools/ingestion.rs` | embed `text`; **re-run `verify_verbatim` against `source_text`+spans when present**; `PIPELINE_VERSION_BASE` → `hierarchical_extraction_v2`; over-budget paragraph split (§10). |
 | `crates/epigraph-mcp/src/types.rs` | inline JSON-schema descriptions for new `Paragraph`/`Section`/`DocumentExtraction`; `structure_source` types. |
 | `.claude/skills/extract-claims/SKILL.md` | Drop Stage-2 compound. New flow: structure → atomize each verbatim paragraph → `ingest_document_inline`. Council-of-Critics re-aimed at atom faithfulness + verbatim drift. |
@@ -284,8 +298,9 @@ Forward-only, gated by `PIPELINE_VERSION_BASE`:
 - **Corpus-mix during transition:** level-2 recall and the cross-source matcher
   (`cross_source_sweep`) will consume a mix of v1-paraphrase and v2-verbatim
   level-2 embeddings (plus workflow `Step` nodes, out of scope per D8).
-  Persist `properties.spine_text_kind ∈ {paraphrase_v1, verbatim_v2}` so the mix
-  is filterable, or document the accepted variance. Matcher candidates shift
+  Persist `properties.spine_text_kind ∈ {paraphrase_v1, verbatim_v2, extracted_v2}`
+  (verbatim_v2 = Tier-1 byte-exact md/plaintext; extracted_v2 = Tier-2 faithful
+  HTML/CNXML extraction) so the mix is filterable. Matcher candidates shift
   from claim-shaped to prose-shaped; `cross_source_sweep` stages to a review
   queue, so this needs no code change beyond the property.
 
@@ -307,10 +322,14 @@ Forward-only, gated by `PIPELINE_VERSION_BASE`:
   - `slice_segmentation` locates boundaries by exact match and round-trips.
 - **Property test:** spans + interstitial whitespace/markup reconstruct the
   in-spine body (nothing prose lost, nothing invented).
-- **Integration:** ingest a known markdown doc → paragraph node `content`
-  byte-equal to the source paragraph, embeddings present,
-  `continues_argument`/`section_follows`/`decomposes_to` wired, atoms decomposed
-  under each paragraph, CDST present on atoms; writer guard re-verifies.
+- **Integration (no live LLM):** call `structure_source` on a known markdown doc
+  → fill `atoms` with a canned set → `ingest_document_inline` (mock-embedder
+  harness) → assert paragraph node `content` byte-equal to the source paragraph,
+  `spine_text_kind = verbatim_v2`, `continues_argument`/`section_follows`/
+  `decomposes_to` wired, atoms decomposed under each paragraph, CDST present on
+  atoms; the writer re-runs `verify_verbatim` against the threaded
+  `source_text`+spans. (Approach C splits structure from atomization, so the
+  end-to-end test cannot call a real LLM — it injects canned atoms.)
 - **Python parsers:** regenerate fixtures for `extract_html.py` /
   `extract_textbook.py`; update `structured_source_glue.rs` +
   `test_structured_source_parsers.py` to `p.text`.
@@ -335,11 +354,17 @@ Forward-only, gated by `PIPELINE_VERSION_BASE`:
   the fiddly part — the plan must map block events to spans explicitly rather
   than assuming `Paragraph` events cover all content.
 - **Embedding token limit:** a verbatim paragraph can exceed the OpenAI
-  8191-token embed limit (vs a one-line compound). The MCP embed path has no
-  truncation, so an over-budget paragraph would store **unembedded** and a
-  backfill would re-hit the same 400 forever. Mitigation: split an over-budget
-  block into multiple **byte-exact** paragraph spans (never truncate); each
-  remains a verbatim slice and the `continues_argument` chain absorbs the split.
+  8191-token embed limit (vs a one-line compound). This is a *wiring* gap:
+  `epigraph_embeddings::tokenizer` + `DEFAULT_MAX_TOKENS = 8191` exist but
+  `McpEmbedder` never calls them, so today an over-budget text stores
+  **unembedded** (best-effort `false`) and a backfill re-hits the same 400
+  forever. Mitigation: truncate the **embedding input** in `embed.rs::generate`
+  via the tokenizer before the OpenAI call. The **stored claim `content` stays
+  full verbatim** — "never truncate the stored claim" is preserved; only the
+  vector is computed over the head of a rare oversized block (giant code
+  block/table, almost never real prose). Splitting over-budget blocks into
+  multiple byte-exact spans is rejected here — it would cut code blocks/tables
+  mid-row.
 - **Level-1 retrieval shift (D4):** section nodes now embed a bare verbatim
   heading ("Introduction", "3. Results"). Section-tier recall is intentionally
   de-emphasized in favor of paragraph nodes; the plan may exclude level-1 from
