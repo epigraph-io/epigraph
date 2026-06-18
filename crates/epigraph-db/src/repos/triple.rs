@@ -435,6 +435,80 @@ mod tests {
     use super::*;
     use crate::EntityRepository;
 
+    /// Helper: insert a minimal agent and claim, returning (agent_id, claim_id).
+    async fn insert_agent_and_claim(pool: &sqlx::PgPool) -> (Uuid, Uuid) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels) \
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'triple-test-agent', 'system', ARRAY['test']) \
+             RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let claim_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id) \
+             VALUES ($1, sha256($1::bytea), 0.7, $2) \
+             RETURNING id",
+        )
+        .bind(format!("triple-test-claim-{}", Uuid::new_v4()))
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        (agent_id, claim_id)
+    }
+
+    /// Helper: insert a canonical entity, returning entity_id.
+    async fn insert_entity(pool: &sqlx::PgPool, name: &str) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO entities (canonical_name, entity_type, is_canonical) \
+             VALUES ($1, 'Material', true) \
+             RETURNING id",
+        )
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn claim_has_triples_returns_false_when_empty(pool: sqlx::PgPool) {
+        let (_agent_id, claim_id) = insert_agent_and_claim(&pool).await;
+        let result = TripleRepository::claim_has_triples(&pool, claim_id)
+            .await
+            .unwrap();
+        assert!(!result, "new claim should have no triples");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn claim_has_triples_returns_true_after_insert(pool: sqlx::PgPool) {
+        let (_agent_id, claim_id) = insert_agent_and_claim(&pool).await;
+        let subject_id = insert_entity(&pool, &format!("subject-{}", Uuid::new_v4())).await;
+
+        TripleRepository::batch_create_triples(
+            &pool,
+            vec![(
+                claim_id,
+                subject_id,
+                "is_a".to_string(),
+                None,
+                Some("TestObject".to_string()),
+                0.9,
+                "test".to_string(),
+                serde_json::json!({}),
+            )],
+        )
+        .await
+        .unwrap();
+
+        let result = TripleRepository::claim_has_triples(&pool, claim_id)
+            .await
+            .unwrap();
+        assert!(result, "claim should have triples after batch_create_triples");
+    }
+
     /// An unpopulated index reports zeros across all three tables — the exact
     /// state behind backlog ae2784a9 (query_triples/search_triples return
     /// count=0, entity_neighborhood resolves nothing). Pin it so the health
