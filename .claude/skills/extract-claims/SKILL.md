@@ -1,6 +1,14 @@
-# Extract Claims — Hierarchical Extraction Protocol
+# Extract Claims — Verbatim-Spine Extraction Protocol
 
-Extract epistemic claims from text, documents, or conversations using a 4-stage hierarchical protocol, then ingest the complete DocumentExtraction into the EpiGraph knowledge graph.
+Extract epistemic claims from text or documents by first **structuring the source
+verbatim** (deterministic Rust splits the source into byte-exact section/paragraph
+spans), then **atomizing** each verbatim paragraph into atomic claims, then ingesting
+the complete `DocumentExtraction` into the EpiGraph knowledge graph.
+
+> **v2 change:** paragraph nodes now store the **verbatim source text** (Tier 1),
+> not an LLM paraphrase. The old `compound` / `supporting_text` / section `summary`
+> fields are removed. The LLM is fenced to **atoms only** — it never rewrites the
+> spine text. See spec `docs/superpowers/specs/2026-06-18-deterministic-spine-ingest-design.md`.
 
 ## When to use
 
@@ -8,169 +16,251 @@ Use this skill when asked to:
 - Analyze a document or text for epistemic claims
 - Extract and ingest claims from research papers, reports, or discussions
 - Build a knowledge graph from unstructured text using the hierarchical decomposition pipeline
-- Ingest structured claim hierarchies (thesis → section summaries → paragraph compounds → atomic claims)
+- Ingest a structured claim hierarchy (thesis → verbatim sections → verbatim paragraphs → atomic claims)
 
-## The 4-Stage Extraction Cascade
+## The 4-Stage Flow
 
-### Stage 1: Document Structure & Section Extraction
+```
+  raw text ──▶ (1) structure_source ──▶ verbatim skeleton ──▶ (2) atomize in place
+                                          (text+span filled,        (fill atoms[],
+                                           atoms[] EMPTY)            generality[], …)
+                                                                          │
+   (4) ingest_document_inline ◀── (3) thesis + relationships ◀───────────┘
+        (writer re-verifies spans)
+```
 
-Read the entire document and produce:
-- **Document metadata**: Title, authors, publication date, source URL, document type
-- **Section inventory**: Identify logical sections (abstract, introduction, methods, results, discussion, conclusion)
-- **Section titles and summaries**: For each section, write a 1-2 sentence summary capturing the main point
+### Stage 1: Structure (deterministic — `structure_source`)
 
-**Output**: Section list with titles and summaries
+Call the **`structure_source`** MCP tool to slice the raw source into a verbatim
+section/paragraph tree. It returns a `DocumentExtraction` JSON with `source_text`
+at the top, byte-exact `span`s on every node, the verbatim paragraph `text`
+populated, and **`atoms` left EMPTY** for you to fill.
 
-### Stage 2: Paragraph-Level Compound Extraction
+```
+structure_source({
+  text:   "<the full raw source>",
+  source: { "title": "...", "doi": "...", "source_type": "Paper", ... },
+  format: "markdown"        // or "plaintext"
+})
+```
 
-For each section, work through the prose paragraph-by-paragraph:
-- Extract the main **compound claim** — a multi-part assertion that has internal logical structure but is still grounded in one section
-- Provide **supporting_text** — exact or near-exact quote(s) from the document backing the compound
-- Mark **confidence** (0.0–1.0) based on evidence clarity and source reliability
+- **Clean markdown / plaintext** → pass `format: "markdown"` (headings open
+  sections; blank-line blocks / lists / code / tables become whole-block
+  paragraph spans) or `format: "plaintext"` (blank-line blocks under one
+  implicit section). Leave `segmentation` unset.
+- **Messy text** (no clean structure, or the deterministic parse mis-splits) →
+  pass an optional `segmentation`: per-section verbatim **boundary strings** that
+  the tool LOCATES verbatim in the source and slices on. Offsets are not
+  required — the boundary string is the authoritative locator, found in order
+  from a forward cursor (so duplicate text resolves correctly):
 
-**Apply the Council of Critics here** — this stage has the highest hallucination risk. Each paragraph extraction must pass:
-- **The Skeptic**: Is this really a claim, or noise? Is supporting text present and accurate?
-- **The Logician**: Is the compound extracting actual document content, not inferring unsupported conclusions?
-- **The Architect**: Does this compound relate to others or duplicate an existing claim?
+  ```
+  structure_source({
+    text:   "<raw source>",
+    source: { ... },
+    format: "plaintext",
+    segmentation: {
+      "sections": [
+        { "heading": "Intro heading line",          // verbatim, or null for an implicit section
+          "paragraphs": ["Alpha block text.", "Beta block text."] }
+      ]
+    }
+  })
+  ```
 
-**Output**: List of compound claims per section, each with supporting_text and confidence
+`structure_source` is **read-only** (no DB writes). Its output is the skeleton you
+enrich in Stages 2–3. **Never edit a paragraph's `text` or `span`** — they are
+byte-exact slices of `source_text`, and the writer re-verifies them at ingest.
 
-### Stage 3: Atomic Decomposition with Generality Scoring
+### Stage 2: Atomize each verbatim paragraph
 
-For each compound claim, decompose into **atomic claims** — single subject-predicate-object propositions.
+For every paragraph the structurer returned, read its verbatim `text` and
+decompose it into **atomic claims** — single subject-predicate-object
+propositions — writing them into **that paragraph's `atoms` array**.
 
 Each atom must:
 - Be a single logical assertion (one fact, one relationship)
-- Resolve all pronouns to explicit entities
-- Preserve specific numbers, names, quantitative details
-- Include only information explicitly stated (no inferences beyond the compound)
+- Resolve all pronouns to explicit entities (no "it", "they", "this")
+- Preserve exact numbers, names, chemical/gene symbols, measurements
+- Contain **only** content present in the paragraph's verbatim `text` — never
+  invent facts the `text` does not state
 
-Assign each atom a **generality score**:
-- **0 (Foundational)**: Specific facts, measurements, observations (e.g., "Enzyme X has activity 5.2 μmol/min")
-- **1 (Intermediate)**: General principles, methods, relationships (e.g., "Enzymes have optimal pH ranges")
-- **2 (Specialized)**: Domain-specific theoretical frameworks (e.g., "Michaelis-Menten kinetics apply to this system")
+Assign each atom a **generality score** in the paragraph's parallel `generality`
+array (`generality[i]` scores `atoms[i]`, index-aligned):
+- **0 (Foundational)** — specific facts, measurements, observations (e.g.
+  "Enzyme X has activity 5.2 μmol/min")
+- **1 (Intermediate)** — general principles, methods, relationships (e.g.
+  "Enzymes have optimal pH ranges")
+- **2 (Specialized)** — domain-specific theoretical frameworks (e.g.
+  "Michaelis-Menten kinetics apply to this system")
 
-Include **cross-atom relationships** when explicitly stated in the source:
-- `supports`: Atom Y directly supports atom X
-- `contradicts`: Atom Y contradicts atom X
-- `refines`: Atom Y adds specificity or conditions to atom X
+Set the paragraph's **`evidence_type`** (one value from the closed set below;
+atoms inherit it) and **`confidence`** (0.0–1.0).
 
-**Output**: Flat list of atoms with generality scores and inter-atom relationships
+Record **cross-atom relationships** in the top-level `relationships` array, by
+path, only when the source explicitly states them (see the schema below).
 
-### Stage 4 (Optional): Bottom-Up Thesis Derivation
+### Stage 3: Thesis (verbatim-first)
 
-If the document structure is weak or thesis is implicit, perform bottom-up synthesis:
-- Collect section summaries
-- Identify the core hypothesis or research question
-- Infer the document thesis as: "The paper demonstrates/claims that [synthesized claim from section evidence]"
+- If the document has an explicit thesis/abstract, set the top-level `thesis`
+  string to the **verbatim** abstract/thesis sentence(s) and leave
+  `thesis_derivation` at its default `"TopDown"`.
+- If the thesis is implicit, synthesize it bottom-up from the atomized evidence
+  and set `thesis_derivation: "BottomUp"` to flag that it was derived rather than
+  quoted.
 
-**Only perform if needed**. If the document has explicit thesis/abstract, use that directly.
+### Stage 4: Submit (`ingest_document_inline`)
+
+Pass the enriched `DocumentExtraction` directly to **`ingest_document_inline`**:
+
+```
+ingest_document_inline({ extraction: <the enriched DocumentExtraction> })
+```
+
+Because `structure_source` populated `source_text` and per-node `span`s, the
+writer **re-runs the verbatim guard** — re-verifying every paragraph `text`
+against `source_text[span.start..span.end]` and rejecting any drift. The ingest
+lands the full graph: paper node, claims at every level down to atoms,
+`decomposes_to` / `section_follows` / `supports` edges, evidence, traces,
+embeddings, and CDST mass functions for atoms.
+
+(The file-path variant `ingest_document({ file_path })` still exists for agents
+that must stage JSON on disk first, but `ingest_document_inline` is the primary,
+inline path and the one this flow uses.)
 
 ## The DocumentExtraction JSON Schema
 
-Assemble all stages into a single `DocumentExtraction` JSON structure:
+This is the shape `structure_source` returns and `ingest_document_inline` parses.
+After Stage 1 you receive it with `text`/`span`/`source_text` filled and `atoms`
+empty; you enrich it in place. Verbatim ground-truth example
+(`crates/epigraph-ingest/tests/fixtures/sample_hierarchical.json`):
 
 ```json
 {
-  "document": {
-    "id": "unique-source-hash",
-    "title": "Paper/Document Title",
-    "authors": ["Author One", "Author Two"],
-    "publication_date": "2025-03-15",
-    "source_url": "https://example.com/paper.pdf",
-    "document_type": "research-paper",
-    "content_hash": "sha256-hash-of-full-text"
+  "source": {
+    "title": "The Advantage of Serial Entrepreneurs",
+    "doi": "10.1234/test-serial-ent",
+    "source_type": "Paper",
+    "authors": [
+      {"name": "Shaw, K.", "affiliations": ["Stanford University"]},
+      {"name": "Sorensen, A.", "affiliations": ["Stanford University"]}
+    ],
+    "journal": "Management Science",
+    "year": 2019,
+    "metadata": {}
   },
-  "thesis": {
-    "claim": "The core hypothesis or main finding of the document",
-    "confidence": 0.85,
-    "source": "Abstract, conclusion, or derived from sections"
-  },
+  "thesis": "Serial entrepreneurs outperform novice entrepreneurs due to transferable learning across ventures, not selection effects.",
+  "thesis_derivation": "TopDown",
   "sections": [
     {
-      "id": "section-001",
       "title": "Introduction",
-      "summary": "This section contextualizes the research question within prior work and establishes the motivation.",
       "paragraphs": [
         {
-          "id": "para-001",
-          "compound_claim": "Protein folding is a fundamental problem in structural biology, yet current prediction methods have error rates exceeding 5 Å in many cases.",
-          "supporting_text": "\"Protein folding remains challenging. State-of-the-art methods achieve ~7 Å RMSD on test sets (Smith et al. 2024).\"",
-          "confidence": 0.82,
+          "text": "Serial entrepreneurs are defined as founders of more than one firm. Approximately 10% of Danish entrepreneurs are serial, with 73% operating as portfolio entrepreneurs running concurrent ventures.",
+          "span": { "start": 16, "end": 213 },
           "atoms": [
-            {
-              "id": "atom-001",
-              "claim": "Protein folding is a problem in structural biology",
-              "generality": 0,
-              "resolved": true
-            },
-            {
-              "id": "atom-002",
-              "claim": "Current prediction methods have error rates exceeding 5 Å",
-              "generality": 0,
-              "resolved": true
-            }
-          ]
+            "Serial entrepreneurs are defined as entrepreneurs who have founded more than one firm.",
+            "Approximately 10% of entrepreneurs in Denmark are serial entrepreneurs.",
+            "73% of serial entrepreneurs are portfolio entrepreneurs who run two or more businesses concurrently."
+          ],
+          "generality": [0, 2, 2],
+          "confidence": 0.92,
+          "methodology": "extraction",
+          "evidence_type": "statistical"
+        }
+      ]
+    },
+    {
+      "title": "Results",
+      "paragraphs": [
+        {
+          "text": "Serial entrepreneurs achieve 67% higher sales than novice entrepreneurs. This advantage is not explained by personal characteristics such as education, gender, or age.",
+          "span": { "start": 224, "end": 388 },
+          "atoms": [
+            "Serial entrepreneurs achieve 67% higher sales than novice entrepreneurs.",
+            "The serial entrepreneur sales advantage is not explained by personal characteristics such as education, gender, or age."
+          ],
+          "generality": [2, 1],
+          "confidence": 0.95,
+          "methodology": "statistical",
+          "evidence_type": "statistical"
+        },
+        {
+          "text": "Among serial entrepreneurs, 73% are portfolio type. Portfolio entrepreneur sales are 77% above novices versus only 32% for sequential entrepreneurs.",
+          "span": { "start": 390, "end": 537 },
+          "atoms": [
+            "Portfolio entrepreneur sales are 77% above novice entrepreneur sales.",
+            "Sequential entrepreneur sales are 32% above novice entrepreneur sales.",
+            "The serial entrepreneur sales advantage is concentrated in portfolio entrepreneurs."
+          ],
+          "generality": [2, 2, 1],
+          "confidence": 0.93,
+          "methodology": "statistical",
+          "evidence_type": "statistical"
         }
       ]
     }
   ],
-  "atoms": [
-    {
-      "id": "atom-global-001",
-      "claim": "The protein αβγ adopts a β-barrel structure in solution",
-      "generality": 0,
-      "evidence_type": "empirical",
-      "supporting_text": "\"Crystal structures confirm β-barrel topology (Jones et al. 2024, PDB: 8XYZ)\"",
-      "confidence": 0.91,
-      "resolved": true
-    },
-    {
-      "id": "atom-global-002",
-      "claim": "β-barrel proteins are thermally stable above 60°C",
-      "generality": 1,
-      "evidence_type": "statistical",
-      "supporting_text": "\"Melting temperatures for β-barrels range 65–85°C in thermal shift assays.\"",
-      "confidence": 0.78,
-      "resolved": true
-    }
-  ],
   "relationships": [
     {
-      "source_atom": "atom-global-001",
-      "target_atom": "atom-global-002",
+      "source_path": "sections[1].paragraphs[0].atoms[0]",
+      "target_path": "sections[1].paragraphs[1].atoms[2]",
       "relationship": "supports",
-      "explanation": "The β-barrel structure directly contributes to thermal stability"
-    },
-    {
-      "source_atom": "atom-global-003",
-      "target_atom": "atom-global-001",
-      "relationship": "contradicts",
-      "explanation": "Alternative study found α-helical structure; contradicts β-barrel claim"
+      "rationale": "The 67% overall advantage is explained by concentration in portfolio entrepreneurs"
     }
-  ]
+  ],
+  "source_text": "<the full raw source string the spans index into>"
 }
 ```
 
-### Schema Explanation
+> The `span`/`heading_span` byte offsets above are illustrative — in a real
+> extraction `structure_source` fills them so each `text` is byte-equal to
+> `source_text[span.start..span.end]`, and the writer rejects any mismatch.
+> Never hand-author or edit them.
 
-| Field | Purpose |
-|-------|---------|
-| `document` | Source metadata (title, authors, URL, hash for integrity) |
-| `thesis` | The paper's main claim or hypothesis |
-| `sections` | Organized by document structure; each contains paragraph compounds and atoms |
-| `atoms` | Flat list of ALL atomic claims, including implicit relationships |
-| `relationships` | Inter-atom edges: supports, contradicts, refines |
-| `confidence` | 0.0–1.0; based on evidence quality and source clarity |
-| `generality` | 0 (specific fact), 1 (general principle), 2 (specialized theory) |
-| `resolved` | Boolean; true if all pronouns are explicit, entities named |
-| `evidence_type` | **Pick exactly ONE from the closed set below.** Tags the kind of support behind the claim; drives Dempster–Shafer reliability weighting. |
+### Schema field reference
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `source` | object | Source metadata: `title`, `doi`/`uri`, `source_type` (PascalCase: `Paper`, `Textbook`, `InternalDocument`, `Report`, `Transcript`, `Legal`, `Tabular`), `authors[{name, affiliations[]}]`, `journal`, `year`, `metadata` |
+| `thesis` | string \| null | The paper's main claim — verbatim abstract span when present, else a bottom-up synthesis |
+| `thesis_derivation` | enum | `"TopDown"` (default — explicit/quoted) or `"BottomUp"` (synthesized) |
+| `sections[]` | array | Document structure, in order. Each: `title`, optional `heading_span {start,end}`, `paragraphs[]` |
+| `sections[].paragraphs[].text` | string | **Verbatim** source paragraph (Tier 1). DO NOT edit — it is a byte-exact slice |
+| `sections[].paragraphs[].span` | {start,end} \| null | Byte offsets of `text` into `source_text`; the writer re-verifies against it |
+| `sections[].paragraphs[].atoms` | string[] | Atomic S-P-O claims you write from `text`. **Plain strings, not objects** |
+| `sections[].paragraphs[].generality` | int[] | Parallel to `atoms`: `generality[i]` scores `atoms[i]` (0/1/2) |
+| `sections[].paragraphs[].confidence` | float | 0.0–1.0; evidence quality and source clarity (default 0.8) |
+| `sections[].paragraphs[].methodology` | string \| null | How the paragraph's evidence was produced (e.g. `extraction`, `statistical`) |
+| `sections[].paragraphs[].evidence_type` | string \| null | One value from the closed set below; atoms inherit it |
+| `relationships[]` | array | Top-level inter-atom edges, **path-based** (see below) |
+| `source_text` | string \| null | The original source bytes the spans index into. Present ⇒ the writer re-runs the verbatim guard |
+
+**Atoms are plain strings, `generality` is a parallel array.** This is the most
+common shape mistake: `atoms` is `["claim one", "claim two"]` (NOT objects), and
+`generality` is `[0, 1]` aligned by index — `generality[i]` is the score for
+`atoms[i]`. Keep the two arrays the same length.
+
+**`relationships[]` are path-based, top-level.** Each entry references atoms by
+their position path, not by id:
+
+```json
+{
+  "source_path": "sections[1].paragraphs[0].atoms[0]",
+  "target_path": "sections[1].paragraphs[1].atoms[2]",
+  "relationship": "supports",          // supports | contradicts | refines
+  "rationale": "why this edge holds"   // optional; "strength" (float) also optional
+}
+```
+
+Include a relationship only when the source **explicitly** states it. Do NOT
+infer relationships.
 
 ### `evidence_type` — pick one from this closed set
 
-Choose the single value that best describes *how* the claim is supported. Set
-it per paragraph (atoms inherit it). Anything outside this set is dropped, so
-do **not** invent values:
+Choose the single value that best describes *how* the claim is supported. Set it
+on the **paragraph** object (atoms inherit it). Anything outside this set is
+dropped at plan-build time, so do **not** invent values:
 
 | Value | Use when the support is… |
 |-------|--------------------------|
@@ -185,93 +275,66 @@ do **not** invent values:
 When unsure between two, prefer the stronger (higher in this table); if none
 fit, omit the field rather than guessing.
 
-Set it on the **paragraph** object the ingester actually reads (sibling of
-`compound`, `atoms`, `methodology`); atoms inherit it:
-
 ```json
 {
-  "compound": "Two empirical observations support the thesis.",
-  "supporting_text": "Measured directly in two assays.",
-  "atoms": ["Observation one ...", "Observation two ..."],
+  "text": "Two empirical observations support the thesis. Both were measured directly in independent assays.",
+  "atoms": ["Observation one was measured directly.", "Observation two was measured directly."],
+  "generality": [0, 0],
   "confidence": 0.8,
   "methodology": "extraction",
   "evidence_type": "empirical"
 }
 ```
 
-> NOTE: the large illustrative JSON earlier in this doc predates the current
-> ingest schema (`source`/`compound`/string-atoms with per-paragraph
-> `evidence_type`). Follow the paragraph snippet above and the field table —
-> not the older block — for the shape `ingest_document` parses.
+## Quality Gate — Council of Critics (atom faithfulness)
 
-## Submission via `ingest_document`
+The verbatim spine removes paraphrase risk at the paragraph level — the
+hallucination risk that remains is in **atomization**. Apply the Council to every
+paragraph's atoms:
 
-Once the `DocumentExtraction` is assembled:
+- **The Skeptic — faithfulness:**
+  - Is every atom actually stated in this paragraph's verbatim `text`, or am I
+    inferring beyond it?
+  - Does each atom preserve the exact numbers, names, and qualifiers in `text`?
+  - Is the `confidence` justified by the evidence clarity in `text`?
 
-1. **Write to file**: Save the JSON to `/home/jeremy/tmp/extractions/extraction_<source_hash>.json`.
-   The `ingest_document` MCP tool canonicalizes the path and rejects anything
-   outside the server's working directory (`/home/jeremy`). `/tmp/...` paths
-   will fail with "file path must be within the working directory".
-2. **Call ingest_document**: Use the MCP tool to submit:
-   ```
-   ingest_document({
-     file_path: "/home/jeremy/tmp/extractions/extraction_<source_hash>.json"
-   })
-   ```
-   The tool takes only `file_path` — extraction metadata travels inside the
-   `DocumentExtraction.source.metadata` JSON field, not as a sibling param.
+- **The Logician — no invention:**
+  - Does any atom assert content absent from `text`? If so, drop it.
+  - Is each atom a single, falsifiable S-P-O proposition (not a multi-part assertion)?
+  - Are all pronouns resolved to explicit entities?
 
-The API will:
-- Parse and validate the JSON schema
-- Create the document node
-- Ingest all sections, paragraphs, atoms, and relationships
-- Return confirmation with claim IDs for reference
+- **The Architect — structure:**
+  - Does an atom duplicate one already extracted (here or in the graph)?
+  - Should two atoms be wired with a `relationships[]` edge the `text` states?
+  - Is the thesis explicit (`TopDown`) or does it need `BottomUp` synthesis?
 
-**This replaces the old per-claim `submit_claim` approach** — all claims are now ingested as a single DocumentExtraction transaction, preserving provenance and structure.
+**Rejection rule:** if an atom is not grounded in the paragraph's verbatim `text`,
+do NOT force-fit it — drop it and note why in the report. **Never** edit the
+paragraph `text` to make an atom fit; the spine text is byte-exact and re-verified.
 
-## Quality Gate — Council of Critics
+## Key Rules
 
-Apply at **Stage 2 (Paragraph Extraction)** where hallucination risk is highest:
-
-- **The Skeptic**:
-  - Is the compound claim actually stated in the paragraph, or am I inferring?
-  - Does the supporting_text exactly (or nearly) match the source?
-  - Is the confidence justified by evidence clarity?
-
-- **The Logician**:
-  - Does the compound have falsifiable, testable structure?
-  - Are all propositions atomic or properly decomposed?
-  - Would future claims reference this correctly?
-
-- **The Architect**:
-  - Does this duplicate a prior extraction?
-  - Should it reference or be related to other claims instead?
-  - Is the document structure clear, or is Stage 4 (bottom-up thesis) needed?
-
-**Rejection rule**: If any paragraph fails the Council, flag it explicitly in the report. Do NOT force-fit it into atoms. Reject the compound, note why, and move on.
-
-## Key Rules for All Stages
-
-1. **Atomic claims are single S-P-O propositions**: "Subject + verb + object" with no compound logic. Examples:
+1. **Never mutate `text` or `span`.** They are byte-exact slices of `source_text`;
+   the writer re-verifies them and rejects any drift. Enrich `atoms`,
+   `generality`, `evidence_type`, `confidence`, `thesis`, and `relationships` only.
+2. **Atomic claims are single S-P-O propositions.**
    - ✓ "Protein X binds ligand Y"
    - ✗ "Protein X binds ligand Y and undergoes conformational change" (two atoms)
-
-2. **Resolve all pronouns**: No "it", "they", "this", "that" in final atoms. Must name the entity explicitly.
-
-3. **Preserve specificity**: Exact numbers, chemical names, gene symbols, measurements. Do NOT round or generalize.
-
-4. **No information beyond the source**: Cross-referencing with prior knowledge is allowed to disambiguate entities ("insulin" = "human insulin, INS gene"), but do NOT infer new facts.
-
-5. **Supporting text must be grounded**: Every compound and atom needs exact or near-exact quotes from the document. Never invent supporting evidence.
-
-6. **Cross-atom relationships are explicit**: Only include relationships (supports, contradicts, refines) when the source explicitly states them. Do NOT infer relationships.
+3. **Resolve all pronouns** — no "it", "they", "this", "that" in final atoms.
+4. **Preserve specificity** — exact numbers, chemical names, gene symbols,
+   measurements. Do NOT round or generalize.
+5. **No information beyond the paragraph's `text`.** Cross-referencing prior
+   knowledge to disambiguate entities ("insulin" = "human insulin, INS gene") is
+   allowed; inferring new facts is not.
+6. **Cross-atom relationships are explicit** — only include `supports`/
+   `contradicts`/`refines` edges the source explicitly states.
 
 ## Report After Ingestion
 
 Summarize:
-- Total compounds extracted
-- Total atoms generated (broken down by generality: 0/1/2)
-- Atoms rejected by Council (with reasons)
+- Sections and paragraphs structured (verbatim spans)
+- Total atoms generated, broken down by generality (0/1/2)
+- Atoms rejected by the Council (with reasons)
 - Relationships identified
-- Confirmation message with assigned claim IDs
-- Any Stage 4 thesis derivation performed and reasoning
+- Thesis derivation used (`TopDown` verbatim vs `BottomUp` synthesis)
+- Confirmation message with assigned claim IDs (`paper_id` and node IDs)
