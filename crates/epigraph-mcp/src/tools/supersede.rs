@@ -2,6 +2,21 @@
 //! NOTE: the new claim INHERITS the OLD claim's agent_id (per
 //! ClaimRepository::supersede semantics). For caller-attributed
 //! supersession use the REST endpoint with explicit auth.
+//!
+//! # Invariants
+//!
+//! **Handler must route through `ClaimRepository::supersede`.**  This MCP
+//! handler performs NO bare `INSERT`/`UPDATE` against the `claims` table.
+//! All mutation goes through `ClaimRepository::supersede`, which guarantees:
+//!
+//! * The old claim's `is_current = false` and `embedding = NULL` are set in a
+//!   *single* `UPDATE` statement.  This is required because the CHECK constraint
+//!   `chk_deprecated_no_embedding` (added in migration 052) fires per-statement,
+//!   not per-transaction: two separate updates would violate the constraint
+//!   between statements and the transaction would be aborted.
+//!
+//! Do not inline SQL here; keep all claim-mutation logic in the repository layer
+//! so that constraint-ordering guarantees remain in one place.
 
 use rmcp::model::{CallToolResult, Content};
 
