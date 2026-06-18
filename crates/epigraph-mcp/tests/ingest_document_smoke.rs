@@ -24,10 +24,8 @@ const FIXTURE: &str = r#"{
   "thesis_derivation": "TopDown",
   "sections": [{
     "title": "Intro",
-    "summary": "Background section connecting prior work to this thesis",
     "paragraphs": [{
-      "compound": "Atomization aids cross-source matching, and explicit decomposition is necessary",
-      "supporting_text": "We argue both points throughout the paper.",
+      "text": "Atomization aids cross-source matching, and explicit decomposition is necessary",
       "atoms": [
         "Atomization aids cross-source matching",
         "Explicit decomposition is necessary for hierarchical reasoning"
@@ -88,7 +86,7 @@ async fn happy_path_ingests_full_hierarchy(pool: PgPool) {
         SELECT COUNT(*) FROM claims
         WHERE content IN (
             'Hierarchies converge through layered claims',
-            'Background section connecting prior work to this thesis',
+            'Intro',
             'Atomization aids cross-source matching, and explicit decomposition is necessary',
             'Atomization aids cross-source matching',
             'Explicit decomposition is necessary for hierarchical reasoning'
@@ -195,10 +193,8 @@ async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
               "thesis_derivation": "TopDown",
               "sections": [{{
                 "title": "Sec",
-                "summary": "Chapter {idx} section summary",
                 "paragraphs": [{{
-                  "compound": "Chapter {idx} compound claim",
-                  "supporting_text": "Chapter {idx} support",
+                  "text": "Chapter {idx} compound claim",
                   "atoms": ["Chapter {idx} atom one"],
                   "generality": [3],
                   "confidence": 0.8
@@ -273,10 +269,8 @@ const FIXTURE_OVERLAP: &str = r#"{
   "thesis_derivation": "TopDown",
   "sections": [{
     "title": "Other Intro",
-    "summary": "An entirely different section summary that should not collide",
     "paragraphs": [{
-      "compound": "A different compound claim that overlaps via one shared atom",
-      "supporting_text": "Different supporting passage.",
+      "text": "A different compound claim that overlaps via one shared atom",
       "atoms": [
         "Atomization aids cross-source matching",
         "A genuinely new atom that has never been ingested before"
@@ -409,10 +403,8 @@ async fn ingest_document_handles_compound_equals_atom(pool: sqlx::PgPool) {
         "thesis_derivation": "TopDown",
         "sections": [{
             "title": "Body",
-            "summary": "One section, one paragraph, one atom.",
             "paragraphs": [{
-                "compound": "Class B agents have a contract.active flag.",
-                "supporting_text": "Class B agents have a contract.active flag.",
+                "text": "Class B agents have a contract.active flag.",
                 "atoms": ["Class B agents have a contract.active flag."],
                 "generality": [0],
                 "confidence": 0.8,
@@ -463,10 +455,8 @@ async fn ingest_tags_bbas_with_normalized_evidence_type(pool: sqlx::PgPool) {
         "thesis_derivation": "TopDown",
         "sections": [{
             "title": "Body",
-            "summary": "One paragraph, two atoms, tagged Empirical.",
             "paragraphs": [{
-                "compound": "Two empirical observations support the thesis.",
-                "supporting_text": "Measured directly in two assays.",
+                "text": "Two empirical observations support the thesis.",
                 "atoms": [
                     "Observation one holds under standard conditions",
                     "Observation two replicates observation one"
@@ -564,13 +554,7 @@ fn inline_tool_wire_schema_is_self_contained() {
     }
 
     let schema_str = serde_json::to_string(input_schema).unwrap();
-    for field in [
-        "sections",
-        "paragraphs",
-        "compound",
-        "atoms",
-        "evidence_type",
-    ] {
+    for field in ["sections", "paragraphs", "text", "atoms", "evidence_type"] {
         assert!(
             schema_str.contains(field),
             "wire schema must expose `{field}` so an MCP client sees the shape"
@@ -609,7 +593,7 @@ fn inline_params_expose_hierarchical_json_schema() {
         "thesis",
         "sections",
         "paragraphs",
-        "compound",
+        "text",
         "atoms",
         "evidence_type",
         "relationships",

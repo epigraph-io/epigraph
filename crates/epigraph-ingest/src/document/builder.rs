@@ -31,6 +31,17 @@ fn enrichment_from_paragraph(paragraph: &Paragraph) -> serde_json::Value {
     })
 }
 
+/// Tier stamp (§2). Tier 1 (`verbatim_v2`) when the extraction carries
+/// `source_text` (so section/paragraph nodes are byte-exact verbatim spans);
+/// else Tier 2 (`extracted_v2`, e.g. the Python HTML/CNXML emitters).
+fn spine_text_kind(extraction: &DocumentExtraction) -> &'static str {
+    if extraction.source_text.is_some() {
+        "verbatim_v2"
+    } else {
+        "extracted_v2"
+    }
+}
+
 /// Walk a `DocumentExtraction` tree and produce a flat list of operations.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -46,7 +57,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
     #[allow(clippy::option_if_let_else)]
     let thesis_id = if let Some(ref thesis_text) = extraction.thesis {
         let hash = content_hash(thesis_text);
-        let id = compound_claim_id(&hash, doc_title);
+        let id = compound_claim_id(&hash, &format!("{doc_title}\u{1f}thesis"));
         path_index.insert("thesis".to_string(), id);
 
         claims.push(PlannedClaim {
@@ -74,19 +85,21 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
 
     for (si, section) in extraction.sections.iter().enumerate() {
         let section_path = format!("sections[{si}]");
-        let section_hash = content_hash(&section.summary);
-        let section_id = compound_claim_id(&section_hash, doc_title);
+        let section_hash = content_hash(&section.title);
+        let section_id =
+            compound_claim_id(&section_hash, &format!("{doc_title}\u{1f}{section_path}"));
         section_ids.push(section_id);
         path_index.insert(section_path.clone(), section_id);
 
         claims.push(PlannedClaim {
             id: section_id,
-            content: section.summary.clone(),
+            content: section.title.clone(),
             level: 1,
             properties: serde_json::json!({
                 "level": 1,
                 "source_type": source_type,
                 "section": section.title,
+                "spine_text_kind": spine_text_kind(extraction),
             }),
             content_hash: section_hash,
             confidence: 1.0,
@@ -104,8 +117,8 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
 
         for (pi, paragraph) in section.paragraphs.iter().enumerate() {
             let para_path = format!("{section_path}.paragraphs[{pi}]");
-            let para_hash = content_hash(&paragraph.compound);
-            let para_id = compound_claim_id(&para_hash, doc_title);
+            let para_hash = content_hash(&paragraph.text);
+            let para_id = compound_claim_id(&para_hash, &format!("{doc_title}\u{1f}{para_path}"));
             para_ids.push(para_id);
             path_index.insert(para_path.clone(), para_id);
 
@@ -120,19 +133,19 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
 
             claims.push(PlannedClaim {
                 id: para_id,
-                content: paragraph.compound.clone(),
+                content: paragraph.text.clone(),
                 level: 2,
                 properties: serde_json::json!({
                     "level": 2,
                     "source_type": source_type,
                     "section": section.title,
-                    "supporting_text": paragraph.supporting_text,
+                    "spine_text_kind": spine_text_kind(extraction),
                 }),
                 content_hash: para_hash,
                 confidence: paragraph.confidence,
                 methodology: paragraph.methodology.clone(),
                 evidence_type: para_evidence_type.clone(),
-                supporting_text: Some(paragraph.supporting_text.clone()),
+                supporting_text: Some(paragraph.text.clone()),
                 enrichment: enrichment.clone(),
             });
 
@@ -164,7 +177,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                     confidence: paragraph.confidence,
                     methodology: paragraph.methodology.clone(),
                     evidence_type: para_evidence_type.clone(),
-                    supporting_text: Some(paragraph.supporting_text.clone()),
+                    supporting_text: Some(paragraph.text.clone()),
                     enrichment: enrichment.clone(),
                 });
 
