@@ -324,6 +324,55 @@ fn parse_plaintext(source: &str) -> StructuredDoc {
     }
 }
 
+/// Slice an agent [`Segmentation`] into a verbatim [`StructuredDoc`]. Locates each
+/// boundary string by the FIRST exact match at/after a forward cursor (handles
+/// duplicates + enforces order); never trusts agent-supplied text otherwise.
+pub fn slice_segmentation(
+    source: &str,
+    seg: &Segmentation,
+) -> Result<StructuredDoc, StructureError> {
+    let mut cursor = 0usize;
+    let mut locate = |needle: &str| -> Result<Span, StructureError> {
+        let rel =
+            source[cursor..]
+                .find(needle)
+                .ok_or_else(|| StructureError::BoundaryNotFound {
+                    cursor,
+                    needle: needle.to_string(),
+                })?;
+        let start = cursor + rel;
+        let end = start + needle.len();
+        cursor = end;
+        Ok(Span {
+            start,
+            end,
+            text: needle.to_string(),
+        })
+    };
+
+    let mut sections = Vec::with_capacity(seg.sections.len());
+    for s in &seg.sections {
+        let heading = match &s.heading {
+            Some(h) => Some(locate(h)?),
+            None => None,
+        };
+        let mut paragraphs = Vec::with_capacity(s.paragraphs.len());
+        for p in &s.paragraphs {
+            paragraphs.push(StructuredParagraph { span: locate(p)? });
+        }
+        sections.push(StructuredSection {
+            heading,
+            paragraphs,
+        });
+    }
+    let doc = StructuredDoc {
+        source_text: source.to_string(),
+        sections,
+    };
+    verify_verbatim(source, &doc)?;
+    Ok(doc)
+}
+
 #[cfg(test)]
 mod guard_tests {
     use super::*;
@@ -525,5 +574,65 @@ mod plaintext_tests {
         assert_eq!(d.sections[0].paragraphs.len(), 2);
         assert_eq!(d.sections[0].paragraphs[0].span.text, "a");
         assert_eq!(d.sections[0].paragraphs[1].span.text, "b");
+    }
+}
+
+#[cfg(test)]
+mod segmentation_tests {
+    use super::*;
+
+    #[test]
+    fn locates_boundary_strings_verbatim_in_order() {
+        let src = "Intro heading line\nAlpha block text.\nBeta block text.";
+        let seg = Segmentation {
+            sections: vec![SegSection {
+                heading: Some("Intro heading line".to_string()),
+                paragraphs: vec![
+                    "Alpha block text.".to_string(),
+                    "Beta block text.".to_string(),
+                ],
+            }],
+        };
+        let d = slice_segmentation(src, &seg).unwrap();
+        assert_eq!(
+            d.sections[0].heading.as_ref().unwrap().text,
+            "Intro heading line"
+        );
+        assert_eq!(d.sections[0].paragraphs[1].span.text, "Beta block text.");
+        // spans are real byte slices ⇒ guard passes
+        assert_eq!(verify_verbatim(src, &d), Ok(()));
+    }
+
+    #[test]
+    fn errors_when_boundary_absent() {
+        let src = "only this text";
+        let seg = Segmentation {
+            sections: vec![SegSection {
+                heading: None,
+                paragraphs: vec!["MISSING".to_string()],
+            }],
+        };
+        assert!(matches!(
+            slice_segmentation(src, &seg),
+            Err(StructureError::BoundaryNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_text_resolved_by_forward_cursor() {
+        // Plan's `dup\nmiddle\ndup` source has dropped prose ("middle") between the
+        // two captured spans, which the Task 3 coverage guard correctly rejects.
+        // Use a whitespace-only gap so the scenario is a LEGAL verbatim doc while
+        // still exercising the duplicate-forward-cursor discriminator (start 5 != 0).
+        let src = "dup\n\ndup";
+        let seg = Segmentation {
+            sections: vec![SegSection {
+                heading: None,
+                paragraphs: vec!["dup".to_string(), "dup".to_string()],
+            }],
+        };
+        let d = slice_segmentation(src, &seg).unwrap();
+        assert_eq!(d.sections[0].paragraphs[0].span.start, 0);
+        assert_eq!(d.sections[0].paragraphs[1].span.start, 5); // the SECOND "dup"
     }
 }
