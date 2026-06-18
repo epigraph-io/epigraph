@@ -32,7 +32,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 // ingest_document — hierarchical DocumentExtraction → graph
 // ────────────────────────────────────────────────────────────────────────────
 
-const PIPELINE_VERSION_BASE: &str = "hierarchical_extraction_v1";
+const PIPELINE_VERSION_BASE: &str = "hierarchical_extraction_v2";
 
 /// Pipeline version stamp used by the `processed_by` edge and the version gate.
 ///
@@ -151,6 +151,13 @@ pub async fn do_ingest_document(
     server: &EpiGraphMcpFull,
     extraction: &DocumentExtraction,
 ) -> Result<CallToolResult, McpError> {
+    // D9 writer-side verbatim re-verification: when the extraction carries
+    // `source_text`, every span-backed paragraph's stored `text` must equal the
+    // bytes its span points at. Fail closed before any DB write so paraphrase
+    // drift can never reach a verbatim_v2 node. No-op for Tier 2 (no source_text).
+    epigraph_ingest::document::structure::verify_extraction_verbatim(extraction)
+        .map_err(|e| invalid_params(format!("verbatim guard failed: {e}")))?;
+
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
     let agent_id = server.agent_id().await?;

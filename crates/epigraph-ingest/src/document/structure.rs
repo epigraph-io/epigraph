@@ -373,6 +373,55 @@ pub fn slice_segmentation(
     Ok(doc)
 }
 
+/// Writer-side re-verification (D9). When `extraction.source_text` is present,
+/// rebuild a [`StructuredDoc`] from the carried spans and run [`verify_verbatim`]
+/// against the original bytes — catching any drift between a paragraph's stored
+/// `text` and the span it claims to come from. When `source_text` is absent
+/// (Tier 2 HTML/CNXML), this is a no-op: the writer does its own non-empty check.
+///
+/// Only span-backed paragraphs are re-verified; span-less paragraphs (Tier 2)
+/// are skipped, so coverage-checking spans exactly the nodes that carry offsets.
+pub fn verify_extraction_verbatim(
+    extraction: &crate::document::schema::DocumentExtraction,
+) -> Result<(), StructureError> {
+    let Some(source) = extraction.source_text.as_deref() else {
+        return Ok(());
+    };
+    let sections = extraction
+        .sections
+        .iter()
+        .map(|sec| StructuredSection {
+            heading: sec.heading_span.as_ref().and_then(|sp| {
+                source.get(sp.start..sp.end).map(|t| Span {
+                    start: sp.start,
+                    end: sp.end,
+                    text: t.to_string(),
+                })
+            }),
+            paragraphs: sec
+                .paragraphs
+                .iter()
+                .filter_map(|p| {
+                    p.span.as_ref().map(|sp| StructuredParagraph {
+                        span: Span {
+                            start: sp.start,
+                            end: sp.end,
+                            text: p.text.clone(),
+                        },
+                    })
+                })
+                .collect(),
+        })
+        .collect();
+    verify_verbatim(
+        source,
+        &StructuredDoc {
+            source_text: source.to_string(),
+            sections,
+        },
+    )
+}
+
 #[cfg(test)]
 mod guard_tests {
     use super::*;
