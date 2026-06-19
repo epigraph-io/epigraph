@@ -844,9 +844,35 @@ pub struct IngestDocumentParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IngestDocumentInlineParams {
     #[schemars(
-        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with title/summary/paragraphs, where each paragraph has compound, supporting_text, atoms, generality, confidence, methodology, evidence_type), and relationships. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms."
+        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, and an optional top-level source_text. When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms."
     )]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
+}
+
+/// Parameters for the `structure_source` MCP tool. Deterministically slices raw
+/// markdown/plaintext (or an agent-supplied messy-input `segmentation`) into a
+/// verbatim `DocumentExtraction` — sections + paragraphs as byte-exact source
+/// slices, with `atoms` left EMPTY for the agent to fill and resubmit via
+/// `ingest_document_inline`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StructureSourceParams {
+    #[schemars(
+        description = "Raw source text to structure into a verbatim section/paragraph tree."
+    )]
+    pub text: String,
+    #[schemars(
+        description = "Document source metadata (title, doi/uri, source_type, authors, year, …) — same shape as DocumentExtraction.source."
+    )]
+    pub source: epigraph_ingest::schema::DocumentSource,
+    #[schemars(
+        description = "Format of `text`: \"markdown\" or \"plaintext\". Determines the deterministic parser."
+    )]
+    pub format: String,
+    #[schemars(
+        description = "Optional messy-input boundary segmentation: per-section heading + verbatim paragraph block strings, located in order. When present, overrides deterministic parsing."
+    )]
+    #[serde(default)]
+    pub segmentation: Option<epigraph_ingest::document::structure::SegmentationWire>,
 }
 
 /// Parameters for the `link_hierarchical` MCP tool.

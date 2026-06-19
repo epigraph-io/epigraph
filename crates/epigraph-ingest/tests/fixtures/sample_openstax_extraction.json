@@ -27,19 +27,16 @@
   "sections": [
     {
       "title": "Ch 1: Electrostatics > Electric Charge and Coulomb's Law",
-      "summary": "Section: Ch 1: Electrostatics > Electric Charge and Coulomb's Law",
       "paragraphs": [
         {
-          "compound": "The electrostatic force between two point charges is proportional to the product of the charges and inversely proportional to the square of the distance between them, as expressed by [equation] in standard form.",
-          "supporting_text": "The electrostatic force between two point charges is proportional to the product of the charges and inversely proportional to the square of the distance between them, as expressed by [equation] in standard form.",
+          "text": "The electrostatic force between two point charges is proportional to the product of the charges and inversely proportional to the square of the distance between them, as expressed by [equation] in standard form.",
           "atoms": [],
           "generality": [],
           "confidence": 0.85,
           "methodology": "textbook_assertion"
         },
         {
-          "compound": "Coulomb is defined as: the SI unit of electric charge, equal to the charge transported by a constant current of one ampere in one second",
-          "supporting_text": "Coulomb is defined as: the SI unit of electric charge, equal to the charge transported by a constant current of one ampere in one second",
+          "text": "Coulomb is defined as: the SI unit of electric charge, equal to the charge transported by a constant current of one ampere in one second",
           "atoms": [],
           "generality": [],
           "confidence": 0.9,

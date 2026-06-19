@@ -37,6 +37,19 @@ pub struct MentionRow {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Aggregate row counts for the structured triple/entity index.
+///
+/// Surfaces the health of the RDF layer (`triples`, `entities`,
+/// `entity_mentions`) so an unpopulated index is observable rather than
+/// indistinguishable from "no matches" in the `query_triples` /
+/// `search_triples` / `entity_neighborhood` tools. See backlog ae2784a9.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct IndexCounts {
+    pub triples: i64,
+    pub entities: i64,
+    pub entity_mentions: i64,
+}
+
 /// Repository for triple and entity mention operations
 pub struct TripleRepository;
 
@@ -385,12 +398,88 @@ impl TripleRepository {
 
         Ok(row.exists)
     }
+
+    /// Return total row counts for the structured triple/entity index.
+    ///
+    /// One round-trip over the three index tables (`triples`, `entities`,
+    /// `entity_mentions`). Exposed through `system_stats` so an empty /
+    /// unpopulated index is observable: the three RDF query tools otherwise
+    /// return `count = 0` / entity-not-found, which is indistinguishable from
+    /// a populated-but-no-match result. See backlog ae2784a9.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn index_counts(pool: &PgPool) -> Result<IndexCounts, DbError> {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM triples)         AS "triples!",
+              (SELECT COUNT(*) FROM entities)        AS "entities!",
+              (SELECT COUNT(*) FROM entity_mentions) AS "entity_mentions!"
+            "#
+        )
+        .fetch_one(pool)
+        .await?;
+
+        Ok(IndexCounts {
+            triples: row.triples,
+            entities: row.entities,
+            entity_mentions: row.entity_mentions,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::EntityRepository;
+
+    /// An unpopulated index reports zeros across all three tables — the exact
+    /// state behind backlog ae2784a9 (query_triples/search_triples return
+    /// count=0, entity_neighborhood resolves nothing). Pin it so the health
+    /// signal stays observable and a future populate-path regression is caught.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn test_triple_repository_placeholder(_pool: sqlx::PgPool) {
-        // Full CRUD coverage is in integration tests once the extraction pipeline is wired.
+    async fn index_counts_empty_db_is_all_zero(pool: sqlx::PgPool) {
+        let counts = TripleRepository::index_counts(&pool)
+            .await
+            .expect("index_counts query should succeed on an empty DB");
+        assert_eq!(counts.triples, 0);
+        assert_eq!(counts.entities, 0);
+        assert_eq!(counts.entity_mentions, 0);
+    }
+
+    /// After inserting canonical entities (no FK dependencies), the entity
+    /// count reflects them while triples/mentions stay zero — proving the three
+    /// counts are independent per table, not one shared aggregate.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn index_counts_reflects_inserted_entities(pool: sqlx::PgPool) {
+        EntityRepository::upsert(
+            &pool,
+            "silicon",
+            "Material",
+            None,
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .expect("upsert silicon");
+        EntityRepository::upsert(
+            &pool,
+            "DNA origami",
+            "Material",
+            None,
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .expect("upsert DNA origami");
+
+        let counts = TripleRepository::index_counts(&pool)
+            .await
+            .expect("index_counts should succeed");
+        assert_eq!(counts.entities, 2, "two canonical entities inserted");
+        assert_eq!(counts.triples, 0, "no triples inserted");
+        assert_eq!(counts.entity_mentions, 0, "no mentions inserted");
     }
 }

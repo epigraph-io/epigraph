@@ -369,9 +369,9 @@ mod tests {
                 "source": {"title": "Test Paper", "source_type": "Paper", "authors": []},
                 "thesis": "Doc thesis",
                 "sections": [{
-                    "title": "Body", "summary": "Body summary",
+                    "title": "Body",
                     "paragraphs": [{
-                        "compound": "P1",
+                        "text": "P1",
                         "atoms": ["text-embedding-3-large produces 3072-dimensional vectors."],
                         "generality": [1], "confidence": 0.9
                     }]

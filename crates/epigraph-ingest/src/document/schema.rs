@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::schema::{AuthorEntry, ClaimRelationship, ThesisDerivation};
 
+/// A byte-offset span into `DocumentExtraction.source_text` (D9). Optional on
+/// each node; when present, the writer re-verifies the node text against it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ByteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
 /// Top-level extraction result from a document.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentExtraction {
@@ -17,6 +25,10 @@ pub struct DocumentExtraction {
     pub sections: Vec<Section>,
     #[serde(default)]
     pub relationships: Vec<ClaimRelationship>,
+    /// Original source bytes the spans index into (D9). Present ⇒ the writer
+    /// re-runs the verbatim guard. Tier 2 (HTML/CNXML) omits it.
+    #[serde(default)]
+    pub source_text: Option<String>,
 }
 
 /// Metadata about the source document.
@@ -57,7 +69,7 @@ pub enum SourceType {
 pub struct Section {
     pub title: String,
     #[serde(default)]
-    pub summary: String,
+    pub heading_span: Option<ByteSpan>,
     #[serde(default)]
     pub paragraphs: Vec<Paragraph>,
 }
@@ -65,9 +77,10 @@ pub struct Section {
 /// A paragraph containing atomic claims.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Paragraph {
-    pub compound: String,
+    /// Verbatim source text (Tier 1) or faithful full extraction (Tier 2).
+    pub text: String,
     #[serde(default)]
-    pub supporting_text: String,
+    pub span: Option<ByteSpan>,
     #[serde(default)]
     pub atoms: Vec<String>,
     #[serde(default)]

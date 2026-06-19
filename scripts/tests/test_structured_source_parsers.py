@@ -28,7 +28,7 @@ def _assert_canonical(doc: dict) -> None:
     for sec in doc["sections"]:
         assert sec["title"], "section title required"
         for p in sec["paragraphs"]:
-            assert p["compound"].strip(), "compound required + non-empty"
+            assert p["text"].strip(), "verbatim text required + non-empty"
             assert p["atoms"] == [], "structure recovery emits no atoms"
             assert isinstance(p["generality"], list)
             if "evidence_type" in p:
@@ -53,7 +53,7 @@ class TestArxivHtml(unittest.TestCase):
         self.assertEqual(len(doc["sections"]), 2, "two h2 sections (abstract excluded)")
         self.assertTrue(doc["thesis"], "abstract becomes thesis")
         body = " ".join(
-            p["supporting_text"] for s in doc["sections"] for p in s["paragraphs"]
+            p["text"] for s in doc["sections"] for p in s["paragraphs"]
         )
         self.assertNotIn("E=m", body, "<math> must be skipped")
         # Regenerate the Rust fixture deterministically.
@@ -91,7 +91,7 @@ class TestOpenStaxCnxml(unittest.TestCase):
         _assert_canonical(doc)
         paras = doc["sections"][0]["paragraphs"]
         self.assertEqual(len(paras), 2, "1 real para + 1 definition; transitional dropped")
-        joined = " ".join(p["supporting_text"] for p in paras)
+        joined = " ".join(p["text"] for p in paras)
         self.assertIn("[equation]", joined, "inline MathML -> [equation] placeholder")
         self.assertNotIn("In this section, we will explore", joined)
         (FIX / "sample_openstax_extraction.json").write_text(

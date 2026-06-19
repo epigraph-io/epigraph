@@ -106,7 +106,7 @@ pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
 pub use trace::ReasoningTraceRepository;
-pub use triple::{MentionRow, TripleRepository, TripleRow};
+pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use workflow::{
     HierarchicalWorkflowRow, ResolvedStep, WorkflowListRow, WorkflowRecallResult,
     WorkflowRepository,

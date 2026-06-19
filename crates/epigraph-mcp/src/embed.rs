@@ -74,8 +74,18 @@ impl McpEmbedder {
             .filter(|k| !k.is_empty() && *k != "mock")
             .ok_or_else(|| "embeddings disabled (no API key)".to_string())?;
 
-        generate_openai_embedding_with_model(&self.http, api_key, text, "text-embedding-3-small")
-            .await
+        // Truncate the EMBEDDING INPUT only to the OpenAI model's 8191-token limit;
+        // the stored claim content stays full verbatim. Verbatim_v2 paragraph
+        // nodes can carry whole sections that exceed the embedding context — an
+        // over-limit request 400s, so clip here rather than drop the embedding.
+        let truncated = truncate_embedding_input(text);
+        generate_openai_embedding_with_model(
+            &self.http,
+            api_key,
+            &truncated,
+            "text-embedding-3-small",
+        )
+        .await
     }
 
     /// Generate an embedding at the requested dimension by selecting the right
@@ -90,7 +100,10 @@ impl McpEmbedder {
         let model = model_for_dim(dim)
             .ok_or_else(|| format!("unsupported centroid_dim: {dim} (must be 1536 or 3072)"))?;
 
-        generate_openai_embedding_with_model(&self.http, api_key, text, model).await
+        // Truncate the embedding input to the model token limit (stored content
+        // is untouched); see `generate` for the verbatim-spine rationale.
+        let truncated = truncate_embedding_input(text);
+        generate_openai_embedding_with_model(&self.http, api_key, &truncated, model).await
     }
 
     /// Generate embedding and store it for a claim. Returns true if embedding succeeded.
@@ -297,6 +310,18 @@ impl EmbeddingService for McpEmbedder {
     }
 }
 
+/// Clip text to the OpenAI embedding model's 8191-token context window before
+/// it is sent as an embedding input. Returns the original string unchanged when
+/// it is already within the limit. This truncates ONLY the embedding input — the
+/// caller-supplied claim content is stored full-length elsewhere; this function
+/// never sees or mutates stored content. Uses the embeddings crate's
+/// [`Tokenizer`](epigraph_embeddings::Tokenizer) (tiktoken when the `openai`
+/// feature is on, char-estimate fallback otherwise).
+fn truncate_embedding_input(text: &str) -> String {
+    epigraph_embeddings::Tokenizer::new(epigraph_embeddings::config::DEFAULT_MAX_TOKENS)
+        .truncate(text)
+}
+
 /// Format a vector as a pgvector string literal: `"[0.1,0.2,...]"`.
 ///
 /// Public so callers can format a cached `Vec<f32>` for direct SQL use
@@ -378,5 +403,40 @@ mod tests {
             !super::key_disabled(Some("sk-real-key")),
             "a real key => enabled"
         );
+    }
+
+    // An over-limit input (a verbatim_v2 paragraph can be a whole section) must
+    // be clipped to <= the OpenAI 8191-token window before it is sent, so the
+    // embedding request never 400s on length. We measure with the SAME tokenizer
+    // the truncator uses, so the assertion holds regardless of whether tiktoken
+    // (openai feature) or the char-estimate fallback is active. No network.
+    #[test]
+    fn truncate_embedding_input_clips_over_limit_text() {
+        let limit = epigraph_embeddings::config::DEFAULT_MAX_TOKENS;
+        let tokenizer = epigraph_embeddings::Tokenizer::new(limit);
+        // Build a string comfortably over the token limit (~5 chars/word).
+        let huge = "word ".repeat(limit * 2);
+        assert!(
+            tokenizer.count_tokens(&huge) > limit,
+            "fixture must exceed the token limit to exercise truncation"
+        );
+
+        let clipped = super::truncate_embedding_input(&huge);
+        assert!(
+            tokenizer.count_tokens(&clipped) <= limit,
+            "truncated input must fit the model's token window"
+        );
+        assert!(
+            clipped.len() < huge.len(),
+            "over-limit input must actually be shortened"
+        );
+    }
+
+    // Short inputs (the common case) must pass through byte-for-byte: truncation
+    // must not silently alter content that already fits.
+    #[test]
+    fn truncate_embedding_input_passes_through_short_text() {
+        let text = "The Earth orbits the Sun.";
+        assert_eq!(super::truncate_embedding_input(text), text);
     }
 }

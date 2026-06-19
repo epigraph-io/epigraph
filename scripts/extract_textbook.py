@@ -7,7 +7,7 @@ parse_module, _extract_content_blocks, _extract_text, _extract_terms,
 _parse_table_rows. The V2 LLM stage (llm_complete / filter_chapter_claims /
 extract_relationships, including the litellm `anthropic` provider branch) is
 DELIBERATELY NOT PORTED: it is superseded by the extract-claims skill
-(hierarchical compound->atoms decomposition), and the litellm/Anthropic-SDK path
+(hierarchical verbatim-text->atoms decomposition), and the litellm/Anthropic-SDK path
 violates the prepaid-OAuth claude-CLI invariant (feedback_claude_cli_oauth).
 Structure recovery needs no LLM.
 
@@ -42,7 +42,6 @@ from lib.document_extraction import (  # noqa: E402
     DocumentExtractionOut,
     ParagraphOut,
     SectionOut,
-    first_sentence,
 )
 
 NS = {
@@ -283,32 +282,29 @@ def _module_to_section(module: Module, chapter: Chapter, book_title: str) -> Sec
             if len(text) < 80 or _is_transitional(text):
                 continue
             paragraphs.append(ParagraphOut(
-                compound=first_sentence(text), supporting_text=text,
-                confidence=0.85, methodology="textbook_assertion",
+                text=text, confidence=0.85, methodology="textbook_assertion",
             ))
         elif block["type"] == "definition":
             stmt = f"{block['term']} is defined as: {block['meaning']}"
             paragraphs.append(ParagraphOut(
-                compound=first_sentence(stmt), supporting_text=stmt,
-                confidence=0.90, methodology="textbook_assertion",
+                text=stmt, confidence=0.90, methodology="textbook_assertion",
             ))
         elif block["type"] == "table" and block.get("caption"):
+            # Fold caption + row text so `text` is non-empty even when no rows
+            # parsed (Rust `Paragraph.text` is required + the guard rejects empty).
+            rows = block.get("text", "")
+            table_text = f"Table: {block['caption']}" + (f" — {rows}" if rows else "")
             paragraphs.append(ParagraphOut(
-                compound=first_sentence(f"Table: {block['caption']}"),
-                supporting_text=block.get("text", ""),
-                confidence=0.80, methodology="textbook_assertion",
+                text=table_text, confidence=0.80, methodology="textbook_assertion",
             ))
     if not paragraphs:
         return None
-    # Derive the L1 summary from the section TITLE, not the first paragraph's
-    # supporting_text. first_sentence(paragraphs[0].supporting_text) is verbatim
-    # paragraphs[0].compound; since compound_claim_id hashes content with no
-    # level in the material, that identical string collides the section (L1) and
-    # its first paragraph (L2) onto the SAME UUID — a decomposes_to self-loop and
-    # a duplicate-id insert (backlog b5518801). A title-derived summary is
-    # hash-distinct from every child compound.
-    return SectionOut(title=sect_title, summary=f"Section: {sect_title}",
-                      paragraphs=paragraphs)
+    # Tier 2 (§2 of the verbatim-spine spec): each paragraph carries its FULL
+    # faithful text and the section carries no summary. Task 7's path-seeded claim
+    # ids (the section path is folded into the UUID seed) make L1 sections and
+    # their L2 paragraphs hash-distinct, so the old summary collision trick
+    # (backlog b5518801) is no longer needed.
+    return SectionOut(title=sect_title, paragraphs=paragraphs)
 
 
 def book_to_document_extraction(repo_path: Path, book_info: dict, max_modules: int = 0) -> DocumentExtractionOut:
@@ -335,7 +331,7 @@ def book_to_document_extraction(repo_path: Path, book_info: dict, max_modules: i
         doi=f"openstax:{book.slug}",
         authors=[Author(name="OpenStax", affiliations=["Rice University"], roles=["publisher"])],
         journal="OpenStax Textbook",
-        thesis=first_sentence(book.title) if book.title else None,
+        thesis=book.title if book.title else None,
         thesis_derivation="TopDown",
         sections=sections_out,
         metadata={
