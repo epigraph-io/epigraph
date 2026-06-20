@@ -3518,8 +3518,7 @@ mod label_tests {
         let too_many: Vec<Uuid> = (0..=ClaimRepository::MAX_PAIRWISE_IDS)
             .map(|_| Uuid::new_v4())
             .collect();
-        let result =
-            ClaimRepository::pairwise_cosine_distance(&pool, &too_many, 0.5).await;
+        let result = ClaimRepository::pairwise_cosine_distance(&pool, &too_many, 0.5).await;
         assert!(
             result.is_err(),
             "should return Err when claim_ids exceeds MAX_PAIRWISE_IDS"

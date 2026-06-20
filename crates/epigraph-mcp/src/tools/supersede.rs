@@ -20,12 +20,7 @@ pub async fn supersede_claim(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {} not found", old)))?;
-    crate::tools::claims::require_owner_or_admin(
-        server,
-        auth,
-        existing.agent_id.as_uuid(),
-    )
-    .await?;
+    crate::tools::claims::require_owner_or_admin(server, auth, existing.agent_id.as_uuid()).await?;
 
     let truth = TruthValue::clamped(params.truth_value);
     let (new_id, old_id) = ClaimRepository::supersede(
@@ -62,20 +57,12 @@ pub async fn mark_duplicate(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {} not found", dup)))?;
-    crate::tools::claims::require_owner_or_admin(
-        server,
-        auth,
-        dup_claim.agent_id.as_uuid(),
-    )
-    .await?;
+    crate::tools::claims::require_owner_or_admin(server, auth, dup_claim.agent_id.as_uuid())
+        .await?;
 
-    ClaimRepository::mark_duplicate(
-        &server.pool,
-        dup_claim_id,
-        ClaimId::from_uuid(canon),
-    )
-    .await
-    .map_err(internal_error)?;
+    ClaimRepository::mark_duplicate(&server.pool, dup_claim_id, ClaimId::from_uuid(canon))
+        .await
+        .map_err(internal_error)?;
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "duplicate_id": dup,
@@ -106,10 +93,7 @@ mod tests {
     ///
     /// We cannot spin up a pool here; tests exercise the auth-branch logic
     /// (auth = Some(_)) which never touches the pool.
-    fn check_ownership(
-        auth: &AuthContext,
-        claim_agent_id: Uuid,
-    ) -> Result<(), String> {
+    fn check_ownership(auth: &AuthContext, claim_agent_id: Uuid) -> Result<(), String> {
         if auth.has_scope("claims:admin") {
             return Ok(());
         }

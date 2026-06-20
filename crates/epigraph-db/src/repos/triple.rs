@@ -506,7 +506,10 @@ mod tests {
         let result = TripleRepository::claim_has_triples(&pool, claim_id)
             .await
             .unwrap();
-        assert!(result, "claim should have triples after batch_create_triples");
+        assert!(
+            result,
+            "claim should have triples after batch_create_triples"
+        );
     }
 
     /// An unpopulated index reports zeros across all three tables — the exact
