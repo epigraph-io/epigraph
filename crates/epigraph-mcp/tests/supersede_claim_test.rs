@@ -6,6 +6,7 @@ use common::*;
 async fn supersede_claim_marks_old_and_links_new(pool: PgPool) {
     let old = seed_claim(&pool, "v1", 0.5).await;
     let server = build_test_server(pool.clone());
+    let auth = admin_auth();
 
     let result = epigraph_mcp::tools::supersede::supersede_claim(
         &server,
@@ -15,6 +16,7 @@ async fn supersede_claim_marks_old_and_links_new(pool: PgPool) {
             truth_value: 0.7,
             reason: "newer evidence".into(),
         },
+        Some(&auth),
     )
     .await
     .unwrap();
