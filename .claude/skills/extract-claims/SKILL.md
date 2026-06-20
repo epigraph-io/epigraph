@@ -128,6 +128,24 @@ embeddings, and CDST mass functions for atoms.
 that must stage JSON on disk first, but `ingest_document_inline` is the primary,
 inline path and the one this flow uses.)
 
+#### Fire-and-forget — response is a queue acknowledgement, not confirmation
+
+`ingest_document_inline` (and `ingest_document`) return **immediately** after
+spawning a detached Tokio task; the response is:
+
+```json
+{ "status": "queued", "doi": "...", "title": "...", "note": "..." }
+```
+
+**The write may still be in flight when you receive this.** Always verify with
+`check_already_ingested` (or `query_paper`) before treating the paper as landed.
+Do not fire a second ingest call based on a timeout — the background task is
+still running. One write at a time per paper is the correct pattern.
+
+`ingest_document_spine`, by contrast, IS synchronous — it must return
+`new_paragraph_paths` before the atomization LLM call can proceed. Spine writes
+are lightweight (no atoms, no CDST) and complete within typical timeout windows.
+
 ## The DocumentExtraction JSON Schema
 
 This is the shape `structure_source` returns and `ingest_document_inline` parses.
