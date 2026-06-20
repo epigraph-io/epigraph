@@ -32,6 +32,31 @@ where
     }
 }
 
+// Defensive deserializer for object-typed parameters like `DocumentSource`.
+//
+// Some MCP clients stringify object-valued arguments (sending the JSON object
+// as a JSON-encoded string) when the schema field isn't explicitly typed as
+// `"type": "object"`. Accept both shapes so a client bug doesn't make the
+// tool uncallable.
+fn deserialize_document_source<'de, D>(
+    d: D,
+) -> Result<epigraph_ingest::schema::DocumentSource, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Object(epigraph_ingest::schema::DocumentSource),
+        Str(String),
+    }
+
+    match Either::deserialize(d)? {
+        Either::Object(src) => Ok(src),
+        Either::Str(s) => serde_json::from_str(&s).map_err(serde::de::Error::custom),
+    }
+}
+
 // ── Claims ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -863,6 +888,7 @@ pub struct StructureSourceParams {
     #[schemars(
         description = "Document source metadata (title, doi/uri, source_type, authors, year, …) — same shape as DocumentExtraction.source."
     )]
+    #[serde(deserialize_with = "deserialize_document_source")]
     pub source: epigraph_ingest::schema::DocumentSource,
     #[schemars(
         description = "Format of `text`: \"markdown\" or \"plaintext\". Determines the deterministic parser."
@@ -1675,6 +1701,36 @@ mod tests {
         let r: Result<MemorizeParams, _> =
             serde_json::from_str(r#"{"content":"x","tags":"not-json"}"#);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn structure_source_params_accepts_stringified_source() {
+        // Simulate a client that double-encodes the `source` object as a JSON string.
+        let raw = serde_json::json!({
+            "text": "hello world",
+            "format": "plaintext",
+            "source": "{\"title\":\"On the Stability of DNA Origami\",\"doi\":\"10.1002/anie.201802890\",\"source_type\":\"Paper\",\"authors\":[{\"name\":\"Kielar, C.\"}],\"journal\":\"Angew. Chem.\",\"year\":2018,\"metadata\":{\"pmid\":\"29799663\"}}"
+        });
+        let params: StructureSourceParams =
+            serde_json::from_value(raw).expect("should deserialize");
+        assert_eq!(params.source.title, "On the Stability of DNA Origami");
+        assert_eq!(params.source.doi.as_deref(), Some("10.1002/anie.201802890"));
+    }
+
+    #[test]
+    fn structure_source_params_accepts_object_source() {
+        // Normal path: `source` arrives as a proper JSON object.
+        let raw = serde_json::json!({
+            "text": "hello world",
+            "format": "plaintext",
+            "source": {
+                "title": "On the Stability of DNA Origami",
+                "doi": "10.1002/anie.201802890"
+            }
+        });
+        let params: StructureSourceParams =
+            serde_json::from_value(raw).expect("should deserialize");
+        assert_eq!(params.source.title, "On the Stability of DNA Origami");
     }
 }
 
