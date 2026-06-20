@@ -162,7 +162,26 @@ pub async fn ingest_document(
     let extraction: DocumentExtraction =
         serde_json::from_str(&data).map_err(|e| invalid_params(format!("invalid JSON: {e}")))?;
 
-    do_ingest_document(server, &extraction).await
+    let doi = resolve_doi(&extraction);
+    let title = extraction.source.title.clone();
+    let bg = EpiGraphMcpFull::new_shared(
+        server.pool.clone(),
+        Arc::clone(&server.signer),
+        Arc::clone(&server.embedder),
+        server.read_only,
+    );
+    let doi_log = doi.clone();
+    tokio::spawn(async move {
+        if let Err(e) = do_ingest_document(&bg, &extraction).await {
+            tracing::warn!(doi = doi_log, "background ingest_document failed: {e:?}");
+        }
+    });
+    success_json(&serde_json::json!({
+        "status": "queued",
+        "doi": doi,
+        "title": title,
+        "note": "DB writes are running as a detached background task. Call check_already_ingested to confirm completion before assuming the write landed."
+    }))
 }
 
 /// Inline (typed-param) counterpart to [`ingest_document`]. Takes a
@@ -174,7 +193,30 @@ pub async fn ingest_document_inline(
     server: &EpiGraphMcpFull,
     params: IngestDocumentInlineParams,
 ) -> Result<CallToolResult, McpError> {
-    do_ingest_document(server, &params.extraction).await
+    let extraction = params.extraction;
+    let doi = resolve_doi(&extraction);
+    let title = extraction.source.title.clone();
+    let bg = EpiGraphMcpFull::new_shared(
+        server.pool.clone(),
+        Arc::clone(&server.signer),
+        Arc::clone(&server.embedder),
+        server.read_only,
+    );
+    let doi_log = doi.clone();
+    tokio::spawn(async move {
+        if let Err(e) = do_ingest_document(&bg, &extraction).await {
+            tracing::warn!(
+                doi = doi_log,
+                "background ingest_document_inline failed: {e:?}"
+            );
+        }
+    });
+    success_json(&serde_json::json!({
+        "status": "queued",
+        "doi": doi,
+        "title": title,
+        "note": "DB writes are running as a detached background task. Call check_already_ingested to confirm completion before assuming the write landed."
+    }))
 }
 
 /// Pool-only gate check: returns `Some(paper_id)` iff a paper with `doi`
