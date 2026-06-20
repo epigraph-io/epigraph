@@ -631,12 +631,13 @@ async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
 
     let json: serde_json::Value =
         serde_json::from_str(&result_text(&result)).expect("response JSON");
-    assert_eq!(json["already_ingested"], serde_json::json!(false));
     assert_eq!(
-        json["claims_ingested"].as_u64().unwrap(),
-        5,
-        "typed-inline path lands the same thesis + section + paragraph + 2 atoms as the file path"
+        json["status"], "queued",
+        "fire-and-forget ingest_document_inline returns a queue acknowledgement immediately"
     );
+
+    // Background task writes DB asynchronously; give it time to complete before asserting state.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     // Atoms landed as their own claim rows — the atomic resolution.
     let atom_count: (i64,) = sqlx::query_as(
