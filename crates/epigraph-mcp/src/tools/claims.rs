@@ -726,6 +726,7 @@ pub async fn patch_claim(
 pub async fn query_undecomposed_claims(
     server: &EpiGraphMcpFull,
     params: crate::types::QueryUndecomposedClaimsParams,
+    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 1000);
     let offset = params.offset.unwrap_or(0).max(0);
@@ -734,18 +735,38 @@ pub async fn query_undecomposed_claims(
         .await
         .map_err(internal_error)?;
 
+    // Apply partition-aware content redaction so private/community-partitioned
+    // claims are not exposed to requesters who don't own them (parity with
+    // query_claims and get_claim — security finding: this path previously
+    // bypassed the check_content_access / batch_check_content_access layer).
+    let ids: Vec<Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
+    let access_map: std::collections::HashMap<Uuid, ContentAccess> =
+        batch_check_content_access(&server.pool, &ids, requester)
+            .await
+            .into_iter()
+            .collect();
+
     let results: Vec<ClaimResponse> = claims
         .into_iter()
-        .map(|c| ClaimResponse {
-            id: c.id.as_uuid().to_string(),
-            content: c.content.clone(),
-            truth_value: c.truth_value.value(),
-            agent_id: c.agent_id.as_uuid().to_string(),
-            content_hash: ContentHasher::to_hex(&c.content_hash),
-            created_at: c.created_at.to_rfc3339(),
-            labels: Vec::new(),
-            is_current: true,
-            supersedes: None,
+        .map(|c| {
+            let id = c.id.as_uuid();
+            let access = access_map
+                .get(&id)
+                .copied()
+                .unwrap_or(ContentAccess::Redacted);
+            let (content, content_hash) =
+                crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
+            ClaimResponse {
+                id: id.to_string(),
+                content,
+                truth_value: c.truth_value.value(),
+                agent_id: c.agent_id.as_uuid().to_string(),
+                content_hash,
+                created_at: c.created_at.to_rfc3339(),
+                labels: Vec::new(),
+                is_current: true,
+                supersedes: None,
+            }
         })
         .collect();
 

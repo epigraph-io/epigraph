@@ -4,10 +4,26 @@
 
 #![allow(dead_code)]
 
+use epigraph_auth::{AuthContext, ClientType};
 use epigraph_core::{AgentId, Claim, TruthValue};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+/// An admin `AuthContext` for tests that exercise ownership-gated tools
+/// (`supersede_claim` / `mark_duplicate`). The `claims:admin` scope satisfies
+/// `require_owner_or_admin` regardless of the seeded claim's author, so the
+/// test keeps asserting the supersede/duplicate *behavior* rather than auth.
+pub fn admin_auth() -> AuthContext {
+    AuthContext {
+        client_id: Uuid::new_v4(),
+        agent_id: None,
+        owner_id: None,
+        client_type: ClientType::Service,
+        scopes: vec!["claims:admin".to_string()],
+        jti: Uuid::new_v4(),
+    }
+}
 
 pub async fn try_test_pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
