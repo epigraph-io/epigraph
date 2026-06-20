@@ -909,10 +909,40 @@ pub struct IngestDocumentParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IngestDocumentInlineParams {
     #[schemars(
-        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, and an optional top-level source_text. When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms."
+        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, and an optional top-level source_text. When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent on paragraph and atom content hashes (node-level): re-ingesting an abstract then the full paper is safe — existing paragraph/atom nodes dedup and only new content is written."
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
+}
+
+/// Parameters for the `ingest_document_spine` MCP tool. Phase 1 of the
+/// two-phase ingest flow: writes thesis + sections + paragraphs (levels 0–2)
+/// and returns which paragraph paths are NEW so the caller can atomize only
+/// those before calling `ingest_document_inline` with atoms.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IngestDocumentSpineParams {
+    #[schemars(
+        description = "DocumentExtraction whose `atoms` fields are EMPTY (e.g. the output of `structure_source`). Writes thesis + sections + paragraphs into the graph with content-hash dedup; atom fields are ignored. Returns `new_paragraph_paths` — the subset of paragraph paths that are NEW to this ingest. Atomize only those paragraphs, fill their atoms, then call `ingest_document_inline` with the full extraction. Two-phase ingest: spine first → atomize new paragraphs only → inline with atoms."
+    )]
+    #[serde(deserialize_with = "deserialize_document_extraction")]
+    pub extraction: epigraph_ingest::schema::DocumentExtraction,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestDocumentSpineResponse {
+    pub paper_id: String,
+    pub paper_title: String,
+    pub doi: String,
+    pub authors: Vec<AuthorResponse>,
+    pub paragraphs_new: usize,
+    pub paragraphs_deduped: usize,
+    pub paragraphs_embedded: usize,
+    /// Paragraph paths (e.g. `"sections[0].paragraphs[1]"`) that were written
+    /// as new in this ingest. Atomize exactly these paragraphs, then call
+    /// `ingest_document_inline` with atoms filled for those paths only.
+    pub new_paragraph_paths: Vec<String>,
+    /// `true` when every paragraph in the extraction already existed; nothing new was written.
+    pub already_ingested: bool,
 }
 
 /// Parameters for the `structure_source` MCP tool. Deterministically slices raw

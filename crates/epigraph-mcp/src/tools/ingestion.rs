@@ -1,6 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rmcp::model::*;
@@ -231,6 +231,18 @@ pub async fn check_already_ingested(
     })
 }
 
+/// Phase 1 of the two-phase ingest flow. Writes thesis + sections +
+/// paragraphs (levels 0–2) and returns which paragraph paths are NEW so the
+/// caller atomizes only those before submitting atoms via
+/// `ingest_document_inline`. Skips atoms entirely; the full content-hash dedup
+/// applies at paragraph level so re-ingesting an abstract is safe.
+pub async fn ingest_document_spine(
+    server: &EpiGraphMcpFull,
+    params: IngestDocumentSpineParams,
+) -> Result<CallToolResult, McpError> {
+    do_ingest_document_spine(server, &params.extraction).await
+}
+
 /// Core ingestion logic factored out so integration tests can drive a parsed
 /// `DocumentExtraction` without round-tripping through the file-path validation
 /// in `ingest_document`.
@@ -256,32 +268,11 @@ pub async fn do_ingest_document(
     let doi = resolve_doi(extraction);
     let pipeline_version = effective_pipeline_version(extraction);
 
-    // ── 1. Version gate: skip if already processed by this pipeline ──
-    if let Some(prior) = PaperRepository::find_by_doi(pool, &doi)
-        .await
-        .map_err(internal_error)?
-    {
-        if PaperRepository::has_processed_by_edge(pool, prior.id, &pipeline_version)
-            .await
-            .map_err(internal_error)?
-        {
-            return success_json(&IngestDocumentResponse {
-                paper_id: prior.id.to_string(),
-                paper_title,
-                doi,
-                authors: vec![],
-                claims_ingested: 0,
-                claims_embedded: 0,
-                claims_skipped_dedup: 0,
-                relationships_created: 0,
-                claims_ds_wired: None,
-                ds_frame_id: None,
-                already_ingested: true,
-            });
-        }
-    }
-
-    // ── 2. Get-or-create paper node ──
+    // ── 1. Get-or-create paper node ──
+    // (Pipeline-version gate removed: node-level content-hash dedup handles
+    //  idempotency so re-ingesting an abstract then the full paper is safe.
+    //  Use ingest_document_spine → ingest_document_inline for the two-phase
+    //  flow that avoids redundant LLM atomization.)
     let paper_id = PaperRepository::get_or_create(
         pool,
         &doi,
@@ -572,17 +563,10 @@ pub async fn do_ingest_document(
         }
     };
 
-    // ── 7. Mark paper as processed by this pipeline (version gate for re-runs) ──
-    // Edge target is the server's agent — paper -processed_by-> agent
-    // models "this paper was processed by this agent at this pipeline
-    // version". (Self-loops on paper are blocked by the edges_no_self_loop
-    // check constraint, so we cannot point the edge back at the paper.)
-    // Direct create (not create_if_not_exists): the gate above guarantees no
-    // edge with this exact `pipeline` value exists yet for this paper. Using
-    // create_if_not_exists here would dedupe on (paper, agent, "processed_by")
-    // alone and silently retain a prior chapter's pipeline marker, breaking
-    // the per-chapter gate on re-ingest.
-    let _edge_id = EdgeRepository::create(
+    // ── 7. Mark paper as processed by this pipeline ──
+    // Idempotent: first ingest stamps the edge; re-runs (full paper after
+    // abstract, or ingest_document_spine + ingest_document_inline) are safe.
+    let (_row, _was_created) = EdgeRepository::create_if_not_exists(
         pool,
         paper_id,
         "paper",
@@ -626,7 +610,7 @@ pub async fn do_ingest_document(
         relationships_created,
         claims_ds_wired,
         ds_frame_id,
-        already_ingested: false,
+        already_ingested: claim_ids.len() == dedup_count && dedup_count > 0,
     })
 }
 
@@ -694,6 +678,339 @@ const fn level_label(level: u8) -> &'static str {
         3 => "atom",
         _ => "unknown",
     }
+}
+
+/// Core spine ingest: thesis + sections + paragraphs (levels 0–2) only.
+/// Atoms in the extraction are ignored; the agent atomizes only the NEW
+/// paragraph paths returned here, then submits via `ingest_document_inline`.
+///
+/// Ordering guarantee: the builder iterates sections then paragraphs in
+/// extraction order, so `new_paragraph_paths` is in document order.
+#[allow(clippy::too_many_lines)]
+pub async fn do_ingest_document_spine(
+    server: &EpiGraphMcpFull,
+    extraction: &DocumentExtraction,
+) -> Result<CallToolResult, McpError> {
+    epigraph_ingest::document::structure::verify_extraction_verbatim(extraction)
+        .map_err(|e| invalid_params(format!("verbatim guard failed: {e}")))?;
+
+    let plan = build_ingest_plan(extraction);
+    let pool = &server.pool;
+    let agent_id = server.agent_id().await?;
+    let agent_id_typed = AgentId::from_uuid(agent_id);
+    let pub_key = server.signer.public_key();
+
+    let paper_title = extraction.source.title.clone();
+    let doi = resolve_doi(extraction);
+    let pipeline_version = effective_pipeline_version(extraction);
+
+    // Atom planned IDs — skip these claims and any edges referencing them.
+    let atom_planned_ids: HashSet<Uuid> = plan
+        .claims
+        .iter()
+        .filter(|c| c.level == 3)
+        .map(|c| c.id)
+        .collect();
+
+    // Map para planned ID → document path e.g. "sections[0].paragraphs[1]".
+    // Builder iterates sections/paragraphs in extraction order so zipping is safe.
+    let para_id_to_path: HashMap<Uuid, String> = {
+        let mut map = HashMap::new();
+        let mut level2_iter = plan.claims.iter().filter(|c| c.level == 2);
+        for (si, section) in extraction.sections.iter().enumerate() {
+            for (pi, _para) in section.paragraphs.iter().enumerate() {
+                if let Some(pc) = level2_iter.next() {
+                    map.insert(pc.id, format!("sections[{si}].paragraphs[{pi}]"));
+                }
+            }
+        }
+        map
+    };
+
+    // ── 1. Get-or-create paper node ──
+    let paper_id = PaperRepository::get_or_create(
+        pool,
+        &doi,
+        Some(&paper_title),
+        extraction.source.journal.as_deref(),
+    )
+    .await
+    .map_err(internal_error)?;
+
+    // ── 2. Ensure author agents + authored edges ──
+    let mut author_responses = Vec::new();
+    let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
+    for (idx, author) in extraction.source.authors.iter().enumerate() {
+        if author.name.is_empty() {
+            continue;
+        }
+        let (_did, pub_key_bytes) =
+            epigraph_crypto::did_key::did_key_for_author(None, &author.name);
+        let agent_uuid = if let Some(existing) =
+            AgentRepository::get_by_public_key(pool, &pub_key_bytes)
+                .await
+                .map_err(internal_error)?
+        {
+            existing.id.into()
+        } else {
+            let author_agent =
+                epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
+            AgentRepository::create(pool, &author_agent)
+                .await
+                .map_err(internal_error)?
+                .id
+                .into()
+        };
+        let (_row, _) = EdgeRepository::create_if_not_exists(
+            pool,
+            agent_uuid,
+            "agent",
+            paper_id,
+            "paper",
+            "authored",
+            Some(serde_json::json!({
+                "position": idx,
+                "role": author.roles.first().map_or("author", String::as_str),
+                "affiliations": author.affiliations,
+            })),
+            None,
+            None,
+        )
+        .await
+        .map_err(internal_error)?;
+        author_agent_map.insert(idx, agent_uuid);
+        author_responses.push(AuthorResponse {
+            agent_id: agent_uuid.to_string(),
+            name: author.name.clone(),
+        });
+    }
+
+    // ── 3. Walk claims: levels 0–2 only ──
+    let source_url = if doi.starts_with("10.") {
+        format!("https://doi.org/{doi}")
+    } else {
+        format!("doi:{doi}")
+    };
+
+    let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
+    let mut embed_queue: Vec<(Uuid, String)> = Vec::new();
+    let mut para_new_count = 0_usize;
+    let mut para_dedup_count = 0_usize;
+    let mut new_paragraph_paths: Vec<String> = Vec::new();
+
+    for planned in &plan.claims {
+        if planned.level == 3 {
+            continue;
+        }
+
+        let confidence = planned.confidence.clamp(0.0, 1.0);
+        let methodology = methodology_from_planned(planned);
+        let weight = methodology.weight_modifier();
+        let raw_truth = (confidence * weight).clamp(0.01, 0.99);
+
+        let mut claim = Claim::new(
+            planned.content.clone(),
+            agent_id_typed,
+            pub_key,
+            TruthValue::clamped(raw_truth),
+        );
+        claim.id = ClaimId::from_uuid(planned.id);
+        claim.content_hash = ContentHasher::hash(planned.content.as_bytes());
+        claim.signature = Some(server.signer.sign(&claim.content_hash));
+
+        let persisted = ClaimRepository::create(pool, &claim)
+            .await
+            .map_err(internal_error)?;
+        let persisted_id: Uuid = persisted.id.into();
+        let already_had_trace = persisted.trace_id.is_some();
+
+        if persisted_id != planned.id || already_had_trace {
+            let (_row, _) = EdgeRepository::create_if_not_exists(
+                pool,
+                paper_id,
+                "paper",
+                persisted_id,
+                "claim",
+                "asserts",
+                Some(planned.properties.clone()),
+                None,
+                None,
+            )
+            .await
+            .map_err(internal_error)?;
+            id_map.insert(planned.id, persisted_id);
+            if planned.level == 2 {
+                para_dedup_count += 1;
+            }
+            continue;
+        }
+
+        ClaimRepository::set_properties(
+            pool,
+            ClaimId::from_uuid(persisted_id),
+            planned.properties.clone(),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        let evidence_text = planned
+            .supporting_text
+            .as_deref()
+            .unwrap_or(&planned.content);
+        let formatted_evidence =
+            format!("Source: {paper_title} (DOI: {doi}). Passage: '{evidence_text}'");
+        let evidence_hash = ContentHasher::hash(formatted_evidence.as_bytes());
+        let mut evidence = Evidence::new(
+            agent_id_typed,
+            pub_key,
+            evidence_hash,
+            EvidenceType::Literature {
+                doi: doi.clone(),
+                extraction_target: format!("level_{}", planned.level),
+                page_range: None,
+            },
+            Some(formatted_evidence),
+            claim.id,
+        );
+        evidence.signature = Some(server.signer.sign(&evidence_hash));
+
+        let trace = ReasoningTrace::new(
+            agent_id_typed,
+            pub_key,
+            methodology,
+            vec![TraceInput::Evidence { id: evidence.id }],
+            confidence,
+            format!(
+                "Extracted from '{paper_title}' (DOI: {doi}); level {} ({})",
+                planned.level,
+                level_label(planned.level),
+            ),
+        );
+
+        ReasoningTraceRepository::create(pool, &trace, claim.id)
+            .await
+            .map_err(internal_error)?;
+        EvidenceRepository::create(pool, &evidence)
+            .await
+            .map_err(internal_error)?;
+        ClaimRepository::update_trace_id(pool, claim.id, trace.id)
+            .await
+            .map_err(internal_error)?;
+
+        let (_row, _) = EdgeRepository::create_if_not_exists(
+            pool,
+            paper_id,
+            "paper",
+            persisted_id,
+            "claim",
+            "asserts",
+            Some(planned.properties.clone()),
+            None,
+            None,
+        )
+        .await
+        .map_err(internal_error)?;
+
+        embed_queue.push((persisted_id, planned.content.clone()));
+
+        if planned.level == 2 {
+            para_new_count += 1;
+            if let Some(path) = para_id_to_path.get(&planned.id) {
+                new_paragraph_paths.push(path.clone());
+            }
+        }
+
+        id_map.insert(planned.id, persisted_id);
+        let _ = &source_url;
+    }
+
+    // ── 4. Plan edges (skip any edge to/from atom planned IDs) ──
+    for edge in &plan.edges {
+        if atom_planned_ids.contains(&edge.target_id)
+            || atom_planned_ids.contains(&edge.source_id)
+        {
+            continue;
+        }
+
+        let (src, src_type) = if edge.source_type == "author_placeholder" {
+            let idx = edge.properties["author_index"].as_u64().unwrap_or(0) as usize;
+            let Some(&agent_uuid) = author_agent_map.get(&idx) else {
+                continue;
+            };
+            (agent_uuid, "agent".to_string())
+        } else {
+            let mapped = id_map
+                .get(&edge.source_id)
+                .copied()
+                .unwrap_or(edge.source_id);
+            (mapped, edge.source_type.clone())
+        };
+        let tgt = id_map
+            .get(&edge.target_id)
+            .copied()
+            .unwrap_or(edge.target_id);
+
+        if src == tgt && src_type == edge.target_type {
+            continue;
+        }
+
+        let (_row, _) = EdgeRepository::create_if_not_exists(
+            pool,
+            src,
+            &src_type,
+            tgt,
+            &edge.target_type,
+            &edge.relationship,
+            Some(edge.properties.clone()),
+            None,
+            None,
+        )
+        .await
+        .map_err(internal_error)?;
+    }
+
+    // ── 5. processed_by edge (idempotent; first spine call stamps the pipeline) ──
+    let (_row, _) = EdgeRepository::create_if_not_exists(
+        pool,
+        paper_id,
+        "paper",
+        agent_id,
+        "agent",
+        "processed_by",
+        Some(serde_json::json!({
+            "pipeline": pipeline_version,
+            "tool": "ingest_document_spine",
+        })),
+        None,
+        None,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    // ── 6. Detach embeddings ──
+    let queued = embed_queue.len();
+    if !embed_queue.is_empty() {
+        let embedder = Arc::clone(&server.embedder);
+        tokio::spawn(async move {
+            for (id, content) in embed_queue {
+                if !embedder.embed_and_store(id, &content).await {
+                    tracing::warn!("background embedding failed for claim {id}");
+                }
+            }
+        });
+    }
+
+    success_json(&IngestDocumentSpineResponse {
+        paper_id: paper_id.to_string(),
+        paper_title,
+        doi,
+        authors: author_responses,
+        paragraphs_new: para_new_count,
+        paragraphs_deduped: para_dedup_count,
+        paragraphs_embedded: queued,
+        new_paragraph_paths,
+        already_ingested: para_new_count == 0 && para_dedup_count > 0,
+    })
 }
 
 #[cfg(test)]
