@@ -93,6 +93,7 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `memorize`** — `crates/epigraph-mcp/src/tools/memory.rs:103`
 - **MCP `batch_submit_claims`** — delegates to `submit_claim`
 - **MCP `ingest_document`** — `crates/epigraph-mcp/src/tools/ingestion.rs:321`
+- **MCP `ingest_document_spine`** — `do_ingest_document_spine` in the same file; phase-1 of the two-phase flow, embeds spine claims (thesis + sections + paragraphs) post-write
 - **MCP `workflow_ingest`** — embeds executor output; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
 - **MCP `store_workflow`** — embeds executor output via `execute_workflow_ingest_with_inserted`; `crates/epigraph-mcp/src/tools/workflows.rs::store_workflow`
 - **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some`

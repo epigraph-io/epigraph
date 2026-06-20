@@ -532,7 +532,7 @@ pub async fn do_ingest_document(
         )
         .await
         .map_err(internal_error)?;
-        relationships_created += 1;
+        relationships_created += usize::from(was_created);
 
         // Epistemic-edge factor auto-wire (best-effort; non-epistemic and
         // non-claim edges are filtered inside the helper).
