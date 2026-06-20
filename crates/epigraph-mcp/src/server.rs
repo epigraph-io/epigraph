@@ -408,7 +408,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Check whether a paper with the given DOI has already been ingested at the specified pipeline version. Returns {already_ingested, paper_id?, doi, pipeline_version}. Use as a pre-flight before invoking expensive extract-claims work — `ingest_document` runs the same gate internally, but only after the LLM call. Read-only."
+        description = "Check whether a paper has been ingested (has a processed_by edge). Returns {already_ingested, paper_id?, doi, pipeline_version}. Useful as a quick pre-flight read before calling ingest_document_spine. Note: with node-level dedup, already_ingested=true means the spine was previously run — it does NOT mean all atoms are present. Use ingest_document_spine to discover which paragraphs are new. Read-only."
     )]
     async fn check_already_ingested(
         &self,
@@ -418,7 +418,18 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent for re-runs at the same pipeline version."
+        description = "Phase 1 of the two-phase ingest flow. Ingests a DocumentExtraction with EMPTY atoms (e.g. output of structure_source): writes thesis + sections + paragraphs into the graph with content-hash dedup, ignores atom fields. Returns new_paragraph_paths — the paths (e.g. 'sections[0].paragraphs[1]') of paragraphs that are NEW to this ingest. Atomize only those paragraphs (LLM cost saved on already-ingested paragraphs), then call ingest_document_inline with atoms for those paths. Idempotent on paragraph content hash: re-running spine on a paper whose abstract was already ingested returns the abstract paragraphs in paragraphs_deduped and the new body paragraphs in new_paragraph_paths."
+    )]
+    async fn ingest_document_spine(
+        &self,
+        Parameters(params): Parameters<IngestDocumentSpineParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::ingestion::ingest_document_spine(self, params).await
+    }
+
+    #[tool(
+        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent on paragraph and atom content hashes (node-level): re-ingesting a full paper after its abstract was ingested is safe — existing nodes dedup and only new content is written. For the two-phase flow that saves LLM atomization cost, use ingest_document_spine first."
     )]
     async fn ingest_document_inline(
         &self,

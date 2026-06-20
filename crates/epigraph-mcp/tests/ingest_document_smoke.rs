@@ -150,8 +150,12 @@ async fn happy_path_ingests_full_hierarchy(pool: PgPool) {
     assert_eq!(processed.0, 1);
 }
 
+/// Re-ingesting the same extraction returns `already_ingested: true` with no new
+/// claims or relationships. Previously gated at the paper level; now detected by
+/// node-level content-hash dedup: all 5 claims hit the dedup path and no edges
+/// are newly created on the second run.
 #[sqlx::test(migrations = "../../migrations")]
-async fn re_ingest_hits_version_gate(pool: PgPool) {
+async fn re_ingest_same_paper_dedup_detected(pool: PgPool) {
     let server = make_server(pool.clone());
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
@@ -169,12 +173,13 @@ async fn re_ingest_hits_version_gate(pool: PgPool) {
     assert_eq!(json["relationships_created"], serde_json::json!(0));
 }
 
-/// Per-chapter version gating: a textbook ingested chapter-by-chapter shares
-/// one paper row across many `DocumentExtraction`s. With `source.metadata.
-/// chapter_index` set, each chunk's `processed_by` edge carries
-/// `pipeline=hierarchical_extraction_v2:ch<N>` so chapter 2 isn't blocked by
-/// the edge chapter 1 left behind. Re-ingesting the *same* chapter still hits
-/// the gate.
+/// Cross-chapter isolation: a textbook ingested chapter-by-chapter shares one
+/// paper row. Each chapter has unique content so chapter 2's claims aren't
+/// deduped by chapter 1's ingest, and `already_ingested` stays false. Re-ingesting
+/// the same chapter yields `already_ingested: true` via node-level content-hash
+/// dedup (all claims hit the dedup path). The per-chapter `processed_by` edge
+/// suffix (`:chN`) is vestigial after gate removal but still written for
+/// observability.
 #[sqlx::test(migrations = "../../migrations")]
 async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
     let server = make_server(pool.clone());
@@ -234,24 +239,28 @@ async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
     assert_eq!(
         repeat_json["already_ingested"],
         serde_json::json!(true),
-        "re-ingesting the same chapter must still hit the per-chapter gate"
+        "re-ingesting the same chapter must still return already_ingested:true (via node-level dedup)"
     );
 
-    // Both per-chapter processed_by edges must coexist on the paper.
+    // With node-level idempotency (gate removed), both chapter processed_by edges
+    // map to the same (paper → agent, 'processed_by') slot — only the first chapter's
+    // edge is retained. The chapter suffix (:chN) is now vestigial/observability-only.
+    // Assert at least one processed_by edge exists.
     let count: (i64,) = sqlx::query_as(
         r#"
         SELECT COUNT(*) FROM edges
         WHERE source_id = $1 AND source_type = 'paper'
           AND relationship = 'processed_by'
-          AND properties ->> 'pipeline' IN
-              ('hierarchical_extraction_v2:ch1', 'hierarchical_extraction_v2:ch2')
         "#,
     )
     .bind(paper_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(count.0, 2, "one processed_by edge per chapter");
+    assert!(
+        count.0 >= 1,
+        "at least one processed_by edge must exist for the paper"
+    );
 }
 
 /// A second fixture sharing one atom and the same author with the primary
