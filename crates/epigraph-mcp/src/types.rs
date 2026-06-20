@@ -57,6 +57,44 @@ where
     }
 }
 
+fn deserialize_document_extraction<'de, D>(
+    d: D,
+) -> Result<epigraph_ingest::schema::DocumentExtraction, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Object(Box<epigraph_ingest::schema::DocumentExtraction>),
+        Str(String),
+    }
+
+    match Either::deserialize(d)? {
+        Either::Object(e) => Ok(*e),
+        Either::Str(s) => serde_json::from_str(&s).map_err(serde::de::Error::custom),
+    }
+}
+
+fn deserialize_workflow_extraction<'de, D>(
+    d: D,
+) -> Result<epigraph_ingest::workflow::WorkflowExtraction, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Object(Box<epigraph_ingest::workflow::WorkflowExtraction>),
+        Str(String),
+    }
+
+    match Either::deserialize(d)? {
+        Either::Object(e) => Ok(*e),
+        Either::Str(s) => serde_json::from_str(&s).map_err(serde::de::Error::custom),
+    }
+}
+
 // ── Claims ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -503,6 +541,7 @@ pub struct IngestWorkflowParams {
     #[schemars(
         description = "Hierarchical workflow extraction: source (canonical_name, goal, generation, authors, tags, metadata), thesis, thesis_derivation, phases (each with title/summary/steps where each step has compound, rationale, operations, generality, confidence), and relationships."
     )]
+    #[serde(deserialize_with = "deserialize_workflow_extraction")]
     pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
 }
 
@@ -516,6 +555,7 @@ pub struct ImproveWorkflowHierarchyParams {
     #[schemars(
         description = "Hierarchical extraction for the new variant. The tool overwrites `extraction.source.canonical_name`, `generation`, and `parent_canonical_name`: canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param (same-lineage improvement only — cross-lineage variants are not supported by this tool), and generation is set to the parent's current max + 1. Caller-supplied values for those three fields are ignored."
     )]
+    #[serde(deserialize_with = "deserialize_workflow_extraction")]
     pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
 }
 
@@ -871,6 +911,7 @@ pub struct IngestDocumentInlineParams {
     #[schemars(
         description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, and an optional top-level source_text. When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms."
     )]
+    #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
 }
 
@@ -1731,6 +1772,42 @@ mod tests {
         let params: StructureSourceParams =
             serde_json::from_value(raw).expect("should deserialize");
         assert_eq!(params.source.title, "On the Stability of DNA Origami");
+    }
+
+    #[test]
+    fn ingest_document_inline_accepts_stringified_extraction() {
+        let inner = serde_json::json!({
+            "source": {"title": "Kielar 2018", "doi": "10.1002/anie.201802890"},
+            "sections": []
+        });
+        let raw = serde_json::json!({ "extraction": inner.to_string() });
+        let params: IngestDocumentInlineParams =
+            serde_json::from_value(raw).expect("should deserialize");
+        assert_eq!(params.extraction.source.title, "Kielar 2018");
+    }
+
+    #[test]
+    fn ingest_document_inline_accepts_object_extraction() {
+        let raw = serde_json::json!({
+            "extraction": {
+                "source": {"title": "Kielar 2018", "doi": "10.1002/anie.201802890"},
+                "sections": []
+            }
+        });
+        let params: IngestDocumentInlineParams =
+            serde_json::from_value(raw).expect("should deserialize");
+        assert_eq!(params.extraction.source.title, "Kielar 2018");
+    }
+
+    #[test]
+    fn ingest_workflow_accepts_stringified_extraction() {
+        let inner = serde_json::json!({
+            "source": {"canonical_name": "test-workflow", "goal": "do stuff"},
+            "phases": []
+        });
+        let raw = serde_json::json!({ "extraction": inner.to_string() });
+        let params: IngestWorkflowParams = serde_json::from_value(raw).expect("should deserialize");
+        assert_eq!(params.extraction.source.canonical_name, "test-workflow");
     }
 }
 
