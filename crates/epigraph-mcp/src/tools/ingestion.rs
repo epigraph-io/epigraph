@@ -753,8 +753,7 @@ pub async fn do_ingest_document_spine(
         {
             existing.id.into()
         } else {
-            let author_agent =
-                epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
+            let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
             AgentRepository::create(pool, &author_agent)
                 .await
                 .map_err(internal_error)?
@@ -926,8 +925,7 @@ pub async fn do_ingest_document_spine(
 
     // ── 4. Plan edges (skip any edge to/from atom planned IDs) ──
     for edge in &plan.edges {
-        if atom_planned_ids.contains(&edge.target_id)
-            || atom_planned_ids.contains(&edge.source_id)
+        if atom_planned_ids.contains(&edge.target_id) || atom_planned_ids.contains(&edge.source_id)
         {
             continue;
         }

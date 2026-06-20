@@ -257,7 +257,10 @@ async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(count.0 >= 1, "at least one processed_by edge must exist for the paper");
+    assert!(
+        count.0 >= 1,
+        "at least one processed_by edge must exist for the paper"
+    );
 }
 
 /// A second fixture sharing one atom and the same author with the primary

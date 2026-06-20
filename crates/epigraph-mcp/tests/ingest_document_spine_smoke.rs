@@ -188,8 +188,5 @@ async fn full_reingest_returns_already_ingested(pool: PgPool) {
     let paths = json["new_paragraph_paths"]
         .as_array()
         .expect("new_paragraph_paths is an array");
-    assert!(
-        paths.is_empty(),
-        "no new paragraph paths on full re-ingest"
-    );
+    assert!(paths.is_empty(), "no new paragraph paths on full re-ingest");
 }
