@@ -217,8 +217,12 @@ impl EpiGraphMcpFull {
     async fn query_undecomposed_claims(
         &self,
         Parameters(params): Parameters<crate::types::QueryUndecomposedClaimsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::claims::query_undecomposed_claims(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::claims::query_undecomposed_claims(self, params, requester).await
     }
 
     #[tool(
@@ -262,9 +266,11 @@ impl EpiGraphMcpFull {
     async fn supersede_claim(
         &self,
         Parameters(params): Parameters<crate::types::SupersedeClaimParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        crate::tools::supersede::supersede_claim(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        crate::tools::supersede::supersede_claim(self, params, auth).await
     }
 
     #[tool(
@@ -273,9 +279,11 @@ impl EpiGraphMcpFull {
     async fn mark_duplicate(
         &self,
         Parameters(params): Parameters<crate::types::MarkDuplicateParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        crate::tools::supersede::mark_duplicate(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        crate::tools::supersede::mark_duplicate(self, params, auth).await
     }
 
     #[tool(description = "Atomically add and/or remove labels on an existing claim. Idempotent.")]
@@ -418,6 +426,16 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
         tools::ingestion::ingest_document_inline(self, params).await
+    }
+
+    #[tool(
+        description = "Deterministically structure raw markdown/plaintext into a verbatim DocumentExtraction (sections + paragraphs as byte-exact source slices, source_text + spans populated, atoms EMPTY). Fill atoms per paragraph and resubmit via ingest_document_inline. Read-only / no DB writes."
+    )]
+    async fn structure_source(
+        &self,
+        Parameters(params): Parameters<StructureSourceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ingestion::structure_source(self, params).await
     }
 
     #[tool(

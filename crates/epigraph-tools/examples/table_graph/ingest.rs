@@ -6,10 +6,10 @@ use std::fs;
 use std::io::Write;
 use std::process::Command;
 
-/// Pipeline version string mirrored from `crates/epigraph-mcp/src/tools/ingestion.rs::PIPELINE_VERSION`.
+/// Pipeline version string mirrored from `crates/epigraph-mcp/src/tools/ingestion.rs::PIPELINE_VERSION_BASE`.
 /// The MCP-side dedup gate keys on (paper.doi, processed_by edge with this `pipeline` property).
 /// Keep this in sync if the MCP constant ever changes.
-const PIPELINE_VERSION: &str = "hierarchical_extraction_v1";
+const PIPELINE_VERSION: &str = "hierarchical_extraction_v2";
 
 pub fn run(dry_run: bool, only: Option<&str>) -> Result<()> {
     let narratives_dir = "docs/superpowers/artifacts/2026-04-30-table-graph/narratives";

@@ -764,6 +764,12 @@ impl ClaimRepository {
         Ok(rows)
     }
 
+    /// Maximum number of claims returned by [`get_by_agent`](Self::get_by_agent) in a single
+    /// call. Prevents loading an arbitrarily large `Vec<Claim>` into heap for agents with many
+    /// claims. Callers that need pagination should use `list_by_truth_range` with explicit
+    /// offset/limit.
+    pub const MAX_AGENT_CLAIMS: i64 = 500;
+
     /// Get all claims by an agent
     ///
     /// # Errors
@@ -772,15 +778,17 @@ impl ClaimRepository {
     pub async fn get_by_agent(pool: &PgPool, agent_id: AgentId) -> Result<Vec<Claim>, DbError> {
         let uuid: Uuid = agent_id.into();
 
-        let rows = sqlx::query!(
+        let rows = sqlx::query_as::<_, ClaimRow>(
             r#"
             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
             FROM claims
             WHERE agent_id = $1
             ORDER BY created_at DESC
+            LIMIT $2
             "#,
-            uuid
         )
+        .bind(uuid)
+        .bind(Self::MAX_AGENT_CLAIMS)
         .fetch_all(pool)
         .await?;
 
@@ -1477,13 +1485,16 @@ impl ClaimRepository {
         limit: i64,
     ) -> Result<Vec<Claim>, DbError> {
         let limit = limit.clamp(1, 1000);
-        let pattern = format!("%{}%", text);
+        // Use the GIN-indexed `content_tsv` column so the text filter can hit
+        // the `idx_claims_content_tsv` index (migration 050) instead of forcing
+        // a sequential scan with a leading-wildcard ILIKE. `websearch_to_tsquery`
+        // accepts free-form query strings and handles quoting internally.
         let rows = sqlx::query_as::<_, ClaimRow>(
             r#"
             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
             FROM claims
             WHERE labels @> $1
-              AND content ILIKE $2
+              AND content_tsv @@ websearch_to_tsquery('english', $2)
               AND truth_value >= $3
               AND COALESCE(is_current, true) = true
             ORDER BY truth_value DESC, created_at DESC
@@ -1491,7 +1502,7 @@ impl ClaimRepository {
             "#,
         )
         .bind(labels)
-        .bind(&pattern)
+        .bind(text)
         .bind(min_truth)
         .bind(limit)
         .fetch_all(pool)
@@ -1798,6 +1809,17 @@ impl ClaimRepository {
     /// # Errors
     /// - `DbError::NotFound` if the old claim doesn't exist
     /// - `DbError::QueryFailed` if the old claim is already superseded or DB fails
+    ///
+    /// # Implementation Notes
+    /// The UPDATE that marks the old claim `is_current = false` also sets
+    /// `embedding = NULL` in the **same statement**.  This is required by the
+    /// CHECK constraint `chk_deprecated_no_embedding` (migration 052), which
+    /// fires per-statement rather than per-transaction: splitting the two
+    /// assignments across two UPDATE statements would violate the constraint
+    /// between statements.  Any future caller — REST handlers, CLI tools, tests
+    /// — must preserve this single-statement invariant.  See also
+    /// [`ClaimRepository::mark_duplicate`] which is subject to the same
+    /// constraint.
     #[instrument(skip(pool))]
     pub async fn supersede(
         pool: &PgPool,
@@ -2432,6 +2454,11 @@ impl ClaimRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Maximum number of claim IDs accepted by [`pairwise_cosine_distance`](Self::pairwise_cosine_distance).
+    /// At N=1000 the O(N²) cross-join produces ~500 k pair comparisons in Postgres; beyond
+    /// this threshold query time becomes unreasonable and the result set itself is huge.
+    pub const MAX_PAIRWISE_IDS: usize = 1_000;
+
     /// Compute pairwise cosine distances between claims in the given set.
     ///
     /// Returns all pairs where distance < `max_distance`, ordered ascending.
@@ -2439,7 +2466,8 @@ impl ClaimRepository {
     /// — HNSW indexes do not accelerate distance filters.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// - `DbError::QueryFailed` if `claim_ids.len() > MAX_PAIRWISE_IDS`
+    /// - `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn pairwise_cosine_distance(
         pool: &PgPool,
@@ -2448,6 +2476,16 @@ impl ClaimRepository {
     ) -> Result<Vec<ClaimPairDistance>, DbError> {
         if claim_ids.len() < 2 {
             return Ok(vec![]);
+        }
+        if claim_ids.len() > Self::MAX_PAIRWISE_IDS {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "pairwise_cosine_distance: {} ids exceeds MAX_PAIRWISE_IDS={}; \
+                     split the input into smaller batches",
+                    claim_ids.len(),
+                    Self::MAX_PAIRWISE_IDS,
+                )),
+            });
         }
 
         let rows: Vec<ClaimPairDistance> = sqlx::query_as(
@@ -2594,6 +2632,15 @@ impl ClaimRepository {
     /// Mark `dup` as a duplicate of `canonical` without creating a new claim.
     /// Sets `supersedes = canonical, is_current = false` on `dup` only.
     /// Refuses if `dup.supersedes` is already set.
+    ///
+    /// # Implementation Notes
+    /// The UPDATE that sets `is_current = false` on the duplicate also sets
+    /// `embedding = NULL` in the **same statement**, satisfying the CHECK
+    /// constraint `chk_deprecated_no_embedding` (migration 052).  This
+    /// constraint fires per-statement, so any split across two UPDATE statements
+    /// would violate it between them.  Any future caller must preserve this
+    /// single-statement invariant.  See also [`ClaimRepository::supersede`]
+    /// which has the same requirement.
     #[instrument(skip(pool))]
     pub async fn mark_duplicate(
         pool: &PgPool,
@@ -3456,5 +3503,35 @@ mod label_tests {
             }
             other => panic!("Expected NotFound, got: {other:?}"),
         }
+    }
+
+    /// Verify `pairwise_cosine_distance` enforces the `MAX_PAIRWISE_IDS` cap.
+    /// No DB required: the size guard fires before the query is issued.
+    #[tokio::test]
+    async fn pairwise_cosine_distance_rejects_oversized_input() {
+        use sqlx::postgres::PgPoolOptions;
+        // We need a (dummy) pool even though the guard fires before any query.
+        // Use a non-existent URL — `connect_lazy` does not dial at construction time.
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://invalid-host/nodb")
+            .unwrap();
+        let too_many: Vec<Uuid> = (0..=ClaimRepository::MAX_PAIRWISE_IDS)
+            .map(|_| Uuid::new_v4())
+            .collect();
+        let result = ClaimRepository::pairwise_cosine_distance(&pool, &too_many, 0.5).await;
+        assert!(
+            result.is_err(),
+            "should return Err when claim_ids exceeds MAX_PAIRWISE_IDS"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("MAX_PAIRWISE_IDS"),
+            "error message should mention MAX_PAIRWISE_IDS; got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn max_agent_claims_constant_is_positive() {
+        assert!(ClaimRepository::MAX_AGENT_CLAIMS > 0);
     }
 }

@@ -2,12 +2,13 @@
 
 This is the net-new glue for backlog b5518801. The fetch/parse layer
 (extract_html.py, extract_textbook.py) recovers source structure
-(title/authors/sections/paragraphs/supporting_text). This module maps that
-recovered structure onto the schema the live MCP `ingest_document` tool parses:
+(title/authors/sections/paragraphs). This module maps that recovered structure
+onto the schema the live MCP `ingest_document` tool parses:
 `epigraph_ingest::schema::DocumentExtraction` (crates/epigraph-ingest/src/document/schema.rs).
 
 IMPORTANT — emit the RUST shape, not the SKILL.md example shape:
-  * paragraph key is `compound` (a String), NOT `compound_claim`
+  * paragraph key is `text` (a String, the FAITHFUL full recovered text — Tier 2,
+    §2 of the verbatim-spine spec), NOT `compound`/`compound_claim`
   * `atoms` is a list[str], NOT a list of objects
   * `thesis` is a plain string|null, NOT an object {claim, confidence, source}
   * cross-claim edges use `source_path`/`target_path`, NOT `source_atom`/`target_atom`
@@ -15,12 +16,12 @@ The builder `build_ingest_plan` (crates/epigraph-ingest/src/document/builder.rs)
 is what consumes this; its tests in lib.rs pin these exact field names.
 
 SCOPE: structure recovery only. This preprocessor does NOT produce atoms or
-generality scores — those require the LLM Stage-3 decomposition in the
-extract-claims skill (.claude/skills/extract-claims/SKILL.md), which rewrites
-`compound` and fills `atoms`/`generality` downstream. Every paragraph here is
-emitted with `atoms: []` and a provisional `compound` (the first sentence /
-truncation of the recovered text); the full text is preserved verbatim in
-`supporting_text` so the LLM stage has the source material.
+generality scores — those require the LLM atomization stage in the extract-claims
+skill (.claude/skills/extract-claims/SKILL.md), which decomposes each paragraph's
+verbatim `text` into `atoms`/`generality` downstream. Every paragraph here is
+emitted with `atoms: []` and the full faithful `text` so the LLM stage has the
+source material. These Python emitters are Tier 2 (faithful full text, no byte
+spans / `source_text`); the markdown/plaintext Rust structurer is Tier 1.
 
 CANONICAL evidence_type set (crates/epigraph-ingest/src/common/evidence_type.rs):
 regulatory, empirical, statistical, logical, testimonial, circumstantial,
@@ -30,7 +31,6 @@ normalizer, so we omit the field rather than guess.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -56,27 +56,6 @@ EVIDENCE_TYPES = {
     "conversational",
 }
 
-# Max chars for the provisional compound (mirrors V2 statement = text[:500]).
-_COMPOUND_MAX = 500
-
-
-def first_sentence(text: str, max_chars: int = _COMPOUND_MAX) -> str:
-    """Provisional compound = first sentence, else a hard truncation.
-
-    The LLM Stage-3 decomposition rewrites this; we only need a non-empty,
-    representative string because `Paragraph.compound` is a required field with
-    no serde default and `build_ingest_plan` hashes it into the claim id.
-    """
-    text = re.sub(r"\s+", " ", text or "").strip()
-    if not text:
-        return ""
-    # First sentence terminator followed by whitespace; keep the terminator.
-    m = re.search(r"[.!?](?:\s|$)", text)
-    if m and m.end() <= max_chars:
-        return text[: m.end()].strip()
-    return text[:max_chars].strip()
-
-
 @dataclass
 class Author:
     name: str
@@ -93,10 +72,10 @@ class Author:
 
 @dataclass
 class ParagraphOut:
-    """Maps to Rust `Paragraph`. compound is required + non-empty."""
+    """Maps to Rust `Paragraph`. `text` is the verbatim/faithful full source
+    text (Tier 2) and is required + non-empty (no serde default in Rust)."""
 
-    compound: str
-    supporting_text: str = ""
+    text: str
     confidence: float = 0.8
     methodology: Optional[str] = None
     evidence_type: Optional[str] = None
@@ -104,9 +83,8 @@ class ParagraphOut:
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
-            "compound": self.compound,
-            "supporting_text": self.supporting_text,
-            # atoms intentionally empty: filled by the LLM Stage-3 decomposition.
+            "text": self.text,
+            # atoms intentionally empty: filled by the LLM atomization stage.
             "atoms": [],
             "generality": [],
             "confidence": self.confidence,
@@ -126,13 +104,11 @@ class SectionOut:
     """Maps to Rust `Section`."""
 
     title: str
-    summary: str = ""
     paragraphs: list[ParagraphOut] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "title": self.title,
-            "summary": self.summary,
             "paragraphs": [p.to_dict() for p in self.paragraphs],
         }
 

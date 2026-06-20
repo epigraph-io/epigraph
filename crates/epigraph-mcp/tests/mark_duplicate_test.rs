@@ -7,6 +7,7 @@ async fn mark_duplicate_marks_dup_only(pool: PgPool) {
     let canonical = seed_claim(&pool, "canonical", 0.5).await;
     let dup = seed_claim(&pool, "duplicate", 0.5).await;
     let server = build_test_server(pool.clone());
+    let auth = admin_auth();
 
     epigraph_mcp::tools::supersede::mark_duplicate(
         &server,
@@ -15,6 +16,7 @@ async fn mark_duplicate_marks_dup_only(pool: PgPool) {
             canonical_id: canonical.to_string(),
             reason: None,
         },
+        Some(&auth),
     )
     .await
     .unwrap();

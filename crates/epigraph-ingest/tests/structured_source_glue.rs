@@ -62,7 +62,7 @@ fn arxiv_html_maps_to_valid_document_extraction_hierarchy() {
     for s in &doc.sections {
         assert_eq!(s.paragraphs.len(), 1, "one paragraph per HTML section");
         let p = &s.paragraphs[0];
-        assert!(!p.compound.is_empty(), "compound is required + non-empty");
+        assert!(!p.text.is_empty(), "verbatim text is required + non-empty");
         assert!(
             p.atoms.is_empty(),
             "structure recovery emits NO atoms; the LLM stage fills them"
@@ -74,7 +74,7 @@ fn arxiv_html_maps_to_valid_document_extraction_hierarchy() {
         .sections
         .iter()
         .flat_map(|s| s.paragraphs.iter())
-        .map(|p| p.supporting_text.clone())
+        .map(|p| p.text.clone())
         .collect();
     assert!(
         !all_text.contains("E=m") && !all_text.contains("E = m"),
@@ -124,15 +124,14 @@ fn openstax_cnxml_maps_to_valid_document_extraction_hierarchy() {
         "no atoms in structure recovery"
     );
     assert!(
-        paras
-            .iter()
-            .any(|p| p.supporting_text.contains("[equation]")),
+        paras.iter().any(|p| p.text.contains("[equation]")),
         "inline MathML must be rendered as the [equation] placeholder"
     );
     assert!(
-        doc.sections[0].paragraphs.iter().all(|p| !p
-            .supporting_text
-            .contains("In this section, we will explore")),
+        doc.sections[0]
+            .paragraphs
+            .iter()
+            .all(|p| !p.text.contains("In this section, we will explore")),
         "transitional paragraph must be filtered out"
     );
 

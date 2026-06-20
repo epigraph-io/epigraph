@@ -38,11 +38,9 @@
   "sections": [
     {
       "title": "Introduction",
-      "summary": "Section: Introduction",
       "paragraphs": [
         {
-          "compound": "Scientific HTML such as ar5iv pages carries explicit section structure.",
-          "supporting_text": "Scientific HTML such as ar5iv pages carries explicit section structure. Exploiting that structure avoids lossy OCR. The preprocessor walks headings and accumulates section text. appears inline but is skipped by the parser.",
+          "text": "Scientific HTML such as ar5iv pages carries explicit section structure. Exploiting that structure avoids lossy OCR. The preprocessor walks headings and accumulates section text. appears inline but is skipped by the parser.",
           "atoms": [],
           "generality": [],
           "confidence": 0.8,
@@ -52,11 +50,9 @@
     },
     {
       "title": "Method",
-      "summary": "Section: Method",
       "paragraphs": [
         {
-          "compound": "The parser tracks a heading stack and flushes a section when a new heading of level two or greater begins.",
-          "supporting_text": "The parser tracks a heading stack and flushes a section when a new heading of level two or greater begins. Each recovered section becomes one node in the downstream hierarchy. Tiny sections under fifty characters are discarded to suppress navigation noise.",
+          "text": "The parser tracks a heading stack and flushes a section when a new heading of level two or greater begins. Each recovered section becomes one node in the downstream hierarchy. Tiny sections under fifty characters are discarded to suppress navigation noise.",
           "atoms": [],
           "generality": [],
           "confidence": 0.8,

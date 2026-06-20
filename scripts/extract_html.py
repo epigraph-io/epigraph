@@ -44,7 +44,6 @@ from lib.document_extraction import (  # noqa: E402
     DocumentExtractionOut,
     ParagraphOut,
     SectionOut,
-    first_sentence,
 )
 
 
@@ -221,18 +220,15 @@ def html_to_document_extraction(html: str, url: str = "") -> DocumentExtractionO
         sections_out.append(
             SectionOut(
                 title=s.title,
-                # Derive the L1 summary from the section TITLE, not the body's
-                # first sentence. The body first sentence is verbatim the first
-                # paragraph's `compound`; since compound_claim_id hashes content
-                # with no level in the material, an identical string collides the
-                # section (L1) and its first paragraph (L2) onto the SAME UUID,
-                # producing a decomposes_to self-loop and a duplicate-id insert
-                # (backlog b5518801). A title-derived summary is hash-distinct.
-                summary=f"Section: {s.title}",
+                # Tier 2 (§2 of the verbatim-spine spec): emit the FULL recovered
+                # section text as `text`. No paraphrase/first-sentence compound and
+                # no section summary — Task 7's path-seeded claim ids (the section
+                # path is folded into the UUID seed) already make L1 sections and
+                # their L2 paragraphs hash-distinct, so the old summary collision
+                # trick (backlog b5518801) is no longer needed.
                 paragraphs=[
                     ParagraphOut(
-                        compound=first_sentence(s.text),
-                        supporting_text=s.text,
+                        text=s.text,
                         confidence=0.8,
                         methodology="structured_html_parse",
                     )

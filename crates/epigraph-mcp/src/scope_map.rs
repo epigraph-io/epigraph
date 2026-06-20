@@ -58,6 +58,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("scoped_belief", "claims:read"),
     ("search_triples", "claims:read"),
     ("sheaf_cohomology", "claims:read"),
+    ("structure_source", "claims:read"),
     ("suggest_alternative_sets", "claims:read"),
     ("system_stats", "claims:read"),
     ("traverse", "claims:read"),
