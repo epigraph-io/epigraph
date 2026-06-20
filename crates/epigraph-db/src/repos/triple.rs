@@ -463,7 +463,7 @@ mod tests {
     /// Helper: insert a canonical entity, returning entity_id.
     async fn insert_entity(pool: &sqlx::PgPool, name: &str) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO entities (canonical_name, entity_type, is_canonical) \
+            "INSERT INTO entities (canonical_name, type_top, is_canonical) \
              VALUES ($1, 'Material', true) \
              RETURNING id",
         )
