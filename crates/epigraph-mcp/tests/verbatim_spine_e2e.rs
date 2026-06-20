@@ -63,12 +63,22 @@ async fn structure_then_ingest_yields_verbatim_spine(pool: PgPool) {
     extraction.sections[1].paragraphs[0].atoms = vec!["Beta follows alpha".to_string()];
 
     // 3) ingest inline; the writer re-verifies the threaded source_text + spans.
+    //    ingest_document_inline is fire-and-forget: it spawns the write as a
+    //    detached Tokio task and returns {"status":"queued"} immediately.
     let result = ingest_document_inline(&server, IngestDocumentInlineParams { extraction })
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
-    assert_eq!(json["already_ingested"], serde_json::json!(false));
-    let paper_id = uuid::Uuid::parse_str(json["paper_id"].as_str().unwrap()).unwrap();
+    assert_eq!(json["status"], "queued");
+
+    // Give the background task time to finish its DB writes.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Resolve paper_id by DOI now that the background write has landed.
+    let paper_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM papers WHERE doi = '10.1/e2e'")
+        .fetch_one(&pool)
+        .await
+        .expect("paper row must exist after background task completes");
 
     // 4a) the paragraph node content is BYTE-EQUAL to the source paragraph.
     //
