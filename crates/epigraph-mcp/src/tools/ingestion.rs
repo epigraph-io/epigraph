@@ -1,6 +1,7 @@
 #![allow(clippy::wildcard_imports)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rmcp::model::*;
 use uuid::Uuid;
@@ -351,7 +352,7 @@ pub async fn do_ingest_document(
 
     let mut claim_ids: Vec<String> = Vec::new();
     let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
-    let mut embedded_count = 0_usize;
+    let mut embed_queue: Vec<(Uuid, String)> = Vec::new();
     let mut dedup_count = 0_usize;
     let mut ds_entries: Vec<BatchDsEntry> = Vec::new();
 
@@ -477,13 +478,7 @@ pub async fn do_ingest_document(
         .await
         .map_err(internal_error)?;
 
-        if server
-            .embedder
-            .embed_and_store(persisted_id, &planned.content)
-            .await
-        {
-            embedded_count += 1;
-        }
+        embed_queue.push((persisted_id, planned.content.clone()));
 
         // Atoms (level 3) are the units we trust to carry CDST evidence.
         if planned.level == 3 {
@@ -604,13 +599,29 @@ pub async fn do_ingest_document(
     .await
     .map_err(internal_error)?;
 
+    // ── 8. Detach embeddings so the MCP response returns immediately after commit ──
+    // All DB writes are done. Embed in the background so the caller is not blocked
+    // by N × ~0.8 s OpenAI calls. The response reports the number queued; the
+    // invariant (every is_current claim has an embedding) is satisfied eventually.
+    let queued = embed_queue.len();
+    if !embed_queue.is_empty() {
+        let embedder = Arc::clone(&server.embedder);
+        tokio::spawn(async move {
+            for (id, content) in embed_queue {
+                if !embedder.embed_and_store(id, &content).await {
+                    tracing::warn!("background embedding failed for claim {id}");
+                }
+            }
+        });
+    }
+
     success_json(&IngestDocumentResponse {
         paper_id: paper_id.to_string(),
         paper_title,
         doi,
         authors: author_responses,
         claims_ingested: claim_ids.len() - dedup_count,
-        claims_embedded: embedded_count,
+        claims_embedded: queued,
         claims_skipped_dedup: dedup_count,
         relationships_created,
         claims_ds_wired,
