@@ -476,4 +476,86 @@ mod tests {
         );
         assert!(db_count > 0, "must have at least one executes edge");
     }
+
+    /// Regression test for k1-trace-bug: `improve_workflow_hierarchy` must not
+    /// produce a `claims_content_not_empty` constraint violation when a Phase
+    /// has an empty (or omitted) `summary`.
+    ///
+    /// `Phase.summary` is `#[serde(default)]` so it defaults to `""` when
+    /// absent from JSON. Before the fix, `build_ingest_plan` used
+    /// `phase.summary.clone()` as the level-1 claim content without guarding
+    /// against an empty value, causing PostgreSQL to reject the INSERT with
+    /// `ERROR: new row violates check constraint "claims_content_not_empty"`.
+    ///
+    /// The fix falls back to `phase.title` in `builder.rs` when summary is blank.
+    /// This test validates the full end-to-end path through
+    /// `improve_workflow_hierarchy_via_pool`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn improve_workflow_hierarchy_empty_phase_summary_succeeds(pool: sqlx::PgPool) {
+        // 1. Seed the base workflow (generation 0).
+        let mut base = minimal_extraction();
+        base.source.canonical_name = "weekly-capability-audit".to_string();
+        do_ingest_workflow_via_pool(&pool, &base)
+            .await
+            .expect("base workflow ingest must succeed");
+
+        // 2. Build an improved extraction where summary is explicitly empty —
+        //    this is the triggering condition from the bug report.
+        let improved = WorkflowExtraction {
+            source: epigraph_ingest::workflow::schema::WorkflowSource {
+                canonical_name: "will-be-overwritten".to_string(),
+                goal: "Improved audit capabilities".to_string(),
+                generation: 99, // overwritten by improve_workflow_hierarchy_via_pool
+                parent_canonical_name: None, // overwritten
+                authors: vec![],
+                expected_outcome: None,
+                tags: vec![],
+                metadata: serde_json::json!({}),
+            },
+            thesis: Some("Improved thesis".to_string()),
+            thesis_derivation: epigraph_ingest::common::schema::ThesisDerivation::TopDown,
+            phases: vec![Phase {
+                title: "Capability Review Phase".to_string(),
+                summary: "".to_string(), // empty — the serde default; was the bug trigger
+                steps: vec![Step {
+                    compound: "Review all system capabilities".to_string(),
+                    rationale: "Ensure completeness".to_string(),
+                    operations: vec!["audit step".to_string()],
+                    generality: vec![1],
+                    confidence: 0.85,
+                }],
+            }],
+            relationships: vec![],
+        };
+
+        // 3. Must succeed without a constraint violation.
+        let result =
+            improve_workflow_hierarchy_via_pool(&pool, "weekly-capability-audit", improved)
+                .await
+                .expect("improve must not violate claims_content_not_empty constraint");
+
+        assert!(!result.already_ingested, "should be a fresh generation");
+        assert!(
+            result.claims_ingested > 0,
+            "expected at least one new claim"
+        );
+        assert_eq!(result.parent_generation, 0);
+        assert_eq!(result.new_generation, 1);
+
+        // 4. Verify the phase claim actually has the title as content (not empty).
+        let phase_content: String = sqlx::query_scalar(
+            "SELECT content FROM claims \
+             WHERE properties->>'kind' = 'workflow_step' \
+               AND properties->>'level' = '1' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("phase claim must exist");
+
+        assert_eq!(
+            phase_content, "Capability Review Phase",
+            "phase claim content must fall back to title when summary is empty"
+        );
+    }
 }
