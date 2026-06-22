@@ -371,6 +371,24 @@ pub async fn store_workflow(
         let _ = server.embedder.embed_and_store(*claim_id, content).await;
     }
 
+    // Also embed the workflow goal into workflows.goal_embedding for
+    // embedding-first find_workflow_hierarchical. Omitted from the original
+    // store_workflow; do_ingest_workflow embeds it correctly.
+    if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
+        match server.embedder.generate(&params.goal).await {
+            Ok(qvec) => {
+                if let Err(e) =
+                    WorkflowRepository::set_goal_embedding(&server.pool, wf_id, &qvec).await
+                {
+                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
+            }
+        }
+    }
+
     success_json(&StoreWorkflowResponse {
         workflow_id: response.workflow_id,
         canonical_name: response.canonical_name,

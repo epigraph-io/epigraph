@@ -239,6 +239,7 @@ pub async fn store_workflow(
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     if let Some(embedder) = state.embedding_service() {
+        let wf_id = result.workflow_id;
         for (claim_id, content) in &result.inserted {
             match embedder.generate(content).await {
                 Ok(embedding) => {
@@ -256,6 +257,23 @@ pub async fn store_workflow(
                 Err(e) => {
                     tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for ingested workflow claim");
                 }
+            }
+        }
+        // Also embed into workflows.goal_embedding for find_workflow_hierarchical.
+        match embedder.generate(&request.goal).await {
+            Ok(qvec) => {
+                if let Err(e) = epigraph_db::WorkflowRepository::set_goal_embedding(
+                    &state.db_pool,
+                    wf_id,
+                    &qvec,
+                )
+                .await
+                {
+                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed for workflow goal");
             }
         }
     }
@@ -1276,6 +1294,7 @@ pub async fn ingest_workflow(
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     if let Some(embedder) = state.embedding_service() {
+        let wf_id = result.workflow_id;
         for (claim_id, content) in &result.inserted {
             match embedder.generate(content).await {
                 Ok(embedding) => {
@@ -1293,6 +1312,23 @@ pub async fn ingest_workflow(
                 Err(e) => {
                     tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for ingested workflow claim");
                 }
+            }
+        }
+        // Also embed into workflows.goal_embedding for find_workflow_hierarchical.
+        match embedder.generate(&extraction.source.goal).await {
+            Ok(qvec) => {
+                if let Err(e) = epigraph_db::WorkflowRepository::set_goal_embedding(
+                    &state.db_pool,
+                    wf_id,
+                    &qvec,
+                )
+                .await
+                {
+                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed for workflow goal");
             }
         }
     }
