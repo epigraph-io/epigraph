@@ -529,12 +529,16 @@ mod tests {
         };
 
         // 3. Must succeed without a constraint violation.
-        let result = improve_workflow_hierarchy_via_pool(&pool, "weekly-capability-audit", improved)
-            .await
-            .expect("improve must not violate claims_content_not_empty constraint");
+        let result =
+            improve_workflow_hierarchy_via_pool(&pool, "weekly-capability-audit", improved)
+                .await
+                .expect("improve must not violate claims_content_not_empty constraint");
 
         assert!(!result.already_ingested, "should be a fresh generation");
-        assert!(result.claims_ingested > 0, "expected at least one new claim");
+        assert!(
+            result.claims_ingested > 0,
+            "expected at least one new claim"
+        );
         assert_eq!(result.parent_generation, 0);
         assert_eq!(result.new_generation, 1);
 
