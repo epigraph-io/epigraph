@@ -987,4 +987,84 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
     }
+
+    /// Regression test for the improve_workflow_hierarchy embedding gap:
+    ///
+    /// When a new generation is inserted but `set_goal_embedding` is not called,
+    /// the row has NULL goal_embedding and is invisible to
+    /// `find_hierarchical_by_embedding` (filtered by WHERE goal_embedding IS NOT
+    /// NULL). Only after `set_goal_embedding` is called does the row become
+    /// searchable via the embedding path.
+    ///
+    /// This test exercises the DB-level invariant; the code fix lives in
+    /// `improve_workflow_hierarchy` (workflow_ingest.rs) which now calls
+    /// `set_goal_embedding` for every new generation it creates.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_hierarchical_by_embedding_skips_null_goal_embedding(pool: sqlx::PgPool) {
+        let gen0_id = uuid::Uuid::new_v4();
+        let gen1_id = uuid::Uuid::new_v4();
+
+        WorkflowRepository::insert_root(
+            &pool,
+            gen0_id,
+            "embed-gap-test",
+            0,
+            "Send daily digest email",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        WorkflowRepository::insert_root(
+            &pool,
+            gen1_id,
+            "embed-gap-test",
+            1,
+            "Send daily digest email with retry",
+            Some(gen0_id),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        // Unit vector in 1536-d (matches workflows.goal_embedding vector(1536)).
+        let mut qvec = vec![0.0f32; 1536];
+        qvec[0] = 1.0;
+
+        // Set embedding only on gen 0 — simulates the pre-fix state where
+        // improve_workflow_hierarchy did not call set_goal_embedding.
+        WorkflowRepository::set_goal_embedding(&pool, gen0_id, &qvec)
+            .await
+            .unwrap();
+
+        // With only gen 0 embedded, the embedding search must return exactly one
+        // row (gen 0). Gen 1 is invisible because its goal_embedding IS NULL.
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.0, 0.0, 10, true)
+                .await
+                .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "gen 1 must be invisible without goal_embedding"
+        );
+        assert_eq!(hits[0].generation, 0);
+
+        // Now set embedding on gen 1 — what the fixed improve_workflow_hierarchy does.
+        WorkflowRepository::set_goal_embedding(&pool, gen1_id, &qvec)
+            .await
+            .unwrap();
+
+        // Both generations must now be visible, and with resolve_to_latest=true
+        // (distance ASC then generation DESC) gen 1 surfaces first.
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.0, 0.0, 10, true)
+                .await
+                .unwrap();
+        assert_eq!(hits.len(), 2, "both gens visible after set_goal_embedding");
+        assert_eq!(
+            hits[0].generation, 1,
+            "higher generation surfaces first with resolve_to_latest ordering"
+        );
+    }
 }

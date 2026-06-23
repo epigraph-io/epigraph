@@ -242,6 +242,8 @@ pub async fn improve_workflow_hierarchy(
     server: &EpiGraphMcpFull,
     params: ImproveWorkflowHierarchyParams,
 ) -> Result<CallToolResult, McpError> {
+    // Save goal before params.extraction is consumed by improve_workflow_hierarchy_with_inserted.
+    let goal = params.extraction.source.goal.clone();
     let (response, inserted) = improve_workflow_hierarchy_with_inserted(
         &server.pool,
         &params.parent_canonical_name,
@@ -253,6 +255,27 @@ pub async fn improve_workflow_hierarchy(
     // `embed_and_store` logs tracing::warn on failure internally; no outer handling needed.
     for (claim_id, content) in &inserted {
         let _ = server.embedder.embed_and_store(*claim_id, content).await;
+    }
+
+    // Also embed into workflows.goal_embedding for find_workflow_hierarchical.
+    // Without this, the new higher-generation row has NULL goal_embedding and is
+    // invisible to find_hierarchical_by_embedding's WHERE goal_embedding IS NOT NULL
+    // filter — the embedding search silently surfaces the last-embedded generation
+    // instead of the latest one. Mirrors the identical block in do_ingest_workflow.
+    if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
+        match server.embedder.generate(&goal).await {
+            Ok(qvec) => {
+                if let Err(e) =
+                    epigraph_db::WorkflowRepository::set_goal_embedding(&server.pool, wf_id, &qvec)
+                        .await
+                {
+                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
+            }
+        }
     }
 
     success_json(&response)
