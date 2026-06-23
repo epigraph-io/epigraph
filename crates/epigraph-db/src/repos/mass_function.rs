@@ -210,6 +210,40 @@ impl MassFunctionRepository {
         Ok(rows)
     }
 
+    /// Get all mass functions for a claim that belong to exactly-2-hypothesis frames.
+    ///
+    /// Joins `mass_functions` with `frames` and restricts to frames whose
+    /// `hypotheses` array has exactly 2 entries. This is the correct query for
+    /// cross-frame combination in `auto_wire_ds_update`: including BBAs from
+    /// frames with 3+ hypotheses would produce semantically wrong focal-element
+    /// interpretation when parsed with the binary frame (index 0 and 1 are
+    /// shared across frames, but `{0,1}` in a ternary frame ≠ Theta on binary).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_for_claim_binary_frames(
+        pool: &PgPool,
+        claim_id: Uuid,
+    ) -> Result<Vec<MassFunctionRow>, DbError> {
+        let rows: Vec<MassFunctionRow> = sqlx::query_as(
+            r#"
+            SELECT mf.id, mf.claim_id, mf.frame_id, mf.source_agent_id, mf.perspective_id,
+                   mf.masses, mf.conflict_k, mf.combination_method, mf.source_strength,
+                   mf.evidence_type, mf.locality_tag, mf.evidence_id, mf.created_at
+            FROM mass_functions mf
+            JOIN frames f ON mf.frame_id = f.id
+            WHERE mf.claim_id = $1 AND array_length(f.hypotheses, 1) = 2
+            ORDER BY mf.frame_id, mf.created_at ASC
+            "#,
+        )
+        .bind(claim_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Get mass functions for a (claim, frame) filtered by perspective
     ///
     /// # Errors
