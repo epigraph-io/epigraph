@@ -353,10 +353,19 @@ pub async fn auto_wire_ds_update(
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
 
-    // Retrieve all BBAs and combine WITH reliability discount
-    let all_rows = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
+    // Retrieve BBAs from ALL 2-hypothesis frames for this claim. The DB JOIN
+    // on frames ensures we only include frames with exactly 2 hypotheses —
+    // a BBA from a 3+-hypothesis frame whose focal elements happen to use only
+    // indices 0 and 1 would be semantically wrong when parsed as binary_frame()
+    // ({0,1} in a ternary frame ≠ Theta on binary). Cross-frame retrieval
+    // prevents frame-fragmentation loss: BBAs written to legacy binary frames
+    // (e.g. "research_validity") are included so update_with_evidence combines
+    // the full evidence history rather than starting fresh from just the new
+    // BBA — the root cause of the BetP drop in backlog 30bfbb19
+    // (claims c98b6dec, adf396a8: 0.883→0.725, 0.834→0.733).
+    let all_rows = MassFunctionRepository::get_for_claim_binary_frames(pool, claim_id)
         .await
-        .map_err(|e| format!("get_for_claim_frame: {e}"))?;
+        .map_err(|e| format!("get_for_claim_binary_frames: {e}"))?;
 
     // Phase 2 (issue #197): the combine path no longer trusts the
     // stored `source_strength` as the authority. The Phase 2 helper
