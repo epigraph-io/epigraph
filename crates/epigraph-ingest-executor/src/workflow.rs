@@ -84,6 +84,27 @@ pub async fn execute_workflow_ingest_plan(
 
     let workflow_id = root_workflow_id(extraction);
 
+    // ── 0. Pre-flight: reject blank claim content before any DB write ────
+    // Catches fields that serde(default) silently turns into "" (e.g.
+    // Phase.summary when omitted from JSON), which would later hit the
+    // claims_content_not_empty DB constraint and leave a zombie workflows row.
+    {
+        let rev_index: std::collections::HashMap<uuid::Uuid, &str> = plan
+            .path_index
+            .iter()
+            .map(|(path, id)| (*id, path.as_str()))
+            .collect();
+        for planned in &plan.claims {
+            if planned.content.trim().is_empty() {
+                let path = rev_index
+                    .get(&planned.id)
+                    .map(|s| (*s).to_string())
+                    .unwrap_or_else(|| planned.id.to_string());
+                return Err(crate::error::IngestExecutorError::InvalidContent { path });
+            }
+        }
+    }
+
     // ── 1. Idempotency gate: skip if workflow row already processed ──────
     if let Some(existing_id) =
         WorkflowRepository::find_root_by_canonical(pool, canonical_name, generation).await?

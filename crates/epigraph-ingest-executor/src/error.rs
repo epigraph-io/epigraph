@@ -27,4 +27,10 @@ pub enum IngestExecutorError {
     /// Plan structure violated an executor invariant.
     #[error("plan inconsistency: {0}")]
     PlanInconsistency(String),
+
+    /// A planned claim has blank content, which would violate the DB
+    /// `claims_content_not_empty` constraint. The embedded `path` names the
+    /// extraction field responsible (e.g. `"phases[2].summary"`).
+    #[error("blank claim content at {path}: claim content must not be empty or whitespace-only")]
+    InvalidContent { path: String },
 }

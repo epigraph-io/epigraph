@@ -144,3 +144,125 @@ async fn improve_workflow_hierarchy_errors_when_parent_missing(pool: sqlx::PgPoo
         "error message should mention missing canonical_name; got: {err_msg}"
     );
 }
+
+/// Regression: improve_workflow_hierarchy must not fail with
+/// `claims_content_not_empty` when a phase omits `summary` (serde default "").
+/// The builder falls back to `phase.title`, so the ingest must SUCCEED and the
+/// persisted phase claim must contain the title text.
+#[sqlx::test(migrations = "../../migrations")]
+async fn improve_workflow_hierarchy_empty_phase_summary_uses_title(pool: sqlx::PgPool) {
+    let canonical = "test-improve-hier-empty-summary";
+
+    epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
+        &pool,
+        &parent_extraction(canonical),
+    )
+    .await
+    .expect("parent ingest");
+
+    let extraction = WorkflowExtraction {
+        source: WorkflowSource {
+            canonical_name: "ignored".to_string(),
+            goal: "Test empty summary fallback".to_string(),
+            generation: 0,
+            parent_canonical_name: None,
+            authors: vec![],
+            expected_outcome: None,
+            tags: vec![],
+            metadata: serde_json::json!({}),
+        },
+        thesis: None,
+        thesis_derivation: ThesisDerivation::TopDown,
+        phases: vec![Phase {
+            title: "Phase With No Summary".to_string(),
+            summary: String::new(), // ← blank: builder falls back to title
+            steps: vec![Step {
+                compound: "some step".to_string(),
+                rationale: "irrelevant".to_string(),
+                operations: vec![],
+                generality: vec![],
+                confidence: 0.8,
+            }],
+        }],
+        relationships: vec![],
+    };
+
+    let result = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
+        &pool, canonical, extraction,
+    )
+    .await
+    .expect("empty summary should not cause a constraint violation; builder falls back to title");
+
+    assert!(!result.already_ingested);
+    assert!(
+        result.claims_ingested > 0,
+        "expected at least one new claim"
+    );
+
+    // Verify the phase claim content is the title, not an empty string.
+    let phase_content: String = sqlx::query_scalar(
+        "SELECT content FROM claims \
+         WHERE properties->>'kind' = 'workflow_step' \
+           AND (properties->>'level')::int = 1 \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("phase claim must exist");
+    assert_eq!(
+        phase_content, "Phase With No Summary",
+        "phase claim content must be the title when summary is blank"
+    );
+}
+
+/// Regression: improve_workflow_hierarchy must reject extractions with a blank
+/// thesis string (Some("")) before writing to the DB.
+#[sqlx::test(migrations = "../../migrations")]
+async fn improve_workflow_hierarchy_rejects_empty_thesis(pool: sqlx::PgPool) {
+    let canonical = "test-improve-hier-empty-thesis";
+
+    epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
+        &pool,
+        &parent_extraction(canonical),
+    )
+    .await
+    .expect("parent ingest");
+
+    let bad_extraction = WorkflowExtraction {
+        source: WorkflowSource {
+            canonical_name: "ignored".to_string(),
+            goal: "Test empty thesis rejection".to_string(),
+            generation: 0,
+            parent_canonical_name: None,
+            authors: vec![],
+            expected_outcome: None,
+            tags: vec![],
+            metadata: serde_json::json!({}),
+        },
+        thesis: Some(String::new()), // ← blank thesis
+        thesis_derivation: ThesisDerivation::TopDown,
+        phases: vec![Phase {
+            title: "A Phase".to_string(),
+            summary: "valid summary".to_string(),
+            steps: vec![],
+        }],
+        relationships: vec![],
+    };
+
+    let result = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
+        &pool,
+        canonical,
+        bad_extraction,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "empty thesis should be rejected before DB write"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("blank claim content") || err_msg.contains("empty"),
+        "error should describe the blank content problem; got: {err_msg}"
+    );
+}
