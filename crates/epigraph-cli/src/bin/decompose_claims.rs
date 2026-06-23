@@ -100,6 +100,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let token = token.clone();
                     async move {
                         // Canonical create via API: signing + DS + embed-on-write.
+                        // if_not_exists=true: when a prior run already decomposed
+                        // the same parent, identical atom text produces the same
+                        // content_hash. Without this flag the API returns 409;
+                        // with it, create_or_get returns the existing claim ID so
+                        // persist_decomposition can re-wire edges idempotently.
                         let resp = http
                             .post(format!("{api_base}/api/v1/claims"))
                             .bearer_auth(&token)
@@ -108,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "methodology": "inductive_generalization",
                                 "evidence_type": "logical",
                                 "confidence": 0.5,
+                                "if_not_exists": true,
                                 "labels": ["atom", format!("generality:{generality}")],
                             }))
                             .send()
