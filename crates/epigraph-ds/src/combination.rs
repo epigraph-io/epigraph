@@ -1893,6 +1893,97 @@ mod tests {
             }
         }
     }
+
+    /// Parametric sweep: adding a pure-support BBA to any mix of pure-support
+    /// BBAs never lowers BetP(TRUE).  This tests the math layer (combine_multiple
+    /// + discount) in isolation, independent of the monotonicity clamp in
+    /// auto_wire_ds_update.
+    ///
+    /// If this test fails, the combination algebra itself is broken.  If it
+    /// passes but the integration test fails, the issue is in the higher-level
+    /// discount/dispatch logic rather than in the core DST math.
+    #[test]
+    fn supporting_bba_never_lowers_betp_parametric_sweep() {
+        use crate::measures::pignistic_probability;
+        use std::collections::BTreeMap;
+        let frame = binary_frame();
+
+        // TRUE is hypothesis index 0 in the binary frame.
+        let true_idx: usize = 0;
+
+        // Pure-support BBA masses and discount alphas to sweep.
+        let support_masses: &[f64] = &[0.40, 0.55, 0.65, 0.75, 0.85, 0.93];
+        let support_alphas: &[f64] = &[0.5, 0.7, 0.85, 1.0];
+        let new_support_strengths: &[f64] = &[0.70, 0.80, 0.90, 0.93, 0.95];
+
+        let mut violations: Vec<String> = Vec::new();
+
+        for n_support in 1_usize..=3 {
+            for &sm in support_masses {
+                for &s_alpha in support_alphas {
+                    for &ns in new_support_strengths {
+                        // Build N existing pure-support BBAs: m({0})=sm, m({0,1})=1-sm.
+                        let mut existing: Vec<MassFunction> = (0..n_support)
+                            .map(|i| {
+                                // Slightly vary masses so we test heterogeneous pools.
+                                let m = (sm + 0.01 * i as f64).min(0.99);
+                                let mut masses = BTreeMap::new();
+                                masses.insert(
+                                    FocalElement::positive(std::iter::once(0).collect()),
+                                    m,
+                                );
+                                masses.insert(
+                                    FocalElement::positive([0, 1].iter().copied().collect()),
+                                    1.0 - m,
+                                );
+                                let bba = MassFunction::from_raw(frame.clone(), masses);
+                                discount(&bba, s_alpha).expect("discount existing")
+                            })
+                            .collect();
+
+                        // Combine existing BBAs to get BetP before.
+                        let combined_before = if existing.len() == 1 {
+                            existing[0].clone()
+                        } else {
+                            combine_multiple(&existing, 0.9)
+                                .expect("combine existing")
+                                .0
+                        };
+                        let betp_before = pignistic_probability(&combined_before, true_idx);
+
+                        // Build the new supporting BBA and discount it.
+                        let mut new_masses = BTreeMap::new();
+                        new_masses.insert(FocalElement::positive(std::iter::once(0).collect()), ns);
+                        new_masses.insert(
+                            FocalElement::positive([0, 1].iter().copied().collect()),
+                            1.0 - ns,
+                        );
+                        let new_bba = MassFunction::from_raw(frame.clone(), new_masses);
+                        let new_discounted = discount(&new_bba, s_alpha).expect("discount new");
+
+                        existing.push(new_discounted);
+                        let combined_after =
+                            combine_multiple(&existing, 0.9).expect("combine after").0;
+                        let betp_after = pignistic_probability(&combined_after, true_idx);
+
+                        if betp_after < betp_before - 1e-9 {
+                            violations.push(format!(
+                                "n_support={n_support} sm={sm:.2} s_alpha={s_alpha:.2} ns={ns:.2}: \
+                                 {betp_before:.6} → {betp_after:.6}",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "Pure-support BBA lowered BetP in {} scenario(s):\n{}",
+            violations.len(),
+            violations.join("\n"),
+        );
+    }
 }
 
 #[cfg(test)]

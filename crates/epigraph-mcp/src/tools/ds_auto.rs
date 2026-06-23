@@ -385,6 +385,18 @@ pub async fn auto_wire_ds_update(
             .ok()
             .flatten();
 
+    // Read current pignistic_prob for monotonicity clamp.  Supporting evidence
+    // must never lower BetP: high-conflict K between legacy mixed-format BBAs
+    // (m({0})>0 AND m({1})>0) and a new pure-support BBA can push mass to
+    // missing via Inagaki redistribution and reduce pignistic_prob even when
+    // supports=true.  We bound the result from below by the pre-addition value.
+    let prior_betp: Option<f64> =
+        sqlx::query_scalar::<_, Option<f64>>("SELECT pignistic_prob FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(None);
+
     let combined = if all_rows.len() <= 1 {
         // Single BBA — still apply discount
         let r = all_rows
@@ -418,7 +430,16 @@ pub async fn auto_wire_ds_update(
         combined
     };
 
-    let (bel, pl, betp, conflict, missing) = compute_measures(&combined);
+    let (bel, pl, mut betp, conflict, missing) = compute_measures(&combined);
+
+    // Monotonicity clamp: supports=true evidence must not lower pignistic_prob.
+    if supports {
+        if let Some(prior) = prior_betp {
+            if betp < prior {
+                betp = prior;
+            }
+        }
+    }
 
     MassFunctionRepository::update_claim_belief(
         pool,
