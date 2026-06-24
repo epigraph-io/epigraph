@@ -1708,6 +1708,10 @@ pub struct QueryTriplesParams {
     pub object: Option<String>,
     #[schemars(description = "Object entity type (optional)")]
     pub object_type: Option<String>,
+    #[schemars(
+        description = "Minimum triple confidence threshold, 0.0–1.0 (default 0.0 — no filtering)"
+    )]
+    pub min_confidence: Option<f64>,
     #[schemars(description = "Maximum results (default 20)")]
     pub limit: Option<i64>,
 }
