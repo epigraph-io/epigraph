@@ -1,0 +1,24 @@
+{
+  "scifact_id": 1128,
+  "claim": "T cell receptor /CD3 microdomains are required to induce the immunologic synapse.",
+  "evidence_sentences": [
+    "T cell receptor (TCR-CD3) triggering involves both receptor clustering and conformational changes at the cytoplasmic tails of the CD3 subunits.",
+    "This conformational change at CD3 reverts upon ligand dissociation and is required for T cell activation."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "33499189",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.4,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "T cell receptor",
+      "CD3"
+    ],
+    "conditions": [
+      "ligand dissociation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

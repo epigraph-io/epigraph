@@ -360,6 +360,35 @@ impl WorkflowRepository {
         Ok(root.map(|(id,)| id).unwrap_or(workflow_id))
     }
 
+    /// The immediate parent of a workflow variant: the `target` of its outgoing
+    /// `variant_of`/`supersedes` edge (the workflow this one was derived from).
+    /// Returns `None` for a lineage root (no such outgoing edge). One hop only —
+    /// unlike [`find_lineage_root`], which walks to the ancestral root. Matches
+    /// that method's relationship set and claim→claim typing.
+    ///
+    /// The promotion gate compares a variant against its immediate parent; this
+    /// resolves which workflow that is.
+    pub async fn immediate_variant_parent(
+        pool: &PgPool,
+        workflow_id: Uuid,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let parent: Option<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT e.target_id
+            FROM edges e
+            WHERE e.source_id = $1
+              AND e.relationship IN ('variant_of', 'supersedes')
+              AND e.source_type = 'claim' AND e.target_type = 'claim'
+            LIMIT 1
+            "#,
+        )
+        .bind(workflow_id)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(parent.map(|(id,)| id))
+    }
+
     /// For each `executes`-edge from the workflow root, walk supersedes/revises
     /// edges to the latest head claim. Mirrors the resolution logic that
     /// previously lived in `epigraph-mcp::tools::workflow_hierarchical::build_resolved_steps`.
@@ -780,6 +809,57 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn immediate_variant_parent_returns_one_hop(pool: sqlx::PgPool) {
+        let agent: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO agents (public_key, display_name) VALUES ($1, 'ivp') RETURNING id",
+        )
+        .bind(blake3::hash(b"ivp-agent").as_bytes().as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mk_claim = |content: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, uuid::Uuid>(
+                    "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
+                     VALUES ($1, sha256($1::bytea), $2, 0.5) RETURNING id",
+                )
+                .bind(content)
+                .bind(agent)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let parent = mk_claim("ivp-parent").await;
+        let variant = mk_claim("ivp-variant").await;
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+             VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'variant_of')",
+        )
+        .bind(variant)
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The variant's one-hop parent is the variant_of target.
+        assert_eq!(
+            WorkflowRepository::immediate_variant_parent(&pool, variant)
+                .await
+                .unwrap(),
+            Some(parent)
+        );
+        // A lineage root has no outgoing variant_of/supersedes edge → None.
+        assert_eq!(
+            WorkflowRepository::immediate_variant_parent(&pool, parent)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn insert_root_is_idempotent_on_canonical_generation(pool: sqlx::PgPool) {
         let id1 = uuid::Uuid::new_v4();
         WorkflowRepository::insert_root(
@@ -906,5 +986,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    /// Regression test for the improve_workflow_hierarchy embedding gap:
+    ///
+    /// When a new generation is inserted but `set_goal_embedding` is not called,
+    /// the row has NULL goal_embedding and is invisible to
+    /// `find_hierarchical_by_embedding` (filtered by WHERE goal_embedding IS NOT
+    /// NULL). Only after `set_goal_embedding` is called does the row become
+    /// searchable via the embedding path.
+    ///
+    /// This test exercises the DB-level invariant; the code fix lives in
+    /// `improve_workflow_hierarchy` (workflow_ingest.rs) which now calls
+    /// `set_goal_embedding` for every new generation it creates.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_hierarchical_by_embedding_skips_null_goal_embedding(pool: sqlx::PgPool) {
+        let gen0_id = uuid::Uuid::new_v4();
+        let gen1_id = uuid::Uuid::new_v4();
+
+        WorkflowRepository::insert_root(
+            &pool,
+            gen0_id,
+            "embed-gap-test",
+            0,
+            "Send daily digest email",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        WorkflowRepository::insert_root(
+            &pool,
+            gen1_id,
+            "embed-gap-test",
+            1,
+            "Send daily digest email with retry",
+            Some(gen0_id),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        // Unit vector in 1536-d (matches workflows.goal_embedding vector(1536)).
+        let mut qvec = vec![0.0f32; 1536];
+        qvec[0] = 1.0;
+
+        // Set embedding only on gen 0 — simulates the pre-fix state where
+        // improve_workflow_hierarchy did not call set_goal_embedding.
+        WorkflowRepository::set_goal_embedding(&pool, gen0_id, &qvec)
+            .await
+            .unwrap();
+
+        // With only gen 0 embedded, the embedding search must return exactly one
+        // row (gen 0). Gen 1 is invisible because its goal_embedding IS NULL.
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.0, 0.0, 10, true)
+                .await
+                .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "gen 1 must be invisible without goal_embedding"
+        );
+        assert_eq!(hits[0].generation, 0);
+
+        // Now set embedding on gen 1 — what the fixed improve_workflow_hierarchy does.
+        WorkflowRepository::set_goal_embedding(&pool, gen1_id, &qvec)
+            .await
+            .unwrap();
+
+        // Both generations must now be visible, and with resolve_to_latest=true
+        // (distance ASC then generation DESC) gen 1 surfaces first.
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.0, 0.0, 10, true)
+                .await
+                .unwrap();
+        assert_eq!(hits.len(), 2, "both gens visible after set_goal_embedding");
+        assert_eq!(
+            hits[0].generation, 1,
+            "higher generation surfaces first with resolve_to_latest ordering"
+        );
     }
 }

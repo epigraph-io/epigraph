@@ -1,0 +1,21 @@
+{
+  "scifact_id": 265,
+  "claim": "Clathrin stabilizes the spindle fiber apparatus during mitosis.",
+  "evidence_sentences": [
+    "Here, we show that clathrin stabilizes fibres of the mitotic spindle to aid congression of chromosomes.",
+    "Depletion of clathrin heavy chain using RNA interference prolonged mitosis; kinetochore fibres were destabilized, leading to defective congression of chromosomes to the metaphase plate and persistent activation of the spindle checkpoint.",
+    "Normal mitosis was rescued by clathrin triskelia but not the N-terminal domain of clathrin heavy chain, indicating that stabilization of kinetochore fibres was dependent on the unique structure of clathrin."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2033917",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

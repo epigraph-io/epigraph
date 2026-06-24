@@ -1,0 +1,23 @@
+{
+  "scifact_id": 645,
+  "claim": "Intake of folic acid (FA) and vitamin B6 (VB6) increases levels of homocysteine.",
+  "evidence_sentences": [
+    "CONTEXT Hyperhomocysteinemia is caused by genetic and lifestyle influences, including low intakes of folate and vitamin B6."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "12810152",
+  "enrichment": {
+    "methodology": "deductive_logic",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "folic acid",
+      "vitamin B6"
+    ],
+    "conditions": [
+      "low intakes of folate and vitamin B6"
+    ],
+    "evidence_type": "logical"
+  }
+}

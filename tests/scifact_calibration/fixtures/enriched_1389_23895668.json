@@ -1,0 +1,28 @@
+{
+  "scifact_id": 1389,
+  "claim": "mTORC2 regulates intracellular cysteine levels through xCT inhibition.",
+  "evidence_sentences": [
+    "mTORC2 phosphorylates serine 26 at the cytosolic N terminus of xCT, inhibiting its activity.",
+    "Genetic inhibition of mTORC2, or pharmacologic inhibition of the mammalian target of rapamycin (mTOR) kinase, promotes glutamate secretion, cystine uptake, and incorporation into glutathione, linking growth factor receptor signaling with amino acid uptake and utilization."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "23895668",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.88,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "glutamate",
+      "cystine",
+      "glutathione",
+      "rapamycin"
+    ],
+    "conditions": [
+      "genetic inhibition of mTORC2",
+      "pharmacologic inhibition of mTOR kinase",
+      "phosphorylation of serine 26 at cytosolic N terminus of xCT"
+    ],
+    "evidence_type": "empirical"
+  }
+}

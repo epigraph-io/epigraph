@@ -2,7 +2,7 @@
 
 use rmcp::model::*;
 
-use crate::errors::{internal_error, McpError};
+use crate::errors::{internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto;
 use crate::types::*;
@@ -12,7 +12,9 @@ use epigraph_core::{
     TruthValue,
 };
 use epigraph_crypto::ContentHasher;
-use epigraph_db::{ClaimRepository, EvidenceRepository, ReasoningTraceRepository};
+use epigraph_db::{ClaimRepository, EvidenceRepository, HybridHit, ReasoningTraceRepository};
+
+use crate::embed::HYBRID_RRF_K;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -132,48 +134,153 @@ pub async fn memorize(
     })
 }
 
+/// Parse the optional `agent_id` recall scope filter. A present-but-invalid
+/// UUID is an ERROR, never a silently dropped filter — silently ignoring it
+/// would widen recall to every agent (a scope bypass) while the caller
+/// believes the results are scoped. Blank/whitespace is treated as absent.
+fn parse_agent_filter(raw: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => uuid::Uuid::parse_str(s)
+            .map(Some)
+            .map_err(|e| format!("invalid agent_id {s:?}: {e}")),
+    }
+}
+
 pub async fn recall(
     server: &EpiGraphMcpFull,
     params: RecallParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let min_truth = params.min_truth.unwrap_or(0.3);
+    let agent_filter = parse_agent_filter(params.agent_id.as_deref()).map_err(invalid_params)?;
+    let tags = params.tags;
+    let tags_opt: Option<&[String]> = if tags.is_empty() { None } else { Some(&tags) };
 
-    // Try semantic search first
-    let results = if let Ok(hits) = server.embedder.search(&params.query, limit).await {
-        let mut results = Vec::new();
-        for (claim_id, similarity) in hits {
-            if let Ok(Some(claim)) =
-                ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id)).await
-            {
-                let tv = claim.truth_value.value();
-                if tv >= min_truth {
-                    results.push(RecallResult {
-                        claim_id: claim_id.to_string(),
-                        content: claim.content,
-                        truth_value: tv,
-                        similarity,
-                    });
-                }
-            }
-        }
-        results
-    } else {
-        // Fallback to text search
-        let claims = ClaimRepository::list(&server.pool, limit, 0, Some(&params.query))
+    // Resolve the optional (frame, perspective) lens up front (both-or-neither,
+    // parse, existence) so the bulk retrieval / ranking / min_truth path — all
+    // unchanged on the global truth_value — is never entered with a bad lens,
+    // and the existence round-trips run ONCE, not per claim.
+    let lens = crate::tools::lens::resolve_lens(
+        params.frame_id.as_deref(),
+        params.perspective_id.as_deref(),
+    )?;
+    if let Some((frame_id, perspective_id)) = lens {
+        crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
+    }
+
+    // Hybrid retrieval: dense (claims.embedding) + lexical (content_tsv), RRF-fused.
+    // On embedder failure, degrade to lexical-only — which, unlike the old ILIKE
+    // fallback, still honors tag/agent scope because it filters in SQL.
+    let hits: Vec<HybridHit> = match server
+        .embedder
+        .search_hybrid_scoped(&params.query, limit, tags_opt, agent_filter)
+        .await
+    {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                query = %params.query,
+                "recall: hybrid embed leg failed; serving scope-honoring lexical-only"
+            );
+            ClaimRepository::search_lexical_scoped(
+                &server.pool,
+                &params.query,
+                HYBRID_RRF_K,
+                limit,
+                tags_opt,
+                agent_filter,
+            )
             .await
-            .map_err(internal_error)?;
-        claims
-            .into_iter()
-            .filter(|c| c.truth_value.value() >= min_truth)
-            .map(|c| RecallResult {
-                claim_id: c.id.as_uuid().to_string(),
-                content: c.content,
-                truth_value: c.truth_value.value(),
-                similarity: 0.0,
-            })
-            .collect()
+            .map_err(internal_error)?
+        }
     };
 
+    let mut results = Vec::new();
+    for hit in hits {
+        if let Ok(Some(claim)) =
+            ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(hit.claim_id)).await
+        {
+            let tv = claim.truth_value.value();
+            if tv >= min_truth {
+                let mut matched_via = Vec::new();
+                if hit.dense_similarity.is_some() {
+                    matched_via.push("dense".to_string());
+                }
+                if hit.in_lexical {
+                    matched_via.push("lexical".to_string());
+                }
+
+                // Additive lensed belief per returned claim. Degrade-not-fail:
+                // a compute error for ONE claim yields null + a warn, never an
+                // aborted page (spec §8). min_truth/ranking stay on `tv`.
+                let lensed_belief = match lens {
+                    Some((frame_id, perspective_id)) => {
+                        match epigraph_engine::belief_query::get_perspective_belief(
+                            &server.pool,
+                            hit.claim_id,
+                            frame_id,
+                            perspective_id,
+                        )
+                        .await
+                        {
+                            Ok(interval) => Some(LensedBelief::from_interval(
+                                frame_id,
+                                perspective_id,
+                                &interval,
+                            )),
+                            Err(e) => {
+                                tracing::warn!(
+                                    claim_id = %hit.claim_id,
+                                    error = %e,
+                                    "lensed belief compute failed; serving null lens for this claim"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+
+                results.push(RecallResult {
+                    claim_id: hit.claim_id.to_string(),
+                    content: claim.content,
+                    truth_value: tv,
+                    similarity: hit.dense_similarity.unwrap_or(0.0),
+                    rrf_score: hit.rrf_score,
+                    matched_via,
+                    lensed_belief,
+                });
+            }
+        }
+    }
+
     success_json(&results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_agent_filter_none_or_blank_is_unscoped() {
+        assert_eq!(parse_agent_filter(None).unwrap(), None);
+        assert_eq!(parse_agent_filter(Some("")).unwrap(), None);
+        assert_eq!(parse_agent_filter(Some("   ")).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_agent_filter_accepts_valid_uuid() {
+        let u = uuid::Uuid::new_v4();
+        assert_eq!(parse_agent_filter(Some(&u.to_string())).unwrap(), Some(u));
+    }
+
+    #[test]
+    fn parse_agent_filter_rejects_bad_uuid_instead_of_silently_dropping() {
+        // A present-but-invalid agent_id MUST error. Silently returning None
+        // would widen recall to every agent while the caller believes the
+        // results are scoped — a scope bypass.
+        assert!(parse_agent_filter(Some("not-a-uuid")).is_err());
+    }
 }

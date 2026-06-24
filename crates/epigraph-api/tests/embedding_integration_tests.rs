@@ -222,6 +222,7 @@ fn test_builder_pattern_preserves_state() {
     let state = AppState::new(ApiConfig {
         require_signatures: true,
         max_request_size: 2048,
+        public_base_url: "http://localhost:8080".to_string(),
     })
     .with_embedding_service(service)
     .with_rate_limiter(rate_limiter);

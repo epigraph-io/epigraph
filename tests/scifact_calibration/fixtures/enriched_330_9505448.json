@@ -1,0 +1,24 @@
+{
+  "scifact_id": 330,
+  "claim": "Deltex has no known interactions with eIF3f.",
+  "evidence_sentences": [
+    "We also show that eIF3f is recruited to activated Notch on endocytic vesicles by the putative E3 ubiquitin ligase Deltex1, which serves as a bridging factor."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "9505448",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "eIF3f",
+      "Deltex1",
+      "Notch"
+    ],
+    "conditions": [
+      "endocytic vesicles"
+    ],
+    "evidence_type": "empirical"
+  }
+}

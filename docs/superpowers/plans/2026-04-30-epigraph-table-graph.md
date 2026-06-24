@@ -20,8 +20,10 @@
 - `crates/epigraph-tools/examples/table_graph/dossier.rs` — DDL/git/grep/FK dossier builder
 - `crates/epigraph-tools/examples/table_graph/llm.rs` — Claude CLI invoker + Markdown rendering
 - `crates/epigraph-tools/examples/table_graph/ingest.rs` — extract-claims + ingest_document driver
+- `crates/epigraph-tools/examples/table_graph/extract.rs` — extract subcommand orchestrator (separate from `dossier.rs` because `dossier.rs` is `#[path]`-included into the integration test crate, where sibling modules `discover` and `llm` are not visible)
 - `crates/epigraph-tools/examples/table_graph/types.rs` — shared structs (`Dossier`, `StagingFile`)
 - `crates/epigraph-tools/tests/table_graph_dossier_tests.rs` — unit tests on dossier components
+- `crates/epigraph-tools/tests/table_graph_discover_tests.rs` — discovery integration tests (episcience cases marked `#[ignore]` because the upstream repo is not present in CI)
 - `docs/superpowers/artifacts/2026-04-30-table-graph/.gitkeep` — directory marker
 - `docs/superpowers/artifacts/2026-04-30-table-graph/README.md` — describes contents
 - `docs/superpowers/artifacts/2026-04-30-table-graph/code-graph-extractor.pubkey` — Ed25519 public key (committed)
@@ -42,6 +44,7 @@
 - Create: `crates/epigraph-tools/examples/table_graph/dossier.rs` (stub)
 - Create: `crates/epigraph-tools/examples/table_graph/llm.rs` (stub)
 - Create: `crates/epigraph-tools/examples/table_graph/ingest.rs` (stub)
+- Create: `crates/epigraph-tools/examples/table_graph/extract.rs` (stub — owns `pub fn run(only: Option<&str>) -> Result<()>` for the extract subcommand; does not live in `dossier.rs` because the integration tests `#[path]`-include `dossier.rs` and would fail to resolve sibling `discover`/`llm` modules)
 
 - [ ] **Step 1.1: New worktree**
 
@@ -277,9 +280,7 @@ echo "<paste-hex-pubkey-from-step-2.1>" > docs/superpowers/artifacts/2026-04-30-
 
 - [ ] **Step 2.3: Document agent registration**
 
-The MCP server auto-registers an agent on first signed request via `crates/epigraph-mcp/src/server.rs::agent_id` (which calls `AgentRepository::get_by_public_key`, then `Agent::new(pub_key, Some("code-graph-extractor".to_string()))` if not found). No explicit registration call is needed; the first ingestion call creates the agent row keyed on this public key.
-
-If `agent_id` does not auto-create with that label string, ASK before continuing — registration may need a different path on the current main.
+The MCP server auto-registers an agent on first signed request via `crates/epigraph-mcp/src/server.rs::agent_id` (which calls `AgentRepository::get_by_public_key`, then constructs an `Agent` if not found). **Important:** the label is hard-coded to `"mcp-agent"` in `server.rs` — there is no path that mints a row labeled `code-graph-extractor`. The pinned pubkey still serves as documentation of which key is meant to be used for this work, but downstream filters MUST discriminate via the synthetic DOI prefix `urn:epigraph-table:` (and/or claim labels), NOT via the agent label.
 
 - [ ] **Step 2.4: Commit the public key**
 
@@ -903,7 +904,6 @@ Replace `llm.rs`:
 
 use crate::types::*;
 use anyhow::{anyhow, Context, Result};
-use std::io::Write;
 use std::process::{Command, Stdio};
 
 const MD_INSTRUCTIONS: &str = r#"
@@ -971,50 +971,74 @@ pub fn build_prompt(d: &Dossier) -> String {
 }
 
 /// Strip an optional ```markdown ... ``` code fence and any leading prose.
+/// Prefers a `# Table` header over a generic ``` fence, because real narrative
+/// output contains an inner ```sql``` block that would otherwise be matched first.
 pub fn extract_md(text: &str) -> Result<String> {
     if let Some(start) = text.find("```markdown") {
         let after = &text[start + "```markdown".len()..];
         let end = after.find("```").ok_or_else(|| anyhow!("unterminated code fence"))?;
         return Ok(after[..end].trim().to_string());
     }
+    if let Some(start) = text.find("# Table") {
+        return Ok(text[start..].trim().to_string());
+    }
     if let Some(start) = text.find("```") {
         let after = &text[start + 3..];
         let end = after.find("```").ok_or_else(|| anyhow!("unterminated code fence"))?;
         return Ok(after[..end].trim().to_string());
     }
-    let start = text.find("# Table").ok_or_else(|| anyhow!("no '# Table' header"))?;
-    Ok(text[start..].trim().to_string())
+    Err(anyhow!("no '# Table' header or code fence"))
 }
 
-pub fn invoke_claude(prompt: &str) -> Result<String> {
-    let mut child = Command::new("claude")
-        .args(["-p", "--output-format", "json", "--model", "claude-sonnet-4-6"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawn claude CLI")?;
-    child.stdin.as_mut().expect("stdin").write_all(prompt.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        return Err(anyhow!("claude CLI failed: {}", String::from_utf8_lossy(&out.stderr)));
+// File-based nested-CLI pattern. The `result` field of `claude -p
+// --output-format json` is empty when the orchestrator is itself a Claude
+// session (see `feedback_nested_cli.md`), so we instruct the subprocess to
+// Write the narrative to a known path and poll for it.
+pub fn invoke_claude(prompt: &str, result_path: &std::path::Path) -> Result<String> {
+    use std::time::{Duration, Instant};
+    if let Some(parent) = result_path.parent() {
+        std::fs::create_dir_all(parent).context("create result_path parent")?;
     }
-    let stdout = String::from_utf8(out.stdout)?;
-    let envelope: serde_json::Value = serde_json::from_str(&stdout)
-        .context("claude CLI stdout not JSON")?;
-    let text = envelope.get("result").and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("empty result; stdout: {}", stdout))?;
-    Ok(text.to_string())
+    if result_path.exists() { std::fs::remove_file(result_path).ok(); }
+
+    let wrapped = format!(
+        "{prompt}\n\n---\n\nWhen you have produced the Markdown document, use the Write tool to save it to:\n\n    {path}\n\nWrite ONLY the Markdown document to that file (no preamble, no postamble, no surrounding code fence). Do not print the document to the chat.\n",
+        prompt = prompt, path = result_path.display(),
+    );
+
+    let status = Command::new("claude")
+        .args(["-p", "--dangerously-skip-permissions", "--model", "claude-sonnet-4-6"])
+        .arg(&wrapped)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("spawn claude CLI")?;
+    if !status.success() {
+        return Err(anyhow!("claude CLI exited non-zero (status {})", status));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !result_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !result_path.exists() {
+        return Err(anyhow!("claude exited successfully but did not write {}", result_path.display()));
+    }
+    std::fs::read_to_string(result_path)
+        .with_context(|| format!("read result file {}", result_path.display()))
 }
 
 /// Run claude once with a retry on parse failure.
 pub fn extract(d: &Dossier) -> Result<String> {
+    let result_dir = std::path::PathBuf::from(
+        "docs/superpowers/artifacts/2026-04-30-table-graph/staging/llm-out");
+    let result_path = result_dir.join(format!("{}.{}.md", d.table.repo, d.table.name));
     let prompt = build_prompt(d);
-    let raw = invoke_claude(&prompt)?;
+    let raw = invoke_claude(&prompt, &result_path)?;
     if let Ok(md) = extract_md(&raw) { return Ok(md); }
     let strict = format!("Respond with ONLY the Markdown document (no prose, no fences).\n\n{}", prompt);
-    let raw = invoke_claude(&strict)?;
+    let raw = invoke_claude(&strict, &result_path)?;
     extract_md(&raw)
 }
 ```
@@ -1135,9 +1159,10 @@ git commit -am "feat(table_graph): wire extract subcommand"
 
 `extract-claims` is a Claude skill at `.claude/skills/extract-claims/SKILL.md` and `ingest_document` is an MCP tool — both Claude-mediated, neither has a headless CLI subcommand. The orchestration happens inside a `claude -p` subprocess per table:
 
-- For each narrative MD, invoke `claude -p --output-format json` with a prompt instructing the session to (1) run extract-claims on the MD, (2) write the resulting `DocumentExtraction` JSON to a known path, (3) call `mcp__epigraph__ingest_document` with that path + the synthetic DOI.
-- Claims will be authored by whatever signer the system MCP server uses (NOT the pre-registered `code-graph-extractor` agent — that row stays orphan, harmless). Discrimination of synthetic claims is via labels (`code-shape`, `table-purpose`, `call-site`, `fk-relationship`) and the synthetic DOI prefix `urn:epigraph-table:`.
-- Forget/regen workflow: `DELETE FROM claims WHERE labels @> ARRAY['code-shape']` (or via the API equivalent if added later).
+- For each narrative MD, invoke `claude -p --dangerously-skip-permissions` with a prompt instructing the session to (1) run extract-claims on the MD, (2) write the resulting `DocumentExtraction` JSON to a known path, (3) call `mcp__epigraph__ingest_document` with that path + the synthetic DOI. The orchestrator MUST keep the worktree as the current working directory because `mcp__epigraph__ingest_document` enforces a CWD-containment check on `file_path` (see `crates/epigraph-mcp/src/tools/ingestion.rs`).
+- Claims will be authored by whatever signer the system MCP server uses. The MCP server hard-codes the auto-registered agent label as `mcp-agent` — there is NO row labeled `code-graph-extractor`. The pinned pubkey is documentation; downstream filters MUST discriminate via the synthetic DOI prefix `urn:epigraph-table:` on the source paper.
+- The `extract-claims` skill emits claims with empty `labels` arrays regardless of MD-side hints, so labels-based filtering does not work. Don't rely on `code-shape`, `table-purpose`, `call-site`, or `fk-relationship` labels.
+- Forget/regen workflow: use the EpiGraph paper-deletion API filtered on `doi LIKE 'urn:epigraph-table:%'` to remove the per-table papers (which removes their edges and orphan claims). Don't `psql DELETE` claims/edges directly — that's a project-wide rule (see `feedback_no_raw_sql.md`).
 
 - [ ] **Step 11.2: Implement `run` and `verify`**
 
@@ -1204,7 +1229,12 @@ Report only the ingest_document tool result.",
             md = md_abs.display(), json = extraction_abs.display(), doi = doi);
 
         let status = Command::new("claude")
-            .args(["-p", "--output-format", "json"])
+            .args([
+                "-p",
+                "--output-format",
+                "json",
+                "--dangerously-skip-permissions",
+            ])
             .arg(&prompt)
             .status()?;
         if !status.success() {
@@ -1229,9 +1259,9 @@ fn log_fail(path: &str, table: &str, stage: &str) -> Result<()> {
 pub fn verify() -> Result<()> {
     eprintln!("Verification — manual queries to run against EpiGraph:");
     eprintln!();
-    eprintln!("1. Coverage — count purpose claims:");
-    eprintln!("   recall query (filter labels = ['code-shape', 'table-purpose']):");
-    eprintln!("   expected: ~85 purpose claims");
+    eprintln!("1. Coverage — count per-table papers:");
+    eprintln!("   psql ... -c \"SELECT count(*) FROM papers WHERE doi LIKE 'urn:epigraph-table:%';\"");
+    eprintln!("   expected: ~85 papers (one per table)");
     eprintln!();
     eprintln!("2. Recall — semantic queries should surface the right table:");
     eprintln!("   recall \"what stores DST mass functions\"  → mass_functions purpose claim");
@@ -1262,23 +1292,29 @@ cd /home/jeremy/epigraph-wt-table-graph && cargo run -p epigraph-tools --example
 
 Expected: a single `claude -p` subprocess runs, performs extract-claims internally, calls ingest_document, prints "1 ok, 0 failed".
 
-Authorship: claims will be authored by the system MCP server's signer (whatever the running `/usr/local/bin/epigraph-mcp` was started with), not by `code-graph-extractor`. Discrimination is via labels (`code-shape`, `table-purpose`, etc.) and the synthetic DOI prefix.
+**Working directory matters.** `mcp__epigraph__ingest_document` enforces a CWD-containment check on the `file_path` it's handed (see `crates/epigraph-mcp/src/tools/ingestion.rs`). The orchestrator inherits the parent's CWD — keep the worktree (`/home/jeremy/epigraph-wt-table-graph`) as the current directory before invoking `cargo run -- ingest`, and don't `cd` to a sibling repo inside the prompt. The result-file paths are absolute (canonicalized in `ingest.rs`), but the MCP tool still rejects paths outside the active CWD.
 
-- [ ] **Step 11.5: Verify the agent and a claim landed**
+Authorship: claims will be authored by the system MCP server's signer (whatever the running `/usr/local/bin/epigraph-mcp` was started with), not by `code-graph-extractor` (the auto-registered agent label is hard-coded to `mcp-agent`). Discrimination is solely via the synthetic DOI prefix `urn:epigraph-table:` on the source paper, since `extract-claims` emits empty `labels` arrays.
 
-```bash
-psql "postgres://epigraph:epigraph@localhost:5432/epigraph" \
-  -c "SELECT id, label FROM agents WHERE label = 'code-graph-extractor';"
-```
+- [ ] **Step 11.5: Verify a paper and at least one claim landed**
 
-Expected: one row.
+The MCP server hard-codes the auto-registered agent label as `mcp-agent` (see `crates/epigraph-mcp/src/server.rs::agent_id`) — there is no row labeled `code-graph-extractor`. Don't filter on agent label. The `extract-claims` skill also emits claims with empty `labels` arrays regardless of any MD-side hints, so labels-based filtering does not work either. Discriminate via the synthetic DOI prefix.
 
 ```bash
 psql "postgres://epigraph:epigraph@localhost:5432/epigraph" \
-  -c "SELECT id, content FROM claims WHERE labels @> ARRAY['code-shape']::text[] LIMIT 3;"
+  -c "SELECT id, doi FROM papers WHERE doi LIKE 'urn:epigraph-table:%' LIMIT 3;"
 ```
 
-Expected: at least one claim, content mentions table `frames`.
+Expected: at least one row.
+
+```bash
+psql "postgres://epigraph:epigraph@localhost:5432/epigraph" \
+  -c "SELECT count(DISTINCT e.target_id)
+        FROM edges e JOIN papers p ON p.id = e.source_id
+        WHERE p.doi LIKE 'urn:epigraph-table:%' AND e.relationship = 'asserts';"
+```
+
+Expected: ≥ 1 (claim count linked from per-table papers).
 
 - [ ] **Step 11.6: Commit**
 
@@ -1300,32 +1336,37 @@ Once a full extract + ingest run completes, the manual `verify` print can be rep
 Replace the `verify` function in `ingest.rs`:
 
 ```rust
+// Filter by synthetic DOI prefix on `papers`, NOT by claim labels.
+// The extract-claims skill emits claims with empty `labels`, so labels
+// filters return zero rows. Per-table papers are joined to claims via
+// edges (source_id = paper.id, relationship = 'asserts').
 pub fn verify() -> Result<()> {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://epigraph:epigraph@localhost:5432/epigraph".into());
-    let purpose_count = std::process::Command::new("psql")
-        .arg(&url).arg("-tAc")
-        .arg("SELECT count(*) FROM claims WHERE labels @> ARRAY['code-shape', 'table-purpose']::text[]")
-        .output()?;
-    let count: i64 = String::from_utf8_lossy(&purpose_count.stdout).trim().parse().unwrap_or(0);
-    eprintln!("Coverage: {} purpose claims (expected ~85)", count);
 
-    let zero_callsite = std::process::Command::new("psql")
-        .arg(&url).arg("-tAc")
-        .arg(r#"
-            SELECT properties->>'table' FROM claims c
-            WHERE labels @> ARRAY['code-shape', 'table-purpose']::text[]
-              AND NOT EXISTS (
-                  SELECT 1 FROM edges e
-                  WHERE e.source_id = c.id AND e.relationship = 'decomposes_to'
-              )
-        "#)
-        .output()?;
-    let names = String::from_utf8_lossy(&zero_callsite.stdout);
-    let lines: Vec<&str> = names.lines().filter(|l| !l.is_empty()).collect();
-    if !lines.is_empty() {
-        eprintln!("Tables with no decomposes_to children ({}): {}",
-            lines.len(), lines.join(", "));
+    let papers = run_psql(&url,
+        "SELECT count(*) FROM papers WHERE doi LIKE 'urn:epigraph-table:%'")?;
+    eprintln!("Coverage: {} papers ingested with DOI prefix urn:epigraph-table: (expected ~85)",
+        papers.trim());
+
+    let total_claims = run_psql(&url, "
+        SELECT count(DISTINCT e.target_id) FROM edges e
+        JOIN papers p ON p.id = e.source_id
+        WHERE p.doi LIKE 'urn:epigraph-table:%' AND e.relationship = 'asserts'
+    ")?;
+    eprintln!("Total claims linked from per-table papers: {}", total_claims.trim());
+
+    let zero = run_psql(&url, "
+        SELECT p.doi FROM papers p
+        WHERE p.doi LIKE 'urn:epigraph-table:%'
+          AND NOT EXISTS (
+              SELECT 1 FROM edges e WHERE e.source_id = p.id AND e.relationship = 'asserts'
+          )
+    ")?;
+    let zero_lines: Vec<&str> = zero.lines().filter(|l| !l.trim().is_empty()).collect();
+    if !zero_lines.is_empty() {
+        eprintln!("WARNING: {} per-table papers have no asserts edges:", zero_lines.len());
+        for l in &zero_lines { eprintln!("  {}", l); }
     }
 
     eprintln!();
@@ -1334,6 +1375,17 @@ pub fn verify() -> Result<()> {
     eprintln!("  recall \"belief frame definition\"         → frames");
     eprintln!("  recall \"harvester audit reports\"         → harvester_audit_reports");
     Ok(())
+}
+
+fn run_psql(url: &str, sql: &str) -> Result<String> {
+    let out = std::process::Command::new("psql")
+        .arg(url).arg("-tAc").arg(sql)
+        .output()
+        .with_context(|| "psql invocation failed")?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!("psql failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(String::from_utf8(out.stdout)?)
 }
 ```
 
@@ -1363,19 +1415,19 @@ git push -u origin feat/table-graph
 - [ ] **Step 13.2: Open PR**
 
 ```bash
-gh pr create --title "feat: table-graph extraction binary, ingested as code-shape claims" --body "$(cat <<'EOF'
+gh pr create --title "feat: table-graph extraction binary, per-table papers via DOI prefix" --body "$(cat <<'EOF'
 ## Summary
 - New example binary `crates/epigraph-tools/examples/table_graph/` that discovers tables, builds dossiers, runs Claude CLI extraction, and ingests structured narratives via `extract-claims` + `ingest_document`
-- Authored by a dedicated `code-graph-extractor` agent (Ed25519 signer keypair)
+- Per-table papers are discriminated by the synthetic DOI prefix `urn:epigraph-table:` (NOT by an agent label — the MCP server hard-codes the auto-registered label as `mcp-agent`)
 - Schema only — no row data; no schema/API changes
 - Spec at `docs/superpowers/specs/2026-04-30-epigraph-table-graph-design.md`
 
 ## Test plan
 - [x] Unit tests pass: `cargo test -p epigraph-tools`
-- [x] Discover lists ~85 tables, 18 crates
-- [x] Single-table extract produces a structured Markdown narrative
-- [x] Single-table ingest creates the `code-graph-extractor` agent and a purpose claim with `decomposes_to` children
-- [x] Verify reports purpose-claim coverage
+- [x] Discover lists ~85 tables, 18 crates (epigraph-side; episcience cases marked `#[ignore]` because the upstream repo isn't checked out in CI)
+- [x] Single-table extract produces a structured Markdown narrative (uses the file-based nested-CLI pattern: subprocess Writes the narrative to a result file, orchestrator polls)
+- [x] Single-table ingest creates a per-table `paper` with `urn:epigraph-table:` DOI and at least one asserted claim
+- [x] Verify reports paper count and per-table claim coverage via DOI-prefix queries
 EOF
 )"
 ```

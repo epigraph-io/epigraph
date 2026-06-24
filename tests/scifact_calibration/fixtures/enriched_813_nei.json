@@ -1,0 +1,16 @@
+{
+  "scifact_id": 813,
+  "claim": "Mutations in G-Beta protein GNB1 are present in many cancers, resulting in loss of interaction with G-alpha subunits and concomitant activation of AKT pathway.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

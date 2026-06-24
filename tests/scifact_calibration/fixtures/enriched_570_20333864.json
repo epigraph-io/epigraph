@@ -1,0 +1,26 @@
+{
+  "scifact_id": 570,
+  "claim": "In breast cancer, the loss of myoepithelial cells promotes the transition of ductal carcinoma in situ to invasive carcinoma.",
+  "evidence_sentences": [
+    "Progression to invasion was promoted by fibroblasts and inhibited by normal myoepithelial cells.",
+    "Molecular profiles of isolated luminal epithelial and myoepithelial cells identified an intricate interaction network involving TGFbeta, Hedgehog, cell adhesion, and p63 required for myoepithelial cell differentiation, the elimination of which resulted in loss of myoepithelial cells and progression to invasion."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "20333864",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "TGFbeta",
+      "Hedgehog"
+    ],
+    "conditions": [
+      "isolated luminal epithelial cells",
+      "isolated myoepithelial cells",
+      "elimination of myoepithelial cell differentiation network"
+    ],
+    "evidence_type": "empirical"
+  }
+}

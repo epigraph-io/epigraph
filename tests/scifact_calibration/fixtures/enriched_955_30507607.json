@@ -1,0 +1,26 @@
+{
+  "scifact_id": 955,
+  "claim": "Pioneer factor OCT3/4 interacts with major chromatin remodeling factors.",
+  "evidence_sentences": [
+    "Subsequent purification of Oct4 partners Sall4, Tcfcp2l1, Dax1, and Esrrb resulted in an Oct4 interactome of 166 proteins, including transcription factors and chromatin-modifying complexes with documented roles in self-renewal, but also many factors not previously associated with the ESC network."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "30507607",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.72,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Sall4",
+      "Tcfcp2l1",
+      "Dax1",
+      "Esrrb",
+      "Oct4"
+    ],
+    "conditions": [
+      "affinity purification of Oct4 partners"
+    ],
+    "evidence_type": "empirical"
+  }
+}

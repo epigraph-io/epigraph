@@ -34,6 +34,7 @@ fn config() -> ApiConfig {
     ApiConfig {
         require_signatures: false,
         max_request_size: 1024 * 1024,
+        public_base_url: "https://test.example".to_string(),
     }
 }
 
@@ -57,6 +58,8 @@ fn google_cfg() -> ProviderConfig {
         redirect_uri_env: None,
         auto_provision: true,
         default_scopes: vec![],
+        allowed_emails: vec![],
+        allowed_domains: vec![],
     }
 }
 
@@ -78,6 +81,8 @@ fn cf_cfg() -> ProviderConfig {
         redirect_uri_env: None,
         auto_provision: true,
         default_scopes: vec![],
+        allowed_emails: vec![],
+        allowed_domains: vec![],
     }
 }
 

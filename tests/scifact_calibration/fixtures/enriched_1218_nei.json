@@ -1,0 +1,16 @@
+{
+  "scifact_id": 1218,
+  "claim": "The first MBT repeat of the four malignant brain tumor (4MBT) domain of Drosophila's Sfmbt and of the orthologous mammalian L3MBTL2 is required for the interaction with the spacer region of Drosophila's Pleiohomeotic (Pho) or its human ortholog YY1.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

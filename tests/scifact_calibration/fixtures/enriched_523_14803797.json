@@ -1,0 +1,27 @@
+{
+  "scifact_id": 523,
+  "claim": "Higher plasma levels of I-carnitine, when associated with trimethylamine N-oxide, are negatively correlated with cardiovascular events in humans.",
+  "evidence_sentences": [
+    "We demonstrate here that metabolism by intestinal microbiota of dietary L-carnitine, a trimethylamine abundant in red meat, also produces TMAO and accelerates atherosclerosis in mice.",
+    "Chronic dietary L-carnitine supplementation in mice altered cecal microbial composition, markedly enhanced synthesis of TMA and TMAO, and increased atherosclerosis, but this did not occur if intestinal microbiota was concurrently suppressed."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "14803797",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.65,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "L-carnitine",
+      "trimethylamine N-oxide",
+      "trimethylamine"
+    ],
+    "conditions": [
+      "chronic dietary L-carnitine supplementation",
+      "intestinal microbiota suppression",
+      "mouse model"
+    ],
+    "evidence_type": "empirical"
+  }
+}

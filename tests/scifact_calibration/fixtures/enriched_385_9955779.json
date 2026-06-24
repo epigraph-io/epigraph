@@ -1,0 +1,23 @@
+{
+  "scifact_id": 385,
+  "claim": "Epigenetic modulating agents (EMAs) modulate antitumor immune response in a cancer model system.",
+  "evidence_sentences": [
+    "Use of this combination treatment schema in mouse models of NSCLC reverses tumor immune evasion and modulates T cell exhaustion state towards memory and effector T cell phenotypes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9955779",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "epigenetic modulating agents"
+    ],
+    "conditions": [
+      "mouse models of NSCLC",
+      "combination treatment schema"
+    ],
+    "evidence_type": "empirical"
+  }
+}

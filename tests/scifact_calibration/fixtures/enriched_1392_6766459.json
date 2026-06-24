@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1392,
+  "claim": "miR-142-5P is a temperature-sensitive microRNA (miRNA).",
+  "evidence_sentences": [
+    "Reduced RBM3 expression resulted in increased expression of RBM3-targeted temperature-sensitive miRNAs, we termed thermomiRs.",
+    "ThermomiRs such as miR-142-5p and miR-143 in turn target endogenous pyrogens including IL-6, IL6ST, TLR2, PGE2 and TNF to complete a negative feedback mechanism, which may be crucial to prevent pathological hyperthermia."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6766459",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

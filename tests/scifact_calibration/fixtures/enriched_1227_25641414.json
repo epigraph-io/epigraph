@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1227,
+  "claim": "The mean suicide rate in women is higher after miscarriage than live birth.",
+  "evidence_sentences": [
+    "The suicide rate associated with birth was significantly lower (5.9) and the rates associated with miscarriage (18.1) and induced abortion (34.7) were significantly higher than in the population."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "25641414",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

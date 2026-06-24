@@ -5,10 +5,25 @@ use epigraph_embeddings::{
 };
 use sqlx::PgPool;
 
+/// Per-leg candidate pool size before RRF fusion in hybrid recall.
+pub const HYBRID_CANDIDATE_POOL: i64 = 50;
+/// Reciprocal Rank Fusion constant `k` (canonical default 60).
+pub const HYBRID_RRF_K: i64 = 60;
+
 pub struct McpEmbedder {
     api_key: Option<String>,
     pool: PgPool,
     http: reqwest::Client,
+}
+
+/// Whether an OpenAI API key string is unusable for embedding generation:
+/// absent, empty, or the literal `"mock"`. Mirrors the disabled-condition that
+/// `generate`/`generate_at_dim` apply inline (`.filter(|k| !k.is_empty() && *k
+/// != "mock")`); `embeddings_disabled` delegates here so the backfill guard and
+/// the generate path agree. Kept free-standing so it is unit-testable without a
+/// `PgPool`.
+fn key_disabled(key: Option<&str>) -> bool {
+    !matches!(key, Some(k) if !k.is_empty() && k != "mock")
 }
 
 /// Map a centroid dimension to the OpenAI model that produces it.
@@ -37,6 +52,17 @@ impl McpEmbedder {
         self.api_key.is_none()
     }
 
+    /// True when no usable API key is configured, so `generate`/`generate_at_dim`
+    /// will reject every call. Mirrors their disabled-condition exactly — a
+    /// `None`, empty, or literal `"mock"` key — so batch callers (e.g.
+    /// `backfill_embeddings`) can fail loudly up front instead of churning a
+    /// whole batch into all-failed. Stricter than [`is_mock`](Self::is_mock),
+    /// which only catches the `None` case.
+    #[must_use]
+    pub fn embeddings_disabled(&self) -> bool {
+        key_disabled(self.api_key.as_deref())
+    }
+
     /// Generate an embedding vector without storing it.
     ///
     /// Returns the raw `Vec<f32>` from OpenAI. Callers can format it
@@ -48,8 +74,18 @@ impl McpEmbedder {
             .filter(|k| !k.is_empty() && *k != "mock")
             .ok_or_else(|| "embeddings disabled (no API key)".to_string())?;
 
-        generate_openai_embedding_with_model(&self.http, api_key, text, "text-embedding-3-small")
-            .await
+        // Truncate the EMBEDDING INPUT only to the OpenAI model's 8191-token limit;
+        // the stored claim content stays full verbatim. Verbatim_v2 paragraph
+        // nodes can carry whole sections that exceed the embedding context — an
+        // over-limit request 400s, so clip here rather than drop the embedding.
+        let truncated = truncate_embedding_input(text);
+        generate_openai_embedding_with_model(
+            &self.http,
+            api_key,
+            &truncated,
+            "text-embedding-3-small",
+        )
+        .await
     }
 
     /// Generate an embedding at the requested dimension by selecting the right
@@ -64,7 +100,10 @@ impl McpEmbedder {
         let model = model_for_dim(dim)
             .ok_or_else(|| format!("unsupported centroid_dim: {dim} (must be 1536 or 3072)"))?;
 
-        generate_openai_embedding_with_model(&self.http, api_key, text, model).await
+        // Truncate the embedding input to the model token limit (stored content
+        // is untouched); see `generate` for the verbatim-spine rationale.
+        let truncated = truncate_embedding_input(text);
+        generate_openai_embedding_with_model(&self.http, api_key, &truncated, model).await
     }
 
     /// Generate embedding and store it for a claim. Returns true if embedding succeeded.
@@ -94,20 +133,68 @@ impl McpEmbedder {
         }
     }
 
-    /// Search by embedding similarity. Returns (claim_id, similarity) pairs.
+    /// Search current claims by embedding similarity. Returns
+    /// (claim_id, similarity) pairs. Unscoped convenience wrapper over
+    /// [`search_scoped`](Self::search_scoped).
+    ///
+    /// Searches `claims.embedding` (where memorize/submit/ingest write claim
+    /// vectors). This previously called `EvidenceRepository::search_by_embedding`
+    /// = `evidence.embedding`, which is unpopulated, so the `recall` tool's
+    /// semantic path always returned empty.
     pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<(uuid::Uuid, f64)>, String> {
+        self.search_scoped(query, limit, None, None).await
+    }
+
+    /// Embedding search over current claims with optional scope pushed into
+    /// the query (see `ClaimRepository::search_by_embedding_scoped`): `tags`
+    /// requires label containment, `agent_id` requires authorship, `None` does
+    /// not restrict.
+    pub async fn search_scoped(
+        &self,
+        query: &str,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<(uuid::Uuid, f64)>, String> {
         let embedding = self.generate(query).await?;
 
         let pgvec = format_pgvector(&embedding);
-        let results =
-            epigraph_db::EvidenceRepository::search_by_embedding(&self.pool, &pgvec, limit)
-                .await
-                .map_err(|e| e.to_string())?;
+        let results = epigraph_db::ClaimRepository::search_by_embedding_scoped(
+            &self.pool, &pgvec, limit, tags, agent_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
         Ok(results
             .into_iter()
             .map(|r| (r.claim_id, r.similarity))
             .collect())
+    }
+
+    /// Hybrid retrieval: embed the query (1536d), then RRF-fuse the dense and
+    /// lexical legs via [`ClaimRepository::search_hybrid_scoped`]. Returns the
+    /// fused hits; the caller (`recall`) degrades to lexical-only on `Err`.
+    pub async fn search_hybrid_scoped(
+        &self,
+        query: &str,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<epigraph_db::HybridHit>, String> {
+        let embedding = self.generate(query).await?;
+        let pgvec = format_pgvector(&embedding);
+        epigraph_db::ClaimRepository::search_hybrid_scoped(
+            &self.pool,
+            &pgvec,
+            query,
+            HYBRID_CANDIDATE_POOL,
+            HYBRID_RRF_K,
+            limit,
+            tags,
+            agent_id,
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -223,6 +310,18 @@ impl EmbeddingService for McpEmbedder {
     }
 }
 
+/// Clip text to the OpenAI embedding model's 8191-token context window before
+/// it is sent as an embedding input. Returns the original string unchanged when
+/// it is already within the limit. This truncates ONLY the embedding input — the
+/// caller-supplied claim content is stored full-length elsewhere; this function
+/// never sees or mutates stored content. Uses the embeddings crate's
+/// [`Tokenizer`](epigraph_embeddings::Tokenizer) (tiktoken when the `openai`
+/// feature is on, char-estimate fallback otherwise).
+fn truncate_embedding_input(text: &str) -> String {
+    epigraph_embeddings::Tokenizer::new(epigraph_embeddings::config::DEFAULT_MAX_TOKENS)
+        .truncate(text)
+}
+
 /// Format a vector as a pgvector string literal: `"[0.1,0.2,...]"`.
 ///
 /// Public so callers can format a cached `Vec<f32>` for direct SQL use
@@ -283,5 +382,61 @@ mod tests {
     fn model_for_dim_rejects_unknown_dim() {
         assert!(model_for_dim(1024).is_none());
         assert!(model_for_dim(0).is_none());
+    }
+
+    // `key_disabled` is the shared disabled-condition behind both `generate`
+    // and `embeddings_disabled`; pinning it keeps the backfill fail-loud guard
+    // from being bypassed by an empty or "mock" key.
+    #[test]
+    fn key_disabled_catches_none_empty_and_mock() {
+        assert!(super::key_disabled(None), "no key => disabled");
+        assert!(super::key_disabled(Some("")), "empty key => disabled");
+        assert!(
+            super::key_disabled(Some("mock")),
+            "literal mock => disabled"
+        );
+    }
+
+    #[test]
+    fn key_disabled_allows_a_real_key() {
+        assert!(
+            !super::key_disabled(Some("sk-real-key")),
+            "a real key => enabled"
+        );
+    }
+
+    // An over-limit input (a verbatim_v2 paragraph can be a whole section) must
+    // be clipped to <= the OpenAI 8191-token window before it is sent, so the
+    // embedding request never 400s on length. We measure with the SAME tokenizer
+    // the truncator uses, so the assertion holds regardless of whether tiktoken
+    // (openai feature) or the char-estimate fallback is active. No network.
+    #[test]
+    fn truncate_embedding_input_clips_over_limit_text() {
+        let limit = epigraph_embeddings::config::DEFAULT_MAX_TOKENS;
+        let tokenizer = epigraph_embeddings::Tokenizer::new(limit);
+        // Build a string comfortably over the token limit (~5 chars/word).
+        let huge = "word ".repeat(limit * 2);
+        assert!(
+            tokenizer.count_tokens(&huge) > limit,
+            "fixture must exceed the token limit to exercise truncation"
+        );
+
+        let clipped = super::truncate_embedding_input(&huge);
+        assert!(
+            tokenizer.count_tokens(&clipped) <= limit,
+            "truncated input must fit the model's token window"
+        );
+        assert!(
+            clipped.len() < huge.len(),
+            "over-limit input must actually be shortened"
+        );
+    }
+
+    // Short inputs (the common case) must pass through byte-for-byte: truncation
+    // must not silently alter content that already fits.
+    #[test]
+    fn truncate_embedding_input_passes_through_short_text() {
+        let text = "The Earth orbits the Sun.";
+        assert_eq!(super::truncate_embedding_input(text), text);
     }
 }

@@ -1,0 +1,20 @@
+{
+  "scifact_id": 475,
+  "claim": "Glycolysis is one of the primary glycometabolic pathways in cells.",
+  "evidence_sentences": [
+    "We demonstrate that glycolysis provides ATP for the FAT of vesicles."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "18678095",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.3,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "ATP"
+    ],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

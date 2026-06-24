@@ -1,0 +1,20 @@
+{
+  "scifact_id": 123,
+  "claim": "Antiretroviral therapy increases rates of tuberculosis across a broad range of CD4 strata.",
+  "evidence_sentences": [
+    "Antiretroviral therapy is strongly associated with a reduction in the incidence of tuberculosis in all baseline CD4 count categories: (1) less than 200 cells/\u00b5l (hazard ratio [HR] 0.16, 95% confidence interval [CI] 0.07 to 0.36), (2) 200 to 350 cells/\u00b5l (HR 0.34, 95% CI 0.19 to 0.60), (3) greater than 350 cells/\u00b5l (HR 0.43, 95% CI 0.30 to 0.63), and (4) any CD4 count (HR 0.35, 95% CI 0.28 to 0.44).",
+    "CONCLUSIONS Antiretroviral therapy is strongly associated with a reduction in the incidence of tuberculosis across all CD4 count strata."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "4883040",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

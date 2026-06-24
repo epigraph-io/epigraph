@@ -1,0 +1,23 @@
+{
+  "scifact_id": 593,
+  "claim": "Incidence of heart failure decreased by 10% in women since 1979.",
+  "evidence_sentences": [
+    "RESULTS The incidence of heart failure was higher among men (378/100 000 persons; 95% confidence interval [CI], 361-395 for men; 289/100 000 persons; 95% CI, 277-300 for women) and did not change over time among men or women."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "19675911",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.97,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "incidence rates per 100,000 persons",
+      "95% confidence intervals",
+      "temporal trend analysis"
+    ],
+    "evidence_type": "statistical",
+    "tier3_enriched": true
+  }
+}

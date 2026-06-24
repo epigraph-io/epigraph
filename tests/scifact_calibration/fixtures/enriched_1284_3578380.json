@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1284,
+  "claim": "Therapeutics receiving accelerated approval encounter a lower frequency of post-marketing safety events",
+  "evidence_sentences": [
+    "In multivariable analysis, postmarket safety events were statistically significantly more frequent among biologics (incidence rate ratio [IRR] = 1.93; 95% CI, 1.06-3.52; P = .03), therapeutics indicated for the treatment of psychiatric disease (IRR = 3.78; 95% CI, 1.77-8.06; P < .001), those receiving accelerated approval (IRR = 2.20; 95% CI, 1.15-4.21; P = .02), and those with near\u2013regulatory deadline approval (IRR = 1.90; 95% CI, 1.19-3.05; P = .008); events were statistically significantly less frequent among those with regulatory review times less than 200 days (IRR = 0.46; 95% CI, 0.24-0.87; P = .02)."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "3578380",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

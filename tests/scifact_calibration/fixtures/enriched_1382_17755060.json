@@ -1,0 +1,22 @@
+{
+  "scifact_id": 1382,
+  "claim": "aPKCz causes tumour enhancement by affecting glutamine metabolism.",
+  "evidence_sentences": [
+    "Interestingly, the loss of PKC\u03b6 in mice results in enhanced intestinal tumorigenesis and increased levels of these two metabolic enzymes, whereas patients with low levels of PKC\u03b6 have a poor prognosis.",
+    "Taken together, this demonstrates that PKC\u03b6 is a critical metabolic tumor suppressor in mouse and human cancer."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "17755060",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "PKC\u03b6 loss in mice",
+      "patients with low levels of PKC\u03b6"
+    ],
+    "evidence_type": "empirical"
+  }
+}

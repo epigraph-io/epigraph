@@ -31,7 +31,7 @@ pub async fn batch_submit_claims(
             confidence: entry.confidence.unwrap_or(0.5),
             source_url: None,
             reasoning: None,
-            labels: vec![],
+            labels: entry.labels.clone(),
         };
 
         match crate::tools::claims::submit_claim(server, claim_params).await {
@@ -175,9 +175,20 @@ pub async fn system_stats(
                 .await
                 .map_err(internal_error)?;
 
+        // Structured triple/entity index health. Surfaced here so an empty /
+        // unpopulated RDF layer is observable, rather than silently reported as
+        // count=0 / entity-not-found by query_triples/search_triples/
+        // entity_neighborhood (backlog ae2784a9).
+        let index = epigraph_db::TripleRepository::index_counts(&server.pool)
+            .await
+            .map_err(internal_error)?;
+
         stats["workflows"] = serde_json::json!(workflow_count.0);
         stats["challenges"] = serde_json::json!(challenge_count.0);
         stats["embeddings"] = serde_json::json!(embedding_count.0);
+        stats["triples"] = serde_json::json!(index.triples);
+        stats["entities"] = serde_json::json!(index.entities);
+        stats["entity_mentions"] = serde_json::json!(index.entity_mentions);
     }
 
     Ok(CallToolResult::success(vec![Content::text(

@@ -1,0 +1,32 @@
+{
+  "scifact_id": 1271,
+  "claim": "The severity of cardiac involvement in amyloidosis can be described by the degree of transmurality of late gadolinium enhancement in MRI.",
+  "evidence_sentences": [
+    "LGE was classified into 3 patterns: none, subendocardial, and transmural, which were associated with increasing amyloid burden as defined by extracellular volume (P<0.0001), with transitions from none to subendocardial LGE at an extracellular volume of 0.40 to 0.43 (AL) and 0.39 to 0.40 (ATTR) and to transmural at 0.48 to 0.55 (AL) and 0.47 to 0.59 (ATTR).",
+    "Transmural LGE is determined reliably by PSIR and represents advanced cardiac amyloidosis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "13768432",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [
+      "MRI",
+      "late gadolinium enhancement",
+      "phase-sensitive inversion recovery (PSIR)"
+    ],
+    "reagents_involved": [
+      "gadolinium contrast agent"
+    ],
+    "conditions": [
+      "subendocardial LGE pattern",
+      "transmural LGE pattern",
+      "no LGE pattern",
+      "extracellular volume thresholds 0.39-0.59",
+      "AL amyloidosis",
+      "ATTR amyloidosis"
+    ],
+    "evidence_type": "empirical"
+  }
+}

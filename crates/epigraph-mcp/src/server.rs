@@ -184,7 +184,7 @@ impl EpiGraphMcpFull {
         }
     }
 
-    // ── Claims (5 tools) ──
+    // ── Claims (11 tools) ──
 
     #[tool(
         description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite."
@@ -203,8 +203,26 @@ impl EpiGraphMcpFull {
     async fn query_claims(
         &self,
         Parameters(params): Parameters<QueryClaimsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::claims::query_claims(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::claims::query_claims(self, params, requester).await
+    }
+
+    #[tool(
+        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow; feed the returned claim_ids to the decompose_claims CLI."
+    )]
+    async fn query_undecomposed_claims(
+        &self,
+        Parameters(params): Parameters<crate::types::QueryUndecomposedClaimsParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::claims::query_undecomposed_claims(self, params, requester).await
     }
 
     #[tool(
@@ -213,8 +231,12 @@ impl EpiGraphMcpFull {
     async fn get_claim(
         &self,
         Parameters(params): Parameters<GetClaimParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::claims::get_claim(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::claims::get_claim(self, params, requester).await
     }
 
     #[tool(
@@ -244,9 +266,11 @@ impl EpiGraphMcpFull {
     async fn supersede_claim(
         &self,
         Parameters(params): Parameters<crate::types::SupersedeClaimParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        crate::tools::supersede::supersede_claim(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        crate::tools::supersede::supersede_claim(self, params, auth).await
     }
 
     #[tool(
@@ -255,9 +279,11 @@ impl EpiGraphMcpFull {
     async fn mark_duplicate(
         &self,
         Parameters(params): Parameters<crate::types::MarkDuplicateParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        crate::tools::supersede::mark_duplicate(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        crate::tools::supersede::mark_duplicate(self, params, auth).await
     }
 
     #[tool(description = "Atomically add and/or remove labels on an existing claim. Idempotent.")]
@@ -382,6 +408,48 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Check whether a paper has been ingested (has a processed_by edge). Returns {already_ingested, paper_id?, doi, pipeline_version}. Useful as a quick pre-flight read before calling ingest_document_spine. Note: with node-level dedup, already_ingested=true means the spine was previously run — it does NOT mean all atoms are present. Use ingest_document_spine to discover which paragraphs are new. Read-only."
+    )]
+    async fn check_already_ingested(
+        &self,
+        Parameters(params): Parameters<CheckAlreadyIngestedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ingestion::check_already_ingested(self, params).await
+    }
+
+    #[tool(
+        description = "Phase 1 of the two-phase ingest flow. Ingests a DocumentExtraction with EMPTY atoms (e.g. output of structure_source): writes thesis + sections + paragraphs into the graph with content-hash dedup, ignores atom fields. Returns new_paragraph_paths — the paths (e.g. 'sections[0].paragraphs[1]') of paragraphs that are NEW to this ingest. Atomize only those paragraphs (LLM cost saved on already-ingested paragraphs), then call ingest_document_inline with atoms for those paths. Idempotent on paragraph content hash: re-running spine on a paper whose abstract was already ingested returns the abstract paragraphs in paragraphs_deduped and the new body paragraphs in new_paragraph_paths."
+    )]
+    async fn ingest_document_spine(
+        &self,
+        Parameters(params): Parameters<IngestDocumentSpineParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::ingestion::ingest_document_spine(self, params).await
+    }
+
+    #[tool(
+        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent on paragraph and atom content hashes (node-level): re-ingesting a full paper after its abstract was ingested is safe — existing nodes dedup and only new content is written. For the two-phase flow that saves LLM atomization cost, use ingest_document_spine first."
+    )]
+    async fn ingest_document_inline(
+        &self,
+        Parameters(params): Parameters<IngestDocumentInlineParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::ingestion::ingest_document_inline(self, params).await
+    }
+
+    #[tool(
+        description = "Deterministically structure raw markdown/plaintext into a verbatim DocumentExtraction (sections + paragraphs as byte-exact source slices, source_text + spans populated, atoms EMPTY). Fill atoms per paragraph and resubmit via ingest_document_inline. Read-only / no DB writes."
+    )]
+    async fn structure_source(
+        &self,
+        Parameters(params): Parameters<StructureSourceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ingestion::structure_source(self, params).await
+    }
+
+    #[tool(
         description = "Create a cross-tier structural edge between two existing claims (decomposes_to, section_follows, or continues_argument). Purpose-built for per-chapter ingest wire-ups (chapter thesis -> book thesis, chapter[N] -> chapter[N+1]). Idempotent on (source, target, relationship): re-runs return the existing edge_id with created=false. Bypasses HTTP and goes straight through the repo layer."
     )]
     async fn link_hierarchical(
@@ -392,14 +460,29 @@ impl EpiGraphMcpFull {
         tools::link_hierarchical::link_hierarchical(self, params).await
     }
 
+    #[tool(
+        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it). On first creation, builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief, then emits an edge.added event; the response reports was_created, belief_wired, and the target's resulting {belief, plausibility, pignistic_prob}. Idempotent on (source, target, relationship): a re-hit returns the existing edge with was_created=false and belief_wired=false (no re-wire). For supersedes use supersede_claim instead."
+    )]
+    async fn link_epistemic(
+        &self,
+        Parameters(params): Parameters<LinkEpistemicParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::link_epistemic::link_epistemic(self, params).await
+    }
+
     // ── Paper Queries (3 tools) ──
 
     #[tool(description = "Look up a paper by its DOI, returning title, authors, and claims.")]
     async fn query_paper(
         &self,
         Parameters(params): Parameters<QueryPaperParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_paper(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_paper(self, params, requester).await
     }
 
     #[tool(
@@ -408,8 +491,12 @@ impl EpiGraphMcpFull {
     async fn query_claims_by_evidence(
         &self,
         Parameters(params): Parameters<QueryClaimsByEvidenceParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_claims_by_evidence(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_claims_by_evidence(self, params, requester).await
     }
 
     #[tool(
@@ -418,8 +505,12 @@ impl EpiGraphMcpFull {
     async fn query_claims_by_methodology(
         &self,
         Parameters(params): Parameters<QueryClaimsByMethodologyParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_claims_by_methodology(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_claims_by_methodology(self, params, requester).await
     }
 
     #[tool(
@@ -428,14 +519,29 @@ impl EpiGraphMcpFull {
     async fn query_claims_by_label(
         &self,
         Parameters(params): Parameters<QueryClaimsByLabelParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::paper_queries::query_claims_by_label(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let server_agent = self.agent_id().await?;
+        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
+        tools::paper_queries::query_claims_by_label(self, params, requester).await
     }
 
-    // ── Workflows (5 tools) ──
+    #[tool(
+        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state, per-frame, in deterministic frame-name order. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path."
+    )]
+    async fn recompute_beliefs(
+        &self,
+        Parameters(params): Parameters<RecomputeBeliefsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::cdst_maintenance::recompute_beliefs(self, params).await
+    }
+
+    // ── Workflows (8 tools) ──
 
     #[tool(
-        description = "Store a new workflow as an epistemic hypothesis with ordered steps and prerequisites."
+        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table; use `report_workflow_outcome` with that returned id to record execution results."
     )]
     async fn store_workflow(
         &self,
@@ -454,7 +560,38 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Record what actually happened when you used a workflow — step-by-step lab notebook with deviations."
+        description = "List a workflow's most recent behavioral executions, newest first: per-run success, quality, tool_pattern, deviation_count and step_beliefs (per-step deviation_reason), plus a window success-rate. Read-only telemetry for analysing or evolving a workflow."
+    )]
+    async fn get_workflow_executions(
+        &self,
+        Parameters(params): Parameters<GetWorkflowExecutionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::workflows::get_workflow_executions(self, params).await
+    }
+
+    #[tool(
+        description = "Evaluate whether a workflow variant is statistically ready to be promoted over its immediate (variant_of) parent: the Wilson lower bound of the variant's behavioral success rate vs the parent's rate, over the same window, gated on a minimum sample. Read-only — returns a verdict, does not promote."
+    )]
+    async fn evaluate_workflow_promotion(
+        &self,
+        Parameters(params): Parameters<EvaluateWorkflowPromotionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::workflows::evaluate_workflow_promotion(self, params).await
+    }
+
+    #[tool(
+        description = "Re-evaluate a workflow variant's promotion verdict and write it to the variant's properties.promotion, overwriting any prior value (so a regressed variant is demoted, not left stale). The apply layer of the workflow-evolution gate; the maintenance pass calls this per candidate variant. Write."
+    )]
+    async fn refresh_workflow_promotion(
+        &self,
+        Parameters(params): Parameters<EvaluateWorkflowPromotionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::workflows::refresh_workflow_promotion(self, params).await
+    }
+
+    #[tool(
+        description = "Record what actually happened when you used a workflow. Accepts workflow_id values returned by `store_workflow` (rows in `workflows`) and delegates to the hierarchical outcome path; legacy flat workflow claim IDs are still supported for backward compatibility."
     )]
     async fn report_workflow_outcome(
         &self,
@@ -515,7 +652,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Record an outcome for a hierarchical workflow run. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution with step_claim_id resolved from the workflow's `executes` edges in plan order. Use `report_workflow_outcome` instead for flat workflow claims."
+        description = "Record an outcome for a hierarchical workflow run by workflows-table id. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution with step_claim_id resolved from the workflow's `executes` edges in plan order. `report_workflow_outcome` is the compatibility entry point for callers that may have either store_workflow ids or legacy flat workflow claim ids."
     )]
     async fn report_hierarchical_outcome(
         &self,
@@ -657,6 +794,17 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
         tools::perspectives::create_perspective(self, params).await
+    }
+
+    #[tool(
+        description = "Set a perspective's source-reliability map (evidence-type tag -> alpha in [0,1]) — the frame-function lens read by scoped_belief / get_perspective_belief, so two observers weight the same evidence differently. An empty map clears the override."
+    )]
+    async fn set_source_reliability(
+        &self,
+        Parameters(params): Parameters<SetSourceReliabilityParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::perspectives::set_source_reliability(self, params).await
     }
 
     #[tool(description = "List all perspectives with optional limit.")]
@@ -811,7 +959,7 @@ impl EpiGraphMcpFull {
         tools::sheaf::reconcile_sheaf(self, params).await
     }
 
-    // ── Embeddings (1 tool) ──
+    // ── Embeddings (2 tools) ──
 
     #[tool(
         description = "Aggregate claim count + similarity stats for the embedding ball around a free-text query. Mirrors POST /api/v1/embeddings/neighborhood-density. Returns n_claims, mean/median cosine similarity, a squashed sparsity score, and breakdowns by level + source_type. Defaults: radius=0.30 (cosine distance), max_sample=500 (clamped to [1, 5000]). Use this to detect dense regions that warrant theme sub-splitting and to drive the nightly theme-maintenance workflow."
@@ -823,6 +971,17 @@ impl EpiGraphMcpFull {
         >,
     ) -> Result<CallToolResult, McpError> {
         crate::tools::embeddings::embedding_neighborhood_density(self, params).await
+    }
+
+    #[tool(
+        description = "Generate and store the missing claims.embedding vector for current, non-telemetry claims that lack one (the is_current AND embedding IS NULL gap the CLAUDE.md embedding-policy invariant tracks). Server-side, MCP-executable counterpart to the embed_backfill CLI: the embed stage of the decomposition-cycle's decompose→embed→cross-source-match pipeline. Selection is oldest-first so repeated runs drain the backlog monotonically. Params: limit (default 200, clamped 1..=2000), dry_run (default false — count candidates without writing; safe with no OpenAI key). Returns {candidates, embedded, failed, dry_run}. Errors if the server has no OPENAI_API_KEY and dry_run is false. Requires claims:write."
+    )]
+    async fn backfill_embeddings(
+        &self,
+        Parameters(params): Parameters<crate::tools::embeddings::BackfillEmbeddingsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        crate::tools::embeddings::backfill_embeddings(self, params).await
     }
 
     // ── Themes (1 tool) ──
@@ -841,7 +1000,7 @@ impl EpiGraphMcpFull {
     // ── RDF Triple Layer (3 tools) ──
 
     #[tool(
-        description = "Query RDF-style triples extracted from claims. Filter by subject entity, predicate pattern, and/or object entity. All filters optional (omit to wildcard). Returns triples with source claim references."
+        description = "Query RDF-style triples extracted from claims. Filter by subject entity, predicate pattern, and/or object entity. All filters optional (omit to wildcard). Optional min_confidence threshold (default 0.0, no filtering). Returns triples with source claim references."
     )]
     async fn query_triples(
         &self,
@@ -905,13 +1064,46 @@ impl EpiGraphMcpFull {
     // ── Meta (1 tool) ──
 
     #[tool(
-        description = "List all MCP tools available on this server. Returns the name, description, and JSON Schema for every registered tool. Use this for runtime tool discovery — the list reflects the live server state, including newly deployed tools not yet stored in the knowledge graph."
+        description = "List all MCP tools available on this server. Returns the name, description, and full JSON Schema for every registered tool — including tools your client may have DEFERRED (name visible but schema not loaded). Use this for runtime tool discovery and to load the schema of any tool your client could not call directly. The list reflects the live server state, including newly deployed tools not yet stored in the knowledge graph."
     )]
     async fn list_mcp_tools(&self) -> Result<CallToolResult, McpError> {
         let tools = self.tool_router.list_all();
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&tools).map_err(crate::errors::internal_error)?,
         )]))
+    }
+}
+
+impl EpiGraphMcpFull {
+    /// Build the `instructions` string surfaced in the MCP `initialize`
+    /// payload (`ServerInfo.instructions`).
+    ///
+    /// This is the ALWAYS-shown, never-deferred handshake text — clients
+    /// (including the claude.ai web connector) render it verbatim before
+    /// any `tools/list` page-in. We therefore use it to advertise the
+    /// deferred-tool / tool-search gate: many clients list a tool's *name*
+    /// but defer its *schema*, so a direct call fails with "not loaded
+    /// yet / call tool-search first". That is client-side deferral, NOT a
+    /// missing server tool — `tools/list` returns every registered tool.
+    ///
+    /// `tool_count` is derived from the live tool router (`all_tools_json`),
+    /// so it can never drift from the registered tool set the way a
+    /// hardcoded constant would.
+    #[must_use]
+    pub fn server_instructions(read_only: bool) -> String {
+        let mode = if read_only { "read-only" } else { "full" };
+        let tool_count = Self::all_tools_json().as_array().map_or(0, Vec::len);
+        format!(
+            "EpiGraph {mode} MCP server with {tool_count} epistemic tools. \
+             Many EpiGraph tools are DEFERRED by your client — their names may appear but \
+             their schemas are not loaded, so a direct call can fail with \
+             \"not loaded yet / call tool-search first\". This is NOT a missing tool. \
+             Use your client's tool-search mechanism (e.g. tool_search / ToolSearch) to load \
+             a tool's schema by name before calling it (the edge-writers submit_claim, \
+             link_hierarchical, supersede_claim and the graph reads get_neighborhood, traverse, \
+             query_claims are all available this way), or call list_mcp_tools to enumerate every \
+             tool with its full schema."
+        )
     }
 }
 
@@ -927,12 +1119,8 @@ impl EpiGraphMcpFull {
 // dispatch.
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
-        let mode = if self.read_only { "read-only" } else { "full" };
-        let tool_count = if self.read_only { 33 } else { 60 };
         ServerInfo {
-            instructions: Some(format!(
-                "EpiGraph {mode} MCP server with {tool_count} epistemic tools."
-            )),
+            instructions: Some(Self::server_instructions(self.read_only)),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
@@ -1074,5 +1262,63 @@ mod scope_guard_tests {
             "error should indicate the tool isn't authorized; got: {}",
             err.message
         );
+    }
+}
+
+#[cfg(test)]
+mod instructions_tests {
+    use super::*;
+
+    /// The `initialize` instructions are the only EpiGraph text a client (incl.
+    /// the claude.ai web connector) is GUARANTEED to render before any tool
+    /// schema is paged in. This guards that the deferred-tool / tool-search
+    /// gate guidance is present there, so an agent that sees a tool name but no
+    /// schema knows how to load it (rather than reporting the tool "missing").
+    ///
+    /// No DB: `server_instructions` is a pure function of `read_only` + the
+    /// static tool router, so it exercises the real production code path.
+    #[test]
+    fn instructions_advertise_the_tool_search_gate() {
+        let s = EpiGraphMcpFull::server_instructions(false);
+
+        // The gate must name a tool-search mechanism the client can act on.
+        assert!(
+            s.contains("tool_search") || s.contains("tool-search"),
+            "instructions must point at the tool-search gate; got: {s}"
+        );
+        // ...and the always-available enumerate-every-schema escape hatch.
+        assert!(
+            s.contains("list_mcp_tools"),
+            "instructions must mention list_mcp_tools as the schema-enumeration fallback; got: {s}"
+        );
+        // It must frame deferral as client-side, NOT a missing server tool —
+        // that framing is the whole point (an agent reported tools "absent").
+        assert!(
+            s.contains("DEFERRED"),
+            "instructions must explain tools are DEFERRED (not missing); got: {s}"
+        );
+    }
+
+    /// The tool count in the instructions must equal the LIVE registered tool
+    /// count, computed dynamically here (never a hardcoded literal) — that is
+    /// exactly what stops it going stale. If a tool is added/removed and this
+    /// substring stops matching, the production string is wrong.
+    #[test]
+    fn instructions_tool_count_matches_live_router() {
+        let n = EpiGraphMcpFull::tool_router().list_all().len();
+        let s = EpiGraphMcpFull::server_instructions(false);
+        assert!(
+            s.contains(&format!("{n} epistemic tools")),
+            "instructions must report the live tool count ({n}); got: {s}"
+        );
+    }
+
+    /// `read_only` only changes the human-readable mode label, not the
+    /// registered tool set (read-only is enforced at call time, not
+    /// registration), so the count is identical across modes.
+    #[test]
+    fn instructions_reflect_mode_label() {
+        assert!(EpiGraphMcpFull::server_instructions(true).contains("read-only"));
+        assert!(EpiGraphMcpFull::server_instructions(false).contains("full"));
     }
 }

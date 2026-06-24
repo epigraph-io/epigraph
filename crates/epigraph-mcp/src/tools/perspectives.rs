@@ -88,6 +88,30 @@ pub async fn create_perspective(
     }))
 }
 
+/// Set a perspective's source-reliability map (the frame-function lens): evidence-type
+/// tag -> alpha in [0,1], merged into `properties.source_reliability`. Empty map clears it.
+pub async fn set_source_reliability(
+    server: &EpiGraphMcpFull,
+    params: SetSourceReliabilityParams,
+) -> Result<CallToolResult, McpError> {
+    let id = parse_uuid(&params.perspective_id)?;
+    for (tag, &alpha) in &params.source_reliability {
+        if alpha.is_nan() || !(0.0..=1.0).contains(&alpha) {
+            return Err(invalid_params(format!(
+                "reliability for '{tag}' must be in [0, 1]"
+            )));
+        }
+    }
+    PerspectiveRepository::set_source_reliability(&server.pool, id, &params.source_reliability)
+        .await
+        .map_err(internal_error)?;
+    success_json(&serde_json::json!({
+        "perspective_id": id.to_string(),
+        "source_reliability": params.source_reliability,
+        "status": "set",
+    }))
+}
+
 /// List all perspectives with optional pagination.
 pub async fn list_perspectives(
     server: &EpiGraphMcpFull,
@@ -110,6 +134,12 @@ pub async fn list_perspectives(
                 "perspective_type": r.perspective_type,
                 "confidence_calibration": r.confidence_calibration,
                 "created_at": r.created_at.to_rfc3339(),
+                // Lens maps so an agent can SEE what a perspective up/down-weights
+                // before choosing it as a (frame, perspective) lens. Serialize as
+                // a JSON object when present, `null` when the perspective sets no
+                // override (Option<HashMap> → object/null).
+                "source_reliability": r.source_reliability(),
+                "locality_reliability": r.locality_reliability(),
             })
         })
         .collect();

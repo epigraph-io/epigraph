@@ -1,0 +1,23 @@
+{
+  "scifact_id": 553,
+  "claim": "IgA plasma cells that are specific for transglutaminase 2 are scarce in the duodenal mucosa of celiac disease patients when the disease is active.",
+  "evidence_sentences": [
+    "We found that TG2-specific plasma cells are markedly expanded within the duodenal mucosa in individuals with active celiac disease."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "1471041",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "TG2"
+    ],
+    "conditions": [
+      "active celiac disease",
+      "duodenal mucosa"
+    ],
+    "evidence_type": "empirical"
+  }
+}

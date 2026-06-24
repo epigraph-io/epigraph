@@ -1,0 +1,30 @@
+{
+  "scifact_id": 506,
+  "claim": "Helminths interfere with immune system control of coinfections by microbial pathogens 16.",
+  "evidence_sentences": [
+    "We show that mice infected with the intestinal helminth Nippostrongylus brasiliensis (Nb) exhibit a transitory impairment of resistance to airborne Mtb infection.",
+    "Furthermore, a second dose of Nb infection substantially increases the bacterial burden in the lungs of co-infected mice.",
+    "The Th2 response can thus enhance the intracellular persistence of Mtb, in part by mediating the alternative activation of macrophages via the IL-4R\u03b1 signaling pathway."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "7433668",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Nippostrongylus brasiliensis",
+      "Mycobacterium tuberculosis",
+      "IL-4R\u03b1"
+    ],
+    "conditions": [
+      "intestinal helminth co-infection",
+      "airborne Mtb infection",
+      "second dose Nb re-infection",
+      "IL-4R\u03b1 signaling pathway",
+      "alternative macrophage activation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

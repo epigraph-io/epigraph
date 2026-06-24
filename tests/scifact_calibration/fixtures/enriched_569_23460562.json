@@ -1,0 +1,21 @@
+{
+  "scifact_id": 569,
+  "claim": "In adult tissue, most T cells are memory T cells.",
+  "evidence_sentences": [
+    "Whereas adult tissues contain a predominance of memory T cells, in pediatric blood and tissues the main subset consists of naive recent thymic emigrants, with effector memory T cells (T(EM)) found only in the lungs and small intestine."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "23460562",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "adult tissues",
+      "pediatric blood and tissues"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "scifact_id": 32,
+  "claim": "A country's Vaccine Alliance (GAVI) eligibility is not indictivate of accelerated adoption of the Hub vaccine.",
+  "evidence_sentences": [
+    "CONCLUSIONS This study substantiates previous findings related to vaccine price and presents new evidence to suggest that GAVI eligibility is associated with accelerated decisions to adopt Hib vaccine."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "12428497",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "GAVI eligibility"
+    ],
+    "evidence_type": "statistical"
+  }
+}

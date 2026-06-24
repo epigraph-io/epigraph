@@ -8,8 +8,8 @@ fn loads_weights_and_bands_from_default_calibration_toml() {
     let cfg = MatcherConfig::load_from(&p).expect("load calibration.toml");
     assert!((cfg.weights.embed_cosine - 0.35).abs() < 1e-6);
     assert!((cfg.weights.theme_proximity - 0.05).abs() < 1e-6);
-    assert!((cfg.bands.high - 0.85).abs() < 1e-6);
-    assert!((cfg.bands.mid - 0.60).abs() < 1e-6);
+    assert!((cfg.bands.high - 1.01).abs() < 1e-6);
+    assert!((cfg.bands.mid - 0.80).abs() < 1e-6);
     assert_eq!(cfg.embedding.model_version, "v1");
     assert!(!cfg.filter.include_agent_id);
     assert_eq!(cfg.fan_out.max_per_claim, 32);

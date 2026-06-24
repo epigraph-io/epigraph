@@ -1,0 +1,19 @@
+{
+  "scifact_id": 673,
+  "claim": "LDL cholesterol has a causal role in the development of cardiovascular disease.",
+  "evidence_sentences": [
+    "BACKGROUND LDL cholesterol has a causal role in the development of cardiovascular disease."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2095573",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "testimonial",
+    "tier2_enriched": true
+  }
+}

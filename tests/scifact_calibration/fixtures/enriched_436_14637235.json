@@ -1,0 +1,25 @@
+{
+  "scifact_id": 436,
+  "claim": "Free histones are degraded by a Rad53-dependent mechanism once DNA has been replicated.",
+  "evidence_sentences": [
+    "Although chromosomal histones are stable, excess (non-chromatin bound) histones are rapidly degraded in a Rad53 (radiation sensitive 53) kinase-dependent manner in Saccharomyces cerevisiae.",
+    "Here we demonstrate that excess histones associate with Rad53 in vivo and seem to undergo modifications such as tyrosine phosphorylation and polyubiquitylation, before their proteolysis by the proteasome."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "14637235",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Rad53 kinase",
+      "proteasome"
+    ],
+    "conditions": [
+      "in vivo",
+      "Saccharomyces cerevisiae"
+    ],
+    "evidence_type": "empirical"
+  }
+}

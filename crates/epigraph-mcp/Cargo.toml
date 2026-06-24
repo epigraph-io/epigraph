@@ -14,7 +14,15 @@ epigraph-core = { workspace = true }
 epigraph-crypto = { workspace = true }
 epigraph-db = { workspace = true }
 epigraph-ds = { workspace = true }
-epigraph-engine = { workspace = true }
+# `features = ["rerank"]` is pinned ON so the DEFAULT-feature build of the
+# serving binary (`cargo build -p epigraph-mcp`, the prod deploy recipe) links
+# the REAL HTTP cross-encoder client, not the keyless stub. The compile feature
+# only chooses stub-vs-real; actual paid calls stay gated at RUNTIME by the
+# `rerank=true` request param AND the presence of `RERANK_API_KEY`, so default-on
+# carries no surprise-spend risk. Without this pin the default deploy would link
+# the stub and rerank would be inert even with the key set.
+epigraph-engine = { workspace = true, features = ["rerank"] }
+epigraph-interfaces = { workspace = true }
 epigraph-embeddings = { workspace = true }
 epigraph-ingest = { workspace = true }
 epigraph-ingest-executor = { workspace = true }
@@ -78,6 +86,12 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 [features]
 default = []
 vendored-openssl = ["dep:openssl"]
+# Explicit alias for the live HTTP cross-encoder rerank client. REDUNDANT in
+# the default build (the `epigraph-engine` dep above already pins
+# `features=["rerank"]` so the real client is always linked), retained so an
+# operator can name the capability explicitly and so a future `default-features
+# = false` build can re-enable it without editing the dep line.
+rerank = ["epigraph-engine/rerank"]
 
 [[bin]]
 name = "epigraph-mcp-full"

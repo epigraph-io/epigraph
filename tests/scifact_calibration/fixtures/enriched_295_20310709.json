@@ -1,0 +1,29 @@
+{
+  "scifact_id": 295,
+  "claim": "Crosstalk between dendritic cells (DCs) and innate lymphoid cells (ILCs) is important in the regulation of intestinal homeostasis.",
+  "evidence_sentences": [
+    "TNF-\u03b1 produced by CD103(-)CD11b(+) dendritic cells synergized with IL-23 to drive IL-17A production by ILCs, demonstrating a previously unrecognized layer of cellular crosstalk between dendritic cells and ILCs.",
+    "Crucially, T-bet also suppressed the expression of IL-7R, a key molecule involved in controlling intestinal ILC homeostasis.",
+    "The importance of IL-7R signaling in TRUC disease was highlighted by the dramatic reduction in intestinal ILCs and attenuated colitis following IL-7R blockade.",
+    "Taken together, these data demonstrate the mechanism by which T-bet regulates the complex interplay between mucosal dendritic cells, ILCs, and the intestinal microbiota."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "20310709",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "TNF-\u03b1",
+      "IL-23",
+      "IL-17A",
+      "IL-7R"
+    ],
+    "conditions": [
+      "IL-7R blockade",
+      "TRUC disease model"
+    ],
+    "evidence_type": "empirical"
+  }
+}

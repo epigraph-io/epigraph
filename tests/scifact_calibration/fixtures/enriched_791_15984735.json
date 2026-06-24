@@ -1,0 +1,23 @@
+{
+  "scifact_id": 791,
+  "claim": "Migraine with aura is associated with ischemic stroke.",
+  "evidence_sentences": [
+    "Additional analyses indicated a significantly higher risk among people who had migraine with aura (2.16, 1.53 to 3.03) compared with people who had migraine without aura (1.23, 0.90 to 1.69; meta-regression for aura status P=0.02).",
+    "CONCLUSION Migraine is associated with a twofold increased risk of ischaemic stroke, which is only apparent among people who have migraine with aura."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "15984735",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "meta-regression for aura status P=0.02",
+      "risk ratio 2.16 (1.53 to 3.03) for migraine with aura",
+      "risk ratio 1.23 (0.90 to 1.69) for migraine without aura"
+    ],
+    "evidence_type": "statistical"
+  }
+}

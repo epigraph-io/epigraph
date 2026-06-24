@@ -1,0 +1,22 @@
+{
+  "scifact_id": 1103,
+  "claim": "Stroke patients with prior use of direct oral anticoagulants have a higher risk of in-hospital mortality than stroke patients with prior use of warfarin.",
+  "evidence_sentences": [
+    "The unadjusted in-hospital mortality rates were 32.6% for warfarin, 26.5% for NOACs, and 22.5% for no OACs.",
+    "Compared with patients without prior use of OACs, the risk of in-hospital mortality was higher among patients with prior use of warfarin (adjusted risk difference [ARD], 9.0% [97.5% CI, 7.9% to 10.1%]; adjusted odds ratio [AOR], 1.62 [97.5% CI, 1.53 to 1.71]) and higher among patients with prior use of NOACs (ARD, 3.3% [97.5% CI, 1.7% to 4.8%]; AOR, 1.21 [97.5% CI, 1.11-1.32]).",
+    "Compared with patients with prior use of warfarin, patients with prior use of NOACs had a lower risk of in-hospital mortality (ARD, \u22125.7% [97.5% CI, \u22127.3% to \u22124.2%]; AOR, 0.75 [97.5% CI, 0.69 to 0.81]).",
+    "Prior use of NOACs, compared with prior use of warfarin, was associated with lower risk of in-hospital mortality."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "3898784",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

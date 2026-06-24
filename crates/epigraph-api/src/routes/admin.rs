@@ -324,6 +324,7 @@ mod tests {
         let state = AppState::new(ApiConfig {
             require_signatures: true,
             max_request_size: 2048,
+            public_base_url: "http://localhost:8080".to_string(),
         });
         let router = test_router_with_state(state);
 

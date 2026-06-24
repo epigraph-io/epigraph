@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1184,
+  "claim": "The US health care system can save up to $5 billion if 7% of patients waiting for kidney transplants participate in the optimized national kidney paired donation program.",
+  "evidence_sentences": [
+    "Even if only 7% of patients awaiting kidney transplantation participated in an optimized national KPD program, the health care system could save as much as $750 million.   \n"
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "16737210",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "scifact_id": 1181,
+  "claim": "The RANK-RANK-Ligand (RANKL) pathway is involved in the development of Aire-expressing medullary thymic epithelial cells (mTECs).",
+  "evidence_sentences": [
+    "Here we show that the cytokine RANK ligand (RANKL) was produced by positively selected thymocytes and regulated the cellularity of mTEC by interacting with RANK and osteoprotegerin."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "39128592",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "RANKL",
+      "RANK",
+      "osteoprotegerin"
+    ],
+    "conditions": [
+      "positive selection of thymocytes"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -8,6 +8,130 @@ use crate::errors::ApiError;
 use crate::oauth::token::TokenResponse;
 use crate::state::AppState;
 
+/// Find-or-create the per-user `human` OAuth client for a validated external identity,
+/// WITHOUT issuing any tokens. Synthesizes `client_id = "{provider}:{subject}"`, returns
+/// the existing row if present, else auto-provisions one (when the provider permits) with
+/// the provider's default scopes and emits an audit row.
+///
+/// This is the consent-gated path: the Google callback (authorization-code flow) needs the
+/// resolved client's `id` + `granted_scopes` to record on the authorize session and render
+/// the consent screen, but must NOT mint tokens until the user clicks Allow. The token-
+/// issuing `provision_external_user` is a thin wrapper over this plus access/refresh minting.
+#[cfg(feature = "db")]
+pub async fn provision_external_user_client(
+    state: &AppState,
+    provider: &dyn ExternalIdentityProvider,
+    identity: &ExternalIdentity,
+) -> Result<epigraph_db::repos::oauth_client::OAuthClientRow, ApiError> {
+    use epigraph_db::repos::oauth_client::OAuthClientRepository;
+
+    let email = identity.email.clone().unwrap_or_default();
+    let name = identity.name.clone().unwrap_or_else(|| email.clone());
+
+    // Email-allowlist gate. Placed at the TOP of the find-or-create path — BEFORE
+    // get_by_client_id — so it covers BOTH the new-provision branch AND the
+    // existing-client branch (an identity provisioned once then later removed from
+    // the allowlist must stop authenticating), and ALL three call sites
+    // (token.rs, device.rs, and authorize.rs which calls this inner fn directly
+    // for the consent screen, bypassing the token-minting wrapper).
+    //
+    // Semantics: when the provider configures no allowlist (both lists empty) the
+    // gate is allow-all and the original behavior is preserved. When an allowlist
+    // IS configured we additionally require a verified email (Google may assert an
+    // unverified address; CloudflareAccess hardcodes email_verified=true so it is
+    // unaffected) and a case-insensitive match against the allowlist.
+    let allowed_emails = provider.allowed_emails();
+    let allowed_domains = provider.allowed_domains();
+    let allowlist_configured = !allowed_emails.is_empty() || !allowed_domains.is_empty();
+    if allowlist_configured {
+        let denied = !identity.email_verified
+            || !super::config::email_is_allowed(&email, allowed_emails, allowed_domains);
+        if denied {
+            tracing::warn!(
+                provider = provider.name(),
+                email = %email,
+                email_verified = identity.email_verified,
+                "Denied external provisioning: identity not in provider email allowlist"
+            );
+            emit_oauth_audit(
+                &state.db_pool,
+                "oauth_provision_denied",
+                false,
+                serde_json::json!({
+                    "provider": provider.name(),
+                    "subject": identity.subject,
+                    "email": email,
+                    "email_verified": identity.email_verified,
+                    "reason": "email_not_in_allowlist",
+                }),
+            );
+            return Err(ApiError::Forbidden {
+                reason: "email not authorized for this provider".into(),
+            });
+        }
+    }
+
+    let oauth_client_id = format!("{}:{}", provider.name(), identity.subject);
+
+    match OAuthClientRepository::get_by_client_id(&state.db_pool, &oauth_client_id).await {
+        Ok(Some(c)) => Ok(c),
+        Ok(None) => {
+            if !provider.auto_provision() {
+                return Err(ApiError::Forbidden {
+                    reason: "user not provisioned and auto_provision disabled".into(),
+                });
+            }
+            let scopes = provider.default_scopes().to_vec();
+            let id = OAuthClientRepository::create(
+                &state.db_pool,
+                &oauth_client_id,
+                None,
+                &name,
+                "human",
+                &scopes,
+                &scopes,
+                "active",
+                None,
+                None,
+                None,
+                Some(&email),
+                None, // redirect_uris: provisioned via Google OIDC, not a registered redirect
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to create human client: {e}"),
+            })?;
+            tracing::info!(
+                provider = provider.name(),
+                client_id = %oauth_client_id,
+                email = %email,
+                "Auto-provisioned human OAuth client"
+            );
+            emit_oauth_audit(
+                &state.db_pool,
+                "oauth_human_provisioned",
+                true,
+                serde_json::json!({
+                    "provider": provider.name(),
+                    "client_id": oauth_client_id,
+                    "email": email,
+                }),
+            );
+            OAuthClientRepository::get_by_id(&state.db_pool, id)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: e.to_string(),
+                })?
+                .ok_or(ApiError::InternalError {
+                    message: "Failed to read newly created client".into(),
+                })
+        }
+        Err(e) => Err(ApiError::InternalError {
+            message: e.to_string(),
+        }),
+    }
+}
+
 #[cfg(feature = "db")]
 pub async fn provision_external_user(
     state: &AppState,
@@ -15,73 +139,9 @@ pub async fn provision_external_user(
     identity: &ExternalIdentity,
     requested_scope: Option<&str>,
 ) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
-    use epigraph_db::repos::oauth_client::OAuthClientRepository;
     use epigraph_db::repos::refresh_token::RefreshTokenRepository;
 
-    let email = identity.email.clone().unwrap_or_default();
-    let name = identity.name.clone().unwrap_or_else(|| email.clone());
-
-    let oauth_client_id = format!("{}:{}", provider.name(), identity.subject);
-
-    let client =
-        match OAuthClientRepository::get_by_client_id(&state.db_pool, &oauth_client_id).await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                if !provider.auto_provision() {
-                    return Err(ApiError::Forbidden {
-                        reason: "user not provisioned and auto_provision disabled".into(),
-                    });
-                }
-                let scopes = provider.default_scopes().to_vec();
-                let id = OAuthClientRepository::create(
-                    &state.db_pool,
-                    &oauth_client_id,
-                    None,
-                    &name,
-                    "human",
-                    &scopes,
-                    &scopes,
-                    "active",
-                    None,
-                    None,
-                    None,
-                    Some(&email),
-                )
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Failed to create human client: {e}"),
-                })?;
-                tracing::info!(
-                    provider = provider.name(),
-                    client_id = %oauth_client_id,
-                    email = %email,
-                    "Auto-provisioned human OAuth client"
-                );
-                emit_oauth_audit(
-                    &state.db_pool,
-                    "oauth_human_provisioned",
-                    true,
-                    serde_json::json!({
-                        "provider": provider.name(),
-                        "client_id": oauth_client_id,
-                        "email": email,
-                    }),
-                );
-                OAuthClientRepository::get_by_id(&state.db_pool, id)
-                    .await
-                    .map_err(|e| ApiError::InternalError {
-                        message: e.to_string(),
-                    })?
-                    .ok_or(ApiError::InternalError {
-                        message: "Failed to read newly created client".into(),
-                    })?
-            }
-            Err(e) => {
-                return Err(ApiError::InternalError {
-                    message: e.to_string(),
-                })
-            }
-        };
+    let client = provision_external_user_client(state, provider, identity).await?;
 
     let ttl = Duration::hours(1);
     let effective_scopes = match requested_scope {

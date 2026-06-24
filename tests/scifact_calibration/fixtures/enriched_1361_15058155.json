@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1361,
+  "claim": "Varying expression levels of EBI2 affect the positioning and migration of B cells.",
+  "evidence_sentences": [
+    "A few subsequently published studies further elucidated how 7\u03b1, 25-OHC bound to EBI2, and how a gradient of 7\u03b1, 25-OHC could be generated in vivo and regulated migration, activation, and functions of B cells, T cells, dendritic cells (DCs), monocytes/macrophages, and astrocytes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "15058155",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.4,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial",
+    "tier2_enriched": true
+  }
+}

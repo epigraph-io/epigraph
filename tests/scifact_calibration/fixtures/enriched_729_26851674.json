@@ -1,0 +1,20 @@
+{
+  "scifact_id": 729,
+  "claim": "Lymphadenopathy is observed in knockin mouse lacking the SHP-2 MAPK pathway.",
+  "evidence_sentences": [
+    "The SHP2 signal-deficient mice (gp130F759/F759 were born normal but displayed splenomegaly and lymphadenopathy and an enhanced acute phase reaction."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "26851674",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "SHP2 signal-deficient mice (gp130F759/F759 knockin)"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -64,6 +64,7 @@ tower = { version = "0.5", features = ["util", "timeout"] }  # Service abstracti
 tower-http = { version = "0.5", features = ["trace", "cors"] }  # HTTP middleware
 serde = { workspace = true }  # Serialization
 serde_json = { workspace = true }  # JSON support
+serde_urlencoded = "0.7"  # OAuth token endpoint body (application/x-www-form-urlencoded, RFC 6749)
 serde_with = { workspace = true }  # Helper macros for serde
 toml = "0.8"  # provider config parsing
 uuid = { workspace = true }  # UUID support
@@ -89,6 +90,7 @@ jsonwebtoken = "9"        # JWT creation and validation
 rand = { workspace = true }  # Token generation, nonce generation
 blake3 = { workspace = true }  # Content hashing for refresh tokens
 ed25519-dalek = { workspace = true }  # Ed25519 agent assertion verification
+url = "2"  # Safe redirect-URL construction (percent-encodes attacker-supplied OAuth `state`); resolves to locked 2.5.8, already in graph via reqwest
 
 [dev-dependencies]
 axum-test = "14"  # Testing utilities for Axum
@@ -101,10 +103,20 @@ epigraph-db = { workspace = true }  # E2E encrypted subgraph tests
 blake3 = { workspace = true }  # Content hashing in E2E tests
 ed25519-dalek = { workspace = true }  # Agent signing keys in E2E tests
 rand = { workspace = true }  # Key generation in E2E tests
+sqlx = { workspace = true }  # Direct row seeding in DB-backed authorization_code redeem tests
+uuid = { workspace = true }  # Client/code identifiers in DB-backed redeem tests
+chrono = { workspace = true }  # expires_at timestamps in DB-backed redeem tests
+sha2 = "0.10"  # PKCE S256 challenge computation in DB-backed redeem tests
+base64 = "0.22"  # base64url of the PKCE challenge in DB-backed redeem tests
+epigraph-auth = { workspace = true }  # DEV_JWT_SECRET to validate issued tokens in redeem tests
 wiremock = "0.6"  # HTTP fixture for OAuth provider integration tests
 rsa = "0.9"  # RSA keypair fixture for OAuth tests
 pkcs1 = "0.7"  # PKCS#1 encoding for RSA fixtures
 toml = "0.8"  # provider config TOML parsing in tests
+
+[[test]]
+name = "boot_secret_gate_test"
+path = "tests/boot_secret_gate_test.rs"
 
 [[test]]
 name = "graph_routes_test"
@@ -197,3 +209,7 @@ path = "tests/integration/embed_on_create_claim.rs"
 [[test]]
 name = "skip_embed_host_telemetry"
 path = "tests/integration/skip_embed_host_telemetry.rs"
+
+[[test]]
+name = "idempotency_2p5_tests"
+path = "tests/integration/idempotency_2p5_tests.rs"

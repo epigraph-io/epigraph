@@ -1,0 +1,19 @@
+{
+  "scifact_id": 964,
+  "claim": "Pre-mRNAs associated with spliceosomal components are more stable than unassociated splicing substrates.",
+  "evidence_sentences": [
+    "We propose that the connection between transcription by Pol II and pre-mRNA splicing guarantees an extended half-life and proper processing of nascent pre-mRNAs."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4162857",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "logical",
+    "tier2_enriched": true
+  }
+}

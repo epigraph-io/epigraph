@@ -22,11 +22,9 @@ mod tests {
             "sections": [
                 {
                     "title": "Introduction",
-                    "summary": "An intro",
                     "paragraphs": [
                         {
-                            "compound": "A compound claim",
-                            "supporting_text": "Some evidence",
+                            "text": "A compound claim",
                             "atoms": ["Atom one", "Atom two"],
                             "generality": [3, 2],
                             "confidence": 0.9
@@ -120,10 +118,8 @@ mod tests {
             "thesis_derivation": "TopDown",
             "sections": [{
                 "title": "S1",
-                "summary": "Section summary",
                 "paragraphs": [{
-                    "compound": "Compound claim",
-                    "supporting_text": "Evidence",
+                    "text": "Compound claim",
                     "atoms": ["Atom one", "Atom two"],
                     "generality": [3, 2],
                     "confidence": 0.9
@@ -164,9 +160,8 @@ mod tests {
             "thesis_derivation": "BottomUp",
             "sections": [{
                 "title": "S1",
-                "summary": "Section summary",
                 "paragraphs": [{
-                    "compound": "Compound",
+                    "text": "Compound",
                     "atoms": ["Atom"],
                     "generality": [1],
                     "confidence": 0.8
@@ -201,16 +196,15 @@ mod tests {
             "thesis": null,
             "sections": [{
                 "title": "S1",
-                "summary": "Summary",
                 "paragraphs": [
                     {
-                        "compound": "P1",
+                        "text": "P1",
                         "atoms": ["A1", "A2"],
                         "generality": [1, 2],
                         "confidence": 0.9
                     },
                     {
-                        "compound": "P2",
+                        "text": "P2",
                         "atoms": ["A3"],
                         "generality": [1],
                         "confidence": 0.8
@@ -251,11 +245,9 @@ mod tests {
             "sections": [
                 {
                     "title": "Intro",
-                    "summary": "Section summary",
                     "paragraphs": [
                         {
-                            "compound": "Compound claim.",
-                            "supporting_text": "Original.",
+                            "text": "Compound claim.",
                             "atoms": ["Atom one.", "Atom two."],
                             "generality": [0, 1],
                             "confidence": 0.9
@@ -291,9 +283,8 @@ mod tests {
             "thesis": null,
             "sections": [{
                 "title": "S1",
-                "summary": "Summary",
                 "paragraphs": [{
-                    "compound": "C",
+                    "text": "C",
                     "atoms": ["Deterministic atom"],
                     "generality": [1],
                     "confidence": 0.9
@@ -323,8 +314,8 @@ mod tests {
             "source": {"title": "Test Paper", "source_type": "Paper", "authors": []},
             "thesis": "Thesis statement",
             "sections": [{
-                "title": "Intro", "summary": "Introduction summary",
-                "paragraphs": [{"compound": "P1 compound", "atoms": ["A1"], "confidence": 0.8}]
+                "title": "Intro",
+                "paragraphs": [{"text": "P1 compound", "atoms": ["A1"], "confidence": 0.8}]
             }]
         }"#;
         let ext: DocumentExtraction = serde_json::from_str(json).unwrap();
@@ -377,9 +368,9 @@ mod tests {
             "source": {"title": "Test", "source_type": "Paper", "authors": []},
             "thesis": "Thesis",
             "sections": [{
-                "title": "S1", "summary": "Summary",
+                "title": "S1",
                 "paragraphs": [{
-                    "compound": "P1",
+                    "text": "P1",
                     "atoms": ["Atom A", "Atom B"],
                     "confidence": 0.8
                 }]
@@ -518,9 +509,9 @@ mod tests {
         let doc_json = r#"{
             "source": {"title": "P", "source_type": "Paper", "authors": []},
             "sections": [{
-                "title": "Body", "summary": "S",
+                "title": "Body",
                 "paragraphs": [{
-                    "compound": "C",
+                    "text": "C",
                     "atoms": ["text-embedding-3-large produces 3072-dimensional vectors."],
                     "generality": [1], "confidence": 0.9
                 }]

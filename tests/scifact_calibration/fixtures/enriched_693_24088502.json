@@ -1,0 +1,21 @@
+{
+  "scifact_id": 693,
+  "claim": "Leuko-reduced blood reduces infectious complications in red blood cell transfusion.",
+  "evidence_sentences": [
+    "Compared with the control period, the adjusted odds of death following leukoreduction were reduced (odds ratio [OR], 0.87; 95% confidence interval [CI], 0.75-0.99), but serious nosocomial infections did not decrease (adjusted OR, 0.97; 95% CI, 0.87-1.09).",
+    "The frequency of posttransfusion fevers decreased significantly following leukoreduction (adjusted OR, 0.86; 95% CI, 0.79-0.94), as did antibiotic use (adjusted OR, 0.90; 95% CI, 0.82-0.99).   \n",
+    "CONCLUSION A national universal leukoreduction program is potentially associated with decreased mortality as well as decreased fever episodes and antibiotic use after red blood cell transfusion in high-risk patients."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "24088502",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.7,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

@@ -11,7 +11,7 @@ pub mod provision;
 mod registry;
 pub use registry::ProviderRegistry;
 mod traits;
-pub use provision::provision_external_user;
+pub use provision::{provision_external_user, provision_external_user_client};
 pub use traits::{ExternalIdentity, ExternalIdentityProvider, OidcRedirectFlow, ProviderError};
 
 use std::path::Path;
@@ -39,6 +39,16 @@ pub fn build_registry(path: &Path) -> Result<Arc<ProviderRegistry>, String> {
     let jwks = JwksCache::new();
 
     for p in cfg.providers {
+        // Security guardrail: an auto-provisioning provider with no email
+        // allowlist will mint a `human` client (carrying write scopes) for ANY
+        // identity the IdP authenticates. Warn loudly at load so an operator who
+        // forgot to populate the allowlist sees it in the logs.
+        if p.auto_provision && p.allowed_emails.is_empty() && p.allowed_domains.is_empty() {
+            tracing::warn!(
+                provider = %p.name,
+                "auto_provision enabled with no email allowlist — ALL authenticated identities will be provisioned"
+            );
+        }
         match p.flow {
             ProviderFlow::Redirect => {
                 let google =

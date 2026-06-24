@@ -1,0 +1,20 @@
+{
+  "scifact_id": 516,
+  "claim": "High levels of CRP reduces the risk of exacerbations in chronic obstructive pulmonary disease (COPD).",
+  "evidence_sentences": [
+    "In the first year of follow-up, multivariable-adjusted odds ratios for having frequent exacerbations were 1.2 (95% CI, 0.7-2.2; 17 events/1000 person-years) for individuals with 1 high biomarker, 1.7 (95% CI, 0.9-3.2; 32 events/1000 person-years) for individuals with 2 high biomarkers, and 3.7 (95% CI, 1.9-7.4; 81 events/1000 person-years) for individuals with 3 high biomarkers compared with individuals who had no elevated biomarkers (9 events/1000 person-years; trend: P = 2 \u00d7 10(-5)).",
+    "CONCLUSIONS AND RELEVANCE Simultaneously elevated levels of CRP and fibrinogen and leukocyte count in individuals with COPD were associated with increased risk of having exacerbations, even in those with milder COPD and in those without previous exacerbations."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "29564505",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

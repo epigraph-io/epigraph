@@ -41,12 +41,13 @@ pub async fn query_triples(
         None
     };
 
+    let min_confidence = params.min_confidence.unwrap_or(0.0);
     let triples = TripleRepository::query(
         &server.pool,
         subject_id,
         params.predicate.as_deref(),
         object_id,
-        0.5,
+        min_confidence,
         limit,
     )
     .await

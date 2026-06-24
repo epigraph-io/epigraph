@@ -1,0 +1,33 @@
+{
+  "scifact_id": 566,
+  "claim": "In S. cerevisiae, the absence of RNA surveillance pathways reduces sensitivity to high iron conditions.",
+  "evidence_sentences": [
+    "We show that many mRNAs encoding iron uptake or iron mobilization proteins are expressed in iron-replete conditions in the absence of the S. cerevisiae RNase III ortholog Rnt1p or of the nuclear exosome component Rrp6p.",
+    "Extended forms of these mRNAs accumulate in the absence of Rnt1p or of the 5'-->3' exonucleases Xrn1p and Rat1p, showing that multiple degradative pathways contribute to the surveillance of aberrant forms of these transcripts.",
+    "RNase III-deficient cells are hypersensitive to high iron concentrations, suggesting that Rnt1p-mediated RNA surveillance is required to prevent iron toxicity.",
+    "These results show that RNA surveillance through multiple ribonucleolytic pathways plays a role in iron homeostasis in yeast to avoid the potentially toxic effects of the expression of the iron starvation response in iron-replete conditions."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "16120395",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Rnt1p",
+      "Rrp6p",
+      "Xrn1p",
+      "Rat1p"
+    ],
+    "conditions": [
+      "iron-replete conditions",
+      "high iron concentrations",
+      "RNase III-deficient cells",
+      "absence of Rnt1p",
+      "absence of Rrp6p",
+      "absence of 5'-->3' exonucleases"
+    ],
+    "evidence_type": "empirical"
+  }
+}

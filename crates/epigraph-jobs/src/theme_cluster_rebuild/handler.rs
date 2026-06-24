@@ -10,7 +10,10 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::sync::Arc;
 
-use crate::{EpiGraphJob, Job, JobError, JobHandler, JobQueue, JobResult, JobResultMetadata};
+use crate::{
+    run_serialized, EpiGraphJob, Job, JobError, JobHandler, JobQueue, JobResult, JobResultMetadata,
+    THEME_REBUILD_LOCK_KEY,
+};
 
 /// Job handler for the scheduled theme rebuild.
 pub struct ThemeClusterRebuildHandler {
@@ -143,13 +146,34 @@ impl JobHandler for ThemeClusterRebuildHandler {
         };
 
         let started = std::time::Instant::now();
-        let summary = Self::handle_direct(
-            &self.pool,
-            max_themes,
-            min_claims_per_theme,
-            skip_if_unchanged,
-        )
+
+        // Serialize: at most one theme rebuild runs at a time across workers
+        // AND processes. `wipe_first` makes a concurrent second run especially
+        // destructive, so a contended run is a cheap no-op.
+        let pool_for_body = Arc::clone(&self.pool);
+        let outcome = run_serialized(self.pool.as_ref(), THEME_REBUILD_LOCK_KEY, async move {
+            Self::handle_direct(
+                pool_for_body.as_ref(),
+                max_themes,
+                min_claims_per_theme,
+                skip_if_unchanged,
+            )
+            .await
+        })
         .await?;
+
+        let Some(summary) = outcome else {
+            tracing::info!("theme_cluster_rebuild: another run holds the advisory lock; skipping");
+            return Ok(JobResult {
+                output: serde_json::json!({ "skipped_locked": true }),
+                execution_duration: started.elapsed(),
+                metadata: JobResultMetadata {
+                    worker_id: Some("theme-cluster-rebuild".into()),
+                    items_processed: Some(0),
+                    extra: std::collections::HashMap::default(),
+                },
+            });
+        };
 
         // Self-heal `graph_neighborhoods` after a `wipe_first` cascade.
         // The skip path leaves the row set intact, so we only need to
@@ -162,9 +186,12 @@ impl JobHandler for ThemeClusterRebuildHandler {
                 })
                 .into_job()
                 {
-                    Ok(followup) => match queue.enqueue(followup).await {
-                        Ok(_) => tracing::info!(
+                    Ok(followup) => match queue.enqueue_unique_pending(followup).await {
+                        Ok(Some(_)) => tracing::info!(
                             "theme_cluster_rebuild: enqueued follow-up ClusterGraph to refill graph_neighborhoods"
+                        ),
+                        Ok(None) => tracing::info!(
+                            "theme_cluster_rebuild: follow-up ClusterGraph already pending; not re-enqueued"
                         ),
                         Err(e) => tracing::error!(
                             error = %e,

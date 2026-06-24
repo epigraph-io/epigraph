@@ -1,0 +1,22 @@
+{
+  "scifact_id": 1373,
+  "claim": "Walking in traffic areas in London improves lung function in elderly adults.",
+  "evidence_sentences": [
+    "Participants with COPD reported more cough (odds ratio [OR] 1\u00b795, 95% CI 0\u00b796-3\u00b795; p<0\u00b71), sputum (3\u00b715, 1\u00b739-7\u00b713; p<0\u00b705), shortness of breath (1\u00b786, 0\u00b797-3\u00b757; p<0\u00b71), and wheeze (4\u00b700, 1\u00b752-10\u00b750; p<0\u00b705) after walking down Oxford Street compared with Hyde Park.",
+    "In all participants, irrespective of their disease status, walking in Hyde Park led to an increase in lung function (forced expiratory volume in the first second [FEV1] and forced vital capacity [FVC]) and a decrease in pulse wave velocity (PWV) and augmentation index up to 26 h after the walk.",
+    "By contrast, these beneficial responses were attenuated after walking on Oxford Street.",
+    "INTERPRETATION Short-term exposure to traffic pollution prevents the beneficial cardiopulmonary effects of walking in people with COPD, ischaemic heart disease, and those free from chronic cardiopulmonary diseases."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "21003930",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

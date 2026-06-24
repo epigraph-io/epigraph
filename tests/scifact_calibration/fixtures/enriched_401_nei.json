@@ -1,0 +1,16 @@
+{
+  "scifact_id": 401,
+  "claim": "Expression of MSX2 is induced 3 hours after the addition of BMP4, which is earlier than T and CDX2.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

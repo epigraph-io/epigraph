@@ -1,0 +1,22 @@
+{
+  "scifact_id": 356,
+  "claim": "Dscam1 acts as a hypervariable pattern-recognition receptor for the immune system.",
+  "evidence_sentences": [
+    "Here we report a novel role of an alternatively spliced hypervariable immunoglobulin domain-encoding gene, Dscam, in generating a broad range of PRRs implicated in immune defense in the malaria vector Anopheles gambiae.",
+    "AgDscam responds to infection by producing pathogen challenge-specific splice form repertoires.",
+    "AgDscam is mediating phagocytosis of bacteria with which it can associate and defend against in a splice form\u2013specific manner.",
+    "AgDscam is a hypervariable PRR of the A. gambiae innate immune system."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6144337",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

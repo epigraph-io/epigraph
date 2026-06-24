@@ -65,6 +65,8 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
 
+import theme_lib  # noqa: E402  (scripts/ is on sys.path when run as a script)
+
 psycopg2.extras.register_uuid()
 
 DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
@@ -99,6 +101,21 @@ def sample_atomic_claims(conn, sample_size=5000):
     return ids, embs
 
 
+def sample_all_claims(conn, sample_size=5000):
+    """Sample across ALL current+embedded claims (composites included)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT c.id::text, c.embedding::text
+            FROM claims c
+            WHERE c.embedding IS NOT NULL AND c.is_current = true
+            ORDER BY random() LIMIT %s
+        """, (sample_size,))
+        rows = cur.fetchall()
+    ids = [r[0] for r in rows]
+    embs = np.array([json.loads(r[1]) for r in rows], dtype=np.float32)
+    return ids, embs
+
+
 def find_optimal_k(reduced, k_min=8, k_max=20):
     """Find optimal k via silhouette on UMAP-reduced data."""
     n = len(reduced)
@@ -120,10 +137,11 @@ def find_optimal_k(reduced, k_min=8, k_max=20):
     return best_k
 
 
-def seed_phase(conn, sample_size, k, run_id):
+def seed_phase(conn, sample_size, k, run_id, all_claims=False):
     """Fit UMAP reducer and k-means centroids from a sample."""
-    print(f"Phase 1: Sampling {sample_size} atomic claims...", file=sys.stderr)
-    ids, embs = sample_atomic_claims(conn, sample_size)
+    scope = "all" if all_claims else "atomic"
+    print(f"Phase 1: Sampling {sample_size} {scope} claims...", file=sys.stderr)
+    ids, embs = (sample_all_claims if all_claims else sample_atomic_claims)(conn, sample_size)
     print(f"  Loaded {len(ids)} claims ({embs.nbytes / 1024 / 1024:.1f} MB)", file=sys.stderr)
 
     if len(ids) < 100:
@@ -438,9 +456,12 @@ def main():
     parser.add_argument("--discover-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--run-id", type=str, default=None)
+    parser.add_argument("--all-claims", action="store_true",
+                        help="Seed from all current claims (default: atomic leaves only)")
     args = parser.parse_args()
 
     conn = psycopg2.connect(args.database_url)
+    theme_lib.set_statement_timeout(conn, ms=900000)  # 15 min ceiling per statement
     run_id = args.run_id or str(uuid.uuid4())
 
     if args.discover_only:
@@ -452,7 +473,8 @@ def main():
 
     if not args.assign_only:
         # Phase 1
-        reducer, centroids, k = seed_phase(conn, args.sample_size, args.k, run_id)
+        reducer, centroids, k = seed_phase(conn, args.sample_size, args.k, run_id,
+                                           all_claims=args.all_claims)
 
         if args.seed_only:
             print(json.dumps({"status": "seeded", "run_id": run_id, "k": k}))

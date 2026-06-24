@@ -3,8 +3,8 @@
 
 use crate::types::*;
 use anyhow::{anyhow, Context, Result};
-use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const MD_INSTRUCTIONS: &str = r#"
 Produce a Markdown document with EXACTLY this structure (no preamble, no postamble):
@@ -103,53 +103,74 @@ pub fn extract_md(text: &str) -> Result<String> {
     Err(anyhow!("no '# Table' header or code fence"))
 }
 
-pub fn invoke_claude(prompt: &str) -> Result<String> {
-    let mut child = Command::new("claude")
+/// Invoke `claude -p` and read its narrative output from a result file.
+///
+/// Nested `claude` sessions suppress text in the `--output-format json` `result`
+/// field (see `feedback_nested_cli.md`), so we instead instruct Claude to Write
+/// the narrative to `result_path` and poll for that file.
+pub fn invoke_claude(prompt: &str, result_path: &std::path::Path) -> Result<String> {
+    if let Some(parent) = result_path.parent() {
+        std::fs::create_dir_all(parent).context("create result_path parent")?;
+    }
+    if result_path.exists() {
+        std::fs::remove_file(result_path).ok();
+    }
+
+    let wrapped = format!(
+        "{prompt}\n\n---\n\nWhen you have produced the Markdown document, use the Write tool to save it to:\n\n    {path}\n\nWrite ONLY the Markdown document to that file (no preamble, no postamble, no surrounding code fence). Do not print the document to the chat.\n",
+        prompt = prompt,
+        path = result_path.display(),
+    );
+
+    let status = Command::new("claude")
         .args([
             "-p",
-            "--output-format",
-            "json",
+            "--dangerously-skip-permissions",
             "--model",
             "claude-sonnet-4-6",
         ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .arg(&wrapped)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
         .context("spawn claude CLI")?;
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(prompt.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
+    if !status.success() {
+        return Err(anyhow!("claude CLI exited non-zero (status {})", status));
+    }
+
+    // Result file is written by the Write tool inside the subprocess, but tool
+    // execution can complete slightly after process exit. Poll briefly.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !result_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !result_path.exists() {
         return Err(anyhow!(
-            "claude CLI failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "claude exited successfully but did not write {}",
+            result_path.display()
         ));
     }
-    let stdout = String::from_utf8(out.stdout)?;
-    let envelope: serde_json::Value =
-        serde_json::from_str(&stdout).context("claude CLI stdout not JSON")?;
-    let text = envelope
-        .get("result")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("empty result; stdout: {}", stdout))?;
-    Ok(text.to_string())
+    std::fs::read_to_string(result_path)
+        .with_context(|| format!("read result file {}", result_path.display()))
 }
 
 pub fn extract(d: &Dossier) -> Result<String> {
+    let result_dir = std::path::PathBuf::from(
+        "docs/superpowers/artifacts/2026-04-30-table-graph/staging/llm-out",
+    );
+    let result_path = result_dir.join(format!("{}.{}.md", d.table.repo, d.table.name));
+
     let prompt = build_prompt(d);
-    let raw = invoke_claude(&prompt)?;
+    let raw = invoke_claude(&prompt, &result_path)?;
     if let Ok(md) = extract_md(&raw) {
         return Ok(md);
     }
+    // Some models wrap the doc in extra prose; ask for a strict re-emission.
     let strict = format!(
         "Respond with ONLY the Markdown document (no prose, no fences).\n\n{}",
         prompt
     );
-    let raw = invoke_claude(&strict)?;
+    let raw = invoke_claude(&strict, &result_path)?;
     extract_md(&raw)
 }

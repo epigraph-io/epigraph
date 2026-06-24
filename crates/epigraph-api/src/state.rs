@@ -32,7 +32,10 @@ use serde::{Deserialize, Serialize};
 pub struct CachedSubmission {
     pub claim_id: Uuid,
     pub truth_value: f64,
-    pub trace_id: Uuid,
+    /// The trace bound to the canonical claim, or `None` when the deduped claim
+    /// has no trace (`trace_id IS NULL`). Mirrors `SubmitPacketResponse::trace_id`
+    /// so a cache hit replays the exact (non-phantom) response.
+    pub trace_id: Option<Uuid>,
     pub evidence_ids: Vec<Uuid>,
     /// Timestamp when this entry was created, used for LRU eviction
     pub created_at: Instant,
@@ -244,6 +247,10 @@ pub struct ApiConfig {
     pub require_signatures: bool,
     /// Maximum size of request bodies in bytes
     pub max_request_size: usize,
+    /// Public HTTPS base URL this API is reachable at externally (no trailing slash),
+    /// used to build OAuth discovery documents and consent/redirect links.
+    /// e.g. "https://5-78-124-36.nip.io"
+    pub public_base_url: String,
 }
 
 impl AppState {
@@ -451,8 +458,13 @@ impl AppState {
 
     /// Default JWT config from env var or dev fallback.
     fn default_jwt_config() -> Arc<crate::oauth::JwtConfig> {
-        let secret = std::env::var("EPIGRAPH_JWT_SECRET")
-            .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+        // NOTE: intentionally NOT fail-closed. This is called by test/builder
+        // constructors; the production gate lives in bin/server.rs::main behind
+        // EPIGRAPH_ALLOW_INSECURE_SECRET. See epigraph_auth::assert_production_secret.
+        let secret = std::env::var("EPIGRAPH_JWT_SECRET").unwrap_or_else(|_| {
+            String::from_utf8(epigraph_auth::DEV_JWT_SECRET.to_vec())
+                .expect("DEV_JWT_SECRET is valid UTF-8")
+        });
         Arc::new(crate::oauth::JwtConfig::from_secret(secret.as_bytes()))
     }
 
@@ -587,6 +599,7 @@ impl Default for ApiConfig {
         Self {
             require_signatures: false,
             max_request_size: 10 * 1024 * 1024, // 10MB
+            public_base_url: "http://localhost:8080".to_string(),
         }
     }
 }
@@ -623,6 +636,7 @@ mod tests {
         let config = ApiConfig {
             require_signatures: true,
             max_request_size: 2048,
+            public_base_url: "http://localhost:8080".to_string(),
         };
         let cloned = config.clone();
         assert!(cloned.require_signatures);

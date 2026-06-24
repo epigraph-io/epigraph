@@ -1,0 +1,23 @@
+{
+  "scifact_id": 980,
+  "claim": "Propriospinal interneurons that play a role in the plastic reorganization of spinal circuits are integral for recovery from spinal cord injury.",
+  "evidence_sentences": [
+    "We show that propriospinal relay connections that bypass one or more injury sites are able to mediate spontaneous functional recovery and supraspinal control of stepping, even when there has been essentially total and irreversible interruption of long descending supraspinal pathways in mice.",
+    "Our findings show that pronounced functional recovery can occur after severe SCI without the maintenance or regeneration of direct projections from the brain past the lesion and can be mediated by the reorganization of descending and propriospinal connections."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "20128547",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "severe spinal cord injury",
+      "total interruption of long descending supraspinal pathways",
+      "mice"
+    ],
+    "evidence_type": "empirical"
+  }
+}

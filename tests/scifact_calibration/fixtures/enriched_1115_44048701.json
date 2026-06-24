@@ -1,0 +1,25 @@
+{
+  "scifact_id": 1115,
+  "claim": "Surgical treatment is not superior to non-surgical in treating adults with displaced fractures of the proximal humerus.",
+  "evidence_sentences": [
+    "RESULTS There was no significant mean treatment group difference in the Oxford Shoulder Score averaged over 2 years (39.07 points for the surgical group vs 38.32 points for the nonsurgical group; difference of 0.75 points [95% CI, -1.33 to 2.84 points]; P = .48) or at individual time points.",
+    "There were also no significant between-group differences over 2 years in the mean SF-12 physical component score (surgical group: 1.77 points higher [95% CI, -0.84 to 4.39 points];",
+    "P = .18); the mean SF-12 mental component score (surgical group: 1.28 points lower [95% CI, -3.80 to 1.23 points]; P = .32); complications related to surgery or shoulder fracture (30 patients in surgical group vs 23 patients in nonsurgical group; P = .28), requiring secondary surgery to the shoulder (11 patients in both groups), and increased or new shoulder-related therapy (7 patients vs 4 patients, respectively; P = .58); and mortality (9 patients vs 5 patients; P = .27).",
+    "CONCLUSIONS AND RELEVANCE Among patients with displaced proximal humeral fractures involving the surgical neck, there was no significant difference between surgical treatment compared with nonsurgical treatment in patient-reported clinical outcomes over 2 years following fracture occurrence."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "44048701",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "displaced proximal humeral fractures involving the surgical neck",
+      "surgical treatment vs nonsurgical treatment",
+      "2-year follow-up period"
+    ],
+    "evidence_type": "statistical"
+  }
+}

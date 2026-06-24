@@ -1,0 +1,19 @@
+{
+  "scifact_id": 70,
+  "claim": "Activation of PPM1D suppresses p53 function.",
+  "evidence_sentences": [
+    "Functional studies demonstrate that the mutations result in enhanced suppression of p53 in response to ionizing radiation exposure, suggesting that the mutant alleles encode hyperactive PPM1D isoforms."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4414547",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

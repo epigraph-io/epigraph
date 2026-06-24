@@ -28,6 +28,8 @@ pub struct RunReport {
     pub run_id: Uuid,
     pub scanned_pairs: usize,
     pub promoted: usize,
+    /// Candidates staged as `pending` for human review (`auto_promote=false`).
+    pub staged: usize,
     pub mid_band: usize,
     pub rejected: usize,
 }
@@ -42,7 +44,14 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         Box::new(SharedTripleBlocker::new(fan_out)),
         Box::new(ContentHashBlocker),
     ];
-    let pairs = union_block(pool, &blockers, &inputs.seeds, inputs.cfg.filter).await?;
+    let pairs = union_block(
+        pool,
+        &blockers,
+        &inputs.seeds,
+        inputs.cfg.filter,
+        &inputs.cfg.eligibility,
+    )
+    .await?;
 
     let mut promoted = 0usize;
     let mut mid_band = 0usize;
@@ -56,12 +65,18 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
     let mut mid_features: Vec<MatchFeatures> = Vec::new();
     for (a, b) in &pairs {
         let f = score_pair(pool, *a, *b, &inputs.cfg.weights).await?;
-        if f.score >= inputs.cfg.bands.high {
-            policy
-                .act(PolicyAction::AutoPromote, *a, *b, &f, None)
-                .await?;
-            promoted += 1;
-        } else if f.score >= inputs.cfg.bands.mid {
+        // Route BOTH high- and mid-band pairs through the verifier. The former
+        // high-band fast path (`score >= bands.high`) auto-promoted to
+        // CORROBORATES with NO verification, which silently corroborated
+        // strongly-cosine but opposite-stance pairs — and missing-mass pairs
+        // whose `belief_alignment` fell back to the neutral 0.5 — because the
+        // contradiction check lives only in the verifier. Verifying the high
+        // band closes that hole; the second-pass dispatch below promotes only
+        // on Same/Paraphrase, writes `contradicts` on Contradicts, and rejects
+        // otherwise. Cost: high-band pairs now incur one verifier call;
+        // acceptable since `auto_promote` defaults off and a future
+        // `belief_alignment`-gated fast-path can re-optimize the clear cases.
+        if f.score >= inputs.cfg.bands.mid {
             mid_pairs.push((*a, *b));
             mid_features.push(f);
         } else {
@@ -115,10 +130,21 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         }
     }
 
+    // When not auto-promoting, every AutoPromote/WriteContradicts decision
+    // above actually STAGED a `pending` candidate for human review (Policy
+    // wrote `status='pending'` under the same `auto_promote` flag), so report
+    // it honestly as `staged` rather than `promoted`.
+    let (promoted, staged) = if inputs.auto_promote {
+        (promoted, 0usize)
+    } else {
+        (0usize, promoted)
+    };
+
     Ok(RunReport {
         run_id,
         scanned_pairs: pairs.len(),
         promoted,
+        staged,
         mid_band,
         rejected,
     })

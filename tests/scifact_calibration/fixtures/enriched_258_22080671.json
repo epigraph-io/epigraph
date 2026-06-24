@@ -1,0 +1,26 @@
+{
+  "scifact_id": 258,
+  "claim": "Cholesterol loading induces KLF4 expression in VSMCs, resulting in the expression of pro-inflammatory cytokines.",
+  "evidence_sentences": [
+    "On the basis of in vivo KLF4 chromatin immunoprecipitation\u2013sequencing (ChIP-seq) analyses and studies of cholesterol-treated cultured SMCs, we identified >800 KLF4 target genes, including many that regulate pro-inflammatory responses of SMCs.",
+    "Our findings indicate that the contribution of SMCs to atherosclerotic plaques has been greatly underestimated, and that KLF4-dependent transitions in SMC phenotype are critical in lesion pathogenesis."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "22080671",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.72,
+    "supports_claim": true,
+    "instruments_used": [
+      "chromatin immunoprecipitation\u2013sequencing (ChIP-seq)"
+    ],
+    "reagents_involved": [
+      "cholesterol"
+    ],
+    "conditions": [
+      "in vivo ChIP-seq analyses",
+      "cholesterol-treated cultured SMCs"
+    ],
+    "evidence_type": "empirical"
+  }
+}

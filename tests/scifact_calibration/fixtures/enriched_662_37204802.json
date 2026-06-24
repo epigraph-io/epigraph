@@ -1,0 +1,28 @@
+{
+  "scifact_id": 662,
+  "claim": "JMJD6 slows the hydroxylation of C-terminal lysine",
+  "evidence_sentences": [
+    "We demonstrated that JMJD6 acts as an \u03b1-ketoglutarate- and Fe(II)-dependent lysyl hydroxylase to catalyze p53 hydroxylation.",
+    "We found that p53 indeed exists as a hydroxylated protein in vivo and that the hydroxylation occurs mainly on lysine 382 of p53.",
+    "Depletion of JMJD6 enhances p53 transcriptional activity, arrests cells in the G1 phase, promotes cell apoptosis, and sensitizes cells to DNA damaging agent-induced cell death."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "37204802",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "\u03b1-ketoglutarate",
+      "Fe(II)",
+      "DNA damaging agent"
+    ],
+    "conditions": [
+      "in vivo",
+      "JMJD6 depletion",
+      "G1 phase arrest"
+    ],
+    "evidence_type": "empirical"
+  }
+}

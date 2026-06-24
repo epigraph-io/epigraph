@@ -1,0 +1,28 @@
+{
+  "scifact_id": 12,
+  "claim": "40mg/day dosage of folic acid and 2mg/day dosage of vitamin B12 does not affect chronic kidney disease (CKD) progression.",
+  "evidence_sentences": [
+    "RESULTS Mean baseline homocysteine level was 24.0 micromol/L in the vitamin group and 24.2 micromol/L in the placebo group.",
+    "CONCLUSION Treatment with high doses of folic acid and B vitamins did not improve survival or reduce the incidence of vascular disease in patients with advanced chronic kidney disease or end-stage renal disease.   \n"
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "33409100",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "folic acid",
+      "vitamin B12",
+      "homocysteine"
+    ],
+    "conditions": [
+      "advanced chronic kidney disease",
+      "end-stage renal disease",
+      "high doses of folic acid and B vitamins",
+      "placebo-controlled"
+    ],
+    "evidence_type": "empirical"
+  }
+}

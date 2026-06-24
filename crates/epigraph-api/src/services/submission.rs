@@ -255,6 +255,7 @@ mod tests {
                 agent_id: Uuid::new_v4(),
                 idempotency_key: None,
                 properties: None,
+                labels: Vec::new(),
             },
             evidence: vec![],
             reasoning_trace: ReasoningTraceSubmission {

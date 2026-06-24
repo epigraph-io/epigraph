@@ -1,0 +1,22 @@
+{
+  "scifact_id": 22,
+  "claim": "76-85% of people with severe mental disorder receive no treatment in low and middle income countries.",
+  "evidence_sentences": [
+    "Although disorder severity was correlated with probability of treatment in almost all countries, 35.5% to 50.3% of serious cases in developed countries and 76.3% to 85.4% in less-developed countries received no treatment in the 12 months before the interview."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6490571",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "12 months before the interview",
+      "less-developed countries",
+      "serious cases"
+    ],
+    "evidence_type": "statistical"
+  }
+}

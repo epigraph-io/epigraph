@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1044,
+  "claim": "Rhythmic expression of Cry1 translates directly into a circadian regulation of cAMP signaling in gluconeogenesis.",
+  "evidence_sentences": [
+    "Here we show that Creb activity during fasting is modulated by Cry1 and Cry2, which are rhythmically expressed in the liver.",
+    "Cry1 expression was elevated during the night-day transition, when it reduced fasting gluconeogenic gene expression by blocking glucagon-mediated increases in intracellular cAMP concentrations and in the protein kinase A-mediated phosphorylation of Creb."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "22500262",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

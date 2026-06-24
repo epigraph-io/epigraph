@@ -32,6 +32,69 @@ where
     }
 }
 
+// Defensive deserializer for object-typed parameters like `DocumentSource`.
+//
+// Some MCP clients stringify object-valued arguments (sending the JSON object
+// as a JSON-encoded string) when the schema field isn't explicitly typed as
+// `"type": "object"`. Accept both shapes so a client bug doesn't make the
+// tool uncallable.
+fn deserialize_document_source<'de, D>(
+    d: D,
+) -> Result<epigraph_ingest::schema::DocumentSource, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Object(epigraph_ingest::schema::DocumentSource),
+        Str(String),
+    }
+
+    match Either::deserialize(d)? {
+        Either::Object(src) => Ok(src),
+        Either::Str(s) => serde_json::from_str(&s).map_err(serde::de::Error::custom),
+    }
+}
+
+fn deserialize_document_extraction<'de, D>(
+    d: D,
+) -> Result<epigraph_ingest::schema::DocumentExtraction, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Object(Box<epigraph_ingest::schema::DocumentExtraction>),
+        Str(String),
+    }
+
+    match Either::deserialize(d)? {
+        Either::Object(e) => Ok(*e),
+        Either::Str(s) => serde_json::from_str(&s).map_err(serde::de::Error::custom),
+    }
+}
+
+fn deserialize_workflow_extraction<'de, D>(
+    d: D,
+) -> Result<epigraph_ingest::workflow::WorkflowExtraction, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Object(Box<epigraph_ingest::workflow::WorkflowExtraction>),
+        Str(String),
+    }
+
+    match Either::deserialize(d)? {
+        Either::Object(e) => Ok(*e),
+        Either::Str(s) => serde_json::from_str(&s).map_err(serde::de::Error::custom),
+    }
+}
+
 // ── Claims ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -89,9 +152,82 @@ pub struct QueryClaimsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct QueryUndecomposedClaimsParams {
+    #[schemars(
+        description = "Maximum number of undecomposed claims to return (default 50, max 1000). Claims are ordered created_at ASC (oldest first) so scheduled runs make monotonic progress."
+    )]
+    pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Skip the first N matching claims (default 0). Combine with limit to page through the backlog."
+    )]
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetClaimParams {
     #[schemars(description = "The UUID of the claim to retrieve")]
     pub claim_id: String,
+
+    #[schemars(
+        description = "Optional lens frame UUID (from list_frames). Must be paired with perspective_id. \
+                       When both are set, the response carries an additive lensed_belief computed under that (frame, perspective) lens; the global truth_value is unchanged."
+    )]
+    #[serde(default)]
+    pub frame_id: Option<String>,
+
+    #[schemars(
+        description = "Optional lens perspective UUID (from list_perspectives). Must be paired with frame_id. \
+                       The perspective's source/locality reliability re-weights the claim's BBAs on-read."
+    )]
+    #[serde(default)]
+    pub perspective_id: Option<String>,
+}
+
+/// Additive per-claim belief computed under a `(frame, perspective)` lens.
+///
+/// Attached as an `Option<LensedBelief>` on the four context-delivery read
+/// tools (`recall`, `recall_with_context`, `get_claim`, `get_belief`) ONLY when
+/// a valid lens is supplied. Serialize-only with
+/// `#[serde(skip_serializing_if = "Option::is_none")]` on the field so a
+/// lens-free call is byte-identical to today (the key is omitted, never `null`).
+///
+/// Source: `epigraph_engine::belief_query::get_perspective_belief` —
+/// recomputes the claim's belief on-read, re-discounting every stored BBA by
+/// the perspective's reliability maps. Order claims by `pignistic_prob` (BetP).
+#[derive(Debug, Clone, Serialize)]
+pub struct LensedBelief {
+    /// Echoes the lens frame UUID.
+    pub frame_id: String,
+    /// Echoes the lens perspective UUID.
+    pub perspective_id: String,
+    /// Dempster-Shafer belief (lower probability bound) under the lens.
+    pub belief: f64,
+    /// Dempster-Shafer plausibility (upper probability bound) under the lens.
+    pub plausibility: f64,
+    /// Pignistic probability (BetP) under the lens — use for ordering.
+    pub pignistic_prob: f64,
+}
+
+impl LensedBelief {
+    /// Build from a computed `BeliefInterval`, carrying only the three lens
+    /// fields (spec §5 names exactly frame_id, perspective_id, belief,
+    /// plausibility, pignistic_prob — not mass/source/framed).
+    #[must_use]
+    pub fn from_interval(
+        frame_id: uuid::Uuid,
+        perspective_id: uuid::Uuid,
+        interval: &epigraph_engine::BeliefInterval,
+    ) -> Self {
+        Self {
+            frame_id: frame_id.to_string(),
+            perspective_id: perspective_id.to_string(),
+            belief: interval.belief,
+            plausibility: interval.plausibility,
+            pignistic_prob: interval.pignistic_prob,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -162,6 +298,32 @@ pub struct RecallParams {
 
     #[schemars(description = "Maximum number of memories to return (default 10)")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Restrict recall to claims carrying ALL these labels/tags (array containment). Default: no tag filter."
+    )]
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    #[schemars(
+        description = "Restrict recall to claims authored by this agent UUID. Default: any agent. An invalid UUID is rejected, not silently ignored."
+    )]
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
+    #[schemars(
+        description = "Optional lens frame UUID (from list_frames). Must be paired with perspective_id. \
+                       When both are set, each returned claim carries an additive lensed_belief computed under that (frame, perspective) lens. Ranking and min_truth stay on the global truth_value."
+    )]
+    #[serde(default)]
+    pub frame_id: Option<String>,
+
+    #[schemars(
+        description = "Optional lens perspective UUID (from list_perspectives). Must be paired with frame_id. \
+                       The perspective's source/locality reliability re-weights each claim's BBAs on-read."
+    )]
+    #[serde(default)]
+    pub perspective_id: Option<String>,
 }
 
 // ── Ingestion ──
@@ -282,6 +444,30 @@ pub struct FindWorkflowParams {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetWorkflowExecutionsParams {
+    #[schemars(
+        description = "Workflow UUID (a `workflows` row id / lineage member) whose recent executions to fetch"
+    )]
+    pub workflow_id: String,
+
+    #[schemars(description = "Max executions to return, newest first (default 20, max 100)")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EvaluateWorkflowPromotionParams {
+    #[schemars(
+        description = "Workflow variant UUID to evaluate for promotion over its variant_of parent"
+    )]
+    pub workflow_id: String,
+
+    #[schemars(
+        description = "Execution window compared on each side, newest first (default 50, max 500)"
+    )]
+    pub window: Option<i64>,
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
     #[schemars(description = "Zero-based index of the step in the workflow")]
@@ -355,6 +541,7 @@ pub struct IngestWorkflowParams {
     #[schemars(
         description = "Hierarchical workflow extraction: source (canonical_name, goal, generation, authors, tags, metadata), thesis, thesis_derivation, phases (each with title/summary/steps where each step has compound, rationale, operations, generality, confidence), and relationships."
     )]
+    #[serde(deserialize_with = "deserialize_workflow_extraction")]
     pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
 }
 
@@ -368,6 +555,7 @@ pub struct ImproveWorkflowHierarchyParams {
     #[schemars(
         description = "Hierarchical extraction for the new variant. The tool overwrites `extraction.source.canonical_name`, `generation`, and `parent_canonical_name`: canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param (same-lineage improvement only — cross-lineage variants are not supported by this tool), and generation is set to the parent's current max + 1. Caller-supplied values for those three fields are ignored."
     )]
+    #[serde(deserialize_with = "deserialize_workflow_extraction")]
     pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
 }
 
@@ -552,6 +740,13 @@ pub struct GetBeliefParams {
         description = "Optional frame UUID. If provided, recomputes Bel/Pl/BetP from stored BBAs. If omitted, returns cached DS columns."
     )]
     pub frame_id: Option<String>,
+
+    #[schemars(
+        description = "Optional lens perspective UUID (from list_perspectives). Requires frame_id. \
+                       When set, the response also carries an additive lensed_belief computed under that (frame, perspective) lens; the existing global belief is unchanged."
+    )]
+    #[serde(default)]
+    pub perspective_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -679,7 +874,17 @@ pub struct RecallResult {
     pub claim_id: String,
     pub content: String,
     pub truth_value: f64,
+    /// Dense cosine similarity in `[0,1]`; `0.0` for a lexical-only hit.
     pub similarity: f64,
+    /// Reciprocal Rank Fusion score (primary ordering).
+    pub rrf_score: f64,
+    /// Which legs matched: subset of `["dense","lexical"]`.
+    pub matched_via: Vec<String>,
+    /// Per-claim belief under the requested `(frame, perspective)` lens.
+    /// Present only when a lens was supplied; omitted (not null) otherwise, so
+    /// a lens-free recall is byte-identical to today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lensed_belief: Option<LensedBelief>,
 }
 
 #[derive(Debug, Serialize)]
@@ -694,6 +899,77 @@ pub struct IngestDocumentParams {
         description = "Absolute or working-directory-relative path to a JSON file containing a hierarchical DocumentExtraction (thesis -> sections -> paragraphs -> atoms)."
     )]
     pub file_path: String,
+}
+
+/// Inline counterpart to `IngestDocumentParams`. Where `ingest_document`
+/// takes a `file_path` to an opaque JSON file, this carries the typed
+/// `DocumentExtraction` directly, so the full hierarchical shape is
+/// self-documenting in the tool schema — the fix for MCP-only agents that
+/// cannot write a file first and otherwise have to guess the JSON shape.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IngestDocumentInlineParams {
+    #[schemars(
+        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, and an optional top-level source_text. When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent on paragraph and atom content hashes (node-level): re-ingesting an abstract then the full paper is safe — existing paragraph/atom nodes dedup and only new content is written."
+    )]
+    #[serde(deserialize_with = "deserialize_document_extraction")]
+    pub extraction: epigraph_ingest::schema::DocumentExtraction,
+}
+
+/// Parameters for the `ingest_document_spine` MCP tool. Phase 1 of the
+/// two-phase ingest flow: writes thesis + sections + paragraphs (levels 0–2)
+/// and returns which paragraph paths are NEW so the caller can atomize only
+/// those before calling `ingest_document_inline` with atoms.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IngestDocumentSpineParams {
+    #[schemars(
+        description = "DocumentExtraction whose `atoms` fields are EMPTY (e.g. the output of `structure_source`). Writes thesis + sections + paragraphs into the graph with content-hash dedup; atom fields are ignored. Returns `new_paragraph_paths` — the subset of paragraph paths that are NEW to this ingest. Atomize only those paragraphs, fill their atoms, then call `ingest_document_inline` with the full extraction. Two-phase ingest: spine first → atomize new paragraphs only → inline with atoms."
+    )]
+    #[serde(deserialize_with = "deserialize_document_extraction")]
+    pub extraction: epigraph_ingest::schema::DocumentExtraction,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestDocumentSpineResponse {
+    pub paper_id: String,
+    pub paper_title: String,
+    pub doi: String,
+    pub authors: Vec<AuthorResponse>,
+    pub paragraphs_new: usize,
+    pub paragraphs_deduped: usize,
+    pub paragraphs_embedded: usize,
+    /// Paragraph paths (e.g. `"sections[0].paragraphs[1]"`) that were written
+    /// as new in this ingest. Atomize exactly these paragraphs, then call
+    /// `ingest_document_inline` with atoms filled for those paths only.
+    pub new_paragraph_paths: Vec<String>,
+    /// `true` when every paragraph in the extraction already existed; nothing new was written.
+    pub already_ingested: bool,
+}
+
+/// Parameters for the `structure_source` MCP tool. Deterministically slices raw
+/// markdown/plaintext (or an agent-supplied messy-input `segmentation`) into a
+/// verbatim `DocumentExtraction` — sections + paragraphs as byte-exact source
+/// slices, with `atoms` left EMPTY for the agent to fill and resubmit via
+/// `ingest_document_inline`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StructureSourceParams {
+    #[schemars(
+        description = "Raw source text to structure into a verbatim section/paragraph tree."
+    )]
+    pub text: String,
+    #[schemars(
+        description = "Document source metadata (title, doi/uri, source_type, authors, year, …) — same shape as DocumentExtraction.source."
+    )]
+    #[serde(deserialize_with = "deserialize_document_source")]
+    pub source: epigraph_ingest::schema::DocumentSource,
+    #[schemars(
+        description = "Format of `text`: \"markdown\" or \"plaintext\". Determines the deterministic parser."
+    )]
+    pub format: String,
+    #[schemars(
+        description = "Optional messy-input boundary segmentation: per-section heading + verbatim paragraph block strings, located in order. When present, overrides deterministic parsing."
+    )]
+    #[serde(default)]
+    pub segmentation: Option<epigraph_ingest::document::structure::SegmentationWire>,
 }
 
 /// Parameters for the `link_hierarchical` MCP tool.
@@ -733,6 +1009,64 @@ pub struct LinkHierarchicalResponse {
     pub created: bool,
 }
 
+/// Parameters for the `link_epistemic` MCP tool.
+///
+/// Wires two existing claims with a **belief-affecting** epistemic relationship
+/// (`supports`, `corroborates`, `elaborates`, `generalizes`, `specializes`,
+/// `contradicts`, `refutes`) and triggers Dempster–Shafer recomputation on the
+/// **target** claim. Direction is `source -> target` ("source `relationship`
+/// target"). Unlike `link_hierarchical` (which is deliberately inert), this
+/// tool mirrors `POST /api/v1/edges`'s create→wire path: on first creation it
+/// builds a BBA from the source claim's belief interval and recomputes the
+/// target's combined belief. Idempotent on `(source, target, relationship)`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LinkEpistemicParams {
+    #[schemars(description = "UUID of the source claim (the evidence / asserting side)")]
+    pub source_claim_id: String,
+
+    #[schemars(description = "UUID of the target claim (the side whose belief is recomputed)")]
+    pub target_claim_id: String,
+
+    #[schemars(
+        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes. (supersedes is intentionally NOT accepted — use supersede_claim.)"
+    )]
+    pub relationship: String,
+
+    #[schemars(description = "Optional arbitrary JSON object attached to the edge.")]
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
+}
+
+/// Belief interval echoed back in [`LinkEpistemicResponse`] so the caller can
+/// observe the target claim's combined belief after the wire.
+#[derive(Debug, Serialize)]
+pub struct LinkEpistemicBelief {
+    pub belief: f64,
+    pub plausibility: f64,
+    pub pignistic_prob: f64,
+}
+
+/// Response for the `link_epistemic` MCP tool.
+///
+/// `was_created=true` means a new edge row was inserted and belief wiring was
+/// attempted; `false` means an edge with the same `(source, target,
+/// relationship)` already existed (idempotent re-hit — no re-wire). `belief_wired`
+/// is `true` only when the engine actually materialized a BBA and recomputed
+/// the target (engine outcome `Wired`); it is `false` for idempotent re-hits and
+/// for the no-op wiring outcomes (source has no belief interval, vacuous
+/// transfer, or a recompute error). `target_belief` is a best-effort read of the
+/// target's cached DS columns after the recompute (`None` if the target carries
+/// no belief yet or the read failed).
+#[derive(Debug, Serialize)]
+pub struct LinkEpistemicResponse {
+    pub edge_id: String,
+    pub was_created: bool,
+    pub relationship: String,
+    pub belief_wired: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_belief: Option<LinkEpistemicBelief>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct IngestDocumentResponse {
     pub paper_id: String,
@@ -748,6 +1082,25 @@ pub struct IngestDocumentResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ds_frame_id: Option<String>,
     pub already_ingested: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CheckAlreadyIngestedParams {
+    #[schemars(description = "DOI of the paper to check.")]
+    pub doi: String,
+    #[schemars(
+        description = "Pipeline version. Omit to use the current hierarchical extraction pipeline."
+    )]
+    pub pipeline_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckAlreadyIngestedResponse {
+    pub already_ingested: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paper_id: Option<String>,
+    pub doi: String,
+    pub pipeline_version: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -790,6 +1143,12 @@ pub struct FindWorkflowResult {
     pub behavioral_success_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub behavioral_execution_count: Option<i64>,
+    /// Set by the workflow-promotion maintenance pass (`refresh_workflow_promotion`)
+    /// from the variant's `properties.promotion.promotable`. `Some(true)` means
+    /// the gate found this variant statistically better than its parent; absent
+    /// when never evaluated. Advisory — callers may prefer promoted variants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotable: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -884,6 +1243,12 @@ pub struct BeliefResponse {
     pub mass_on_conflict: f64,
     pub mass_on_missing: f64,
     pub source: String,
+    /// Belief under the requested `(frame, perspective)` lens. Present only when
+    /// a perspective_id was supplied (frame_id required); omitted (not null)
+    /// otherwise so a lens-free get_belief is byte-identical to today. The
+    /// top-level belief/plausibility/etc remain the global (unlensed) values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lensed_belief: Option<LensedBelief>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1073,6 +1438,12 @@ pub struct BatchClaimEntry {
 
     #[schemars(description = "Confidence 0.0-1.0")]
     pub confidence: Option<f64>,
+
+    #[schemars(
+        description = "Optional labels to attach to the new claim (e.g. ['backlog','bug'])"
+    )]
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1264,6 +1635,17 @@ pub struct CreatePerspectiveParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetSourceReliabilityParams {
+    #[schemars(description = "UUID of the perspective whose source-reliability lens to set")]
+    pub perspective_id: String,
+
+    #[schemars(
+        description = "Map of evidence-type tag -> reliability alpha in [0,1] (e.g. {\"western_clinical\":0.95,\"ayurvedic_classical\":0.15}). This is the frame-function lens read by scoped_belief. An empty map clears the override."
+    )]
+    pub source_reliability: std::collections::HashMap<String, f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListPerspectivesParams {
     #[schemars(description = "Maximum number of perspectives to return (default 20)")]
     pub limit: Option<i64>,
@@ -1326,6 +1708,10 @@ pub struct QueryTriplesParams {
     pub object: Option<String>,
     #[schemars(description = "Object entity type (optional)")]
     pub object_type: Option<String>,
+    #[schemars(
+        description = "Minimum triple confidence threshold, 0.0–1.0 (default 0.0 — no filtering)"
+    )]
+    pub min_confidence: Option<f64>,
     #[schemars(description = "Maximum results (default 20)")]
     pub limit: Option<i64>,
 }
@@ -1391,6 +1777,72 @@ mod tests {
             serde_json::from_str(r#"{"content":"x","tags":"not-json"}"#);
         assert!(r.is_err());
     }
+
+    #[test]
+    fn structure_source_params_accepts_stringified_source() {
+        // Simulate a client that double-encodes the `source` object as a JSON string.
+        let raw = serde_json::json!({
+            "text": "hello world",
+            "format": "plaintext",
+            "source": "{\"title\":\"On the Stability of DNA Origami\",\"doi\":\"10.1002/anie.201802890\",\"source_type\":\"Paper\",\"authors\":[{\"name\":\"Kielar, C.\"}],\"journal\":\"Angew. Chem.\",\"year\":2018,\"metadata\":{\"pmid\":\"29799663\"}}"
+        });
+        let params: StructureSourceParams =
+            serde_json::from_value(raw).expect("should deserialize");
+        assert_eq!(params.source.title, "On the Stability of DNA Origami");
+        assert_eq!(params.source.doi.as_deref(), Some("10.1002/anie.201802890"));
+    }
+
+    #[test]
+    fn structure_source_params_accepts_object_source() {
+        // Normal path: `source` arrives as a proper JSON object.
+        let raw = serde_json::json!({
+            "text": "hello world",
+            "format": "plaintext",
+            "source": {
+                "title": "On the Stability of DNA Origami",
+                "doi": "10.1002/anie.201802890"
+            }
+        });
+        let params: StructureSourceParams =
+            serde_json::from_value(raw).expect("should deserialize");
+        assert_eq!(params.source.title, "On the Stability of DNA Origami");
+    }
+
+    #[test]
+    fn ingest_document_inline_accepts_stringified_extraction() {
+        let inner = serde_json::json!({
+            "source": {"title": "Kielar 2018", "doi": "10.1002/anie.201802890"},
+            "sections": []
+        });
+        let raw = serde_json::json!({ "extraction": inner.to_string() });
+        let params: IngestDocumentInlineParams =
+            serde_json::from_value(raw).expect("should deserialize");
+        assert_eq!(params.extraction.source.title, "Kielar 2018");
+    }
+
+    #[test]
+    fn ingest_document_inline_accepts_object_extraction() {
+        let raw = serde_json::json!({
+            "extraction": {
+                "source": {"title": "Kielar 2018", "doi": "10.1002/anie.201802890"},
+                "sections": []
+            }
+        });
+        let params: IngestDocumentInlineParams =
+            serde_json::from_value(raw).expect("should deserialize");
+        assert_eq!(params.extraction.source.title, "Kielar 2018");
+    }
+
+    #[test]
+    fn ingest_workflow_accepts_stringified_extraction() {
+        let inner = serde_json::json!({
+            "source": {"canonical_name": "test-workflow", "goal": "do stuff"},
+            "phases": []
+        });
+        let raw = serde_json::json!({ "extraction": inner.to_string() });
+        let params: IngestWorkflowParams = serde_json::from_value(raw).expect("should deserialize");
+        assert_eq!(params.extraction.source.canonical_name, "test-workflow");
+    }
 }
 
 // ── Cross-source matching (T19) ──
@@ -1415,4 +1867,30 @@ pub struct DecideMatchCandidateParams {
     pub candidate_id: String,
     #[schemars(description = "Decision: 'promote' (writes CORROBORATES edge) or 'reject'")]
     pub verdict: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecomputeBeliefsParams {
+    #[schemars(
+        description = "Explicit claim UUIDs to recompute. Highest-priority target selector — when present and non-empty, `labels` and the bulk enumeration are ignored."
+    )]
+    #[serde(default)]
+    pub claim_ids: Option<Vec<String>>,
+
+    #[schemars(
+        description = "Recompute every current claim carrying ALL of these labels (e.g. a paper's claim set). Used only when `claim_ids` is absent/empty."
+    )]
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+
+    #[schemars(
+        description = "Cap on the number of claims processed (default 500, max 2000). For the bulk path (no claim_ids/labels) this bounds the DISTINCT-claim enumeration and the response reports `truncated=true` when more remain — page with repeated calls or use the `epigraph-recompute-belief` CLI for full-DB rebuilds."
+    )]
+    pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Offset into the bulk DISTINCT-claim enumeration for pagination (default 0). Ignored when `claim_ids` or `labels` is given."
+    )]
+    #[serde(default)]
+    pub offset: Option<i64>,
 }

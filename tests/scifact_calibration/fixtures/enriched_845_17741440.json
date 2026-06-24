@@ -1,0 +1,24 @@
+{
+  "scifact_id": 845,
+  "claim": "Neutrophil extracellular traps (NETs) are released by ANCA-stimulated neutrophils.",
+  "evidence_sentences": [
+    "Here we show that chromatin fibers, so-called neutrophil extracellular traps (NETs), are released by ANCA-stimulated neutrophils and contain the targeted autoantigens proteinase-3 (PR3) and myeloperoxidase (MPO)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "17741440",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.99,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "ANCA",
+      "proteinase-3",
+      "myeloperoxidase"
+    ],
+    "conditions": [
+      "ANCA-stimulated neutrophils"
+    ],
+    "evidence_type": "empirical"
+  }
+}

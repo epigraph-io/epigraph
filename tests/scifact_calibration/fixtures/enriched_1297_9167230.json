@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1297,
+  "claim": "There was an estimated 30 million cases of pneumonia in young children worldwide in 2010.",
+  "evidence_sentences": [
+    "FINDINGS We identified 89 eligible studies and estimated that in 2010, 11\u00b79 million (95% CI 10\u00b73-13\u00b79 million) episodes of severe and 3\u00b70 million (2\u00b71-4\u00b72 million) episodes of very severe ALRI resulted in hospital admissions in young children worldwide."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9167230",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.35,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

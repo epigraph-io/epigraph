@@ -7,6 +7,8 @@ pub mod activity;
 pub mod agent;
 pub mod agent_key;
 pub mod analysis;
+pub mod authorization_code;
+pub mod authorize_session;
 pub mod behavioral_execution;
 pub mod challenge;
 pub mod claim;
@@ -63,8 +65,8 @@ pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    ClaimEmbeddingHit, ClaimPairDistance, ClaimRepository, EvolveStepResult, LineageHead,
-    PatchClaimDiff, PatchClaimInput,
+    ClaimBeliefColumns, ClaimEmbeddingHit, ClaimPairDistance, ClaimRepository, EvolveStepResult,
+    HybridHit, LineageHead, PatchClaimDiff, PatchClaimInput,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
@@ -104,7 +106,7 @@ pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
 pub use trace::ReasoningTraceRepository;
-pub use triple::{MentionRow, TripleRepository, TripleRow};
+pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use workflow::{
     HierarchicalWorkflowRow, ResolvedStep, WorkflowListRow, WorkflowRecallResult,
     WorkflowRepository,

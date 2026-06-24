@@ -1,0 +1,25 @@
+{
+  "scifact_id": 530,
+  "claim": "Human embryonic stem cells give rise to cell types from the outer embryonic germ layer, but not the other two layers.",
+  "evidence_sentences": [
+    "Embryonic stem (ES) cell lines derived from human blastocysts have the developmental potential to form derivatives of all three embryonic germ layers even after prolonged culture.",
+    "High-passage H9.1 and H9.2 cells both formed teratomas in SCID-beige mice that included differentiated derivatives of all three embryonic germ layers."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "25413327",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "SCID-beige mice"
+    ],
+    "conditions": [
+      "prolonged culture",
+      "high-passage H9.1 and H9.2 cells",
+      "teratoma formation in SCID-beige mice"
+    ],
+    "evidence_type": "empirical"
+  }
+}

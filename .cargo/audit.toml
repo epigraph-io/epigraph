@@ -1,0 +1,36 @@
+# cargo-audit ignore-list — triage of known RustSec advisories in Cargo.lock.
+#
+# The "Security audit (advisory)" CI job (.github/workflows/ci.yml) runs
+# `cargo audit` and is intentionally `continue-on-error: true` — advisory, not a
+# merge gate. (Foreman auto-merges epigraph PRs, so a hard gate would let any
+# newly-published transitive advisory red-light unrelated PRs.) This file lets
+# the job go GREEN on the *currently-triaged* advisories, so a genuinely NEW
+# advisory still turns it red as actionable signal rather than drowning in a
+# permanently-red check.
+#
+# Tracking: EpiGraph backlog claim a2fa31b1-b733-4f32-bdc2-6a0f0bd4c4ef
+# (sqlx 0.7->0.8 + reqwest 0.11->0.12 migrations). Remove entries from the
+# "deferred" group below as those migrations land. Re-review the "no fix"
+# group periodically in case upstream ships a patch.
+
+[advisories]
+ignore = [
+    # ── No fix available — accepted risk ────────────────────────────────────
+    "RUSTSEC-2023-0071", # rsa: Marvin timing side-channel. No fixed upstream
+                         #   release exists (pulled by epigraph-api).
+    "RUSTSEC-2026-0097", # rand: unsound with a custom logger. Both 0.8.5 and
+                         #   0.9.2 are flagged — no patched release yet.
+    "RUSTSEC-2024-0384", # instant: unmaintained. Transitive via `ascent`
+                         #   (Datalog engine) — not removable by us.
+    "RUSTSEC-2024-0436", # paste: unmaintained. Transitive via `ascent`.
+
+    # ── Deferred — cleared by the tracked migrations (backlog a2fa31b1) ──────
+    "RUSTSEC-2024-0363", # sqlx 0.7.4 binary-protocol cast. Fixed by sqlx 0.8.
+    "RUSTSEC-2026-0098", # rustls-webpki 0.101.7 name-constraint (URI). Old TLS
+                         #   stack via reqwest 0.11 + sqlx 0.7 -> rustls 0.21;
+                         #   cleared by reqwest 0.12 + sqlx 0.8.
+    "RUSTSEC-2026-0099", # rustls-webpki 0.101.7 name-constraint (wildcard).
+    "RUSTSEC-2026-0104", # rustls-webpki 0.101.7 CRL-parse panic.
+    "RUSTSEC-2025-0134", # rustls-pemfile 1.0.4 unmaintained. Same old TLS
+                         #   stack; reqwest 0.12 + sqlx 0.8 move to pemfile 2.x.
+]

@@ -4,7 +4,7 @@ use epigraph_api::{create_router, ApiConfig, AppState};
 #[cfg(feature = "db")]
 use epigraph_jobs::{
     cluster_graph::ClusterGraphHandler, theme_cluster_rebuild::ThemeClusterRebuildHandler,
-    EpiGraphJob, JobQueue, JobRunner, PostgresJobQueue,
+    JobQueue, JobRunner, PostgresJobQueue,
 };
 use std::sync::Arc;
 #[cfg(feature = "db")]
@@ -155,6 +155,24 @@ async fn main() {
         }
     }
 
+    // Fail-closed JWT secret gate. Prod refuses to boot with an unset/dev
+    // secret; dev/CI opt out with EPIGRAPH_ALLOW_INSECURE_SECRET=1. The dev
+    // fallback in AppState::default_jwt_config is unchanged so the suite still
+    // compiles and runs.
+    let allow_insecure = std::env::var("EPIGRAPH_ALLOW_INSECURE_SECRET")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if !allow_insecure {
+        let secret = std::env::var("EPIGRAPH_JWT_SECRET").unwrap_or_default();
+        if let Err(reason) = epigraph_auth::assert_production_secret(secret.as_bytes()) {
+            eprintln!(
+                "FATAL: {reason}. Set a real EPIGRAPH_JWT_SECRET (>= 32 bytes, not the dev literal), \
+                 or set EPIGRAPH_ALLOW_INSECURE_SECRET=1 for local dev/CI."
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Configure API settings.
     //
     // `require_signatures` enables a packet-signature gate on the write path
@@ -167,9 +185,15 @@ async fn main() {
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
+    // Public HTTPS base URL this API is reachable at externally (no trailing
+    // slash), used to build OAuth discovery documents and consent/redirect
+    // links. Defaults to localhost for local dev/CI.
+    let public_base_url = std::env::var("EPIGRAPH_PUBLIC_BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:8080".to_string());
     let config = ApiConfig {
         require_signatures,
         max_request_size: 10 * 1024 * 1024, // 10MB — figure evidence carries base64 images
+        public_base_url,
     };
 
     // Create embedding service for semantic search
@@ -191,7 +215,32 @@ async fn main() {
             .expect("Failed to apply pending migrations");
         tracing::info!("Migrations up to date");
 
-        let job_pool = pool.clone();
+        // Dedicated pool for background jobs with a per-connection
+        // `statement_timeout`, so a runaway clustering query — or a backend
+        // orphaned by a hard restart — self-aborts instead of grinding for
+        // hours and saturating Postgres (incident 2026-05-29). Kept separate
+        // from the API pool so the cap never affects request handling.
+        let job_statement_timeout = std::time::Duration::from_millis(
+            std::env::var("EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2_700_000), // 45 minutes
+        );
+        let job_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(8)
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    epigraph_jobs::apply_job_connection_settings(conn, job_statement_timeout).await
+                })
+            })
+            .connect(&database_url)
+            .await
+            .expect("Failed to create background job pool");
+        tracing::info!(
+            statement_timeout_ms = job_statement_timeout.as_millis() as u64,
+            "Background job pool ready"
+        );
+
         let state = AppState::with_db(pool, config).with_embedding_service(embedding_service);
         (state, job_pool)
     };
@@ -225,8 +274,10 @@ async fn main() {
         tracing::info!("EPIGRAPH_DISABLE_JOBS=1 set; skipping job runner registration");
     } else {
         let queue: Arc<dyn JobQueue> = Arc::new(PostgresJobQueue::new(job_pool.clone()));
-        let queue_for_cluster_cron = Arc::clone(&queue);
         let queue_for_theme_cron = Arc::clone(&queue);
+        // Concrete handle for the stale-job reaper (recover_stale_jobs is a
+        // PostgresJobQueue method, not part of the JobQueue trait).
+        let reaper_queue = PostgresJobQueue::new(job_pool.clone());
 
         let handler_pool = Arc::new(job_pool);
         let mut runner = JobRunner::new(2, queue);
@@ -242,75 +293,47 @@ async fn main() {
             runner.start().await;
         });
 
+        // Reaper: a process hard-killed mid-run leaves its job stuck in
+        // `running` forever (there is no graceful shutdown). Periodically reset
+        // such rows to `pending` so the nightly is re-attempted rather than
+        // wedged. The 90-min threshold exceeds the 45-min statement_timeout, so
+        // a legitimately running job is never reset out from under itself. The
+        // first iteration runs immediately and clears the previous process's
+        // orphans on boot.
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            let stale_after = Duration::from_secs(90 * 60);
             loop {
-                match (EpiGraphJob::ClusterGraph {
-                    resolution: 1.0,
-                    retain_runs: 3,
-                })
-                .into_job()
-                {
-                    Ok(job) => {
-                        if let Err(e) = queue_for_cluster_cron.enqueue(job).await {
-                            tracing::error!(
-                                error = %e,
-                                "failed to enqueue nightly ClusterGraph job"
-                            );
-                        } else {
-                            tracing::info!("Enqueued nightly ClusterGraph job");
-                        }
+                match reaper_queue.recover_stale_jobs(stale_after).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::warn!(recovered = n, "reaper: reset stale running jobs to pending")
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "failed to serialize ClusterGraph job payload"
-                        );
-                    }
+                    Err(e) => tracing::error!(error = %e, "reaper: recover_stale_jobs failed"),
                 }
-                tokio::time::sleep(Duration::from_secs(86_400)).await;
+                tokio::time::sleep(Duration::from_secs(15 * 60)).await;
             }
         });
 
-        // Sibling cron: ThemeClusterRebuild — staggered 30-minute warmup
-        // (vs ClusterGraph's 60 s) so ClusterGraph finishes its first run
-        // before ThemeClusterRebuild's `wipe_first` cascades into
-        // `graph_neighborhoods.theme_id` (ON DELETE CASCADE, migration
-        // 026).  Subsequent daily runs preserve the same offset.
-        // `skip_if_unchanged: true` makes this a cheap no-op on idle days.
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(1800)).await;
-            loop {
-                match (EpiGraphJob::ThemeClusterRebuild {
-                    max_themes: 50,
-                    min_claims_per_theme: 5,
-                    skip_if_unchanged: true,
-                })
-                .into_job()
-                {
-                    Ok(job) => {
-                        if let Err(e) = queue_for_theme_cron.enqueue(job).await {
-                            tracing::error!(
-                                error = %e,
-                                "failed to enqueue nightly ThemeClusterRebuild job"
-                            );
-                        } else {
-                            tracing::info!("Enqueued nightly ThemeClusterRebuild job");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "failed to serialize ThemeClusterRebuild job payload"
-                        );
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(86_400)).await;
-            }
-        });
+        // Nightly auto-enqueue is DISABLED for both ClusterGraph and
+        // ThemeClusterRebuild.
+        //
+        // The ThemeClusterRebuild rebuild (in-memory 1536-dim k-means, linfa
+        // n_runs=10 × elbow range, see theme_kmeans.rs) wedged epigraph-api
+        // for ~30 min after every restart — its cron fired 1800 s post-boot,
+        // so a bounce was effectively a forced full re-cluster. ClusterGraph
+        // (Louvain) likewise self-triggered ~60 s after boot. Both jobs are
+        // expensive and not latency-sensitive, so they should run on operator
+        // demand, not as an unconditional side effect of starting the server.
+        //
+        // Both handlers stay REGISTERED above (the theme handler borrows
+        // `queue_for_theme_cron` for its follow-up queue), so an operator can
+        // still trigger a one-off run by enqueuing a `ClusterGraph` or
+        // `ThemeClusterRebuild` job via the jobs API; nothing auto-enqueues
+        // either.
 
         tracing::info!(
-            "Job runner started (2 workers); nightly ClusterGraph + ThemeClusterRebuild jobs scheduled"
+            "Job runner started (2 workers); ClusterGraph + ThemeClusterRebuild \
+             auto-enqueue disabled (run on demand via the jobs API)"
         );
     }
 

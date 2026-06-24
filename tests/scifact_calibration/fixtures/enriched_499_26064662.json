@@ -1,0 +1,23 @@
+{
+  "scifact_id": 499,
+  "claim": "HbA1c consistently overestimates glycemic control in black individuals with Sickle cell trait (SCT).",
+  "evidence_sentences": [
+    "In unadjusted GEE analyses, for a given fasting glucose, HbA1c values were statistically significantly lower in those with (5.72%) vs those without (6.01%) SCT (mean HbA1c difference, \u22120.29%; 95% CI, \u22120.35% to \u22120.23%).",
+    "Findings were similar in models adjusted for key risk factors and in analyses using 2001 concurrent measures of 2-hour glucose and HbA1c concentration for those with SCT (mean, 5.35%) vs those without SCT (mean, 5.65%) for a mean HbA1c difference of \u22120.30% (95% CI, \u22120.39% to \u22120.21%).",
+    "The prevalence of prediabetes and diabetes was statistically significantly lower among participants with SCT when defined using HbA1c values (29.2% vs 48.6% for prediabetes and 3.8% vs 7.3% for diabetes in 572 observations from participants with SCT and 6877 observations from participants without SCT; P<.001 for both comparisons).",
+    "Conclusions and Relevance Among African Americans from 2 large, well-established cohorts, participants with SCT had lower levels of HbA1c at any given concentration of fasting or 2-hour glucose compared with participants without SCT.",
+    "These findings suggest that HbA1c may systematically underestimate past glycemia in black patients with SCT and may require further evaluation."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "26064662",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

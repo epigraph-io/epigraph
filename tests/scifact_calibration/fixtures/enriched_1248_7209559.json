@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1248,
+  "claim": "The peak incidence of fractures occurs during pubertal growth spurt in early adolescents.",
+  "evidence_sentences": [
+    "CONTEXT The incidence of distal forearm fractures in children peaks around the time of the pubertal growth spurt, possibly because physical activity increases at the time of a transient deficit in cortical bone mass due to the increased calcium demand during maximal skeletal growth."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "7209559",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

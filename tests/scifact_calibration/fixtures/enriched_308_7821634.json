@@ -1,0 +1,21 @@
+{
+  "scifact_id": 308,
+  "claim": "DUSP4 downregulation deactivates the Ras-ERK pathway",
+  "evidence_sentences": [
+    "Low concentrations of dual specificity protein phosphatase 4 (DUSP4), an ERK phosphatase, correlated with high post-NAC tumor cell proliferation and with basal-like breast cancer (BLBC) status.",
+    "BLBC had higher DUSP4 promoter methylation and gene expression patterns of Ras-ERK pathway activation relative to other breast cancer subtypes.",
+    "Thus, DUSP4 downregulation activates the Ras-ERK pathway in BLBC, resulting in an attenuated response to anti-cancer chemotherapy."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "7821634",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

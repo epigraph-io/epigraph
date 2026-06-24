@@ -1,0 +1,20 @@
+{
+  "scifact_id": 79,
+  "claim": "Active caspase-11 protein promotes pyroptosis.",
+  "evidence_sentences": [
+    "Here, we demonstrated that caspase-11 was dispensable for caspase-1 activation in response to Legionella, Salmonella, Francisella, and Listeria.",
+    "We also determined that active mouse caspase-11 was required for restriction of L. pneumophila infection."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5099266",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.2,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial",
+    "tier2_enriched": true
+  }
+}

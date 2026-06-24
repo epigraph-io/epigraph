@@ -264,7 +264,11 @@ pub fn compute_cdst_section(
 ///
 /// The expected interval is computed by applying the restriction map for
 /// `relationship` to `source_interval`.  The obstruction components are:
-/// - `conflict_component`: Hausdorff distance on Bel/Pl only (open_world zeroed)
+/// - `interval_inconsistency` / `conflict_component`: for `contradicts` / frame-
+///   evidence / neutral, the symmetric Bel/Pl distance (Hausdorff); for
+///   `supports` (Positive), the directional floor *shortfall* — only the target
+///   sitting below the corroborated `expected` floor on bel/pl counts, so over-
+///   support is benign corroboration and contributes 0 to both fields and to H¹.
 /// - `open_world_component`: |source_ow − expected_ow|
 /// - `ignorance_component`: |width_target − width_expected|
 pub fn compute_cdst_edge_inconsistency(
@@ -308,15 +312,44 @@ pub fn compute_cdst_edge_inconsistency_with_properties(
         RestrictionKind::Neutral => target_interval,
     };
 
-    let interval_inconsistency = target_interval.hausdorff_distance(&expected_interval);
-
-    // Conflict component: pure Bel/Pl distance (ignore open_world)
-    let conflict_component = {
-        let t_bel = target_interval.bel;
-        let t_pl = target_interval.pl;
-        let e_bel = expected_interval.bel;
-        let e_pl = expected_interval.pl;
-        (t_bel - e_bel).abs().max((t_pl - e_pl).abs())
+    // For a `supports` edge the expected interval is a one-sided FLOOR — the
+    // target should be AT LEAST this strongly believed AND plausible
+    // (`restrict_epistemic_positive` sets `expected.bel = source.bel * factor`
+    // and `expected.pl = 1-(1-source.pl)*factor`). Only UNDER-support — the
+    // target sitting *below* that corroborated floor on bel OR pl — is a genuine
+    // conflict; a strongly corroborated hub that *exceeds* a discounted weak
+    // supporter is benign corroboration, not contradiction.
+    //
+    // So the Positive arm is directional for BOTH twin fields: `interval_
+    // inconsistency` (which `compute_cdst_cohomology` filters/sorts/sums to form
+    // H¹, and which the MCP `sheaf_cohomology` tool surfaces as `edge_
+    // inconsistency`) and `conflict_component` are each the floor *shortfall*.
+    // Keeping them equal preserves the twin-field equality origin/main has for
+    // supports edges; zeroing only `conflict_component` (the prior fix) left the
+    // over-support obstruction listed under `interval_inconsistency` so H¹ never
+    // dropped and the nightly conflict-resolution scan re-observed it forever.
+    //
+    // contradicts / frame-evidence / neutral are NOT one-sided floors, so they
+    // keep the symmetric Bel/Pl distance: `interval_inconsistency` stays the
+    // Hausdorff distance and `conflict_component` its (equal) symmetric form.
+    let (interval_inconsistency, conflict_component) = match kind {
+        RestrictionKind::Positive(_) => {
+            // Floor shortfall: only mass BELOW the corroborated floor on either
+            // endpoint is inconsistency; over-support contributes 0.
+            let below = (expected_interval.bel - target_interval.bel)
+                .max(0.0)
+                .max((expected_interval.pl - target_interval.pl).max(0.0));
+            (below, below)
+        }
+        _ => {
+            let hausdorff = target_interval.hausdorff_distance(&expected_interval);
+            let t_bel = target_interval.bel;
+            let t_pl = target_interval.pl;
+            let e_bel = expected_interval.bel;
+            let e_pl = expected_interval.pl;
+            let symmetric = (t_bel - e_bel).abs().max((t_pl - e_pl).abs());
+            (hausdorff, symmetric)
+        }
     };
 
     // Open-world component: divergence in open-world mass
@@ -573,6 +606,196 @@ mod tests {
             matches!(obs.obstruction_kind, ObstructionKind::BeliefConflict),
             "Stale support should classify as BeliefConflict, got {:?}",
             obs.obstruction_kind
+        );
+    }
+
+    // ── directional supports-edge conflict (backlog 69b43e94) ─────────────
+
+    #[test]
+    fn test_supports_over_support_is_benign() {
+        // A WEAK supporter (bel≈0.50) on a `supports` edge into a STRONG,
+        // independently corroborated hub (bel≈0.98). The discounted floor
+        // (expected.bel = 0.50 * 0.80 = 0.40) sits FAR below the hub. This is
+        // corroboration, not conflict: the hub merely exceeds the floor.
+        //
+        // BEFORE the directional fix BOTH twin fields used the symmetric
+        // Hausdorff distance:
+        //   max(|0.98 - 0.40|, |1.0 - 0.68|) = max(0.58, 0.32) = 0.58,
+        // which spuriously inflated conflict-K on every belief hub each nightly
+        // scan AND — because `interval_inconsistency` is what
+        // `compute_cdst_cohomology` filters/sums into H¹ and the MCP tool
+        // surfaces as `edge_inconsistency` — kept the over-support obstruction
+        // permanently listed so H¹ never dropped and the conflict-resolution
+        // scan re-observed it forever. AFTER the fix the Positive arm is
+        // directional on BOTH fields and only the (here zero) UNDER-support
+        // shortfall counts:
+        //   below = (0.40-0.98).max(0).max((0.68-1.0).max(0)) = 0.0.
+        let src_id = Uuid::new_v4();
+        let tgt_id = Uuid::new_v4();
+        let weak_source = EpistemicInterval::new(0.50, 0.60, 0.0);
+        let strong_hub = EpistemicInterval::new(0.98, 1.0, 0.0);
+
+        let obs = compute_cdst_edge_inconsistency(
+            src_id,
+            tgt_id,
+            weak_source,
+            strong_hub,
+            "supports",
+            &sci(),
+        );
+
+        // Sanity: the symmetric distance we are REPLACING would have been 0.58.
+        let symmetric_before = (strong_hub.bel - obs.expected_interval.bel)
+            .abs()
+            .max((strong_hub.pl - obs.expected_interval.pl).abs());
+        assert!(
+            (symmetric_before - 0.58).abs() < 1e-9,
+            "regression baseline: symmetric conflict should be 0.58, got {symmetric_before}"
+        );
+
+        // AFTER: over-support contributes ~no conflict mass …
+        assert!(
+            obs.conflict_component < 0.05,
+            "over-support must be benign corroboration; conflict_component={} (was {symmetric_before} symmetric)",
+            obs.conflict_component
+        );
+        // … AND no inconsistency mass: this is the load-bearing assertion. The
+        // scan and H¹ key on `interval_inconsistency`, so it MUST also drop to 0
+        // (was 0.58) for the edge to leave the sheaf-cohomology obstruction set.
+        assert!(
+            obs.interval_inconsistency < 0.05,
+            "over-support must also be sheaf-consistent; interval_inconsistency={} (was {symmetric_before} symmetric)",
+            obs.interval_inconsistency
+        );
+        // Twin fields stay equal for supports edges, as origin/main has them.
+        assert!(
+            (obs.interval_inconsistency - obs.conflict_component).abs() < 1e-12,
+            "supports twin fields must be equal: interval={} conflict={}",
+            obs.interval_inconsistency,
+            obs.conflict_component
+        );
+    }
+
+    #[test]
+    fn test_supports_over_support_drops_from_cohomology() {
+        // The load-bearing, cohomology-LEVEL proof that the re-observe loop
+        // closes. A weak supporter [0.50,0.60] supports a strong hub [0.98,1.0]
+        // over a `supports` edge. Build the one-edge sheaf, run
+        // `compute_cdst_cohomology`, and assert the over-support edge is treated
+        // as CONSISTENT: it lands in h0, is ABSENT from the returned obstruction
+        // list, and contributes 0 to H¹. (It still classifies as IgnoranceDrift
+        // from the width mismatch — but with interval_inconsistency = 0 that
+        // never reaches the obstruction set, which is exactly the point.)
+        let src_id = Uuid::new_v4();
+        let tgt_id = Uuid::new_v4();
+        let weak_source = EpistemicInterval::new(0.50, 0.60, 0.0);
+        let strong_hub = EpistemicInterval::new(0.98, 1.0, 0.0);
+
+        let obs = compute_cdst_edge_inconsistency(
+            src_id,
+            tgt_id,
+            weak_source,
+            strong_hub,
+            "supports",
+            &sci(),
+        );
+
+        let coh = compute_cdst_cohomology(vec![obs], 0.05);
+
+        assert_eq!(coh.edge_count, 1, "one edge in the sheaf");
+        assert_eq!(
+            coh.h0, 1,
+            "over-support edge must be consistent (h0), got h0={}",
+            coh.h0
+        );
+        assert!(
+            coh.obstructions.is_empty(),
+            "over-support edge must be ABSENT from the obstruction list, got {} obstructions",
+            coh.obstructions.len()
+        );
+        assert!(
+            coh.h1 < 1e-9,
+            "over-support must contribute 0 to H¹, got h1={}",
+            coh.h1
+        );
+        assert!(
+            coh.conflict_h1 < 1e-9,
+            "over-support must contribute 0 to conflict_h1, got {}",
+            coh.conflict_h1
+        );
+        assert_eq!(
+            coh.belief_conflict_count, 0,
+            "over-support must NOT be a belief conflict, got count={}",
+            coh.belief_conflict_count
+        );
+    }
+
+    #[test]
+    fn test_supports_under_support_still_flags() {
+        // A STRONG supporter into a WEAK target: the target sits well below the
+        // corroborated floor (expected.bel = 0.90 * 0.80 = 0.72, target = 0.10).
+        // This is a real conflict and must still produce non-trivial conflict.
+        let src_id = Uuid::new_v4();
+        let tgt_id = Uuid::new_v4();
+        let strong_source = EpistemicInterval::new(0.90, 1.0, 0.0);
+        let weak_target = EpistemicInterval::new(0.10, 0.30, 0.0);
+
+        let obs = compute_cdst_edge_inconsistency(
+            src_id,
+            tgt_id,
+            strong_source,
+            weak_target,
+            "supports",
+            &sci(),
+        );
+
+        // The floor shortfall is the MAX over both endpoints:
+        //   expected.bel = 0.90*0.80 = 0.72, target.bel = 0.10 → bel shortfall 0.62
+        //   expected.pl  = 1-(1-1.0)*0.80 = 1.0, target.pl = 0.30 → pl shortfall 0.70
+        //   below = max(0.62, 0.70) = 0.70.
+        // (The pl shortfall dominates; the prior bel-only formula pinned 0.62.
+        // Still a real conflict, still classifies BeliefConflict — the metric is
+        // merely corrected to the larger, true endpoint shortfall.)
+        assert!(
+            obs.conflict_component > 0.0,
+            "under-support must still flag a conflict, got {}",
+            obs.conflict_component
+        );
+        assert!(
+            (obs.conflict_component - 0.70).abs() < 1e-9,
+            "under-support shortfall should be max(0.72-0.10, 1.0-0.30)=0.70, got {}",
+            obs.conflict_component
+        );
+        // Twin field equality for supports edges.
+        assert!(
+            (obs.interval_inconsistency - obs.conflict_component).abs() < 1e-12,
+            "supports twin fields must be equal: interval={} conflict={}",
+            obs.interval_inconsistency,
+            obs.conflict_component
+        );
+    }
+
+    #[test]
+    fn test_contradicts_conflict_unchanged() {
+        // The Negative (contradicts) arm must keep the symmetric Bel/Pl distance
+        // unchanged by this fix. Pin the exact pre-fix value.
+        //
+        // contradicts → Negative(0.90); restrict_epistemic_negative on
+        // source [0.80, 0.95] gives expected bel = (1-0.95)*0.90 = 0.045,
+        // pl = 1 - 0.80*0.90 = 0.28. Against target [0.70, 0.90]:
+        //   conflict = max(|0.70-0.045|, |0.90-0.28|) = max(0.655, 0.62) = 0.655.
+        let src_id = Uuid::new_v4();
+        let tgt_id = Uuid::new_v4();
+        let source = EpistemicInterval::new(0.80, 0.95, 0.0);
+        let target = EpistemicInterval::new(0.70, 0.90, 0.0);
+
+        let obs =
+            compute_cdst_edge_inconsistency(src_id, tgt_id, source, target, "contradicts", &sci());
+
+        assert!(
+            (obs.conflict_component - 0.655).abs() < 1e-9,
+            "contradicts conflict must stay symmetric at 0.655, got {}",
+            obs.conflict_component
         );
     }
 }

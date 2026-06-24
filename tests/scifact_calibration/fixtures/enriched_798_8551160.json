@@ -1,0 +1,19 @@
+{
+  "scifact_id": 798,
+  "claim": "Mitochondria play a trivial role in calcium homeostasis.",
+  "evidence_sentences": [
+    "Additionally, they participate in intermediary metabolism, calcium signaling, and apoptosis."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "8551160",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "logical",
+    "tier2_enriched": true
+  }
+}

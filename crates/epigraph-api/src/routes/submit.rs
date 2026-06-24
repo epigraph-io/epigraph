@@ -155,6 +155,14 @@ pub struct ClaimSubmission {
     /// Optional JSONB properties for extensible metadata (e.g., files_changed, commit_date)
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
+
+    /// Optional labels to set on the claim at creation. Lets a multi-principal
+    /// writer (e.g. the git ingester, which creates claims under system/author/
+    /// orchestrator agents) label them atomically as the creator, instead of a
+    /// separate ownership-gated `PATCH /claims/{id}/labels` that would require
+    /// `claims:admin`. Applied only on the create path (mirrors `properties`).
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// Submission structure for evidence
@@ -322,8 +330,12 @@ pub struct SubmitPacketResponse {
     /// The calculated truth value (from evidence, NOT from reputation)
     pub truth_value: f64,
 
-    /// The created trace ID
-    pub trace_id: Uuid,
+    /// The trace bound to the canonical claim. `Some` on the create path
+    /// (a fresh reasoning trace was inserted) and on a dedup onto a claim that
+    /// already carries a trace; `None` when the deduped claim has no trace
+    /// (`trace_id IS NULL`). Never a fabricated id the caller would then try to
+    /// operate on (B2 — no phantom trace).
+    pub trace_id: Option<Uuid>,
 
     /// IDs of created evidence items
     pub evidence_ids: Vec<Uuid>,
@@ -970,6 +982,26 @@ fn parse_signature_hex(hex: &str) -> Option<[u8; 64]> {
 /// 7. Commit transaction
 ///
 /// On any failure, the transaction is rolled back automatically.
+///
+/// The canonical ids the caller must use downstream (response body, in-memory
+/// claim, event, idempotency cache, embedding loops). On the create path these
+/// are the freshly inserted trace + evidence ids; on the dedup path the trace
+/// id of the existing claim and an **empty** evidence list — the existing
+/// claim's evidence already lives in the graph and the caller must not echo
+/// phantom ids it would then try to embed against non-existent rows (B2).
+#[cfg(feature = "db")]
+struct PersistOutcome {
+    /// The canonical claim id — equal to the pre-generated id on a create,
+    /// or the existing row's id on a dedup.
+    claim_id: ClaimId,
+    /// `true` when the submit collapsed onto an existing claim.
+    was_duplicate: bool,
+    /// The trace bound to the canonical claim (create: fresh; dedup: existing).
+    trace_id: Option<TraceId>,
+    /// Evidence ids written on this submit — empty on a dedup.
+    evidence_ids: Vec<EvidenceId>,
+}
+
 #[cfg(feature = "db")]
 async fn persist_packet(
     pool: &epigraph_db::PgPool,
@@ -978,7 +1010,7 @@ async fn persist_packet(
     trace_id: TraceId,
     evidence_ids: &[EvidenceId],
     truth_value: f64,
-) -> Result<(), (StatusCode, ErrorResponse)> {
+) -> Result<PersistOutcome, (StatusCode, ErrorResponse)> {
     let agent_id = AgentId::from_uuid(packet.claim.agent_id);
 
     // 1. Verify agent exists (FK constraint check)
@@ -1013,59 +1045,118 @@ async fn persist_packet(
         )
     })?;
 
-    // 3. Insert claim (without trace_id initially)
-    let _truth = TruthValue::new(truth_value).map_err(|e| {
+    // 3. Find-or-create the claim keyed on (content_hash, agent_id).
+    //
+    // The claim is created with trace_id = NULL: the FK
+    // `claims_trace_id_fkey` forbids referencing a reasoning_trace row that
+    // does not exist yet, so we keep the NULL-then-UPDATE dance below. The
+    // canonical content_hash is computed inside `create_strict`; the hash and
+    // public_key we pass to `with_id` only satisfy the constructor.
+    let truth = TruthValue::new(truth_value).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorResponse::new("InternalError", format!("Invalid truth value: {}", e)),
         )
     })?;
 
-    let claim_uuid: Uuid = claim_id.into();
     let agent_uuid: Uuid = agent_id.into();
     let content_hash = ContentHasher::hash(packet.claim.content.as_bytes());
     let now = chrono::Utc::now();
 
-    sqlx::query!(
-        r#"
-        INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, properties, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, NULL, COALESCE($6, '{}'::jsonb), $7, $7)
-        "#,
-        claim_uuid,
-        packet.claim.content,
-        content_hash.as_slice(),
-        truth_value,
-        agent_uuid,
-        packet.claim.properties,
-        now
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new("DatabaseError", format!("Failed to insert claim: {}", e)),
-        )
-    })?;
+    let claim = Claim::with_id(
+        claim_id,
+        packet.claim.content.clone(),
+        agent_id,
+        [0u8; 32],    // placeholder public key (verification done in middleware)
+        content_hash, // ignored by create_strict, which recomputes the hash
+        None,         // trace_id = None: link after the trace exists (FK)
+        None,         // signature verified in middleware
+        truth,
+        now,
+        now,
+    );
 
-    // 4. Insert reasoning trace (with claim_id)
-    let trace_uuid: Uuid = trace_id.into();
-    let methodology = convert_methodology(packet.reasoning_trace.methodology);
-    let methodology_str = match methodology {
-        Methodology::Deductive | Methodology::FormalProof => "deductive",
-        Methodology::Inductive => "inductive",
-        Methodology::Abductive | Methodology::Heuristic => "abductive",
-        _ => "statistical",
-    };
+    let (persisted, was_created) = epigraph_db::ClaimRepository::create_or_get(&mut tx, &claim)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new("DatabaseError", format!("Failed to insert claim: {}", e)),
+            )
+        })?;
+    let canonical_id = persisted.id;
+    // All dependent rows hang off the canonical claim id, not the
+    // pre-generated one (which differs on a duplicate submit).
+    let claim_uuid: Uuid = canonical_id.into();
 
-    // Convert evidence IDs for trace inputs
-    let domain_evidence_ids: Vec<EvidenceId> = evidence_ids.to_vec();
-    let trace_inputs = convert_trace_inputs(&packet.reasoning_trace.inputs, &domain_evidence_ids);
-    let properties_json = serde_json::json!({
-        "inputs": trace_inputs,
-    });
+    // Port the `properties` write to the create path (B1): `create_strict`
+    // omits `properties`, mirroring `claims.rs::create_claim`. On a duplicate
+    // we must not mutate another run's canonical claim, so guard on creation.
+    if was_created {
+        sqlx::query("UPDATE claims SET properties = COALESCE($1, properties) WHERE id = $2")
+            .bind(&packet.claim.properties)
+            .bind(claim_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        format!("Failed to set claim properties: {}", e),
+                    ),
+                )
+            })?;
+    }
 
-    sqlx::query!(
+    // Set labels at creation (parity with `claims.rs::create_claim`), so a
+    // multi-principal writer labels the claim it just created as the creator —
+    // no separate ownership-gated label PATCH (which would need `claims:admin`).
+    // Guarded on creation: a duplicate submit must not relabel another run's claim.
+    if was_created && !packet.claim.labels.is_empty() {
+        sqlx::query("UPDATE claims SET labels = $1 WHERE id = $2")
+            .bind(&packet.claim.labels)
+            .bind(claim_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        format!("Failed to set claim labels: {}", e),
+                    ),
+                )
+            })?;
+    }
+
+    // Short-circuit all dependent writes on a duplicate. On a duplicate the
+    // evidence INSERT would hit `evidence_content_hash_claim_unique` → 500;
+    // the `trace_id` UPDATE would mutate another run's canonical noun-claim
+    // (forbidden, see claim.rs noun-claim invariant); and post-018 the edges
+    // have no triple-unique, so re-inserting would silently duplicate the
+    // graph. The trace/edge/evidence rows below all reference `claim_uuid`
+    // (== canonical id) and `trace_uuid`.
+    if was_created {
+        // 4. Insert reasoning trace (with claim_id)
+        let trace_uuid: Uuid = trace_id.into();
+        let methodology = convert_methodology(packet.reasoning_trace.methodology);
+        let methodology_str = match methodology {
+            Methodology::Deductive | Methodology::FormalProof => "deductive",
+            Methodology::Inductive => "inductive",
+            Methodology::Abductive | Methodology::Heuristic => "abductive",
+            _ => "statistical",
+        };
+
+        // Convert evidence IDs for trace inputs
+        let domain_evidence_ids: Vec<EvidenceId> = evidence_ids.to_vec();
+        let trace_inputs =
+            convert_trace_inputs(&packet.reasoning_trace.inputs, &domain_evidence_ids);
+        let properties_json = serde_json::json!({
+            "inputs": trace_inputs,
+        });
+
+        sqlx::query!(
         r#"
         INSERT INTO reasoning_traces (id, claim_id, reasoning_type, confidence, explanation, properties, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -1087,29 +1178,29 @@ async fn persist_packet(
         )
     })?;
 
-    // 5. Update claim with trace_id
-    sqlx::query!(
-        r#"
+        // 5. Update claim with trace_id
+        sqlx::query!(
+            r#"
         UPDATE claims SET trace_id = $1, updated_at = $2 WHERE id = $3
         "#,
-        trace_uuid,
-        now,
-        claim_uuid
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new(
-                "DatabaseError",
-                format!("Failed to update claim with trace_id: {}", e),
-            ),
+            trace_uuid,
+            now,
+            claim_uuid
         )
-    })?;
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new(
+                    "DatabaseError",
+                    format!("Failed to update claim with trace_id: {}", e),
+                ),
+            )
+        })?;
 
-    // 5b. Materialize structural edges: agent --AUTHORED--> claim, claim --HAS_TRACE--> trace
-    sqlx::query_scalar::<_, i32>(
+        // 5b. Materialize structural edges: agent --AUTHORED--> claim, claim --HAS_TRACE--> trace
+        sqlx::query_scalar::<_, i32>(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
          VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', '{}'::jsonb) \
          RETURNING 1"
@@ -1125,7 +1216,7 @@ async fn persist_packet(
         )
     })?;
 
-    sqlx::query_scalar::<_, i32>(
+        sqlx::query_scalar::<_, i32>(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
          VALUES ($1, 'claim', $2, 'trace', 'HAS_TRACE', '{}'::jsonb) \
          RETURNING 1"
@@ -1141,7 +1232,7 @@ async fn persist_packet(
         )
     })?;
 
-    sqlx::query_scalar::<_, i32>(
+        sqlx::query_scalar::<_, i32>(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
          VALUES ($1, 'trace', $2, 'claim', 'TRACES', '{}'::jsonb) \
          RETURNING 1"
@@ -1157,57 +1248,57 @@ async fn persist_packet(
         )
     })?;
 
-    // 6. Insert evidence records
-    for (i, evidence_submission) in packet.evidence.iter().enumerate() {
-        let evidence_id = evidence_ids[i];
-        let evidence_uuid: Uuid = evidence_id.into();
+        // 6. Insert evidence records
+        for (i, evidence_submission) in packet.evidence.iter().enumerate() {
+            let evidence_id = evidence_ids[i];
+            let evidence_uuid: Uuid = evidence_id.into();
 
-        // Parse content hash from hex
-        let content_hash_bytes = ContentHasher::from_hex(&evidence_submission.content_hash)
-            .map_err(|_| {
+            // Parse content hash from hex
+            let content_hash_bytes = ContentHasher::from_hex(&evidence_submission.content_hash)
+                .map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorResponse::new("InternalError", "Invalid content hash format"),
+                    )
+                })?;
+
+            // Determine evidence type string
+            let evidence_type_str = match &evidence_submission.evidence_type {
+                EvidenceTypeSubmission::Document { .. } => "document",
+                EvidenceTypeSubmission::Observation { .. } => "observation",
+                EvidenceTypeSubmission::Testimony { .. } => "testimony",
+                EvidenceTypeSubmission::Literature { .. } => "reference",
+                EvidenceTypeSubmission::Figure { .. } => "figure",
+            };
+
+            // Convert evidence type to JSONB
+            let evidence_type_domain = convert_evidence_type(&evidence_submission.evidence_type);
+            let evidence_type_json = serde_json::to_value(&evidence_type_domain).map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new("InternalError", "Invalid content hash format"),
+                    ErrorResponse::new(
+                        "InternalError",
+                        format!("Failed to serialize evidence type: {}", e),
+                    ),
                 )
             })?;
 
-        // Determine evidence type string
-        let evidence_type_str = match &evidence_submission.evidence_type {
-            EvidenceTypeSubmission::Document { .. } => "document",
-            EvidenceTypeSubmission::Observation { .. } => "observation",
-            EvidenceTypeSubmission::Testimony { .. } => "testimony",
-            EvidenceTypeSubmission::Literature { .. } => "reference",
-            EvidenceTypeSubmission::Figure { .. } => "figure",
-        };
+            // Parse signature if provided
+            let signature_bytes: Option<Vec<u8>> = evidence_submission
+                .signature
+                .as_ref()
+                .and_then(|s| parse_signature_hex(s))
+                .map(|arr| arr.to_vec());
 
-        // Convert evidence type to JSONB
-        let evidence_type_domain = convert_evidence_type(&evidence_submission.evidence_type);
-        let evidence_type_json = serde_json::to_value(&evidence_type_domain).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new(
-                    "InternalError",
-                    format!("Failed to serialize evidence type: {}", e),
-                ),
-            )
-        })?;
+            // Signer ID must be present if and only if signature is present
+            // (DB CHECK constraint: evidence_signature_requires_signer)
+            let signer_id: Option<Uuid> = if signature_bytes.is_some() {
+                Some(agent_uuid)
+            } else {
+                None
+            };
 
-        // Parse signature if provided
-        let signature_bytes: Option<Vec<u8>> = evidence_submission
-            .signature
-            .as_ref()
-            .and_then(|s| parse_signature_hex(s))
-            .map(|arr| arr.to_vec());
-
-        // Signer ID must be present if and only if signature is present
-        // (DB CHECK constraint: evidence_signature_requires_signer)
-        let signer_id: Option<Uuid> = if signature_bytes.is_some() {
-            Some(agent_uuid)
-        } else {
-            None
-        };
-
-        sqlx::query!(
+            sqlx::query!(
             r#"
             INSERT INTO evidence (id, content_hash, evidence_type, source_url, raw_content, claim_id, signature, signer_id, properties, created_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -1232,8 +1323,8 @@ async fn persist_packet(
             )
         })?;
 
-        // Materialize graph edges: evidence --SUPPORTS--> claim
-        sqlx::query_scalar::<_, i32>(
+            // Materialize graph edges: evidence --SUPPORTS--> claim
+            sqlx::query_scalar::<_, i32>(
             "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
              VALUES ($1, 'evidence', $2, 'claim', 'SUPPORTS', '{}'::jsonb) \
              RETURNING 1"
@@ -1249,8 +1340,8 @@ async fn persist_packet(
             )
         })?;
 
-        // Materialize graph edges: trace --USES_EVIDENCE--> evidence
-        sqlx::query_scalar::<_, i32>(
+            // Materialize graph edges: trace --USES_EVIDENCE--> evidence
+            sqlx::query_scalar::<_, i32>(
             "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
              VALUES ($1, 'trace', $2, 'evidence', 'USES_EVIDENCE', '{}'::jsonb) \
              RETURNING 1"
@@ -1265,7 +1356,55 @@ async fn persist_packet(
                 ErrorResponse::new("DatabaseError", format!("Failed to create USES_EVIDENCE edge: {}", e)),
             )
         })?;
-    }
+        }
+    } // end `if was_created`
+
+    // On a duplicate, resolve the canonical ids the caller will echo and reject
+    // tombstones (B3). `find_by_content_hash_and_agent` (used by
+    // `create_or_get`) has no `is_current` predicate, so a superseded /
+    // marked-duplicate row collides on `(content_hash, agent_id)` just like a
+    // live one. `get_by_id` returns the *real* `is_current`; attaching new
+    // ingestion data to a tombstone (or returning it as if live) is forbidden.
+    //
+    // Invariant: structural ingestion nodes (repo/PR/commit) are never
+    // superseded, so a 409 here is an operational anomaly, not a normal path.
+    // (A partial `UNIQUE … WHERE is_current` index would enforce this in the
+    // schema, but that is a migration and out of scope for 2.5.)
+    let dedup_trace_id = if was_created {
+        None
+    } else {
+        let existing = epigraph_db::ClaimRepository::get_by_id(pool, canonical_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        format!("Failed to load existing claim: {}", e),
+                    ),
+                )
+            })?
+            .ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        "claim for (content_hash, agent_id) vanished after find-or-create",
+                    ),
+                )
+            })?;
+        if !existing.is_current {
+            return Err((
+                StatusCode::CONFLICT,
+                ErrorResponse::new(
+                    "DuplicateNotCurrent",
+                    "claim for (content_hash, agent_id) exists but is not current \
+                     (superseded/duplicate); refusing to attach to a tombstone",
+                ),
+            ));
+        }
+        existing.trace_id
+    };
 
     // 7. Commit transaction
     tx.commit().await.map_err(|e| {
@@ -1278,7 +1417,25 @@ async fn persist_packet(
         )
     })?;
 
-    Ok(())
+    // Carry the canonical ids for the response (B2). On the create path the
+    // freshly inserted trace + evidence ids; on the dedup path the existing
+    // claim's trace and an empty evidence list (its evidence is already in the
+    // graph — echoing the pre-generated ids would make the caller embed against
+    // non-existent rows).
+    Ok(PersistOutcome {
+        claim_id: canonical_id,
+        was_duplicate: !was_created,
+        trace_id: if was_created {
+            Some(trace_id)
+        } else {
+            dedup_trace_id
+        },
+        evidence_ids: if was_created {
+            evidence_ids.to_vec()
+        } else {
+            Vec::new()
+        },
+    })
 }
 
 // =============================================================================
@@ -1364,8 +1521,17 @@ pub async fn submit_packet(
     //    - Inserts evidence records
     //    - Commits transaction
     //    - On any failure, rolls back (no partial state)
+    //
+    // Persist and resolve the *canonical* ids the response and downstream
+    // bookkeeping must carry. On a duplicate submit the find-or-create resolves
+    // to an existing row, so the response/idempotency-cache must report that
+    // claim's id, its trace, an empty evidence list (B2 — no phantom ids), and
+    // `was_duplicate = true`. The pre-generated `trace_id` / `evidence_ids`
+    // locals are kept intact for the in-memory propagation claim and the
+    // figure-embedding loop (which indexes `evidence_ids[i]`); the full
+    // propagation/embedding skip on dedup is Task 5.
     #[cfg(feature = "db")]
-    {
+    let (claim_id, was_duplicate, response_trace_id, response_evidence_ids) = {
         let domain_claim_id = ClaimId::from_uuid(claim_id);
         let domain_trace_id = TraceId::from_uuid(trace_id);
         let domain_evidence_ids: Vec<EvidenceId> = evidence_ids
@@ -1373,7 +1539,7 @@ pub async fn submit_packet(
             .map(|id| EvidenceId::from_uuid(*id))
             .collect();
 
-        if let Err((status, error)) = persist_packet(
+        match persist_packet(
             &state.db_pool,
             &packet,
             domain_claim_id,
@@ -1383,90 +1549,123 @@ pub async fn submit_packet(
         )
         .await
         {
-            return (status, Json(error)).into_response();
+            Ok(outcome) => {
+                // Carry the canonical claim's *actual* trace, faithfully `None`
+                // when the deduped claim has no trace. No fallback to the
+                // pre-generated `trace_id`: it was never inserted into
+                // `reasoning_traces` (the trace INSERT is gated on `was_created`),
+                // so echoing it would advertise a phantom trace id the caller
+                // would then try to operate on (B2 — no phantom trace/evidence).
+                let response_trace_id: Option<Uuid> = outcome.trace_id.map(|tid| tid.as_uuid());
+                let response_evidence_ids: Vec<Uuid> = outcome
+                    .evidence_ids
+                    .iter()
+                    .map(EvidenceId::as_uuid)
+                    .collect();
+                (
+                    outcome.claim_id.as_uuid(),
+                    outcome.was_duplicate,
+                    response_trace_id,
+                    response_evidence_ids,
+                )
+            }
+            Err((status, error)) => return (status, Json(error)).into_response(),
         }
-    }
+    };
+    // Without the db feature there is no persistence step; the response simply
+    // echoes the pre-generated ids and is never a duplicate.
+    #[cfg(not(feature = "db"))]
+    let (was_duplicate, response_trace_id, response_evidence_ids) =
+        (false, Some(trace_id), evidence_ids.clone());
 
     // 6. Create the claim object and register it for propagation
     //
     // This creates an in-memory representation of the claim for the
     // propagation orchestrator to track truth value updates.
-    let content_hash = ContentHasher::hash(packet.claim.content.as_bytes());
-    let claim = Claim::with_id(
-        ClaimId::from_uuid(claim_id),
-        packet.claim.content.clone(),
-        AgentId::from_uuid(packet.claim.agent_id),
-        [0u8; 32], // Placeholder public key - actual verification done in middleware
-        content_hash,
-        Some(TraceId::from_uuid(trace_id)),
-        None, // Signature verified in middleware
-        TruthValue::new(truth_value).unwrap_or_else(|_| TruthValue::uncertain()),
-        chrono::Utc::now(),
-        chrono::Utc::now(),
-    );
-
-    // 7. Register claim in the propagation orchestrator and trigger propagation
     //
-    // This step:
-    //    a. Registers the new claim in the in-memory DAG
-    //    b. Triggers propagation to any dependent claims
-    //    c. Updates truth values throughout the graph
-    //    d. Records audit trail for forensic analysis
-    //
-    // CRITICAL: Propagation NEVER uses agent reputation to influence truth values.
-    // Only evidence strength and source claim truth affect the calculation.
-    {
-        let mut orchestrator = state.propagation_orchestrator.write().await;
-
-        // Register the new claim in the orchestrator
-        if let Err(e) = orchestrator.register_claim(claim) {
-            tracing::warn!(
-                claim_id = %claim_id,
-                error = %e,
-                "Failed to register claim in propagation orchestrator"
-            );
-            // Continue anyway - claim submission shouldn't fail due to propagation issues
-        }
-
-        // Trigger propagation from this claim to any dependents
-        // Note: A newly created claim typically has no dependents yet, but this
-        // sets up the infrastructure for when dependencies are added later.
-        let propagation_result = state.propagator.propagate_from(
-            &mut orchestrator,
+    // Skip on a duplicate submit (B5): the canonical claim was inserted by an
+    // earlier submit and is already tracked in the in-memory DAG; re-registering
+    // it (and re-running propagation) would only churn the orchestrator for a
+    // claim that did not change. The in-memory `claim` is built *inside* this
+    // guard so it is never constructed on the dedup path.
+    if !was_duplicate {
+        let content_hash = ContentHasher::hash(packet.claim.content.as_bytes());
+        let claim = Claim::with_id(
             ClaimId::from_uuid(claim_id),
-            None, // Use the claim's current truth value
+            packet.claim.content.clone(),
+            AgentId::from_uuid(packet.claim.agent_id),
+            [0u8; 32], // Placeholder public key - actual verification done in middleware
+            content_hash,
+            Some(TraceId::from_uuid(trace_id)),
+            None, // Signature verified in middleware
+            TruthValue::new(truth_value).unwrap_or_else(|_| TruthValue::uncertain()),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
         );
 
-        match propagation_result {
-            Ok(result) => {
-                if !result.updated_claims.is_empty() {
-                    tracing::info!(
-                        claim_id = %claim_id,
-                        updated_count = result.updated_claims.len(),
-                        depth = result.depth_reached,
-                        converged = result.converged,
-                        depth_limited = result.depth_limited,
-                        "Propagation completed after claim submission"
-                    );
+        // 7. Register claim in the propagation orchestrator and trigger propagation
+        //
+        // This step:
+        //    a. Registers the new claim in the in-memory DAG
+        //    b. Triggers propagation to any dependent claims
+        //    c. Updates truth values throughout the graph
+        //    d. Records audit trail for forensic analysis
+        //
+        // CRITICAL: Propagation NEVER uses agent reputation to influence truth values.
+        // Only evidence strength and source claim truth affect the calculation.
+        {
+            let mut orchestrator = state.propagation_orchestrator.write().await;
 
-                    // In production with database, persist the updated truth values:
-                    // for updated_id in &result.updated_claims {
-                    //     if let Some(updated_truth) = orchestrator.get_truth(*updated_id) {
-                    //         ClaimRepository::update_truth_value(pool, *updated_id, updated_truth).await?;
-                    //     }
-                    // }
-                }
-            }
-            Err(e) => {
+            // Register the new claim in the orchestrator
+            if let Err(e) = orchestrator.register_claim(claim) {
                 tracing::warn!(
                     claim_id = %claim_id,
                     error = %e,
-                    "Propagation failed after claim submission"
+                    "Failed to register claim in propagation orchestrator"
                 );
-                // Continue anyway - claim was already created successfully
+                // Continue anyway - claim submission shouldn't fail due to propagation issues
+            }
+
+            // Trigger propagation from this claim to any dependents
+            // Note: A newly created claim typically has no dependents yet, but this
+            // sets up the infrastructure for when dependencies are added later.
+            let propagation_result = state.propagator.propagate_from(
+                &mut orchestrator,
+                ClaimId::from_uuid(claim_id),
+                None, // Use the claim's current truth value
+            );
+
+            match propagation_result {
+                Ok(result) => {
+                    if !result.updated_claims.is_empty() {
+                        tracing::info!(
+                            claim_id = %claim_id,
+                            updated_count = result.updated_claims.len(),
+                            depth = result.depth_reached,
+                            converged = result.converged,
+                            depth_limited = result.depth_limited,
+                            "Propagation completed after claim submission"
+                        );
+
+                        // In production with database, persist the updated truth values:
+                        // for updated_id in &result.updated_claims {
+                        //     if let Some(updated_truth) = orchestrator.get_truth(*updated_id) {
+                        //         ClaimRepository::update_truth_value(pool, *updated_id, updated_truth).await?;
+                        //     }
+                        // }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        claim_id = %claim_id,
+                        error = %e,
+                        "Propagation failed after claim submission"
+                    );
+                    // Continue anyway - claim was already created successfully
+                }
             }
         }
-    }
+    } // end `if !was_duplicate` (skip register + propagation on dedup)
 
     // 8. Generate and store embedding for the claim content
     //
@@ -1497,109 +1696,21 @@ pub async fn submit_packet(
             )
         });
 
+    // Skip re-embedding on a duplicate submit (§5): the canonical claim already
+    // carries its embedding from the create path; re-running the (paid) embed
+    // and overwriting the column for an unchanged claim is wasted work.
     #[cfg(feature = "db")]
-    if let Some(ref embedding_service) = state.embedding_service {
-        if is_host_telemetry {
-            tracing::debug!(
-                claim_id = %claim_id,
-                "Skipping embedding for host-provenance telemetry claim"
-            );
-        } else {
-            match embedding_service.generate(&packet.claim.content).await {
-                Ok(embedding) => {
-                    // Store directly via SQL (provider-agnostic — works with Jina, OpenAI, etc.)
-                    let pgvector_str = format!(
-                        "[{}]",
-                        embedding
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
-                    if let Err(e) =
-                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                            .bind(&pgvector_str)
-                            .bind(claim_id)
-                            .execute(&state.db_pool)
-                            .await
-                    {
-                        tracing::warn!(
-                            claim_id = %claim_id,
-                            error = %e,
-                            "Failed to store claim embedding"
-                        );
-                    } else {
-                        tracing::debug!(
-                            claim_id = %claim_id,
-                            embedding_dim = embedding.len(),
-                            "Generated and stored embedding for claim"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        claim_id = %claim_id,
-                        error = %e,
-                        "Failed to generate embedding for claim"
-                    );
-                    // Continue anyway - claim submission shouldn't fail due to embedding issues
-                }
-            }
-        }
-    }
-    #[cfg(not(feature = "db"))]
-    if let Some(ref embedding_service) = state.embedding_service {
-        if is_host_telemetry {
-            tracing::debug!(
-                claim_id = %claim_id,
-                "Skipping embedding for host-provenance telemetry claim"
-            );
-        } else {
-            match embedding_service.generate(&packet.claim.content).await {
-                Ok(embedding) => {
-                    if let Err(e) = embedding_service.store(claim_id, &embedding).await {
-                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store claim embedding");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for claim");
-                }
-            }
-        }
-    }
-
-    // 8a. Generate and store embeddings for figure evidence
-    //
-    // When the embedding service supports multimodal (e.g., Jina v4), figure
-    // evidence gets image embeddings via generate_from_image(). When multimodal
-    // is unavailable, falls back to embedding the figure caption text.
-    // This is non-blocking: failures don't affect claim submission.
-    #[cfg(feature = "db")]
-    if let Some(ref embedding_service) = state.embedding_service {
-        for (i, evidence_submission) in packet.evidence.iter().enumerate() {
-            if let EvidenceTypeSubmission::Figure { ref caption, .. } =
-                evidence_submission.evidence_type
-            {
-                let evidence_id = evidence_ids[i];
-
-                let embedding_result =
-                    if let Some(ref raw_content) = evidence_submission.raw_content {
-                        // Try multimodal image embedding first
-                        if let Some(multimodal) = embedding_service.as_multimodal() {
-                            multimodal.generate_from_image(raw_content).await
-                        } else {
-                            // Fall back to caption text embedding
-                            let text = caption.as_deref().unwrap_or("scientific figure");
-                            embedding_service.generate(text).await
-                        }
-                    } else {
-                        // No image data — embed caption text
-                        let text = caption.as_deref().unwrap_or("scientific figure");
-                        embedding_service.generate(text).await
-                    };
-
-                match embedding_result {
+    if !was_duplicate {
+        if let Some(ref embedding_service) = state.embedding_service {
+            if is_host_telemetry {
+                tracing::debug!(
+                    claim_id = %claim_id,
+                    "Skipping embedding for host-provenance telemetry claim"
+                );
+            } else {
+                match embedding_service.generate(&packet.claim.content).await {
                     Ok(embedding) => {
+                        // Store directly via SQL (provider-agnostic — works with Jina, OpenAI, etc.)
                         let pgvector_str = format!(
                             "[{}]",
                             embedding
@@ -1609,49 +1720,153 @@ pub async fn submit_packet(
                                 .join(",")
                         );
                         if let Err(e) =
-                            sqlx::query("UPDATE evidence SET embedding = $1::vector WHERE id = $2")
+                            sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
                                 .bind(&pgvector_str)
-                                .bind(evidence_id)
+                                .bind(claim_id)
                                 .execute(&state.db_pool)
                                 .await
                         {
                             tracing::warn!(
-                                evidence_id = %evidence_id,
+                                claim_id = %claim_id,
                                 error = %e,
-                                "Failed to store figure evidence embedding"
+                                "Failed to store claim embedding"
                             );
                         } else {
-                            let mode = if embedding_service.as_multimodal().is_some() {
-                                "image"
-                            } else {
-                                "caption"
-                            };
                             tracing::debug!(
-                                evidence_id = %evidence_id,
+                                claim_id = %claim_id,
                                 embedding_dim = embedding.len(),
-                                mode,
-                                "Generated and stored figure evidence embedding"
+                                "Generated and stored embedding for claim"
                             );
                         }
                     }
                     Err(e) => {
                         tracing::warn!(
-                            evidence_id = %evidence_id,
+                            claim_id = %claim_id,
                             error = %e,
-                            "Failed to generate figure evidence embedding"
+                            "Failed to generate embedding for claim"
                         );
+                        // Continue anyway - claim submission shouldn't fail due to embedding issues
                     }
                 }
             }
         }
-    }
+    } // end `if !was_duplicate` (skip claim re-embed on dedup)
+    #[cfg(not(feature = "db"))]
+    if !was_duplicate {
+        if let Some(ref embedding_service) = state.embedding_service {
+            if is_host_telemetry {
+                tracing::debug!(
+                    claim_id = %claim_id,
+                    "Skipping embedding for host-provenance telemetry claim"
+                );
+            } else {
+                match embedding_service.generate(&packet.claim.content).await {
+                    Ok(embedding) => {
+                        if let Err(e) = embedding_service.store(claim_id, &embedding).await {
+                            tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store claim embedding");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for claim");
+                    }
+                }
+            }
+        }
+    } // end `if !was_duplicate` (skip claim re-embed on dedup, non-db twin)
+
+    // 8a. Generate and store embeddings for figure evidence
+    //
+    // When the embedding service supports multimodal (e.g., Jina v4), figure
+    // evidence gets image embeddings via generate_from_image(). When multimodal
+    // is unavailable, falls back to embedding the figure caption text.
+    // This is non-blocking: failures don't affect claim submission.
+    //
+    // Skip on a duplicate submit (§5): the create path's evidence rows already
+    // carry their embeddings, and on dedup no new evidence was inserted
+    // (`outcome.evidence_ids` is empty) — re-embedding by the pre-generated
+    // `evidence_ids` would only churn paid embed calls against rows that either
+    // already have an embedding or do not exist.
+    #[cfg(feature = "db")]
+    if !was_duplicate {
+        if let Some(ref embedding_service) = state.embedding_service {
+            for (i, evidence_submission) in packet.evidence.iter().enumerate() {
+                if let EvidenceTypeSubmission::Figure { ref caption, .. } =
+                    evidence_submission.evidence_type
+                {
+                    let evidence_id = evidence_ids[i];
+
+                    let embedding_result =
+                        if let Some(ref raw_content) = evidence_submission.raw_content {
+                            // Try multimodal image embedding first
+                            if let Some(multimodal) = embedding_service.as_multimodal() {
+                                multimodal.generate_from_image(raw_content).await
+                            } else {
+                                // Fall back to caption text embedding
+                                let text = caption.as_deref().unwrap_or("scientific figure");
+                                embedding_service.generate(text).await
+                            }
+                        } else {
+                            // No image data — embed caption text
+                            let text = caption.as_deref().unwrap_or("scientific figure");
+                            embedding_service.generate(text).await
+                        };
+
+                    match embedding_result {
+                        Ok(embedding) => {
+                            let pgvector_str = format!(
+                                "[{}]",
+                                embedding
+                                    .iter()
+                                    .map(|v| v.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            );
+                            if let Err(e) = sqlx::query(
+                                "UPDATE evidence SET embedding = $1::vector WHERE id = $2",
+                            )
+                            .bind(&pgvector_str)
+                            .bind(evidence_id)
+                            .execute(&state.db_pool)
+                            .await
+                            {
+                                tracing::warn!(
+                                    evidence_id = %evidence_id,
+                                    error = %e,
+                                    "Failed to store figure evidence embedding"
+                                );
+                            } else {
+                                let mode = if embedding_service.as_multimodal().is_some() {
+                                    "image"
+                                } else {
+                                    "caption"
+                                };
+                                tracing::debug!(
+                                    evidence_id = %evidence_id,
+                                    embedding_dim = embedding.len(),
+                                    mode,
+                                    "Generated and stored figure evidence embedding"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                evidence_id = %evidence_id,
+                                error = %e,
+                                "Failed to generate figure evidence embedding"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    } // end `if !was_duplicate` (skip figure-evidence re-embed on dedup)
 
     let response = SubmitPacketResponse {
         claim_id,
         truth_value,
-        trace_id,
-        evidence_ids: evidence_ids.clone(),
-        was_duplicate: false,
+        trace_id: response_trace_id,
+        evidence_ids: response_evidence_ids.clone(),
+        was_duplicate,
     };
 
     // 9. Publish ClaimSubmitted event (fire-and-forget)
@@ -1690,8 +1905,8 @@ pub async fn submit_packet(
             CachedSubmission {
                 claim_id,
                 truth_value,
-                trace_id,
-                evidence_ids,
+                trace_id: response_trace_id,
+                evidence_ids: response_evidence_ids,
                 created_at: Instant::now(),
             },
         );
@@ -2060,6 +2275,7 @@ mod signature_verification_tests {
             agent_id,
             idempotency_key: None,
             properties: None,
+            labels: Vec::new(),
         }
     }
 

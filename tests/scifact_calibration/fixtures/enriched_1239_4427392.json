@@ -1,0 +1,24 @@
+{
+  "scifact_id": 1239,
+  "claim": "The myocardial cell lineage originally develops from cardiac progenitors of exclusively endodermal origin.",
+  "evidence_sentences": [
+    "Studies in the mouse embryo and the mouse embryonic stem cell differentiation model have provided evidence indicating that these three lineages develop from a common Flk-1+ (kinase insert domain protein receptor, also known as Kdr) cardiovascular progenitor that represents one of the earliest stages in mesoderm specification to the cardiovascular lineages."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "4427392",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Flk-1",
+      "mouse embryonic stem cells"
+    ],
+    "conditions": [
+      "mouse embryo model",
+      "mouse embryonic stem cell differentiation model"
+    ],
+    "evidence_type": "empirical"
+  }
+}

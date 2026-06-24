@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1170,
+  "claim": "The NF-\u03baB essential modulator gene induces intestinal inflammation by promoting receptor-interacting protein (RIP) kinase 1 kinase activity-mediated epithelial cell death.",
+  "evidence_sentences": [
+    "Inhibition of receptor-interacting protein kinase 1 (RIPK1) kinase activity or combined deficiency of Fas-associated via death domain protein (FADD) and RIPK3 prevented epithelial cell death, Paneth cell loss, and colitis development in mice with epithelial NEMO deficiency.",
+    "Therefore, NEMO prevents intestinal inflammation by inhibiting RIPK1 kinase activity-mediated IEC death, suggesting that RIPK1 inhibitors could be effective in the treatment of colitis in patients with NEMO mutations and possibly in IBD."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "18956141",
+  "enrichment": {
+    "methodology": "deductive_logic",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "scifact_id": 1029,
+  "claim": "Reduced responsiveness to interleukin-2 in regulatory T cells is associated with greater resistance to autoimmune diseases such as Type 1 Diabetes.",
+  "evidence_sentences": [
+    "We demonstrated that the presence of an autoimmune disease-associated IL2RA haplotype correlates with diminished IL-2 responsiveness in Ag-experienced CD4(+) T cells, as measured by phosphorylation of STAT5a, and is associated with lower levels of FOXP3 expression by Tregs and a reduction in their ability to suppress proliferation of autologous effector T cells."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "11899391",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [
+      "flow cytometer",
+      "phospho-STAT5a assay"
+    ],
+    "reagents_involved": [
+      "IL-2",
+      "FOXP3",
+      "STAT5a",
+      "IL2RA",
+      "CD4+ T cells"
+    ],
+    "conditions": [
+      "autoimmune disease-associated IL2RA haplotype",
+      "antigen-experienced CD4+ T cells",
+      "autologous effector T cell suppression assay"
+    ],
+    "evidence_type": "empirical"
+  }
+}

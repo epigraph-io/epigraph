@@ -1,0 +1,28 @@
+{
+  "scifact_id": 1274,
+  "claim": "The tip of the inner tube of the toxic type VI secretion system (T6SS) antibacterial effector in Escherichia coli (E. coli) carries toxic effector proteins.",
+  "evidence_sentences": [
+    "Here we report that proteins from the PAAR (proline-alanine-alanine-arginine) repeat superfamily form a sharp conical extension on the VgrG spike, which is further involved in attaching effector domains to the spike.",
+    "The crystal structures of two PAAR-repeat proteins bound to VgrG-like partners show that these proteins sharpen the tip of the T6SS spike complex.",
+    "Our results indicate a new model of the T6SS organelle in which the VgrG-PAAR spike complex is decorated with multiple effectors that are delivered simultaneously into target cells in a single contraction-driven translocation event."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4406819",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [
+      "X-ray crystallography"
+    ],
+    "reagents_involved": [
+      "PAAR repeat proteins",
+      "VgrG spike proteins"
+    ],
+    "conditions": [
+      "crystal structure determination",
+      "protein-protein binding analysis"
+    ],
+    "evidence_type": "empirical"
+  }
+}

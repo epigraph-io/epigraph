@@ -1,0 +1,22 @@
+{
+  "scifact_id": 1334,
+  "claim": "Type 1 Diabetes is associated with subtle perturbations in T reg development.",
+  "evidence_sentences": [
+    "Numerous reports have demonstrated that CD4(+)CD25(+) regulatory T cells (Tregs) from individuals with a range of human autoimmune diseases, including type 1 diabetes, are deficient in their ability to control autologous proinflammatory responses when compared with nondiseased, control individuals."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11899391",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.7,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "autoimmune diseases",
+      "type 1 diabetes",
+      "comparison with nondiseased control individuals"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -165,14 +165,33 @@ belief_alignment = 0.10
 theme_proximity  = 0.05
 
 [matcher.bands]
-high = 0.85
-mid  = 0.60
+# Provisional bootstrap bands for the renormalized (≈cosine) cross-source score
+# (backlog 27bc9754). mid is grounded in resolved item 4a715300 ("real
+# corroboration clusters >0.85 cosine; 0.70–0.79 is topical noise"); high is set
+# unreachable so EVERY candidate routes to the LLM verifier (the precision gate)
+# rather than auto-promoting. Final calibrated values → #239 precision sweep.
+high = 1.01
+mid  = 0.80
 
 [matcher.embedding]
 model_version = "v1"
 
 [matcher.filter]
 include_agent_id = false
+
+# Candidate hygiene: claims carrying ANY of these labels (or a host-provenance
+# `properties->>'event'` marker) are dropped from candidate generation before
+# scoring. `workflow_step` artifacts (e.g. content "Body") dominate the
+# high-cosine candidate pool on prod (806/838 of embed_cosine>=0.90 pairs)
+# without being substantive cross-source claims; `telemetry` is host noise.
+# 2026-06-15: extended with EpiClaw/scheduled-task self-narration labels. A prod
+# dry-run staged 31/44 pending candidates from operational self-logs (daily
+# journals, graph-integrity/theme/data-integrity maintenance runs, ingest-session
+# logs) — they share heavy boilerplate, score >0.80 cosine, and evade
+# workflow_step/telemetry because they carry date-stamps + ops tags instead.
+# Set `exclude_labels = []` to disable.
+[matcher.eligibility]
+exclude_labels = ["workflow_step", "telemetry", "maintenance", "graph-integrity", "maintenance-log", "theme-maintenance", "data-integrity", "system-health", "journal", "daily-journal", "digest", "nightly-digest", "session-log", "scheduled-task", "reconciliation-complete", "conflict-resolution", "research-ingest"]
 
 [matcher.fan_out]
 max_per_claim = 32
@@ -196,3 +215,17 @@ max_per_claim = 32
 
 [evidence_locality]
 intra_evidence_locality_factor = 0.3
+
+# ── Split-Conformal Prediction Sets ────────────────
+# Per-class nonconformity quantiles q_c, fit by scripts/calibrate_conformal.py
+# over 1189 labelled SciFact fixtures (split-conformal, alpha=0.1,
+# seed=42). score_c = 1 - BetP_c (supported/contradicted) or 1 - theta (NEI);
+# class c is in the prediction set iff score_c <= q_c. Calibration n per class:
+# supported=508 contradicted=265 not_enough_info=416.
+[conformal]
+alpha = 0.1
+
+[conformal.quantiles]
+supported        = 0.414726
+contradicted     = 0.367560
+not_enough_info  = 0.117009

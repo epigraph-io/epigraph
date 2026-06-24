@@ -57,6 +57,52 @@ pub async fn bearer_auth_middleware(
     }
 }
 
+/// Middleware: extract Bearer token if present, validate, inject AuthContext.
+///
+/// Unlike [`bearer_auth_middleware`], a request WITHOUT an Authorization header
+/// is allowed through anonymously (no `AuthContext`, no 401) — this layers on
+/// the PUBLIC router so reads stay anonymously readable. A request WITH a
+/// `Bearer` token that is revoked, malformed, or expired is rejected 401.
+pub async fn optional_bearer_auth_middleware(
+    State(state): State<AppState>,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    match auth_header.as_deref() {
+        Some(header) if header.starts_with("Bearer ") => {
+            let token = &header[7..];
+
+            // Present token must be valid: revoked → 401.
+            if state.is_token_revoked(token) {
+                return Err(ApiError::Unauthorized {
+                    reason: "Token has been revoked".to_string(),
+                });
+            }
+
+            // Present token must validate: invalid/expired → 401.
+            let claims =
+                state
+                    .jwt_config
+                    .validate_token(token)
+                    .map_err(|e| ApiError::Unauthorized {
+                        reason: format!("Invalid token: {e}"),
+                    })?;
+
+            let auth_ctx: AuthContext = claims.into();
+            request.extensions_mut().insert(auth_ctx);
+            Ok(next.run(request).await)
+        }
+        // No Authorization header (or a non-Bearer scheme) → anonymous pass-through.
+        _ => Ok(next.run(request).await),
+    }
+}
+
 /// Scope-aware `FromRequestParts` extractors.
 ///
 /// These run BEFORE any `FromRequest` body-consuming extractor (e.g., `Json`),

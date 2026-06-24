@@ -1,0 +1,20 @@
+{
+  "scifact_id": 222,
+  "claim": "Ca2+ cycling is a UCP1-independent thermogenic mechanism.",
+  "evidence_sentences": [
+    "Here we report a robust UCP1-independent thermogenic mechanism in beige fat that involves enhanced ATP-dependent Ca2+ cycling by sarco/endoplasmic reticulum Ca2+-ATPase 2b (SERCA2b) and ryanodine receptor 2 (RyR2).",
+    "Conversely, enhanced Ca2+ cycling by activation of \u03b11- and/or \u03b23-adrenergic receptors or the SERCA2b-RyR2 pathway stimulates UCP1-independent thermogenesis in beige adipocytes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "19205437",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

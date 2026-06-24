@@ -1,0 +1,29 @@
+{
+  "scifact_id": 683,
+  "claim": "Lack of FGF21 in mice slows the rate of atherosclerotic plaque formation.",
+  "evidence_sentences": [
+    "FGF21 deficiency causes a marked exacerbation of atherosclerotic plaque formation and premature death in apolipoprotein E(-/-) mice, which is accompanied by hypoadiponectinemia and severe hypercholesterolemia.",
+    "Replenishment of FGF21 protects against atherosclerosis in apolipoprotein E(-/-)mice via 2 independent mechanisms, inducing the adipocyte production of adiponectin, which in turn acts on the blood vessels to inhibit neointima formation and macrophage inflammation, and suppressing the hepatic expression of the transcription factor sterol regulatory element-binding protein-2, thereby leading to reduced cholesterol synthesis and attenuation of hypercholesterolemia.",
+    "CONCLUSIONS FGF21 protects against atherosclerosis via fine tuning the multiorgan crosstalk among liver, adipose tissue, and blood vessels."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "9315213",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "FGF21",
+      "adiponectin",
+      "apolipoprotein E",
+      "sterol regulatory element-binding protein-2"
+    ],
+    "conditions": [
+      "FGF21 deficiency",
+      "apolipoprotein E knockout mice",
+      "FGF21 replenishment"
+    ],
+    "evidence_type": "empirical"
+  }
+}

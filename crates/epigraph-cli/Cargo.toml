@@ -81,6 +81,16 @@ path = "src/bin/reembed.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "decompose_claims"
+path = "src/bin/decompose_claims.rs"
+required-features = ["db"]
+
+[[bin]]
+name = "embed_backfill"
+path = "src/bin/embed_backfill.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "cross_source_sweep"
 path = "src/bin/cross_source_sweep.rs"
 required-features = ["genai"]
@@ -101,6 +111,11 @@ path = "src/bin/bootstrap_clients.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "ingest-document"
+path = "src/bin/ingest_document.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "backfill_factors"
 path = "src/bin/backfill_factors.rs"
 required-features = ["db"]
@@ -113,6 +128,7 @@ epigraph-embeddings = { workspace = true }
 epigraph-interfaces = { workspace = true }
 epigraph-ds = { workspace = true }
 epigraph-mcp = { workspace = true }
+epigraph-ingest = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 epigraph-db = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
@@ -140,6 +156,12 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 sqlx = { workspace = true }
+# PR-hierarchical ingest integration test (tests/pr_hierarchical_ingest_test.rs):
+# oneshot the real epigraph-api handlers the CLI hits against epigraph_db_repo_test.
+epigraph-api = { workspace = true }
+axum = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [lints]
 workspace = true

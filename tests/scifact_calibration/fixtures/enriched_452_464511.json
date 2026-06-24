@@ -1,0 +1,21 @@
+{
+  "scifact_id": 452,
+  "claim": "Gene expression does not vary appreciably across genetically identical cells.",
+  "evidence_sentences": [
+    "Genetically identical cells sharing an environment can display markedly different phenotypes."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "464511",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.72,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "genetically identical cells",
+      "shared environment"
+    ],
+    "evidence_type": "logical"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "scifact_id": 1187,
+  "claim": "The YAP1 and TEAD complex tanslocates into the nucleus where it interacts with transcription factors and DNA-binding proteins that modulate target gene transcription.",
+  "evidence_sentences": [
+    "YAP/TAZ are transcription co-activators that regulate gene expression primarily through interaction with the TEA domain DNA-binding family of transcription factors (TEAD)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "52873726",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.55,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "logical"
+  }
+}

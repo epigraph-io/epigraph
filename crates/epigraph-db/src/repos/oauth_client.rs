@@ -72,13 +72,14 @@ impl OAuthClientRepository {
         owner_id: Option<Uuid>,
         legal_entity_name: Option<&str>,
         legal_contact_email: Option<&str>,
+        redirect_uris: Option<&[String]>,
     ) -> Result<Uuid, DbError> {
         let row: (Uuid,) = sqlx::query_as(
             r#"INSERT INTO oauth_clients
                 (client_id, client_secret_hash, client_name, client_type,
                  allowed_scopes, granted_scopes, status, agent_id, owner_id,
-                 legal_entity_name, legal_contact_email)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 legal_entity_name, legal_contact_email, redirect_uris)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING id"#,
         )
         .bind(client_id)
@@ -92,6 +93,7 @@ impl OAuthClientRepository {
         .bind(owner_id)
         .bind(legal_entity_name)
         .bind(legal_contact_email)
+        .bind(redirect_uris)
         .fetch_one(pool)
         .await
         .map_err(|e| DbError::QueryFailed { source: e })?;

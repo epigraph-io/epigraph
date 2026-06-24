@@ -1,0 +1,22 @@
+{
+  "scifact_id": 267,
+  "claim": "Cognitive behavioral therapy is an ineffective treatment for insomnia",
+  "evidence_sentences": [
+    "RESULTS CBT resulted in improved short- and long-term outcomes compared with zopiclone on 3 out of 4 outcome measures.",
+    "Participants receiving CBT improved their sleep efficiency from 81.4% at pretreatment to 90.1% at 6-month follow-up compared with a decrease from 82.3% to 81.9% in the zopiclone group.",
+    "Participants in the CBT group spent much more time in slow-wave sleep (stages 3 and 4) compared with those in other groups, and spent less time awake during the night.",
+    "CONCLUSION These results suggest that interventions based on CBT are superior to zopiclone treatment both in short- and long-term management of insomnia in older adults.   \n"
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "5912283",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

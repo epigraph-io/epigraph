@@ -10,6 +10,18 @@ use uuid::Uuid;
 /// Repository for Claim operations
 pub struct ClaimRepository;
 
+/// Cached Dempster–Shafer belief columns for a claim, as read by
+/// [`ClaimRepository::get_belief_columns`].
+///
+/// Each field is `Option` because the column is NULL on claims that have never
+/// had a BBA combined onto them (the edge-wiring recompute populates them).
+#[derive(Debug, Clone, Copy, sqlx::FromRow, serde::Serialize)]
+pub struct ClaimBeliefColumns {
+    pub belief: Option<f64>,
+    pub plausibility: Option<f64>,
+    pub pignistic_prob: Option<f64>,
+}
+
 /// Result row for [`ClaimRepository::search_by_embedding`].
 ///
 /// `similarity` is `1 - cosine_distance`, in `[0, 1]` for non-degenerate
@@ -18,6 +30,22 @@ pub struct ClaimRepository;
 pub struct ClaimEmbeddingHit {
     pub claim_id: Uuid,
     pub similarity: f64,
+}
+
+/// One fused hit from [`ClaimRepository::search_hybrid_scoped`] /
+/// [`ClaimRepository::search_lexical_scoped`].
+///
+/// `rrf_score` is the Reciprocal Rank Fusion score (higher = better; sums
+/// `1/(k+rank)` across the legs the claim appeared in). `dense_similarity` is
+/// `Some(1 - cosine_distance)` when the claim was in the dense (embedding) leg,
+/// `None` for lexical-only hits. `in_lexical` is true when it appeared in the
+/// lexical (`content_tsv`) leg.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct HybridHit {
+    pub claim_id: Uuid,
+    pub rrf_score: f64,
+    pub dense_similarity: Option<f64>,
+    pub in_lexical: bool,
 }
 
 /// Result row for [`ClaimRepository::latest_in_lineage`].
@@ -221,6 +249,90 @@ impl ClaimRepository {
             id,
             properties
         )
+        .execute(pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound {
+                entity: "Claim".to_string(),
+                id,
+            });
+        }
+        Ok(())
+    }
+
+    /// Read a claim's workflow-promotion flag
+    /// (`properties->'promotion'->>'promotable'`). `None` when the claim was
+    /// never evaluated (or does not exist); `Some(bool)` otherwise. Used by
+    /// `find_workflow` to surface whether a variant has been promoted.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn promotion_flag(pool: &PgPool, claim_id: ClaimId) -> Result<Option<bool>, DbError> {
+        let id: Uuid = claim_id.into();
+        let flag: Option<Option<bool>> = sqlx::query_scalar(
+            "SELECT (properties->'promotion'->>'promotable')::bool FROM claims WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(flag.flatten())
+    }
+
+    /// Read a claim's cached Dempster–Shafer belief columns
+    /// (`belief`, `plausibility`, `pignistic_prob`).
+    ///
+    /// These are the columns the edge-wiring recompute path
+    /// (`MassFunctionRepository::update_claim_belief`) writes — distinct from
+    /// `truth_value`, which the recompute leaves untouched. Callers that need
+    /// the *post-wire* combined belief (e.g. the MCP `link_epistemic` readback)
+    /// must read these columns, NOT `truth_value`; the unframed
+    /// `belief_query::get_belief` path reads `truth_value` and so does not
+    /// reflect a recompute.
+    ///
+    /// Returns `Ok(None)` when the claim does not exist; the columns inside
+    /// [`ClaimBeliefColumns`] are individually `Option` (NULL when the claim
+    /// has never had a BBA combined onto it).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_belief_columns(
+        pool: &PgPool,
+        claim_id: ClaimId,
+    ) -> Result<Option<ClaimBeliefColumns>, DbError> {
+        let id: Uuid = claim_id.into();
+        let row: Option<ClaimBeliefColumns> =
+            sqlx::query_as("SELECT belief, plausibility, pignistic_prob FROM claims WHERE id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        Ok(row)
+    }
+
+    /// Shallow-merge `patch` into the claim's `properties` JSONB (`||`),
+    /// preserving keys not present in `patch` and overwriting those that are.
+    /// Unlike [`set_properties`] (which replaces the whole object), this is for
+    /// incrementally attaching/refreshing a sub-object — e.g. the workflow
+    /// promotion verdict — without clobbering hierarchy metadata like `level`.
+    ///
+    /// # Errors
+    /// Returns `DbError::NotFound` if no claim has `claim_id`;
+    /// `DbError::QueryFailed` on other database errors.
+    #[instrument(skip(pool, patch))]
+    pub async fn merge_properties(
+        pool: &PgPool,
+        claim_id: ClaimId,
+        patch: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        let id: Uuid = claim_id.into();
+        let result = sqlx::query(
+            "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || $2, \
+             updated_at = NOW() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(patch)
         .execute(pool)
         .await?;
 
@@ -470,6 +582,194 @@ impl ClaimRepository {
         Ok(q.fetch_all(pool).await?)
     }
 
+    /// Search **current** claims by embedding similarity across **all levels**.
+    ///
+    /// This is the search backing the simple `recall` MCP tool. Unlike
+    /// [`search_by_embedding`] — which is paper-paragraph-primary and
+    /// restricts to `(properties->>'level')::int = 2` — memorized claims have
+    /// no `level` property and store their vector on the 1536d
+    /// `claims.embedding` column. `recall` therefore needs a search with no
+    /// level restriction, limited to `is_current` so superseded/retired claims
+    /// are not resurfaced. (`recall` previously queried
+    /// `EvidenceRepository::search_by_embedding`, i.e. `evidence.embedding`,
+    /// which is unpopulated — so its semantic path returned nothing.)
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn search_by_embedding_current(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        limit: i64,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        Self::search_by_embedding_scoped(pool, query_embedding_pgvector, limit, None, None).await
+    }
+
+    /// [`search_by_embedding_current`] with optional scope predicates pushed
+    /// into the query: `tags` requires label containment (`c.labels @> $tags`,
+    /// the claim must carry ALL given tags) and `agent_id` requires authorship.
+    /// A `None`/empty filter does not restrict (the `$n IS NULL OR …` idiom),
+    /// so the two compose with AND. Scoping at the DB keeps it correct and
+    /// index-friendly rather than over-fetching and filtering in Rust.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn search_by_embedding_scoped(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        // Empty tag slice scopes to nothing meaningful (`@> '{}'` is all rows);
+        // collapse it to None so the IS NULL branch short-circuits.
+        let tags_owned: Option<Vec<String>> = match tags {
+            Some(t) if !t.is_empty() => Some(t.to_vec()),
+            _ => None,
+        };
+
+        let rows = sqlx::query_as::<_, ClaimEmbeddingHit>(
+            r#"
+            SELECT c.id AS claim_id,
+                   1 - (c.embedding <=> $1::vector) AS similarity
+            FROM claims c
+            WHERE c.embedding IS NOT NULL
+              AND c.is_current
+              AND ($3::text[] IS NULL OR c.labels @> $3::text[])
+              AND ($4::uuid IS NULL OR c.agent_id = $4::uuid)
+            ORDER BY c.embedding <=> $1::vector
+            LIMIT $2
+            "#,
+        )
+        .bind(query_embedding_pgvector)
+        .bind(limit)
+        .bind(tags_owned)
+        .bind(agent_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Hybrid retrieval over current claims: RRF-fuse a dense
+    /// (`claims.embedding`, HNSW) leg and a lexical (`content_tsv`, GIN) leg in
+    /// one round-trip. Both legs share the `is_current` / `labels @> tags` /
+    /// `agent_id` predicates, so the only difference is the relevance signal.
+    /// `candidate_pool` caps each leg before fusion; `k_rrf` is the RRF constant.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_scoped(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        query_text: &str,
+        candidate_pool: i64,
+        k_rrf: i64,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
+        let tags_owned: Option<Vec<String>> = match tags {
+            Some(t) if !t.is_empty() => Some(t.to_vec()),
+            _ => None,
+        };
+
+        let rows = sqlx::query_as::<_, HybridHit>(
+            r#"
+            WITH dense AS (
+                SELECT c.id,
+                       row_number() OVER (ORDER BY c.embedding <=> $1::vector) AS rank,
+                       1 - (c.embedding <=> $1::vector) AS cos
+                FROM claims c
+                WHERE c.embedding IS NOT NULL AND c.is_current
+                  AND ($6::text[] IS NULL OR c.labels @> $6::text[])
+                  AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
+                ORDER BY c.embedding <=> $1::vector
+                LIMIT $3
+            ),
+            lex AS (
+                SELECT c.id,
+                       row_number() OVER (ORDER BY ts_rank_cd(c.content_tsv, q) DESC) AS rank
+                FROM claims c, websearch_to_tsquery('english', $2) q
+                WHERE c.content_tsv @@ q AND c.is_current
+                  AND ($6::text[] IS NULL OR c.labels @> $6::text[])
+                  AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
+                ORDER BY ts_rank_cd(c.content_tsv, q) DESC
+                LIMIT $3
+            )
+            SELECT COALESCE(d.id, l.id) AS claim_id,
+                   (COALESCE(1.0/($4 + d.rank), 0)
+                    + COALESCE(1.0/($4 + l.rank), 0))::float8 AS rrf_score,
+                   d.cos::float8 AS dense_similarity,
+                   (l.rank IS NOT NULL) AS in_lexical
+            FROM dense d
+            FULL OUTER JOIN lex l ON d.id = l.id
+            ORDER BY rrf_score DESC
+            LIMIT $5
+            "#,
+        )
+        .bind(query_embedding_pgvector) // $1
+        .bind(query_text) // $2
+        .bind(candidate_pool) // $3
+        .bind(k_rrf) // $4
+        .bind(limit) // $5
+        .bind(tags_owned) // $6
+        .bind(agent_id) // $7
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Lexical-only retrieval over current claims (`content_tsv` / GIN), ranked
+    /// by `ts_rank_cd`. Returns `HybridHit`s with `dense_similarity = None` and
+    /// `in_lexical = true`; `rrf_score = 1/(k_rrf + rank)` keeps the score scale
+    /// consistent with the hybrid path. Used as `recall`'s embedder-down
+    /// fallback — unlike an ILIKE scan it honors the tag/agent scope in SQL.
+    pub async fn search_lexical_scoped(
+        pool: &PgPool,
+        query_text: &str,
+        k_rrf: i64,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
+        let tags_owned: Option<Vec<String>> = match tags {
+            Some(t) if !t.is_empty() => Some(t.to_vec()),
+            _ => None,
+        };
+
+        let rows = sqlx::query_as::<_, HybridHit>(
+            r#"
+            SELECT c.id AS claim_id,
+                   (1.0 / ($2 + row_number() OVER (
+                       ORDER BY ts_rank_cd(c.content_tsv, q) DESC)))::float8 AS rrf_score,
+                   NULL::float8 AS dense_similarity,
+                   true AS in_lexical
+            FROM claims c, websearch_to_tsquery('english', $1) q
+            WHERE c.content_tsv @@ q AND c.is_current
+              AND ($4::text[] IS NULL OR c.labels @> $4::text[])
+              AND ($5::uuid IS NULL OR c.agent_id = $5::uuid)
+            ORDER BY ts_rank_cd(c.content_tsv, q) DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(query_text) // $1
+        .bind(k_rrf) // $2
+        .bind(limit) // $3
+        .bind(tags_owned) // $4
+        .bind(agent_id) // $5
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Maximum number of claims returned by [`get_by_agent`](Self::get_by_agent) in a single
+    /// call. Prevents loading an arbitrarily large `Vec<Claim>` into heap for agents with many
+    /// claims. Callers that need pagination should use `list_by_truth_range` with explicit
+    /// offset/limit.
+    pub const MAX_AGENT_CLAIMS: i64 = 500;
+
     /// Get all claims by an agent
     ///
     /// # Errors
@@ -478,15 +778,17 @@ impl ClaimRepository {
     pub async fn get_by_agent(pool: &PgPool, agent_id: AgentId) -> Result<Vec<Claim>, DbError> {
         let uuid: Uuid = agent_id.into();
 
-        let rows = sqlx::query!(
+        let rows = sqlx::query_as::<_, ClaimRow>(
             r#"
             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
             FROM claims
             WHERE agent_id = $1
             ORDER BY created_at DESC
+            LIMIT $2
             "#,
-            uuid
         )
+        .bind(uuid)
+        .bind(Self::MAX_AGENT_CLAIMS)
         .fetch_all(pool)
         .await?;
 
@@ -879,6 +1181,113 @@ impl ClaimRepository {
         Ok(claims)
     }
 
+    /// List claims whose `truth_value` falls within `[min_truth, max_truth]`,
+    /// most-recent first. The range filter is applied in SQL **before**
+    /// `LIMIT`, so matching claims are reachable regardless of how recently
+    /// they were created.
+    ///
+    /// This exists because the obvious `list()` + post-query filter can only
+    /// ever inspect the first `limit` most-recent rows — a matching claim
+    /// outside that window is silently invisible (backlog bug `5a55a48e`:
+    /// `query_claims(max_truth=0.75)` returned empty while matching claims
+    /// existed).
+    pub async fn list_by_truth_range(
+        pool: &PgPool,
+        min_truth: f64,
+        max_truth: f64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Claim>, DbError> {
+        let rows = sqlx::query_as::<_, ClaimRow>(
+            r#"
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            FROM claims
+            WHERE truth_value >= $1 AND truth_value <= $2
+            ORDER BY created_at DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(min_truth)
+        .bind(max_truth)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+
+        let mut claims = Vec::with_capacity(rows.len());
+        for row in rows {
+            let truth_value = TruthValue::new(row.truth_value)?;
+            claims.push(claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            ));
+        }
+        Ok(claims)
+    }
+
+    /// Returns `true` iff **every** id in `ids` exists AND has
+    /// `is_current = true`.
+    ///
+    /// A missing id, a superseded claim (`is_current = false` via
+    /// [`Self::supersede`]), or a duplicate (via [`Self::mark_duplicate`])
+    /// all yield `false`. Used to guard structural-edge creation against
+    /// stale/duplicate endpoints — e.g. a CORROBORATES edge must not point at
+    /// a claim that has already been retired (backlog bug `5c7fc645`).
+    pub async fn are_all_current(pool: &PgPool, ids: &[uuid::Uuid]) -> Result<bool, DbError> {
+        if ids.is_empty() {
+            return Ok(true);
+        }
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM claims \
+             WHERE id = ANY($1) AND COALESCE(is_current, true) = true",
+        )
+        .bind(ids)
+        .fetch_one(pool)
+        .await?;
+        // Distinct ids must each be present-and-current. A missing or
+        // non-current id lowers the count below the distinct cardinality.
+        let distinct: std::collections::HashSet<&uuid::Uuid> = ids.iter().collect();
+        Ok(live as usize == distinct.len())
+    }
+
+    /// Fetch `(id, content)` for a batch of claim ids, current rows only.
+    ///
+    /// Lightweight companion to the structural enrichment in
+    /// `epigraph-mcp`'s `fetch_batched_context`: the rerank pipeline needs
+    /// the candidate *text* to score query-relevance, but must NOT pay for
+    /// siblings/corroborates/neighbor joins until AFTER it has truncated the
+    /// widened pool down to the final `limit`. Returns a `HashMap` so the
+    /// caller can look up content by id in any order (ANN result order is
+    /// not preserved by `id = ANY(...)`). Missing/non-current ids are simply
+    /// absent from the map.
+    ///
+    /// Uses the runtime `query_as` form (no compile-time `.sqlx` cache entry)
+    /// to keep `cargo sqlx prepare` out of this change's footprint.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    pub async fn contents_by_ids(
+        pool: &PgPool,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, String>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String)>(
+            "SELECT id, content FROM claims \
+             WHERE id = ANY($1) AND COALESCE(is_current, true) = true",
+        )
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// List claims that contain ALL of the specified labels.
     ///
     /// Uses the GIN index on `claims.labels` for efficient `@>` containment queries.
@@ -968,6 +1377,91 @@ impl ClaimRepository {
         Ok(out)
     }
 
+    /// List claims that have NEVER been touched by decomposition: claims that
+    /// are neither the source (parent) nor the target (child) of any
+    /// `decomposes_to` edge.
+    ///
+    /// `decomposes_to` is parent -> child (source = compound/parent, target =
+    /// atom/child) — see `epigraph_ingest::common::edges::decomposes_edge`
+    /// ("Build a decomposes_to edge between two claim nodes ... for parent ->
+    /// child relationships"). A leaf atom therefore has only an *incoming*
+    /// decomposes_to edge, so an outgoing-only predicate would wrongly
+    /// re-select every atom for re-decomposition. We exclude BOTH directions —
+    /// matching V2 `scripts/export_decomposition_input.py`'s
+    /// `NOT EXISTS (... source_id = c.id ...) AND NOT EXISTS (... target_id =
+    /// c.id ...)` predicate — so only standalone claims created via
+    /// non-hierarchical paths (`memorize`, `submit_claim`, workflow outputs,
+    /// legacy imports) are returned.
+    ///
+    /// Excludes host-telemetry claims (the `telemetry` label OR a
+    /// `properties->>'event'` marker) per the repo embedding policy — these
+    /// are container/task lifecycle noise with no decomposable propositional
+    /// content, and replace V2's brittle `content LIKE 'Agent sent message%'`
+    /// skip-patterns. Also drops trivially short content (`length > 10`), the
+    /// one filter ported verbatim from V2.
+    ///
+    /// Ordered `created_at ASC` (oldest first) so a bounded batch makes
+    /// monotonic progress through the backlog across scheduled runs.
+    pub async fn list_undecomposed(
+        pool: &PgPool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Claim>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        let limit = limit.clamp(1, 1000);
+        let offset = offset.max(0);
+        let rows = sqlx::query_as::<_, Row>(
+            r#"
+            SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                   c.created_at, c.updated_at
+            FROM claims c
+            WHERE COALESCE(c.is_current, true) = true
+              AND length(c.content) > 10
+              AND NOT ('telemetry' = ANY(c.labels))
+              AND (c.properties ->> 'event') IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM edges e
+                  WHERE e.source_id = c.id AND e.relationship = 'decomposes_to'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM edges e
+                  WHERE e.target_id = c.id AND e.relationship = 'decomposes_to'
+              )
+            ORDER BY c.created_at ASC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+
+        let mut claims = Vec::with_capacity(rows.len());
+        for row in rows {
+            let truth_value = TruthValue::new(row.truth_value)?;
+            claims.push(claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            ));
+        }
+        Ok(claims)
+    }
+
     /// Search workflow-tagged claims by content text match.
     ///
     /// Used by find_workflow MCP tool as a fallback when semantic search via
@@ -991,13 +1485,16 @@ impl ClaimRepository {
         limit: i64,
     ) -> Result<Vec<Claim>, DbError> {
         let limit = limit.clamp(1, 1000);
-        let pattern = format!("%{}%", text);
+        // Use the GIN-indexed `content_tsv` column so the text filter can hit
+        // the `idx_claims_content_tsv` index (migration 050) instead of forcing
+        // a sequential scan with a leading-wildcard ILIKE. `websearch_to_tsquery`
+        // accepts free-form query strings and handles quoting internally.
         let rows = sqlx::query_as::<_, ClaimRow>(
             r#"
             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
             FROM claims
             WHERE labels @> $1
-              AND content ILIKE $2
+              AND content_tsv @@ websearch_to_tsquery('english', $2)
               AND truth_value >= $3
               AND COALESCE(is_current, true) = true
             ORDER BY truth_value DESC, created_at DESC
@@ -1005,7 +1502,7 @@ impl ClaimRepository {
             "#,
         )
         .bind(labels)
-        .bind(&pattern)
+        .bind(text)
         .bind(min_truth)
         .bind(limit)
         .fetch_all(pool)
@@ -1312,6 +1809,17 @@ impl ClaimRepository {
     /// # Errors
     /// - `DbError::NotFound` if the old claim doesn't exist
     /// - `DbError::QueryFailed` if the old claim is already superseded or DB fails
+    ///
+    /// # Implementation Notes
+    /// The UPDATE that marks the old claim `is_current = false` also sets
+    /// `embedding = NULL` in the **same statement**.  This is required by the
+    /// CHECK constraint `chk_deprecated_no_embedding` (migration 052), which
+    /// fires per-statement rather than per-transaction: splitting the two
+    /// assignments across two UPDATE statements would violate the constraint
+    /// between statements.  Any future caller — REST handlers, CLI tools, tests
+    /// — must preserve this single-statement invariant.  See also
+    /// [`ClaimRepository::mark_duplicate`] which is subject to the same
+    /// constraint.
     #[instrument(skip(pool))]
     pub async fn supersede(
         pool: &PgPool,
@@ -1359,11 +1867,17 @@ impl ClaimRepository {
             });
         }
 
-        // Mark old claim as non-current
-        sqlx::query("UPDATE claims SET is_current = false, updated_at = NOW() WHERE id = $1")
-            .bind(old_uuid)
-            .execute(&mut *tx)
-            .await?;
+        // Mark old claim as non-current and null its embedding in one statement.
+        // Combining both in a single UPDATE is required by the CHECK constraint
+        // `chk_deprecated_no_embedding` (migration 052) which fires per-statement,
+        // not per-transaction: a two-step update would violate it between statements.
+        sqlx::query(
+            "UPDATE claims SET is_current = false, embedding = NULL, updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(old_uuid)
+        .execute(&mut *tx)
+        .await?;
 
         // Insert new claim with supersedes link, carrying forward only labels
         // from the old row. Embeddings are intentionally NOT copied: the new
@@ -1396,12 +1910,6 @@ impl ClaimRepository {
         .bind(reason)
         .execute(&mut *tx)
         .await?;
-
-        // Null old claim's embedding so it drops out of semantic search
-        sqlx::query("UPDATE claims SET embedding = NULL WHERE id = $1")
-            .bind(old_uuid)
-            .execute(&mut *tx)
-            .await?;
 
         // Migrate incoming edges: redirect edges pointing TO old claim to point to new claim
         sqlx::query(
@@ -1875,14 +2383,24 @@ impl ClaimRepository {
         pool: &PgPool,
         limit: i64,
     ) -> Result<Vec<(Uuid, String)>, DbError> {
+        // Exclude host-provenance telemetry (epiclaw-host ProvenanceRecorder
+        // signs every observable event as an immutable claim — container
+        // lifecycle, task execution, agent output, messages). These are
+        // intentionally NOT embedded (no semantic value, one OpenAI call each)
+        // and dominate the is_current embedding gap; embedding them would
+        // pollute semantic recall. They carry the `telemetry` label (added by
+        // provenance.rs) and a `properties->>'event'` marker — filter on both
+        // so pre-label-backfill rows and any label-PATCH-failure rows are still
+        // excluded. Also restrict to current claims: per the embedding
+        // invariant, `is_current = false` rows should have `embedding = NULL`
+        // by design, so they never "need" an embedding. (backlog a4aaa487)
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
             r#"
             SELECT id, content FROM claims
             WHERE embedding IS NULL
-              AND content NOT LIKE 'Agent sent message%'
-              AND content NOT LIKE 'Container epiclaw%'
-              AND content NOT LIKE 'Received message from%'
-              AND content NOT LIKE 'Agent in epiclaw%'
+              AND COALESCE(is_current, true) = true
+              AND NOT ('telemetry' = ANY(labels))
+              AND (properties->>'event') IS NULL
             ORDER BY created_at
             LIMIT $1
             "#,
@@ -1892,6 +2410,26 @@ impl ClaimRepository {
         .await?;
 
         Ok(rows)
+    }
+
+    /// Read a claim's cached CDST classification label (`supported` |
+    /// `contradicted` | `not_enough_info`), or `None` if unclassified or the
+    /// claim does not exist. Written by `recompute_combined_belief` via
+    /// `MassFunctionRepository::update_claim_classification`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_classification(
+        pool: &PgPool,
+        claim_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT classification FROM claims WHERE id = $1")
+                .bind(claim_id)
+                .fetch_optional(pool)
+                .await?;
+        Ok(row.and_then(|(c,)| c))
     }
 
     /// Store an embedding vector on a claim.
@@ -1916,6 +2454,11 @@ impl ClaimRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Maximum number of claim IDs accepted by [`pairwise_cosine_distance`](Self::pairwise_cosine_distance).
+    /// At N=1000 the O(N²) cross-join produces ~500 k pair comparisons in Postgres; beyond
+    /// this threshold query time becomes unreasonable and the result set itself is huge.
+    pub const MAX_PAIRWISE_IDS: usize = 1_000;
+
     /// Compute pairwise cosine distances between claims in the given set.
     ///
     /// Returns all pairs where distance < `max_distance`, ordered ascending.
@@ -1923,7 +2466,8 @@ impl ClaimRepository {
     /// — HNSW indexes do not accelerate distance filters.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// - `DbError::QueryFailed` if `claim_ids.len() > MAX_PAIRWISE_IDS`
+    /// - `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn pairwise_cosine_distance(
         pool: &PgPool,
@@ -1932,6 +2476,16 @@ impl ClaimRepository {
     ) -> Result<Vec<ClaimPairDistance>, DbError> {
         if claim_ids.len() < 2 {
             return Ok(vec![]);
+        }
+        if claim_ids.len() > Self::MAX_PAIRWISE_IDS {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "pairwise_cosine_distance: {} ids exceeds MAX_PAIRWISE_IDS={}; \
+                     split the input into smaller batches",
+                    claim_ids.len(),
+                    Self::MAX_PAIRWISE_IDS,
+                )),
+            });
         }
 
         let rows: Vec<ClaimPairDistance> = sqlx::query_as(
@@ -2054,10 +2608,16 @@ impl ClaimRepository {
         .await?;
 
         if edge_type == "supersedes" {
-            sqlx::query("UPDATE claims SET is_current = false, updated_at = NOW() WHERE id = $1")
-                .bind(parent_uuid)
-                .execute(&mut *tx)
-                .await?;
+            // Also null the embedding so the retired step drops out of semantic
+            // search. Mirrors the invariant enforced by supersede() and
+            // mark_duplicate(): is_current=false → embedding=NULL.
+            sqlx::query(
+                "UPDATE claims SET is_current = false, embedding = NULL, updated_at = NOW() \
+                 WHERE id = $1",
+            )
+            .bind(parent_uuid)
+            .execute(&mut *tx)
+            .await?;
         }
 
         tx.commit().await?;
@@ -2072,6 +2632,15 @@ impl ClaimRepository {
     /// Mark `dup` as a duplicate of `canonical` without creating a new claim.
     /// Sets `supersedes = canonical, is_current = false` on `dup` only.
     /// Refuses if `dup.supersedes` is already set.
+    ///
+    /// # Implementation Notes
+    /// The UPDATE that sets `is_current = false` on the duplicate also sets
+    /// `embedding = NULL` in the **same statement**, satisfying the CHECK
+    /// constraint `chk_deprecated_no_embedding` (migration 052).  This
+    /// constraint fires per-statement, so any split across two UPDATE statements
+    /// would violate it between them.  Any future caller must preserve this
+    /// single-statement invariant.  See also [`ClaimRepository::supersede`]
+    /// which has the same requirement.
     #[instrument(skip(pool))]
     pub async fn mark_duplicate(
         pool: &PgPool,
@@ -2115,17 +2684,114 @@ impl ClaimRepository {
                 )),
             });
         }
+        // Null the embedding in the same statement as is_current=false so the
+        // CHECK constraint chk_deprecated_no_embedding (migration 052) is not
+        // violated mid-transaction. Dropping it from semantic search is the same
+        // invariant as supersede() and deprecate_claim().
         sqlx::query(
-            "UPDATE claims SET supersedes = $1, is_current = false, updated_at = NOW() WHERE id = $2",
+            "UPDATE claims \
+             SET supersedes = $1, is_current = false, embedding = NULL, updated_at = NOW() \
+             WHERE id = $2",
         )
-        .bind(canon_uuid).bind(dup_uuid).execute(&mut *tx).await?;
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
 
-        // is_current=false invariant: drop the duplicate from semantic search.
-        // Mirrors supersede() at line 1401. See CLAUDE.md "Embedding policy".
-        sqlx::query("UPDATE claims SET embedding = NULL WHERE id = $1")
-            .bind(dup_uuid)
-            .execute(&mut *tx)
-            .await?;
+        // Migrate edges off the now-non-current duplicate onto the canonical
+        // claim, mirroring supersede()'s edge migration — otherwise edges to/from
+        // third claims dangle at a claim that no longer surfaces. Unlike supersede
+        // (which targets a freshly-minted claim with no pre-existing edges), the
+        // canonical here already exists, so we must guard against two collision
+        // classes before running the UPDATEs:
+        //
+        //   1. Self-loops: `dup→canonical` or `canonical→dup` edges that would
+        //      become `canonical→canonical` after migration (handled by the
+        //      `AND NOT (... = $1)` filters in the UPDATE clauses below).
+        //
+        //   2. Diamond duplicates: a third claim T that has edges to *both* dup
+        //      and canonical with the same relationship — e.g.
+        //      `T→[CORROBORATES]→dup` AND `T→[CORROBORATES]→canonical`.
+        //      Migrating the dup edge to point at canonical would produce a
+        //      second `T→[CORROBORATES]→canonical` triple, tripping the partial
+        //      unique index `idx_edges_unique_triple_non_authored`
+        //      (migration 017, covers all relationship types except AUTHORED)
+        //      and rolling back the whole transaction before `is_current` is
+        //      flipped.  Pre-delete the redundant dup edges so the UPDATE only
+        //      touches survivors.  AUTHORED edges are excluded because the
+        //      partial index does not cover them, and they are meant to
+        //      accumulate (migration 017 explicitly allows multiple AUTHORED
+        //      edges per triple).
+        //
+        // The 'supersedes' edges (dedup/lineage trail) are preserved throughout.
+
+        // Drop incoming dup-edges whose migrated triple already exists on canonical.
+        // Alias the outer table as `e` so the correlated subquery references
+        // `e.source_id`, `e.source_type`, `e.relationship` unambiguously.
+        // Without the alias, unqualified column names inside the EXISTS bind to
+        // `edges e2` (innermost scope in PostgreSQL), making the predicate
+        // tautological and causing false-positive deletions of edges that should
+        // be migrated.
+        sqlx::query(
+            "DELETE FROM edges AS e \
+             WHERE e.target_id = $2 AND e.target_type = 'claim' \
+               AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
+               AND e.source_type = 'claim' AND e.source_id != $1 \
+               AND EXISTS ( \
+                   SELECT 1 FROM edges e2 \
+                   WHERE e2.source_id = e.source_id \
+                     AND e2.source_type = e.source_type \
+                     AND e2.target_id = $1 \
+                     AND e2.target_type = 'claim' \
+                     AND e2.relationship = e.relationship \
+               )",
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
+
+        // Drop outgoing dup-edges whose migrated triple already exists on canonical.
+        // Same aliasing discipline: `e.target_id`, `e.target_type`, `e.relationship`
+        // must refer to the outer (being-deleted) row, not the subquery table.
+        sqlx::query(
+            "DELETE FROM edges AS e \
+             WHERE e.source_id = $2 AND e.source_type = 'claim' \
+               AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
+               AND e.target_type = 'claim' AND e.target_id != $1 \
+               AND EXISTS ( \
+                   SELECT 1 FROM edges e2 \
+                   WHERE e2.source_id = $1 \
+                     AND e2.source_type = 'claim' \
+                     AND e2.target_id = e.target_id \
+                     AND e2.target_type = e.target_type \
+                     AND e2.relationship = e.relationship \
+               )",
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE edges SET target_id = $1 \
+             WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
+               AND NOT (source_type = 'claim' AND source_id = $1)",
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE edges SET source_id = $1 \
+             WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes' \
+               AND NOT (target_type = 'claim' AND target_id = $1)",
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         Ok(())
@@ -2220,10 +2886,115 @@ mod tests {
         .await
         .unwrap();
 
+        // Host-provenance telemetry must be EXCLUDED: one via the `telemetry`
+        // label, one via the `properties->>'event'` marker (covers rows whose
+        // label back-fill / post-submit PATCH never landed). (backlog a4aaa487)
+        let tele_labeled = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding, labels)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, NULL, ARRAY['telemetry','epiclaw'])
+             RETURNING id",
+        )
+        .bind(format!(
+            "Container epiclaw-x exited code 0 after 5ms {}",
+            Uuid::new_v4()
+        ))
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let tele_event_prop = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding, properties)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, NULL, '{\"event\":\"task_executed\"}'::jsonb)
+             RETURNING id",
+        )
+        .bind(format!("Task t-{} executed, status: completed", Uuid::new_v4()))
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
         let missing = ClaimRepository::find_claims_needing_embeddings(&pool, 1000)
             .await
             .unwrap();
-        assert!(missing.iter().any(|(id, _)| *id == claim_id));
+        assert!(
+            missing.iter().any(|(id, _)| *id == claim_id),
+            "substantive claim must be returned"
+        );
+        assert!(
+            !missing.iter().any(|(id, _)| *id == tele_labeled),
+            "telemetry-labeled claim must be excluded"
+        );
+        assert!(
+            !missing.iter().any(|(id, _)| *id == tele_event_prop),
+            "event-property telemetry claim must be excluded"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn contents_by_ids_returns_current_only_and_skips_missing(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'test-contents-by-ids', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let current_text = format!("current-claim-{}", Uuid::new_v4());
+        let current_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, true)
+             RETURNING id",
+        )
+        .bind(&current_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // A superseded (is_current = false) row must NOT be returned — the
+        // rerank pool must never score retired claim text.
+        let stale_text = format!("stale-claim-{}", Uuid::new_v4());
+        let stale_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, false)
+             RETURNING id",
+        )
+        .bind(&stale_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let absent_id = Uuid::new_v4();
+        let map = ClaimRepository::contents_by_ids(&pool, &[current_id, stale_id, absent_id])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            map.get(&current_id).map(String::as_str),
+            Some(current_text.as_str()),
+            "current claim content must be returned verbatim"
+        );
+        assert!(
+            !map.contains_key(&stale_id),
+            "non-current (superseded) claim must be absent from the map"
+        );
+        assert!(
+            !map.contains_key(&absent_id),
+            "id with no matching row must be absent from the map"
+        );
+        assert_eq!(
+            map.len(),
+            1,
+            "only the single current claim should be present"
+        );
+
+        // Empty input short-circuits to an empty map without touching the DB.
+        let empty = ClaimRepository::contents_by_ids(&pool, &[]).await.unwrap();
+        assert!(empty.is_empty());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2261,6 +3032,76 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row.0, props);
+    }
+
+    /// `merge_properties` shallow-merges a patch into `properties`, preserving
+    /// untouched keys and OVERWRITING the patched key on a repeat call. This is
+    /// what makes the workflow-promotion flag bidirectional: re-running the
+    /// pass with promotable=false replaces a prior promotable=true rather than
+    /// leaving a stale mark, while sibling keys (e.g. `level`) survive.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn merge_properties_preserves_siblings_and_overwrites_target(pool: sqlx::PgPool) {
+        let (agent_id, agent_pk): (Uuid, Vec<u8>) = sqlx::query_as(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'merge-props-test', 'system', ARRAY['test'])
+             RETURNING id, public_key",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut public_key = [0u8; 32];
+        public_key.copy_from_slice(&agent_pk);
+        let claim = Claim::new(
+            "Test claim for merge".to_string(),
+            AgentId::from_uuid(agent_id),
+            public_key,
+            TruthValue::clamped(0.5),
+        );
+        let persisted = ClaimRepository::create(&pool, &claim).await.unwrap();
+        ClaimRepository::set_properties(&pool, persisted.id, serde_json::json!({"level": 2}))
+            .await
+            .unwrap();
+
+        // Merge a promotion verdict — `level` must survive.
+        ClaimRepository::merge_properties(
+            &pool,
+            persisted.id,
+            &serde_json::json!({"promotion": {"promotable": true, "lower_bound": 0.72}}),
+        )
+        .await
+        .unwrap();
+        let row: (serde_json::Value,) =
+            sqlx::query_as("SELECT properties FROM claims WHERE id = $1")
+                .bind(Uuid::from(persisted.id))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0["level"], 2, "sibling key preserved");
+        assert_eq!(row.0["promotion"]["promotable"], true);
+
+        // Re-merge with promotable=false (a demotion) — overwrites the promotion
+        // sub-object, `level` still preserved.
+        ClaimRepository::merge_properties(
+            &pool,
+            persisted.id,
+            &serde_json::json!({"promotion": {"promotable": false}}),
+        )
+        .await
+        .unwrap();
+        let row2: (serde_json::Value,) =
+            sqlx::query_as("SELECT properties FROM claims WHERE id = $1")
+                .bind(Uuid::from(persisted.id))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row2.0["level"], 2,
+            "sibling key still preserved after re-merge"
+        );
+        assert_eq!(
+            row2.0["promotion"]["promotable"], false,
+            "promotion sub-object overwritten — bidirectional, no stale mark"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2336,6 +3177,40 @@ mod tests {
 // ── Label Mutation ──
 
 impl ClaimRepository {
+    /// Deprecate a single claim: drop its truth to the 0.05 sentinel, flip
+    /// `is_current = false`, and NULL its embedding in one statement.
+    ///
+    /// This is the canonical deprecation primitive for workflow claims. It is
+    /// the THIRD `is_current = false` cleanup path (alongside `supersede` and
+    /// `mark_duplicate`); per CLAUDE.md "Embedding policy → Cleanup paths",
+    /// any path flipping `is_current = false` MUST null the embedding in the
+    /// same statement so the row drops out of semantic recall and does not
+    /// inflate the `stale_present` audit count.
+    ///
+    /// Returns the number of rows affected (0 when `id` does not exist).
+    /// Idempotent: re-running on an already-deprecated claim is a no-op flip
+    /// plus a no-op NULL — safe to call twice (used as the post-deploy
+    /// remediation path for claims deprecated by the pre-fix binary).
+    ///
+    /// Uses the runtime `sqlx::query` (string) form — NOT the compile-time
+    /// `query!` macro — to match the existing deprecation call-sites and to
+    /// avoid touching `.sqlx/` (no `cargo sqlx prepare` required).
+    ///
+    /// # Errors
+    /// Returns `DbError` if the database query fails.
+    pub async fn deprecate_claim(pool: &PgPool, id: ClaimId) -> Result<u64, DbError> {
+        let uuid: Uuid = id.into();
+        let result = sqlx::query(
+            "UPDATE claims \
+             SET truth_value = 0.05, is_current = false, embedding = NULL, updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(uuid)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Update labels on a claim by adding and/or removing labels atomically.
     ///
     /// Uses PostgreSQL array functions. Idempotent: adding a duplicate is a no-op,
@@ -2696,5 +3571,35 @@ mod label_tests {
             }
             other => panic!("Expected NotFound, got: {other:?}"),
         }
+    }
+
+    /// Verify `pairwise_cosine_distance` enforces the `MAX_PAIRWISE_IDS` cap.
+    /// No DB required: the size guard fires before the query is issued.
+    #[tokio::test]
+    async fn pairwise_cosine_distance_rejects_oversized_input() {
+        use sqlx::postgres::PgPoolOptions;
+        // We need a (dummy) pool even though the guard fires before any query.
+        // Use a non-existent URL — `connect_lazy` does not dial at construction time.
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://invalid-host/nodb")
+            .unwrap();
+        let too_many: Vec<Uuid> = (0..=ClaimRepository::MAX_PAIRWISE_IDS)
+            .map(|_| Uuid::new_v4())
+            .collect();
+        let result = ClaimRepository::pairwise_cosine_distance(&pool, &too_many, 0.5).await;
+        assert!(
+            result.is_err(),
+            "should return Err when claim_ids exceeds MAX_PAIRWISE_IDS"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("MAX_PAIRWISE_IDS"),
+            "error message should mention MAX_PAIRWISE_IDS; got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn max_agent_claims_constant_is_positive() {
+        assert!(ClaimRepository::MAX_AGENT_CLAIMS > 0);
     }
 }

@@ -1,0 +1,27 @@
+{
+  "scifact_id": 55,
+  "claim": "AMP-activated protein kinase (AMPK) activation reduces inflammation-related fibrosis in the lungs.",
+  "evidence_sentences": [
+    "Pharmacological activation of AMPK in myofibroblasts from lungs of humans with IPF display lower fibrotic activity, along with enhanced mitochondrial biogenesis and normalization of sensitivity to apoptosis.",
+    "In a bleomycin model of lung fibrosis in mice, metformin therapeutically accelerates the resolution of well-established fibrosis in an AMPK-dependent manner.",
+    "These studies implicate deficient AMPK activation in non-resolving, pathologic fibrotic processes, and support a role for metformin (or other AMPK activators) to reverse established fibrosis by facilitating deactivation and apoptosis of myofibroblasts."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "49556906",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "metformin",
+      "bleomycin"
+    ],
+    "conditions": [
+      "pharmacological AMPK activation in human IPF myofibroblasts",
+      "bleomycin model of lung fibrosis in mice",
+      "therapeutic administration of metformin on established fibrosis"
+    ],
+    "evidence_type": "empirical"
+  }
+}

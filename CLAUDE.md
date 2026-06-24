@@ -70,11 +70,19 @@ DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo 
 
 ## Embedding policy
 
-**Invariant:** every claim with `is_current = true` should have an embedding;
-every claim with `is_current = false` should have `embedding = NULL`. Semantic
-recall (`recall()`, `recall_with_context()`, `theme_cluster`, `find_workflow`'s
-semantic path) reads from `embedding`, so violations either hide live claims
-or surface stale ones.
+**Invariant:** every **non-telemetry** claim with `is_current = true` should
+have an embedding; every claim with `is_current = false` should have
+`embedding = NULL`. Semantic recall (`recall()`, `recall_with_context()`,
+`theme_cluster`, `find_workflow`'s semantic path) reads from `embedding`, so
+violations either hide live claims or surface stale ones.
+
+**Telemetry exception:** host-provenance claims (epiclaw-host's
+`ProvenanceRecorder` — container/task lifecycle, agent output, messages) are
+intentionally NOT embedded (no semantic value, one OpenAI call each). They carry
+the `telemetry` label and a `properties->>'event'` marker, and dominate the
+is_current embedding gap. The write path already skips embedding them
+(`submit.rs` `is_host_telemetry`), and `find_claims_needing_embeddings` excludes
+them. Do NOT treat them as `live_missing`. (backlog a4aaa487)
 
 ### Write paths (must embed on insert)
 
@@ -85,8 +93,10 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `memorize`** — `crates/epigraph-mcp/src/tools/memory.rs:103`
 - **MCP `batch_submit_claims`** — delegates to `submit_claim`
 - **MCP `ingest_document`** — `crates/epigraph-mcp/src/tools/ingestion.rs:321`
+- **MCP `ingest_document_spine`** — `do_ingest_document_spine` in the same file; phase-1 of the two-phase flow, embeds spine claims (thesis + sections + paragraphs) post-write
 - **MCP `workflow_ingest`** — embeds executor output; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
 - **MCP `store_workflow`** — embeds executor output via `execute_workflow_ingest_with_inserted`; `crates/epigraph-mcp/src/tools/workflows.rs::store_workflow`
+- **MCP `improve_workflow_hierarchy`** — embeds executor output (claims) AND calls `set_goal_embedding` for the new `workflows` row; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
 - **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some`
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs:1480`
@@ -112,7 +122,8 @@ If you add a third path that flips `is_current = false`, add the matching
 ### Auditing the gap
 
 ```sql
-SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL) AS live_missing,
+SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
+         AND NOT ('telemetry' = ANY(labels)) AND (properties->>'event') IS NULL) AS live_missing,
        COUNT(*) FILTER (WHERE NOT is_current AND embedding IS NOT NULL) AS stale_present
 FROM claims;
 ```
@@ -120,3 +131,76 @@ FROM claims;
 Both should trend toward zero. `live_missing` growing means a write path is
 bypassing the embedder; `stale_present` growing means a cleanup path is
 missing the null. Track via `system_stats` if exposed; otherwise spot-check.
+
+<!-- BEGIN epistemic-commit-protocol (managed block — keep these markers; edit the source at ~/.epistemic-commit-protocol.md and re-run the propagator) -->
+
+## The Epistemic Commit Protocol
+
+Treat version control as an **Epistemic Ledger**: every commit is a node in the project's
+knowledge graph, parseable into a claim with evidence, reasoning, and verification. Write each
+commit so a future reader — or an automated git-log ingester — can reconstruct *what* decision
+was made, *why*, and *how we know it is correct*.
+
+### Forbidden commit messages
+
+Never write "Fixed bug", "Updated code", "WIP", "Misc changes", or "Refactored stuff". They
+destroy provenance: future developers (and future you) cannot reconstruct the *why*.
+
+### Atomic discipline
+
+One commit = one logical decision. **If the Reasoning section needs multiple unrelated
+paragraphs, split the commit.**
+
+| Too small | Just right | Too large |
+|-----------|------------|-----------|
+| "Add newline" | "Define Claim struct with validation" | "Implement the whole module" |
+| "Fix typo" | "Add BLAKE3 content hasher" | "Add all crypto functions" |
+
+### Message schema
+
+```
+<type>(<scope>): <claim — imperative summary of the single decision>
+
+**Evidence:**
+- <the raw error, issue ID, metric, or requirement that triggered this>
+
+**Reasoning:**
+- <why this solution over the alternatives>
+
+**Verification:**
+- <proof the claim holds — tests, checks, measurements>
+```
+
+`<scope>` is the module / subsystem / package the change touches (e.g. `api`, `db`, `loader`);
+keep scopes consistent within a repo. Omit `(<scope>)` only when the change is genuinely global.
+
+### Types
+
+| Type | Use |
+|------|-----|
+| `feat` | new feature or capability |
+| `fix` | bug fix |
+| `refactor` | change that neither fixes a bug nor adds behaviour |
+| `perf` | performance improvement |
+| `test` | adding or updating tests |
+| `docs` | documentation only |
+| `chore` | build, CI, dependencies |
+| `security` | security fix or hardening |
+
+### Example
+
+```
+security(crypto): use constant-time comparison in signature verification
+
+**Evidence:**
+- Audit flagged `==` on signature bytes in the verify path (timing side-channel)
+
+**Reasoning:**
+- Replaced `==` with `subtle::ConstantTimeEq`; short-circuit comparison leaks timing
+  on cryptographic material, and there is no correctness cost
+
+**Verification:**
+- cargo test passes; manual review confirms no early returns in the verify path
+```
+
+<!-- END epistemic-commit-protocol -->

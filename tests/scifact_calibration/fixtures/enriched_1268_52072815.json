@@ -1,0 +1,23 @@
+{
+  "scifact_id": 1268,
+  "claim": "The risk of cancer rises with level of alcohol consumption.",
+  "evidence_sentences": [
+    "For populations aged 50 years and older, cancers accounted for a large proportion of total alcohol-attributable deaths in 2016, constituting 27\u00b71% (95% UI 21\u00b72\u201333\u00b73) of total alcohol-attributable female deaths and 18\u00b79% (15\u00b73\u201322\u00b76) of male deaths.",
+    "We found that the risk of all-cause mortality, and of cancers specifically, rises with increasing levels of consumption, and the level of consumption that minimises health loss is zero."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "52072815",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "populations aged 50 years and older",
+      "year 2016",
+      "all-cause mortality"
+    ],
+    "evidence_type": "statistical"
+  }
+}

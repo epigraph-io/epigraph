@@ -1,0 +1,20 @@
+{
+  "scifact_id": 737,
+  "claim": "MICAL redox enzymes regulate actin dynamics in many cell types.",
+  "evidence_sentences": [
+    "In this study we show that in non-neural cells human MICALs are required for normal actin organization, and all three MICALs regulate actin stress fibers."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6609935",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "non-neural cells"
+    ],
+    "evidence_type": "empirical"
+  }
+}

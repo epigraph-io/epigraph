@@ -1,0 +1,19 @@
+{
+  "scifact_id": 529,
+  "claim": "Human embryonic stem cells give rise to cell types from all three embryonic germ layers.",
+  "evidence_sentences": [
+    "Embryonic stem cells have the ability to remain undifferentiated and proliferate indefinitely in vitro while maintaining the potential to differentiate into derivatives of all three embryonic germ layers."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "36651210",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

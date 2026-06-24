@@ -6,7 +6,12 @@ use std::fs;
 use std::io::Write;
 use std::process::Command;
 
-pub fn run(dry_run: bool) -> Result<()> {
+/// Pipeline version string mirrored from `crates/epigraph-mcp/src/tools/ingestion.rs::PIPELINE_VERSION_BASE`.
+/// The MCP-side dedup gate keys on (paper.doi, processed_by edge with this `pipeline` property).
+/// Keep this in sync if the MCP constant ever changes.
+const PIPELINE_VERSION: &str = "hierarchical_extraction_v2";
+
+pub fn run(dry_run: bool, only: Option<&str>) -> Result<()> {
     let narratives_dir = "docs/superpowers/artifacts/2026-04-30-table-graph/narratives";
     let staging_dir = "docs/superpowers/artifacts/2026-04-30-table-graph/staging";
     let failed_path = format!("{}/failed-ingest.jsonl", staging_dir);
@@ -27,6 +32,11 @@ pub fn run(dry_run: bool) -> Result<()> {
             continue;
         }
         let (repo, table) = (parts[0], parts[1]);
+        if let Some(filter) = only {
+            if table != filter {
+                continue;
+            }
+        }
         let doi = format!("urn:epigraph-table:{}:{}", repo, table);
         let md_abs = std::fs::canonicalize(&p)?;
         let extraction_json = p.with_extension("extraction.json");
@@ -40,6 +50,19 @@ pub fn run(dry_run: bool) -> Result<()> {
         };
 
         eprintln!("ingest {} ({})", stem, doi);
+
+        // Cheap pre-flight: skip if the same DOI is already processed at the
+        // current pipeline version. The MCP `ingest_document` tool re-runs this
+        // gate, but only AFTER the extract-claims LLM call (~$2.50 per table)
+        // has already happened. Doing the check here saves that cost on re-runs.
+        match already_processed(&doi)? {
+            true => {
+                eprintln!("  skip: already processed at pipeline {}", PIPELINE_VERSION);
+                count_ok += 1;
+                continue;
+            }
+            false => {}
+        }
 
         if dry_run {
             eprintln!("  dry-run: would orchestrate claude -p extract+ingest");
@@ -169,4 +192,29 @@ fn run_psql(url: &str, sql: &str) -> Result<String> {
         ));
     }
     Ok(String::from_utf8(out.stdout)?)
+}
+
+/// Pre-flight dedup check that mirrors the MCP `ingest_document` version gate.
+/// Returns true iff a paper with this DOI exists AND has a `processed_by` edge
+/// at the current `PIPELINE_VERSION`. Read-only, so psql is fine here.
+fn already_processed(doi: &str) -> Result<bool> {
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://epigraph:epigraph@localhost:5432/epigraph".into());
+    // Quote the DOI as a single-quoted SQL literal; doubling any embedded ' for safety.
+    // DOIs in this binary are constructed from repo+table identifiers, so this is belt-and-braces.
+    let doi_lit = doi.replace('\'', "''");
+    let pipe_lit = PIPELINE_VERSION.replace('\'', "''");
+    let sql = format!(
+        "SELECT 1 FROM papers p \
+         JOIN edges e ON e.source_id = p.id \
+         WHERE p.doi = '{doi}' \
+           AND e.source_type = 'paper' \
+           AND e.relationship = 'processed_by' \
+           AND e.properties ->> 'pipeline' = '{pipe}' \
+         LIMIT 1",
+        doi = doi_lit,
+        pipe = pipe_lit,
+    );
+    let out = run_psql(&url, &sql)?;
+    Ok(!out.trim().is_empty())
 }

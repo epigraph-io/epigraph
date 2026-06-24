@@ -1,0 +1,25 @@
+{
+  "scifact_id": 1355,
+  "claim": "V-9302 inhibits antitumor responses by decreasing cell death and oxidative stress.",
+  "evidence_sentences": [
+    "Pharmacological blockade of ASCT2 with V-9302 resulted in attenuated cancer cell growth and proliferation, increased cell death, and increased oxidative stress, which collectively contributed to antitumor responses in vitro and in vivo."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "5256564",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "V-9302",
+      "ASCT2"
+    ],
+    "conditions": [
+      "in vitro",
+      "in vivo",
+      "pharmacological blockade of ASCT2"
+    ],
+    "evidence_type": "empirical"
+  }
+}

@@ -11,9 +11,9 @@ fn evidence_type_normalized_and_inherited_by_atoms() {
       "sections": [{
         "title": "S",
         "paragraphs": [
-          { "compound": "c1", "evidence_type": "Empirical", "atoms": ["a1", "a2"] },
-          { "compound": "c2", "evidence_type": "made_up_type", "atoms": ["a3"] },
-          { "compound": "c3", "atoms": ["a4"] }
+          { "text": "c1", "evidence_type": "Empirical", "atoms": ["a1", "a2"] },
+          { "text": "c2", "evidence_type": "made_up_type", "atoms": ["a3"] },
+          { "text": "c3", "atoms": ["a4"] }
         ]
       }]
     }"#;

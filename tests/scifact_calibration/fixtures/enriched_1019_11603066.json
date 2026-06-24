@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1019,
+  "claim": "Rapid phosphotransfer rates govern fidelity in two component systems",
+  "evidence_sentences": [
+    "In summary, our results provide valuable insight into how cells mediate specificity in one of the most abundant signalling pathways in biology, two-component signal transduction."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11603066",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.25,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial",
+    "tier3_enriched": true
+  }
+}

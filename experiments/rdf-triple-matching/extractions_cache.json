@@ -1,0 +1,5199 @@
+{
+ "dffbe8ba-f8e1-430c-9f91-c5702b0dd4a2": {
+  "entities": [
+   {
+    "name": "jack edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "length",
+    "type": "Property",
+    "role": "modifier"
+   },
+   {
+    "name": "28 nm",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "<6 nm",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "reconfiguration",
+    "type": "Concept",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "jack edges",
+    "predicate": "has_length_before_reconfiguration"
+   },
+   {
+    "subject": "jack edges",
+    "predicate": "has_length_after_reconfiguration"
+   },
+   {
+    "subject": "jack edges",
+    "predicate": "changes_length_during"
+   }
+  ]
+ },
+ "e5b9c7dc-42b1-4f73-bdbc-93cfcfd75d4f": {
+  "entities": [
+   {
+    "name": "force distribution",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "adaptable mode",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "inadaptable mode",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "narrow distribution",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "compression",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "single edge",
+    "type": "Material",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "force distribution",
+    "predicate": "is_widespread_in"
+   },
+   {
+    "subject": "edges",
+    "predicate": "follow_narrow_distribution_in"
+   },
+   {
+    "subject": "compression",
+    "predicate": "is_concentrated_in"
+   },
+   {
+    "subject": "compression",
+    "predicate": "occurs_in"
+   }
+  ]
+ },
+ "edba5f9b-0dba-4cd5-b2ef-ad598b886a54": {
+  "entities": [
+   {
+    "name": "DNA origami nanostructures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "M13 scaffold strands",
+    "type": "Molecule",
+    "role": "object"
+   },
+   {
+    "name": "DNA staple oligonucleotides",
+    "type": "Molecule",
+    "role": "object"
+   },
+   {
+    "name": "DNA staples",
+    "type": "Molecule",
+    "role": "object"
+   },
+   {
+    "name": "regular edges",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "jack edges",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "5 nM",
+    "type": "Measurement",
+    "role": "modifier"
+   },
+   {
+    "name": "4\u00d7",
+    "type": "Measurement",
+    "role": "modifier"
+   },
+   {
+    "name": "8\u00d7",
+    "type": "Measurement",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA origami nanostructures",
+    "predicate": "constructed_by_mixing"
+   },
+   {
+    "subject": "DNA origami nanostructures",
+    "predicate": "constructed_by_mixing"
+   },
+   {
+    "subject": "M13 scaffold strands",
+    "predicate": "used_at_concentration"
+   },
+   {
+    "subject": "DNA staple oligonucleotides",
+    "predicate": "used_at_molar_excess_for"
+   },
+   {
+    "subject": "DNA staples",
+    "predicate": "used_at_molar_excess_for"
+   }
+  ]
+ },
+ "9190e890-7d4d-4450-aac1-883bf3254562": {
+  "entities": [
+   {
+    "name": "synthesized structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "yield",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "75%",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "90%",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "AFM imaging",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "agarose gel electrophoresis",
+    "type": "Method",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "synthesized structures",
+    "predicate": "has_yield_range"
+   },
+   {
+    "subject": "yield",
+    "predicate": "measured_by"
+   },
+   {
+    "subject": "yield",
+    "predicate": "measured_by"
+   }
+  ]
+ },
+ "aad7a7e8-6e7c-42db-bdf7-608c6c882746": {
+  "entities": [
+   {
+    "name": "inadaptable free-energy peak",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "free-energy minima",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "< 5 kBT",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "state transitions",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "room temperature",
+    "type": "Condition",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable free-energy peak",
+    "predicate": "separates"
+   },
+   {
+    "subject": "inadaptable free-energy peak",
+    "predicate": "has_magnitude"
+   },
+   {
+    "subject": "inadaptable free-energy peak",
+    "predicate": "enables"
+   },
+   {
+    "subject": "state transitions",
+    "predicate": "occur_at"
+   }
+  ]
+ },
+ "54a18843-aae1-48f0-9dc3-32db9c4b23f0": {
+  "entities": [
+   {
+    "name": "adaptable structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "undefined states",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "UV light",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "30 min",
+    "type": "Measurement",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "adaptable structures",
+    "predicate": "transitions_to_upon_uv_exposure"
+   },
+   {
+    "subject": "inadaptable structures",
+    "predicate": "transitions_to_upon_uv_exposure"
+   },
+   {
+    "subject": "UV light",
+    "predicate": "has_exposure_duration"
+   }
+  ]
+ },
+ "a4f4f304-d352-4d37-925b-4acde9802c27": {
+  "entities": [
+   {
+    "name": "structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "average pull force",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "maximum theoretical force",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "jack",
+    "type": "Concept",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "structures",
+    "predicate": "requires_average_pull_force_of"
+   },
+   {
+    "subject": "structures",
+    "predicate": "has_maximum_theoretical_force_of"
+   },
+   {
+    "subject": "average pull force",
+    "predicate": "is_measured_per"
+   }
+  ]
+ },
+ "c80febd0-b9db-4e77-8553-34b08134fd9c": {
+  "entities": [
+   {
+    "name": "DNA lattice",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "two-helix bundle edges",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "honeycomb pattern",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "28 nm",
+    "type": "Measurement",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA lattice",
+    "predicate": "is_composed_of"
+   },
+   {
+    "subject": "two-helix bundle edges",
+    "predicate": "has_geometric_pattern"
+   },
+   {
+    "subject": "two-helix bundle edges",
+    "predicate": "has_designed_length"
+   }
+  ]
+ },
+ "998d56bf-c37c-4c21-9592-facdbb0189b2": {
+  "entities": [
+   {
+    "name": "adaptable mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "bend deflection",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "confined region",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "extrema",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "severe buckling",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "adaptable mode",
+    "predicate": "constrains_edges_within"
+   },
+   {
+    "subject": "inadaptable mode",
+    "predicate": "concentrates_edges_at"
+   },
+   {
+    "subject": "inadaptable mode",
+    "predicate": "exhibits_edge_with"
+   },
+   {
+    "subject": "bend deflection",
+    "predicate": "is_bounded_by"
+   }
+  ]
+ },
+ "5163d9e4-59d2-4796-b45c-5071d9b7a59c": {
+  "entities": [
+   {
+    "name": "structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "loading",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "initial configurations",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "structures",
+    "predicate": "spontaneously_returns_to_upon_load_removal"
+   },
+   {
+    "subject": "loading",
+    "predicate": "precedes_recovery_of"
+   }
+  ]
+ },
+ "f0170ddc-d097-4bf6-b8a2-f8d1f0273b74": {
+  "entities": [
+   {
+    "name": "wireframe DNA origami",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "2HB edges",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "hexagonal lattice",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "84 nts",
+    "type": "Measurement",
+    "role": "modifier"
+   },
+   {
+    "name": "28 nm",
+    "type": "Measurement",
+    "role": "modifier"
+   },
+   {
+    "name": "4 nm",
+    "type": "Measurement",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "wireframe DNA origami",
+    "predicate": "has_edge_count"
+   },
+   {
+    "subject": "wireframe DNA origami",
+    "predicate": "consists_of"
+   },
+   {
+    "subject": "wireframe DNA origami",
+    "predicate": "is_arranged_on"
+   },
+   {
+    "subject": "2HB edges",
+    "predicate": "has_nucleotide_length"
+   },
+   {
+    "subject": "2HB edges",
+    "predicate": "has_physical_length"
+   },
+   {
+    "subject": "2HB edges",
+    "predicate": "has_diameter"
+   }
+  ]
+ },
+ "0487ed9e-06dc-479c-8243-27e487f78069": {
+  "entities": [
+   {
+    "name": "buckled edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "end-to-end distance",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "18 nm",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "free energy calculations",
+    "type": "Method",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "buckled edges",
+    "predicate": "has_end_to_end_distance"
+   },
+   {
+    "subject": "buckled edges",
+    "predicate": "exists_in_state"
+   },
+   {
+    "subject": "free energy calculations",
+    "predicate": "predicts_property"
+   },
+   {
+    "subject": "free energy calculations",
+    "predicate": "predicts_value"
+   }
+  ]
+ },
+ "6d4ba283-987b-48ff-8fe8-2e6ef5f85337": {
+  "entities": [
+   {
+    "name": "DNA metastructure",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "mechanical frustration",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "adaptable mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "frustrated mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "strain",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA metastructure",
+    "predicate": "exhibits"
+   },
+   {
+    "subject": "adaptable mode",
+    "predicate": "distributes_homogeneously"
+   },
+   {
+    "subject": "frustrated mode",
+    "predicate": "concentrates_at_specific_location"
+   }
+  ]
+ },
+ "854d44cb-0581-4b60-847c-752e33ebe4f6": {
+  "entities": [
+   {
+    "name": "strain map",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "adaptable mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "edges",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "domain",
+    "type": "Concept",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "strain map",
+    "predicate": "characterizes"
+   },
+   {
+    "subject": "adaptable mode",
+    "predicate": "has_uniform_strain_distribution_throughout"
+   },
+   {
+    "subject": "inadaptable mode",
+    "predicate": "shows_elevated_strain_in"
+   }
+  ]
+ },
+ "d66a9664-3516-4c84-80ca-d8a2c19a0a8e": {
+  "entities": [
+   {
+    "name": "5-nt nick defects",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "edges",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "stiffness",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "free energy profile",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "5-nt nick defects",
+    "predicate": "has_count"
+   },
+   {
+    "subject": "5-nt nick defects",
+    "predicate": "weakens_stiffness_of"
+   },
+   {
+    "subject": "edges",
+    "predicate": "has_property"
+   },
+   {
+    "subject": "5-nt nick defects",
+    "predicate": "lowers"
+   }
+  ]
+ },
+ "46a9559c-523a-4db0-b3ba-e4e1d4799b66": {
+  "entities": [
+   {
+    "name": "experimental yield",
+    "type": "Measurement",
+    "role": "subject"
+   },
+   {
+    "name": "modified structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "jack locations",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "defects",
+    "type": "Property",
+    "role": "modifier"
+   },
+   {
+    "name": "75 to 90%",
+    "type": "Measurement",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "experimental yield",
+    "predicate": "ranges_between"
+   },
+   {
+    "subject": "modified structures",
+    "predicate": "achieves_experimental_yield"
+   },
+   {
+    "subject": "modified structures",
+    "predicate": "vary_by"
+   },
+   {
+    "subject": "modified structures",
+    "predicate": "contain"
+   }
+  ]
+ },
+ "63de27fd-058d-4a77-8b36-cc52328f7e2e": {
+  "entities": [
+   {
+    "name": "adaptable mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "free energy",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "steep-welled single minimum",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "two distinct minima",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "adaptable mode",
+    "predicate": "has_free_energy_landscape"
+   },
+   {
+    "subject": "adaptable mode",
+    "predicate": "has_free_energy_minimum_count"
+   },
+   {
+    "subject": "inadaptable state",
+    "predicate": "has_free_energy_landscape"
+   },
+   {
+    "subject": "inadaptable state",
+    "predicate": "has_free_energy_minimum_count"
+   }
+  ]
+ },
+ "f595a5ab-02e3-4382-a46f-d8bd351a1403": {
+  "entities": [
+   {
+    "name": "maximum force",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "chemical loading",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "57 pN per jack",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "actual forces required",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "15 pN per jack",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "jack",
+    "type": "Material",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "maximum force",
+    "predicate": "has_theoretical_value"
+   },
+   {
+    "subject": "maximum force",
+    "predicate": "is_applied_during"
+   },
+   {
+    "subject": "actual forces required",
+    "predicate": "has_value"
+   },
+   {
+    "subject": "maximum force",
+    "predicate": "exceeds"
+   },
+   {
+    "subject": "jack",
+    "predicate": "requires_applied_force"
+   }
+  ]
+ },
+ "d7bc56ba-4e22-4704-b103-a3f44adeabee": {
+  "entities": [
+   {
+    "name": "average edge length",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "28 nm",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "angles",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "60\u00b0",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "120\u00b0",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "theoretical design",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "average edge length",
+    "predicate": "measures_approximately"
+   },
+   {
+    "subject": "angles",
+    "predicate": "include_value"
+   },
+   {
+    "subject": "angles",
+    "predicate": "include_value"
+   },
+   {
+    "subject": "average edge length",
+    "predicate": "matches"
+   },
+   {
+    "subject": "angles",
+    "predicate": "match"
+   }
+  ]
+ },
+ "90588623-3fc8-48b1-ae2d-4c7e63ff2825": {
+  "entities": [
+   {
+    "name": "joints",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "single-stranded nucleotides",
+    "type": "Molecule",
+    "role": "object"
+   },
+   {
+    "name": "120\u00b0",
+    "type": "Measurement",
+    "role": "modifier"
+   },
+   {
+    "name": "60\u00b0",
+    "type": "Measurement",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "joints",
+    "predicate": "have_nucleotide_count_at_120_degree_angle"
+   },
+   {
+    "subject": "joints",
+    "predicate": "have_nucleotide_count_at_60_degree_angle"
+   },
+   {
+    "subject": "joints",
+    "predicate": "have_expected_angle"
+   },
+   {
+    "subject": "joints",
+    "predicate": "have_desired_angle"
+   }
+  ]
+ },
+ "2ed08fa6-7bc7-4819-b7ee-5f2ad3fade22": {
+  "entities": [
+   {
+    "name": "inadaptable structure",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "stable mode",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "buckled edge",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "nanoscale states",
+    "type": "Concept",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable structure",
+    "predicate": "transitions_between"
+   },
+   {
+    "subject": "inadaptable structure",
+    "predicate": "transitions_via_interchange_of"
+   },
+   {
+    "subject": "nanoscale states",
+    "predicate": "are_not_fixed"
+   }
+  ]
+ },
+ "dbebcbf0-1440-4953-9bc1-a46c62c054f1": {
+  "entities": [
+   {
+    "name": "frustrated state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "non-frustrated state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "reconfigurable struts",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "DNA jacks",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "metastructure",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "global deformation",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA jacks",
+    "predicate": "also_known_as"
+   },
+   {
+    "subject": "DNA jacks",
+    "predicate": "enables_switching_between"
+   },
+   {
+    "subject": "DNA jacks",
+    "predicate": "enables_switching_between"
+   },
+   {
+    "subject": "reconfigurable struts",
+    "predicate": "engineered_into"
+   },
+   {
+    "subject": "reconfigurable struts",
+    "predicate": "actuation_causes"
+   },
+   {
+    "subject": "global deformation",
+    "predicate": "deforms"
+   }
+  ]
+ },
+ "eeb13cf8-5cd5-4696-84f5-8587b809e764": {
+  "entities": [
+   {
+    "name": "inadaptable structure",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "buckled edge",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "initial state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "external loading",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "MD simulation",
+    "type": "Method",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable structure",
+    "predicate": "recovers_to"
+   },
+   {
+    "subject": "inadaptable structure",
+    "predicate": "recovery_upon_removal_of"
+   },
+   {
+    "subject": "inadaptable structure",
+    "predicate": "characterized_via"
+   },
+   {
+    "subject": "inadaptable structure",
+    "predicate": "has_feature"
+   }
+  ]
+ },
+ "6ce53e0a-2b26-4793-ad56-9daa61d2825d": {
+  "entities": [
+   {
+    "name": "4HB edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "6HB edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "2HB edges",
+    "type": "Material",
+    "role": "modifier"
+   },
+   {
+    "name": "free energy profile",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "energy cost",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "bending",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "energy minima wells",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "4HB edges",
+    "predicate": "replaces"
+   },
+   {
+    "subject": "6HB edges",
+    "predicate": "replaces"
+   },
+   {
+    "subject": "4HB edges",
+    "predicate": "changes_shape_of"
+   },
+   {
+    "subject": "6HB edges",
+    "predicate": "changes_shape_of"
+   },
+   {
+    "subject": "4HB edges",
+    "predicate": "increases"
+   },
+   {
+    "subject": "6HB edges",
+    "predicate": "increases"
+   },
+   {
+    "subject": "energy cost",
+    "predicate": "associated_with"
+   },
+   {
+    "subject": "4HB edges",
+    "predicate": "makes_relatively_deeper_and_narrower"
+   },
+   {
+    "subject": "6HB edges",
+    "predicate": "makes_relatively_deeper_and_narrower"
+   }
+  ]
+ },
+ "c2dadbd4-a3ad-44a3-933c-b60e05ab7152": {
+  "entities": [
+   {
+    "name": "interior spokes",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "compression",
+    "type": "Condition",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "interior spokes",
+    "predicate": "most_likely_to_buckle_in"
+   },
+   {
+    "subject": "interior spokes",
+    "predicate": "are_under"
+   }
+  ]
+ },
+ "e6b4f9a5-c91a-49e8-80d2-fef4361ac355": {
+  "entities": [
+   {
+    "name": "exterior hexagon edges",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "extension",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "adaptable mode",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "inadaptable mode",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "inner hexagon edges",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "distribution",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "exterior hexagon edges",
+    "predicate": "is_primarily_under"
+   },
+   {
+    "subject": "exterior hexagon edges",
+    "predicate": "is_under_extension_in"
+   },
+   {
+    "subject": "exterior hexagon edges",
+    "predicate": "is_under_extension_in"
+   },
+   {
+    "subject": "inner hexagon edges",
+    "predicate": "has_distribution_differing_markedly_between"
+   }
+  ]
+ },
+ "4e67c241-b76b-4342-8646-88c54639c152": {
+  "entities": [
+   {
+    "name": "inadaptable mode",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "edge 27",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "buckling",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "MD simulation",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "normalized strain",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "edge 27",
+    "predicate": "operates_in"
+   },
+   {
+    "subject": "edge 27",
+    "predicate": "experiences"
+   },
+   {
+    "subject": "edge 27",
+    "predicate": "experiences_buckling_during"
+   },
+   {
+    "subject": "edge 27",
+    "predicate": "has_highest"
+   }
+  ]
+ },
+ "81ca33b5-4b3d-4d1e-8f86-8667f783efa7": {
+  "entities": [
+   {
+    "name": "DNA jack mechanism",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "structural reconfiguration",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "two-step DNA reaction",
+    "type": "Method",
+    "role": "object"
+   },
+   {
+    "name": "toehold-mediated strand displacement",
+    "type": "Method",
+    "role": "object"
+   },
+   {
+    "name": "releaser strands",
+    "type": "Molecule",
+    "role": "modifier"
+   },
+   {
+    "name": "re-annealing",
+    "type": "Method",
+    "role": "object"
+   },
+   {
+    "name": "staple strands",
+    "type": "Molecule",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA jack mechanism",
+    "predicate": "achieves"
+   },
+   {
+    "subject": "DNA jack mechanism",
+    "predicate": "achieves_via"
+   },
+   {
+    "subject": "two-step DNA reaction",
+    "predicate": "consists_of_first_step"
+   },
+   {
+    "subject": "two-step DNA reaction",
+    "predicate": "consists_of_second_step"
+   },
+   {
+    "subject": "toehold-mediated strand displacement",
+    "predicate": "uses"
+   },
+   {
+    "subject": "re-annealing",
+    "predicate": "uses"
+   }
+  ]
+ },
+ "e2d37a9e-5103-45b2-a907-a23e834cff1d": {
+  "entities": [
+   {
+    "name": "adaptable mode",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "36 edges",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "confined region",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "bend deflection",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "buckled state",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "36 edges",
+    "predicate": "operate_in"
+   },
+   {
+    "subject": "36 edges",
+    "predicate": "remain_within"
+   },
+   {
+    "subject": "confined region",
+    "predicate": "is_characterized_by_low"
+   },
+   {
+    "subject": "36 edges",
+    "predicate": "do_not_permanently_settle_into"
+   }
+  ]
+ },
+ "5815d40e-d52c-488f-bb00-256c15394950": {
+  "entities": [
+   {
+    "name": "buckled edges",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "end-to-end distance",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "18 nm",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "free energy minimum",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "MD simulations",
+    "type": "Method",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "buckled edges",
+    "predicate": "are_in"
+   },
+   {
+    "subject": "buckled edges",
+    "predicate": "have_end_to_end_distance_of"
+   },
+   {
+    "subject": "end-to-end distance",
+    "predicate": "is_consistent_with"
+   },
+   {
+    "subject": "free energy minimum",
+    "predicate": "is_predicted_by"
+   }
+  ]
+ },
+ "1e607c37-55bc-4473-b855-7207260ae102": {
+  "entities": [
+   {
+    "name": "free energy profile",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "adaptable mode",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "2HB DNA edge",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "deformation",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "DNA nanostructure",
+    "type": "Material",
+    "role": "modifier"
+   },
+   {
+    "name": "monitored edge",
+    "type": "Material",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "free energy profile",
+    "predicate": "is_similar_to"
+   },
+   {
+    "subject": "adaptable mode",
+    "predicate": "has_free_energy_profile_equivalent_to"
+   },
+   {
+    "subject": "deformation",
+    "predicate": "does_not_significantly_affect"
+   },
+   {
+    "subject": "deformation",
+    "predicate": "originates_in"
+   }
+  ]
+ },
+ "30a41534-84e3-4025-8ef8-e7f389a0fb4d": {
+  "entities": [
+   {
+    "name": "inadaptable free energy landscape",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "free energy minimum",
+    "type": "Measurement",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "buckling",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "edges",
+    "type": "Material",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable free energy landscape",
+    "predicate": "has_minimum_at"
+   },
+   {
+    "subject": "free energy minimum",
+    "predicate": "implies_transfer_of"
+   },
+   {
+    "subject": "buckling",
+    "predicate": "is_transferred_to"
+   },
+   {
+    "subject": "inadaptable state",
+    "predicate": "localizes"
+   }
+  ]
+ },
+ "38313083-deb0-49b6-a688-d9648b624bb0": {
+  "entities": [
+   {
+    "name": "inadaptable frustrated state",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "AFM imaging",
+    "type": "Method",
+    "role": "subject"
+   },
+   {
+    "name": "buckling",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "buckled edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "straight edges",
+    "type": "Material",
+    "role": "subject"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "AFM imaging",
+    "predicate": "reveals"
+   },
+   {
+    "subject": "buckled edges",
+    "predicate": "exhibit"
+   },
+   {
+    "subject": "straight edges",
+    "predicate": "are_largely"
+   },
+   {
+    "subject": "buckling",
+    "predicate": "occurs_in_multiple"
+   }
+  ]
+ },
+ "ba1c03d9-11cf-4b2a-8f54-15adec6d518d": {
+  "entities": [
+   {
+    "name": "edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "strain",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "inadaptable MD simulations",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "diagonal struts",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "rhombic group",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "buckling",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "edges",
+    "predicate": "exhibit_high"
+   },
+   {
+    "subject": "inadaptable MD simulations",
+    "predicate": "identify"
+   },
+   {
+    "subject": "diagonal struts",
+    "predicate": "are_most_likely_to_experience"
+   },
+   {
+    "subject": "diagonal struts",
+    "predicate": "belong_to"
+   }
+  ]
+ },
+ "781a5c46-500a-4fa7-bcde-d183e667ceea": {
+  "entities": [
+   {
+    "name": "inadaptable mode",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "equilibrium",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "internal force distribution",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "edge 27",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "compression",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "stress localization",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "edges",
+    "predicate": "lie_within"
+   },
+   {
+    "subject": "edge 27",
+    "predicate": "experiences_disproportionately_greater"
+   },
+   {
+    "subject": "edge 27",
+    "predicate": "is_outlier_in"
+   },
+   {
+    "subject": "inadaptable mode",
+    "predicate": "exhibits"
+   }
+  ]
+ },
+ "71d368b4-3d54-4463-9f2d-02e08f028d23": {
+  "entities": [
+   {
+    "name": "DNA origami",
+    "type": "Method",
+    "role": "subject"
+   },
+   {
+    "name": "metastructures",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "adaptability",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "inadaptability",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "lattice",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "top-down fabrication",
+    "type": "Method",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA origami",
+    "predicate": "increases_versatility_of"
+   },
+   {
+    "subject": "DNA origami",
+    "predicate": "engineers_into_single_lattice"
+   },
+   {
+    "subject": "DNA origami",
+    "predicate": "engineers_into_single_lattice"
+   },
+   {
+    "subject": "top-down fabrication",
+    "predicate": "is_difficult_for_achieving"
+   },
+   {
+    "subject": "top-down fabrication",
+    "predicate": "is_difficult_for_achieving"
+   }
+  ]
+ },
+ "e0f9bc19-78c2-4945-89cd-54ac50759c9e": {
+  "entities": [
+   {
+    "name": "toehold-mediated strand displacement",
+    "type": "Method",
+    "role": "subject"
+   },
+   {
+    "name": "DNA jack mechanisms",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "reversible reconfiguration",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "initial state",
+    "type": "Condition",
+    "role": "object"
+   },
+   {
+    "name": "adaptable state",
+    "type": "Condition",
+    "role": "object"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Condition",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "toehold-mediated strand displacement",
+    "predicate": "uses_mechanism"
+   },
+   {
+    "subject": "toehold-mediated strand displacement",
+    "predicate": "enables"
+   },
+   {
+    "subject": "reversible reconfiguration",
+    "predicate": "transitions_between"
+   },
+   {
+    "subject": "reversible reconfiguration",
+    "predicate": "transitions_between"
+   },
+   {
+    "subject": "reversible reconfiguration",
+    "predicate": "transitions_between"
+   }
+  ]
+ },
+ "2ee5f994-cbc0-4afb-99d0-55ee55b7b015": {
+  "entities": [
+   {
+    "name": "MD simulations",
+    "type": "Method",
+    "role": "subject"
+   },
+   {
+    "name": "strain map",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "adaptable mode",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "uniform distribution",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "domain",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "edges",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "excessive strain",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "MD simulations",
+    "predicate": "reveals"
+   },
+   {
+    "subject": "strain map",
+    "predicate": "characterizes"
+   },
+   {
+    "subject": "strain map",
+    "predicate": "has_distribution"
+   },
+   {
+    "subject": "uniform distribution",
+    "predicate": "extends_throughout"
+   },
+   {
+    "subject": "edges",
+    "predicate": "are_not_stuck_in"
+   }
+  ]
+ },
+ "abc42cfc-e2ba-4ed6-b051-1f97ffab2387": {
+  "entities": [
+   {
+    "name": "inadaptable mode",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "MD mechanical loading",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "strain",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "edge",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "structure",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "buckled state",
+    "type": "Condition",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "strain",
+    "predicate": "develops_in"
+   },
+   {
+    "subject": "strain",
+    "predicate": "concentrates_into"
+   },
+   {
+    "subject": "structure",
+    "predicate": "becomes_stuck_in"
+   },
+   {
+    "subject": "MD mechanical loading",
+    "predicate": "applied_to"
+   },
+   {
+    "subject": "inadaptable mode",
+    "predicate": "exhibits"
+   }
+  ]
+ },
+ "2731dd1e-d1b4-47b4-aa36-bcc4ca933500": {
+  "entities": [
+   {
+    "name": "MD simulations",
+    "type": "Method",
+    "role": "subject"
+   },
+   {
+    "name": "mechanical loading",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "external forces",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "jack-edge residue sites",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "10 bp short residues",
+    "type": "Material",
+    "role": "modifier"
+   },
+   {
+    "name": "harmonic traps",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "oxDNA",
+    "type": "Software",
+    "role": "modifier"
+   },
+   {
+    "name": "28 nm",
+    "type": "Measurement",
+    "role": "modifier"
+   },
+   {
+    "name": "6 nm",
+    "type": "Measurement",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "MD simulations",
+    "predicate": "applies"
+   },
+   {
+    "subject": "external forces",
+    "predicate": "pull"
+   },
+   {
+    "subject": "jack-edge residue sites",
+    "predicate": "displaced_from"
+   },
+   {
+    "subject": "jack-edge residue sites",
+    "predicate": "displaced_to"
+   },
+   {
+    "subject": "external forces",
+    "predicate": "applied_via"
+   },
+   {
+    "subject": "MD simulations",
+    "predicate": "implemented_in"
+   },
+   {
+    "subject": "jack-edge residue sites",
+    "predicate": "consist_of"
+   }
+  ]
+ },
+ "6380b698-41df-4ed8-bc7e-4e57db86fc98": {
+  "entities": [
+   {
+    "name": "inadaptable mode",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "bend deflection distributions",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "monitored rhombi",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "red diagonal edge",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "buckled state",
+    "type": "Condition",
+    "role": "object"
+   },
+   {
+    "name": "blue edge",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "extended state",
+    "type": "Condition",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "bend deflection distributions",
+    "predicate": "diverge_over_time_in"
+   },
+   {
+    "subject": "bend deflection distributions",
+    "predicate": "characterizes"
+   },
+   {
+    "subject": "red diagonal edge",
+    "predicate": "is_trapped_in"
+   },
+   {
+    "subject": "blue edge",
+    "predicate": "remains_in"
+   }
+  ]
+ },
+ "6838bc5d-f8e6-4bdf-8609-a5468494f4f7": {
+  "entities": [
+   {
+    "name": "DNA origami lattice",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "two-helix bundle edges",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "honeycomb pattern",
+    "type": "Property",
+    "role": "modifier"
+   },
+   {
+    "name": "28 nm",
+    "type": "Measurement",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA origami lattice",
+    "predicate": "is_composed_of"
+   },
+   {
+    "subject": "two-helix bundle edges",
+    "predicate": "has_geometric_pattern"
+   },
+   {
+    "subject": "two-helix bundle edges",
+    "predicate": "has_designed_length"
+   }
+  ]
+ },
+ "b58855e9-e45f-4ac1-875d-04ae4f4fa029": {
+  "entities": [
+   {
+    "name": "buckling",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "particular edge",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "MD simulations",
+    "type": "Method",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "buckling",
+    "predicate": "occurs_in"
+   },
+   {
+    "subject": "buckling",
+    "predicate": "occurs_consistently_in"
+   },
+   {
+    "subject": "buckling",
+    "predicate": "is_observed_across_rounds_of"
+   }
+  ]
+ },
+ "b56183c9-489f-4f02-8a9f-1b42008621db": {
+  "entities": [
+   {
+    "name": "adaptable state",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "blue-green edge",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "green jack edges",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "blue edge",
+    "type": "Material",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "adaptable state",
+    "predicate": "is_induced_by_activating"
+   },
+   {
+    "subject": "adaptable state",
+    "predicate": "is_induced_by_activating"
+   },
+   {
+    "subject": "inadaptable state",
+    "predicate": "results_from_activating"
+   },
+   {
+    "subject": "inadaptable state",
+    "predicate": "results_from_activating"
+   }
+  ]
+ },
+ "9a8819fb-6459-403b-be19-a06efdc9eea7": {
+  "entities": [
+   {
+    "name": "DNA origami lattice",
+    "type": "Material",
+    "role": "modifier"
+   },
+   {
+    "name": "lattice edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "two-helix bundle DNA",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "84 nucleotides",
+    "type": "Measurement",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "lattice edges",
+    "predicate": "are_component_of"
+   },
+   {
+    "subject": "lattice edges",
+    "predicate": "are_designed_as"
+   },
+   {
+    "subject": "two-helix bundle DNA",
+    "predicate": "has_sequence_length"
+   }
+  ]
+ },
+ "9df079e5-31d6-458e-a847-7dbad350eae6": {
+  "entities": [
+   {
+    "name": "inadaptable free energy peak",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "5 kBT",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "thermally driven transitions",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "buckled state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "extended state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "room temperature",
+    "type": "Condition",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable free energy peak",
+    "predicate": "has_magnitude_less_than"
+   },
+   {
+    "subject": "inadaptable free energy peak",
+    "predicate": "separates"
+   },
+   {
+    "subject": "inadaptable free energy peak",
+    "predicate": "separates"
+   },
+   {
+    "subject": "thermally driven transitions",
+    "predicate": "enabled_by"
+   },
+   {
+    "subject": "thermally driven transitions",
+    "predicate": "occur_at"
+   },
+   {
+    "subject": "thermally driven transitions",
+    "predicate": "occurs_between"
+   },
+   {
+    "subject": "thermally driven transitions",
+    "predicate": "occurs_between"
+   }
+  ]
+ },
+ "b0a03a1f-9f64-4726-a18c-7fd24f2925ef": {
+  "entities": [
+   {
+    "name": "free energy profiles",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "umbrella sampling",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "thermodynamic behaviors",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "adaptable modes",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "inadaptable modes",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "free energy profiles",
+    "predicate": "calculated_using"
+   },
+   {
+    "subject": "free energy profiles",
+    "predicate": "quantifies"
+   },
+   {
+    "subject": "thermodynamic behaviors",
+    "predicate": "contrasts_between"
+   },
+   {
+    "subject": "thermodynamic behaviors",
+    "predicate": "contrasts_between"
+   }
+  ]
+ },
+ "c3b93041-e71e-462e-8be6-a1f0ed150257": {
+  "entities": [
+   {
+    "name": "six-cell hexagonal lattice",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "Kagome geometry",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "DNA metastructures",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "mechanical frustration",
+    "type": "Property",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "six-cell hexagonal lattice",
+    "predicate": "based_on"
+   },
+   {
+    "subject": "six-cell hexagonal lattice",
+    "predicate": "designed_as_model_for"
+   },
+   {
+    "subject": "six-cell hexagonal lattice",
+    "predicate": "has_cell_count"
+   },
+   {
+    "subject": "DNA metastructures",
+    "predicate": "exhibits"
+   }
+  ]
+ },
+ "f8a2926e-53c5-4f4b-af91-8e260f03c20f": {
+  "entities": [
+   {
+    "name": "nanoscale frustrated metastructures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "stable states",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "macroscale counterparts",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "random thermal fluctuations",
+    "type": "Condition",
+    "role": "subject"
+   },
+   {
+    "name": "multistability",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "nanoscale frustrated metastructures",
+    "predicate": "exhibit_greater_number_of"
+   },
+   {
+    "subject": "nanoscale frustrated metastructures",
+    "predicate": "compared_to"
+   },
+   {
+    "subject": "random thermal fluctuations",
+    "predicate": "increases_propensity_of"
+   },
+   {
+    "subject": "random thermal fluctuations",
+    "predicate": "causes_greater_multistability_in"
+   }
+  ]
+ },
+ "baddc727-1a4f-4de7-9547-529fb435d41c": {
+  "entities": [
+   {
+    "name": "dual minima",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable free energy landscape",
+    "type": "Property",
+    "role": "modifier"
+   },
+   {
+    "name": "bistability",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "buckled edge",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "17\u201320 nm",
+    "type": "Measurement",
+    "role": "modifier"
+   },
+   {
+    "name": "fully extended edge",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "28 nm",
+    "type": "Measurement",
+    "role": "modifier"
+   },
+   {
+    "name": "unstable intermediates",
+    "type": "Concept",
+    "role": "subject"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "dual minima",
+    "predicate": "indicate"
+   },
+   {
+    "subject": "dual minima",
+    "predicate": "found_in"
+   },
+   {
+    "subject": "bistability",
+    "predicate": "has_stable_state"
+   },
+   {
+    "subject": "bistability",
+    "predicate": "has_stable_state"
+   },
+   {
+    "subject": "buckled edge",
+    "predicate": "has_edge_length_range"
+   },
+   {
+    "subject": "fully extended edge",
+    "predicate": "has_minimum_at"
+   },
+   {
+    "subject": "unstable intermediates",
+    "predicate": "separate"
+   },
+   {
+    "subject": "unstable intermediates",
+    "predicate": "separate"
+   }
+  ]
+ },
+ "01d7229e-0346-42b2-8574-1b894f220413": {
+  "entities": [
+   {
+    "name": "directly assembled DNA structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "chemically loaded DNA structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "adaptable state",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "two-step chemical loading",
+    "type": "Method",
+    "role": "subject"
+   },
+   {
+    "name": "direct assembly",
+    "type": "Method",
+    "role": "object"
+   },
+   {
+    "name": "structural outcomes",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "directly assembled DNA structures",
+    "predicate": "is_consistent_with"
+   },
+   {
+    "subject": "two-step chemical loading",
+    "predicate": "produces_equivalent"
+   },
+   {
+    "subject": "direct assembly",
+    "predicate": "produces_equivalent"
+   },
+   {
+    "subject": "two-step chemical loading",
+    "predicate": "produces_same_structural_outcomes_as"
+   }
+  ]
+ },
+ "cc8ca3fa-6efc-43e7-b19f-8e79534c7bc1": {
+  "entities": [
+   {
+    "name": "DNA metastructure",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "frustrated mechanical state",
+    "type": "Condition",
+    "role": "object"
+   },
+   {
+    "name": "non-frustrated mechanical state",
+    "type": "Condition",
+    "role": "object"
+   },
+   {
+    "name": "free energy profile",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA metastructure",
+    "predicate": "can_adopt"
+   },
+   {
+    "subject": "DNA metastructure",
+    "predicate": "can_adopt"
+   },
+   {
+    "subject": "frustrated mechanical state",
+    "predicate": "is_characterized_by"
+   },
+   {
+    "subject": "non-frustrated mechanical state",
+    "predicate": "is_characterized_by"
+   },
+   {
+    "subject": "DNA metastructure",
+    "predicate": "is_precisely_controllable_to_adopt"
+   }
+  ]
+ },
+ "1638f5b3-5f9b-44d8-884b-345fabe114ce": {
+  "entities": [
+   {
+    "name": "adaptable mode",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "free energy landscape",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "steep-welled single minimum",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "most stable state",
+    "type": "Condition",
+    "role": "subject"
+   },
+   {
+    "name": "edge",
+    "type": "Material",
+    "role": "subject"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "free energy landscape",
+    "predicate": "exhibits_in_condition"
+   },
+   {
+    "subject": "free energy landscape",
+    "predicate": "exhibits_in_condition"
+   },
+   {
+    "subject": "most stable state",
+    "predicate": "occurs_when"
+   },
+   {
+    "subject": "edge",
+    "predicate": "is_fully_extended_at"
+   }
+  ]
+ },
+ "e32e36dc-66b1-4261-8630-6ef609918036": {
+  "entities": [
+   {
+    "name": "non-frustrated state",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "frustrated state",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "strain",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "structure",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "specific location",
+    "type": "Location",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "strain",
+    "predicate": "distributes_homogeneously_throughout"
+   },
+   {
+    "subject": "strain",
+    "predicate": "distributes_homogeneously_in"
+   },
+   {
+    "subject": "strain",
+    "predicate": "concentrates_at"
+   },
+   {
+    "subject": "strain",
+    "predicate": "concentrates_in"
+   }
+  ]
+ },
+ "22d8d3a6-896e-4c4f-b04e-ea1235c32d7f": {
+  "entities": [
+   {
+    "name": "DNA metastructure design",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "dual energy minima",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "edge thickness",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "number of nicks",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "energy landscape",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "multiple minima",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA metastructure design",
+    "predicate": "exhibits"
+   },
+   {
+    "subject": "edge thickness",
+    "predicate": "modification_could_engineer"
+   },
+   {
+    "subject": "number of nicks",
+    "predicate": "modification_could_engineer"
+   },
+   {
+    "subject": "energy landscape",
+    "predicate": "could_exhibit"
+   }
+  ]
+ },
+ "2526ef11-3ce7-45aa-9c2f-c02f6d246ac2": {
+  "entities": [
+   {
+    "name": "adaptable DNA structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable DNA structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "theoretical designs",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "AFM imaging",
+    "type": "Method",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "adaptable DNA structures",
+    "predicate": "conforms_to"
+   },
+   {
+    "subject": "inadaptable DNA structures",
+    "predicate": "conforms_to"
+   },
+   {
+    "subject": "AFM imaging",
+    "predicate": "confirms_conformance_of"
+   },
+   {
+    "subject": "AFM imaging",
+    "predicate": "confirms_conformance_of"
+   }
+  ]
+ },
+ "7e605e5a-f375-4929-b633-29dad73d1a10": {
+  "entities": [
+   {
+    "name": "classical elasticity theories",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "meso- to macroscale structures",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "nanoscale DNA metastructures",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "thermal fluctuations",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "intrinsic mechanical properties",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "DNA",
+    "type": "Molecule",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "classical elasticity theories",
+    "predicate": "holds_for"
+   },
+   {
+    "subject": "classical elasticity theories",
+    "predicate": "is_insufficient_for"
+   },
+   {
+    "subject": "nanoscale DNA metastructures",
+    "predicate": "requires_consideration_of"
+   },
+   {
+    "subject": "nanoscale DNA metastructures",
+    "predicate": "requires_consideration_of"
+   },
+   {
+    "subject": "intrinsic mechanical properties",
+    "predicate": "is_property_of"
+   }
+  ]
+ },
+ "9979fb31-fe4b-42e4-bb91-9f6ab71fdb8b": {
+  "entities": [
+   {
+    "name": "internal force distribution",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "adaptable mode",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "equilibrium",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "equal spread of forces",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "internal force distribution",
+    "predicate": "is_wide_at"
+   },
+   {
+    "subject": "internal force distribution",
+    "predicate": "indicates"
+   },
+   {
+    "subject": "internal force distribution",
+    "predicate": "occurs_in"
+   }
+  ]
+ },
+ "a9fa8be4-9a75-4994-a33d-c2107f9334c7": {
+  "entities": [
+   {
+    "name": "current study",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "2D deformations",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "3D metastructure design",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "current study",
+    "predicate": "focused_on"
+   },
+   {
+    "subject": "current study",
+    "predicate": "has_not_demonstrated"
+   },
+   {
+    "subject": "3D metastructure design",
+    "predicate": "remains_to_be_demonstrated"
+   }
+  ]
+ },
+ "8abe3fc1-b55b-49a2-8358-c8559ccf8997": {
+  "entities": [
+   {
+    "name": "adaptable mode",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "rhombic cells",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "diagonal struts",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "enclosed angle",
+    "type": "Measurement",
+    "role": "subject"
+   },
+   {
+    "name": "bend deflection",
+    "type": "Measurement",
+    "role": "subject"
+   },
+   {
+    "name": "deformation",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "equilibrium angle",
+    "type": "Measurement",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "enclosed angle",
+    "predicate": "enclosed_by"
+   },
+   {
+    "subject": "bend deflection",
+    "predicate": "characterizes"
+   },
+   {
+    "subject": "enclosed angle",
+    "predicate": "remains_invariant_during"
+   },
+   {
+    "subject": "bend deflection",
+    "predicate": "remains_invariant_during"
+   },
+   {
+    "subject": "enclosed angle",
+    "predicate": "returns_to"
+   },
+   {
+    "subject": "equilibrium angle",
+    "predicate": "has_value"
+   },
+   {
+    "subject": "bend deflection",
+    "predicate": "returns_to"
+   },
+   {
+    "subject": "enclosed angle",
+    "predicate": "occurs_in"
+   }
+  ]
+ },
+ "7aa35b96-2968-477b-ba7f-5495128135f1": {
+  "entities": [
+   {
+    "name": "scale bar",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "AFM images",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "DNA metastructure",
+    "type": "Material",
+    "role": "modifier"
+   },
+   {
+    "name": "50 nm",
+    "type": "Measurement",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "scale bar",
+    "predicate": "has_length"
+   },
+   {
+    "subject": "scale bar",
+    "predicate": "appears_in"
+   },
+   {
+    "subject": "AFM images",
+    "predicate": "depicts"
+   }
+  ]
+ },
+ "e9883e16-8a9f-4c18-9278-6025ca48314b": {
+  "entities": [
+   {
+    "name": "DNA structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "MD simulations",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "DNA jack",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "average pulling force",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "15 pN",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "maximum force",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "57 pN",
+    "type": "Measurement",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA structures",
+    "predicate": "requires_pulling_force"
+   },
+   {
+    "subject": "MD simulations",
+    "predicate": "simulates"
+   },
+   {
+    "subject": "DNA jack",
+    "predicate": "exerts_maximum_force"
+   },
+   {
+    "subject": "average pulling force",
+    "predicate": "measured_in"
+   }
+  ]
+ },
+ "8bd794a5-0607-4234-9b02-4ffeddf8608a": {
+  "entities": [
+   {
+    "name": "free solution",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "inadaptable DNA metastructure",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "out-of-plane deformations",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "bending modulus",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable DNA metastructure",
+    "predicate": "exists_in_condition"
+   },
+   {
+    "subject": "inadaptable DNA metastructure",
+    "predicate": "experiences"
+   },
+   {
+    "subject": "edges",
+    "predicate": "buckle_along_direction_of_lowest"
+   },
+   {
+    "subject": "inadaptable DNA metastructure",
+    "predicate": "has_structural_component"
+   }
+  ]
+ },
+ "fb024d68-10ba-4fb2-8da6-619b91b858bc": {
+  "entities": [
+   {
+    "name": "AFM",
+    "type": "Instrument",
+    "role": "modifier"
+   },
+   {
+    "name": "edge widths",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "4 nm",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "two-helix bundle DNA",
+    "type": "Material",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "AFM",
+    "predicate": "measures"
+   },
+   {
+    "subject": "edge widths",
+    "predicate": "has_measured_value"
+   },
+   {
+    "subject": "edge widths",
+    "predicate": "corresponds_to_expected_width_of"
+   },
+   {
+    "subject": "two-helix bundle DNA",
+    "predicate": "has_expected_width"
+   }
+  ]
+ },
+ "1334d660-6962-4ad8-8af5-bd651cc5b81a": {
+  "entities": [
+   {
+    "name": "jack edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "28 nm",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "6 nm",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "toehold-mediated strand displacement",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "reconfiguration",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "jack edges",
+    "predicate": "has_initial_length"
+   },
+   {
+    "subject": "jack edges",
+    "predicate": "reduces_length_to"
+   },
+   {
+    "subject": "jack edges",
+    "predicate": "undergoes"
+   },
+   {
+    "subject": "reconfiguration",
+    "predicate": "mediated_by"
+   },
+   {
+    "subject": "toehold-mediated strand displacement",
+    "predicate": "changes_length_of"
+   }
+  ]
+ },
+ "28e43d56-6611-452a-813d-15cd56aef38b": {
+  "entities": [
+   {
+    "name": "equilibrium configuration",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "MD simulations",
+    "type": "Method",
+    "role": "subject"
+   },
+   {
+    "name": "144\u00d710^6 steps",
+    "type": "Measurement",
+    "role": "modifier"
+   },
+   {
+    "name": "average internal forces",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "central section",
+    "type": "Concept",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "MD simulations",
+    "predicate": "has_duration"
+   },
+   {
+    "subject": "equilibrium configuration",
+    "predicate": "derived_from"
+   },
+   {
+    "subject": "equilibrium configuration",
+    "predicate": "used_to_extract"
+   },
+   {
+    "subject": "average internal forces",
+    "predicate": "located_at"
+   }
+  ]
+ },
+ "0861d3f4-a9bf-418d-b935-a01a67491613": {
+  "entities": [
+   {
+    "name": "inadaptable frustrated mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "free energy minima",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "gradual dip with flat bottom",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "17 to 20 nm range",
+    "type": "Measurement",
+    "role": "modifier"
+   },
+   {
+    "name": "28 nm",
+    "type": "Measurement",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable frustrated mode",
+    "predicate": "exhibits"
+   },
+   {
+    "subject": "inadaptable frustrated mode",
+    "predicate": "has_free_energy_plateau"
+   },
+   {
+    "subject": "inadaptable frustrated mode",
+    "predicate": "has_free_energy_minimum_at"
+   }
+  ]
+ },
+ "10f24040-fd55-4cf3-99a0-44622a1ae7bf": {
+  "entities": [
+   {
+    "name": "DNA origami metastructure",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "mechanical frustration",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "nanoscale",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "frustrated metamaterials",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "meso- to macroscale",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "3D-printed lattices",
+    "type": "Material",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA origami metastructure",
+    "predicate": "first_realizes"
+   },
+   {
+    "subject": "DNA origami metastructure",
+    "predicate": "demonstrated_at_scale"
+   },
+   {
+    "subject": "frustrated metamaterials",
+    "predicate": "previously_demonstrated_at_scale"
+   },
+   {
+    "subject": "frustrated metamaterials",
+    "predicate": "fabricated_using"
+   }
+  ]
+ },
+ "3044aff0-0e44-40da-8844-cedaf520c025": {
+  "entities": [
+   {
+    "name": "inadaptable state",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "broken symmetry",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "equilibrium conformation",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "MD simulation",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "adaptable state",
+    "type": "Concept",
+    "role": "subject"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable state",
+    "predicate": "exhibits"
+   },
+   {
+    "subject": "inadaptable state",
+    "predicate": "has_equilibrium_conformation"
+   },
+   {
+    "subject": "equilibrium conformation",
+    "predicate": "derived_from"
+   },
+   {
+    "subject": "adaptable state",
+    "predicate": "exhibits_symmetry"
+   }
+  ]
+ },
+ "9015807c-2781-4874-a754-8a9978b46b0a": {
+  "entities": [
+   {
+    "name": "non-frustrated adaptable state",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "AFM",
+    "type": "Instrument",
+    "role": "modifier"
+   },
+   {
+    "name": "assembled DNA",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "straight edges",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "interior triangles",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "edge",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "28 nm length",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "4 nm width",
+    "type": "Measurement",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "non-frustrated adaptable state",
+    "predicate": "demonstrated_by"
+   },
+   {
+    "subject": "assembled DNA",
+    "predicate": "has_edge_morphology"
+   },
+   {
+    "subject": "interior triangles",
+    "predicate": "retains"
+   },
+   {
+    "subject": "edge",
+    "predicate": "has_length"
+   },
+   {
+    "subject": "edge",
+    "predicate": "has_width"
+   }
+  ]
+ },
+ "92105cb2-af69-4b54-b087-85769f47e9ee": {
+  "entities": [
+   {
+    "name": "coarse-grained MD simulations",
+    "type": "Method",
+    "role": "subject"
+   },
+   {
+    "name": "oxDNA",
+    "type": "Software",
+    "role": "modifier"
+   },
+   {
+    "name": "DNA metastructure",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "structural behaviors",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "free energy landscapes",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "coarse-grained MD simulations",
+    "predicate": "uses_platform"
+   },
+   {
+    "subject": "coarse-grained MD simulations",
+    "predicate": "elucidates"
+   },
+   {
+    "subject": "coarse-grained MD simulations",
+    "predicate": "elucidates"
+   },
+   {
+    "subject": "structural behaviors",
+    "predicate": "characterizes"
+   },
+   {
+    "subject": "free energy landscapes",
+    "predicate": "characterizes"
+   }
+  ]
+ },
+ "8c56af38-f8ba-41a7-88e6-ddadd650567d": {
+  "entities": [
+   {
+    "name": "free energy profiles",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "metastructure",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "single-stranded DNA sections",
+    "type": "Molecule",
+    "role": "object"
+   },
+   {
+    "name": "vertices",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "60\u00b0 junctions",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "120\u00b0 junctions",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "5 nucleotide ssDNA",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "3 nucleotide ssDNA",
+    "type": "Measurement",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "free energy profiles",
+    "predicate": "tailored_by_changing_length_of"
+   },
+   {
+    "subject": "free energy profiles",
+    "predicate": "belongs_to"
+   },
+   {
+    "subject": "single-stranded DNA sections",
+    "predicate": "located_at"
+   },
+   {
+    "subject": "60\u00b0 junctions",
+    "predicate": "has_ssDNA_section_length"
+   },
+   {
+    "subject": "120\u00b0 junctions",
+    "predicate": "has_ssDNA_section_length"
+   }
+  ]
+ },
+ "a1d48c72-8743-48d8-9b20-4cdd16abba94": {
+  "entities": [
+   {
+    "name": "mechanical loading",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "adaptable DNA structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable DNA structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "initial configurations",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "MD simulations",
+    "type": "Method",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "adaptable DNA structures",
+    "predicate": "spontaneously_returns_to_on_unloading"
+   },
+   {
+    "subject": "inadaptable DNA structures",
+    "predicate": "spontaneously_returns_to_on_unloading"
+   },
+   {
+    "subject": "adaptable DNA structures",
+    "predicate": "conditioned_by_removal_of"
+   },
+   {
+    "subject": "inadaptable DNA structures",
+    "predicate": "conditioned_by_removal_of"
+   },
+   {
+    "subject": "adaptable DNA structures",
+    "predicate": "simulated_by"
+   },
+   {
+    "subject": "inadaptable DNA structures",
+    "predicate": "simulated_by"
+   }
+  ]
+ },
+ "b775a31f-f3c0-475f-8f19-e418aa6dbe69": {
+  "entities": [
+   {
+    "name": "chemical loading method",
+    "type": "Method",
+    "role": "subject"
+   },
+   {
+    "name": "reversible structural transformations",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "initial state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "adaptable state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "chemical loading method",
+    "predicate": "enables"
+   },
+   {
+    "subject": "reversible structural transformations",
+    "predicate": "between_states"
+   },
+   {
+    "subject": "reversible structural transformations",
+    "predicate": "between_states"
+   },
+   {
+    "subject": "reversible structural transformations",
+    "predicate": "between_states"
+   }
+  ]
+ },
+ "306efd91-dc04-4b8b-9bc3-a6234a6294af": {
+  "entities": [
+   {
+    "name": "jack edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "reconfiguration",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "28 nm length",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "6 nm length",
+    "type": "Measurement",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "jack edges",
+    "predicate": "has_length_before_reconfiguration"
+   },
+   {
+    "subject": "jack edges",
+    "predicate": "has_length_after_reconfiguration"
+   },
+   {
+    "subject": "jack edges",
+    "predicate": "changes_length_upon"
+   }
+  ]
+ },
+ "3938f3ab-1ac6-4b28-b40c-2275f63e7fdd": {
+  "entities": [
+   {
+    "name": "frustrated metamaterials",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "nanoscale",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "precise assembly",
+    "type": "Method",
+    "role": "object"
+   },
+   {
+    "name": "structural accuracy",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "frustrated metamaterials",
+    "predicate": "has_not_been_realized_at"
+   },
+   {
+    "subject": "frustrated metamaterials",
+    "predicate": "realization_impeded_by_lack_of"
+   },
+   {
+    "subject": "frustrated metamaterials",
+    "predicate": "realization_impeded_by_lack_of"
+   }
+  ]
+ },
+ "51aab347-44f3-4001-88af-21d7d77d1fb9": {
+  "entities": [
+   {
+    "name": "angle",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "bend deflection",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "deformation",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "adaptable mode",
+    "type": "Concept",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "angle",
+    "predicate": "remains_invariant_throughout"
+   },
+   {
+    "subject": "bend deflection",
+    "predicate": "remains_invariant_throughout"
+   },
+   {
+    "subject": "angle",
+    "predicate": "is_invariant_in"
+   },
+   {
+    "subject": "bend deflection",
+    "predicate": "is_invariant_in"
+   }
+  ]
+ },
+ "3ee0f4d8-49ef-48a5-921e-a31e2c2408e0": {
+  "entities": [
+   {
+    "name": "structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "average pull force",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "maximum force",
+    "type": "Measurement",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "structures",
+    "predicate": "requires_average_pull_force_of"
+   },
+   {
+    "subject": "structures",
+    "predicate": "has_theoretical_maximum_exertable_force_of"
+   }
+  ]
+ },
+ "26e287fe-ee73-4837-8942-01ff13e7741f": {
+  "entities": [
+   {
+    "name": "edge no. 27",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "compression",
+    "type": "Condition",
+    "role": "object"
+   },
+   {
+    "name": "buckling",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "edge no. 27",
+    "predicate": "is_outlier_relative_to_others_for"
+   },
+   {
+    "subject": "edge no. 27",
+    "predicate": "experiences_greater"
+   },
+   {
+    "subject": "edge no. 27",
+    "predicate": "undergoes"
+   },
+   {
+    "subject": "compression",
+    "predicate": "causes"
+   }
+  ]
+ },
+ "3a08a42b-20e3-4e15-a189-40cd88f0944f": {
+  "entities": [
+   {
+    "name": "structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "states",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "direct assemblies",
+    "type": "Method",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "structures",
+    "predicate": "is_consistent_with_observations_from"
+   }
+  ]
+ },
+ "fcc313bc-3208-4609-8bdb-d9b5f49c1ff0": {
+  "entities": [
+   {
+    "name": "adaptable distributions",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "equilibrium angle",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "deflection",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "adaptable distributions",
+    "predicate": "returns_to_equilibrium_angle_of"
+   },
+   {
+    "subject": "adaptable distributions",
+    "predicate": "exhibits"
+   }
+  ]
+ },
+ "be32c36a-26f3-4756-8b1a-e86b161a933f": {
+  "entities": [
+   {
+    "name": "nanoscale frustrated metastructures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "macroscale counterparts",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "stable states",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "nanoscale frustrated metastructures",
+    "predicate": "exhibits_greater_count_of"
+   },
+   {
+    "subject": "nanoscale frustrated metastructures",
+    "predicate": "exceeds_in_stable_state_count"
+   }
+  ]
+ },
+ "6143729f-a1a2-4f29-81ad-d7a0e8179541": {
+  "entities": [
+   {
+    "name": "free energy spike",
+    "type": "Measurement",
+    "role": "subject"
+   },
+   {
+    "name": "energy minima",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "buckled state",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "extended state",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "partially bent intermediates",
+    "type": "Concept",
+    "role": "subject"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "free energy spike",
+    "predicate": "occurs_between"
+   },
+   {
+    "subject": "buckled state",
+    "predicate": "is_stable"
+   },
+   {
+    "subject": "extended state",
+    "predicate": "is_stable"
+   },
+   {
+    "subject": "partially bent intermediates",
+    "predicate": "is_stable"
+   }
+  ]
+ },
+ "28814bed-b88d-4075-91f6-d05d1c764e45": {
+  "entities": [
+   {
+    "name": "inadaptable mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "structural edges",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "gray region extrema",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "severe buckling",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "simulation",
+    "type": "Method",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable mode",
+    "predicate": "has_more_structural_edges_at"
+   },
+   {
+    "subject": "structural edges",
+    "predicate": "experiences"
+   },
+   {
+    "subject": "severe buckling",
+    "predicate": "occurs_during_latter_half_of"
+   }
+  ]
+ },
+ "7bdca577-c826-4293-a81b-7cab3827f2cb": {
+  "entities": [
+   {
+    "name": "inadaptable DNA",
+    "type": "Molecule",
+    "role": "subject"
+   },
+   {
+    "name": "buckling",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "structural edges",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable DNA",
+    "predicate": "displays_in_some_edges"
+   },
+   {
+    "subject": "structural edges",
+    "predicate": "remains"
+   }
+  ]
+ },
+ "340032fb-d8b3-40bb-94a6-3e6142ec931d": {
+  "entities": [
+   {
+    "name": "DNA lattice",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "two-helix bundle",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "honeycomb pattern",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "designed length",
+    "type": "Property",
+    "role": "modifier"
+   },
+   {
+    "name": "~28 nm",
+    "type": "Measurement",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA lattice",
+    "predicate": "is_composed_of"
+   },
+   {
+    "subject": "two-helix bundle",
+    "predicate": "has_geometric_pattern"
+   },
+   {
+    "subject": "two-helix bundle",
+    "predicate": "has_designed_length"
+   }
+  ]
+ },
+ "339a74c9-73c9-45a8-b9bb-08ac74e4957a": {
+  "entities": [
+   {
+    "name": "edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "adaptable mode",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "confined region",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "excessive bending",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "edges",
+    "predicate": "remain_within"
+   },
+   {
+    "subject": "edges",
+    "predicate": "does_not_exhibit"
+   },
+   {
+    "subject": "adaptable mode",
+    "predicate": "constrains"
+   }
+  ]
+ },
+ "541bc9a9-511d-4411-b669-b5c7f998573f": {
+  "entities": [
+   {
+    "name": "buckled edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "end-to-end distance",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "~18 nm",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "free energy calculations",
+    "type": "Method",
+    "role": "subject"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "buckled edges",
+    "predicate": "has_end_to_end_distance"
+   },
+   {
+    "subject": "buckled edges",
+    "predicate": "exists_in_state"
+   },
+   {
+    "subject": "free energy calculations",
+    "predicate": "predicts"
+   }
+  ]
+ },
+ "8ea530c8-c13e-4f14-8398-f21b5ebf53b1": {
+  "entities": [
+   {
+    "name": "buckling",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "edge",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "MD simulations",
+    "type": "Method",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "buckling",
+    "predicate": "occurs_in"
+   },
+   {
+    "subject": "buckling",
+    "predicate": "observed_consistently_across"
+   },
+   {
+    "subject": "MD simulations",
+    "predicate": "reproduces"
+   }
+  ]
+ },
+ "8fd5ab78-1499-41ed-a47f-156b5c6a6303": {
+  "entities": [
+   {
+    "name": "edge",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "snap buckling",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "extended state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "buckled state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "activation barrier",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "sufficient energy",
+    "type": "Condition",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "edge",
+    "predicate": "experiences"
+   },
+   {
+    "subject": "edge",
+    "predicate": "exists_in"
+   },
+   {
+    "subject": "edge",
+    "predicate": "exists_in"
+   },
+   {
+    "subject": "snap buckling",
+    "predicate": "requires_to_switch"
+   },
+   {
+    "subject": "sufficient energy",
+    "predicate": "overcomes"
+   }
+  ]
+ },
+ "51320d8d-b876-4032-850a-76bc34a625db": {
+  "entities": [
+   {
+    "name": "inadaptable state",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "edges",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "narrow distribution",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "buckled edge",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "stresses",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "localization of stresses",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "edges",
+    "predicate": "lie_in"
+   },
+   {
+    "subject": "buckled edge",
+    "predicate": "is_outlier_in"
+   },
+   {
+    "subject": "inadaptable state",
+    "predicate": "exhibits"
+   },
+   {
+    "subject": "buckled edge",
+    "predicate": "suggests"
+   }
+  ]
+ },
+ "8c235e16-8e1c-4cef-96e0-57ec5c78209f": {
+  "entities": [
+   {
+    "name": "chemical loading",
+    "type": "Condition",
+    "role": "subject"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "chemical loading",
+    "predicate": "is_sufficient_for_experiment"
+   }
+  ]
+ },
+ "41c31ecd-00b6-4ff5-9dd8-ffee9fda898d": {
+  "entities": [
+   {
+    "name": "strain map",
+    "type": "Measurement",
+    "role": "subject"
+   },
+   {
+    "name": "adaptable mode",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "uniform distribution",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "domain",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "strain map",
+    "predicate": "belongs_to"
+   },
+   {
+    "subject": "strain map",
+    "predicate": "has_distribution"
+   },
+   {
+    "subject": "strain map",
+    "predicate": "spans"
+   }
+  ]
+ },
+ "e6bc3453-19c3-49ca-9ef4-eda231ad3b99": {
+  "entities": [
+   {
+    "name": "structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "designs",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "structures",
+    "predicate": "conforms_to"
+   }
+  ]
+ },
+ "aa6dc7e5-483c-48f8-8ee1-279d37715351": {
+  "entities": [
+   {
+    "name": "edges",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "high strain",
+    "type": "Property",
+    "role": "modifier"
+   },
+   {
+    "name": "diagonal struts",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "rhombic group",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "geometry",
+    "type": "Property",
+    "role": "modifier"
+   },
+   {
+    "name": "experimental results",
+    "type": "Concept",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "edges",
+    "predicate": "exhibits"
+   },
+   {
+    "subject": "edges",
+    "predicate": "are_identified_as"
+   },
+   {
+    "subject": "diagonal struts",
+    "predicate": "belong_to"
+   },
+   {
+    "subject": "diagonal struts",
+    "predicate": "similar_in_geometry_to"
+   }
+  ]
+ },
+ "8078fcb5-0255-4063-a95b-d11dad390e2b": {
+  "entities": [
+   {
+    "name": "4HB edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "6HB edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "profile shape",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "bending energy cost",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "4HB edges",
+    "predicate": "changes_profile_shape"
+   },
+   {
+    "subject": "6HB edges",
+    "predicate": "changes_profile_shape"
+   },
+   {
+    "subject": "4HB edges",
+    "predicate": "has_higher_bending_energy_cost"
+   },
+   {
+    "subject": "6HB edges",
+    "predicate": "has_higher_bending_energy_cost"
+   },
+   {
+    "subject": "bending energy cost",
+    "predicate": "determines"
+   }
+  ]
+ },
+ "0c8e192b-271e-4158-9735-f1e4c1051d06": {
+  "entities": [
+   {
+    "name": "inadaptable mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "adaptable mode",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "strain",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "flexure",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "timestep",
+    "type": "Condition",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable mode",
+    "predicate": "exhibits_greater_strain_than"
+   },
+   {
+    "subject": "inadaptable mode",
+    "predicate": "exhibits_greater_flexure_than"
+   },
+   {
+    "subject": "strain",
+    "predicate": "compared_at_condition"
+   },
+   {
+    "subject": "flexure",
+    "predicate": "compared_at_condition"
+   }
+  ]
+ },
+ "b8ca6245-d2a6-4597-8611-e253827803fb": {
+  "entities": [
+   {
+    "name": "inadaptable free-energy peak",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "free-energy minima",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "state transitions",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "mechanical bistability",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "room temperature",
+    "type": "Condition",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable free-energy peak",
+    "predicate": "has_magnitude"
+   },
+   {
+    "subject": "inadaptable free-energy peak",
+    "predicate": "separates"
+   },
+   {
+    "subject": "inadaptable free-energy peak",
+    "predicate": "enables"
+   },
+   {
+    "subject": "state transitions",
+    "predicate": "unlocks"
+   },
+   {
+    "subject": "mechanical bistability",
+    "predicate": "occurs_at"
+   }
+  ]
+ },
+ "6e1f962a-bbcf-4144-b191-890632df3bcc": {
+  "entities": [
+   {
+    "name": "adaptable mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "free energy",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "steep-welled single minimum",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "two distinct minima",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "17 to 20 nm range",
+    "type": "Measurement",
+    "role": "modifier"
+   },
+   {
+    "name": "28 nm minimum",
+    "type": "Measurement",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "adaptable mode",
+    "predicate": "exhibits_free_energy_landscape"
+   },
+   {
+    "subject": "inadaptable state",
+    "predicate": "exhibits_free_energy_landscape"
+   },
+   {
+    "subject": "two distinct minima",
+    "predicate": "includes_first_minimum_spanning"
+   },
+   {
+    "subject": "two distinct minima",
+    "predicate": "includes_second_minimum_at"
+   }
+  ]
+ },
+ "0ef19eb5-34e1-4fb3-bd24-c247e83b3c89": {
+  "entities": [
+   {
+    "name": "non-frustrated state",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "frustrated state",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "strain",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "structure",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "specific location",
+    "type": "Location",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "non-frustrated state",
+    "predicate": "enables_homogeneous_strain_distribution_in"
+   },
+   {
+    "subject": "strain",
+    "predicate": "distributes_homogeneously_throughout"
+   },
+   {
+    "subject": "frustrated state",
+    "predicate": "concentrates_strain_at"
+   },
+   {
+    "subject": "strain",
+    "predicate": "concentrates_at"
+   }
+  ]
+ },
+ "6581738f-257a-4eea-8106-6e742791a99a": {
+  "entities": [
+   {
+    "name": "red rhombi",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "blue rhombi",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable mode",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "red diagonal edge",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "buckled state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "deformation",
+    "type": "Method",
+    "role": "modifier"
+   },
+   {
+    "name": "blue edge",
+    "type": "Concept",
+    "role": "subject"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "red rhombi",
+    "predicate": "distribution_diverges_from"
+   },
+   {
+    "subject": "red rhombi",
+    "predicate": "distribution_diverges_in"
+   },
+   {
+    "subject": "red diagonal edge",
+    "predicate": "trapped_into"
+   },
+   {
+    "subject": "red diagonal edge",
+    "predicate": "trapped_during"
+   },
+   {
+    "subject": "blue edge",
+    "predicate": "remains_extended_during"
+   }
+  ]
+ },
+ "49ca096d-2548-42b3-8955-ba0966a8c93b": {
+  "entities": [
+   {
+    "name": "exterior hexagons",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "extension",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "adaptable case",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "inadaptable case",
+    "type": "Concept",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "exterior hexagons",
+    "predicate": "primarily_under"
+   },
+   {
+    "subject": "exterior hexagons",
+    "predicate": "primarily_under_in"
+   },
+   {
+    "subject": "exterior hexagons",
+    "predicate": "primarily_under_in"
+   }
+  ]
+ },
+ "2e80a4b7-161b-4042-9058-51028d9ee5db": {
+  "entities": [
+   {
+    "name": "adaptable state",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable mode",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "symmetry",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "broken symmetry",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "adaptable state",
+    "predicate": "exhibits"
+   },
+   {
+    "subject": "inadaptable mode",
+    "predicate": "exhibits"
+   }
+  ]
+ },
+ "6c8b7d72-1d5b-46af-940e-32e791210daa": {
+  "entities": [
+   {
+    "name": "interior spokes",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "inadaptable state",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "compression",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "interior spokes",
+    "predicate": "most_likely_to_buckle_in"
+   },
+   {
+    "subject": "interior spokes",
+    "predicate": "are_under"
+   }
+  ]
+ },
+ "13d37efd-fc13-4088-9934-6b11c62485c9": {
+  "entities": [
+   {
+    "name": "edge",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "28 nm",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "4 nm",
+    "type": "Measurement",
+    "role": "object"
+   },
+   {
+    "name": "theoretical designs",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "2HB DNA",
+    "type": "Material",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "edge",
+    "predicate": "has_length"
+   },
+   {
+    "subject": "edge",
+    "predicate": "has_width"
+   },
+   {
+    "subject": "edge",
+    "predicate": "matches"
+   },
+   {
+    "subject": "edge",
+    "predicate": "corresponds_to_expectation_for"
+   }
+  ]
+ },
+ "6aad7932-1307-4cf2-8911-ed1ba3980282": {
+  "entities": [
+   {
+    "name": "free energy profile",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "2HB DNA edge",
+    "type": "Material",
+    "role": "object"
+   },
+   {
+    "name": "structure",
+    "type": "Material",
+    "role": "modifier"
+   },
+   {
+    "name": "deformation",
+    "type": "Concept",
+    "role": "subject"
+   },
+   {
+    "name": "free energy",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "edge",
+    "type": "Material",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "free energy profile",
+    "predicate": "is_similar_to"
+   },
+   {
+    "subject": "deformation",
+    "predicate": "does_not_affect"
+   },
+   {
+    "subject": "structure",
+    "predicate": "plays_minor_role_in_affecting"
+   }
+  ]
+ },
+ "cbe0464c-7619-45ec-b3ab-7911e3a1658b": {
+  "entities": [
+   {
+    "name": "structure",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "free solution",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "out-of-plane deformations",
+    "type": "Property",
+    "role": "object"
+   },
+   {
+    "name": "edges",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "weakest direction",
+    "type": "Property",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "structure",
+    "predicate": "exists_in"
+   },
+   {
+    "subject": "structure",
+    "predicate": "experiences"
+   },
+   {
+    "subject": "edges",
+    "predicate": "buckle_along"
+   }
+  ]
+ },
+ "d2bb69d9-2f2e-4bfd-b6ee-e82e76073fc4": {
+  "entities": [
+   {
+    "name": "inadaptable structure",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "stable mode",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "buckling",
+    "type": "Concept",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "inadaptable structure",
+    "predicate": "may_transition_between"
+   },
+   {
+    "subject": "inadaptable structure",
+    "predicate": "transitions_via"
+   }
+  ]
+ },
+ "6c1964ee-00c9-4d4b-9c68-535ec20d8c31": {
+  "entities": [
+   {
+    "name": "loading",
+    "type": "Condition",
+    "role": "modifier"
+   },
+   {
+    "name": "structures",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "initial configurations",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "structures",
+    "predicate": "spontaneously_return_to"
+   },
+   {
+    "subject": "loading",
+    "predicate": "removal_triggers_recovery_in"
+   }
+  ]
+ },
+ "d1c46285-e062-4de0-9825-4016e5af2d85": {
+  "entities": [
+   {
+    "name": "distribution of internal forces",
+    "type": "Property",
+    "role": "subject"
+   },
+   {
+    "name": "adaptable state",
+    "type": "Concept",
+    "role": "modifier"
+   },
+   {
+    "name": "internal forces",
+    "type": "Property",
+    "role": "modifier"
+   },
+   {
+    "name": "equal spread of forces",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "structure",
+    "type": "Material",
+    "role": "modifier"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "distribution of internal forces",
+    "predicate": "is_wider_in"
+   },
+   {
+    "subject": "distribution of internal forces",
+    "predicate": "implies"
+   },
+   {
+    "subject": "equal spread of forces",
+    "predicate": "distributed_throughout"
+   }
+  ]
+ },
+ "ef3af08e-dfe0-4b0d-841d-c39da55d2c47": {
+  "entities": [
+   {
+    "name": "DNA metastructure",
+    "type": "Material",
+    "role": "subject"
+   },
+   {
+    "name": "frustrated mechanical state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "non-frustrated mechanical state",
+    "type": "Concept",
+    "role": "object"
+   },
+   {
+    "name": "free energy profile",
+    "type": "Property",
+    "role": "object"
+   }
+  ],
+  "triples": [
+   {
+    "subject": "DNA metastructure",
+    "predicate": "can_adopt"
+   },
+   {
+    "subject": "DNA metastructure",
+    "predicate": "can_adopt"
+   },
+   {
+    "subject": "DNA metastructure",
+    "predicate": "is_precisely_controllable_to_adopt"
+   },
+   {
+    "subject": "DNA metastructure",
+    "predicate": "is_precisely_controllable_to_adopt"
+   },
+   {
+    "subject": "frustrated mechanical state",
+    "predicate": "characterized_by"
+   },
+   {
+    "subject": "non-frustrated mechanical state",
+    "predicate": "characterized_by"
+   }
+  ]
+ }
+}

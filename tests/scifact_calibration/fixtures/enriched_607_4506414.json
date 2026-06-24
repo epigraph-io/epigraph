@@ -1,0 +1,21 @@
+{
+  "scifact_id": 607,
+  "claim": "Increased diastolic blood pressure (DBP) is associated with abdominal aortic aneurysm.",
+  "evidence_sentences": [
+    "Compared with diastolic blood pressure, raised systolic blood pressure had a greater effect on angina, myocardial infarction, and peripheral arterial disease, whereas raised diastolic blood pressure had a greater effect on abdominal aortic aneurysm than did raised systolic pressure."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4506414",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "comparison of systolic vs diastolic blood pressure effects",
+      "multiple cardiovascular outcomes assessed"
+    ],
+    "evidence_type": "statistical"
+  }
+}

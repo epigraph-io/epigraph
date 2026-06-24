@@ -64,6 +64,14 @@ pub struct CalibrationConfig {
 
     /// Classifier decision thresholds (NEI, support, conflict).
     pub classifier_thresholds: ClassifierThresholds,
+
+    /// Split-conformal per-class nonconformity quantiles (issue: backlog
+    /// d5ba91a5). Optional: absent `[conformal]` parses to the default
+    /// (every quantile 1.0 -> include-always, i.e. the trivial coverage-1
+    /// set), so the set-valued classifier degrades to "return all classes"
+    /// rather than panicking when calibration.toml predates this feature.
+    #[serde(default)]
+    pub conformal: ConformalConfig,
 }
 
 /// Multiplicative locality factor for intra-source evidential BBAs.
@@ -94,6 +102,66 @@ pub struct ClassifierThresholds {
     pub has_opposing_threshold: f64,
 }
 
+/// Split-conformal calibration for set-valued classification.
+///
+/// `quantiles.<class>` is the calibrated nonconformity threshold q_c fit
+/// offline by `scripts/calibrate_conformal.py` over the labelled SciFact
+/// fixtures. The set-valued classifier includes class c iff its
+/// nonconformity score `score_c <= q_c`. With the conventional
+/// nonconformity score `score_c = 1 - BetP_c` (or `1 - theta` for NEI),
+/// this yields marginal (1 - alpha) coverage on the calibration
+/// distribution.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConformalConfig {
+    /// Target miscoverage rate the quantiles were fit at (informational;
+    /// the quantiles already encode it). 0.1 => 90% marginal coverage.
+    #[serde(default = "default_conformal_alpha")]
+    pub alpha: f64,
+    /// Per-class nonconformity quantiles q_c, keyed by the classifier's
+    /// label string (`supported` | `contradicted` | `not_enough_info`).
+    #[serde(default)]
+    pub quantiles: ConformalQuantiles,
+}
+
+/// Per-class conformal quantiles. Default 1.0 = include-always (trivial
+/// coverage-1 set), the safe degenerate value when `[conformal]` is absent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConformalQuantiles {
+    #[serde(default = "default_quantile")]
+    pub supported: f64,
+    #[serde(default = "default_quantile")]
+    pub contradicted: f64,
+    #[serde(default = "default_quantile")]
+    pub not_enough_info: f64,
+}
+
+fn default_conformal_alpha() -> f64 {
+    0.1
+}
+
+fn default_quantile() -> f64 {
+    1.0
+}
+
+impl Default for ConformalQuantiles {
+    fn default() -> Self {
+        Self {
+            supported: default_quantile(),
+            contradicted: default_quantile(),
+            not_enough_info: default_quantile(),
+        }
+    }
+}
+
+impl Default for ConformalConfig {
+    fn default() -> Self {
+        Self {
+            alpha: default_conformal_alpha(),
+            quantiles: ConformalQuantiles::default(),
+        }
+    }
+}
+
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl CalibrationConfig {
@@ -117,7 +185,40 @@ impl CalibrationConfig {
     /// Production hot-path callers should treat I/O failure as recoverable
     /// (e.g. `.ok().map(...).unwrap_or((defaults))`) rather than propagating —
     /// the engine has reasonable defaults for every locality / weight key.
+    ///
+    /// Backed by a process-wide cache (see [`Self::cached`]): `calibration.toml`
+    /// is read and parsed once, and this returns a clone — the previous per-call
+    /// `fs::read` + TOML parse on hot paths was backlog 03cb3167. On load
+    /// failure the cache holds [`Self::default_for_phase2_fallback`], so this
+    /// returns `Ok(default)` rather than `Err` — matching what every hot-path
+    /// caller already did via `.ok()` / `.unwrap_or_else(default)`.
     pub fn from_workspace_root() -> Result<Self, CalibrationError> {
+        Ok(Self::cached().clone())
+    }
+
+    /// Process-wide cached calibration config: `calibration.toml` is read and
+    /// parsed exactly once per process, then reused. Hot paths (belief queries,
+    /// edge factors, DS auto-wiring) hit this every request. On load failure
+    /// falls back to [`Self::default_for_phase2_fallback`].
+    ///
+    /// NOTE: changes to `calibration.toml` require a process restart to take
+    /// effect (this is a deploy-time config, not a runtime-tunable).
+    #[must_use]
+    pub fn cached() -> &'static Self {
+        static CACHED: std::sync::LazyLock<CalibrationConfig> = std::sync::LazyLock::new(|| {
+            CalibrationConfig::load_from_workspace_root_uncached()
+                .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback())
+        });
+        &CACHED
+    }
+
+    /// Uncached load: resolve `calibration.toml` (`CALIBRATION_PATH` env →
+    /// workspace root via `CARGO_MANIFEST_DIR` → cwd-relative fallback) and
+    /// parse it. Hot paths should use [`Self::cached`] / [`Self::from_workspace_root`].
+    ///
+    /// # Errors
+    /// Returns [`CalibrationError`] if the file cannot be read or parsed.
+    fn load_from_workspace_root_uncached() -> Result<Self, CalibrationError> {
         let path = if let Ok(explicit) = std::env::var("CALIBRATION_PATH") {
             std::path::PathBuf::from(explicit)
         } else if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
@@ -260,6 +361,7 @@ impl CalibrationConfig {
                 conflict_threshold: 0.05,
                 has_opposing_threshold: 0.1,
             },
+            conformal: ConformalConfig::default(),
         }
     }
 
@@ -310,6 +412,37 @@ mod tests {
             (config.evidence_locality.intra_evidence_locality_factor - 0.3).abs() < 1e-9,
             "intra_evidence_locality_factor = {}",
             config.evidence_locality.intra_evidence_locality_factor
+        );
+    }
+
+    #[test]
+    fn cached_returns_stable_singleton_with_loaded_values() {
+        // Hot paths (belief queries, edge factors, DS auto-wiring) call the
+        // workspace-root accessor per request; it must parse calibration.toml
+        // once and reuse it, not read+parse on every call (backlog 03cb3167).
+        let a = CalibrationConfig::cached();
+        let b = CalibrationConfig::cached();
+        assert!(
+            std::ptr::eq(a, b),
+            "cached() must return the same process-wide instance (parsed once)"
+        );
+        assert!(
+            (a.default_journal_reliability - 0.78).abs() < f64::EPSILON,
+            "cached() should carry loaded calibration.toml values (0.78), got {}",
+            a.default_journal_reliability
+        );
+    }
+
+    #[test]
+    fn from_workspace_root_matches_cached() {
+        // from_workspace_root now delegates to the cache; it must still return
+        // the loaded values (Ok) so existing callers are unaffected.
+        let owned = CalibrationConfig::from_workspace_root().expect("loads");
+        assert!(
+            (owned.default_journal_reliability
+                - CalibrationConfig::cached().default_journal_reliability)
+                .abs()
+                < f64::EPSILON
         );
     }
 

@@ -19,8 +19,14 @@ pub struct GraphQueryRequest {
 #[cfg(feature = "db")]
 pub async fn execute_graph_query(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<GraphQueryRequest>,
 ) -> Result<Json<FullGraphResponse>, ApiError> {
+    // SECURITY (A3): redact on the authenticated requester, not request.agent_id.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+
     // 1. Parse GQL
     let ast: GqlQuery = parse_gql(&request.query).map_err(|e| ApiError::ValidationError {
         field: "query".to_string(),
@@ -230,7 +236,7 @@ pub async fn execute_graph_query(
         }
 
         let mut resp = super::graph_query_utils::load_subgraph(pool, node_ids).await?;
-        apply_partition_filter(pool, &mut resp, request.agent_id).await;
+        apply_partition_filter(pool, &mut resp, requester).await;
         Ok(resp)
     } else {
         let sql = format!(
@@ -273,7 +279,7 @@ pub async fn execute_graph_query(
         }
 
         let mut resp = super::graph_query_utils::load_subgraph(pool, node_ids).await?;
-        apply_partition_filter(pool, &mut resp, request.agent_id).await;
+        apply_partition_filter(pool, &mut resp, requester).await;
         Ok(resp)
     }
 }

@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1031,
+  "claim": "Reduction of Rpl38 alters the composition of the Hox gene mRNAs translation in mice without lowering overall protein synthesis.",
+  "evidence_sentences": [
+    "In Rpl38 mutant embryos, global protein synthesis is unchanged; however the translation of a select subset of Homeobox mRNAs is perturbed."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "12486491",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "Rpl38 mutant embryos"
+    ],
+    "evidence_type": "empirical"
+  }
+}

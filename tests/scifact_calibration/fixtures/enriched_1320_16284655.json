@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1320,
+  "claim": "Transplanted human glial progenitor cells are incapable of forming a neural network with host animals' neurons.",
+  "evidence_sentences": [
+    "Long-term potentiation (LTP) was sharply enhanced in the human glial chimeric mice, as was their learning, as assessed by Barnes maze navigation, object-location memory, and both contextual and tone fear conditioning."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "16284655",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": false,
+    "instruments_used": [
+      "Barnes maze"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "human glial chimeric mice",
+      "long-term potentiation measurement",
+      "object-location memory test",
+      "contextual fear conditioning",
+      "tone fear conditioning"
+    ],
+    "evidence_type": "empirical"
+  }
+}

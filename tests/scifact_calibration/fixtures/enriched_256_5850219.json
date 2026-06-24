@@ -1,0 +1,20 @@
+{
+  "scifact_id": 256,
+  "claim": "Chlamydia trachomatis is most prevalent in the UK among sexually-experienced individuals aged 16 to 24.",
+  "evidence_sentences": [
+    "Prevalences in individuals aged 16-24 years were 3\u00b71% (2\u00b72-4\u00b73) in women and 2\u00b73% (1\u00b75-3\u00b74) in men."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5850219",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.45,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "individuals aged 16-24 years"
+    ],
+    "evidence_type": "statistical"
+  }
+}

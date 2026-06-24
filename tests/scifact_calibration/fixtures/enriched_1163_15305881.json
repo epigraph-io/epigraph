@@ -1,0 +1,25 @@
+{
+  "scifact_id": 1163,
+  "claim": "The DdrB protein from Deinococcus radiodurans is an alternative SSB.",
+  "evidence_sentences": [
+    "Unexpectedly, the crystal structure reveals that DdrB comprises a novel fold that is structurally and topologically distinct from all other single-stranded binding (SSB) proteins characterized to date."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "15305881",
+  "enrichment": {
+    "methodology": "deductive_logic",
+    "confidence": 0.82,
+    "supports_claim": true,
+    "instruments_used": [
+      "X-ray crystallography"
+    ],
+    "reagents_involved": [
+      "DdrB protein"
+    ],
+    "conditions": [
+      "crystal structure determination"
+    ],
+    "evidence_type": "empirical",
+    "tier3_enriched": true
+  }
+}

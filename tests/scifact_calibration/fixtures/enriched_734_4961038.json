@@ -1,0 +1,24 @@
+{
+  "scifact_id": 734,
+  "claim": "MEK inhibitors are effective treatments in RAS-driven mouse models of cancer.",
+  "evidence_sentences": [
+    "However, when NVP-BEZ235 was combined with a mitogen-activated protein kinase kinase (MEK) inhibitor, ARRY-142886, there was marked synergy in shrinking these Kras-mutant cancers."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4961038",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.45,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "NVP-BEZ235",
+      "ARRY-142886"
+    ],
+    "conditions": [
+      "Kras-mutant cancers",
+      "combination therapy"
+    ],
+    "evidence_type": "empirical"
+  }
+}

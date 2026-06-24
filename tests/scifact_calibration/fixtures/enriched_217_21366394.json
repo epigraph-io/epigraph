@@ -1,0 +1,25 @@
+{
+  "scifact_id": 217,
+  "claim": "CX3CR1 on the Th2 cells promotes T cell survival",
+  "evidence_sentences": [
+    "We found that CX3CR1 signaling promoted T(H)2 survival in the inflamed lungs, and injection of B cell leukemia/lymphoma-2 protein (BCl-2)-transduced CX3CR1-deficient T(H)2 cells into CX3CR1-deficient mice restored asthma."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "21366394",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "BCl-2 protein",
+      "CX3CR1-deficient T(H)2 cells"
+    ],
+    "conditions": [
+      "inflamed lungs",
+      "CX3CR1-deficient mice",
+      "BCl-2-transduced CX3CR1-deficient T(H)2 cell injection"
+    ],
+    "evidence_type": "empirical"
+  }
+}

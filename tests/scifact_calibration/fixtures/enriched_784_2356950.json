@@ -1,0 +1,25 @@
+{
+  "scifact_id": 784,
+  "claim": "MicroRNA is involved in the regulation of Neural Stem Cell (NSC) differentiation and proliferation dynamic homeostasis",
+  "evidence_sentences": [
+    "High levels of miR-184 promoted proliferation but inhibited differentiation of aNSCs, whereas inhibition of miR-184 rescued the phenotypes associated with MBD1 deficiency."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2356950",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "miR-184",
+      "MBD1"
+    ],
+    "conditions": [
+      "high levels of miR-184",
+      "inhibition of miR-184",
+      "MBD1 deficiency"
+    ],
+    "evidence_type": "empirical"
+  }
+}

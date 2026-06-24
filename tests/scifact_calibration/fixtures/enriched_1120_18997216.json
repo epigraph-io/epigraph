@@ -1,0 +1,25 @@
+{
+  "scifact_id": 1120,
+  "claim": "Sympathetic nerve activity is reduced throughout normal pregnancy.",
+  "evidence_sentences": [
+    "Muscle sympathetic nerve activity is increased during normotensive pregnancy while mean arterial pressure is maintained or reduced, suggesting baroreflex resetting.",
+    "Pregnant women had elevated baseline sympathetic burst incidence (43 \u00b1 2 vs. 33 \u00b1 2 bursts/100 heart beats, P = 0.01) and total sympathetic activity (1,811 \u00b1 148 vs. 1,140 \u00b1 55 au, P < 0.01) relative to controls."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "18997216",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [
+      "microneurography"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "normotensive pregnancy",
+      "baseline sympathetic burst incidence measurement",
+      "total sympathetic activity measurement"
+    ],
+    "evidence_type": "empirical"
+  }
+}

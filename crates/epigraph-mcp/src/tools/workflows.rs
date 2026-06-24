@@ -7,7 +7,7 @@ use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto;
 use crate::types::*;
 
-use epigraph_core::{AgentId, Claim, Evidence, EvidenceType, TruthValue};
+use epigraph_core::{AgentId, Claim, ClaimId, Evidence, EvidenceType, TruthValue};
 use epigraph_crypto::ContentHasher;
 use epigraph_db::{
     BehavioralExecutionRepository, ClaimRepository, EdgeRepository, EvidenceRepository,
@@ -32,6 +32,230 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
+}
+
+/// Read-only window into a workflow's recent behavioral executions, newest
+/// first: per-run `success`, `quality`, `tool_pattern`, `deviation_count`, and
+/// `step_beliefs` (per-step `deviation_reason`), plus a `window_success_rate`.
+/// This is the telemetry the workflow-evolution proposer reads before
+/// proposing a variant; an invalid `workflow_id` errors rather than returning
+/// an empty set (which would read as "no runs" and mislead the proposer).
+pub async fn get_workflow_executions(
+    server: &EpiGraphMcpFull,
+    params: GetWorkflowExecutionsParams,
+) -> Result<CallToolResult, McpError> {
+    let workflow_id = parse_uuid(params.workflow_id.trim())?;
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+
+    let rows = BehavioralExecutionRepository::recent_executions(&server.pool, workflow_id, limit)
+        .await
+        .map_err(internal_error)?;
+
+    let returned = rows.len();
+    let successes = rows.iter().filter(|r| r.success).count();
+    let window_success_rate = if returned > 0 {
+        successes as f64 / returned as f64
+    } else {
+        0.0
+    };
+    let executions: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "goal_text": r.goal_text,
+                "success": r.success,
+                "quality": r.quality,
+                "deviation_count": r.deviation_count,
+                "total_steps": r.total_steps,
+                "tool_pattern": r.tool_pattern,
+                "step_beliefs": r.step_beliefs,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+
+    success_json(&serde_json::json!({
+        "workflow_id": workflow_id,
+        "returned": returned,
+        "window_success_rate": window_success_rate,
+        "executions": executions,
+    }))
+}
+
+/// Evaluate whether a workflow variant is statistically ready to be promoted
+/// over its immediate (`variant_of`) parent — the autonomous-statistical-gate
+/// verdict the workflow-evolution maintenance pass consumes. Resolves the
+/// parent, compares both sides over the SAME execution window with the Wilson
+/// lower-bound gate, and returns the verdict. READ-ONLY: it decides, it does
+/// not promote (applying a promotion is a separate, deliberate step).
+pub async fn evaluate_workflow_promotion(
+    server: &EpiGraphMcpFull,
+    params: EvaluateWorkflowPromotionParams,
+) -> Result<CallToolResult, McpError> {
+    let variant_id = parse_uuid(params.workflow_id.trim())?;
+    let window = params.window.unwrap_or(50).clamp(1, 500);
+    let assessment = assess_workflow_promotion(server, variant_id, window).await?;
+    success_json(&assessment.to_json())
+}
+
+/// One workflow variant's promotion assessment: its parent (if any), both
+/// sides' counts over the same window, and the gate verdict. Shared by the
+/// read-only `evaluate_workflow_promotion` tool and the write-side
+/// `refresh_workflow_promotion` pass so both compute the verdict identically.
+struct PromotionAssessment {
+    variant_id: uuid::Uuid,
+    parent_id: Option<uuid::Uuid>,
+    window: i64,
+    min_executions: i64,
+    variant: (i64, i64),
+    parent: (i64, i64),
+    /// `None` exactly when the workflow has no parent (a lineage root).
+    verdict: Option<epigraph_engine::workflow_promotion::WorkflowPromotionVerdict>,
+}
+
+impl PromotionAssessment {
+    fn parent_rate(&self) -> f64 {
+        let (s, t) = self.parent;
+        if t <= 0 {
+            0.0
+        } else {
+            s as f64 / t as f64
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match &self.verdict {
+            None => serde_json::json!({
+                "workflow_id": self.variant_id,
+                "parent_id": serde_json::Value::Null,
+                "promotable": false,
+                "reason": "workflow has no variant_of/supersedes parent (it is a lineage root); nothing to promote over",
+            }),
+            Some(v) => serde_json::json!({
+                "workflow_id": self.variant_id,
+                "parent_id": self.parent_id,
+                "window": self.window,
+                "min_executions": self.min_executions,
+                "variant": { "successes": self.variant.0, "total": self.variant.1 },
+                "parent": { "successes": self.parent.0, "total": self.parent.1, "success_rate": self.parent_rate() },
+                "promotable": v.promotable,
+                "variant_lower_bound": v.variant_lower_bound,
+                "parent_rate": v.parent_rate,
+                "reason": v.reason,
+            }),
+        }
+    }
+}
+
+/// Resolve the variant's immediate parent, pull both sides' (successes, total)
+/// over the SAME window (mixing windows would be apples-to-oranges), and apply
+/// the Wilson gate. A lineage root yields `verdict: None`.
+async fn assess_workflow_promotion(
+    server: &EpiGraphMcpFull,
+    variant_id: uuid::Uuid,
+    window: i64,
+) -> Result<PromotionAssessment, McpError> {
+    use epigraph_engine::workflow_promotion::{
+        evaluate_workflow_promotion as gate, WorkflowPromotionConfig, WorkflowSampleStats,
+    };
+    let config = WorkflowPromotionConfig::default();
+
+    let parent_id = WorkflowRepository::immediate_variant_parent(&server.pool, variant_id)
+        .await
+        .map_err(|e| internal_error(e.to_string()))?;
+
+    let variant = BehavioralExecutionRepository::success_stats(&server.pool, variant_id, window)
+        .await
+        .map_err(internal_error)?;
+
+    let (parent, verdict) = match parent_id {
+        None => ((0, 0), None),
+        Some(pid) => {
+            let parent = BehavioralExecutionRepository::success_stats(&server.pool, pid, window)
+                .await
+                .map_err(internal_error)?;
+            let parent_rate = if parent.1 <= 0 {
+                0.0
+            } else {
+                parent.0 as f64 / parent.1 as f64
+            };
+            let v = gate(
+                &WorkflowSampleStats {
+                    successes: variant.0,
+                    total: variant.1,
+                },
+                parent_rate,
+                &config,
+            );
+            (parent, Some(v))
+        }
+    };
+
+    Ok(PromotionAssessment {
+        variant_id,
+        parent_id,
+        window,
+        min_executions: config.min_executions,
+        variant,
+        parent,
+        verdict,
+    })
+}
+
+/// Apply layer (additive promotable flag). Re-evaluate a workflow variant's
+/// promotion verdict and write it to the variant claim's
+/// `properties.promotion`, OVERWRITING any prior value. This is bidirectional
+/// by construction: a variant that has regressed below threshold gets
+/// `promotable: false` on the next run rather than keeping a stale `true`. A
+/// lineage root (no parent) is left untouched. The maintenance pass / scheduled
+/// job calls this per candidate variant; `find_workflow` surfaces the flag.
+pub async fn refresh_workflow_promotion(
+    server: &EpiGraphMcpFull,
+    params: EvaluateWorkflowPromotionParams,
+) -> Result<CallToolResult, McpError> {
+    let variant_id = parse_uuid(params.workflow_id.trim())?;
+    let window = params.window.unwrap_or(50).clamp(1, 500);
+    let assessment = assess_workflow_promotion(server, variant_id, window).await?;
+
+    let Some(verdict) = &assessment.verdict else {
+        return success_json(&serde_json::json!({
+            "workflow_id": variant_id,
+            "refreshed": false,
+            "reason": "lineage root (no variant_of parent); nothing to promote over",
+        }));
+    };
+
+    // Overwrite properties.promotion with the CURRENT verdict (provenance for
+    // audit + demotion). Overwriting — not a write-once set — is what keeps the
+    // flag honest as more executions accrue.
+    let promotion = serde_json::json!({
+        "promotion": {
+            "promotable": verdict.promotable,
+            "lower_bound": verdict.variant_lower_bound,
+            "parent_rate": verdict.parent_rate,
+            "parent_id": assessment.parent_id,
+            "n": assessment.variant.1,
+            "evaluated_at": chrono::Utc::now().to_rfc3339(),
+        }
+    });
+    ClaimRepository::merge_properties(
+        &server.pool,
+        epigraph_core::ClaimId::from_uuid(variant_id),
+        &promotion,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    success_json(&serde_json::json!({
+        "workflow_id": variant_id,
+        "parent_id": assessment.parent_id,
+        "refreshed": true,
+        "promotable": verdict.promotable,
+        "variant_lower_bound": verdict.variant_lower_bound,
+        "parent_rate": verdict.parent_rate,
+        "reason": verdict.reason,
+    }))
 }
 
 fn parse_workflow_content(content: &str) -> (String, Vec<String>, Vec<String>, Option<String>) {
@@ -151,6 +375,24 @@ pub async fn store_workflow(
         let _ = server.embedder.embed_and_store(*claim_id, content).await;
     }
 
+    // Also embed the workflow goal into workflows.goal_embedding for
+    // embedding-first find_workflow_hierarchical. Omitted from the original
+    // store_workflow; do_ingest_workflow embeds it correctly.
+    if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
+        match server.embedder.generate(&params.goal).await {
+            Ok(qvec) => {
+                if let Err(e) =
+                    WorkflowRepository::set_goal_embedding(&server.pool, wf_id, &qvec).await
+                {
+                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
+            }
+        }
+    }
+
     success_json(&StoreWorkflowResponse {
         workflow_id: response.workflow_id,
         canonical_name: response.canonical_name,
@@ -166,13 +408,11 @@ pub async fn find_workflow(
     server: &EpiGraphMcpFull,
     params: FindWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
-    let limit = params.limit.unwrap_or(5).clamp(1, 20);
-    let min_truth = params.min_truth.unwrap_or(0.3);
-
     // Generate embedding once — reused for both semantic search and behavioral
     // affinity. Failure here is non-fatal: we still want the ILIKE fallback to
-    // run (workflows commonly lack evidence embeddings, and offline embedders
-    // shouldn't blank the whole tool).
+    // run (offline embedders shouldn't blank the whole tool). The post-embed
+    // pipeline (extracted to mirror recall.rs's recall_with_context split) lets
+    // integration tests skip the OpenAI embedder via `__test_only`.
     let pgvec_opt = match server.embedder.generate(&params.goal).await {
         Ok(v) => Some(format_pgvector(&v)),
         Err(e) => {
@@ -181,11 +421,38 @@ pub async fn find_workflow(
         }
     };
 
-    // Semantic search via evidence embeddings (only when embedding is available).
+    find_workflow_post_embed(server, &params, pgvec_opt).await
+}
+
+/// Post-embedding pipeline: shared by `find_workflow` and the
+/// `__test_only::find_workflow_with_pgvec` entry point that lets integration
+/// tests skip the OpenAI embedder (no API key available in CI / sandbox).
+///
+/// Recomputes `limit`/`min_truth` from `params` internally (rather than taking
+/// them as args) so the public wrapper stays minimal and the two extraction
+/// sites cannot drift, mirroring recall.rs's wrapper pattern.
+async fn find_workflow_post_embed(
+    server: &EpiGraphMcpFull,
+    params: &FindWorkflowParams,
+    pgvec_opt: Option<String>,
+) -> Result<CallToolResult, McpError> {
+    let limit = params.limit.unwrap_or(5).clamp(1, 20);
+    let min_truth = params.min_truth.unwrap_or(0.3);
+
+    // Semantic search over claims.embedding (workflow vectors live on claims,
+    // not evidence; evidence.embedding is 100% empty in prod). Scoped to the
+    // "workflow" label so only workflow claims compete for the budget.
+    let workflow_tag = vec!["workflow".to_string()];
     let semantic_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
-        epigraph_db::EvidenceRepository::search_by_embedding(&server.pool, pgvec, limit * 3)
-            .await
-            .map_err(internal_error)?
+        ClaimRepository::search_by_embedding_scoped(
+            &server.pool,
+            pgvec,
+            limit * 3,
+            Some(&workflow_tag),
+            None,
+        )
+        .await
+        .map_err(internal_error)?
     } else {
         Vec::new()
     };
@@ -360,6 +627,12 @@ async fn enrich_workflow_result(
         None
     };
 
+    // Promotion flag set by the refresh_workflow_promotion maintenance pass.
+    // Advisory metadata; best-effort (a lookup failure must not drop the result).
+    let promotable = ClaimRepository::promotion_flag(pool, ClaimId::from_uuid(workflow_id))
+        .await
+        .unwrap_or(None);
+
     Some(FindWorkflowResult {
         workflow_id: workflow_id.to_string(),
         goal,
@@ -373,6 +646,7 @@ async fn enrich_workflow_result(
         behavioral_affinity,
         behavioral_success_rate,
         behavioral_execution_count,
+        promotable,
     })
 }
 
@@ -594,14 +868,14 @@ pub async fn deprecate_workflow(
 
     let mut deprecated_ids = Vec::new();
 
-    // Deprecate the target workflow (A4: also set is_current = false)
-    sqlx::query(
-        "UPDATE claims SET truth_value = 0.05, is_current = false, updated_at = NOW() WHERE id = $1",
-    )
-    .bind(workflow_id)
-    .execute(&server.pool)
-    .await
-    .map_err(internal_error)?;
+    // Deprecate the target workflow (A4: also set is_current = false).
+    // ClaimRepository::deprecate_claim ALSO nulls the embedding in the same
+    // statement — required by CLAUDE.md "Embedding policy → Cleanup paths"
+    // so the deprecated workflow drops out of semantic recall and does not
+    // inflate the `stale_present` audit count.
+    ClaimRepository::deprecate_claim(&server.pool, epigraph_core::ClaimId::from_uuid(workflow_id))
+        .await
+        .map_err(internal_error)?;
     // Cascade onto the hierarchical `workflows` row (no-op when this
     // workflow has only a flat-claim representation). Without this,
     // `find_workflow_hierarchical` keeps returning the deprecated row.
@@ -645,11 +919,10 @@ pub async fn deprecate_workflow(
                     continue;
                 }
 
-                sqlx::query(
-                    "UPDATE claims SET truth_value = 0.05, is_current = false, updated_at = NOW() WHERE id = $1",
+                ClaimRepository::deprecate_claim(
+                    &server.pool,
+                    epigraph_core::ClaimId::from_uuid(child_id),
                 )
-                .bind(child_id)
-                .execute(&server.pool)
                 .await
                 .map_err(internal_error)?;
                 // Mirror onto the hierarchical row, if any.
@@ -666,4 +939,24 @@ pub async fn deprecate_workflow(
         deprecated_ids,
         reason: params.reason,
     })
+}
+
+#[doc(hidden)]
+pub mod __test_only {
+    use super::{find_workflow_post_embed, EpiGraphMcpFull, FindWorkflowParams, McpError};
+    use rmcp::model::CallToolResult;
+
+    /// Integration-test entry point that skips the OpenAI embedder.
+    ///
+    /// Tests cannot call the real embedder (no API key in CI / sandbox),
+    /// so they pre-format a known pgvector literal and dispatch directly
+    /// into the post-embed pipeline. This is the same code that
+    /// `find_workflow` runs after `embedder.generate`.
+    pub async fn find_workflow_with_pgvec(
+        server: &EpiGraphMcpFull,
+        params: FindWorkflowParams,
+        pgvec: Option<String>,
+    ) -> Result<CallToolResult, McpError> {
+        find_workflow_post_embed(server, &params, pgvec).await
+    }
 }

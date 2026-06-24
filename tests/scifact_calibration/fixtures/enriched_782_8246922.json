@@ -1,0 +1,25 @@
+{
+  "scifact_id": 782,
+  "claim": "Mice without IFN-\u03b3 or its receptor are highly susceptible to EAM induced with \u03b1-MyHC/CFA.",
+  "evidence_sentences": [
+    "Lack of IFN-gamma due to either depletion with an antibody or a genetic deficiency exacerbated myocarditis.",
+    "In contrast, IFN-gamma plays a protective role."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "8246922",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "IFN-gamma",
+      "anti-IFN-gamma antibody"
+    ],
+    "conditions": [
+      "IFN-gamma depletion via antibody",
+      "IFN-gamma genetic deficiency"
+    ],
+    "evidence_type": "empirical"
+  }
+}

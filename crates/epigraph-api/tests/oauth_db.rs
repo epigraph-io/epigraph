@@ -39,6 +39,7 @@ fn config() -> ApiConfig {
     ApiConfig {
         require_signatures: false,
         max_request_size: 1024 * 1024,
+        public_base_url: "http://localhost:8080".to_string(),
     }
 }
 
@@ -64,6 +65,8 @@ fn google_cfg(jwks_url: &str, auto_provision: bool, env_suffix: &str) -> Provide
         redirect_uri_env: None,
         auto_provision,
         default_scopes: vec!["claims:read".into(), "claims:write".into()],
+        allowed_emails: vec![],
+        allowed_domains: vec![],
     }
 }
 

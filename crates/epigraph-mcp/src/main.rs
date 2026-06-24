@@ -81,6 +81,11 @@ struct Cli {
     /// Start in read-only mode (query tools only, write operations return errors)
     #[arg(long)]
     read_only: bool,
+
+    /// Absolute URL of the protected-resource metadata document, advertised in 401
+    /// WWW-Authenticate challenges so MCP clients can discover the auth server.
+    #[arg(long, env = "EPIGRAPH_RESOURCE_METADATA_URL")]
+    resource_metadata_url: Option<String>,
 }
 
 #[tokio::main]
@@ -102,15 +107,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // auth (e.g., a unix-socket listener behind filesystem permissions).
     if cli.listen.is_some() {
         match (cli.jwt_secret.as_deref(), cli.allow_unauthenticated_http) {
-            (Some(secret), false) if secret.len() < 32 => {
-                eprintln!(
-                    "ERROR: --jwt-secret must be at least 32 bytes (got {}).",
-                    secret.len()
-                );
-                std::process::exit(1);
+            (Some(secret), false) => {
+                if let Err(reason) = epigraph_auth::assert_production_secret(secret.as_bytes()) {
+                    eprintln!("ERROR: --jwt-secret rejected: {reason}");
+                    std::process::exit(1);
+                }
+                // authenticated path
             }
-            (Some(_), false) => {} // authenticated path
-            (None, true) => {}     // operator-acknowledged unauthenticated path
+            (None, true) => {} // operator-acknowledged unauthenticated path
             (Some(_), true) => {
                 eprintln!(
                     "ERROR: --jwt-secret and --allow-unauthenticated-http are mutually exclusive."
@@ -125,6 +129,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 std::process::exit(1);
             }
+        }
+    }
+
+    // Fail fast on a malformed --resource-metadata-url. The value is interpolated
+    // into the 401 WWW-Authenticate challenge (an HTTP header), which rejects
+    // control chars / non-ASCII. Validating here surfaces an operator typo at boot
+    // instead of letting it fail to attach the header on every 401.
+    if let Some(url) = cli.resource_metadata_url.as_deref() {
+        if let Err(reason) = epigraph_mcp::auth::validate_resource_metadata_url(url) {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
         }
     }
 
@@ -162,12 +177,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create embedder
     let embedder = McpEmbedder::new(pool.clone(), cli.openai_api_key);
 
-    let mode = if cli.read_only {
-        "read-only (33 tools)"
-    } else {
-        "full (58 tools)"
-    };
-    tracing::info!("EpiGraph MCP server running in {mode} mode");
+    let tool_count = EpiGraphMcpFull::all_tools_json()
+        .as_array()
+        .map_or(0, Vec::len);
+    let mode = if cli.read_only { "read-only" } else { "full" };
+    tracing::info!("EpiGraph MCP server running in {mode} ({tool_count} tools) mode");
 
     if let Some(addr) = &cli.listen {
         // ── HTTP transport (TCP or Unix socket) ────────────────────────
@@ -202,10 +216,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let state = McpAuthState {
                 jwt_config: Arc::new(JwtConfig::from_secret(secret.as_bytes())),
+                resource_metadata_url: cli.resource_metadata_url.clone(),
             };
             router.layer(axum::middleware::from_fn_with_state(
                 state,
                 bearer_auth_middleware,
+            ))
+        } else if cli.allow_unauthenticated_http {
+            // Operator opted out of Bearer auth (e.g. unix-socket listener
+            // behind filesystem perms). Inject a permissive AuthContext so the
+            // per-tool scope gate passes — without it every tool 403s on a
+            // missing auth context, making the flag misleading (bug be2a3391).
+            router.layer(axum::middleware::from_fn(
+                epigraph_mcp::auth::inject_unauthenticated_context,
             ))
         } else {
             router

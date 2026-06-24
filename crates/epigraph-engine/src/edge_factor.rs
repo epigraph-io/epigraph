@@ -709,6 +709,46 @@ async fn recompute_combined_belief(
     )
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
+
+    // CDST classification — a verdict on the COMBINED belief via the
+    // deterministic BetP 7-rule cascade. Defined only on the canonical binary
+    // {TRUE, FALSE} frame (supported = idx 0, contradicted = idx 1); other
+    // frames write the frame-agnostic belief scalars above but leave
+    // `claims.classification` untouched. Thresholds come from `calibration`
+    // (operator-tunable, same load as the discount path).
+    if frame.id == BINARY_FRAME_NAME {
+        let thresholds = &calibration.classifier_thresholds;
+        // theta = closed-world full-frame ignorance m({0,1}); the open-world
+        // missing mass is excluded (Smets TBM), matching the legacy
+        // `compute_betp` the cascade was calibrated against. `betp` (above) is
+        // pignistic(idx 0) = betp_supported.
+        let theta = combined.mass_of(&FocalElement::positive(BTreeSet::from([0_usize, 1_usize])));
+        let betp_unsup = measures::pignistic_probability(&combined, 1);
+        // has_opposing: does any single source BBA lean toward contradiction?
+        // Post-#197 a `refutes`/`contradicts` edge auto-wires a Negative-leaning
+        // BBA on the target, so edge-borne AND directly-submitted opposition both
+        // surface here as a per-BBA betp_unsup — this replaces (and subsumes) the
+        // legacy CONTRADICTS-edge query, which only saw edge-borne opposition.
+        let has_opposing = all_rows.iter().any(|row| {
+            parse_stored_bba(frame, &row.masses)
+                .map(|bba| {
+                    measures::pignistic_probability(&bba, 1) > thresholds.has_opposing_threshold
+                })
+                .unwrap_or(false)
+        });
+        let label = crate::classifier::classify(
+            conflict,
+            theta,
+            betp,
+            betp_unsup,
+            has_opposing,
+            thresholds,
+        );
+        MassFunctionRepository::update_claim_classification(pool, claim_id, &label.to_string())
+            .await
+            .map_err(|e| format!("update_claim_classification: {e}"))?;
+    }
+
     Ok(())
 }
 

@@ -1,0 +1,28 @@
+{
+  "scifact_id": 568,
+  "claim": "In a naive state, blocking Wingless-Int-1 secretion from mouse embryonic stem cells inhibits self-renewal of the mouse embryonic stem cells.",
+  "evidence_sentences": [
+    "We show here that paracrine and autocrine Wnt signals are essential self-renewal factors for ESCs, and are required to inhibit their differentiation into EpiSCs.",
+    "Moreover, we find that Wnt proteins in combination with the cytokine LIF are sufficient to support ESC self-renewal in the absence of any undefined factors, and support the derivation of new ESC lines, including ones from non-permissive mouse strains.",
+    "Our results not only demonstrate that Wnt signals regulate the naive-to-primed pluripotency transition, but also identify Wnt as an essential and limiting ESC self-renewal factor."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "23418635",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Wnt proteins",
+      "LIF (leukemia inhibitory factor)"
+    ],
+    "conditions": [
+      "paracrine and autocrine Wnt signaling",
+      "naive pluripotent state",
+      "absence of undefined factors",
+      "non-permissive mouse strains"
+    ],
+    "evidence_type": "empirical"
+  }
+}

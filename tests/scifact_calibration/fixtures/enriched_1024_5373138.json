@@ -1,0 +1,18 @@
+{
+  "scifact_id": 1024,
+  "claim": "Recurrent mutations occur frequently within CTCF anchor sites adjacent to oncogenes.",
+  "evidence_sentences": [
+    "The CTCF anchor regions we identified are conserved across species, influence gene expression, and are a frequent site of mutations in cancer cells, underscoring their functional importance in cellular regulation."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5373138",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.65,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical"
+  }
+}

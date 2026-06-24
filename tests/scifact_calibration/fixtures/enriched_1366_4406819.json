@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1366,
+  "claim": "VgrG (Tssl) protein punctures membranes by forming a spike at the tip of the tube apparatus.",
+  "evidence_sentences": [
+    "The T6SS organelle is functionally analogous to contractile tails of bacteriophages and is thought to attack cells by initially penetrating them with a trimeric protein complex called the VgrG spike.",
+    "Here we report that proteins from the PAAR (proline-alanine-alanine-arginine) repeat superfamily form a sharp conical extension on the VgrG spike, which is further involved in attaching effector domains to the spike."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4406819",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.7,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial",
+    "tier2_enriched": true
+  }
+}

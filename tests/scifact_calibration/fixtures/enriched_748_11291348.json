@@ -1,0 +1,23 @@
+{
+  "scifact_id": 748,
+  "claim": "MafA ubiquitination increases the recruitment of coavtivator P/CAF by MafA.",
+  "evidence_sentences": [
+    "Paradoxically, this phosphorylation increases MafA-transcriptional activity through the recruitment of the coactivator P/CAF."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "11291348",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.35,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "MafA",
+      "P/CAF"
+    ],
+    "conditions": [
+      "phosphorylation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

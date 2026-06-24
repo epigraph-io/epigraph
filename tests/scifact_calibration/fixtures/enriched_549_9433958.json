@@ -1,0 +1,25 @@
+{
+  "scifact_id": 549,
+  "claim": "IRG1 has antiviral effects against neurotropic viruses.",
+  "evidence_sentences": [
+    "By transducing cortical neurons with genes that were expressed more highly in granule cell neurons, we identified three interferon-stimulated genes (ISGs; Ifi27, Irg1 and Rsad2 (also known as Viperin)) that mediated the antiviral effects against different neurotropic viruses."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9433958",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "Ifi27",
+      "Irg1",
+      "Rsad2",
+      "Viperin"
+    ],
+    "conditions": [
+      "cortical neurons transduced with genes expressed more highly in granule cell neurons"
+    ],
+    "evidence_type": "empirical"
+  }
+}

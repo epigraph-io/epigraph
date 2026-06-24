@@ -1,0 +1,16 @@
+{
+  "scifact_id": 20,
+  "claim": "7-day-old adult Caenorhabditis elegans exhibit approximately 75% of the learning capacity seen in 1-day old adults.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

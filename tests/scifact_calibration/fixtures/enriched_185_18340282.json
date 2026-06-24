@@ -1,0 +1,21 @@
+{
+  "scifact_id": 185,
+  "claim": "Breast cancer development is determined exclusively by genetic factors.",
+  "evidence_sentences": [
+    "METHODS We tested gene-environment interactions in 7610 women who developed breast cancer and 10 196 controls without the disease, studying the effects of 12 polymorphisms (FGFR2-rs2981582, TNRC9-rs3803662, 2q35-rs13387042, MAP3K1-rs889312, 8q24-rs13281615, 2p-rs4666451, 5p12-rs981782, CASP8-rs1045485, LSP1-rs3817198, 5q-rs30099, TGFB1-rs1982073, and ATM-rs1800054) in relation to prospectively collected information about ten established environmental risk factors (age at menarche, parity, age at first birth, breastfeeding, menopausal status, age at menopause, use of hormone replacement therapy, body-mass index, height, and alcohol consumption).   \n",
+    "INTERPRETATION Risks of breast cancer associated with low-penetrance susceptibility polymorphisms do not vary significantly with these ten established environmental risk factors.   \n"
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "18340282",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true,
+    "tier3_enriched": true
+  }
+}

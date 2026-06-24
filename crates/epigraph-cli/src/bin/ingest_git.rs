@@ -57,6 +57,26 @@ struct Args {
     embed: bool,
     /// Bearer token for agent registration (required for /agents endpoint)
     token: Option<String>,
+    /// PR-hierarchical ingestion mode (repo → PR → commit hierarchy)
+    pr_mode: bool,
+    /// Repository slug `owner/name` (PR mode)
+    repo_slug: Option<String>,
+    /// Pull-request number (PR mode)
+    pr_number: Option<u64>,
+    /// Pull-request title (PR mode)
+    pr_title: Option<String>,
+    /// Pull-request body / description (PR mode)
+    pr_body: Option<String>,
+    /// Merge commit SHA of the PR (PR mode)
+    merge_sha: Option<String>,
+    /// ISO-8601 merge timestamp (PR mode)
+    merged_at: Option<String>,
+    /// GitHub login of the PR author (PR mode)
+    pr_author: Option<String>,
+    /// Git revision range `A..B` for the PR's commits (PR mode)
+    rev_range: Option<String>,
+    /// Explicit orchestrator agent id, overriding trailer/env resolution (PR mode)
+    orchestrator_id: Option<Uuid>,
 }
 
 impl Args {
@@ -72,6 +92,16 @@ impl Args {
         let mut enricher = EnricherMode::Noop;
         let mut embed = false;
         let mut token = None;
+        let mut pr_mode = false;
+        let mut repo_slug = None;
+        let mut pr_number = None;
+        let mut pr_title = None;
+        let mut pr_body = None;
+        let mut merge_sha = None;
+        let mut merged_at = None;
+        let mut pr_author = None;
+        let mut rev_range = None;
+        let mut orchestrator_id = None;
 
         let mut i = 1;
         while i < args.len() {
@@ -131,6 +161,81 @@ impl Args {
                             .clone(),
                     );
                 }
+                "--pr-ingest" => {
+                    pr_mode = true;
+                }
+                "--repo-slug" => {
+                    i += 1;
+                    repo_slug = Some(
+                        args.get(i)
+                            .ok_or("--repo-slug requires an owner/name argument")?
+                            .clone(),
+                    );
+                }
+                "--pr-number" => {
+                    i += 1;
+                    let val = args.get(i).ok_or("--pr-number requires a number")?;
+                    pr_number = Some(
+                        val.parse::<u64>()
+                            .map_err(|_| format!("--pr-number must be a number, got: {val}"))?,
+                    );
+                }
+                "--pr-title" => {
+                    i += 1;
+                    pr_title = Some(
+                        args.get(i)
+                            .ok_or("--pr-title requires a string argument")?
+                            .clone(),
+                    );
+                }
+                "--pr-body" => {
+                    i += 1;
+                    pr_body = Some(
+                        args.get(i)
+                            .ok_or("--pr-body requires a string argument")?
+                            .clone(),
+                    );
+                }
+                "--merge-sha" => {
+                    i += 1;
+                    merge_sha = Some(
+                        args.get(i)
+                            .ok_or("--merge-sha requires a SHA argument")?
+                            .clone(),
+                    );
+                }
+                "--merged-at" => {
+                    i += 1;
+                    merged_at = Some(
+                        args.get(i)
+                            .ok_or("--merged-at requires an ISO-8601 timestamp argument")?
+                            .clone(),
+                    );
+                }
+                "--pr-author" => {
+                    i += 1;
+                    pr_author = Some(
+                        args.get(i)
+                            .ok_or("--pr-author requires a login argument")?
+                            .clone(),
+                    );
+                }
+                "--rev-range" => {
+                    i += 1;
+                    rev_range = Some(
+                        args.get(i)
+                            .ok_or("--rev-range requires an A..B revision range")?
+                            .clone(),
+                    );
+                }
+                "--orchestrator-id" => {
+                    i += 1;
+                    let val = args.get(i).ok_or("--orchestrator-id requires a UUID")?;
+                    orchestrator_id =
+                        Some(val.parse::<Uuid>().map_err(|_| {
+                            format!("--orchestrator-id must be a UUID, got: {val}")
+                        })?);
+                }
                 "--help" | "-h" => {
                     return Err(USAGE.to_string());
                 }
@@ -151,6 +256,16 @@ impl Args {
             enricher,
             embed,
             token,
+            pr_mode,
+            repo_slug,
+            pr_number,
+            pr_title,
+            pr_body,
+            merge_sha,
+            merged_at,
+            pr_author,
+            rev_range,
+            orchestrator_id,
         })
     }
 }
@@ -168,7 +283,19 @@ Options:
       --enricher <MODE>   Enrichment mode: noop (default) or llm
       --embed             Generate and store embeddings for submitted claims
   -t, --token <TOKEN>     Bearer token for agent registration
-  -h, --help              Show this help message";
+  -h, --help              Show this help message
+
+PR-hierarchical mode (build a repo -> PR -> commit claim hierarchy):
+      --pr-ingest             Enable PR-hierarchical ingestion mode
+      --repo-slug <OWNER/NAME>  Repository slug (e.g. epigraph-io/epigraph)
+      --pr-number <N>         Pull-request number
+      --pr-title <TITLE>      Pull-request title
+      --pr-body <BODY>        Pull-request body / description
+      --merge-sha <SHA>       Merge commit SHA
+      --merged-at <ISO8601>   Merge timestamp (ISO-8601)
+      --pr-author <LOGIN>     GitHub login of the PR author
+      --rev-range <A..B>      Git revision range covering the PR's commits
+      --orchestrator-id <UUID>  Explicit orchestrator agent id (overrides trailer/env)";
 
 // =============================================================================
 // COMMIT TYPES & PARSING
@@ -716,6 +843,42 @@ fn parse_git_log(
     parse_git_log_output(&stdout)
 }
 
+/// Run `git log <rev_range> --no-merges` and parse the output into ParsedCommits.
+///
+/// PR mode supplies an explicit revision range (e.g. `base..head`) instead of a
+/// `--since` date so exactly the PR's own commits are ingested. `--no-merges`
+/// keeps merge commits out of the claim hierarchy (design §4.2: only real work
+/// commits become claims). Reuses the same format string and `parse_git_log_output`
+/// as `parse_git_log` so both paths produce identical `ParsedCommit`s.
+#[allow(dead_code)]
+fn parse_git_log_range(
+    repo: &std::path::Path,
+    rev_range: &str,
+) -> Result<Vec<ParsedCommit>, String> {
+    let format = format!(
+        "{RECORD_SEP}%H{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%aI{FIELD_SEP}%P{FIELD_SEP}%B"
+    );
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("log")
+        .arg(format!("--format={format}"))
+        .arg("--name-only")
+        .arg("--no-merges")
+        .arg(rev_range)
+        .output()
+        .map_err(|e| format!("Failed to run git log: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git log {rev_range} failed: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_git_log_output(&stdout)
+}
+
 /// Parse the raw git log output string into ParsedCommits
 fn parse_git_log_output(output: &str) -> Result<Vec<ParsedCommit>, String> {
     let mut commits = Vec::new();
@@ -818,6 +981,10 @@ struct ClaimSubmission {
     idempotency_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub properties: Option<serde_json::Value>,
+    /// Labels set on the claim AT CREATION by the server (creator-owned), so a
+    /// multi-principal writer needs no ownership-gated label PATCH / claims:admin.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -881,6 +1048,128 @@ struct CreateAgentRequest {
 // =============================================================================
 // AGENT MANAGEMENT
 // =============================================================================
+
+/// Derive a STABLE Ed25519 signer for a git author from their email, so the same
+/// human maps to the same agent identity across every run and repo. Email is
+/// normalized (trimmed + lowercased). This is the interim author-DID scheme
+/// pending the project's real DID system (spec §6.3).
+fn author_signer(_display_name: &str, email: &str) -> AgentSigner {
+    let normalized = email.trim().to_ascii_lowercase();
+    let seed = blake3::hash(format!("epigraph-git-author-v1:{normalized}").as_bytes());
+    let key: [u8; 32] = *seed.as_bytes();
+    AgentSigner::from_bytes(&key).expect("32-byte blake3 hash is a valid Ed25519 seed")
+}
+
+/// Derive the STABLE signer for the single repo-root *system* agent, derived from
+/// a constant identity (independent of repo or orchestrator). Every repo-root node
+/// is authored by this agent so that `(content_hash, agent_id)` is constant across
+/// every PR/orchestrator and the server's find-or-create collapses it to one node.
+/// Reuses the `author_signer` derivation so the key is a deterministic Ed25519 seed.
+fn repo_root_signer() -> AgentSigner {
+    author_signer("git-ingester-system", "git-ingester@epigraph.system")
+}
+
+/// Resolve (and register if needed) the stable agent id for a git author.
+/// Caches the resolved agent id per email within a run to avoid duplicate POSTs.
+///
+/// `AgentSigner` is not `Clone` and the key is fully derived from the (normalized)
+/// email, so the cache stores only the `Uuid`; the signer is rebuilt deterministically
+/// via `author_signer` on every call. Per Task 0, agent registration is NOT idempotent
+/// on `public_key` (a UNIQUE constraint makes a repeated POST error), so the in-run cache
+/// is what prevents the duplicate registration; cross-run find-or-create is a server
+/// concern tracked for Task 8.
+#[allow(dead_code)]
+async fn resolve_author_agent(
+    client: &reqwest::Client,
+    endpoint: &str,
+    cache: &mut std::collections::HashMap<String, Uuid>,
+    display_name: &str,
+    email: &str,
+) -> Result<(AgentSigner, Uuid), String> {
+    let key = email.trim().to_ascii_lowercase();
+    let signer = author_signer(display_name, email);
+    if let Some(&agent_id) = cache.get(&key) {
+        return Ok((signer, agent_id));
+    }
+    let agent_id = AgentRegistry::register_agent(client, endpoint, &signer, display_name).await?;
+    cache.insert(key, agent_id);
+    Ok((signer, agent_id))
+}
+
+/// Parse an `Epigraph-Orchestrator-Id: <uuid>` trailer from a PR body or commit message.
+/// Case-insensitive key match; last occurrence wins (trailers live at the bottom).
+fn parse_orchestrator_trailer(text: &str) -> Option<Uuid> {
+    text.lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("Epigraph-Orchestrator-Id") {
+                v.trim().parse::<Uuid>().ok()
+            } else {
+                None
+            }
+        })
+        .next_back()
+}
+
+/// Resolve the implementing orchestrator agent id for a PR:
+/// 1) `Epigraph-Orchestrator-Id:` trailer in the PR body or any commit message;
+/// 2) else `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` env var.
+///
+/// Returns an error if neither is present (the PR claim MUST have an author).
+/// Existence of the resolved agent is verified by the caller (Task 8 / `run_pr_ingest`)
+/// via the registration route; this resolver only determines the id, never mints one.
+#[allow(dead_code)]
+fn resolve_orchestrator_agent(pr_body: &str, commit_msgs: &[String]) -> Result<Uuid, String> {
+    if let Some(id) = parse_orchestrator_trailer(pr_body) {
+        return Ok(id);
+    }
+    for m in commit_msgs {
+        if let Some(id) = parse_orchestrator_trailer(m) {
+            return Ok(id);
+        }
+    }
+    std::env::var("EPIGRAPH_DEFAULT_ORCHESTRATOR_ID")
+        .ok()
+        .and_then(|s| s.trim().parse::<Uuid>().ok())
+        .ok_or_else(|| {
+            "no Epigraph-Orchestrator-Id trailer and EPIGRAPH_DEFAULT_ORCHESTRATOR_ID unset"
+                .to_string()
+        })
+}
+
+/// Candidate resolution references extracted from PR body + commit text.
+#[derive(Debug, Default, PartialEq)]
+struct References {
+    claim_uuids: Vec<Uuid>,
+    pr_numbers: Vec<u64>,
+}
+
+/// Extract resolution references from PR body + commit text:
+/// - any token parseable as a UUID that appears after "Resolves" or in a
+///   "Resolves-Claim:" trailer;
+/// - any `#<n>` token (PR/issue numbers).
+///
+/// This deliberately treats *any* UUID in the text as a candidate claim
+/// reference (the `Resolves`/`Resolves-Claim:` context is human convention);
+/// existence is validated before any edge is created (`link_resolutions`), so a
+/// stray UUID that isn't a claim is simply dropped at lookup time.
+#[allow(dead_code)]
+fn extract_references(text: &str) -> References {
+    let mut r = References::default();
+    for raw in text.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+        let tok = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '#');
+        if let Ok(id) = tok.parse::<Uuid>() {
+            if !r.claim_uuids.contains(&id) {
+                r.claim_uuids.push(id);
+            }
+        } else if let Some(num) = tok.strip_prefix('#').and_then(|n| n.parse::<u64>().ok()) {
+            if !r.pr_numbers.contains(&num) {
+                r.pr_numbers.push(num);
+            }
+        }
+    }
+    r
+}
 
 /// Per-author agent state: each unique git author gets their own signer and agent ID
 struct AuthorAgent {
@@ -1123,6 +1412,7 @@ fn build_packet(
         agent_id,
         idempotency_key: Some(format!("git:{}", commit.hash)),
         properties: Some(properties),
+        labels: Vec::new(), // set by submit_find_or_create at creation
     };
 
     // Use placeholder signature — the API server does not yet verify real Ed25519
@@ -1154,6 +1444,173 @@ fn build_all_packets(
         .collect()
 }
 
+/// Build the find-or-create packet for a repository's root node.
+///
+/// Keyed on a stable `repo:{slug}` idempotency_key so re-runs across every PR
+/// resolve to the same persistent root claim (the hierarchy's anchor). The
+/// `node`/`repo` properties let downstream queries find the root by repository.
+fn build_repo_packet(repo_slug: &str, agent_id: Uuid, signer: &AgentSigner) -> EpistemicPacket {
+    let content = format!("Repository {repo_slug} — development history (commits and PRs).");
+    let evidence_text = format!("Repository slug: {repo_slug}");
+    let ev = EvidenceSubmission {
+        content_hash: hex::encode(ContentHasher::hash(evidence_text.as_bytes())),
+        evidence_type: EvidenceTypeSubmission::Document {
+            source_url: Some(format!("repo://{repo_slug}")),
+            mime_type: "text/plain".into(),
+        },
+        raw_content: Some(evidence_text.clone()),
+        signature: Some(hex::encode(signer.sign(evidence_text.as_bytes()))),
+    };
+    EpistemicPacket {
+        claim: ClaimSubmission {
+            content,
+            initial_truth: Some(0.95),
+            agent_id,
+            idempotency_key: Some(format!("repo:{repo_slug}")),
+            properties: Some(serde_json::json!({
+                "source": "git-history", "node": "repo", "repo": repo_slug
+            })),
+            labels: Vec::new(), // set by submit_find_or_create at creation
+        },
+        evidence: vec![ev],
+        reasoning_trace: ReasoningTraceSubmission {
+            methodology: "heuristic".into(),
+            inputs: vec![TraceInputSubmission::Evidence { index: 0 }],
+            confidence: 0.95,
+            explanation: format!("Root node for repository {repo_slug}"),
+            signature: None,
+        },
+        signature: "0".repeat(128),
+    }
+}
+
+/// Metadata describing a single merged pull request, supplied by the CI caller.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct PrMeta {
+    repo_slug: String,
+    number: u64,
+    title: String,
+    body: String,
+    merge_sha: String,
+    merged_at: String, // ISO-8601
+    author_login: String,
+}
+
+/// Build the find-or-create packet for a PR node. `orchestrator_id` is the
+/// implementing orchestrator agent (resolved upstream), which authors the PR
+/// claim per the design's attribution rule (§6.1).
+///
+/// Keyed on a stable `pr:{slug}#{number}` idempotency_key so re-runs of the same
+/// PR resolve to one claim. The PR body is carried as evidence; the merge sha,
+/// merge time, url, and number live in `properties` for downstream datestamped
+/// edge linking and resolution lookup.
+#[allow(dead_code)]
+fn build_pr_packet(meta: &PrMeta, orchestrator_id: Uuid) -> EpistemicPacket {
+    let content = format!("[PR #{}] {}", meta.number, meta.title);
+    let body = if meta.body.trim().is_empty() {
+        meta.title.clone()
+    } else {
+        meta.body.clone()
+    };
+    let url = format!("https://github.com/{}/pull/{}", meta.repo_slug, meta.number);
+    let ev = EvidenceSubmission {
+        content_hash: hex::encode(ContentHasher::hash(body.as_bytes())),
+        evidence_type: EvidenceTypeSubmission::Document {
+            source_url: Some(url.clone()),
+            mime_type: "text/markdown".into(),
+        },
+        raw_content: Some(body),
+        signature: None,
+    };
+    EpistemicPacket {
+        claim: ClaimSubmission {
+            content,
+            initial_truth: Some(0.8),
+            agent_id: orchestrator_id,
+            idempotency_key: Some(format!("pr:{}#{}", meta.repo_slug, meta.number)),
+            properties: Some(serde_json::json!({
+                "source": "git-history", "node": "pr",
+                "repo": meta.repo_slug, "pr_number": meta.number,
+                "merge_sha": meta.merge_sha, "merged_at": meta.merged_at,
+                "url": url,
+                "author_login": meta.author_login, "orchestrator_agent_id": orchestrator_id,
+            })),
+            labels: Vec::new(), // set by submit_find_or_create at creation
+        },
+        evidence: vec![ev],
+        reasoning_trace: ReasoningTraceSubmission {
+            methodology: "heuristic".into(),
+            inputs: vec![TraceInputSubmission::Evidence { index: 0 }],
+            confidence: 0.8,
+            explanation: format!("PR #{} merged at {}", meta.number, meta.merged_at),
+            signature: None,
+        },
+        signature: "0".repeat(128),
+    }
+}
+
+/// Submit a packet and return its claim id. Because the packet carries a stable
+/// `idempotency_key`, a second call returns the same `claim_id` (`was_duplicate=true`),
+/// making this the find-or-create primitive for the hierarchy's nodes.
+///
+/// Labels are baked into the packet's claim so the SERVER sets them AT CREATION
+/// (as the creating principal), instead of a separate ownership-gated
+/// `PATCH /claims/{id}/labels` that would require `claims:admin` — the ingester
+/// creates claims under system/author/orchestrator agents it does not "own", so
+/// a post-hoc relabel would be rejected. Labels are applied only on the create
+/// path server-side; a duplicate submit leaves the existing claim's labels intact.
+#[allow(dead_code)]
+async fn submit_find_or_create(
+    client: &reqwest::Client,
+    endpoint: &str,
+    mut packet: EpistemicPacket,
+    labels: &[&str],
+) -> Result<Uuid, String> {
+    packet.claim.labels = labels.iter().map(|s| s.to_string()).collect();
+    let url = format!("{endpoint}/api/v1/submit/packet");
+    let resp = client
+        .post(&url)
+        .json(&packet)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("submit failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "submit {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let parsed: SubmitResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("decode submit resp: {e}"))?;
+    Ok(parsed.claim_id)
+}
+
+/// Find-or-create the repository's root node and return its claim id, labelled
+/// `source:git-history` / `node:repo` / `repo:<slug>`.
+#[allow(dead_code)]
+async fn ensure_repo_node(
+    client: &reqwest::Client,
+    endpoint: &str,
+    repo_slug: &str,
+    agent_id: Uuid,
+    signer: &AgentSigner,
+) -> Result<Uuid, String> {
+    let packet = build_repo_packet(repo_slug, agent_id, signer);
+    let label = format!("repo:{repo_slug}");
+    submit_find_or_create(
+        client,
+        endpoint,
+        packet,
+        &["source:git-history", "node:repo", &label],
+    )
+    .await
+}
+
 // =============================================================================
 // EDGE SUBMISSION
 // =============================================================================
@@ -1167,6 +1624,160 @@ struct CreateEdgeRequest {
     target_type: String,
     relationship: String,
     properties: Option<serde_json::Value>,
+}
+
+/// Build a generic POST /api/v1/edges body. Uses the generic endpoint (not
+/// /edges/hierarchical) because only this one accepts `valid_from` +
+/// `if_not_exists`, which the hierarchy needs for datestamping and re-run safety.
+#[allow(dead_code)]
+fn edge_body(
+    source_id: Uuid,
+    target_id: Uuid,
+    relationship: &str,
+    valid_from: Option<&str>,
+) -> serde_json::Value {
+    let mut b = serde_json::json!({
+        "source_id": source_id,
+        "target_id": target_id,
+        "source_type": "claim",
+        "target_type": "claim",
+        "relationship": relationship,
+        "if_not_exists": true,
+        "properties": { "source": "git-history" },
+    });
+    if let Some(ts) = valid_from {
+        b["valid_from"] = serde_json::json!(ts);
+    }
+    b
+}
+
+/// Create an idempotent, datestamped edge via POST /api/v1/edges. Both 200 and
+/// 201 mean success (existing edge returned vs newly created).
+#[allow(dead_code)]
+async fn link_edge(
+    client: &reqwest::Client,
+    endpoint: &str,
+    source_id: Uuid,
+    target_id: Uuid,
+    relationship: &str,
+    valid_from: Option<&str>,
+) -> Result<(), String> {
+    let url = format!("{endpoint}/api/v1/edges");
+    let resp = client
+        .post(&url)
+        .json(&edge_body(source_id, target_id, relationship, valid_from))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("edge POST failed: {e}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "edge {}: {}",
+            status,
+            resp.text().await.unwrap_or_default()
+        ))
+    }
+}
+
+// =============================================================================
+// RESOLUTION LINKING
+// =============================================================================
+
+/// Confirm a claim exists (GET returns 200). `properties` are not exposed by the
+/// read endpoint, but existence is all we need before creating a resolution edge.
+#[allow(dead_code)]
+async fn claim_exists(client: &reqwest::Client, endpoint: &str, id: Uuid) -> bool {
+    let url = format!("{endpoint}/api/v1/claims/{id}");
+    matches!(
+        client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await,
+        Ok(r) if r.status().is_success()
+    )
+}
+
+/// Find existing resolution/backlog claims whose CONTENT cites "PR #<n>".
+#[allow(dead_code)]
+async fn find_claims_citing_pr(client: &reqwest::Client, endpoint: &str, n: u64) -> Vec<Uuid> {
+    let needle = format!("PR #{n}");
+    let url = format!("{endpoint}/api/v1/claims");
+    let resp = client
+        .get(&url)
+        .query(&[
+            ("content_contains", needle.as_str()),
+            ("is_current", "true"),
+            ("limit", "25"),
+        ])
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await;
+    let Ok(resp) = resp else { return vec![] };
+    if !resp.status().is_success() {
+        return vec![];
+    }
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return vec![];
+    };
+    v["claims"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c["id"].as_str()?.parse::<Uuid>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// For each resolved target, create `target --RESOLVED_BY--> PR`, datestamped at
+/// merge time. Direction reads "X was resolved by this PR". `RESOLVED_BY` is in
+/// `VALID_RELATIONSHIPS` and non-evidential (no DS recompute). Self-references and
+/// the PR's own claim are skipped; UUID refs are validated for existence first, so
+/// stray tokens from `extract_references` are harmless.
+#[allow(dead_code)]
+async fn link_resolutions(
+    client: &reqwest::Client,
+    endpoint: &str,
+    pr_claim_id: Uuid,
+    refs: &References,
+    merged_at: &str,
+) -> Result<usize, String> {
+    let mut linked = 0;
+    for uuid in &refs.claim_uuids {
+        if *uuid != pr_claim_id && claim_exists(client, endpoint, *uuid).await {
+            link_edge(
+                client,
+                endpoint,
+                *uuid,
+                pr_claim_id,
+                "RESOLVED_BY",
+                Some(merged_at),
+            )
+            .await?;
+            linked += 1;
+        }
+    }
+    for n in &refs.pr_numbers {
+        for target in find_claims_citing_pr(client, endpoint, *n).await {
+            if target != pr_claim_id {
+                link_edge(
+                    client,
+                    endpoint,
+                    target,
+                    pr_claim_id,
+                    "RESOLVED_BY",
+                    Some(merged_at),
+                )
+                .await?;
+                linked += 1;
+            }
+        }
+    }
+    Ok(linked)
 }
 
 /// Resolve semantic edges from enrichment data and submit them as API edges.
@@ -1457,6 +2068,175 @@ async fn submit_evidence_embeddings(
 }
 
 // =============================================================================
+// PR-HIERARCHICAL INGESTION
+// =============================================================================
+
+/// Build a reqwest client, attaching `Authorization: Bearer <token>` when a
+/// token is configured. Required because the label PATCH route
+/// (`PATCH /api/v1/claims/{id}/labels`) demands `claims:write`; a tokenless
+/// client would 401 on every label application.
+fn build_http_client(token: Option<&str>) -> reqwest::Client {
+    if let Some(tok) = token {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {tok}"))
+                .expect("bearer token is a valid header value"),
+        );
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("client builder with bearer header")
+    } else {
+        reqwest::Client::new()
+    }
+}
+
+/// Assemble the `repo → PR → commit` claim hierarchy for one merged PR:
+/// find-or-create the repo root + PR node, attribute the PR to the orchestrator
+/// agent and each commit to its (stable) git-author agent, stamp the
+/// `decomposes_to` edges at merge/commit time, and link the PR to any backlog /
+/// resolution claims it resolves via `RESOLVED_BY` (design §4, §6, §7).
+async fn run_pr_ingest(args: &Args) -> Result<(), String> {
+    let client = build_http_client(args.token.as_deref());
+    let repo_slug = args.repo_slug.clone().ok_or("--repo-slug required")?;
+    let meta = PrMeta {
+        repo_slug: repo_slug.clone(),
+        number: args.pr_number.ok_or("--pr-number required")?,
+        title: args.pr_title.clone().ok_or("--pr-title required")?,
+        body: args.pr_body.clone().unwrap_or_default(),
+        merge_sha: args.merge_sha.clone().ok_or("--merge-sha required")?,
+        merged_at: args.merged_at.clone().ok_or("--merged-at required")?,
+        author_login: args.pr_author.clone().unwrap_or_default(),
+    };
+    let rev_range = args.rev_range.clone().ok_or("--rev-range required")?;
+    let commits = parse_git_log_range(&args.repo, &rev_range)?;
+    let commit_msgs: Vec<String> = commits
+        .iter()
+        .map(|c| format!("[{}][{}] {}", c.commit_type, c.scope, c.claim_text))
+        .collect();
+
+    // Resolution references (PR-level): UUID refs + PR-number citations from the
+    // PR body and commit messages. Computed up front so --dry-run can show the
+    // planned resolution targets, and reused by section 5 below.
+    let mut ref_text = meta.body.clone();
+    for c in &commits {
+        ref_text.push('\n');
+        ref_text.push_str(&c.claim_text);
+    }
+    let refs = extract_references(&ref_text);
+
+    // --dry-run: parse + print the planned hierarchy and resolution targets, then
+    // return BEFORE any POST (the first write is register_agent in section 2).
+    // Safe to run on untrusted/unmerged PRs since it makes no network calls.
+    if args.dry_run {
+        println!(
+            "[dry-run] repo={} pr=#{} commits={} refs={:?}",
+            meta.repo_slug,
+            meta.number,
+            commits.len(),
+            refs
+        );
+        return Ok(());
+    }
+
+    // 1) Resolve the implementing orchestrator agent: explicit flag, then trailer
+    //    (PR body / commits), then EPIGRAPH_DEFAULT_ORCHESTRATOR_ID. The resolver
+    //    only reads an id (never mints one); a bogus id surfaces at submit time.
+    let orchestrator_id = match args.orchestrator_id {
+        Some(id) => id,
+        None => resolve_orchestrator_agent(&meta.body, &commit_msgs)?,
+    };
+
+    // 2) Repo root node, attributed to a fixed system agent (NOT the per-PR
+    //    orchestrator). Keying on the orchestrator made the repo node's
+    //    (content_hash, agent_id) vary per PR, defeating the server's find-or-create
+    //    and re-creating the repo node every run. We register the system agent and
+    //    use its returned id as the node's author. Registration is now `.await?`
+    //    (not best-effort) because create_agent is idempotent on public_key
+    //    (Plan 2.5 Tasks 1-2): a re-run returns the same id instead of a 400.
+    let repo_root_signer = repo_root_signer();
+    let repo_root_id = AgentRegistry::register_agent(
+        &client,
+        &args.endpoint,
+        &repo_root_signer,
+        "git-ingester-system",
+    )
+    .await?;
+    let repo_id = ensure_repo_node(
+        &client,
+        &args.endpoint,
+        &repo_slug,
+        repo_root_id,
+        &repo_root_signer,
+    )
+    .await?;
+
+    // 3) PR node, attributed to the orchestrator.
+    let pr_packet = build_pr_packet(&meta, orchestrator_id);
+    let pr_label = format!("repo:{repo_slug}");
+    let pr_id = submit_find_or_create(
+        &client,
+        &args.endpoint,
+        pr_packet,
+        &["source:git-history", "node:pr", &pr_label],
+    )
+    .await?;
+    // repo --decomposes_to--> PR, stamped at merge time.
+    link_edge(
+        &client,
+        &args.endpoint,
+        repo_id,
+        pr_id,
+        "decomposes_to",
+        Some(&meta.merged_at),
+    )
+    .await?;
+
+    // 4) Commit children, attributed to their (stable) git-author agents.
+    let mut author_cache = std::collections::HashMap::new();
+    for commit in &commits {
+        let (signer, author_id) = resolve_author_agent(
+            &client,
+            &args.endpoint,
+            &mut author_cache,
+            &commit.author_name,
+            &commit.author_email,
+        )
+        .await?;
+        let packet = build_packet(commit, &signer, author_id, None);
+        let commit_label = format!("repo:{repo_slug}");
+        let commit_id = submit_find_or_create(
+            &client,
+            &args.endpoint,
+            packet,
+            &["source:git-history", "node:commit", &commit_label],
+        )
+        .await?;
+        // PR --decomposes_to--> commit, stamped at commit time.
+        link_edge(
+            &client,
+            &args.endpoint,
+            pr_id,
+            commit_id,
+            "decomposes_to",
+            Some(&commit.date),
+        )
+        .await?;
+    }
+
+    // 5) Resolution links (PR-level): create the RESOLVED_BY edges for the
+    //    references gathered above (UUID refs + PR-number citations).
+    let linked = link_resolutions(&client, &args.endpoint, pr_id, &refs, &meta.merged_at).await?;
+    println!(
+        "PR #{}: repo={repo_id} pr={pr_id} commits={} resolved_links={linked}",
+        meta.number,
+        commits.len()
+    );
+    Ok(())
+}
+
+// =============================================================================
 // MAIN
 // =============================================================================
 
@@ -1475,6 +2255,16 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
+
+    // PR-hierarchical ingestion is a distinct mode: it builds a repo -> PR ->
+    // commit hierarchy from the supplied PR metadata + rev-range and returns.
+    if args.pr_mode {
+        if let Err(e) = run_pr_ingest(&args).await {
+            eprintln!("pr-ingest failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Parse git log
     println!("Parsing git log from: {}", args.repo.display());
@@ -2091,6 +2881,169 @@ async fn create_prov_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------------------------------
+    // Deterministic per-author agent identity tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn author_signer_is_deterministic_per_email() {
+        let a = author_signer("Jeremy Barton", "jeremy.barton@gmail.com");
+        let b = author_signer("J. Barton", "jeremy.barton@gmail.com"); // name differs, email same
+        let c = author_signer("Someone", "other@example.com");
+        assert_eq!(a.public_key(), b.public_key(), "same email => same key");
+        assert_ne!(
+            a.public_key(),
+            c.public_key(),
+            "different email => different key"
+        );
+    }
+
+    #[test]
+    fn author_email_is_normalized() {
+        let a = author_signer("x", "Jeremy.Barton@Gmail.com  ");
+        let b = author_signer("x", "jeremy.barton@gmail.com");
+        assert_eq!(
+            a.public_key(),
+            b.public_key(),
+            "case/space-insensitive email"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Repo-root system-agent identity tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn repo_root_agent_is_fixed_and_orchestrator_independent() {
+        // The repo-root node must be attributed to a single, stable system agent
+        // derived from a constant — never the per-PR orchestrator — so that
+        // `create_or_get` collapses the repo node across every PR/orchestrator.
+        // `orchestrator_id` is not even an input to the repo-root signer, so two
+        // different orchestrators necessarily resolve the same repo-root key.
+        assert_eq!(
+            repo_root_signer().public_key(),
+            repo_root_signer().public_key(),
+            "repo-root signer is deterministic from a constant"
+        );
+        assert_ne!(
+            repo_root_signer().public_key(),
+            author_signer("x", "someone@example.com").public_key(),
+            "repo-root system agent is distinct from any git author"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Orchestrator-agent resolution tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parses_orchestrator_trailer() {
+        let body = "fix(api): x\n\nEvidence:\n- y\n\nEpigraph-Orchestrator-Id: 7b3a0c1e-0000-4000-8000-000000000001\nCo-Authored-By: Claude <a@b>";
+        assert_eq!(
+            parse_orchestrator_trailer(body),
+            Some("7b3a0c1e-0000-4000-8000-000000000001".parse().unwrap())
+        );
+        assert_eq!(parse_orchestrator_trailer("no trailer here"), None);
+    }
+
+    #[test]
+    fn orchestrator_trailer_key_match_is_case_insensitive() {
+        // The doc comment promises a case-insensitive key match; assert lower- and
+        // upper-cased trailer keys both resolve to the same id.
+        let id = "7b3a0c1e-0000-4000-8000-000000000001";
+        assert_eq!(
+            parse_orchestrator_trailer(&format!("epigraph-orchestrator-id: {id}")),
+            Some(id.parse().unwrap())
+        );
+        assert_eq!(
+            parse_orchestrator_trailer(&format!("EPIGRAPH-ORCHESTRATOR-ID: {id}")),
+            Some(id.parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn orchestrator_trailer_last_occurrence_wins() {
+        // The doc comment promises last-occurrence-wins (trailers live at the bottom),
+        // so a later trailer must override an earlier one.
+        let first = "7b3a0c1e-0000-4000-8000-000000000001";
+        let last = "7b3a0c1e-0000-4000-8000-00000000ffff";
+        let body = format!("Epigraph-Orchestrator-Id: {first}\nEpigraph-Orchestrator-Id: {last}");
+        assert_eq!(
+            parse_orchestrator_trailer(&body),
+            Some(last.parse().unwrap())
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Repo-node find-or-create packet tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn repo_node_packet_has_stable_idempotency_and_label() {
+        let signer = AgentSigner::generate();
+        let p = build_repo_packet("epigraph-io/epiclaw-host", Uuid::nil(), &signer);
+        assert_eq!(
+            p.claim.idempotency_key.as_deref(),
+            Some("repo:epigraph-io/epiclaw-host")
+        );
+        assert!(p.claim.content.contains("epigraph-io/epiclaw-host"));
+        let props = p.claim.properties.as_ref().unwrap();
+        assert_eq!(props["source"], "git-history");
+        assert_eq!(props["node"], "repo");
+        assert_eq!(props["repo"], "epigraph-io/epiclaw-host");
+    }
+
+    // -------------------------------------------------------------------------
+    // PR-node find-or-create packet tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn pr_packet_keys_on_repo_and_number_and_carries_properties() {
+        // build_pr_packet takes only the orchestrator agent_id; the PR node carries
+        // no per-author evidence signature (unlike build_repo_packet).
+        let meta = PrMeta {
+            repo_slug: "epigraph-io/epigraph".into(),
+            number: 252,
+            title: "fix(api): stop auto-enqueueing cluster jobs".into(),
+            body: "## Summary\nResolves d531c585".into(),
+            merge_sha: "2a31f8d".into(),
+            merged_at: "2026-06-02T15:10:01Z".into(),
+            author_login: "tylorsama".into(),
+        };
+        let p = build_pr_packet(&meta, Uuid::nil());
+        assert_eq!(
+            p.claim.idempotency_key.as_deref(),
+            Some("pr:epigraph-io/epigraph#252")
+        );
+        assert!(p
+            .claim
+            .content
+            .contains("stop auto-enqueueing cluster jobs"));
+        let props = p.claim.properties.as_ref().unwrap();
+        assert_eq!(props["node"], "pr");
+        assert_eq!(props["pr_number"], 252);
+        assert_eq!(props["merge_sha"], "2a31f8d");
+    }
+
+    // -------------------------------------------------------------------------
+    // Datestamped edge body tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn edge_body_uses_generic_endpoint_fields() {
+        let body = edge_body(
+            Uuid::nil(),
+            Uuid::nil(),
+            "decomposes_to",
+            Some("2026-06-02T15:10:01Z"),
+        );
+        assert_eq!(body["source_type"], "claim");
+        assert_eq!(body["target_type"], "claim");
+        assert_eq!(body["relationship"], "decomposes_to");
+        assert_eq!(body["valid_from"], "2026-06-02T15:10:01Z");
+        assert_eq!(body["if_not_exists"], true);
+    }
 
     // -------------------------------------------------------------------------
     // Header parsing tests
@@ -3926,8 +4879,8 @@ crates/epigraph-core/src/domain/mod.rs",
     #[test]
     fn test_edge_submission_skips_unresolved_source() {
         // When a commit's hash isn't in the tracker, edges should be skipped
-        let _commits = vec![make_commit("aaa", CommitType::Feat, "core", vec![])];
-        let _enrichments = vec![EnrichedData {
+        let _commits = [make_commit("aaa", CommitType::Feat, "core", vec![])];
+        let _enrichments = [EnrichedData {
             semantic_edges: vec![SemanticEdge {
                 target_hash: "bbb".to_string(),
                 relationship: "supports".to_string(),
@@ -3939,16 +4892,16 @@ crates/epigraph-core/src/domain/mod.rs",
 
         let tracker = RelationshipTracker::new();
         // tracker has no entries — source hash "aaa" won't resolve
-        assert!(tracker.hash_to_claim.get("aaa").is_none());
+        assert!(!tracker.hash_to_claim.contains_key("aaa"));
     }
 
     #[test]
     fn test_edge_submission_skips_unresolved_target() {
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
         ];
-        let _enrichments = vec![
+        let _enrichments = [
             EnrichedData {
                 semantic_edges: vec![SemanticEdge {
                     target_hash: "zzz".to_string(), // Not in our batch
@@ -3966,17 +4919,17 @@ crates/epigraph-core/src/domain/mod.rs",
         tracker.record(&commits[0], claim_a);
 
         // Source "aaa" resolves, but target "zzz" won't
-        assert!(tracker.hash_to_claim.get(&commits[0].hash).is_some());
-        assert!(tracker.hash_to_claim.get("zzz").is_none());
+        assert!(tracker.hash_to_claim.contains_key(&commits[0].hash));
+        assert!(!tracker.hash_to_claim.contains_key("zzz"));
     }
 
     #[test]
     fn test_edge_submission_resolves_both_hashes() {
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
         ];
-        let enrichments = vec![
+        let enrichments = [
             EnrichedData {
                 semantic_edges: vec![SemanticEdge {
                     target_hash: "bbb".to_string(),
@@ -4010,11 +4963,11 @@ crates/epigraph-core/src/domain/mod.rs",
     #[test]
     fn test_dry_run_shows_semantic_edges() {
         // Verify that enrichment edges are accessible by index during dry-run display
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
         ];
-        let enrichments = vec![
+        let enrichments = [
             EnrichedData {
                 semantic_edges: vec![SemanticEdge {
                     target_hash: "bbb".to_string(),
@@ -4063,7 +5016,7 @@ crates/epigraph-core/src/domain/mod.rs",
     #[test]
     fn test_embedding_only_for_submitted_commits() {
         // Only commits with claim IDs in the tracker should get embeddings
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
             make_commit("ccc", CommitType::Docs, "", vec![]),
@@ -4075,9 +5028,9 @@ crates/epigraph-core/src/domain/mod.rs",
         tracker.record(&commits[0], claim_a);
 
         // "aaa" should be embeddable, "bbb" and "ccc" should not
-        assert!(tracker.hash_to_claim.get("aaa").is_some());
-        assert!(tracker.hash_to_claim.get("bbb").is_none());
-        assert!(tracker.hash_to_claim.get("ccc").is_none());
+        assert!(tracker.hash_to_claim.contains_key("aaa"));
+        assert!(!tracker.hash_to_claim.contains_key("bbb"));
+        assert!(!tracker.hash_to_claim.contains_key("ccc"));
     }
 
     #[test]
@@ -4102,7 +5055,7 @@ crates/epigraph-core/src/domain/mod.rs",
 
     #[test]
     fn test_record_evidence_stores_evidence_ids() {
-        let commits = vec![make_commit("aaa", CommitType::Feat, "core", vec![])];
+        let commits = [make_commit("aaa", CommitType::Feat, "core", vec![])];
         let mut tracker = RelationshipTracker::new();
         let evidence_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
         tracker.record_evidence(&commits[0], evidence_ids.clone());
@@ -4112,16 +5065,16 @@ crates/epigraph-core/src/domain/mod.rs",
 
     #[test]
     fn test_record_evidence_skips_empty() {
-        let commits = vec![make_commit("aaa", CommitType::Feat, "core", vec![])];
+        let commits = [make_commit("aaa", CommitType::Feat, "core", vec![])];
         let mut tracker = RelationshipTracker::new();
         tracker.record_evidence(&commits[0], vec![]);
 
-        assert!(tracker.hash_to_evidence.get("aaa").is_none());
+        assert!(!tracker.hash_to_evidence.contains_key("aaa"));
     }
 
     #[test]
     fn test_record_evidence_independent_of_claim() {
-        let commits = vec![make_commit("aaa", CommitType::Feat, "core", vec![])];
+        let commits = [make_commit("aaa", CommitType::Feat, "core", vec![])];
         let mut tracker = RelationshipTracker::new();
         let claim_id = Uuid::new_v4();
         let evidence_ids = vec![Uuid::new_v4()];
@@ -4158,7 +5111,7 @@ crates/epigraph-core/src/domain/mod.rs",
 
     #[test]
     fn test_evidence_embedding_only_for_tracked_evidence() {
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
         ];
@@ -4168,13 +5121,13 @@ crates/epigraph-core/src/domain/mod.rs",
         tracker.record_evidence(&commits[0], ev_ids_a.clone());
         // commit "bbb" has no evidence tracked
 
-        assert!(tracker.hash_to_evidence.get("aaa").is_some());
-        assert!(tracker.hash_to_evidence.get("bbb").is_none());
+        assert!(tracker.hash_to_evidence.contains_key("aaa"));
+        assert!(!tracker.hash_to_evidence.contains_key("bbb"));
     }
 
     #[test]
     fn test_evidence_count_aggregation() {
-        let commits = vec![
+        let commits = [
             make_commit("aaa", CommitType::Feat, "core", vec![]),
             make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
         ];
@@ -4271,7 +5224,7 @@ crates/epigraph-core/src/domain/mod.rs",
         // Build all packets — verify enrichment is applied
         let mut packets_with_edges = 0;
         for (commit, enrichment) in commits.iter().zip(enrichments.iter()) {
-            let _packet = build_packet(commit, &signer, agent_id, Some(&enrichment));
+            let _packet = build_packet(commit, &signer, agent_id, Some(enrichment));
             if !enrichment.semantic_edges.is_empty() {
                 packets_with_edges += 1;
             }
@@ -4630,7 +5583,7 @@ crates/epigraph-core/src/domain/mod.rs",
         let n = token_estimates.len();
 
         // Median
-        let median = if n % 2 == 0 {
+        let median = if n.is_multiple_of(2) {
             (token_estimates[n / 2 - 1] + token_estimates[n / 2]) / 2
         } else {
             token_estimates[n / 2]
@@ -4700,5 +5653,25 @@ crates/epigraph-core/src/domain/mod.rs",
             tokens,
             total_chars
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Reference-resolver tests (UUID trailers/free-text + PR-number)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn extracts_uuid_and_pr_references() {
+        let text = "Resolves d531c585-0214-4fad-972b-10c7aa039984\n\
+                    Resolves-Claim: 9699e396-380b-4105-99c3-e4938dc3e156\n\
+                    see also PR #219 and #237";
+        let refs = extract_references(text);
+        assert!(refs
+            .claim_uuids
+            .contains(&"d531c585-0214-4fad-972b-10c7aa039984".parse().unwrap()));
+        assert!(refs
+            .claim_uuids
+            .contains(&"9699e396-380b-4105-99c3-e4938dc3e156".parse().unwrap()));
+        assert!(refs.pr_numbers.contains(&219));
+        assert!(refs.pr_numbers.contains(&237));
     }
 }

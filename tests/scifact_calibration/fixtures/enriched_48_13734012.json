@@ -1,0 +1,23 @@
+{
+  "scifact_id": 48,
+  "claim": "A total of 1,000 people in the UK are asymptomatic carriers of vCJD infection.",
+  "evidence_sentences": [
+    "RESULTS Of the 32,441 appendix samples 16 were positive for abnormal PrP, indicating an overall prevalence of 493 per million population (95% confidence interval 282 to 801 per million)."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "13734012",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.75,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [
+      "abnormal PrP"
+    ],
+    "conditions": [
+      "32,441 appendix samples",
+      "prevalence estimation with 95% confidence interval"
+    ],
+    "evidence_type": "statistical"
+  }
+}

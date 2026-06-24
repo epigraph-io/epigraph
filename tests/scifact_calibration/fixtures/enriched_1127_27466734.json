@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1127,
+  "claim": "Systemic lupus erythematosus is a risk factor for cardiovascular disease.",
+  "evidence_sentences": [
+    "Risk factors considered included those already in QRISK2 (age, ethnicity, deprivation, systolic blood pressure, body mass index, total cholesterol: high density lipoprotein cholesterol ratio, smoking, family history of coronary heart disease in a first degree relative aged less than 60 years, type 1 diabetes, type 2 diabetes, treated hypertension, rheumatoid arthritis, atrial fibrillation, chronic kidney disease (stage 4 or 5)) and new risk factors (chronic kidney disease (stage 3, 4, or 5), a measure of systolic blood pressure variability (standard deviation of repeated measures), migraine, corticosteroids, systemic lupus erythematosus (SLE), atypical antipsychotics, severe mental illness, and HIV/AIDs)."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "27466734",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.72,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true,
+    "tier3_enriched": true
+  }
+}

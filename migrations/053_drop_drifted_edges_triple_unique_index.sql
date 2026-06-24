@@ -1,0 +1,41 @@
+-- Reconcile out-of-band schema drift: drop the UNIQUE index
+-- idx_edges_source_target_relationship on edges(source_id, target_id, relationship).
+--
+-- EVIDENCE
+-- This UNIQUE index is present in live databases but is defined by NO migration
+-- and NO committed code (`git log -S idx_edges_source_target_relationship` is
+-- empty; it appears in none of 001..052). It was added out-of-band and
+-- re-introduces exactly the triple-uniqueness that migrations 017 and 018
+-- deliberately removed so that AUTHORED (and, post-018, every) verb-edge
+-- accumulates one row per submission. The knowledge graph also still carries
+-- stale claims asserting "edges has UNIQUE(source_id, target_id, relationship)",
+-- consistent with this drift having been observed on real databases.
+--
+-- IMPACT
+-- With the index present, claim_helper::create_claim_idempotent's second
+-- AUTHORED EdgeRepository::create (a bare INSERT) trips the unique violation;
+-- the helper swallows it via `tracing::warn!("AUTHORED verb-edge emit failed
+-- ...")`, so the authorship verb-event for a claim RE-submission is silently
+-- dropped. This is precisely the bug migration 017's header documents fixing.
+-- It surfaced as two failing tests in
+-- crates/epigraph-mcp/tests/claim_helper_tests.rs
+-- (helper_returns_existing_when_present, helper_emits_authored_on_both_branches)
+-- only when run against a drifted DB; both pass on a fresh repo-migrated DB.
+--
+-- SAFETY
+-- No in-tree code depends on this index. Triple-uniqueness has not been part of
+-- the repo schema since migration 018, and EdgeRepository::create_if_not_exists
+-- performs an explicit check-then-insert (its docstring states "the edges table
+-- has no unique index on this triple"), so dropping it cannot break a relied-on
+-- ON CONFLICT path (none exist in crates/). The NON-unique composite index
+-- idx_edges_source_target_rel (migration 013) remains and continues to serve
+-- (source_id, target_id, relationship) lookups. `IF EXISTS` makes this a no-op
+-- on any database that never accumulated the drift (fresh/CI DBs).
+--
+-- VERIFICATION
+-- Fresh repo-migrated DB + this index -> claim_helper_tests fails the two
+-- AUTHORED-accumulation tests; applying this migration drops the index and all
+-- six tests pass. A fresh DB without the drift applies this migration as a
+-- clean no-op.
+
+DROP INDEX IF EXISTS idx_edges_source_target_relationship;

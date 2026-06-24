@@ -1,0 +1,22 @@
+{
+  "scifact_id": 592,
+  "claim": "Incidence of 10/66 dementia is lower than the incidence of DSM-IV dementia.",
+  "evidence_sentences": [
+    "Incidence for 10/66 dementia varied between 18\u00b72 and 30\u00b74 per 1000 person-years, and were 1\u00b74-2\u00b77 times higher than were those for DSM-IV dementia (9\u00b79-15\u00b77 per 1000 person-years)."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "14682243",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.95,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "10/66 dementia diagnosis",
+      "DSM-IV dementia diagnosis",
+      "incidence per 1000 person-years"
+    ],
+    "evidence_type": "statistical"
+  }
+}

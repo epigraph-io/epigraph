@@ -39,6 +39,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
+        None,
     )
     .await
     .expect("query_claims_by_label default");
@@ -83,6 +84,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
+        None,
     )
     .await
     .expect("query_claims_by_label exclude_labels");
@@ -107,6 +109,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
+        None,
     )
     .await
     .expect("query_claims_by_label current_only");
@@ -131,6 +134,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
+        None,
     )
     .await
     .expect("query_claims_by_label both filters");
@@ -139,6 +143,81 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
     assert_eq!(
         claims[0]["id"].as_str().unwrap(),
         backlog_open.as_uuid().to_string()
+    );
+}
+
+/// Discriminating redaction regression for a `paper_queries` per-row read path
+/// (A3 §7.5, Task 11). Each `paper_queries` site hand-loops its own
+/// `redact_content` call; their distinctive failure mode is a branch inversion
+/// (or the content_hash oracle leak), both of which a single private claim
+/// detects. Seeds one `private`-partition labelled claim and asserts the OWNER
+/// sees full content + real hash while a STRANGER sees "[REDACTED]" + blank
+/// hash. The stranger assertions fail if the redaction branch is
+/// deleted/inverted; the blank-hash assertion fails if content_hash
+/// (= BLAKE3(content)) is leaked for a redacted claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_by_label_redacts_private_content_for_strangers(pool: PgPool) {
+    let owner = seed_agent(&pool).await;
+    let claim_id = seed_claim(&pool, owner, &["backlog"], true, None).await;
+    let expected_content = format!("test claim {}", claim_id.as_uuid());
+
+    sqlx::query(
+        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
+         VALUES ($1, 'claim', 'private', $2)",
+    )
+    .bind(claim_id.as_uuid())
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .expect("seed private ownership");
+
+    let server = build_test_server(pool.clone());
+
+    let params = || QueryClaimsByLabelParams {
+        labels: vec!["backlog".into()],
+        exclude_labels: vec![],
+        current_only: false,
+        min_truth: None,
+        limit: Some(10),
+        offset: None,
+    };
+
+    // Owner → full content + real hash.
+    let owner_claims = parse_claims(
+        &query_claims_by_label(&server, params(), Some(owner))
+            .await
+            .expect("query as owner"),
+    );
+    let owner_claim = find_claim(&owner_claims, claim_id);
+    assert_eq!(
+        owner_claim["content"].as_str().unwrap(),
+        expected_content,
+        "owner must see full private content"
+    );
+    assert!(
+        !owner_claim["content_hash"].as_str().unwrap().is_empty(),
+        "owner must see the real content_hash: {owner_claim:?}"
+    );
+
+    // Stranger → redacted content + blank hash.
+    let stranger = Uuid::new_v4();
+    let stranger_claims = parse_claims(
+        &query_claims_by_label(&server, params(), Some(stranger))
+            .await
+            .expect("query as stranger"),
+    );
+    let stranger_claim = find_claim(&stranger_claims, claim_id);
+    assert_eq!(
+        stranger_claim["content"].as_str().unwrap(),
+        "[REDACTED]",
+        "stranger must NOT see private content — fails if the redaction branch \
+         is deleted or inverted"
+    );
+    assert_eq!(
+        stranger_claim["content_hash"].as_str().unwrap(),
+        "",
+        "stranger must NOT see the content_hash — BLAKE3(content) is a \
+         confirmation oracle for the redacted content"
     );
 }
 

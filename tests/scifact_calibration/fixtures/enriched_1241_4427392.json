@@ -1,0 +1,21 @@
+{
+  "scifact_id": 1241,
+  "claim": "The myocardial lineage develops from cardiac progenitors of mesodermal origin.",
+  "evidence_sentences": [
+    "The functional heart is comprised of distinct mesoderm-derived lineages including cardiomyocytes, endothelial cells and vascular smooth muscle cells.",
+    "Here we show that after induction with combinations of activin A, bone morphogenetic protein 4 (BMP4), basic fibroblast growth factor (bFGF, also known as FGF2), vascular endothelial growth factor (VEGF, also known as VEGFA) and dickkopf homolog 1 (DKK1) in serum-free media, human embryonic-stem-cell-derived embryoid bodies generate a KDRlow/C-KIT(CD117)neg population that displays cardiac, endothelial and vascular smooth muscle potential in vitro and, after transplantation, in vivo.",
+    "When plated in monolayer cultures, these KDRlow/C-KITneg cells differentiate to generate populations consisting of greater than 50% contracting cardiomyocytes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "4427392",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

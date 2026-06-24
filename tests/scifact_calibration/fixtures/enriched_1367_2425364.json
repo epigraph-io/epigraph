@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1367,
+  "claim": "Vitamin D deficiency effects birth weight.",
+  "evidence_sentences": [
+    "Pregnant women with low serum 25-OHD levels had an increased risk of bacterial vaginosis and low birthweight infants but not delivery by caesarean section.   \n",
+    "Pregnant women with low 25-OHD levels had an increased risk of bacterial vaginosis and lower birth weight infants, but not delivery by caesarean section."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "2425364",
+  "enrichment": {
+    "methodology": "meta_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "scifact_id": 531,
+  "claim": "Human embryonic stem cells have the capacity to give rise to differentiated progeny representative of all three embryonic germ layers.",
+  "evidence_sentences": [
+    "Embryonic stem cells have the ability to remain undifferentiated and proliferate indefinitely in vitro while maintaining the potential to differentiate into derivatives of all three embryonic germ layers."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "36651210",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "in vitro"
+    ],
+    "evidence_type": "logical"
+  }
+}

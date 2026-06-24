@@ -1,0 +1,16 @@
+{
+  "scifact_id": 587,
+  "claim": "In transgenic mice harboring green florescent protein under the control of the Sox2 promoter, less than ten percent of the cells with green florescent colocalize with cell proliferation markers.",
+  "evidence_sentences": [],
+  "ground_truth": "NOT_ENOUGH_INFO",
+  "doc_id": null,
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.1,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

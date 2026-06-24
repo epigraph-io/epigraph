@@ -12,8 +12,12 @@ use epigraph_core::{
     TruthValue,
 };
 use epigraph_crypto::ContentHasher;
+use epigraph_db::access_control::{
+    batch_check_content_access, check_content_access, ContentAccess,
+};
 use epigraph_db::PatchClaimInput;
 use epigraph_db::{ClaimRepository, EdgeRepository, EvidenceRepository, ReasoningTraceRepository};
+use uuid::Uuid;
 
 fn parse_methodology(s: &str) -> Result<Methodology, String> {
     match s.to_lowercase().replace('-', "_").as_str() {
@@ -248,33 +252,52 @@ pub async fn submit_claim(
 pub async fn query_claims(
     server: &EpiGraphMcpFull,
     params: QueryClaimsParams,
+    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
-
-    // Use list with search for now (min/max truth filtering done post-query)
-    let claims = ClaimRepository::list(&server.pool, limit, 0, None)
-        .await
-        .map_err(internal_error)?;
-
     let min = params.min_truth.unwrap_or(0.0);
     let max = params.max_truth.unwrap_or(1.0);
 
+    // Filter by truth range in SQL (before LIMIT) so matching claims outside
+    // the most-recent `limit` rows are still reachable (bug 5a55a48e).
+    let claims = ClaimRepository::list_by_truth_range(&server.pool, min, max, limit, 0)
+        .await
+        .map_err(internal_error)?;
+
+    // Redact PRIVATE content the requester cannot read (A3 §7.5). Build a
+    // per-id access map and look each claim's decision up BY ITS OWN ID rather
+    // than positionally zipping the batch result. The lookup fails closed
+    // (`unwrap_or(Redacted)`), so a future reorder — or any id the batch helper
+    // fails to return — redacts rather than leaks. This is a durable runtime
+    // guard, not a debug-only tripwire.
+    let ids: Vec<Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
+    let access_map: std::collections::HashMap<Uuid, ContentAccess> =
+        batch_check_content_access(&server.pool, &ids, requester)
+            .await
+            .into_iter()
+            .collect();
+
     let results: Vec<ClaimResponse> = claims
         .into_iter()
-        .filter(|c| {
-            let tv = c.truth_value.value();
-            tv >= min && tv <= max
-        })
-        .map(|c| ClaimResponse {
-            id: c.id.as_uuid().to_string(),
-            content: c.content.clone(),
-            truth_value: c.truth_value.value(),
-            agent_id: c.agent_id.as_uuid().to_string(),
-            content_hash: ContentHasher::to_hex(&c.content_hash),
-            created_at: c.created_at.to_rfc3339(),
-            labels: Vec::new(),
-            is_current: true,
-            supersedes: None,
+        .map(|c| {
+            let id = c.id.as_uuid();
+            let access = access_map
+                .get(&id)
+                .copied()
+                .unwrap_or(ContentAccess::Redacted);
+            let (content, content_hash) =
+                crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
+            ClaimResponse {
+                id: id.to_string(),
+                content,
+                truth_value: c.truth_value.value(),
+                agent_id: c.agent_id.as_uuid().to_string(),
+                content_hash,
+                created_at: c.created_at.to_rfc3339(),
+                labels: Vec::new(),
+                is_current: true,
+                supersedes: None,
+            }
         })
         .collect();
 
@@ -284,9 +307,21 @@ pub async fn query_claims(
 pub async fn get_claim(
     server: &EpiGraphMcpFull,
     params: GetClaimParams,
+    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
     let claim_id = ClaimId::from_uuid(id);
+
+    // Resolve the optional (frame, perspective) lens up front (both-or-neither,
+    // parse, existence) so a bad lens fails fast before any belief compute.
+    let lens = crate::tools::lens::resolve_lens(
+        params.frame_id.as_deref(),
+        params.perspective_id.as_deref(),
+    )?;
+    if let Some((frame_id, perspective_id)) = lens {
+        crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
+    }
+
     let claim = ClaimRepository::get_by_id(&server.pool, claim_id)
         .await
         .map_err(internal_error)?
@@ -294,17 +329,70 @@ pub async fn get_claim(
     let labels = ClaimRepository::get_labels(&server.pool, claim_id)
         .await
         .map_err(internal_error)?;
+    let access = check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
+    let (content, content_hash) =
+        crate::tools::redaction::redact_content(access, &claim.content, &claim.content_hash);
+    // Cached CDST classification ('supported' | 'contradicted' |
+    // 'not_enough_info' | null). Flattened onto the standard claim response so
+    // existing `ClaimResponse` consumers are unaffected.
+    let classification = ClaimRepository::get_classification(&server.pool, id)
+        .await
+        .map_err(internal_error)?;
 
-    success_json(&ClaimResponse {
-        id: claim.id.as_uuid().to_string(),
-        content: claim.content.clone(),
-        truth_value: claim.truth_value.value(),
-        agent_id: claim.agent_id.as_uuid().to_string(),
-        content_hash: ContentHasher::to_hex(&claim.content_hash),
-        created_at: claim.created_at.to_rfc3339(),
-        labels,
-        is_current: claim.is_current,
-        supersedes: claim.supersedes.map(|s| s.as_uuid().to_string()),
+    // Additive lensed belief: compute the claim's belief under the chosen lens.
+    // Frame/perspective existence is already validated, so a compute failure
+    // here is a genuine internal error (single-claim tool → propagate, no
+    // page-degrade semantics).
+    let lensed_belief = match lens {
+        Some((frame_id, perspective_id)) => {
+            let interval = epigraph_engine::belief_query::get_perspective_belief(
+                &server.pool,
+                id,
+                frame_id,
+                perspective_id,
+            )
+            .await
+            .map_err(|e| match e {
+                epigraph_engine::BeliefQueryError::FrameNotFound(fid) => {
+                    invalid_params(format!("frame {fid} not found"))
+                }
+                epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
+                    invalid_params(format!("invalid mass function: {msg}"))
+                }
+                other => internal_error(other),
+            })?;
+            Some(LensedBelief::from_interval(
+                frame_id,
+                perspective_id,
+                &interval,
+            ))
+        }
+        None => None,
+    };
+
+    #[derive(serde::Serialize)]
+    struct GetClaimResponse {
+        #[serde(flatten)]
+        claim: ClaimResponse,
+        classification: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lensed_belief: Option<LensedBelief>,
+    }
+
+    success_json(&GetClaimResponse {
+        claim: ClaimResponse {
+            id: claim.id.as_uuid().to_string(),
+            content,
+            truth_value: claim.truth_value.value(),
+            agent_id: claim.agent_id.as_uuid().to_string(),
+            content_hash,
+            created_at: claim.created_at.to_rfc3339(),
+            labels,
+            is_current: claim.is_current,
+            supersedes: claim.supersedes.map(|s| s.as_uuid().to_string()),
+        },
+        classification,
+        lensed_belief,
     })
 }
 
@@ -633,4 +721,54 @@ pub async fn patch_claim(
         "after_properties": diff.after_props,
         "after_trace": diff.after_trace,
     }))
+}
+
+pub async fn query_undecomposed_claims(
+    server: &EpiGraphMcpFull,
+    params: crate::types::QueryUndecomposedClaimsParams,
+    requester: Option<Uuid>,
+) -> Result<CallToolResult, McpError> {
+    let limit = params.limit.unwrap_or(50).clamp(1, 1000);
+    let offset = params.offset.unwrap_or(0).max(0);
+
+    let claims = ClaimRepository::list_undecomposed(&server.pool, limit, offset)
+        .await
+        .map_err(internal_error)?;
+
+    // Apply partition-aware content redaction so private/community-partitioned
+    // claims are not exposed to requesters who don't own them (parity with
+    // query_claims and get_claim — security finding: this path previously
+    // bypassed the check_content_access / batch_check_content_access layer).
+    let ids: Vec<Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
+    let access_map: std::collections::HashMap<Uuid, ContentAccess> =
+        batch_check_content_access(&server.pool, &ids, requester)
+            .await
+            .into_iter()
+            .collect();
+
+    let results: Vec<ClaimResponse> = claims
+        .into_iter()
+        .map(|c| {
+            let id = c.id.as_uuid();
+            let access = access_map
+                .get(&id)
+                .copied()
+                .unwrap_or(ContentAccess::Redacted);
+            let (content, content_hash) =
+                crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
+            ClaimResponse {
+                id: id.to_string(),
+                content,
+                truth_value: c.truth_value.value(),
+                agent_id: c.agent_id.as_uuid().to_string(),
+                content_hash,
+                created_at: c.created_at.to_rfc3339(),
+                labels: Vec::new(),
+                is_current: true,
+                supersedes: None,
+            }
+        })
+        .collect();
+
+    success_json(&results)
 }

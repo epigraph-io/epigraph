@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1265,
+  "claim": "The risk of breast cancer among parous women decreases with placental weight of pregnancies.",
+  "evidence_sentences": [
+    "Compared with women who had placentas weighing less than 500 g in 2 consecutive pregnancies, the risk of breast cancer was increased among women whose placentas weighed between 500 and 699 g in their first pregnancy and at least 700 g in their second pregnancy (or vice versa) (adjusted hazard ratio, 1.82; 95% confidence interval [CI], 1.07-3.08), and the corresponding risk was doubled among women whose placentas weighed at least 700 g in both pregnancies (adjusted hazard ratio, 2.05; 95% CI, 1.15-3.64).",
+    "CONCLUSIONS Placental weight is positively associated with maternal risk of breast cancer."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "37480103",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

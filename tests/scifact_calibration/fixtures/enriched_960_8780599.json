@@ -1,0 +1,22 @@
+{
+  "scifact_id": 960,
+  "claim": "Polymeal nutrition reduces cardiovascular mortality.",
+  "evidence_sentences": [
+    "For men, taking the Polymeal daily represented an increase in total life expectancy of 6.6 years, an increase in life expectancy free from cardiovascular disease of 9.0 years, and a decrease in life expectancy with cardiovascular disease of 2.4 years.",
+    "CONCLUSION The Polymeal promises to be an effective, non-pharmacological, safe, cheap, and tasty alternative to reduce cardiovascular morbidity and increase life expectancy in the general population."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "8780599",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "daily Polymeal intake",
+      "male subjects"
+    ],
+    "evidence_type": "statistical"
+  }
+}

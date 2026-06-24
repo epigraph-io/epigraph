@@ -1,0 +1,20 @@
+{
+  "scifact_id": 1107,
+  "claim": "Subcutaneous fat depots undergo extensive browning processes after cold exposure.",
+  "evidence_sentences": [
+    "During cold-induced 'browning' of subcutaneous fat, most 'beige' adipocytes stem from de novo\u2013differentiated adipocytes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "20532591",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "cold exposure"
+    ],
+    "evidence_type": "empirical"
+  }
+}

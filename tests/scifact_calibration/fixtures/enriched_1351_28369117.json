@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1351,
+  "claim": "Upregulation of dynein in Drosophila neurons increases the number of microtubule plus-ends growing toward the cell body of each neuron.",
+  "evidence_sentences": [
+    "Axonal microtubules are normally oriented uniformly plus-end-distal; however, without dynein, axons contain both plus- and minus-end distal microtubules."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "28369117",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

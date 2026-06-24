@@ -1,0 +1,30 @@
+{
+  "scifact_id": 397,
+  "claim": "Exercise reduces cancer mortality rates among Chinese citizens.",
+  "evidence_sentences": [
+    "Compared to women with a score of zero, hazard ratios (95% confidence intervals) for women with four to five factors were 0.57 (0.44-0.74) for total mortality, 0.29 (0.16-0.54) for CVD mortality, and 0.76 (0.54-1.06) for cancer mortality.",
+    "The population attributable risks for not having 4-5 healthy lifestyle factors were 33% for total deaths, 59% for CVD deaths, and 19% for cancer deaths.   \n",
+    "CONCLUSIONS In this first study, to our knowledge, to quantify the combined impact of lifestyle-related factors on mortality outcomes in Chinese women, a healthier lifestyle pattern-including being of normal weight, lower central adiposity, participation in physical activity, nonexposure to spousal smoking, and higher fruit and vegetable intake-was associated with reductions in total and cause-specific mortality among lifetime nonsmoking and nondrinking women, supporting the importance of overall lifestyle modification in disease prevention."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "1456068",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.72,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "lifetime nonsmoking women",
+      "nondrinking women",
+      "four to five healthy lifestyle factors combined",
+      "normal weight",
+      "lower central adiposity",
+      "participation in physical activity",
+      "nonexposure to spousal smoking",
+      "higher fruit and vegetable intake"
+    ],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

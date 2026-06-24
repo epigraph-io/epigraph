@@ -1,0 +1,26 @@
+{
+  "scifact_id": 1089,
+  "claim": "Smc5/6 engagment drives the activation of SUMO E3 ligase Mms21 by ATP-dependent remolding.",
+  "evidence_sentences": [
+    "In accordance, scanning force microscopy of the Smc5-Mms21 heterodimer shows that the molecule is physically remodeled in an ATP-dependent manner."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "17628888",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.6,
+    "supports_claim": true,
+    "instruments_used": [
+      "scanning force microscopy"
+    ],
+    "reagents_involved": [
+      "Smc5",
+      "Mms21",
+      "ATP"
+    ],
+    "conditions": [
+      "ATP-dependent"
+    ],
+    "evidence_type": "empirical"
+  }
+}

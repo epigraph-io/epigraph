@@ -174,37 +174,44 @@ pub async fn create_agent(
     // update path or direct DB write for properties. The field is accepted
     // here for forward-compatibility but not persisted until core model is extended.
     let _ = request.properties; // acknowledged but unused until core model supports it
-    let created_agent = AgentRepository::create(&state.db_pool, &agent).await?;
+    let (created_agent, was_created) =
+        AgentRepository::create_or_get(&state.db_pool, &agent).await?;
     let new_agent_id = Uuid::from(created_agent.id);
 
-    // Auto-provision an OAuth client for the new agent when caller is authenticated
-    if let Some(axum::Extension(auth)) = &auth_ctx {
-        let client_id_str = hex::encode(public_key);
-        let client_name = created_agent.display_name.as_deref().unwrap_or("Agent");
-        let scopes: Vec<String> = AGENT_DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
+    // Auto-provision an OAuth client only for a *newly created* agent (and only
+    // when the caller is authenticated). On a find-hit the client already
+    // exists from the original registration; re-creating it would hit the
+    // `oauth_clients` unique constraint on `client_id` and warn-spam the log.
+    if was_created {
+        if let Some(axum::Extension(auth)) = &auth_ctx {
+            let client_id_str = hex::encode(public_key);
+            let client_name = created_agent.display_name.as_deref().unwrap_or("Agent");
+            let scopes: Vec<String> = AGENT_DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
 
-        if let Err(e) = OAuthClientRepository::create(
-            &state.db_pool,
-            &client_id_str,
-            None, // no client_secret_hash for agent clients
-            client_name,
-            "agent",
-            &scopes, // allowed_scopes
-            &scopes, // granted_scopes (auto-approved for agents)
-            "active",
-            Some(new_agent_id),   // agent_id
-            Some(auth.client_id), // owner_id = the creating user/service
-            None,                 // legal_entity_name
-            None,                 // legal_contact_email
-        )
-        .await
-        {
-            // Log but don't fail agent creation — the agent row already exists
-            tracing::warn!(
-                agent_id = %new_agent_id,
-                error = %e,
-                "Failed to auto-provision OAuth client for new agent"
-            );
+            if let Err(e) = OAuthClientRepository::create(
+                &state.db_pool,
+                &client_id_str,
+                None, // no client_secret_hash for agent clients
+                client_name,
+                "agent",
+                &scopes, // allowed_scopes
+                &scopes, // granted_scopes (auto-approved for agents)
+                "active",
+                Some(new_agent_id),   // agent_id
+                Some(auth.client_id), // owner_id = the creating user/service
+                None,                 // legal_entity_name
+                None,                 // legal_contact_email
+                None, // redirect_uris: agents use Ed25519 assertion auth, no redirect
+            )
+            .await
+            {
+                // Log but don't fail agent creation — the agent row already exists
+                tracing::warn!(
+                    agent_id = %new_agent_id,
+                    error = %e,
+                    "Failed to auto-provision OAuth client for new agent"
+                );
+            }
         }
     }
 

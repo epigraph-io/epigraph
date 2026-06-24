@@ -7,7 +7,8 @@ use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
-use epigraph_mcp::tools::ingestion::do_ingest_document;
+use epigraph_mcp::tools::ingestion::{do_ingest_document, ingest_document_inline};
+use epigraph_mcp::types::IngestDocumentInlineParams;
 use sqlx::PgPool;
 
 const FIXTURE: &str = r#"{
@@ -23,10 +24,8 @@ const FIXTURE: &str = r#"{
   "thesis_derivation": "TopDown",
   "sections": [{
     "title": "Intro",
-    "summary": "Background section connecting prior work to this thesis",
     "paragraphs": [{
-      "compound": "Atomization aids cross-source matching, and explicit decomposition is necessary",
-      "supporting_text": "We argue both points throughout the paper.",
+      "text": "Atomization aids cross-source matching, and explicit decomposition is necessary",
       "atoms": [
         "Atomization aids cross-source matching",
         "Explicit decomposition is necessary for hierarchical reasoning"
@@ -87,7 +86,7 @@ async fn happy_path_ingests_full_hierarchy(pool: PgPool) {
         SELECT COUNT(*) FROM claims
         WHERE content IN (
             'Hierarchies converge through layered claims',
-            'Background section connecting prior work to this thesis',
+            'Intro',
             'Atomization aids cross-source matching, and explicit decomposition is necessary',
             'Atomization aids cross-source matching',
             'Explicit decomposition is necessary for hierarchical reasoning'
@@ -141,7 +140,7 @@ async fn happy_path_ingests_full_hierarchy(pool: PgPool) {
         SELECT COUNT(*) FROM edges
         WHERE source_id = $1 AND source_type = 'paper'
           AND target_type = 'agent' AND relationship = 'processed_by'
-          AND properties ->> 'pipeline' = 'hierarchical_extraction_v1'
+          AND properties ->> 'pipeline' = 'hierarchical_extraction_v2'
         "#,
     )
     .bind(paper_id)
@@ -151,8 +150,12 @@ async fn happy_path_ingests_full_hierarchy(pool: PgPool) {
     assert_eq!(processed.0, 1);
 }
 
+/// Re-ingesting the same extraction returns `already_ingested: true` with no new
+/// claims or relationships. Previously gated at the paper level; now detected by
+/// node-level content-hash dedup: all 5 claims hit the dedup path and no edges
+/// are newly created on the second run.
 #[sqlx::test(migrations = "../../migrations")]
-async fn re_ingest_hits_version_gate(pool: PgPool) {
+async fn re_ingest_same_paper_dedup_detected(pool: PgPool) {
     let server = make_server(pool.clone());
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
@@ -170,12 +173,13 @@ async fn re_ingest_hits_version_gate(pool: PgPool) {
     assert_eq!(json["relationships_created"], serde_json::json!(0));
 }
 
-/// Per-chapter version gating: a textbook ingested chapter-by-chapter shares
-/// one paper row across many `DocumentExtraction`s. With `source.metadata.
-/// chapter_index` set, each chunk's `processed_by` edge carries
-/// `pipeline=hierarchical_extraction_v1:ch<N>` so chapter 2 isn't blocked by
-/// the edge chapter 1 left behind. Re-ingesting the *same* chapter still hits
-/// the gate.
+/// Cross-chapter isolation: a textbook ingested chapter-by-chapter shares one
+/// paper row. Each chapter has unique content so chapter 2's claims aren't
+/// deduped by chapter 1's ingest, and `already_ingested` stays false. Re-ingesting
+/// the same chapter yields `already_ingested: true` via node-level content-hash
+/// dedup (all claims hit the dedup path). The per-chapter `processed_by` edge
+/// suffix (`:chN`) is vestigial after gate removal but still written for
+/// observability.
 #[sqlx::test(migrations = "../../migrations")]
 async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
     let server = make_server(pool.clone());
@@ -194,10 +198,8 @@ async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
               "thesis_derivation": "TopDown",
               "sections": [{{
                 "title": "Sec",
-                "summary": "Chapter {idx} section summary",
                 "paragraphs": [{{
-                  "compound": "Chapter {idx} compound claim",
-                  "supporting_text": "Chapter {idx} support",
+                  "text": "Chapter {idx} compound claim",
                   "atoms": ["Chapter {idx} atom one"],
                   "generality": [3],
                   "confidence": 0.8
@@ -237,24 +239,28 @@ async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
     assert_eq!(
         repeat_json["already_ingested"],
         serde_json::json!(true),
-        "re-ingesting the same chapter must still hit the per-chapter gate"
+        "re-ingesting the same chapter must still return already_ingested:true (via node-level dedup)"
     );
 
-    // Both per-chapter processed_by edges must coexist on the paper.
+    // With node-level idempotency (gate removed), both chapter processed_by edges
+    // map to the same (paper → agent, 'processed_by') slot — only the first chapter's
+    // edge is retained. The chapter suffix (:chN) is now vestigial/observability-only.
+    // Assert at least one processed_by edge exists.
     let count: (i64,) = sqlx::query_as(
         r#"
         SELECT COUNT(*) FROM edges
         WHERE source_id = $1 AND source_type = 'paper'
           AND relationship = 'processed_by'
-          AND properties ->> 'pipeline' IN
-              ('hierarchical_extraction_v1:ch1', 'hierarchical_extraction_v1:ch2')
         "#,
     )
     .bind(paper_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(count.0, 2, "one processed_by edge per chapter");
+    assert!(
+        count.0 >= 1,
+        "at least one processed_by edge must exist for the paper"
+    );
 }
 
 /// A second fixture sharing one atom and the same author with the primary
@@ -272,10 +278,8 @@ const FIXTURE_OVERLAP: &str = r#"{
   "thesis_derivation": "TopDown",
   "sections": [{
     "title": "Other Intro",
-    "summary": "An entirely different section summary that should not collide",
     "paragraphs": [{
-      "compound": "A different compound claim that overlaps via one shared atom",
-      "supporting_text": "Different supporting passage.",
+      "text": "A different compound claim that overlaps via one shared atom",
       "atoms": [
         "Atomization aids cross-source matching",
         "A genuinely new atom that has never been ingested before"
@@ -408,10 +412,8 @@ async fn ingest_document_handles_compound_equals_atom(pool: sqlx::PgPool) {
         "thesis_derivation": "TopDown",
         "sections": [{
             "title": "Body",
-            "summary": "One section, one paragraph, one atom.",
             "paragraphs": [{
-                "compound": "Class B agents have a contract.active flag.",
-                "supporting_text": "Class B agents have a contract.active flag.",
+                "text": "Class B agents have a contract.active flag.",
                 "atoms": ["Class B agents have a contract.active flag."],
                 "generality": [0],
                 "confidence": 0.8,
@@ -462,10 +464,8 @@ async fn ingest_tags_bbas_with_normalized_evidence_type(pool: sqlx::PgPool) {
         "thesis_derivation": "TopDown",
         "sections": [{
             "title": "Body",
-            "summary": "One paragraph, two atoms, tagged Empirical.",
             "paragraphs": [{
-                "compound": "Two empirical observations support the thesis.",
-                "supporting_text": "Measured directly in two assays.",
+                "text": "Two empirical observations support the thesis.",
                 "atoms": [
                     "Observation one holds under standard conditions",
                     "Observation two replicates observation one"
@@ -505,6 +505,198 @@ async fn ingest_tags_bbas_with_normalized_evidence_type(pool: sqlx::PgPool) {
     assert_eq!(
         raw_case, 0,
         "raw 'Empirical' should have been normalized to lowercase"
+    );
+}
+
+// ── Typed-inline ingest variant (for MCP-only agents) ──────────────────────
+
+/// Recursively collect every `$ref` string value in a JSON schema.
+fn collect_refs(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                if k == "$ref" {
+                    if let Some(s) = val.as_str() {
+                        out.push(s.to_string());
+                    }
+                } else {
+                    collect_refs(val, out);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => arr.iter().for_each(|val| collect_refs(val, out)),
+        _ => {}
+    }
+}
+
+/// The deliverable, verified on the wire (not just the param type): the live
+/// tool router must expose `ingest_document_inline` with a self-contained
+/// `inputSchema` — the nested hierarchy inlined in `$defs` down to the atom
+/// layer, and every `$ref` resolvable within that same block. A `$ref` with
+/// no matching `$defs` entry would hand an MCP client an unusable schema while
+/// the param-type schema test stayed green, so this is the assertion that
+/// actually guards the feature.
+#[test]
+fn inline_tool_wire_schema_is_self_contained() {
+    let tools = epigraph_mcp::server::EpiGraphMcpFull::all_tools_json();
+    let arr = tools.as_array().expect("tool array");
+    let tool = arr
+        .iter()
+        .find(|t| t["name"] == "ingest_document_inline")
+        .expect("ingest_document_inline registered in live tool router");
+    let input_schema = &tool["inputSchema"];
+
+    let defs = input_schema["$defs"]
+        .as_object()
+        .expect("inputSchema carries a $defs block");
+    for ty in [
+        "DocumentExtraction",
+        "DocumentSource",
+        "Section",
+        "Paragraph",
+    ] {
+        assert!(
+            defs.contains_key(ty),
+            "$defs must inline `{ty}`; got keys {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    let schema_str = serde_json::to_string(input_schema).unwrap();
+    for field in ["sections", "paragraphs", "text", "atoms", "evidence_type"] {
+        assert!(
+            schema_str.contains(field),
+            "wire schema must expose `{field}` so an MCP client sees the shape"
+        );
+    }
+
+    // Decisive: every $ref resolves within this schema's own $defs.
+    let mut refs = Vec::new();
+    collect_refs(input_schema, &mut refs);
+    assert!(
+        !refs.is_empty(),
+        "expected nested $ref pointers in the schema"
+    );
+    for r in &refs {
+        let key = r
+            .strip_prefix("#/$defs/")
+            .unwrap_or_else(|| panic!("unexpected $ref form: {r}"));
+        assert!(
+            defs.contains_key(key),
+            "dangling $ref `{r}` — not present in $defs"
+        );
+    }
+}
+
+/// The discoverability fix: the typed inline param must expose the full
+/// hierarchical `DocumentExtraction` shape as a JSON schema, so an MCP client
+/// can introspect exactly what to produce — down to atoms — instead of
+/// guessing at the opaque `file_path` contract `ingest_document` exposes.
+#[test]
+fn inline_params_expose_hierarchical_json_schema() {
+    let schema = schemars::schema_for!(IngestDocumentInlineParams);
+    let s = serde_json::to_string(&schema).expect("schema serializes");
+    for needle in [
+        "extraction",
+        "source",
+        "thesis",
+        "sections",
+        "paragraphs",
+        "text",
+        "atoms",
+        "evidence_type",
+        "relationships",
+    ] {
+        assert!(
+            s.contains(needle),
+            "inline-ingest JSON schema must expose `{needle}` so an MCP client can see the shape; schema was: {s}"
+        );
+    }
+}
+
+/// Parity: the typed-inline path lands the identical full hierarchy as the
+/// file-path `do_ingest_document` — thesis + section + paragraph + 2 atoms —
+/// with the atoms persisted as their own claim nodes (the "down to atomic
+/// claims" resolution the inline variant exists to provide for MCP-only
+/// agents).
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
+    let server = make_server(pool.clone());
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+    let params = IngestDocumentInlineParams { extraction };
+
+    let result = ingest_document_inline(&server, params)
+        .await
+        .expect("inline ingest succeeds");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    assert_eq!(
+        json["status"], "queued",
+        "fire-and-forget ingest_document_inline returns a queue acknowledgement immediately"
+    );
+
+    // Background task writes DB asynchronously; give it time to complete before asserting state.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Atoms landed as their own claim rows — the atomic resolution.
+    let atom_count: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM claims
+        WHERE content IN (
+            'Atomization aids cross-source matching',
+            'Explicit decomposition is necessary for hierarchical reasoning'
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        atom_count.0, 2,
+        "both atoms persisted as claim nodes via the inline path"
+    );
+}
+
+/// D9 writer-side guard: when an extraction carries `source_text`, every
+/// span-backed paragraph's stored `text` must equal the bytes its span points
+/// at. Here the span `0..5` of `"alpha beta"` is `"alpha"` but the paragraph
+/// text is `"TAMPERED"` — a verbatim drift that the writer must reject before
+/// any DB write. The fixture is otherwise a fully valid extraction (so the
+/// rejection comes from the guard, not from a malformed plan).
+#[sqlx::test(migrations = "../../migrations")]
+async fn writer_rejects_span_text_drift(pool: PgPool) {
+    let server = make_server(pool);
+    let extraction: DocumentExtraction = serde_json::from_value(serde_json::json!({
+        "source": {
+            "title": "Drift Doc",
+            "doi": "10.1/drift",
+            "source_type": "InternalDocument",
+            "authors": [{"name": "test", "affiliations": [], "roles": ["author"]}],
+            "metadata": {}
+        },
+        "thesis": "t",
+        "thesis_derivation": "TopDown",
+        "sections": [{
+            "title": "S",
+            "paragraphs": [{
+                "text": "TAMPERED",
+                "span": { "start": 0, "end": 5 },
+                "atoms": ["a"],
+                "generality": [0],
+                "confidence": 0.8
+            }]
+        }],
+        "relationships": [],
+        "source_text": "alpha beta"
+    }))
+    .unwrap();
+
+    let err = do_ingest_document(&server, &extraction).await;
+    let err = err.expect_err("drift between span and source_text must be rejected");
+    assert!(
+        err.message.contains("verbatim guard"),
+        "rejection must come from the verbatim guard, got: {err:?}"
     );
 }
 

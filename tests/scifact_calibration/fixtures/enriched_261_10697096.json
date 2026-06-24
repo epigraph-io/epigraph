@@ -1,0 +1,25 @@
+{
+  "scifact_id": 261,
+  "claim": "Chronic aerobic exercise alters endothelial function, improving vasodilating mechanisms mediated by NO.",
+  "evidence_sentences": [
+    "CONCLUSIONS These results suggest that exercise training enhances bradykinin-induced vasodilation through increased endothelium-derived relaxing factor/nitric oxide production by the L-arginine/nitric oxide synthase pathway."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "10697096",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "bradykinin",
+      "L-arginine",
+      "nitric oxide"
+    ],
+    "conditions": [
+      "exercise training",
+      "bradykinin-induced vasodilation"
+    ],
+    "evidence_type": "empirical"
+  }
+}

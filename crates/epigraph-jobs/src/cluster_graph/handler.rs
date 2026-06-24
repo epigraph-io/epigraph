@@ -3,7 +3,10 @@ use sqlx::PgPool;
 use std::sync::Arc;
 
 use super::runner::{run_clustering, RunConfig};
-use crate::{EpiGraphJob, Job, JobError, JobHandler, JobResult, JobResultMetadata};
+use crate::{
+    run_serialized, EpiGraphJob, Job, JobError, JobHandler, JobResult, JobResultMetadata,
+    CLUSTER_GRAPH_LOCK_KEY,
+};
 
 pub struct ClusterGraphHandler {
     pool: Arc<PgPool>,
@@ -37,17 +40,38 @@ impl JobHandler for ClusterGraphHandler {
         };
 
         let started = std::time::Instant::now();
-        let summary = run_clustering(
-            &self.pool,
-            &RunConfig {
-                resolution,
-                retain_runs,
-            },
-        )
-        .await
-        .map_err(|e| JobError::ProcessingFailed {
-            message: e.to_string(),
-        })?;
+
+        // Serialize: at most one cluster_graph run executes at a time across
+        // workers AND processes. A contended run is a cheap no-op rather than
+        // a second full clustering pass stacked on the first.
+        let pool_for_body = Arc::clone(&self.pool);
+        let outcome = run_serialized(self.pool.as_ref(), CLUSTER_GRAPH_LOCK_KEY, async move {
+            run_clustering(
+                pool_for_body.as_ref(),
+                &RunConfig {
+                    resolution,
+                    retain_runs,
+                },
+            )
+            .await
+            .map_err(|e| JobError::ProcessingFailed {
+                message: e.to_string(),
+            })
+        })
+        .await?;
+
+        let Some(summary) = outcome else {
+            tracing::info!("cluster_graph: another run holds the advisory lock; skipping");
+            return Ok(JobResult {
+                output: serde_json::json!({ "skipped_locked": true }),
+                execution_duration: started.elapsed(),
+                metadata: JobResultMetadata {
+                    worker_id: Some("cluster-graph".into()),
+                    items_processed: Some(0),
+                    extra: std::collections::HashMap::default(),
+                },
+            });
+        };
 
         let mut extra = std::collections::HashMap::new();
         extra.insert("run_id".into(), serde_json::json!(summary.run_id));

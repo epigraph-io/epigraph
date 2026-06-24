@@ -1,0 +1,19 @@
+{
+  "scifact_id": 797,
+  "claim": "Mitochondria play a major role in energy production.",
+  "evidence_sentences": [
+    "Mitochondria are the primary energy-generating system in most eukaryotic cells."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "8551160",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.85,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "testimonial",
+    "tier2_enriched": true
+  }
+}

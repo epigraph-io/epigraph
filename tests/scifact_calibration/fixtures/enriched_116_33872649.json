@@ -1,0 +1,18 @@
+{
+  "scifact_id": 116,
+  "claim": "Anthrax spores remain deadly until affected areas are decontaminated.",
+  "evidence_sentences": [
+    "More than 80% of the B anthracis particles collected on stationary monitors were within an alveolar respirable size range of 0.95 to 3.5 micro m.   CONCLUSIONS Bacillus anthracis spores used in a recent terrorist incident reaerosolized under common office activities."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "33872649",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.0,
+    "supports_claim": false,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "circumstantial"
+  }
+}

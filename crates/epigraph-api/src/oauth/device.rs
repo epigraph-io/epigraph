@@ -53,6 +53,19 @@ fn generate_state() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Crate-internal wrapper exposing [`generate_pkce`] to other oauth submodules
+/// (the authorization endpoint reuses the same PKCE construction for the
+/// EpiGraph↔Google leg). Kept `pub(crate)` so it never widens the public API.
+pub(crate) fn generate_pkce_public() -> (String, String) {
+    generate_pkce()
+}
+
+/// Crate-internal wrapper exposing [`generate_state`] to other oauth submodules
+/// (the authorization endpoint needs a fresh CSRF `state` for the Google leg).
+pub(crate) fn generate_state_public() -> String {
+    generate_state()
+}
+
 fn extract_code(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.contains("code=") {

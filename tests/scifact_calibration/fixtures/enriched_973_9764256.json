@@ -1,0 +1,20 @@
+{
+  "scifact_id": 973,
+  "claim": "Primary cervical cytology screening with HPV detection has higher longitudinal sensitivity to detect severe cervical intraepithelial neoplasia than conventional cytology.",
+  "evidence_sentences": [
+    "Furthermore, significantly more cases of CIN grade 2 or worse were detected in the intervention group than in the control group (267 of 19 999 vs 215 of 20,106; 1\u00b725, 1\u00b705-1\u00b750; p=0\u00b7015).",
+    "INTERPRETATION Implementation of HPV DNA testing in cervical screening leads to earlier detection of clinically relevant CIN grade 2 or worse, which when adequately treated, improves protection against CIN grade 3 or worse and cervical cancer."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "9764256",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "statistical",
+    "tier2_enriched": true
+  }
+}

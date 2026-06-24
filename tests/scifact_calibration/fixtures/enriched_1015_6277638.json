@@ -1,0 +1,19 @@
+{
+  "scifact_id": 1015,
+  "claim": "Rapamycin delays aging in fruit flies.",
+  "evidence_sentences": [
+    "We show here that feeding rapamycin to adult Drosophila produces the life span extension seen in some TOR mutants."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6277638",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [],
+    "evidence_type": "empirical",
+    "tier2_enriched": true
+  }
+}

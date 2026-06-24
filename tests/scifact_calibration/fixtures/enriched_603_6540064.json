@@ -1,0 +1,27 @@
+{
+  "scifact_id": 603,
+  "claim": "Increased LDL receptors plays a role in the reduction of plasma Lp(a).",
+  "evidence_sentences": [
+    "RESULTS Alirocumab reduced ultracentrifugally isolated LDL-C by 55.1%, LDL-apoB by 56.3%, and plasma Lp(a) by 18.7%.",
+    "The fall in LDL-apoB was caused by an 80.4% increase in LDL-apoB FCR and a 23.9% reduction in LDL-apoB PR.",
+    "The latter was due to a 46.1% increase in IDL-apoB FCR coupled with a 27.2% decrease in conversion of IDL to LDL.",
+    "The increase in apo(a) FCR during alirocumab treatment suggests that increased LDL receptors may also play a role in the reduction of plasma Lp(a).   "
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "6540064",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.75,
+    "supports_claim": true,
+    "instruments_used": [
+      "ultracentrifuge"
+    ],
+    "reagents_involved": [
+      "alirocumab"
+    ],
+    "conditions": [
+      "alirocumab treatment"
+    ],
+    "evidence_type": "empirical"
+  }
+}

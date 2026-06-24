@@ -444,17 +444,37 @@ pub async fn create_claim(
     let (created_claim, was_created) = if request.if_not_exists {
         ClaimRepository::create_or_get(&mut tx, &claim).await?
     } else {
+        // The (content_hash, agent_id) UNIQUE constraint that create_strict's
+        // 409-on-duplicate contract relied on was dropped (migration 107), so
+        // create_strict now silently INSERTs duplicates — 20+ identical claims
+        // accumulated this way (bug c11c1295). Re-assert the contract at the app
+        // layer: refuse a duplicate up front with the same 409 the constraint
+        // would have produced. (Restoring the DB constraint requires de-duping
+        // existing rows first and is a separate migration; adding it here would
+        // brick API boot on the existing duplicates.)
+        let content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
+        let agent_uuid: Uuid = claim.agent_id.into();
+        let dup_conflict = || {
+            ApiError::Conflict {
+            reason: "claim already exists for this (content_hash, agent_id); use if_not_exists=true to retrieve it".to_string(),
+        }
+        };
+        if ClaimRepository::find_by_content_hash_and_agent(
+            &mut tx,
+            content_hash.as_slice(),
+            agent_uuid,
+        )
+        .await?
+        .is_some()
+        {
+            return Err(dup_conflict());
+        }
         match ClaimRepository::create_strict(&mut tx, &claim).await {
             Ok(c) => (c, true),
-            Err(epigraph_db::DbError::DuplicateKey { .. }) => {
-                // Post-107: the (content_hash, agent_id) UNIQUE constraint fired.
-                // Surface as 409 Conflict so callers can distinguish "already
-                // exists for this agent" from a generic 400. Pre-107 this branch
-                // is unreachable because the constraint does not exist.
-                return Err(ApiError::Conflict {
-                    reason: "claim already exists for this (content_hash, agent_id); use if_not_exists=true to retrieve it".to_string(),
-                });
-            }
+            // Belt-and-suspenders: if the UNIQUE constraint is ever restored, or
+            // a concurrent writer wins the race between the check above and this
+            // INSERT, still surface 409 rather than a generic 500.
+            Err(epigraph_db::DbError::DuplicateKey { .. }) => return Err(dup_conflict()),
             Err(e) => return Err(e.into()),
         }
     };
@@ -846,7 +866,13 @@ pub async fn get_claim(
         response.group_id = Some(enc.group_id);
     }
 
-    let access = check_content_access(&state.db_pool, id, params.agent_id).await;
+    // SECURITY (A3): derive the requester from the authenticated AuthContext
+    // (agent_id, falling back to client_id), NEVER the spoofable
+    // params.agent_id wire value. params.agent_id stays parsed-but-ignored.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    let access = check_content_access(&state.db_pool, id, requester).await;
     if access == ContentAccess::Redacted {
         crate::access_control::redact_claim_content(&mut response.content);
     }
@@ -985,8 +1011,12 @@ pub async fn list_claims(
     // Transaction auto-rolls-back on drop (read-only, no commit needed)
     drop(tx);
 
+    // SECURITY (A3): use the authenticated requester, not params.agent_id.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
     for item in &mut items {
-        let access = check_content_access(&state.db_pool, item.id, params.agent_id).await;
+        let access = check_content_access(&state.db_pool, item.id, requester).await;
         if access == ContentAccess::Redacted {
             crate::access_control::redact_claim_content(&mut item.content);
         }

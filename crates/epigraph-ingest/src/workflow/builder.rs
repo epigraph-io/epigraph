@@ -62,7 +62,29 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
 
     for (pi, phase) in extraction.phases.iter().enumerate() {
         let phase_path = format!("phases[{pi}]");
-        let phase_hash = content_hash(&phase.summary);
+        // BUGFIX (k1-trace-bug): `Phase.summary` carries `#[serde(default)]` in
+        // schema.rs so it silently defaults to `""` when the field is omitted from
+        // JSON input. Passing an empty string as `content` to
+        // `ClaimRepository::create_with_id_if_absent` violates the DB constraint
+        // `claims_content_not_empty` (`length(TRIM(BOTH FROM content)) > 0`).
+        //
+        // Root-cause line: this was `content_hash(&phase.summary)` / `content:
+        // phase.summary.clone()` with no guard — any caller that omits `summary`
+        // would trigger the constraint, regardless of `canonical_name`.
+        // `improve_workflow_hierarchy` with `parent_canonical_name =
+        // "weekly-capability-audit"` was the first observed trigger, but the bug
+        // affects every code path that reaches `build_ingest_plan`.
+        //
+        // Fix: fall back to `phase.title` (always required, never empty) when
+        // `summary` is blank. The hash is computed from whichever string ends up as
+        // the claim content so the deterministic ID stays consistent with what is
+        // actually persisted.
+        let phase_content = if phase.summary.trim().is_empty() {
+            phase.title.clone()
+        } else {
+            phase.summary.clone()
+        };
+        let phase_hash = content_hash(&phase_content);
         let phase_id = compound_claim_id(&phase_hash, canonical_name);
         phase_ids.push(phase_id);
         path_index.insert(phase_path.clone(), phase_id);
@@ -74,7 +96,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
         // `properties.level` (1 vs 2) to disambiguate phase from step when needed.
         claims.push(PlannedClaim {
             id: phase_id,
-            content: phase.summary.clone(),
+            content: phase_content,
             level: 1,
             properties: serde_json::json!({
                 "level": 1,
@@ -262,5 +284,95 @@ pub fn root_workflow_id(extraction: &WorkflowExtraction) -> Uuid {
 impl crate::common::walker::Walker for WorkflowExtraction {
     fn build_ingest_plan(&self) -> IngestPlan {
         build_ingest_plan(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::schema::ThesisDerivation;
+    use crate::workflow::schema::{Phase, Step, WorkflowSource};
+
+    fn extraction_with_empty_phase_summary() -> WorkflowExtraction {
+        WorkflowExtraction {
+            source: WorkflowSource {
+                canonical_name: "weekly-capability-audit".to_string(),
+                goal: "Audit weekly capabilities".to_string(),
+                generation: 1,
+                parent_canonical_name: Some("weekly-capability-audit".to_string()),
+                authors: vec![],
+                expected_outcome: None,
+                tags: vec![],
+                metadata: serde_json::json!({}),
+            },
+            thesis: Some("Thesis text".to_string()),
+            thesis_derivation: ThesisDerivation::TopDown,
+            phases: vec![Phase {
+                title: "Capability Review".to_string(),
+                summary: "".to_string(), // empty — serde default; triggers constraint bug
+                steps: vec![Step {
+                    compound: "Review all capabilities".to_string(),
+                    rationale: "Need to know what we have".to_string(),
+                    operations: vec!["List capabilities".to_string()],
+                    generality: vec![1],
+                    confidence: 0.9,
+                    evidence_type: None,
+                }],
+            }],
+            relationships: vec![],
+        }
+    }
+
+    /// Regression: a Phase with `summary = ""` (the serde default when the field
+    /// is omitted from JSON) must NOT produce a PlannedClaim with empty content,
+    /// because the DB enforces `claims_content_not_empty` CHECK
+    /// `(length(TRIM(BOTH FROM content)) > 0)`.
+    ///
+    /// Root cause: `Phase.summary` is `#[serde(default)]` (schema.rs:54), so it
+    /// defaults to `""`. `build_ingest_plan` previously passed `phase.summary.clone()`
+    /// directly as `PlannedClaim.content` for level-1 phase claims without guarding
+    /// against an empty value. The fix falls back to `phase.title` when `summary`
+    /// is blank, which is always present and required.
+    #[test]
+    fn phase_with_empty_summary_falls_back_to_title() {
+        let extraction = extraction_with_empty_phase_summary();
+        let plan = build_ingest_plan(&extraction);
+
+        for claim in &plan.claims {
+            assert!(
+                !claim.content.trim().is_empty(),
+                "PlannedClaim at level {} has empty content (would violate \
+                 claims_content_not_empty); id={:?}",
+                claim.level,
+                claim.id,
+            );
+        }
+
+        // The phase claim (level=1) must have fallen back to the title.
+        let phase_claim = plan
+            .claims
+            .iter()
+            .find(|c| c.level == 1)
+            .expect("expected a level-1 phase claim");
+        assert_eq!(
+            phase_claim.content, "Capability Review",
+            "phase claim content should be the phase title when summary is empty"
+        );
+    }
+
+    /// A Phase with a non-empty summary must continue to use the summary as
+    /// content (no regression).
+    #[test]
+    fn phase_with_nonempty_summary_uses_summary() {
+        let mut extraction = extraction_with_empty_phase_summary();
+        extraction.phases[0].summary = "Non-empty summary text".to_string();
+        let plan = build_ingest_plan(&extraction);
+
+        let phase_claim = plan
+            .claims
+            .iter()
+            .find(|c| c.level == 1)
+            .expect("expected a level-1 phase claim");
+        assert_eq!(phase_claim.content, "Non-empty summary text");
     }
 }

@@ -5,12 +5,38 @@
 //! - refresh_token (all client types)
 //! - external provider grant types (registered via providers.toml; e.g. google_id_token, cloudflare_access_jwt)
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
+    Json,
+};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::ApiError;
 use crate::state::AppState;
+
+/// Parse a token request from either `application/x-www-form-urlencoded` — the OAuth 2.0
+/// standard body for the token endpoint (RFC 6749 §4.1.3), sent by claude.ai and other
+/// RFC 6749 / remote-MCP clients — or `application/json`, used by EpiGraph's own agents.
+/// Defaults to form-encoded when the Content-Type is absent, per the spec.
+#[cfg(feature = "db")]
+fn parse_token_request(headers: &HeaderMap, body: &[u8]) -> Result<TokenRequest, ApiError> {
+    let ct = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if ct.starts_with("application/json") {
+        serde_json::from_slice(body).map_err(|e| ApiError::BadRequest {
+            message: format!("invalid JSON token request: {e}"),
+        })
+    } else {
+        serde_urlencoded::from_bytes(body).map_err(|e| ApiError::BadRequest {
+            message: format!("invalid form-encoded token request: {e}"),
+        })
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct TokenRequest {
@@ -31,6 +57,12 @@ pub struct TokenRequest {
     pub id_token: Option<String>,
     /// Generic external-provider assertion (preferred over id_token for non-Google).
     pub assertion: Option<String>,
+    /// For authorization_code grant: the code returned to the client.
+    pub code: Option<String>,
+    /// For authorization_code grant: PKCE verifier.
+    pub code_verifier: Option<String>,
+    /// For authorization_code grant: must equal the redirect_uri used at /authorize.
+    pub redirect_uri: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,15 +74,76 @@ pub struct TokenResponse {
     pub scope: String,
 }
 
+/// Pure allowlist decision for the `refresh_token` grant — re-evaluates the
+/// provider's email allowlist against the persisted identity at refresh time.
+///
+/// This closes the revocation hole: the provision gate
+/// ([`crate::oauth::providers::provision::provision_external_user_client`]) only
+/// runs on a full ID-token / authorization grant, but `handle_refresh_token`
+/// rotates a fresh 30-day refresh token on every call keyed solely on possession
+/// of a valid refresh token. Without re-checking here, an identity removed from
+/// the allowlist would keep renewing access indefinitely (status flip is the only
+/// other stop). Re-running the SAME `email_is_allowed` predicate makes the gate
+/// comment's "removed identities stop authenticating" guarantee true for refresh.
+///
+/// Returns `true` (issue tokens normally — SKIP the gate) when:
+/// * `client_id` has no `':'` (not a `{provider}:{subject}` external client —
+///   agent client_ids are hex pubkeys, service / DCR are `epigraph_{hex}`; gating
+///   these would lock agents/services out of refresh), OR
+/// * the prefix resolves to no registered provider via [`ProviderRegistry::by_name`]
+///   (unknown / removed provider — there is no allowlist left to consult here; whole-
+///   provider de-authorization is an operational `status='suspended'` action), OR
+/// * the resolved provider configures no allowlist (both lists empty — allow-all,
+///   backward compatible with [`crate::oauth::providers::config::email_is_allowed`]).
+///
+/// Returns `false` (DENY) only when an external client's provider HAS a configured
+/// allowlist and `persisted_email` (from `oauth_clients.legal_contact_email`, `""`
+/// when NULL) is not on it. `email_verified` is deliberately NOT consulted: it lives
+/// only on the original assertion (not on `OAuthClientRow`), verification was already
+/// enforced at provision time and does not lapse, and defaulting a missing flag to
+/// `false` would lock out every external client on rotation.
+///
+/// Gated on `feature = "db"` to match its only production caller
+/// (`handle_refresh_token` / `handle_authorization_code`); without the gate it is
+/// dead code under `--no-default-features` and trips `clippy -D warnings`.
+#[cfg(feature = "db")]
+fn refresh_allowed(
+    registry: &crate::oauth::providers::ProviderRegistry,
+    client_id: &str,
+    persisted_email: &str,
+) -> bool {
+    // Provider names are validated to `[a-z0-9-]+` (cannot contain ':'), so the
+    // FIRST ':' is the correct prefix splitter even when a subject embeds colons.
+    let Some((prefix, _)) = client_id.split_once(':') else {
+        return true; // non-external client (agent / service / DCR) — skip the gate.
+    };
+    let Some(provider) = registry.by_name(prefix) else {
+        return true; // unknown / removed provider — no allowlist to consult.
+    };
+    let allowed_emails = provider.allowed_emails();
+    let allowed_domains = provider.allowed_domains();
+    if allowed_emails.is_empty() && allowed_domains.is_empty() {
+        return true; // provider configures no allowlist — allow-all.
+    }
+    crate::oauth::providers::config::email_is_allowed(
+        persisted_email,
+        allowed_emails,
+        allowed_domains,
+    )
+}
+
 /// POST /oauth/token
 #[cfg(feature = "db")]
 pub async fn token_endpoint(
     State(state): State<AppState>,
-    Json(req): Json<TokenRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
+    let req = parse_token_request(&headers, &body)?;
     match req.grant_type.as_str() {
         "client_credentials" => handle_client_credentials(&state, &req).await,
         "refresh_token" => handle_refresh_token(&state, &req).await,
+        "authorization_code" => handle_authorization_code(&state, &req).await,
         other => {
             // Look up an external provider by grant_type.
             if let Some(provider) = state.providers.by_grant_type(other) {
@@ -67,7 +160,8 @@ pub async fn token_endpoint(
 #[cfg(not(feature = "db"))]
 pub async fn token_endpoint(
     State(_state): State<AppState>,
-    Json(_req): Json<TokenRequest>,
+    _headers: HeaderMap,
+    _body: Bytes,
 ) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
     Err(ApiError::ServiceUnavailable {
         service: "database required for OAuth2".to_string(),
@@ -419,6 +513,38 @@ async fn handle_refresh_token(
         });
     }
 
+    // Re-run the provider email allowlist for external (`{provider}:{subject}`)
+    // clients BEFORE minting. The provision gate only fires on a full ID-token /
+    // authorization grant; refresh rotation re-issues a fresh 30d refresh on every
+    // call, so without this an identity removed from the allowlist keeps renewing
+    // access indefinitely. The old token was already revoked above (rotation), so a
+    // denied refresh correctly burns it — a deauthorized identity keeps no reusable
+    // token. SKIP (issue normally) for non-external clients and unconfigured
+    // allowlists; see [`refresh_allowed`].
+    if !refresh_allowed(
+        &state.providers,
+        &client.client_id,
+        client.legal_contact_email.as_deref().unwrap_or(""),
+    ) {
+        tracing::warn!(
+            client_id = %client.client_id,
+            "Denied token refresh: identity no longer in provider email allowlist"
+        );
+        crate::oauth::providers::provision::emit_oauth_audit(
+            &state.db_pool,
+            "oauth_refresh_denied",
+            false,
+            serde_json::json!({
+                "client_id": client.client_id,
+                "email": client.legal_contact_email,
+                "reason": "email_not_in_allowlist",
+            }),
+        );
+        return Err(ApiError::Forbidden {
+            reason: "email no longer authorized for this provider".into(),
+        });
+    }
+
     let ttl = match client.client_type.as_str() {
         "agent" => Duration::minutes(15),
         "human" => Duration::hours(1),
@@ -476,6 +602,187 @@ async fn handle_refresh_token(
             token_type: "Bearer".to_string(),
             expires_in: ttl.num_seconds(),
             refresh_token: Some(new_refresh),
+            scope: effective_scopes.join(" "),
+        }),
+    ))
+}
+
+#[cfg(feature = "db")]
+async fn handle_authorization_code(
+    state: &AppState,
+    req: &TokenRequest,
+) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
+    use base64::Engine;
+    use epigraph_db::repos::authorization_code::AuthorizationCodeRepository;
+    use epigraph_db::repos::oauth_client::OAuthClientRepository;
+    use sha2::Digest;
+
+    let code = req.code.as_deref().ok_or(ApiError::BadRequest {
+        message: "missing code".into(),
+    })?;
+    let verifier = req.code_verifier.as_deref().ok_or(ApiError::BadRequest {
+        message: "missing code_verifier".into(),
+    })?;
+    let redirect_uri = req.redirect_uri.as_deref().ok_or(ApiError::BadRequest {
+        message: "missing redirect_uri".into(),
+    })?;
+    // RFC 9700 §4.1.3 / OAuth 2.1: client_id validation in the authorization_code
+    // grant is a MUST. Extract presence here, alongside the other required-param
+    // checks and BEFORE consume(), so an omitted client_id is rejected without
+    // burning the single-use code. The value-vs-row binding check is below (needs
+    // the consumed row). Making this unconditional closes the binding-bypass where
+    // a captured/replayed code could be redeemed by any caller that simply leaves
+    // client_id out of the token request.
+    let req_client_id = req.client_id.as_deref().ok_or(ApiError::BadRequest {
+        message: "missing client_id".into(),
+    })?;
+
+    // Single-use consume (atomic; rejects used/expired).
+    let raw = code.as_bytes();
+    let code_hash = blake3::hash(raw);
+    let row = AuthorizationCodeRepository::consume(&state.db_pool, code_hash.as_bytes())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?
+        .ok_or(ApiError::BadRequest {
+            message: "invalid_grant: code invalid, used, or expired".into(),
+        })?;
+
+    // PKCE S256: base64url(SHA256(verifier)) == stored challenge.
+    // We assume S256 (we never compute the "plain" transform). That assumption is
+    // safe by construction: oauth_authorization_codes.code_challenge_method defaults
+    // to 'S256' (migration 049), AuthorizationCodeRepository::create never sets a
+    // different value, and Task 7's /authorize will reject any method != "S256"
+    // before a code is ever minted. consume() therefore omits the method column
+    // rather than carrying an always-'S256' field through this hot path.
+    let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()));
+    if computed != row.code_challenge {
+        return Err(ApiError::BadRequest {
+            message: "invalid_grant: PKCE mismatch".into(),
+        });
+    }
+    // Binding checks.
+    if redirect_uri != row.redirect_uri {
+        return Err(ApiError::BadRequest {
+            message: "invalid_grant: redirect_uri mismatch".into(),
+        });
+    }
+    if req_client_id != row.client_id {
+        return Err(ApiError::BadRequest {
+            message: "invalid_grant: client mismatch".into(),
+        });
+    }
+
+    // Load the per-user client to populate token claims (type/owner/agent).
+    let client = OAuthClientRepository::get_by_id(&state.db_pool, row.oauth_client_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?
+        .ok_or(ApiError::BadRequest {
+            message: "invalid_grant: unknown user".into(),
+        })?;
+
+    // get_by_id returns suspended/revoked clients, so gate on status here — same as
+    // handle_client_credentials and handle_refresh_token. Without this, a user whose
+    // client was suspended/revoked could still redeem a valid code for a fresh 1h
+    // access token + 30d refresh token (a 30-day blast radius).
+    if client.status != "active" {
+        return Err(ApiError::Forbidden {
+            reason: format!("Client status is '{}', must be 'active'", client.status),
+        });
+    }
+
+    // Re-run the provider email allowlist before issuing tokens, mirroring
+    // handle_refresh_token, so the SAME invariant holds on every token-issuance
+    // path: an identity de-listed between consent (when the provision gate ran and
+    // minted this code) and code exchange is refused here rather than handed a 1h
+    // access token + 30d refresh. The single-use code was already consumed above,
+    // so a denied exchange burns it. SKIP for non-external clients / unconfigured
+    // allowlists; see [`refresh_allowed`].
+    if !refresh_allowed(
+        &state.providers,
+        &client.client_id,
+        client.legal_contact_email.as_deref().unwrap_or(""),
+    ) {
+        tracing::warn!(
+            client_id = %client.client_id,
+            "Denied authorization_code exchange: identity no longer in provider email allowlist"
+        );
+        crate::oauth::providers::provision::emit_oauth_audit(
+            &state.db_pool,
+            "oauth_authcode_denied",
+            false,
+            serde_json::json!({
+                "client_id": client.client_id,
+                "email": client.legal_contact_email,
+                "reason": "email_not_in_allowlist",
+            }),
+        );
+        return Err(ApiError::Forbidden {
+            reason: "email no longer authorized for this provider".into(),
+        });
+    }
+
+    // TTLs by client type, matching the sibling grant handlers' tables. Per-user
+    // clients are always client_type="human" (1h access / 30d refresh); keying off
+    // client_type keeps the values coupled to type rather than hardcoded.
+    let ttl = match client.client_type.as_str() {
+        "agent" => Duration::minutes(15),
+        "human" => Duration::hours(1),
+        "service" => Duration::hours(1),
+        _ => Duration::minutes(15),
+    };
+    let effective_scopes = row.scopes.clone();
+    let (access_token, _jti) = state
+        .jwt_config
+        .issue_access_token(
+            client.id,
+            effective_scopes.clone(),
+            &client.client_type,
+            client.owner_id,
+            client.agent_id,
+            ttl,
+        )
+        .map_err(|e| ApiError::InternalError {
+            message: format!("JWT signing failed: {e}"),
+        })?;
+
+    // Refresh token (reuse the existing rotation pattern).
+    let refresh_token = {
+        use rand::Rng;
+        let raw: [u8; 32] = rand::thread_rng().gen();
+        let token_str = hex::encode(raw);
+        let hash = blake3::hash(&raw);
+        let refresh_ttl = match client.client_type.as_str() {
+            "agent" => Duration::hours(24),
+            "human" => Duration::days(30),
+            "service" => Duration::days(90),
+            _ => Duration::hours(24),
+        };
+        epigraph_db::repos::refresh_token::RefreshTokenRepository::create(
+            &state.db_pool,
+            hash.as_bytes(),
+            client.id,
+            &effective_scopes,
+            Utc::now() + refresh_ttl,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
+        token_str
+    };
+
+    Ok((
+        StatusCode::OK,
+        Json(TokenResponse {
+            access_token,
+            token_type: "Bearer".to_string(),
+            expires_in: ttl.num_seconds(),
+            refresh_token: Some(refresh_token),
             scope: effective_scopes.join(" "),
         }),
     ))
@@ -608,5 +915,166 @@ mod assertion_tests {
         let client_id = hex::encode(pk);
 
         assert!(verify_agent_assertion(&assertion, &pk, &client_id).is_ok());
+    }
+}
+
+/// Unit tests for the pure `refresh_allowed` decision. DB-free: they build an
+/// in-memory `ProviderRegistry` with a stub provider whose allowlist is
+/// configurable, mirroring the `email_is_allowed` and registry tests. These cover
+/// the four branches the refresh re-gate must get right WITHOUT touching the DB.
+#[cfg(all(test, feature = "db"))]
+mod refresh_gate_tests {
+    use super::refresh_allowed;
+    use crate::oauth::providers::{
+        ExternalIdentity, ExternalIdentityProvider, ProviderError, ProviderRegistry,
+    };
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    /// A provider whose allowlist is supplied by the test, so we can exercise both
+    /// the configured-allowlist (deny/allow) and the empty-allowlist (allow-all)
+    /// branches — the default trait impls only give the allow-all path.
+    struct AllowlistProvider {
+        name: String,
+        grant: String,
+        allowed_emails: Vec<String>,
+        allowed_domains: Vec<String>,
+    }
+
+    #[async_trait]
+    impl ExternalIdentityProvider for AllowlistProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn grant_type(&self) -> &str {
+            &self.grant
+        }
+        async fn validate(&self, _: &str) -> Result<ExternalIdentity, ProviderError> {
+            unimplemented!("not exercised by the pure refresh_allowed decision")
+        }
+        fn auto_provision(&self) -> bool {
+            true
+        }
+        fn default_scopes(&self) -> &[String] {
+            &[]
+        }
+        fn allowed_emails(&self) -> &[String] {
+            &self.allowed_emails
+        }
+        fn allowed_domains(&self) -> &[String] {
+            &self.allowed_domains
+        }
+    }
+
+    fn registry_with(
+        name: &str,
+        grant: &str,
+        allowed_emails: Vec<String>,
+        allowed_domains: Vec<String>,
+    ) -> ProviderRegistry {
+        let mut r = ProviderRegistry::empty();
+        r.register(
+            Arc::new(AllowlistProvider {
+                name: name.into(),
+                grant: grant.into(),
+                allowed_emails,
+                allowed_domains,
+            }) as Arc<dyn ExternalIdentityProvider>,
+            None,
+        )
+        .unwrap();
+        r
+    }
+
+    #[test]
+    fn allowlisted_external_client_is_allowed() {
+        // (a) External client whose persisted email IS on the provider allowlist.
+        let r = registry_with(
+            "google",
+            "google_id_token",
+            vec!["jeremy.barton@gmail.com".into()],
+            vec![],
+        );
+        assert!(refresh_allowed(
+            &r,
+            "google:107485523387294236292",
+            "jeremy.barton@gmail.com"
+        ));
+    }
+
+    #[test]
+    fn delisted_external_client_is_denied() {
+        // (b) External client whose persisted email is NOT on the allowlist (the
+        // revocation case): an identity removed from the allowlist must be denied.
+        let r = registry_with(
+            "google",
+            "google_id_token",
+            vec!["jeremy.barton@gmail.com".into()],
+            vec![],
+        );
+        assert!(!refresh_allowed(
+            &r,
+            "google:999999999999999999999",
+            "evil@attacker.com"
+        ));
+    }
+
+    #[test]
+    fn non_external_client_skips_gate() {
+        // (c) Non-external clients must NOT be affected by the gate. Agent client_ids
+        // are hex pubkeys and service/DCR are `epigraph_{hex}` — neither contains a
+        // ':' — so the gate skips (returns allowed) regardless of registry contents.
+        let r = registry_with(
+            "google",
+            "google_id_token",
+            vec!["jeremy.barton@gmail.com".into()],
+            vec![],
+        );
+        // hex pubkey (agent): no ':' → skip.
+        assert!(refresh_allowed(
+            &r,
+            "a1b2c3d4e5f6071829aabbccddeeff00112233445566778899aabbccddeeff00",
+            ""
+        ));
+        // service / DCR: no ':' → skip.
+        assert!(refresh_allowed(&r, "epigraph_deadbeefcafef00d", ""));
+        // unrecognized provider prefix (e.g. legacy underscore `google_<sub>` has no
+        // ':'; a colon-bearing id for an UNregistered provider also skips).
+        assert!(refresh_allowed(
+            &r,
+            "google_107485523387294236292",
+            "evil@attacker.com"
+        ));
+        assert!(refresh_allowed(
+            &r,
+            "removed-provider:subject",
+            "evil@attacker.com"
+        ));
+    }
+
+    #[test]
+    fn empty_allowlist_provider_allows_all() {
+        // (d) A registered provider that configures NO allowlist (both lists empty)
+        // is allow-all (backward compatible) — even an empty persisted email passes.
+        let r = registry_with("google", "google_id_token", vec![], vec![]);
+        assert!(refresh_allowed(
+            &r,
+            "google:any-subject",
+            "anyone@example.com"
+        ));
+        assert!(refresh_allowed(&r, "google:any-subject", ""));
+    }
+
+    #[test]
+    fn domain_allowlist_external_client() {
+        // Belt-and-braces: the domain branch of the allowlist also gates refresh.
+        let r = registry_with(
+            "google",
+            "google_id_token",
+            vec![],
+            vec!["baros.associates".into()],
+        );
+        assert!(refresh_allowed(&r, "google:sub", "anyone@baros.associates"));
+        assert!(!refresh_allowed(&r, "google:sub", "anyone@gmail.com"));
     }
 }

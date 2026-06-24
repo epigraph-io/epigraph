@@ -78,6 +78,7 @@ pub async fn bootstrap_canonical_clients(
             owner_client_id,
             Some(legal_entity_name),
             Some(legal_contact_email),
+            None, // redirect_uris: service clients use client_credentials, no redirect
         )
         .await
         .with_context(|| format!("create client {name}"))?;

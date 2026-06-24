@@ -1,0 +1,24 @@
+{
+  "scifact_id": 971,
+  "claim": "Primary cervical cancer screening with HPV detection has higher longitudinal sensitivity than conventional cytology to detect cervical intraepithelial neoplasia grade 2.",
+  "evidence_sentences": [
+    "BACKGROUND Human papillomavirus (HPV) testing is known to be more sensitive, but less specific than cytology for detecting cervical intraepithelial neoplasia (CIN).",
+    "Among women aged 35-60 years, at round one the relative detection (HPV vs cytology) was 2.00 (95% CI 1.44-2.77) for CIN2, 2.08 (1.47-2.95) for CIN3, and 2.03 (1.60-2.57) for CIN2 and 3 together.",
+    "INTERPRETATION HPV-based screening is more effective than cytology in preventing invasive cervical cancer, by detecting persistent high-grade lesions earlier and providing a longer low-risk period."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "27873158",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.92,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "women aged 35-60 years",
+      "round one screening",
+      "HPV detection vs conventional cytology"
+    ],
+    "evidence_type": "statistical"
+  }
+}

@@ -342,6 +342,34 @@ impl MassFunctionRepository {
         Ok(())
     }
 
+    /// Write the CDST classification label for a claim.
+    ///
+    /// A verdict on the claim's *combined* belief (`supported` |
+    /// `contradicted` | `not_enough_info`), produced by
+    /// `epigraph_engine::classifier::classify` inside
+    /// `recompute_combined_belief`. Kept as a separate one-column UPDATE
+    /// rather than folded into [`Self::update_claim_belief`] because that
+    /// method has many callers and a param-ordering ratchet test; only the
+    /// combine cascade computes a classification, so only it calls this.
+    /// The extra UPDATE lands on the recompute (maintenance) path, not an
+    /// online read path.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn update_claim_classification(
+        pool: &PgPool,
+        claim_id: Uuid,
+        classification: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE claims SET classification = $1, updated_at = NOW() WHERE id = $2")
+            .bind(classification)
+            .bind(claim_id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
     /// Count mass functions for a claim-frame pair
     ///
     /// # Errors
@@ -414,6 +442,72 @@ impl MassFunctionRepository {
 
         Ok(rows)
     }
+
+    /// List every distinct `frame_id` a claim carries BBAs on, paired with the
+    /// frame's name and **ordered by frame name**.
+    ///
+    /// The `claims.{belief, plausibility, pignistic_prob, ...}` columns are
+    /// frame-agnostic scalars (last-writer-wins), so callers that recompute a
+    /// claim across all its frames must process them in a deterministic order
+    /// for two runs to converge to the same cached value. Frame-name order is
+    /// that canonical order — it matches the `epigraph-recompute-belief`
+    /// operator binary.
+    #[instrument(skip(pool))]
+    pub async fn list_frames_for_claim(
+        pool: &PgPool,
+        claim_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>, DbError> {
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT mf.frame_id, f.name
+            FROM mass_functions mf
+            JOIN frames f ON f.id = mf.frame_id
+            WHERE mf.claim_id = $1
+            ORDER BY f.name
+            "#,
+        )
+        .bind(claim_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// List distinct `claim_id`s of **current** claims that have at least one
+    /// BBA, ordered by `claim_id` for stable pagination. Used by bulk
+    /// belief-recompute to enumerate the rebuild population when no explicit
+    /// target set is given.
+    ///
+    /// The `JOIN claims … WHERE c.is_current` matters because supersede /
+    /// mark_duplicate flip `is_current = false` but leave the claim's
+    /// `mass_functions` rows in place; without the filter the bulk path would
+    /// recompute beliefs on retired claims. This mirrors the sibling
+    /// labels-target path (`list_by_labels(.., current_only = true, ..)`).
+    /// `recompute_beliefs`' explicit `claim_ids` target bypasses this method,
+    /// so a caller can still deliberately recompute a non-current claim by id.
+    #[instrument(skip(pool))]
+    pub async fn list_claim_ids(
+        pool: &PgPool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let rows: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT mf.claim_id
+            FROM mass_functions mf
+            JOIN claims c ON c.id = mf.claim_id
+            WHERE c.is_current
+            ORDER BY mf.claim_id
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -478,6 +572,220 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert!(all.iter().any(|r| r.claim_id == claim1_id));
         assert!(all.iter().any(|r| r.claim_id == claim2_id));
+    }
+
+    // Helper: insert a fresh system agent and return its id.
+    #[cfg(test)]
+    async fn insert_agent(pool: &PgPool, name: &str) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), $1, 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[cfg(test)]
+    async fn insert_frame(pool: &PgPool, name: &str) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO frames (name, hypotheses) VALUES ($1, '{\"supported\",\"contradicted\"}') RETURNING id",
+        )
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[cfg(test)]
+    async fn insert_claim(pool: &PgPool, agent_id: Uuid, content: &str) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id) VALUES ($1, sha256($1::bytea), 0.5, $2) RETURNING id",
+        )
+        .bind(content)
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// `list_frames_for_claim` must (a) return each frame ONCE even when the
+    /// claim has multiple BBAs on it (DISTINCT), and (b) order by frame NAME,
+    /// not by insertion order / frame id — the ordering the recompute cascade
+    /// relies on for deterministic last-writer convergence.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_frames_for_claim_is_distinct_and_name_ordered(pool: sqlx::PgPool) {
+        let agent_a = insert_agent(&pool, "frames-for-claim-a").await;
+        let agent_b = insert_agent(&pool, "frames-for-claim-b").await;
+        // Insert the alphabetically-LATER frame FIRST, so insertion order is
+        // the reverse of name order — a name-blind query would fail the assert.
+        let suffix = Uuid::new_v4();
+        let frame_z = insert_frame(&pool, &format!("zzz-{suffix}")).await;
+        let frame_a = insert_frame(&pool, &format!("aaa-{suffix}")).await;
+        let claim_id = insert_claim(&pool, agent_a, &format!("ffc-{suffix}")).await;
+
+        let masses = serde_json::json!({"0": 0.6, "0,1": 0.4});
+        // Two BBAs (distinct agents) on frame_z → must still collapse to one frame entry.
+        for ag in [agent_a, agent_b] {
+            MassFunctionRepository::store(
+                &pool,
+                claim_id,
+                frame_z,
+                Some(ag),
+                &masses,
+                None,
+                Some("test"),
+                "unknown",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        MassFunctionRepository::store(
+            &pool,
+            claim_id,
+            frame_a,
+            Some(agent_a),
+            &masses,
+            None,
+            Some("test"),
+            "unknown",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let frames = MassFunctionRepository::list_frames_for_claim(&pool, claim_id)
+            .await
+            .unwrap();
+        assert_eq!(frames.len(), 2, "two distinct frames despite 3 BBAs");
+        assert_eq!(frames[0].0, frame_a, "name-ordered: aaa frame first");
+        assert_eq!(frames[1].0, frame_z, "name-ordered: zzz frame last");
+    }
+
+    /// `list_claim_ids` must return DISTINCT claim ids (a claim with multiple
+    /// BBAs appears once), ordered ascending, and page correctly via limit/offset.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_claim_ids_is_distinct_and_paged(pool: sqlx::PgPool) {
+        let agent_a = insert_agent(&pool, "lci-a").await;
+        let agent_b = insert_agent(&pool, "lci-b").await;
+        let suffix = Uuid::new_v4();
+        let frame_id = insert_frame(&pool, &format!("lci-frame-{suffix}")).await;
+        let c1 = insert_claim(&pool, agent_a, &format!("lci-1-{suffix}")).await;
+        let c2 = insert_claim(&pool, agent_a, &format!("lci-2-{suffix}")).await;
+        let c3 = insert_claim(&pool, agent_a, &format!("lci-3-{suffix}")).await;
+
+        let masses = serde_json::json!({"0": 0.6, "0,1": 0.4});
+        // c1 gets TWO BBAs (distinct agents) — must appear ONCE in the result.
+        for ag in [agent_a, agent_b] {
+            MassFunctionRepository::store(
+                &pool,
+                c1,
+                frame_id,
+                Some(ag),
+                &masses,
+                None,
+                Some("test"),
+                "unknown",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        for c in [c2, c3] {
+            MassFunctionRepository::store(
+                &pool,
+                c,
+                frame_id,
+                Some(agent_a),
+                &masses,
+                None,
+                Some("test"),
+                "unknown",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Ephemeral sqlx::test DB → only our 3 distinct claims have BBAs.
+        let all = MassFunctionRepository::list_claim_ids(&pool, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.len(),
+            3,
+            "3 distinct claim ids despite c1 having 2 BBAs"
+        );
+
+        let mut expected = vec![c1, c2, c3];
+        expected.sort();
+        assert_eq!(all, expected, "ascending claim_id order");
+
+        // Paging: page 1 (limit 2) + page 2 (offset 2) partition the set, disjoint.
+        let page1 = MassFunctionRepository::list_claim_ids(&pool, 2, 0)
+            .await
+            .unwrap();
+        let page2 = MassFunctionRepository::list_claim_ids(&pool, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(page1, expected[..2].to_vec());
+        assert_eq!(page2, vec![expected[2]]);
+    }
+
+    /// `list_claim_ids` (the bulk belief-recompute enumeration) must EXCLUDE
+    /// non-current claims. supersede/mark_duplicate flip `is_current = false`
+    /// but deliberately leave the claim's `mass_functions` rows in place, so
+    /// without an is_current filter the bulk recompute path rebuilds beliefs
+    /// on retired claims — wasted work, and it diverges from the sibling
+    /// labels-target path which is already current-only.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_claim_ids_excludes_non_current_claims(pool: sqlx::PgPool) {
+        let agent = insert_agent(&pool, "lci-cur-a").await;
+        let suffix = Uuid::new_v4();
+        let frame_id = insert_frame(&pool, &format!("lci-cur-frame-{suffix}")).await;
+        let c_current = insert_claim(&pool, agent, &format!("lci-cur-1-{suffix}")).await;
+        let c_retired = insert_claim(&pool, agent, &format!("lci-cur-2-{suffix}")).await;
+
+        let masses = serde_json::json!({"0": 0.6, "0,1": 0.4});
+        for c in [c_current, c_retired] {
+            MassFunctionRepository::store(
+                &pool,
+                c,
+                frame_id,
+                Some(agent),
+                &masses,
+                None,
+                Some("test"),
+                "unknown",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Retire one claim the way supersede/mark_duplicate do — flip
+        // is_current WITHOUT removing its BBAs.
+        sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+            .bind(c_retired)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let ids = MassFunctionRepository::list_claim_ids(&pool, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![c_current],
+            "only the current claim's id is enumerated"
+        );
+        assert!(
+            !ids.contains(&c_retired),
+            "retired (is_current=false) claim must be excluded from bulk recompute"
+        );
     }
 
     /// Regression test for the NULL-perspective upsert bug fixed by

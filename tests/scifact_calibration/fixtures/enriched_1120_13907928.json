@@ -1,0 +1,27 @@
+{
+  "scifact_id": 1120,
+  "claim": "Sympathetic nerve activity is reduced throughout normal pregnancy.",
+  "evidence_sentences": [
+    "Sympathetic activation was greater across all 3 minutes of cold pressor stimulation in the pregnant women relative to the nonpregnant controls.",
+    "Peak sympathoexcitation was also greater in pregnant than in nonpregnant women, whether expressed as sympathetic burst frequency (+17\u00b113 versus +7\u00b18 bursts/min, P=0.049), burst incidence (+17\u00b19 versus +6\u00b111 bursts/100 hb, P=0.03), or total activity (+950\u00b1660 versus +363\u00b1414 arbitrary units, P=0.04)."
+  ],
+  "ground_truth": "CONTRADICT",
+  "doc_id": "13907928",
+  "enrichment": {
+    "methodology": "statistical_analysis",
+    "confidence": 0.85,
+    "supports_claim": false,
+    "instruments_used": [
+      "microneurography",
+      "cold pressor"
+    ],
+    "reagents_involved": [],
+    "conditions": [
+      "pregnancy",
+      "nonpregnant controls",
+      "cold pressor stimulation",
+      "3 minutes duration"
+    ],
+    "evidence_type": "empirical"
+  }
+}

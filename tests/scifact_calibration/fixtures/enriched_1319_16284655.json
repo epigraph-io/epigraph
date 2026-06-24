@@ -1,0 +1,21 @@
+{
+  "scifact_id": 1319,
+  "claim": "Transplanted human glial cells can differentiate within the host animal.",
+  "evidence_sentences": [
+    "Upon maturation, the recipient brains exhibited large numbers and high proportions of both human glial progenitors and astrocytes."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "16284655",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.7,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "upon maturation",
+      "recipient brains"
+    ],
+    "evidence_type": "empirical"
+  }
+}

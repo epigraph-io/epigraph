@@ -50,19 +50,23 @@
 //!
 //! All migrations are in `/migrations/` and should be run with `sqlx migrate run`.
 
+pub mod access_control;
 pub mod errors;
 pub mod pool;
 pub mod repos;
 
 // Re-export primary types
+pub use access_control::{
+    batch_check_content_access, check_content_access, ContentAccess, COARSE_EDGE_TYPES,
+};
 pub use errors::DbError;
 pub use pool::{create_pool, create_pool_from_options, create_pool_with_options};
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentRepository, AnalysisRecord,
     AnalysisRepository, BehavioralExecutionRepository, BehavioralExecutionRow, ChallengeRepository,
-    ChallengeRow, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow,
-    ClaimNeighborBetpRow, ClaimRepository, ClaimSummary, ClaimThemeRepository, ClaimThemeRow,
-    ClaimVersionRepository, ClaimVersionRow, CommunityRepository, ContextRepository,
+    ChallengeRow, ClaimBeliefColumns, ClaimEmbeddingHit, ClaimEncryptionRepository,
+    ClaimEncryptionRow, ClaimNeighborBetpRow, ClaimRepository, ClaimSummary, ClaimThemeRepository,
+    ClaimThemeRow, ClaimVersionRepository, ClaimVersionRow, CommunityRepository, ContextRepository,
     CounterfactualRepository, CounterfactualRow, DivergenceRepository, EdgeEncryptionRepository,
     EdgeEncryptionRow, EdgeRepository, EmbeddingShareRepository, EmbeddingShareRow,
     EntityRepository, EntityRow, EpistemicEdgePairRow, EventRepository, EventRow,
@@ -70,18 +74,19 @@ pub use repos::{
     EvolveStepResult, ExperimentRepository, ExperimentResultRepository, ExperimentResultRow,
     ExperimentRow, FactorRepository, FrameRepository, GapAnalysisResult, GapChallengeRow,
     GapRecord, GapRepository, GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository,
-    GroupRow, HierarchicalWorkflowRow, KeyEpochRow, LearningEventRepository, LearningEventRow,
-    LineageHead, LineageRepository, MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow,
-    MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes,
-    MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper,
-    MethodUsageExample, OAuthClientRepository, OAuthClientRow, OwnershipRepository,
-    PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository,
-    PatternTemplateRow, PerspectiveRepository, ProvenanceLogRow, ProvenanceRepository,
-    ReEncryptionKeyRepository, ReEncryptionKeyRow, ReasoningTraceRepository,
-    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, ScopedBeliefRepository,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, TaskRepository, TaskRow,
-    TripleRepository, TripleRow, WorkflowExecutionRepository, WorkflowExecutionRow,
-    WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    GroupRow, HierarchicalWorkflowRow, HybridHit, IndexCounts, KeyEpochRow,
+    LearningEventRepository, LearningEventRow, LineageHead, LineageRepository,
+    MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow, MembershipRow, MentionRow,
+    MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
+    MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
+    OAuthClientRepository, OAuthClientRow, OwnershipRepository, PaperRepository, PaperRow,
+    PatchClaimDiff, PatchClaimInput, PatternTemplateRepository, PatternTemplateRow,
+    PerspectiveRepository, ProvenanceLogRow, ProvenanceRepository, ReEncryptionKeyRepository,
+    ReEncryptionKeyRow, ReasoningTraceRepository, RefreshTokenRepository, RefreshTokenRow,
+    ResolvedStep, ScopedBeliefRepository, SecurityEventRepository, SecurityEventRow,
+    SheafRepository, TaskRepository, TaskRow, TripleRepository, TripleRow,
+    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository,
 };
 
 // Re-export sqlx types that users will need

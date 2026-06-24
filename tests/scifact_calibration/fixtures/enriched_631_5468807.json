@@ -1,0 +1,24 @@
+{
+  "scifact_id": 631,
+  "claim": "Inhibiting HDAC6 increases survival of mice with ARID1A mutated tumors.",
+  "evidence_sentences": [
+    "Inhibition of HDAC6 activity using a clinically applicable small-molecule inhibitor significantly improved the survival of mice bearing ARID1A-mutated tumours."
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "5468807",
+  "enrichment": {
+    "methodology": "extraction",
+    "confidence": 0.95,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [
+      "HDAC6 inhibitor",
+      "small-molecule inhibitor"
+    ],
+    "conditions": [
+      "ARID1A-mutated tumours",
+      "in vivo mouse model"
+    ],
+    "evidence_type": "empirical"
+  }
+}

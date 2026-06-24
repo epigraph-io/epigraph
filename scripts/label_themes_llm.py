@@ -131,6 +131,7 @@ def call_claude_cli(prompt, result_path, cwd, timeout=120):
             [
                 "claude", "-p", prompt,
                 "--output-format", "json",
+                "--model", "claude-haiku-4-5-20251001",
                 "--max-turns", "1",
                 "--dangerously-skip-permissions",
             ],

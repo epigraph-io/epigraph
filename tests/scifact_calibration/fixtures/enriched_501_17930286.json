@@ -1,0 +1,22 @@
+{
+  "scifact_id": 501,
+  "claim": "Headaches are not correlated with cognitive impairment.",
+  "evidence_sentences": [
+    "Evidence was lacking for cognitive impairment for any headache type with or without brain lesions.   \n"
+  ],
+  "ground_truth": "SUPPORT",
+  "doc_id": "17930286",
+  "enrichment": {
+    "methodology": "inductive_generalization",
+    "confidence": 0.72,
+    "supports_claim": true,
+    "instruments_used": [],
+    "reagents_involved": [],
+    "conditions": [
+      "any headache type",
+      "with brain lesions",
+      "without brain lesions"
+    ],
+    "evidence_type": "statistical"
+  }
+}
