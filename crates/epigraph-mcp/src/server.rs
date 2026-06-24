@@ -1000,7 +1000,7 @@ impl EpiGraphMcpFull {
     // ── RDF Triple Layer (3 tools) ──
 
     #[tool(
-        description = "Query RDF-style triples extracted from claims. Filter by subject entity, predicate pattern, and/or object entity. All filters optional (omit to wildcard). Returns triples with source claim references."
+        description = "Query RDF-style triples extracted from claims. Filter by subject entity, predicate pattern, and/or object entity. All filters optional (omit to wildcard). Optional min_confidence threshold (default 0.0, no filtering). Returns triples with source claim references."
     )]
     async fn query_triples(
         &self,
