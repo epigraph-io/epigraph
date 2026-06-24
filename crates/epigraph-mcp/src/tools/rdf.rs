@@ -1,4 +1,9 @@
 //! MCP tools for querying the RDF triple layer.
+//!
+//! **Stub — not in production use.** The `triples` table exists in the schema but is not
+//! populated by any current write path. These tools are wired up and correct, but return
+//! empty results against a live graph. Retained for potential future use when an RDF
+//! extraction or materialization pass is introduced.
 
 use rmcp::model::*;
 use uuid::Uuid;
