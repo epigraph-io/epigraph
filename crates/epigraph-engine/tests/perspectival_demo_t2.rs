@@ -107,6 +107,7 @@ async fn betp(pool: &PgPool, claim: Uuid, frame: Uuid, persp: Uuid) -> f64 {
 }
 
 #[tokio::test]
+#[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
 async fn t2_real_engine_reproduces_python_model() {
     let Some(pool) = get_pool().await else {
         eprintln!("SKIP: DATABASE_URL not set");

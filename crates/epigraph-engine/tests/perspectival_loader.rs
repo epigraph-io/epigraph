@@ -88,6 +88,7 @@ fn ow_bba_json(frame: &FrameOfDiscernment, hyps: &[String], masses: &Value) -> V
 }
 
 #[tokio::test]
+#[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
 async fn load_and_validate_open_world() {
     let Ok(url) = std::env::var("DATABASE_URL") else { eprintln!("SKIP: DATABASE_URL not set"); return; };
     let dir = std::env::var("SEED_DIR").expect("set SEED_DIR");

@@ -49,6 +49,7 @@ async fn insert_claim(pool: &PgPool, author: Uuid, content: &str) -> Uuid {
 }
 
 #[tokio::test]
+#[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
 async fn t3_engine_adjudicates_agent_bbas() {
     let eff = FrameOfDiscernment::new("treatment_efficacy", vec!["efficacious".into(), "no_effect".into()]).unwrap();
     let saf = FrameOfDiscernment::new("treatment_safety", vec!["safe".into(), "harmful".into()]).unwrap();

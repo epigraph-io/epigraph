@@ -88,6 +88,7 @@ struct ClaimMeta {
 }
 
 #[tokio::test]
+#[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
 async fn discover_to_snapshot() {
     let Ok(url) = std::env::var("DATABASE_URL") else { eprintln!("SKIP: DATABASE_URL not set"); return; };
     let pkg_path = std::env::var("DISCOVERY_IN").expect("set DISCOVERY_IN");
