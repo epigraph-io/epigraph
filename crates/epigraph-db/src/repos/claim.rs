@@ -2726,18 +2726,24 @@ impl ClaimRepository {
         // The 'supersedes' edges (dedup/lineage trail) are preserved throughout.
 
         // Drop incoming dup-edges whose migrated triple already exists on canonical.
+        // Alias the outer table as `e` so the correlated subquery references
+        // `e.source_id`, `e.source_type`, `e.relationship` unambiguously.
+        // Without the alias, unqualified column names inside the EXISTS bind to
+        // `edges e2` (innermost scope in PostgreSQL), making the predicate
+        // tautological and causing false-positive deletions of edges that should
+        // be migrated.
         sqlx::query(
-            "DELETE FROM edges \
-             WHERE target_id = $2 AND target_type = 'claim' \
-               AND relationship != 'supersedes' AND relationship != 'AUTHORED' \
-               AND source_type = 'claim' AND source_id != $1 \
+            "DELETE FROM edges AS e \
+             WHERE e.target_id = $2 AND e.target_type = 'claim' \
+               AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
+               AND e.source_type = 'claim' AND e.source_id != $1 \
                AND EXISTS ( \
                    SELECT 1 FROM edges e2 \
-                   WHERE e2.source_id = source_id \
-                     AND e2.source_type = source_type \
+                   WHERE e2.source_id = e.source_id \
+                     AND e2.source_type = e.source_type \
                      AND e2.target_id = $1 \
                      AND e2.target_type = 'claim' \
-                     AND e2.relationship = relationship \
+                     AND e2.relationship = e.relationship \
                )",
         )
         .bind(canon_uuid)
@@ -2746,18 +2752,20 @@ impl ClaimRepository {
         .await?;
 
         // Drop outgoing dup-edges whose migrated triple already exists on canonical.
+        // Same aliasing discipline: `e.target_id`, `e.target_type`, `e.relationship`
+        // must refer to the outer (being-deleted) row, not the subquery table.
         sqlx::query(
-            "DELETE FROM edges \
-             WHERE source_id = $2 AND source_type = 'claim' \
-               AND relationship != 'supersedes' AND relationship != 'AUTHORED' \
-               AND target_type = 'claim' AND target_id != $1 \
+            "DELETE FROM edges AS e \
+             WHERE e.source_id = $2 AND e.source_type = 'claim' \
+               AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
+               AND e.target_type = 'claim' AND e.target_id != $1 \
                AND EXISTS ( \
                    SELECT 1 FROM edges e2 \
                    WHERE e2.source_id = $1 \
                      AND e2.source_type = 'claim' \
-                     AND e2.target_id = target_id \
-                     AND e2.target_type = target_type \
-                     AND e2.relationship = relationship \
+                     AND e2.target_id = e.target_id \
+                     AND e2.target_type = e.target_type \
+                     AND e2.relationship = e.relationship \
                )",
         )
         .bind(canon_uuid)
