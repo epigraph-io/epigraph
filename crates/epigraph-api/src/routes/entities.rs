@@ -109,8 +109,11 @@ pub struct BatchIdsResponse {
 #[cfg(feature = "db")]
 pub async fn create_entity(
     State(state): State<AppState>,
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     Json(req): Json<CreateEntityRequest>,
 ) -> Result<Json<EntityResponse>, ApiError> {
+    // Scope gate ran in the extractor; if we reach the body, the caller has
+    // `claims:write`. See `RequireScopeWrite` in `middleware::bearer`.
     let properties = req
         .properties
         .unwrap_or(serde_json::Value::Object(Default::default()));
@@ -146,8 +149,11 @@ pub async fn create_entity(
 #[cfg(feature = "db")]
 pub async fn batch_create_mentions(
     State(state): State<AppState>,
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     Json(req): Json<BatchMentionsRequest>,
 ) -> Result<Json<BatchIdsResponse>, ApiError> {
+    // Scope gate ran in the extractor; if we reach the body, the caller has
+    // `claims:write`. See `RequireScopeWrite` in `middleware::bearer`.
     let data = req
         .mentions
         .into_iter()
@@ -182,8 +188,11 @@ pub async fn batch_create_mentions(
 #[cfg(feature = "db")]
 pub async fn batch_create_triples(
     State(state): State<AppState>,
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     Json(req): Json<BatchTriplesRequest>,
 ) -> Result<Json<BatchIdsResponse>, ApiError> {
+    // Scope gate ran in the extractor; if we reach the body, the caller has
+    // `claims:write`. See `RequireScopeWrite` in `middleware::bearer`.
     let data = req
         .triples
         .into_iter()
