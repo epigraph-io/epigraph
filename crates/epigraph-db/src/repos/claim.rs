@@ -2702,9 +2702,77 @@ impl ClaimRepository {
         // claim, mirroring supersede()'s edge migration — otherwise edges to/from
         // third claims dangle at a claim that no longer surfaces. Unlike supersede
         // (which targets a freshly-minted claim with no pre-existing edges), the
-        // canonical here already exists, so guard against creating a
-        // canonical->canonical self-loop when an edge already linked dup and
-        // canonical. The 'supersedes' edges (dedup/lineage trail) are preserved.
+        // canonical here already exists, so we must guard against two collision
+        // classes before running the UPDATEs:
+        //
+        //   1. Self-loops: `dup→canonical` or `canonical→dup` edges that would
+        //      become `canonical→canonical` after migration (handled by the
+        //      `AND NOT (... = $1)` filters in the UPDATE clauses below).
+        //
+        //   2. Diamond duplicates: a third claim T that has edges to *both* dup
+        //      and canonical with the same relationship — e.g.
+        //      `T→[CORROBORATES]→dup` AND `T→[CORROBORATES]→canonical`.
+        //      Migrating the dup edge to point at canonical would produce a
+        //      second `T→[CORROBORATES]→canonical` triple, tripping the partial
+        //      unique index `idx_edges_unique_triple_non_authored`
+        //      (migration 017, covers all relationship types except AUTHORED)
+        //      and rolling back the whole transaction before `is_current` is
+        //      flipped.  Pre-delete the redundant dup edges so the UPDATE only
+        //      touches survivors.  AUTHORED edges are excluded because the
+        //      partial index does not cover them, and they are meant to
+        //      accumulate (migration 017 explicitly allows multiple AUTHORED
+        //      edges per triple).
+        //
+        // The 'supersedes' edges (dedup/lineage trail) are preserved throughout.
+
+        // Drop incoming dup-edges whose migrated triple already exists on canonical.
+        // Alias the outer table as `e` so the correlated subquery references
+        // `e.source_id`, `e.source_type`, `e.relationship` unambiguously.
+        // Without the alias, unqualified column names inside the EXISTS bind to
+        // `edges e2` (innermost scope in PostgreSQL), making the predicate
+        // tautological and causing false-positive deletions of edges that should
+        // be migrated.
+        sqlx::query(
+            "DELETE FROM edges AS e \
+             WHERE e.target_id = $2 AND e.target_type = 'claim' \
+               AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
+               AND e.source_type = 'claim' AND e.source_id != $1 \
+               AND EXISTS ( \
+                   SELECT 1 FROM edges e2 \
+                   WHERE e2.source_id = e.source_id \
+                     AND e2.source_type = e.source_type \
+                     AND e2.target_id = $1 \
+                     AND e2.target_type = 'claim' \
+                     AND e2.relationship = e.relationship \
+               )",
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
+
+        // Drop outgoing dup-edges whose migrated triple already exists on canonical.
+        // Same aliasing discipline: `e.target_id`, `e.target_type`, `e.relationship`
+        // must refer to the outer (being-deleted) row, not the subquery table.
+        sqlx::query(
+            "DELETE FROM edges AS e \
+             WHERE e.source_id = $2 AND e.source_type = 'claim' \
+               AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
+               AND e.target_type = 'claim' AND e.target_id != $1 \
+               AND EXISTS ( \
+                   SELECT 1 FROM edges e2 \
+                   WHERE e2.source_id = $1 \
+                     AND e2.source_type = 'claim' \
+                     AND e2.target_id = e.target_id \
+                     AND e2.target_type = e.target_type \
+                     AND e2.relationship = e.relationship \
+               )",
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query(
             "UPDATE edges SET target_id = $1 \
              WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
