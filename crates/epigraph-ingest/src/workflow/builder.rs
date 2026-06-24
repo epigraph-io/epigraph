@@ -125,6 +125,17 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
             step_ids.push(step_id);
             path_index.insert(step_path.clone(), step_id);
 
+            // Normalise once per step to a canonical calibration key (or None);
+            // the operation atoms below inherit the same tag. Mirrors the
+            // document path (`build_ingest_plan` per-paragraph normalisation):
+            // keeps unrecognised extractor values off the BBA, where they'd hit
+            // the 0.5 unknown-evidence-type fallback. Thesis (L0) and phase (L1)
+            // claims are structural and stay untagged, exactly like the document
+            // thesis/section claims.
+            let step_evidence_type = crate::common::evidence_type::normalize_evidence_type(
+                step.evidence_type.as_deref(),
+            );
+
             claims.push(PlannedClaim {
                 id: step_id,
                 content: step.compound.clone(),
@@ -139,7 +150,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                 content_hash: step_hash,
                 confidence: step.confidence,
                 methodology: None,
-                evidence_type: None,
+                evidence_type: step_evidence_type.clone(),
                 supporting_text: Some(step.rationale.clone()),
                 enrichment: serde_json::json!({}),
             });
@@ -173,7 +184,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                     content_hash: op_hash,
                     confidence: step.confidence,
                     methodology: None,
-                    evidence_type: None,
+                    evidence_type: step_evidence_type.clone(),
                     supporting_text: Some(step.rationale.clone()),
                     enrichment: serde_json::json!({}),
                 });
@@ -305,6 +316,7 @@ mod tests {
                     operations: vec!["List capabilities".to_string()],
                     generality: vec![1],
                     confidence: 0.9,
+                    evidence_type: None,
                 }],
             }],
             relationships: vec![],

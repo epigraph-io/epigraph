@@ -339,6 +339,7 @@ mod tests {
                         operations: vec!["op a1".to_string()],
                         generality: vec![1],
                         confidence: 0.9,
+                        evidence_type: None,
                     },
                     Step {
                         compound: "Step B".to_string(),
@@ -346,6 +347,7 @@ mod tests {
                         operations: vec!["op b1".to_string()],
                         generality: vec![1],
                         confidence: 0.9,
+                        evidence_type: None,
                     },
                 ],
             }],

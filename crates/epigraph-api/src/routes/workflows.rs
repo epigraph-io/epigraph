@@ -204,6 +204,8 @@ pub async fn store_workflow(
                     operations: vec![],
                     generality: vec![],
                     confidence,
+                    // Flat steps have no operation atoms → no evidence_type source.
+                    evidence_type: None,
                 })
                 .collect(),
         }]

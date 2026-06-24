@@ -73,6 +73,36 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
             )
             .await;
         }
+
+        // Per-claim CDST batch wire (operation atoms only) — parity with
+        // `do_ingest_document`, which wires a per-atom BBA carrying the
+        // normalised `evidence_type` so the tag reaches `mass_functions` and
+        // participates in `effective_source_strength` / the per-perspective
+        // frame function. The workflow hierarchy edges (decomposes / *_follows /
+        // executes / asserts) all map to `RestrictionKind::Neutral`, so edge
+        // auto-wire writes no BBA — without this loop the operation atoms would
+        // have no BBA at all. Only newly-inserted level-3 atoms get an entry:
+        // thesis/phase/step claims are structural (matching the document path,
+        // where only level-3 atoms are wired). `weight` mirrors the document
+        // default for an untagged-methodology claim (`Methodology::Extraction`).
+        let inserted_ids: std::collections::HashSet<uuid::Uuid> =
+            result.inserted.iter().map(|(id, _)| *id).collect();
+        let ds_entries: Vec<ds_auto::BatchDsEntry> = plan
+            .claims
+            .iter()
+            .filter(|c| c.level == 3 && inserted_ids.contains(&c.id))
+            .map(|c| ds_auto::BatchDsEntry {
+                claim_id: c.id,
+                confidence: c.confidence.clamp(0.0, 1.0),
+                weight: epigraph_core::Methodology::Extraction.weight_modifier(),
+                evidence_type: c.evidence_type.clone(),
+            })
+            .collect();
+        if !ds_entries.is_empty() {
+            if let Err(e) = ds_auto::auto_wire_ds_batch(pool, &ds_entries, agent_id).await {
+                tracing::warn!("workflow ds auto-wire batch failed: {e}");
+            }
+        }
     }
 
     let inserted = result.inserted.clone();
@@ -312,6 +342,7 @@ mod tests {
                     operations: vec!["cargo test".to_string(), "check exit code".to_string()],
                     generality: vec![2, 1],
                     confidence: 0.9,
+                    evidence_type: None,
                 }],
             }],
             relationships: vec![],
@@ -500,6 +531,105 @@ mod tests {
         assert!(db_count > 0, "must have at least one executes edge");
     }
 
+    /// End-to-end parity with #208 (document side): a workflow step tagged
+    /// (mixed-case) "Empirical" must produce operation-atom BBAs whose
+    /// `mass_functions.evidence_type` is the normalized canonical 'empirical'.
+    /// Asserts on the DB-stored value, not the in-memory plan. Also covers the
+    /// unknown-tag → None path and confirms structural claims (thesis/phase/
+    /// step compound) get no per-claim BBA.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_workflow_tags_atom_bbas_with_normalized_evidence_type(pool: sqlx::PgPool) {
+        let extraction = WorkflowExtraction {
+            source: WorkflowSource {
+                canonical_name: "test-workflow-evidence-type".to_string(),
+                goal: "Validate evidence_type wiring".to_string(),
+                generation: 0,
+                parent_canonical_name: None,
+                authors: vec![],
+                expected_outcome: None,
+                tags: vec![],
+                metadata: serde_json::json!({}),
+            },
+            thesis: Some("Workflow evidence-type tags reach the BBA".to_string()),
+            thesis_derivation: epigraph_ingest::common::schema::ThesisDerivation::TopDown,
+            phases: vec![Phase {
+                title: "Phase 1".to_string(),
+                summary: "Tagged phase".to_string(),
+                steps: vec![
+                    Step {
+                        compound: "Empirical step compound".to_string(),
+                        rationale: "measured directly".to_string(),
+                        operations: vec![
+                            "Empirical operation one under standard conditions".to_string(),
+                            "Empirical operation two replicating operation one".to_string(),
+                        ],
+                        generality: vec![1, 1],
+                        confidence: 0.9,
+                        evidence_type: Some("Empirical".to_string()), // mixed case
+                    },
+                    Step {
+                        compound: "Untagged step compound".to_string(),
+                        rationale: "no evidence type".to_string(),
+                        operations: vec!["Operation with a bogus tag source".to_string()],
+                        generality: vec![1],
+                        confidence: 0.9,
+                        evidence_type: Some("made_up_type".to_string()), // unknown → None
+                    },
+                ],
+            }],
+            relationships: vec![],
+        };
+
+        do_ingest_workflow_via_pool(&pool, &extraction)
+            .await
+            .expect("ingest must succeed");
+
+        // The two operation atoms under the "Empirical" step carry the
+        // normalized canonical tag on their BBA.
+        let empirical_bbas: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM mass_functions WHERE evidence_type = 'empirical'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            empirical_bbas, 2,
+            "expected exactly 2 operation-atom BBAs tagged 'empirical', found {empirical_bbas}"
+        );
+
+        // The raw (un-normalized) mixed-case value never reaches the column.
+        let raw_case: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM mass_functions WHERE evidence_type = 'Empirical'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            raw_case, 0,
+            "raw 'Empirical' must be normalized to lowercase"
+        );
+
+        // The unknown tag is dropped: its atom BBA exists but is untagged.
+        let bogus: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM mass_functions WHERE evidence_type = 'made_up_type'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bogus, 0, "unknown tag must not reach mass_functions");
+
+        // Exactly 3 operation atoms total → 3 per-claim BBAs; no BBA for the
+        // structural thesis/phase/step claims (only level-3 atoms are wired).
+        let total_bbas: i64 = sqlx::query_scalar("SELECT count(*) FROM mass_functions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            total_bbas, 3,
+            "one BBA per operation atom; structural claims get none, found {total_bbas}"
+        );
+    }
+
     /// Regression test for k1-trace-bug: `improve_workflow_hierarchy` must not
     /// produce a `claims_content_not_empty` constraint violation when a Phase
     /// has an empty (or omitted) `summary`.
@@ -546,6 +676,7 @@ mod tests {
                     operations: vec!["audit step".to_string()],
                     generality: vec![1],
                     confidence: 0.85,
+                    evidence_type: None,
                 }],
             }],
             relationships: vec![],
