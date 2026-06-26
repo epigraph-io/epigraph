@@ -185,6 +185,7 @@ async fn improve_workflow_hierarchy_empty_phase_summary_uses_title(pool: sqlx::P
                 operations: vec![],
                 generality: vec![],
                 confidence: 0.8,
+                evidence_type: None,
             }],
         }],
         relationships: vec![],
