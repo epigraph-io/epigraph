@@ -64,13 +64,14 @@ async fn e2e_empty_thesis_rejected_before_db_write() {
     }
 
     // No zombie row should have been written.
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM workflows WHERE canonical_name = $1",
-    )
-    .bind(canonical)
-    .fetch_one(&pool)
-    .await
-    .expect("count query");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflows WHERE canonical_name = $1")
+        .bind(canonical)
+        .fetch_one(&pool)
+        .await
+        .expect("count query");
 
-    assert_eq!(count, 0, "no workflows row should exist after a guard rejection");
+    assert_eq!(
+        count, 0,
+        "no workflows row should exist after a guard rejection"
+    );
 }
