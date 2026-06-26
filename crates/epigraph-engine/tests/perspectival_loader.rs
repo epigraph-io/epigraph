@@ -14,7 +14,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use epigraph_db::{EntityRepository, FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
+use epigraph_db::{
+    EntityRepository, FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool,
+};
 use epigraph_ds::{combination, FocalElement, FrameOfDiscernment, MassFunction};
 use serde_json::Value;
 use uuid::Uuid;
@@ -27,10 +29,15 @@ fn read(dir: &str, file: &str) -> Value {
     serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse {path}: {e}"))
 }
 fn arr<'a>(v: &'a Value, key: &str) -> &'a Vec<Value> {
-    v.get(key).and_then(|x| x.as_array()).unwrap_or_else(|| panic!("missing array {key}"))
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .unwrap_or_else(|| panic!("missing array {key}"))
 }
 fn s(v: &Value, key: &str) -> String {
-    v.get(key).and_then(|x| x.as_str()).unwrap_or_else(|| panic!("missing str {key}")).to_string()
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or_else(|| panic!("missing str {key}"))
+        .to_string()
 }
 
 async fn insert_agent(pool: &PgPool) -> Uuid {
@@ -53,7 +60,9 @@ async fn assign(pool: &PgPool, claim: Uuid, frame: Uuid) {
 /// BetP for hypothesis index 0 (the target: efficacious / safe / holds) under a perspective.
 async fn betp0(pool: &PgPool, claim: Uuid, frame: Uuid, persp: Uuid) -> f64 {
     epigraph_engine::belief_query::get_perspective_belief(pool, claim, frame, persp)
-        .await.expect("belief").pignistic_prob
+        .await
+        .expect("belief")
+        .pignistic_prob
 }
 
 /// Build an open-world BBA json: mass on the named hypothesis (its frame index),
@@ -69,7 +78,10 @@ fn ow_bba_json(frame: &FrameOfDiscernment, hyps: &[String], masses: &Value) -> V
         if k == "theta" {
             theta_mass = val;
         } else {
-            let idx = hyps.iter().position(|h| h == k).unwrap_or_else(|| panic!("hyp {k} not in frame"));
+            let idx = hyps
+                .iter()
+                .position(|h| h == k)
+                .unwrap_or_else(|| panic!("hyp {k} not in frame"));
             hyp_idx = Some(idx);
             hyp_mass = val;
         }
@@ -84,13 +96,18 @@ fn ow_bba_json(frame: &FrameOfDiscernment, hyps: &[String], masses: &Value) -> V
         m.insert(FocalElement::theta(frame), theta_rem);
     }
     m.insert(FocalElement::missing(frame), ow);
-    MassFunction::new(frame.clone(), m).expect("ow bba").masses_to_json()
+    MassFunction::new(frame.clone(), m)
+        .expect("ow bba")
+        .masses_to_json()
 }
 
 #[tokio::test]
 #[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
 async fn load_and_validate_open_world() {
-    let Ok(url) = std::env::var("DATABASE_URL") else { eprintln!("SKIP: DATABASE_URL not set"); return; };
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
     let dir = std::env::var("SEED_DIR").expect("set SEED_DIR");
     let pool = PgPool::connect(&url).await.expect("connect");
     sqlx::migrate!("../../migrations").run(&pool).await.ok();
@@ -112,8 +129,13 @@ async fn load_and_validate_open_world() {
     // ---- frames ----
     for f in arr(&frames_j, "frames") {
         let name = s(f, "name");
-        let hyps: Vec<String> = arr(f, "hypotheses").iter().map(|h| h.as_str().unwrap().to_string()).collect();
-        let row = FrameRepository::create(&pool, &name, None, &hyps).await.expect("frame");
+        let hyps: Vec<String> = arr(f, "hypotheses")
+            .iter()
+            .map(|h| h.as_str().unwrap().to_string())
+            .collect();
+        let row = FrameRepository::create(&pool, &name, None, &hyps)
+            .await
+            .expect("frame");
         frame_of.insert(s(f, "key"), (row.id, hyps));
     }
     // ---- agents (source + observer) ----
@@ -127,19 +149,39 @@ async fn load_and_validate_open_world() {
     // ---- entities ----
     for e in arr(&entities_j, "entities") {
         let type_sub = e.get("type_sub").and_then(|x| x.as_str());
-        let props = e.get("properties").cloned().unwrap_or_else(|| serde_json::json!({}));
-        let row = EntityRepository::upsert(&pool, &s(e, "canonical_name"), &s(e, "type_top"), type_sub, None, props)
-            .await.expect("entity");
+        let props = e
+            .get("properties")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let row = EntityRepository::upsert(
+            &pool,
+            &s(e, "canonical_name"),
+            &s(e, "type_top"),
+            type_sub,
+            None,
+            props,
+        )
+        .await
+        .expect("entity");
         key_id.insert(s(e, "key"), row.id);
     }
     // ---- perspectives + source_reliability ----
     for p in arr(&obs_j, "perspectives") {
         let ptype = p.get("perspective_type").and_then(|x| x.as_str());
-        let row = PerspectiveRepository::create(&pool, &s(p, "name"), None, None, ptype, &[], None, None)
-            .await.expect("perspective");
-        let map: HashMap<String, f64> = p.get("source_reliability").and_then(|x| x.as_object()).unwrap()
-            .iter().map(|(k, v)| (k.clone(), v.as_f64().unwrap())).collect();
-        PerspectiveRepository::set_source_reliability(&pool, row.id, &map).await.expect("rel");
+        let row =
+            PerspectiveRepository::create(&pool, &s(p, "name"), None, None, ptype, &[], None, None)
+                .await
+                .expect("perspective");
+        let map: HashMap<String, f64> = p
+            .get("source_reliability")
+            .and_then(|x| x.as_object())
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_f64().unwrap()))
+            .collect();
+        PerspectiveRepository::set_source_reliability(&pool, row.id, &map)
+            .await
+            .expect("rel");
         persp_id.insert(s(p, "key"), row.id);
     }
     // ---- claims + BBAs (open-world) ----
@@ -158,9 +200,21 @@ async fn load_and_validate_open_world() {
             let masses = ev.get("masses").expect("masses");
             let bba = ow_bba_json(&frame, &hyps, masses);
             MassFunctionRepository::store_with_perspective(
-                &pool, claim_uuid, frame_uuid, src, None, &bba, None,
-                Some("discount"), Some(1.0), Some(&etype), "cross", None,
-            ).await.expect("store bba");
+                &pool,
+                claim_uuid,
+                frame_uuid,
+                src,
+                None,
+                &bba,
+                None,
+                Some("discount"),
+                Some(1.0),
+                Some(&etype),
+                "cross",
+                None,
+            )
+            .await
+            .expect("store bba");
             n_bba += 1;
         }
     }
@@ -169,7 +223,15 @@ async fn load_and_validate_open_world() {
     for e in arr(&edges_j, "edges") {
         let src = key_id.get(&s(e, "source")).copied().expect("edge source");
         let tgt = key_id.get(&s(e, "target")).copied().expect("edge target");
-        EdgeRepositoryCreate(&pool, src, &s(e, "source_type"), tgt, &s(e, "target_type"), &s(e, "relationship")).await;
+        EdgeRepositoryCreate(
+            &pool,
+            src,
+            &s(e, "source_type"),
+            tgt,
+            &s(e, "target_type"),
+            &s(e, "relationship"),
+        )
+        .await;
         n_edge += 1;
     }
     eprintln!("LOADED: {} frames, {} entities, {} claims, {} BBAs (open-world), {} perspectives, {} edges",
@@ -180,34 +242,104 @@ async fn load_and_validate_open_world() {
     let pid = |k: &str| *persp_id.get(k).expect(k);
     let eff_frame = frame_of.get("treatment_efficacy").unwrap().0;
     let saf_frame = frame_of.get("treatment_safety").unwrap().0;
-    let persps = ["clinical_observer", "tradition_observer", "regulatory_observer", "skeptic_observer"];
+    let persps = [
+        "clinical_observer",
+        "tradition_observer",
+        "regulatory_observer",
+        "skeptic_observer",
+    ];
 
-    eprintln!("\nEFFICACY BetP(efficacious) — open-world, real engine  [clin  trad  regul  skept]:");
-    for claim in ["eff-treatment-a-symptom-1", "eff-treatment-b-symptom-3", "eff-treatment-e-symptom-4", "eff-treatment-c-symptom-2"] {
+    eprintln!(
+        "\nEFFICACY BetP(efficacious) — open-world, real engine  [clin  trad  regul  skept]:"
+    );
+    for claim in [
+        "eff-treatment-a-symptom-1",
+        "eff-treatment-b-symptom-3",
+        "eff-treatment-e-symptom-4",
+        "eff-treatment-c-symptom-2",
+    ] {
         let mut v = vec![];
-        for p in persps { v.push(betp0(&pool, cid(claim), eff_frame, pid(p)).await); }
-        eprintln!("  {claim:<26} {:.3} {:.3} {:.3} {:.3}", v[0], v[1], v[2], v[3]);
+        for p in persps {
+            v.push(betp0(&pool, cid(claim), eff_frame, pid(p)).await);
+        }
+        eprintln!(
+            "  {claim:<26} {:.3} {:.3} {:.3} {:.3}",
+            v[0], v[1], v[2], v[3]
+        );
     }
     eprintln!("SAFETY BetP(safe):");
     for claim in ["saf-treatment-a", "saf-treatment-c"] {
         let mut v = vec![];
-        for p in persps { v.push(betp0(&pool, cid(claim), saf_frame, pid(p)).await); }
-        eprintln!("  {claim:<26} {:.3} {:.3} {:.3} {:.3}", v[0], v[1], v[2], v[3]);
+        for p in persps {
+            v.push(betp0(&pool, cid(claim), saf_frame, pid(p)).await);
+        }
+        eprintln!(
+            "  {claim:<26} {:.3} {:.3} {:.3} {:.3}",
+            v[0], v[1], v[2], v[3]
+        );
     }
 
     // Directional assertions (open-world shifts magnitudes; directions hold).
     for p in persps {
-        assert!(betp0(&pool, cid("eff-treatment-a-symptom-1"), eff_frame, pid(p)).await > 0.5, "consensus eff {p}");
+        assert!(
+            betp0(&pool, cid("eff-treatment-a-symptom-1"), eff_frame, pid(p)).await > 0.5,
+            "consensus eff {p}"
+        );
     }
-    let bv = betp0(&pool, cid("eff-treatment-b-symptom-3"), eff_frame, pid("tradition_observer")).await;
-    let bc = betp0(&pool, cid("eff-treatment-b-symptom-3"), eff_frame, pid("clinical_observer")).await;
-    assert!(bv > bc + 0.15, "tradition-only gap: tradition {bv} vs clinical {bc}");
-    let jv = betp0(&pool, cid("eff-treatment-e-symptom-4"), eff_frame, pid("tradition_observer")).await;
-    let jc = betp0(&pool, cid("eff-treatment-e-symptom-4"), eff_frame, pid("clinical_observer")).await;
-    assert!(jv > jc && jc < 0.5, "conflict: tradition {jv} vs clinical {jc}");
-    let sv = betp0(&pool, cid("saf-treatment-c"), saf_frame, pid("tradition_observer")).await;
-    let sc = betp0(&pool, cid("saf-treatment-c"), saf_frame, pid("clinical_observer")).await;
-    assert!(sv > sc + 0.25 && sc < 0.5, "safety divergence: tradition {sv} vs clinical {sc}");
+    let bv = betp0(
+        &pool,
+        cid("eff-treatment-b-symptom-3"),
+        eff_frame,
+        pid("tradition_observer"),
+    )
+    .await;
+    let bc = betp0(
+        &pool,
+        cid("eff-treatment-b-symptom-3"),
+        eff_frame,
+        pid("clinical_observer"),
+    )
+    .await;
+    assert!(
+        bv > bc + 0.15,
+        "tradition-only gap: tradition {bv} vs clinical {bc}"
+    );
+    let jv = betp0(
+        &pool,
+        cid("eff-treatment-e-symptom-4"),
+        eff_frame,
+        pid("tradition_observer"),
+    )
+    .await;
+    let jc = betp0(
+        &pool,
+        cid("eff-treatment-e-symptom-4"),
+        eff_frame,
+        pid("clinical_observer"),
+    )
+    .await;
+    assert!(
+        jv > jc && jc < 0.5,
+        "conflict: tradition {jv} vs clinical {jc}"
+    );
+    let sv = betp0(
+        &pool,
+        cid("saf-treatment-c"),
+        saf_frame,
+        pid("tradition_observer"),
+    )
+    .await;
+    let sc = betp0(
+        &pool,
+        cid("saf-treatment-c"),
+        saf_frame,
+        pid("clinical_observer"),
+    )
+    .await;
+    assert!(
+        sv > sc + 0.25 && sc < 0.5,
+        "safety divergence: tradition {sv} vs clinical {sc}"
+    );
 
     // ---- OPEN-WORLD PROOF ----
     // The engine implements the YagerOpen rule as inagaki_combine(gamma=1.0) (routes ALL
@@ -220,7 +352,9 @@ async fn load_and_validate_open_world() {
     let mk = |idx: usize, ow: f64| {
         let mut m = BTreeMap::new();
         m.insert(FocalElement::positive(BTreeSet::from([idx])), 0.80); // K = 0.80*0.80 = 0.64 >= 0.5
-        if ow > 0.0 { m.insert(FocalElement::missing(&bf), ow); }
+        if ow > 0.0 {
+            m.insert(FocalElement::missing(&bf), ow);
+        }
         m.insert(FocalElement::theta(&bf), 0.20 - ow);
         MassFunction::new(bf.clone(), m).unwrap()
     };

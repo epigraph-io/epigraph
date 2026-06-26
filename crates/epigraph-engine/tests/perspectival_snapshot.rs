@@ -11,7 +11,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use epigraph_db::{EntityRepository, FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
+use epigraph_db::{
+    EntityRepository, FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool,
+};
 use epigraph_ds::{FocalElement, FrameOfDiscernment, MassFunction};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -24,10 +26,15 @@ fn read(dir: &str, file: &str) -> Value {
     serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse {path}: {e}"))
 }
 fn arr<'a>(v: &'a Value, key: &str) -> &'a Vec<Value> {
-    v.get(key).and_then(|x| x.as_array()).unwrap_or_else(|| panic!("missing array {key}"))
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .unwrap_or_else(|| panic!("missing array {key}"))
 }
 fn s(v: &Value, key: &str) -> String {
-    v.get(key).and_then(|x| x.as_str()).unwrap_or_else(|| panic!("missing str {key}")).to_string()
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or_else(|| panic!("missing str {key}"))
+        .to_string()
 }
 fn s_opt(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(String::from)
@@ -51,36 +58,62 @@ async fn assign(pool: &PgPool, claim: Uuid, frame: Uuid) {
 }
 async fn betp0(pool: &PgPool, claim: Uuid, frame: Uuid, persp: Uuid) -> f64 {
     epigraph_engine::belief_query::get_perspective_belief(pool, claim, frame, persp)
-        .await.expect("belief").pignistic_prob
+        .await
+        .expect("belief")
+        .pignistic_prob
 }
 fn ow_bba_json(frame: &FrameOfDiscernment, hyps: &[String], masses: &Value) -> Value {
     let obj = masses.as_object().expect("masses obj");
     let (mut hyp_idx, mut hyp_mass, mut theta_mass) = (None, 0.0, 0.0);
     for (k, v) in obj {
         let val = v.as_f64().expect("mass f64");
-        if k == "theta" { theta_mass = val; }
-        else { hyp_idx = Some(hyps.iter().position(|h| h == k).unwrap_or_else(|| panic!("hyp {k}"))); hyp_mass = val; }
+        if k == "theta" {
+            theta_mass = val;
+        } else {
+            hyp_idx = Some(
+                hyps.iter()
+                    .position(|h| h == k)
+                    .unwrap_or_else(|| panic!("hyp {k}")),
+            );
+            hyp_mass = val;
+        }
     }
     let idx = hyp_idx.expect("hyp");
     let ow = OPEN_WORLD_FRACTION.min(theta_mass);
     let theta_rem = (theta_mass - ow).max(0.0);
     let mut m: BTreeMap<FocalElement, f64> = BTreeMap::new();
     m.insert(FocalElement::positive(BTreeSet::from([idx])), hyp_mass);
-    if theta_rem > 1e-9 { m.insert(FocalElement::theta(frame), theta_rem); }
+    if theta_rem > 1e-9 {
+        m.insert(FocalElement::theta(frame), theta_rem);
+    }
     m.insert(FocalElement::missing(frame), ow);
-    MassFunction::new(frame.clone(), m).expect("ow bba").masses_to_json()
+    MassFunction::new(frame.clone(), m)
+        .expect("ow bba")
+        .masses_to_json()
 }
 
 struct ClaimMeta {
-    key: String, kind: String, frame: String, target: String, content: String,
-    treatment: Option<String>, symptom: Option<String>, dimension: Option<String>, archetype: Option<String>,
-    evidence: Vec<Value>, uuid: Uuid, frame_uuid: Uuid,
+    key: String,
+    kind: String,
+    frame: String,
+    target: String,
+    content: String,
+    treatment: Option<String>,
+    symptom: Option<String>,
+    dimension: Option<String>,
+    archetype: Option<String>,
+    evidence: Vec<Value>,
+    uuid: Uuid,
+    frame_uuid: Uuid,
 }
 
 #[tokio::test]
 #[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
 async fn generate_snapshot() {
-    let Ok(url) = std::env::var("DATABASE_URL") else { eprintln!("SKIP: DATABASE_URL not set"); return; };
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
     let dir = std::env::var("SEED_DIR").expect("set SEED_DIR");
     let out = std::env::var("SNAPSHOT_OUT").expect("set SNAPSHOT_OUT");
     let pool = PgPool::connect(&url).await.expect("connect");
@@ -98,27 +131,63 @@ async fn generate_snapshot() {
     let mut frame_of: HashMap<String, (Uuid, Vec<String>)> = HashMap::new();
 
     for f in arr(&frames_j, "frames") {
-        let hyps: Vec<String> = arr(f, "hypotheses").iter().map(|h| h.as_str().unwrap().to_string()).collect();
-        let row = FrameRepository::create(&pool, &s(f, "name"), None, &hyps).await.expect("frame");
+        let hyps: Vec<String> = arr(f, "hypotheses")
+            .iter()
+            .map(|h| h.as_str().unwrap().to_string())
+            .collect();
+        let row = FrameRepository::create(&pool, &s(f, "name"), None, &hyps)
+            .await
+            .expect("frame");
         frame_of.insert(s(f, "key"), (row.id, hyps));
     }
     for grp in ["source_agents", "observer_agents"] {
         if let Some(list) = agents_j.get(grp).and_then(|x| x.as_array()) {
-            for a in list { agent_id.insert(s(a, "key"), insert_agent(&pool).await); }
+            for a in list {
+                agent_id.insert(s(a, "key"), insert_agent(&pool).await);
+            }
         }
     }
     for e in arr(&entities_j, "entities") {
-        EntityRepository::upsert(&pool, &s(e, "canonical_name"), &s(e, "type_top"),
-            e.get("type_sub").and_then(|x| x.as_str()), None,
-            e.get("properties").cloned().unwrap_or_else(|| json!({}))).await.expect("entity");
+        EntityRepository::upsert(
+            &pool,
+            &s(e, "canonical_name"),
+            &s(e, "type_top"),
+            e.get("type_sub").and_then(|x| x.as_str()),
+            None,
+            e.get("properties").cloned().unwrap_or_else(|| json!({})),
+        )
+        .await
+        .expect("entity");
     }
     for p in arr(&obs_j, "perspectives") {
-        let row = PerspectiveRepository::create(&pool, &s(p, "name"), None, None,
-            p.get("perspective_type").and_then(|x| x.as_str()), &[], None, None).await.expect("persp");
-        let map: HashMap<String, f64> = p.get("source_reliability").and_then(|x| x.as_object()).unwrap()
-            .iter().map(|(k, v)| (k.clone(), v.as_f64().unwrap())).collect();
-        PerspectiveRepository::set_source_reliability(&pool, row.id, &map).await.expect("rel");
-        persp.push((s(p, "key"), s(p, "name"), row.id, p.get("source_reliability").cloned().unwrap()));
+        let row = PerspectiveRepository::create(
+            &pool,
+            &s(p, "name"),
+            None,
+            None,
+            p.get("perspective_type").and_then(|x| x.as_str()),
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect("persp");
+        let map: HashMap<String, f64> = p
+            .get("source_reliability")
+            .and_then(|x| x.as_object())
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_f64().unwrap()))
+            .collect();
+        PerspectiveRepository::set_source_reliability(&pool, row.id, &map)
+            .await
+            .expect("rel");
+        persp.push((
+            s(p, "key"),
+            s(p, "name"),
+            row.id,
+            p.get("source_reliability").cloned().unwrap(),
+        ));
     }
 
     let mut claims: Vec<ClaimMeta> = Vec::new();
@@ -133,15 +202,37 @@ async fn generate_snapshot() {
             let etype = s(ev, "evidence_type");
             let masses = ev.get("masses").expect("masses");
             let bba = ow_bba_json(&frame, &hyps, masses);
-            MassFunctionRepository::store_with_perspective(&pool, cu, frame_uuid,
-                agent_id.get(&s(ev, "source_agent")).copied(), None, &bba, None,
-                Some("discount"), Some(1.0), Some(&etype), "cross", None).await.expect("bba");
+            MassFunctionRepository::store_with_perspective(
+                &pool,
+                cu,
+                frame_uuid,
+                agent_id.get(&s(ev, "source_agent")).copied(),
+                None,
+                &bba,
+                None,
+                Some("discount"),
+                Some(1.0),
+                Some(&etype),
+                "cross",
+                None,
+            )
+            .await
+            .expect("bba");
             ev_out.push(json!({ "source_type": etype, "source_agent": s(ev, "source_agent"), "masses": masses }));
         }
         claims.push(ClaimMeta {
-            key: s(c, "key"), kind: s(c, "claim_kind"), frame: fk, target: hyps[0].clone(), content: s(c, "content"),
-            treatment: s_opt(c, "treatment"), symptom: s_opt(c, "symptom"), dimension: s_opt(c, "dimension"),
-            archetype: s_opt(c, "archetype"), evidence: ev_out, uuid: cu, frame_uuid,
+            key: s(c, "key"),
+            kind: s(c, "claim_kind"),
+            frame: fk,
+            target: hyps[0].clone(),
+            content: s(c, "content"),
+            treatment: s_opt(c, "treatment"),
+            symptom: s_opt(c, "symptom"),
+            dimension: s_opt(c, "dimension"),
+            archetype: s_opt(c, "archetype"),
+            evidence: ev_out,
+            uuid: cu,
+            frame_uuid,
         });
     }
 
@@ -149,7 +240,10 @@ async fn generate_snapshot() {
     for cm in &claims {
         let mut betp = serde_json::Map::new();
         for (pk, _pn, pid, _sr) in &persp {
-            betp.insert(pk.clone(), json!(betp0(&pool, cm.uuid, cm.frame_uuid, *pid).await));
+            betp.insert(
+                pk.clone(),
+                json!(betp0(&pool, cm.uuid, cm.frame_uuid, *pid).await),
+            );
         }
         claims_json.push(json!({
             "key": cm.key, "kind": cm.kind, "frame": cm.frame, "target": cm.target, "content": cm.content,
@@ -158,16 +252,29 @@ async fn generate_snapshot() {
         }));
     }
 
-    let entities_out: Vec<Value> = arr(&entities_j, "entities").iter().map(|e| json!({
-        "key": s(e, "key"), "name": s(e, "canonical_name"), "type_top": s(e, "type_top"),
-        "type_sub": e.get("type_sub").and_then(|x| x.as_str()),
-    })).collect();
-    let disease = entities_out.iter()
+    let entities_out: Vec<Value> = arr(&entities_j, "entities")
+        .iter()
+        .map(|e| {
+            json!({
+                "key": s(e, "key"), "name": s(e, "canonical_name"), "type_top": s(e, "type_top"),
+                "type_sub": e.get("type_sub").and_then(|x| x.as_str()),
+            })
+        })
+        .collect();
+    let disease = entities_out
+        .iter()
         .find(|e| e["type_sub"].as_str() == Some("DiseaseState"))
-        .and_then(|e| e["name"].as_str()).unwrap_or("condition cluster").to_string();
-    let persp_out: Vec<Value> = persp.iter().map(|(k, n, _, sr)| json!({
-        "key": k, "name": n, "source_reliability": sr,
-    })).collect();
+        .and_then(|e| e["name"].as_str())
+        .unwrap_or("condition cluster")
+        .to_string();
+    let persp_out: Vec<Value> = persp
+        .iter()
+        .map(|(k, n, _, sr)| {
+            json!({
+                "key": k, "name": n, "source_reliability": sr,
+            })
+        })
+        .collect();
 
     let snapshot = json!({
         "generated_from": "epigraph_demo_dev — real CDST engine (get_perspective_belief), open-world BBAs",
@@ -178,7 +285,13 @@ async fn generate_snapshot() {
         "claims": claims_json,
     });
 
-    if let Some(parent) = std::path::Path::new(&out).parent() { std::fs::create_dir_all(parent).ok(); }
+    if let Some(parent) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
     std::fs::write(&out, serde_json::to_string_pretty(&snapshot).unwrap()).expect("write snapshot");
-    eprintln!("SNAPSHOT → {out}  ({} claims × {} perspectives)", claims.len(), persp.len());
+    eprintln!(
+        "SNAPSHOT → {out}  ({} claims × {} perspectives)",
+        claims.len(),
+        persp.len()
+    );
 }

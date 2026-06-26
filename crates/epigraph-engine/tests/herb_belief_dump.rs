@@ -81,7 +81,10 @@ async fn herb_belief_dump() {
             // line when stdout/stderr interleave.
         }
         for ((herb, persp), (sum, n)) in &acc {
-            println!("ROW\t{mode}\t{aspect}\t{herb}\t{persp}\t{:.3}\t{n}", sum / (*n as f64));
+            println!(
+                "ROW\t{mode}\t{aspect}\t{herb}\t{persp}\t{:.3}\t{n}",
+                sum / (*n as f64)
+            );
         }
     }
 }

@@ -28,7 +28,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use epigraph_db::{EntityRepository, FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
+use epigraph_db::{
+    EntityRepository, FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool,
+};
 use epigraph_ds::{FocalElement, FrameOfDiscernment, MassFunction};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
@@ -41,10 +43,16 @@ fn read(path: &str) -> Value {
     serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse {path}: {e}"))
 }
 fn arr<'a>(v: &'a Value, key: &str) -> &'a Vec<Value> {
-    v.get(key).and_then(|x| x.as_array()).map(|a| a).unwrap_or_else(|| panic!("missing array {key}"))
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|a| a)
+        .unwrap_or_else(|| panic!("missing array {key}"))
 }
 fn s(v: &Value, key: &str) -> String {
-    v.get(key).and_then(|x| x.as_str()).unwrap_or_default().to_string()
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 async fn insert_agent(pool: &PgPool) -> Uuid {
@@ -65,7 +73,9 @@ async fn assign(pool: &PgPool, claim: Uuid, frame: Uuid) {
 }
 async fn betp0(pool: &PgPool, claim: Uuid, frame: Uuid, persp: Uuid) -> f64 {
     epigraph_engine::belief_query::get_perspective_belief(pool, claim, frame, persp)
-        .await.expect("belief").pignistic_prob
+        .await
+        .expect("belief")
+        .pignistic_prob
 }
 
 /// Open-world BBA from an arbitrary masses map (hypothesis names + "theta");
@@ -84,7 +94,8 @@ fn ow_bba_json(frame: &FrameOfDiscernment, hyps: &[String], masses: &Map<String,
             theta_mass = val;
         } else if let Some(idx) = hyps.iter().position(|h| h == k) {
             if val > 0.0 {
-                *m.entry(FocalElement::positive(BTreeSet::from([idx]))).or_insert(0.0) += val;
+                *m.entry(FocalElement::positive(BTreeSet::from([idx])))
+                    .or_insert(0.0) += val;
             }
         }
     }
@@ -100,7 +111,9 @@ fn ow_bba_json(frame: &FrameOfDiscernment, hyps: &[String], masses: &Map<String,
             *v /= sum;
         }
     }
-    MassFunction::new(frame.clone(), m).expect("ow bba").masses_to_json()
+    MassFunction::new(frame.clone(), m)
+        .expect("ow bba")
+        .masses_to_json()
 }
 
 /// Match a (possibly latin-suffixed) evidence treatment_key back onto a clean
@@ -108,10 +121,15 @@ fn ow_bba_json(frame: &FrameOfDiscernment, hyps: &[String], masses: &Map<String,
 fn match_treatment<'a>(pkg: &'a Value, raw_tk: &str) -> (String, String) {
     let matched = arr(pkg, "treatments").iter().find(|t| {
         let k = s(t, "key");
-        !k.is_empty() && (raw_tk == k || raw_tk.starts_with(&k) || raw_tk.contains(&k) || k.contains(raw_tk))
+        !k.is_empty()
+            && (raw_tk == k || raw_tk.starts_with(&k) || raw_tk.contains(&k) || k.contains(raw_tk))
     });
-    let tk = matched.map(|t| s(t, "key")).unwrap_or_else(|| raw_tk.to_string());
-    let tname = matched.map(|t| s(t, "name")).unwrap_or_else(|| raw_tk.to_string());
+    let tk = matched
+        .map(|t| s(t, "key"))
+        .unwrap_or_else(|| raw_tk.to_string());
+    let tname = matched
+        .map(|t| s(t, "name"))
+        .unwrap_or_else(|| raw_tk.to_string());
     (tk, tname)
 }
 
@@ -142,7 +160,10 @@ struct ClaimMeta {
 #[tokio::test]
 #[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
 async fn merge_interview_and_recompute() {
-    let Ok(url) = std::env::var("DATABASE_URL") else { eprintln!("SKIP: DATABASE_URL not set"); return; };
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("SKIP: DATABASE_URL not set");
+        return;
+    };
     let pkg_path = std::env::var("DISCOVERY_IN").expect("set DISCOVERY_IN");
     let interview_path = std::env::var("INTERVIEW_IN").expect("set INTERVIEW_IN");
     let dir = std::env::var("SEED_DIR").expect("set SEED_DIR");
@@ -160,48 +181,115 @@ async fn merge_interview_and_recompute() {
     // ---- frames (fixed 4) ----
     let mut frame_of: HashMap<String, (Uuid, Vec<String>)> = HashMap::new();
     for f in arr(&frames_j, "frames") {
-        let hyps: Vec<String> = arr(f, "hypotheses").iter().map(|h| h.as_str().unwrap().to_string()).collect();
-        let row = FrameRepository::create(&pool, &s(f, "name"), None, &hyps).await.expect("frame");
+        let hyps: Vec<String> = arr(f, "hypotheses")
+            .iter()
+            .map(|h| h.as_str().unwrap().to_string())
+            .collect();
+        let row = FrameRepository::create(&pool, &s(f, "name"), None, &hyps)
+            .await
+            .expect("frame");
         frame_of.insert(s(f, "key"), (row.id, hyps));
     }
     // ---- perspectives (fixed 4) ----
     let author = insert_agent(&pool).await;
     let mut persp: Vec<(String, String, Uuid, Value)> = Vec::new();
     for p in arr(&obs_j, "perspectives") {
-        let row = PerspectiveRepository::create(&pool, &s(p, "name"), None, None,
-            p.get("perspective_type").and_then(|x| x.as_str()), &[], None, None).await.expect("persp");
-        let map: HashMap<String, f64> = p.get("source_reliability").and_then(|x| x.as_object()).unwrap()
-            .iter().map(|(k, v)| (k.clone(), v.as_f64().unwrap())).collect();
-        PerspectiveRepository::set_source_reliability(&pool, row.id, &map).await.expect("rel");
-        persp.push((s(p, "key"), s(p, "name"), row.id, p.get("source_reliability").cloned().unwrap()));
+        let row = PerspectiveRepository::create(
+            &pool,
+            &s(p, "name"),
+            None,
+            None,
+            p.get("perspective_type").and_then(|x| x.as_str()),
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect("persp");
+        let map: HashMap<String, f64> = p
+            .get("source_reliability")
+            .and_then(|x| x.as_object())
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_f64().unwrap()))
+            .collect();
+        PerspectiveRepository::set_source_reliability(&pool, row.id, &map)
+            .await
+            .expect("rel");
+        persp.push((
+            s(p, "key"),
+            s(p, "name"),
+            row.id,
+            p.get("source_reliability").cloned().unwrap(),
+        ));
     }
 
     // ---- entities: condition-cluster anchor + treatment organisms ----
-    let mut entities_out: Vec<Value> = vec![json!({ "key": "disease-state", "name": disease, "type_top": "Condition", "type_sub": "DiseaseState" })];
-    EntityRepository::upsert(&pool, &disease, "Condition", Some("DiseaseState"), None, json!({})).await.expect("disease entity");
-    let symptom_name: HashMap<String, String> =
-        arr(cluster, "symptoms").iter().map(|s_| (s(s_, "key"), s(s_, "name"))).collect();
+    let mut entities_out: Vec<Value> = vec![
+        json!({ "key": "disease-state", "name": disease, "type_top": "Condition", "type_sub": "DiseaseState" }),
+    ];
+    EntityRepository::upsert(
+        &pool,
+        &disease,
+        "Condition",
+        Some("DiseaseState"),
+        None,
+        json!({}),
+    )
+    .await
+    .expect("disease entity");
+    let symptom_name: HashMap<String, String> = arr(cluster, "symptoms")
+        .iter()
+        .map(|s_| (s(s_, "key"), s(s_, "name")))
+        .collect();
     for t in arr(&pkg, "treatments") {
-        let name = if s(t, "latin").is_empty() { s(t, "name") } else { format!("{} ({})", s(t, "name"), s(t, "latin")) };
-        EntityRepository::upsert(&pool, &name, "Organism", Some("Botanical"), None, json!({})).await.expect("treatment entity");
+        let name = if s(t, "latin").is_empty() {
+            s(t, "name")
+        } else {
+            format!("{} ({})", s(t, "name"), s(t, "latin"))
+        };
+        EntityRepository::upsert(&pool, &name, "Organism", Some("Botanical"), None, json!({}))
+            .await
+            .expect("treatment entity");
         entities_out.push(json!({ "key": s(t, "key"), "name": name, "type_top": "Organism", "type_sub": "Botanical" }));
     }
 
     // clean treatment key -> display name (for content of newly-created claims)
-    let treat_name: HashMap<String, String> =
-        arr(&pkg, "treatments").iter().map(|t| (s(t, "key"), s(t, "name"))).collect();
+    let treat_name: HashMap<String, String> = arr(&pkg, "treatments")
+        .iter()
+        .map(|t| (s(t, "key"), s(t, "name")))
+        .collect();
 
     // ============================================================
     // STAGE A: build the discovery cluster exactly as the converter
     // ============================================================
     let mut metas: Vec<ClaimMeta> = Vec::new();
-    let mut push_claim = |metas: &mut Vec<ClaimMeta>, key: String, kind: &str, frame_key: &str, content: String,
-                          treatment: Option<String>, symptom: Option<String>, dimension: Option<String>, evidence: Vec<Value>| {
+    let mut push_claim = |metas: &mut Vec<ClaimMeta>,
+                          key: String,
+                          kind: &str,
+                          frame_key: &str,
+                          content: String,
+                          treatment: Option<String>,
+                          symptom: Option<String>,
+                          dimension: Option<String>,
+                          evidence: Vec<Value>| {
         let (fu, hyps) = frame_of.get(frame_key).expect("frame").clone();
         metas.push(ClaimMeta {
-            key, kind: kind.to_string(), frame_key: frame_key.to_string(), target: hyps[0].clone(),
-            content, treatment, symptom, dimension, evidence, uuid: Uuid::nil(), frame_uuid: fu,
-            before: Map::new(), after: Map::new(), created_for_interview: false, touched: false,
+            key,
+            kind: kind.to_string(),
+            frame_key: frame_key.to_string(),
+            target: hyps[0].clone(),
+            content,
+            treatment,
+            symptom,
+            dimension,
+            evidence,
+            uuid: Uuid::nil(),
+            frame_uuid: fu,
+            before: Map::new(),
+            after: Map::new(),
+            created_for_interview: false,
+            touched: false,
         });
     };
 
@@ -212,33 +300,82 @@ async fn merge_interview_and_recompute() {
                     "masses": { "holds": m.get("holds").and_then(|x| x.as_f64()).unwrap_or(0.4),
                                 "theta": 1.0 - m.get("holds").and_then(|x| x.as_f64()).unwrap_or(0.4) } })
         }).collect()).unwrap_or_default();
-        push_claim(&mut metas, s(sy, "key"), "symptom", "symptom_membership", s(sy, "name"),
-            None, None, sy.get("dimension").and_then(|x| x.as_str()).map(String::from), ev);
+        push_claim(
+            &mut metas,
+            s(sy, "key"),
+            "symptom",
+            "symptom_membership",
+            s(sy, "name"),
+            None,
+            None,
+            sy.get("dimension")
+                .and_then(|x| x.as_str())
+                .map(String::from),
+            ev,
+        );
     }
     // diagnostic-label claims
     for (i, lbl) in arr(cluster, "western_labels").iter().enumerate() {
         let lbl = lbl.as_str().unwrap_or("clinical diagnosis").to_string();
-        let ev = vec![json!({ "source_type": "source_clinical", "masses": { "holds": 0.85, "theta": 0.15 } })];
-        push_claim(&mut metas, format!("label-{i}"), "label", "diagnostic_label",
-            format!("This state is correctly labeled {lbl}."), None, None, None, ev);
+        let ev = vec![
+            json!({ "source_type": "source_clinical", "masses": { "holds": 0.85, "theta": 0.15 } }),
+        ];
+        push_claim(
+            &mut metas,
+            format!("label-{i}"),
+            "label",
+            "diagnostic_label",
+            format!("This state is correctly labeled {lbl}."),
+            None,
+            None,
+            None,
+            ev,
+        );
     }
     // treatment efficacy + safety claims
     for tev in arr(&pkg, "evidence") {
         let raw_tk = s(tev, "treatment_key");
         let (tk, tname) = match_treatment(&pkg, &raw_tk);
-        for eff in tev.get("efficacy").and_then(|x| x.as_array()).map(|a| a.clone()).unwrap_or_default() {
+        for eff in tev
+            .get("efficacy")
+            .and_then(|x| x.as_array())
+            .map(|a| a.clone())
+            .unwrap_or_default()
+        {
             let sk = s(&eff, "symptom_key");
             let sname = symptom_name.get(&sk).cloned().unwrap_or(sk.clone());
             let ev: Vec<Value> = eff.get("sources").and_then(|x| x.as_array()).map(|a| a.iter().map(|sc| {
                 json!({ "source_type": s(sc, "source_type"), "masses": sc.get("masses").cloned().unwrap_or(json!({})) })
             }).collect()).unwrap_or_default();
-            push_claim(&mut metas, format!("eff-{tk}-{sk}"), "treatment_effect", "treatment_efficacy",
-                format!("{tname} is efficacious for {sname}."), Some(tk.clone()), Some(sk), None, ev);
+            push_claim(
+                &mut metas,
+                format!("eff-{tk}-{sk}"),
+                "treatment_effect",
+                "treatment_efficacy",
+                format!("{tname} is efficacious for {sname}."),
+                Some(tk.clone()),
+                Some(sk),
+                None,
+                ev,
+            );
         }
-        if let Some(saf) = tev.get("safety").and_then(|x| x.get("sources")).and_then(|x| x.as_array()) {
+        if let Some(saf) = tev
+            .get("safety")
+            .and_then(|x| x.get("sources"))
+            .and_then(|x| x.as_array())
+        {
             let ev: Vec<Value> = saf.iter().map(|sc| json!({ "source_type": s(sc, "source_type"), "masses": sc.get("masses").cloned().unwrap_or(json!({})) })).collect();
-            push_claim(&mut metas, format!("saf-{tk}"), "treatment_safety", "treatment_safety",
-                format!("{tname} is safe at therapeutic dose for chronic use."), Some(tk.clone()), None, None, ev);
+            push_claim(
+                &mut metas,
+                format!("saf-{tk}"),
+                "treatment_safety",
+                "treatment_safety",
+                format!("{tname} is safe at therapeutic dose for chronic use."),
+                Some(tk.clone()),
+                None,
+                None,
+                ev,
+            );
         }
     }
 
@@ -252,12 +389,32 @@ async fn merge_interview_and_recompute() {
         let frame = FrameOfDiscernment::new(cm.frame_key.clone(), hyps.clone()).unwrap();
         for ev in &cm.evidence {
             let st = s(ev, "source_type");
-            let masses = ev.get("masses").and_then(|x| x.as_object()).cloned().unwrap_or_default();
-            if masses.is_empty() { continue; }
+            let masses = ev
+                .get("masses")
+                .and_then(|x| x.as_object())
+                .cloned()
+                .unwrap_or_default();
+            if masses.is_empty() {
+                continue;
+            }
             let bba = ow_bba_json(&frame, &hyps, &masses);
             let src = insert_agent(&pool).await;
-            MassFunctionRepository::store_with_perspective(&pool, cu, cm.frame_uuid, Some(src),
-                None, &bba, None, Some("discount"), Some(1.0), Some(&st), "cross", None).await.expect("bba");
+            MassFunctionRepository::store_with_perspective(
+                &pool,
+                cu,
+                cm.frame_uuid,
+                Some(src),
+                None,
+                &bba,
+                None,
+                Some("discount"),
+                Some(1.0),
+                Some(&st),
+                "cross",
+                None,
+            )
+            .await
+            .expect("bba");
         }
     }
 
@@ -267,7 +424,10 @@ async fn merge_interview_and_recompute() {
     for cm in metas.iter_mut() {
         let mut betp = Map::new();
         for (pk, _pn, pid, _sr) in &persp {
-            betp.insert(pk.clone(), json!(betp0(&pool, cm.uuid, cm.frame_uuid, *pid).await));
+            betp.insert(
+                pk.clone(),
+                json!(betp0(&pool, cm.uuid, cm.frame_uuid, *pid).await),
+            );
         }
         cm.before = betp;
     }
@@ -282,19 +442,30 @@ async fn merge_interview_and_recompute() {
     let interview = read(&interview_path);
     // (key, id) for each perspective — used to materialize a created claim's
     // baseline "before" BetP inside ensure_meta.
-    let persp_ids: Vec<(String, Uuid)> = persp.iter().map(|(k, _, id, _)| (k.clone(), *id)).collect();
+    let persp_ids: Vec<(String, Uuid)> =
+        persp.iter().map(|(k, _, id, _)| (k.clone(), *id)).collect();
     let practitioner = insert_agent(&pool).await;
-    let practitioner_did = interview.get("agent").and_then(|a| a.get("did"))
-        .and_then(|x| x.as_str()).unwrap_or("did:perspectival:practitioner:unknown").to_string();
+    let practitioner_did = interview
+        .get("agent")
+        .and_then(|a| a.get("did"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("did:perspectival:practitioner:unknown")
+        .to_string();
 
     // index existing metas by key for precise attachment (claims live in the DB
     // by content/hash, so the key->uuid map is the only reliable lookup)
-    let mut key_index: HashMap<String, usize> =
-        metas.iter().enumerate().map(|(i, cm)| (cm.key.clone(), i)).collect();
+    let mut key_index: HashMap<String, usize> = metas
+        .iter()
+        .enumerate()
+        .map(|(i, cm)| (cm.key.clone(), i))
+        .collect();
 
     // collect (meta_index, frame_key, raw_masses_value, source_type) merges to
     // apply after we finish mutating `metas`, to keep the borrow checker happy.
-    struct Merge { idx: usize, masses: Map<String, Value> }
+    struct Merge {
+        idx: usize,
+        masses: Map<String, Value>,
+    }
     let mut merges: Vec<Merge> = Vec::new();
 
     for tev in arr(&interview, "evidence") {
@@ -303,35 +474,77 @@ async fn merge_interview_and_recompute() {
         let tname = treat_name.get(&tk).cloned().unwrap_or_else(|| tk.clone());
 
         // efficacy entries: one practitioner BBA per (treatment, symptom)
-        for eff in tev.get("efficacy").and_then(|x| x.as_array()).map(|a| a.clone()).unwrap_or_default() {
+        for eff in tev
+            .get("efficacy")
+            .and_then(|x| x.as_array())
+            .map(|a| a.clone())
+            .unwrap_or_default()
+        {
             let sk = s(&eff, "symptom_key");
             let sname = symptom_name.get(&sk).cloned().unwrap_or(sk.clone());
             // the interview provides a single practitioner source per symptom;
             // take its masses (raw 3-key)
-            let masses = eff.get("sources").and_then(|x| x.as_array())
+            let masses = eff
+                .get("sources")
+                .and_then(|x| x.as_array())
                 .and_then(|a| a.first())
-                .and_then(|sc| sc.get("masses")).and_then(|x| x.as_object()).cloned()
+                .and_then(|sc| sc.get("masses"))
+                .and_then(|x| x.as_object())
+                .cloned()
                 .unwrap_or_default();
-            if masses.is_empty() { continue; }
+            if masses.is_empty() {
+                continue;
+            }
             let key = format!("eff-{tk}-{sk}");
-            let idx = ensure_meta(&pool, &mut metas, &mut key_index, &frame_of, &persp_ids, author,
-                &key, "treatment_effect", "treatment_efficacy",
+            let idx = ensure_meta(
+                &pool,
+                &mut metas,
+                &mut key_index,
+                &frame_of,
+                &persp_ids,
+                author,
+                &key,
+                "treatment_effect",
+                "treatment_efficacy",
                 format!("{tname} is efficacious for {sname}."),
-                Some(tk.clone()), Some(sk.clone()), None).await;
+                Some(tk.clone()),
+                Some(sk.clone()),
+                None,
+            )
+            .await;
             merges.push(Merge { idx, masses });
         }
 
         // safety entry: one practitioner BBA per treatment
-        if let Some(saf_sources) = tev.get("safety").and_then(|x| x.get("sources")).and_then(|x| x.as_array()) {
-            let masses = saf_sources.first()
-                .and_then(|sc| sc.get("masses")).and_then(|x| x.as_object()).cloned()
+        if let Some(saf_sources) = tev
+            .get("safety")
+            .and_then(|x| x.get("sources"))
+            .and_then(|x| x.as_array())
+        {
+            let masses = saf_sources
+                .first()
+                .and_then(|sc| sc.get("masses"))
+                .and_then(|x| x.as_object())
+                .cloned()
                 .unwrap_or_default();
             if !masses.is_empty() {
                 let key = format!("saf-{tk}");
-                let idx = ensure_meta(&pool, &mut metas, &mut key_index, &frame_of, &persp_ids, author,
-                    &key, "treatment_safety", "treatment_safety",
+                let idx = ensure_meta(
+                    &pool,
+                    &mut metas,
+                    &mut key_index,
+                    &frame_of,
+                    &persp_ids,
+                    author,
+                    &key,
+                    "treatment_safety",
+                    "treatment_safety",
                     format!("{tname} is safe at therapeutic dose for chronic use."),
-                    Some(tk.clone()), None, None).await;
+                    Some(tk.clone()),
+                    None,
+                    None,
+                )
+                .await;
                 merges.push(Merge { idx, masses });
             }
         }
@@ -348,9 +561,22 @@ async fn merge_interview_and_recompute() {
         let hyps = frame_of.get(&cm.frame_key).unwrap().1.clone();
         let frame = FrameOfDiscernment::new(cm.frame_key.clone(), hyps.clone()).unwrap();
         let bba = ow_bba_json(&frame, &hyps, &m.masses);
-        MassFunctionRepository::store_with_perspective(&pool, cm.uuid, cm.frame_uuid, Some(practitioner),
-            None, &bba, None, Some("discount"), Some(1.0), Some(PRACTITIONER_SOURCE_TYPE), "cross", None)
-            .await.expect("practitioner bba");
+        MassFunctionRepository::store_with_perspective(
+            &pool,
+            cm.uuid,
+            cm.frame_uuid,
+            Some(practitioner),
+            None,
+            &bba,
+            None,
+            Some("discount"),
+            Some(1.0),
+            Some(PRACTITIONER_SOURCE_TYPE),
+            "cross",
+            None,
+        )
+        .await
+        .expect("practitioner bba");
         // append raw-masses practitioner entry to the snapshot evidence list
         // (the snapshot stores RAW masses; ow is applied only to the DB BBA)
         cm.evidence.push(json!({
@@ -366,7 +592,10 @@ async fn merge_interview_and_recompute() {
     for cm in metas.iter_mut() {
         let mut betp = Map::new();
         for (pk, _pn, pid, _sr) in &persp {
-            betp.insert(pk.clone(), json!(betp0(&pool, cm.uuid, cm.frame_uuid, *pid).await));
+            betp.insert(
+                pk.clone(),
+                json!(betp0(&pool, cm.uuid, cm.frame_uuid, *pid).await),
+            );
         }
         cm.after = betp;
     }
@@ -382,7 +611,10 @@ async fn merge_interview_and_recompute() {
             "betp": Value::Object(cm.after.clone()), "evidence": cm.evidence,
         }));
     }
-    let persp_out: Vec<Value> = persp.iter().map(|(k, n, _, sr)| json!({ "key": k, "name": n, "source_reliability": sr })).collect();
+    let persp_out: Vec<Value> = persp
+        .iter()
+        .map(|(k, n, _, sr)| json!({ "key": k, "name": n, "source_reliability": sr }))
+        .collect();
     let snapshot = json!({
         "generated_from": "agentic discovery + practitioner interview merge → epigraph engine (get_perspective_belief), open-world BBAs",
         "disease": disease,
@@ -391,7 +623,9 @@ async fn merge_interview_and_recompute() {
         "entities": entities_out,
         "claims": claims_json,
     });
-    if let Some(p) = std::path::Path::new(&out).parent() { std::fs::create_dir_all(p).ok(); }
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
     std::fs::write(&out, serde_json::to_string_pretty(&snapshot).unwrap()).expect("write snapshot");
 
     // ============================================================
@@ -403,12 +637,25 @@ async fn merge_interview_and_recompute() {
     // ============================================================
     let mut deltas: Vec<Value> = Vec::new();
     for cm in &metas {
-        if !cm.touched { continue; }
+        if !cm.touched {
+            continue;
+        }
         let mut per_persp = Map::new();
         for (pk, _pn, _pid, _sr) in &persp {
-            let b = cm.before.get(pk).and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
-            let a = cm.after.get(pk).and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
-            per_persp.insert(pk.clone(), json!({ "before": b, "after": a, "delta": a - b }));
+            let b = cm
+                .before
+                .get(pk)
+                .and_then(|v| v.as_f64())
+                .unwrap_or(f64::NAN);
+            let a = cm
+                .after
+                .get(pk)
+                .and_then(|v| v.as_f64())
+                .unwrap_or(f64::NAN);
+            per_persp.insert(
+                pk.clone(),
+                json!({ "before": b, "after": a, "delta": a - b }),
+            );
         }
         deltas.push(json!({
             "claim_key": cm.key,
@@ -425,8 +672,12 @@ async fn merge_interview_and_recompute() {
     deltas.sort_by(|x, y| {
         let tx = x.get("treatment").and_then(|v| v.as_str()).unwrap_or("");
         let ty = y.get("treatment").and_then(|v| v.as_str()).unwrap_or("");
-        tx.cmp(ty).then(x.get("kind").and_then(|v| v.as_str()).unwrap_or("")
-            .cmp(y.get("kind").and_then(|v| v.as_str()).unwrap_or("")))
+        tx.cmp(ty).then(
+            x.get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(y.get("kind").and_then(|v| v.as_str()).unwrap_or("")),
+        )
     });
     let delta_report = json!({
         "generated_from": "perspectival_interview_merge: before vs after per-perspective BetP for claims touched by the practitioner interview",
@@ -438,8 +689,14 @@ async fn merge_interview_and_recompute() {
         "touched_claim_count": deltas.len(),
         "deltas": deltas,
     });
-    if let Some(p) = std::path::Path::new(&delta_out).parent() { std::fs::create_dir_all(p).ok(); }
-    std::fs::write(&delta_out, serde_json::to_string_pretty(&delta_report).unwrap()).expect("write delta");
+    if let Some(p) = std::path::Path::new(&delta_out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    std::fs::write(
+        &delta_out,
+        serde_json::to_string_pretty(&delta_report).unwrap(),
+    )
+    .expect("write delta");
 
     let touched = metas.iter().filter(|c| c.touched).count();
     let created = metas.iter().filter(|c| c.created_for_interview).count();
@@ -487,10 +744,21 @@ async fn ensure_meta(
     }
     let idx = metas.len();
     metas.push(ClaimMeta {
-        key: key.to_string(), kind: kind.to_string(), frame_key: frame_key.to_string(),
-        target: hyps[0].clone(), content, treatment, symptom, dimension,
-        evidence: Vec::new(), uuid: cu, frame_uuid: fu,
-        before, after: Map::new(), created_for_interview: true, touched: false,
+        key: key.to_string(),
+        kind: kind.to_string(),
+        frame_key: frame_key.to_string(),
+        target: hyps[0].clone(),
+        content,
+        treatment,
+        symptom,
+        dimension,
+        evidence: Vec::new(),
+        uuid: cu,
+        frame_uuid: fu,
+        before,
+        after: Map::new(),
+        created_for_interview: true,
+        touched: false,
     });
     key_index.insert(key.to_string(), idx);
     idx

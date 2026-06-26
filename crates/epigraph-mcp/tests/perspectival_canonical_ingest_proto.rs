@@ -68,24 +68,57 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
 
     // ── 4 observer lenses, reliability keyed on the CANONICAL vocabulary ──
     let lenses: [(&str, HashMap<String, f64>); 4] = [
-        ("tradition_observer", HashMap::from([
-            ("testimonial".into(), 0.85), ("regulatory".into(), 0.70),
-            ("empirical".into(), 0.30), ("statistical".into(), 0.25)])),
-        ("clinical_observer", HashMap::from([
-            ("empirical".into(), 0.90), ("statistical".into(), 0.85),
-            ("testimonial".into(), 0.10), ("regulatory".into(), 0.20)])),
-        ("regulatory_observer", HashMap::from([
-            ("regulatory".into(), 0.80), ("statistical".into(), 0.60),
-            ("empirical".into(), 0.50), ("testimonial".into(), 0.35)])),
-        ("skeptic_observer", HashMap::from([
-            ("statistical".into(), 0.40), ("empirical".into(), 0.30),
-            ("regulatory".into(), 0.05), ("testimonial".into(), 0.02)])),
+        (
+            "tradition_observer",
+            HashMap::from([
+                ("testimonial".into(), 0.85),
+                ("regulatory".into(), 0.70),
+                ("empirical".into(), 0.30),
+                ("statistical".into(), 0.25),
+            ]),
+        ),
+        (
+            "clinical_observer",
+            HashMap::from([
+                ("empirical".into(), 0.90),
+                ("statistical".into(), 0.85),
+                ("testimonial".into(), 0.10),
+                ("regulatory".into(), 0.20),
+            ]),
+        ),
+        (
+            "regulatory_observer",
+            HashMap::from([
+                ("regulatory".into(), 0.80),
+                ("statistical".into(), 0.60),
+                ("empirical".into(), 0.50),
+                ("testimonial".into(), 0.35),
+            ]),
+        ),
+        (
+            "skeptic_observer",
+            HashMap::from([
+                ("statistical".into(), 0.40),
+                ("empirical".into(), 0.30),
+                ("regulatory".into(), 0.05),
+                ("testimonial".into(), 0.02),
+            ]),
+        ),
     ];
     let mut persp: Vec<(String, Uuid)> = Vec::new();
     for (name, rel) in &lenses {
-        let row = PerspectiveRepository::create(&pool, name, None, None, Some("observer"), &[], None, None)
-            .await
-            .expect("create perspective");
+        let row = PerspectiveRepository::create(
+            &pool,
+            name,
+            None,
+            None,
+            Some("observer"),
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect("create perspective");
         PerspectiveRepository::set_source_reliability(&pool, row.id, rel)
             .await
             .expect("set reliability");
@@ -100,7 +133,9 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
         async move {
             let mut out: Vec<(String, f64)> = Vec::new();
             for (k, id) in &persp {
-                let b = get_perspective_belief(&pool, claim, frame, *id).await.expect("belief");
+                let b = get_perspective_belief(&pool, claim, frame, *id)
+                    .await
+                    .expect("belief");
                 out.push((k.clone(), b.pignistic_prob));
             }
             out
@@ -109,23 +144,68 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
 
     // ── representative claims ──
     let c_eff = seed_claim(&pool, "treatment-e is efficacious for symptom-5.", 0.5).await;
-    let c_saf = seed_claim(&pool, "treatment-d is safe at therapeutic dose for chronic use.", 0.5).await;
+    let c_saf = seed_claim(
+        &pool,
+        "treatment-d is safe at therapeutic dose for chronic use.",
+        0.5,
+    )
+    .await;
     let c_novel = seed_claim(&pool, "treatment-a is efficacious for symptom-6.", 0.5).await;
 
     // ── prior (discovery) evidence, mapped to canonical types ──
-    add_evidence(&server, c_eff, "empirical", true, 0.55, "source_clinical: modest RCT signal").await; // source_clinical→empirical
-    add_evidence(&server, c_saf, "statistical", true, 0.60, "source_survey: largely safe in practice").await; // source_survey→statistical
-    // c_novel: no prior evidence (practitioner-only signal)
+    add_evidence(
+        &server,
+        c_eff,
+        "empirical",
+        true,
+        0.55,
+        "source_clinical: modest RCT signal",
+    )
+    .await; // source_clinical→empirical
+    add_evidence(
+        &server,
+        c_saf,
+        "statistical",
+        true,
+        0.60,
+        "source_survey: largely safe in practice",
+    )
+    .await; // source_survey→statistical
+            // c_novel: no prior evidence (practitioner-only signal)
 
     let before_eff = read(c_eff).await;
     let before_saf = read(c_saf).await;
     let before_novel = read(c_novel).await;
 
     // ── the INTERVIEW, ingested via the real path as canonical `testimonial` ──
-    add_evidence(&server, c_eff, "testimonial", true, 0.82, "practitioner: foremost treatment, strong in symptom-5").await;
+    add_evidence(
+        &server,
+        c_eff,
+        "testimonial",
+        true,
+        0.82,
+        "practitioner: foremost treatment, strong in symptom-5",
+    )
+    .await;
     // treatment-d: two-sided {safe 0.20, harmful 0.55} → can only be one-sided refutation
-    add_evidence(&server, c_saf, "testimonial", false, 0.55, "practitioner: caution in chronic use of the condition cluster").await;
-    add_evidence(&server, c_novel, "testimonial", true, 0.80, "practitioner: calms symptom-6").await;
+    add_evidence(
+        &server,
+        c_saf,
+        "testimonial",
+        false,
+        0.55,
+        "practitioner: caution in chronic use of the condition cluster",
+    )
+    .await;
+    add_evidence(
+        &server,
+        c_novel,
+        "testimonial",
+        true,
+        0.80,
+        "practitioner: calms symptom-6",
+    )
+    .await;
 
     let after_eff = read(c_eff).await;
     let after_saf = read(c_saf).await;
@@ -138,9 +218,17 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
         }
     };
     eprintln!("\n=== option ii: interview ingested via update_with_evidence (canonical types), per-lens BetP ===");
-    show("treatment-e efficacious (practitioner=testimonial, supports)", &before_eff, &after_eff);
+    show(
+        "treatment-e efficacious (practitioner=testimonial, supports)",
+        &before_eff,
+        &after_eff,
+    );
     show("treatment-d safe (practitioner=testimonial, REFUTES — one-sided collapse of {safe .20, harmful .55})", &before_saf, &after_saf);
-    show("treatment-a efficacious — NOVEL practitioner-only", &before_novel, &after_novel);
+    show(
+        "treatment-a efficacious — NOVEL practitioner-only",
+        &before_novel,
+        &after_novel,
+    );
 
     // ── core (ii) claim: the per-lens discount survives the canonical mapping ──
     let d = |rows_b: &[(String, f64)], rows_a: &[(String, f64)], lens: &str| -> f64 {
@@ -158,5 +246,8 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
     // safety must fall (or at least not rise) for the trusting lens on a refutation
     let tradition_saf = d(&before_saf, &after_saf, "tradition_observer");
     eprintln!("  treatment-d safety — tradition Δ {tradition_saf:+.3} (refutation; one-sided)");
-    assert!(tradition_saf < 0.0, "practitioner caution must lower safety for the trusting lens");
+    assert!(
+        tradition_saf < 0.0,
+        "practitioner caution must lower safety for the trusting lens"
+    );
 }
