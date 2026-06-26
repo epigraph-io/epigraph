@@ -24,7 +24,10 @@ async fn perspective_divergence_is_real() {
             .fetch_all(&pool)
             .await
             .expect("perspectives");
-    assert!(!perspectives.is_empty(), "no perspectives — run tag_ingest first");
+    assert!(
+        !perspectives.is_empty(),
+        "no perspectives — run tag_ingest first"
+    );
 
     // The native binary frame; BetP(TRUE) = P(the proposition holds).
     let frame_id: Uuid = sqlx::query_scalar("SELECT id FROM frames WHERE name = 'binary_truth'")
@@ -63,7 +66,10 @@ async fn perspective_divergence_is_real() {
             let bi = get_perspective_belief(&pool, *cid, frame_id, *pid)
                 .await
                 .expect("belief");
-            println!("   {:<24} BetP(holds)={:.3}  bel={:.3}  pl={:.3}", pname, bi.pignistic_prob, bi.belief, bi.plausibility);
+            println!(
+                "   {:<24} BetP(holds)={:.3}  bel={:.3}  pl={:.3}",
+                pname, bi.pignistic_prob, bi.belief, bi.plausibility
+            );
             betps.push(bi.pignistic_prob);
         }
         let (min, max) = (

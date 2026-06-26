@@ -89,9 +89,18 @@ async fn store(
 }
 
 async fn make_perspective(pool: &PgPool, name: &str, rel: &[(&str, f64)]) -> Uuid {
-    let p = PerspectiveRepository::create(pool, name, None, None, Some("disciplinary"), &[], None, None)
-        .await
-        .expect("create perspective");
+    let p = PerspectiveRepository::create(
+        pool,
+        name,
+        None,
+        None,
+        Some("disciplinary"),
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("create perspective");
     let map: HashMap<String, f64> = rel.iter().map(|(k, v)| ((*k).to_string(), *v)).collect();
     PerspectiveRepository::set_source_reliability(pool, p.id, &map)
         .await
@@ -124,42 +133,152 @@ async fn t2_real_engine_reproduces_python_model() {
     let clinical = make_perspective(
         &pool,
         &format!("clinical_observer_{sfx}"),
-        &[("source_clinical", 0.95), ("source_survey", 0.40), ("source_tradition", 0.15), ("source_practitioner", 0.10)],
+        &[
+            ("source_clinical", 0.95),
+            ("source_survey", 0.40),
+            ("source_tradition", 0.15),
+            ("source_practitioner", 0.10),
+        ],
     )
     .await;
     let tradition = make_perspective(
         &pool,
         &format!("tradition_observer_{sfx}"),
-        &[("source_clinical", 0.60), ("source_survey", 0.70), ("source_tradition", 0.90), ("source_practitioner", 0.85)],
+        &[
+            ("source_clinical", 0.60),
+            ("source_survey", 0.70),
+            ("source_tradition", 0.90),
+            ("source_practitioner", 0.85),
+        ],
     )
     .await;
 
-    let eff_row = FrameRepository::create(&pool, &format!("treatment_efficacy_{sfx}"), None, &["efficacious".to_string(), "no_effect".to_string()])
-        .await
-        .expect("eff frame");
-    let saf_row = FrameRepository::create(&pool, &format!("treatment_safety_{sfx}"), None, &["safe".to_string(), "harmful".to_string()])
-        .await
-        .expect("saf frame");
+    let eff_row = FrameRepository::create(
+        &pool,
+        &format!("treatment_efficacy_{sfx}"),
+        None,
+        &["efficacious".to_string(), "no_effect".to_string()],
+    )
+    .await
+    .expect("eff frame");
+    let saf_row = FrameRepository::create(
+        &pool,
+        &format!("treatment_safety_{sfx}"),
+        None,
+        &["safe".to_string(), "harmful".to_string()],
+    )
+    .await
+    .expect("saf frame");
     let eff = FrameOfDiscernment::new(eff_row.name.clone(), eff_row.hypotheses.clone()).unwrap();
     let saf = FrameOfDiscernment::new(saf_row.name.clone(), saf_row.hypotheses.clone()).unwrap();
 
     // Case A — treatment-c SAFETY {safe(0), harmful(1)}: clinical harmful vs tradition safe (K>0).
     let tc_saf = insert_claim(&pool, author, "treatment-c is safe at therapeutic dose").await;
-    store(&pool, tc_saf, saf_row.id, a_clin, &saf, "source_clinical", 1, 0.70).await;
-    store(&pool, tc_saf, saf_row.id, a_trad, &saf, "source_tradition", 0, 0.50).await;
-    store(&pool, tc_saf, saf_row.id, a_prac, &saf, "source_practitioner", 0, 0.45).await;
+    store(
+        &pool,
+        tc_saf,
+        saf_row.id,
+        a_clin,
+        &saf,
+        "source_clinical",
+        1,
+        0.70,
+    )
+    .await;
+    store(
+        &pool,
+        tc_saf,
+        saf_row.id,
+        a_trad,
+        &saf,
+        "source_tradition",
+        0,
+        0.50,
+    )
+    .await;
+    store(
+        &pool,
+        tc_saf,
+        saf_row.id,
+        a_prac,
+        &saf,
+        "source_practitioner",
+        0,
+        0.45,
+    )
+    .await;
 
     // Case B — treatment-e EFFICACY {efficacious(0), no_effect(1)}: tradition efficacious vs clinical no_effect (K>0).
     let te_eff = insert_claim(&pool, author, "treatment-e is efficacious for symptom-4").await;
-    store(&pool, te_eff, eff_row.id, a_trad, &eff, "source_tradition", 0, 0.55).await;
-    store(&pool, te_eff, eff_row.id, a_prac, &eff, "source_practitioner", 0, 0.45).await;
-    store(&pool, te_eff, eff_row.id, a_clin, &eff, "source_clinical", 1, 0.60).await;
+    store(
+        &pool,
+        te_eff,
+        eff_row.id,
+        a_trad,
+        &eff,
+        "source_tradition",
+        0,
+        0.55,
+    )
+    .await;
+    store(
+        &pool,
+        te_eff,
+        eff_row.id,
+        a_prac,
+        &eff,
+        "source_practitioner",
+        0,
+        0.45,
+    )
+    .await;
+    store(
+        &pool,
+        te_eff,
+        eff_row.id,
+        a_clin,
+        &eff,
+        "source_clinical",
+        1,
+        0.60,
+    )
+    .await;
 
     // Case C — treatment-a EFFICACY (consensus control, K=0).
     let ta_eff = insert_claim(&pool, author, "treatment-a is efficacious for symptom-1").await;
-    store(&pool, ta_eff, eff_row.id, a_clin, &eff, "source_clinical", 0, 0.75).await;
-    store(&pool, ta_eff, eff_row.id, a_trad, &eff, "source_tradition", 0, 0.55).await;
-    store(&pool, ta_eff, eff_row.id, a_prac, &eff, "source_practitioner", 0, 0.40).await;
+    store(
+        &pool,
+        ta_eff,
+        eff_row.id,
+        a_clin,
+        &eff,
+        "source_clinical",
+        0,
+        0.75,
+    )
+    .await;
+    store(
+        &pool,
+        ta_eff,
+        eff_row.id,
+        a_trad,
+        &eff,
+        "source_tradition",
+        0,
+        0.55,
+    )
+    .await;
+    store(
+        &pool,
+        ta_eff,
+        eff_row.id,
+        a_prac,
+        &eff,
+        "source_practitioner",
+        0,
+        0.40,
+    )
+    .await;
 
     let saf_clin = betp(&pool, tc_saf, saf_row.id, clinical).await;
     let saf_trad = betp(&pool, tc_saf, saf_row.id, tradition).await;
@@ -174,10 +293,28 @@ async fn t2_real_engine_reproduces_python_model() {
     eprintln!("  treatment-a eff     clinical={ta_clin:.3} (py 0.873)   tradition={ta_trad:.3} (py 0.908)");
 
     let approx = |a: f64, b: f64| (a - b).abs() < 0.005;
-    assert!(approx(saf_clin, 0.203), "treatment-c safety clinical = {saf_clin}");
-    assert!(approx(saf_trad, 0.666), "treatment-c safety tradition = {saf_trad}");
-    assert!(approx(te_clin, 0.260), "treatment-e eff clinical = {te_clin}");
-    assert!(approx(te_trad, 0.718), "treatment-e eff tradition = {te_trad}");
-    assert!(approx(ta_clin, 0.873), "treatment-a eff clinical = {ta_clin}");
-    assert!(approx(ta_trad, 0.908), "treatment-a eff tradition = {ta_trad}");
+    assert!(
+        approx(saf_clin, 0.203),
+        "treatment-c safety clinical = {saf_clin}"
+    );
+    assert!(
+        approx(saf_trad, 0.666),
+        "treatment-c safety tradition = {saf_trad}"
+    );
+    assert!(
+        approx(te_clin, 0.260),
+        "treatment-e eff clinical = {te_clin}"
+    );
+    assert!(
+        approx(te_trad, 0.718),
+        "treatment-e eff tradition = {te_trad}"
+    );
+    assert!(
+        approx(ta_clin, 0.873),
+        "treatment-a eff clinical = {ta_clin}"
+    );
+    assert!(
+        approx(ta_trad, 0.908),
+        "treatment-a eff tradition = {ta_trad}"
+    );
 }

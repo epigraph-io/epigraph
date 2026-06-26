@@ -106,6 +106,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Canonical create via API: signing + DS + embed-on-write.
                         // methodology/evidence_type belong in `properties` (JSONB);
                         // top-level they were unknown fields and silently dropped.
+                        // if_not_exists=true: when a prior run already decomposed
+                        // the same parent, identical atom text produces the same
+                        // content_hash. Without this flag the API returns 409;
+                        // with it, create_or_get returns the existing claim ID so
+                        // persist_decomposition can re-wire edges idempotently.
                         let resp = http
                             .post(format!("{api_base}/api/v1/claims"))
                             .bearer_auth(&token)
@@ -113,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "content": atom_text,
                                 "agent_id": parent_agent_id,
                                 "initial_truth": 0.5,
+                                "if_not_exists": true,
                                 "properties": {
                                     "methodology": "inductive_generalization",
                                     "evidence_type": "logical"
