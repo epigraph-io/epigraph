@@ -92,6 +92,15 @@ jobs:
       # than silently resolving newer versions.
       - name: Build
         run: cargo build --workspace --locked
+      - name: Run migrations
+        # epigraph-ingest-executor's e2e_empty_content_guard test connects to
+        # DATABASE_URL directly (no #[sqlx::test] template DB) and queries the
+        # `workflows` table. The postgres service starts empty; without this step
+        # the non-DB parallel tests fail with "relation workflows does not exist".
+        # The epigraph-migrate binary embeds all migrations at compile time
+        # (sqlx::migrate!("../../migrations") in epigraph-api/src/lib.rs) so no
+        # external sqlx-cli is needed — just run the already-built binary.
+        run: ./target/debug/epigraph-migrate
       - name: Test (non-DB packages, parallel)
         # Packages without DB tests can run fully in parallel.
         # Crates with #[sqlx::test] integration tests (or live DB usage) are
