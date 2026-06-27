@@ -486,12 +486,46 @@ pub async fn list_workflows(
 
 /// GET /api/v1/workflows/:id - Fetch a single workflow by ID.
 ///
-/// Returns 404 if the claim does not exist or is not labeled `workflow`.
+/// Probes the `workflows` table (hierarchical) first; falls through to the
+/// legacy flat-workflow claims path. Returns 404 only when the id is absent
+/// from both tables.
+///
+/// Response fields common to both paths:
+/// - `workflow_id`: the UUID
+/// - `content`: goal text (hierarchical) or claim content (flat, may be JSON)
+/// - `goal`: goal text (hierarchical) or `null` (flat)
+/// - `truth_value`: workflow truth / claim truth_value
+/// - `properties`: metadata JSONB (hierarchical) or claim properties (flat)
+/// - `canonical_name`: canonical_name (hierarchical) or `null` (flat)
 #[cfg(feature = "db")]
 pub async fn get_workflow(
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // ── 1. Try hierarchical workflows table ─────────────────────────────────
+    let hier: Option<WorkflowHierarchicalRow> = sqlx::query_as::<_, WorkflowHierarchicalRow>(
+        "SELECT id, canonical_name, goal, truth_value, metadata \
+         FROM workflows WHERE id = $1",
+    )
+    .bind(workflow_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to fetch hierarchical workflow: {e}"),
+    })?;
+
+    if let Some(row) = hier {
+        return Ok(Json(serde_json::json!({
+            "workflow_id": row.id,
+            "content": row.goal,
+            "goal": row.goal,
+            "truth_value": row.truth_value,
+            "properties": row.metadata,
+            "canonical_name": row.canonical_name,
+        })));
+    }
+
+    // ── 2. Fall through to legacy flat-workflow claims ───────────────────────
     let row = sqlx::query_as::<_, WorkflowContentRow>(
         "SELECT id, content, truth_value, properties \
          FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
@@ -500,7 +534,7 @@ pub async fn get_workflow(
     .fetch_optional(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch workflow: {e}"),
+        message: format!("Failed to fetch workflow claim: {e}"),
     })?
     .ok_or(ApiError::NotFound {
         entity: "workflow".to_string(),
@@ -511,8 +545,10 @@ pub async fn get_workflow(
         "workflow_id": row.id,
         "content": serde_json::from_str::<serde_json::Value>(&row.content)
             .unwrap_or(serde_json::Value::String(row.content)),
+        "goal": serde_json::Value::Null,
         "truth_value": row.truth_value,
         "properties": row.properties,
+        "canonical_name": serde_json::Value::Null,
     })))
 }
 
@@ -1432,6 +1468,16 @@ struct WorkflowContentRow {
     properties: Option<serde_json::Value>,
 }
 
+#[cfg(feature = "db")]
+#[derive(sqlx::FromRow)]
+struct WorkflowHierarchicalRow {
+    id: Uuid,
+    canonical_name: String,
+    goal: String,
+    truth_value: f64,
+    metadata: serde_json::Value,
+}
+
 // ── add_step / delete_step ──────────────────────────────────────────────────
 
 #[cfg(feature = "db")]
@@ -1724,6 +1770,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_workflow_returns_hierarchical_workflow_by_id(pool: PgPool) {
+        // Seed a row directly into the `workflows` table (same table that
+        // `ingest_workflow`/`store_workflow` write to). The id is the
+        // deterministic UUID that epiclaw-host's `workflow_id` field holds.
+        let wf_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workflows (id, canonical_name, generation, goal, metadata) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(wf_id)
+        .bind("test-hier-workflow")
+        .bind(0_i32)
+        .bind("Synthesise recent nanofabrication findings.")
+        .bind(serde_json::json!({"use_count": 0, "success_count": 0, "failure_count": 0}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let router = workflow_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/v1/workflows/{wf_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = parse_body(response).await;
+        assert_eq!(body["workflow_id"], wf_id.to_string());
+        assert_eq!(
+            body["goal"].as_str(),
+            Some("Synthesise recent nanofabrication findings."),
+            "goal must be the workflows.goal text"
+        );
+        assert_eq!(
+            body["content"].as_str(),
+            Some("Synthesise recent nanofabrication findings."),
+            "content must equal goal for hierarchical workflows"
+        );
+        assert!(body["canonical_name"].as_str().is_some());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
