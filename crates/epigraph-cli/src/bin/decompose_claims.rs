@@ -10,8 +10,11 @@
 //! the canonical API claim path so embedding + DS auto-wire + signing happen
 //! on write.
 //!
-//! Required: DATABASE_URL, EPIGRAPH_API (e.g. http://127.0.0.1:8080),
-//! EPIGRAPH_TOKEN (bearer for the API), and CLAUDE_CODE_OAUTH_TOKEN.
+//! Required: DATABASE_URL, and CLAUDE_CODE_OAUTH_TOKEN.
+//! API base: EPIGRAPH_API (primary) or EPIGRAPH_API_URL (container fallback),
+//! default http://127.0.0.1:8080. Auth token: EPIGRAPH_TOKEN if set, otherwise
+//! minted via client_credentials from EPIGRAPH_SERVICE_CLIENT_ID +
+//! EPIGRAPH_SERVICE_SECRET.
 //! Use `--provider mock` for a dry compile/smoke without credentials.
 
 use clap::Parser;
@@ -38,6 +41,32 @@ struct Cli {
     dry_run: bool,
 }
 
+/// Mint a bearer token from service-client credentials via the OAuth
+/// client_credentials flow. Returns `None` if either credential env var is
+/// absent or the request fails — callers fall back to an empty token (which
+/// will produce a 401 on the first API call, surfacing the problem clearly).
+async fn mint_service_token(api_base: &str) -> Option<String> {
+    let client_id = std::env::var("EPIGRAPH_SERVICE_CLIENT_ID").ok()?;
+    let client_secret = std::env::var("EPIGRAPH_SERVICE_SECRET").ok()?;
+    let url = format!("{}/oauth/token", api_base.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
+            ("scope", "claims:write"),
+        ])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    json["access_token"].as_str().map(str::to_owned)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -58,9 +87,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let embedder = epigraph_cli::embedding_service();
 
     // API submit closure — canonical claim create (embed + DS + sign on write).
-    let api_base =
-        std::env::var("EPIGRAPH_API").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-    let token = std::env::var("EPIGRAPH_TOKEN").unwrap_or_default();
+    // EPIGRAPH_API takes precedence; EPIGRAPH_API_URL is the container-standard
+    // name exposed by epiclaw-host. If neither is set we fall back to localhost.
+    let api_base = std::env::var("EPIGRAPH_API")
+        .or_else(|_| std::env::var("EPIGRAPH_API_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+
+    // EPIGRAPH_TOKEN if present; otherwise attempt client_credentials mint so
+    // container deployments work without a token-mint preamble in the schedule.
+    let token = {
+        let t = std::env::var("EPIGRAPH_TOKEN").unwrap_or_default();
+        if t.is_empty() {
+            mint_service_token(&api_base).await.unwrap_or_default()
+        } else {
+            t
+        }
+    };
     let http = reqwest::Client::new();
 
     let mut total_atoms = 0usize;
