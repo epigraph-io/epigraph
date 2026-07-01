@@ -127,7 +127,7 @@ pub fn invoke_claude(prompt: &str, result_path: &std::path::Path) -> Result<Stri
             "-p",
             "--dangerously-skip-permissions",
             "--model",
-            "claude-sonnet-4-6",
+            "claude-sonnet-5",
         ])
         .arg(&wrapped)
         .stdin(Stdio::null())
