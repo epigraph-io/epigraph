@@ -24,6 +24,16 @@ ignore = [
                          #   (Datalog engine) — not removable by us.
     "RUSTSEC-2024-0436", # paste: unmaintained. Transitive via `ascent`.
 
+    # ── Deferred — pending rmcp 0.x → 1.x migration ────────────────────────
+    "RUSTSEC-2026-0189", # rmcp 0.15.0: DNS rebinding via streamable-HTTP server
+                         #   transport (CVSS 8.8). epigraph-mcp uses the
+                         #   `transport-streamable-http-server` feature. Fix =
+                         #   upgrade to rmcp >=1.4.0, which is a breaking API
+                         #   change. Exposure is mitigated: the MCP endpoint is
+                         #   only reachable via the Caddy TLS proxy (nip.io:443),
+                         #   not bound directly to a public interface.
+                         #   Track in a follow-up backlog item.
+
     # ── Deferred — cleared by the tracked migrations (backlog a2fa31b1) ──────
     "RUSTSEC-2024-0363", # sqlx 0.7.4 binary-protocol cast. Fixed by sqlx 0.8.
     "RUSTSEC-2026-0098", # rustls-webpki 0.101.7 name-constraint (URI). Old TLS
