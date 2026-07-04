@@ -41,13 +41,38 @@ struct Cli {
     dry_run: bool,
 }
 
+/// API base precedence: `EPIGRAPH_API` (explicit override) first,
+/// `EPIGRAPH_API_URL` (the container-standard name epiclaw-host exposes)
+/// second, `http://127.0.0.1:8080` otherwise. Takes already-read env values
+/// (rather than reading `std::env::var` itself) so it's a pure function —
+/// testable without mutating global process env, which races under
+/// parallel test execution.
+fn resolve_api_base(epigraph_api: Option<String>, epigraph_api_url: Option<String>) -> String {
+    epigraph_api
+        .or(epigraph_api_url)
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string())
+}
+
+/// `None` unless both service-client credential env values are present.
+/// Split out from `mint_service_token` as a pure guard so the "don't even
+/// attempt a mint without both creds" behavior is unit-testable without an
+/// HTTP mock.
+fn resolve_service_credentials(
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> Option<(String, String)> {
+    Some((client_id?, client_secret?))
+}
+
 /// Mint a bearer token from service-client credentials via the OAuth
 /// client_credentials flow. Returns `None` if either credential env var is
 /// absent or the request fails — callers fall back to an empty token (which
 /// will produce a 401 on the first API call, surfacing the problem clearly).
 async fn mint_service_token(api_base: &str) -> Option<String> {
-    let client_id = std::env::var("EPIGRAPH_SERVICE_CLIENT_ID").ok()?;
-    let client_secret = std::env::var("EPIGRAPH_SERVICE_SECRET").ok()?;
+    let (client_id, client_secret) = resolve_service_credentials(
+        std::env::var("EPIGRAPH_SERVICE_CLIENT_ID").ok(),
+        std::env::var("EPIGRAPH_SERVICE_SECRET").ok(),
+    )?;
     let url = format!("{}/oauth/token", api_base.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .post(&url)
@@ -89,9 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // API submit closure — canonical claim create (embed + DS + sign on write).
     // EPIGRAPH_API takes precedence; EPIGRAPH_API_URL is the container-standard
     // name exposed by epiclaw-host. If neither is set we fall back to localhost.
-    let api_base = std::env::var("EPIGRAPH_API")
-        .or_else(|_| std::env::var("EPIGRAPH_API_URL"))
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let api_base = resolve_api_base(
+        std::env::var("EPIGRAPH_API").ok(),
+        std::env::var("EPIGRAPH_API_URL").ok(),
+    );
 
     // EPIGRAPH_TOKEN if present; otherwise attempt client_credentials mint so
     // container deployments work without a token-mint preamble in the schedule.
@@ -186,4 +212,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("decompose complete: {total_atoms} atoms, {total_edges} decomposes_to edges");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_api_base, resolve_service_credentials};
+
+    #[test]
+    fn resolve_api_base_prefers_epigraph_api_when_both_set() {
+        assert_eq!(
+            resolve_api_base(
+                Some("https://explicit.example".to_string()),
+                Some("http://container-standard.example".to_string()),
+            ),
+            "https://explicit.example"
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_falls_back_to_epigraph_api_url() {
+        assert_eq!(
+            resolve_api_base(None, Some("http://container-standard.example".to_string())),
+            "http://container-standard.example"
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_defaults_to_localhost_when_neither_set() {
+        assert_eq!(resolve_api_base(None, None), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn resolve_service_credentials_none_when_client_id_missing() {
+        assert_eq!(
+            resolve_service_credentials(None, Some("secret".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_service_credentials_none_when_client_secret_missing() {
+        assert_eq!(
+            resolve_service_credentials(Some("id".to_string()), None),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_service_credentials_some_when_both_present() {
+        assert_eq!(
+            resolve_service_credentials(Some("id".to_string()), Some("secret".to_string())),
+            Some(("id".to_string(), "secret".to_string()))
+        );
+    }
 }
