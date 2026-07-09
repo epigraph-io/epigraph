@@ -114,8 +114,18 @@ impl PaperRepository {
 
     /// Count the claims this paper asserts (`paper -asserts-> claim` edges).
     ///
-    /// Used by MCP `query_paper` as the canonical "did this paper land in the
-    /// graph?" probe — replaces the old broken `ILIKE '%doi%'` content search.
+    /// This alone under-counts a partially-ingested paper: `do_ingest_document`
+    /// / `do_ingest_document_spine` label every claim `doi:<doi>` *before*
+    /// writing that claim's `asserts` edge (evidence + reasoning-trace writes
+    /// sit in between), so a crash or error mid-loop can leave claims with the
+    /// doi label but no edge yet. Callers that need an accurate "has this DOI
+    /// landed in the graph at all?" probe must combine this with
+    /// [`Self::count_claims_by_doi_label`] (see `query_paper`) — trusting this
+    /// alone as a duplicate-ingestion gate is the write-order race behind
+    /// backlog 7c6ce1b3-b372-4727-a510-43e63001bf18 (the specific claims that
+    /// prompted that report predate the `doi:<doi>` label entirely and were
+    /// resolved separately by a full re-ingestion; this closes the gap for
+    /// future partial ingestions under the current write order).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -131,6 +141,36 @@ impl PaperRepository {
               AND relationship = 'asserts'
             "#,
             paper_id,
+        )
+        .fetch_one(pool)
+        .await?;
+        Ok(row.count)
+    }
+
+    /// Count current claims labelled `doi:<doi>`, independent of whether a
+    /// `paper -asserts-> claim` edge exists yet for them.
+    ///
+    /// Every claim written by `do_ingest_document` / `do_ingest_document_spine`
+    /// picks up this label as soon as the claim row itself is created — ahead
+    /// of the `asserts` edge, which lands only after evidence + reasoning-trace
+    /// writes succeed. This makes the label a more direct "does this DOI have
+    /// node presence in the graph?" signal than the edge-based count, and is
+    /// what `query_paper` uses to avoid mis-reporting `claim_count=0` for a
+    /// paper that was partially ingested.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn count_claims_by_doi_label(pool: &PgPool, doi: &str) -> Result<i64, DbError> {
+        let label = format!("doi:{doi}");
+        let row = sqlx::query!(
+            r#"
+            SELECT COUNT(*) AS "count!"
+            FROM claims
+            WHERE is_current
+              AND labels @> ARRAY[$1]::text[]
+            "#,
+            label,
         )
         .fetch_one(pool)
         .await?;
