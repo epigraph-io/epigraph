@@ -32,6 +32,23 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// Returns a zero-shaped response (claim_count=0, empty title/authors) when
 /// the DOI isn't in the graph. Callers (the monitor) use this as a dedup
 /// probe and expect a structured response, not a 404.
+///
+/// `claim_count` is `max(asserted_count, labeled_count)`: the `asserts`-edge
+/// count alone under-reports a partially-ingested paper, because ingestion
+/// labels a claim `doi:<doi>` before it links the `asserts` edge (see
+/// `PaperRepository::count_claims_by_doi_label`). Without the label-based
+/// floor, a crash between those two writes leaves a claim in the graph that
+/// this probe would report as `claim_count=0`, letting the nightly monitor
+/// re-extract an already (partially) ingested paper.
+///
+/// This closes the write-order race going forward; it does not retroactively
+/// recover claims ingested before the `doi:<doi>` label existed (they carry
+/// neither the label nor, in the failure case, the edge — no DOI-keyed query
+/// can find them). Investigating backlog 7c6ce1b3-b372-4727-a510-43e63001bf18
+/// (arXiv 2504.18085) found exactly that: its orphaned claims predate the
+/// label and are unlabeled in the live DB, so this fix prevents the same
+/// class of gap from recurring rather than repairing that specific paper
+/// (which was already made whole by a subsequent full re-ingestion).
 pub async fn query_paper(
     server: &EpiGraphMcpFull,
     params: QueryPaperParams,
@@ -51,9 +68,16 @@ pub async fn query_paper(
         });
     };
 
-    let claim_count = PaperRepository::count_asserted_claims(&server.pool, paper.id)
+    let asserted_count = PaperRepository::count_asserted_claims(&server.pool, paper.id)
         .await
         .map_err(internal_error)?;
+    // Node-existence probe, independent of the `asserts` edge: catches claims
+    // a partial/crashed ingestion already labelled `doi:<doi>` but never got
+    // to link, which `asserted_count` alone would silently report as zero.
+    let labeled_count = PaperRepository::count_claims_by_doi_label(&server.pool, &paper.doi)
+        .await
+        .map_err(internal_error)?;
+    let claim_count = asserted_count.max(labeled_count);
 
     let authors = PaperRepository::list_authors(&server.pool, paper.id)
         .await
