@@ -1053,12 +1053,24 @@ mcp__epigraph__resolve_backlog_item(original_id="25188750-1793-419c-b291-3ab80b7
 **Claim:** `88a09fd2-ea9c-4333-92c1-5c038031a791` — prerequisite (`goal_embedding` populated on
 `store_workflow`/HTTP ingest, PR #296) already shipped.
 
-- [ ] **Step 1:** Add `include_workflows: bool` param to `recall()` MCP tool (default `false`).
-- [ ] **Step 2:** In the recall SQL, `UNION` the workflows ANN result (`SELECT goal_embedding <-> $query AS similarity, id AS claim_id, goal AS content, 'workflow' AS result_type FROM workflows WHERE goal_embedding IS NOT NULL ORDER BY goal_embedding <-> $query LIMIT $k`) with the claims ANN.
-- [ ] **Step 3:** RRF-merge the two ranked lists; tag workflow hits with `result_type='workflow'`.
-- [ ] **Step 4:** Regression test: a query matching only a workflow's `goal` (not any claim) returns
-that workflow when `include_workflows=true`, nothing when unset.
-- [ ] **Step 5: Verify, commit, resolve**
+> **DONE (2026-07-10), PR #325 open.** Task review: Approved, spec compliance Met, no
+> Critical/Important findings. 3 Minor findings noted in the PR body (non-blocking): (1)
+> `tags`/`agent_id` don't scope the new workflows leg — a real if narrow scope-leak, worth a doc
+> fix or a skip-when-scoped guard; (2) displayed `rrf_score` on claim hits isn't always monotonic
+> with merged sort order once workflows are mixed in (serve order itself is correct); (3)
+> "byte-identical" is narrowly overstated for one DB-error-vs-embedder-error edge case.
+
+- [x] **Step 1:** Add `include_workflows: bool` param to `recall()` MCP tool (default `false`). — DONE.
+- [x] **Step 2:** In the recall SQL, `UNION` the workflows ANN result — DONE, as a sibling
+`WorkflowRepository::search_by_goal_embedding` method (justified: `find_hierarchical_by_embedding`
+takes `&[f32]` not a pre-formatted pgvector and drops the similarity column), using `<=>` cosine
+distance (matches every other ANN query in the codebase) not the brief's literal `<->`.
+- [x] **Step 3:** RRF-merge the two ranked lists; tag workflow hits with `result_type='workflow'`. —
+DONE, reusing the exact `1.0/(HYBRID_RRF_K+rank)` formula/constant claims already use SQL-side.
+- [x] **Step 4:** Regression test — DONE (`recall_workflows.rs`, 2 tests: true→surfaces,
+false→excludes with the identical matching pgvector, proving the leg isn't queried when unset).
+- [x] **Step 5: Verify, commit, resolve** — verify + commit + PR #325 DONE (fmt/clippy/test green,
+task review Approved). `resolve_backlog_item` deferred to post-merge (live graph write).
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="88a09fd2-ea9c-4333-92c1-5c038031a791", resolution_content="Resolves 88a09fd2: recall() accepts include_workflows (default false); when true, UNIONs the workflows ANN result with claims ANN, RRF-merged, workflow hits tagged result_type='workflow'.")
