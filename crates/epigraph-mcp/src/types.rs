@@ -1878,7 +1878,7 @@ pub struct RecomputeBeliefsParams {
     pub claim_ids: Option<Vec<String>>,
 
     #[schemars(
-        description = "Recompute every current claim carrying ALL of these labels (e.g. a paper's claim set). Used only when `claim_ids` is absent/empty."
+        description = "Recompute every current claim carrying ALL of these labels (e.g. a paper's claim set — ingest_document/ingest_document_inline tag every claim they write with `doi:<doi>`, so pass that to recompute just one paper). Used only when `claim_ids` is absent/empty."
     )]
     #[serde(default)]
     pub labels: Option<Vec<String>>,

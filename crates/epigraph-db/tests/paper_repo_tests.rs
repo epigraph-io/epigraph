@@ -87,3 +87,41 @@ async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
             .expect("query has_processed_by_edge")
     );
 }
+
+/// `count_claims_by_doi_label` counts claims labelled `doi:<doi>` regardless
+/// of whether a `paper -asserts-> claim` edge exists for them — this is the
+/// signal `query_paper` unions with `count_asserted_claims` so a partial
+/// ingestion (claim labelled, edge not yet written) still reads as non-zero.
+#[sqlx::test(migrations = "../../migrations")]
+async fn count_claims_by_doi_label_ignores_asserts_edges(pool: PgPool) {
+    let doi = "10.1234/label-count-test";
+
+    assert_eq!(
+        PaperRepository::count_claims_by_doi_label(&pool, doi)
+            .await
+            .expect("count with no claims"),
+        0
+    );
+
+    let agent = make_agent(Some("label-count-agent"));
+    let agent_row = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("create agent");
+    let claim = make_claim(agent_row.id, "orphan-labeled claim", 0.5);
+    let claim_row = ClaimRepository::create(&pool, &claim)
+        .await
+        .expect("create claim");
+
+    // Label the claim but deliberately create no `asserts` edge.
+    ClaimRepository::update_labels(&pool, claim_row.id.into(), &[format!("doi:{doi}")], &[])
+        .await
+        .expect("label claim");
+
+    assert_eq!(
+        PaperRepository::count_claims_by_doi_label(&pool, doi)
+            .await
+            .expect("count after labeling"),
+        1,
+        "labeled claim must count even without an asserts edge"
+    );
+}

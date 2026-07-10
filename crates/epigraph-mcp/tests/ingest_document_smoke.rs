@@ -7,8 +7,9 @@ use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
+use epigraph_mcp::tools;
 use epigraph_mcp::tools::ingestion::{do_ingest_document, ingest_document_inline};
-use epigraph_mcp::types::IngestDocumentInlineParams;
+use epigraph_mcp::types::{IngestDocumentInlineParams, RecomputeBeliefsParams};
 use sqlx::PgPool;
 
 const FIXTURE: &str = r#"{
@@ -148,6 +149,53 @@ async fn happy_path_ingests_full_hierarchy(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(processed.0, 1);
+}
+
+/// Backlog c9d12a95: `recompute_beliefs(labels=[doi_slug])` returned 0 claims for
+/// a paper freshly ingested via `ingest_document_inline`, even though the
+/// claims existed — because ingestion never attached any per-paper label, so
+/// the label-based recompute path (and `query_claims_by_label`) can never find
+/// a paper's claim set. Every claim `do_ingest_document` writes must carry a
+/// `doi:<doi>` label, and `recompute_beliefs` must actually find them by it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingested_claims_carry_doi_label_for_recompute(pool: PgPool) {
+    let server = make_server(pool.clone());
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+
+    do_ingest_document(&server, &extraction)
+        .await
+        .expect("ingest_document succeeds");
+
+    let doi_label = "doi:10.1234/hierarchy-smoke";
+    let labeled_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM claims WHERE $1 = ANY(labels)")
+            .bind(doi_label)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        labeled_count.0, 5,
+        "all 5 hierarchy-level claims must carry the paper's doi label"
+    );
+
+    let result = tools::cdst_maintenance::recompute_beliefs(
+        &server,
+        RecomputeBeliefsParams {
+            claim_ids: None,
+            labels: Some(vec![doi_label.to_string()]),
+            limit: None,
+            offset: None,
+        },
+    )
+    .await
+    .expect("recompute_beliefs succeeds");
+    let json: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+    assert_eq!(
+        json["claims_considered"],
+        serde_json::json!(5),
+        "recompute_beliefs(labels=[doi_label]) must find the paper's full claim \
+         set, not 0 (the exact symptom reported in backlog c9d12a95)"
+    );
 }
 
 /// Re-ingesting the same extraction returns `already_ingested: true` with no new
