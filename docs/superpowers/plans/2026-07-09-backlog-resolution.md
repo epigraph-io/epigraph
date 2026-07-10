@@ -468,21 +468,51 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files:** `crates/epigraph-db/src/repos/claim.rs` (`update_with_evidence` dedup-match path).
 
-- [ ] **Step 1: Locate**
+> **Stale pointer, confirmed during implementation:** there is no `update_with_evidence`
+> function in `epigraph-db`. The real (and only) implementation is
+> `crates/epigraph-mcp/src/tools/claims.rs::update_with_evidence`, backed by
+> `UpdateWithEvidenceParams` in `crates/epigraph-mcp/src/types.rs`. `update_with_evidence`
+> takes an already-resolved `claim_id` (there is no in-repo similarity/hash lookup inside
+> the function itself) — it *is* the dedup-match write: the caller (the norcal-rfp
+> orchestrator, external to this repo) resolves the dedup match upstream and calls this
+> tool instead of `submit_claim` to re-assert evidence against the existing claim. The gap
+> was structural: `UpdateWithEvidenceParams` had no `labels` field at all, so no label could
+> ever reach this path. `submit_claim` and `memorize` already handle the analogous
+> dedup-hit case correctly (both call `ClaimRepository::update_labels` unconditionally when
+> labels are non-empty); `update_with_evidence` was the odd one out. Fixed at the MCP tool
+> layer; `ClaimRepository::update_labels` (db layer) needed no changes — its
+> `array_agg(DISTINCT ...)` union is already the additive primitive the fix reuses.
+
+- [x] **Step 1: Locate**
 
 ```bash
 rg -n "fn update_with_evidence" crates/epigraph-db/src/repos/claim.rs
 ```
 
-- [ ] **Step 2: Write the failing test** — call `update_with_evidence` against an existing claim
+(Returned nothing — see stale-pointer note above. Located instead via
+`rg -n "fn update_with_evidence" crates/ --type rust`, which resolved to
+`crates/epigraph-mcp/src/tools/claims.rs`.)
+
+- [x] **Step 2: Write the failing test** — call `update_with_evidence` against an existing claim
 that already carries label `norcal-rfp-2026-06-29`; pass a new `run_tag` label
 `norcal-rfp-2026-07-05`. Assert the claim's labels afterward include **both** the original and the
 new run tag (additive, not replacing).
 
-- [ ] **Step 3: Fix** — add the caller-supplied current-cycle label(s) to the claim's label array on
+(`crates/epigraph-mcp/tests/update_with_evidence_labels_test.rs`. RED before the fix:
+`current-cycle run-tag label must be added on the dedup-match write; got
+["norcal-rfp-2026-06-29"]` — the original label alone, proving the seed worked and the new
+label was silently dropped.)
+
+- [x] **Step 3: Fix** — add the caller-supplied current-cycle label(s) to the claim's label array on
 every dedup-match write, alongside the existing evidence/truth update. Use array-append
 (`labels = array_cat(labels, $new_labels)` with dedup via `array(select distinct unnest(...))` or
 equivalent) — do not overwrite the array.
+
+(Added `labels: Vec<String>` with `#[serde(default)]` to `UpdateWithEvidenceParams`, then in
+`update_with_evidence` call `ClaimRepository::update_labels(&server.pool, claim_id,
+&params.labels, &[])` when non-empty — reusing the existing `array_agg(DISTINCT ...)`
+union primitive, no new SQL needed. Mirrors `submit_claim`'s and `memorize`'s dedup-hit
+label handling in the same file.)
 
 - [ ] **Step 4: Also standardize the `bucket-k12`/`bucket-a` naming mismatch** flagged in the same
 claim — grep the norcal-rfp orchestrator prompt/workflow definition for the literal string
@@ -490,7 +520,13 @@ claim — grep the norcal-rfp orchestrator prompt/workflow definition for the li
 `bucket-k12`); this is a workflow-definition edit via `evolve_step`, not a code change — do it as
 part of Part 10, Task 10.7 (norcal-rfp source refresh), not here.
 
+(Out of scope for this task per the plan's own instruction — left for Part 10 Task 10.7.)
+
 - [ ] **Step 5: Verify, commit, resolve**
+
+(Verify + commit done on branch `fix/update-with-evidence-dedup-labels`. The
+`resolve_backlog_item` graph write is intentionally NOT executed from this branch — it's a
+live EpiGraph mutation meant to run post-merge, once the fix is actually on `main`.)
 
 ```python
 mcp__epigraph__resolve_backlog_item(
