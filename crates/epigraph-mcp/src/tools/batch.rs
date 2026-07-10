@@ -32,6 +32,7 @@ pub async fn batch_submit_claims(
             source_url: None,
             reasoning: None,
             labels: entry.labels.clone(),
+            novelty_threshold: None,
         };
 
         match crate::tools::claims::submit_claim(server, claim_params).await {

@@ -30,14 +30,77 @@ pub async fn memorize(
     let agent_id_typed = AgentId::from_uuid(agent_id);
     let pub_key = server.signer.public_key();
     let confidence = params.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
-    let tags = params.tags.unwrap_or_default();
+    let mut tags = params.tags.unwrap_or_default();
 
     let raw_truth = (confidence * 0.6).clamp(0.01, 0.99);
     let truth_value = TruthValue::clamped(raw_truth);
 
     let mut claim = Claim::new(params.content.clone(), agent_id_typed, pub_key, truth_value);
-    claim.content_hash = ContentHasher::hash(params.content.as_bytes());
+    let content_hash = ContentHasher::hash(params.content.as_bytes());
+    claim.content_hash = content_hash;
     claim.signature = Some(server.signer.sign(&claim.content_hash));
+
+    // Write-side semantic novelty gate (backlog 1bcaed94, Task 6.4) — same
+    // shape as `submit_claim`'s wiring, see `crate::tools::novelty_gate`
+    // module docs for the full rationale (content-hash check first so an
+    // exact resubmit is unaffected; gate only runs on genuinely new content).
+    let is_exact_resubmit = {
+        let mut conn = server.pool.acquire().await.map_err(internal_error)?;
+        ClaimRepository::find_by_content_hash_and_agent(&mut conn, &content_hash, agent_id)
+            .await
+            .map_err(internal_error)?
+            .is_some()
+    };
+    let mut pending_embedding: Option<String> = None;
+    if !is_exact_resubmit {
+        let novelty_threshold = params
+            .novelty_threshold
+            .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
+        if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
+            &server.pool,
+            server.embedder.as_ref(),
+            &params.content,
+            novelty_threshold,
+        )
+        .await
+        {
+            if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) = decision
+            {
+                // See submit_claim's identical branch (claims.rs) for the
+                // full rationale on both deliberate differences from
+                // content-hash dedup: corpus-wide (cross-agent) suppression
+                // — with the same epistemic-corroboration-loss consequence
+                // for memorize's caller — and this submission's `tags`
+                // being dropped since nothing is inserted.
+                let existing =
+                    ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(existing_id))
+                        .await
+                        .map_err(internal_error)?
+                        .ok_or_else(|| {
+                            internal_error(format!(
+                            "novelty gate: nearest claim {existing_id} vanished before read-back"
+                        ))
+                        })?;
+                return success_json(&MemorizeResponse {
+                    claim_id: existing_id.to_string(),
+                    truth_value: existing.truth_value.value(),
+                    embedded: false,
+                    tags,
+                    belief: None,
+                    plausibility: None,
+                    pignistic_prob: None,
+                });
+            }
+            pending_embedding = Some(pgvec);
+            if matches!(
+                decision,
+                crate::tools::novelty_gate::GateDecision::InsertFlagged
+            ) && !tags.iter().any(|t| t == "near-duplicate")
+            {
+                tags.push("near-duplicate".to_string());
+            }
+        }
+    }
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
@@ -111,10 +174,22 @@ pub async fn memorize(
             }
         };
 
-        let embedded = server
-            .embedder
-            .embed_and_store(claim_uuid, &params.content)
-            .await;
+        // Reuse the novelty gate's already-generated vector when available,
+        // matching submit_claim's pattern — avoids a second OpenAI call.
+        let embedded = if let Some(pgvec) = pending_embedding.take() {
+            match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
+                Ok(stored) => stored,
+                Err(e) => {
+                    tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
+                    false
+                }
+            }
+        } else {
+            server
+                .embedder
+                .embed_and_store(claim_uuid, &params.content)
+                .await
+        };
 
         (raw_truth, ds, embedded)
     } else {

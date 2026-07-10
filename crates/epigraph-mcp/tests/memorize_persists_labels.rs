@@ -43,6 +43,7 @@ async fn memorize_with_tags_populates_claims_labels() {
         content: content.clone(),
         confidence: Some(0.7),
         tags: Some(vec!["backlog".to_string(), "alt-set-extension".to_string()]),
+        novelty_threshold: None,
     };
 
     tools::memory::memorize(&server, params)
@@ -88,6 +89,7 @@ async fn memorize_resubmit_accumulates_labels() {
             content: content.clone(),
             confidence: Some(0.7),
             tags: Some(vec!["one".to_string()]),
+            novelty_threshold: None,
         },
     )
     .await
@@ -100,6 +102,7 @@ async fn memorize_resubmit_accumulates_labels() {
             content: content.clone(),
             confidence: Some(0.7),
             tags: Some(vec!["two".to_string()]),
+            novelty_threshold: None,
         },
     )
     .await
@@ -138,6 +141,7 @@ async fn memorize_without_tags_leaves_labels_empty() {
             content: content.clone(),
             confidence: Some(0.7),
             tags: None,
+            novelty_threshold: None,
         },
     )
     .await

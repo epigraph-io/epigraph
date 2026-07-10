@@ -137,6 +137,12 @@ pub struct SubmitClaimParams {
     )]
     #[serde(default)]
     pub labels: Vec<String>,
+
+    #[schemars(
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
+    )]
+    #[serde(default)]
+    pub novelty_threshold: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -286,6 +292,12 @@ pub struct MemorizeParams {
     )]
     #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub tags: Option<Vec<String>>,
+
+    #[schemars(
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
+    )]
+    #[serde(default)]
+    pub novelty_threshold: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

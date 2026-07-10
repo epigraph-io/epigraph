@@ -32,6 +32,18 @@ pub struct ClaimEmbeddingHit {
     pub similarity: f64,
 }
 
+/// Result row for [`ClaimRepository::nearest_by_embedding`].
+///
+/// `distance` is raw pgvector cosine distance (`<=>`), in `[0, 2]`, 0 =
+/// identical direction. Unlike [`ClaimEmbeddingHit::similarity`] this is NOT
+/// inverted, because the write-side novelty gate (backlog `1bcaed94`)
+/// thresholds directly on distance (`dist < 0.05` / `dist < 0.15`).
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct NearestClaimHit {
+    pub claim_id: Uuid,
+    pub distance: f64,
+}
+
 /// One fused hit from [`ClaimRepository::search_hybrid_scoped`] /
 /// [`ClaimRepository::search_lexical_scoped`].
 ///
@@ -646,6 +658,45 @@ impl ClaimRepository {
         .bind(limit)
         .bind(tags_owned)
         .bind(agent_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// ANN lookup backing the write-side semantic novelty gate (backlog
+    /// `1bcaed94`, Task 6.4): the `limit` nearest `is_current` claims to
+    /// `query_embedding_pgvector`, ordered closest-first by cosine distance
+    /// (`<=>`, matching `idx_claims_embedding_hnsw`'s `vector_cosine_ops` and
+    /// every other ANN query in this repo — the backlog plan's SQL sketch
+    /// wrote `<->` (L2), but L2 is neither index-accelerated here nor
+    /// calibrated for the 0.05/0.15 thresholds).
+    ///
+    /// Excludes `embedding IS NULL` (no defined distance) and
+    /// `is_current = false` rows (superseded/retired claims must never
+    /// suppress a new near-paraphrase insert).
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn nearest_by_embedding(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        limit: i64,
+    ) -> Result<Vec<NearestClaimHit>, DbError> {
+        let rows = sqlx::query_as::<_, NearestClaimHit>(
+            r#"
+            SELECT id AS claim_id,
+                   (embedding <=> $1::vector)::float8 AS distance
+            FROM claims
+            WHERE embedding IS NOT NULL
+              AND is_current
+            ORDER BY embedding <=> $1::vector
+            LIMIT $2
+            "#,
+        )
+        .bind(query_embedding_pgvector)
+        .bind(limit)
         .fetch_all(pool)
         .await?;
 

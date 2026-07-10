@@ -44,6 +44,7 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         source_url: None,
         reasoning: None,
         labels: vec![],
+        novelty_threshold: None,
     };
     let params2 = SubmitClaimParams {
         content: content.clone(),
@@ -54,6 +55,7 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         source_url: None,
         reasoning: None,
         labels: vec![],
+        novelty_threshold: None,
     };
 
     tools::claims::submit_claim(&server, params1)
@@ -276,6 +278,7 @@ async fn memorize_resubmit_option_a_skip() {
         content: content.clone(),
         confidence: Some(0.7),
         tags: Some(vec!["s3a-test".to_string()]),
+        novelty_threshold: None,
     };
 
     tools::memory::memorize(&server, make_params())

@@ -104,6 +104,7 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
             source_url: None,
             reasoning: None,
             labels: vec!["backlog".into()],
+            novelty_threshold: None,
         },
     )
     .await
@@ -299,6 +300,7 @@ async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &P
             source_url: None,
             reasoning: None,
             labels: vec![],
+            novelty_threshold: None,
         },
     )
     .await
