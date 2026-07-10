@@ -259,6 +259,15 @@ pub struct UpdateWithEvidenceParams {
 
     #[schemars(description = "Source URL or DOI for this evidence (optional)")]
     pub source_url: Option<String>,
+
+    #[schemars(
+        description = "Optional labels to add to the claim (e.g. current-cycle run tags like \
+                        'norcal-rfp-2026-07-05'). Additive: merged into the claim's existing \
+                        label array via ClaimRepository::update_labels, never overwrites \
+                        pre-existing labels — matches submit_claim/memorize's dedup-hit behavior."
+    )]
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 // ── Provenance ──

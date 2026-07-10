@@ -56,6 +56,7 @@ async fn add_evidence(
             source_url: None,
             supports,
             strength,
+            labels: vec![],
         },
     )
     .await

@@ -498,6 +498,19 @@ pub async fn update_with_evidence(
         .await
         .map_err(internal_error)?;
 
+    // Additive label merge on the dedup-match write, mirroring submit_claim's
+    // and memorize's dedup-hit behavior: labels union into the claim's
+    // existing array (ClaimRepository::update_labels dedupes via
+    // array_agg(DISTINCT ...)), never overwriting labels from the claim's
+    // original creation cycle. Fixes backlog f14592cb: run-tag labels (e.g.
+    // norcal-rfp-2026-07-05) were previously dropped on every call because
+    // UpdateWithEvidenceParams had no labels field at all.
+    if !params.labels.is_empty() {
+        ClaimRepository::update_labels(&server.pool, claim_id, &params.labels, &[])
+            .await
+            .map_err(internal_error)?;
+    }
+
     success_json(&UpdateResponse {
         claim_id: claim_id.to_string(),
         truth_before: before,
