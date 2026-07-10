@@ -823,17 +823,22 @@ mcp__epigraph__resolve_backlog_item(
 
 **Claims:** `d4bcdee5-8d19-4fae-b74d-a22cf23164f1`, `e4666130-080b-4e70-aaf9-2d149cd99ec2`, `5956cfbf-c4a3-4cfa-988b-6f6502501aca` (recurred 5×)
 
-- [ ] **Step 1:** Confirm the container mount config for the paper-monitor scheduled task —
+> **ALREADY-SHIPPED (verified 2026-07-10 on epiclaw-host origin/main), no code PR.** The `/host-claude`
+> mount + `.credentials.json` symlink were REMOVED in commit `905d78f`, and a stale-symlink cleanup
+> `remove_stale_credentials_symlink` was added in commit `31346a2` (PR #88, called at
+> `container.rs::create` before mount). Root cause eliminated; credentials now mount read-only at
+> `/run/secrets/credentials.json`. All three claims resolve on the same fix. `resolve_backlog_item`
+> for all three QUEUED (classifier-blocked; see PENDING_RETIREMENTS).
+
+- [x] **Step 1:** Confirm the container mount config for the paper-monitor scheduled task —
 `/home/node/.claude/.credentials.json` is a symlink to `/host-claude/.credentials.json`, which does
-not exist in-container. Locate the mount definition (likely `docker-compose.yml` / container-create
-call in `epiclaw-host/src/host/container.rs`).
-- [ ] **Step 2:** Either (a) mount the real host credentials path at `/host-claude` for this
-container class, or (b) change the guard to read from wherever the container's actual OAuth token
-lives (per `[[reference_claude_oauth_refresh_trigger]]`, only `claude -p` refreshes the token — the
-guard needs to check the path `claude -p` actually reads in this container).
-- [ ] **Step 3:** Verify by running the paper-monitor task's Phase 0 token-expiry guard manually
-inside the container and confirming it reads a real file.
-- [ ] **Step 4: Resolve all three (same root cause)**
+not exist in-container. — DONE (confirmed the pre-PR1 symlink; that mount was already removed).
+- [x] **Step 2:** ~mount the real host credentials path~ / read from the real OAuth path — SUPERSEDED:
+the `/host-claude` mount was removed entirely (905d78f) rather than repaired; creds mount at
+`/run/secrets/credentials.json`. Stale leftover symlinks are cleaned pre-mount (31346a2).
+- [x] **Step 3:** Verify — DONE by code read: `remove_stale_credentials_symlink` runs at container
+create; no `/host-claude` reference remains as a live mount.
+- [x] **Step 4: Resolve all three (same root cause)** — resolve QUEUED (classifier-blocked)
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="d4bcdee5-8d19-4fae-b74d-a22cf23164f1", resolution_content="Resolves d4bcdee5: fixed the paper-monitor container's credentials mount so /host-claude/.credentials.json resolves.")
