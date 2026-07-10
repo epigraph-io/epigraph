@@ -872,19 +872,25 @@ mcp__epigraph__resolve_backlog_item(
 
 **Claim:** `27315f6c-7d5e-4eff-9e24-c7eb3dd32de6` — pure ops, no code, but a real production edit.
 
-- [ ] **Step 1:** Edit `/var/lib/epiclaw/data/schedules.toml` on the prod host, repointing the
-assessment-worker scheduled-task prompt from `find_workflow` to `find_workflow_hierarchical` so it
-resolves workflow `d87b3c1b` (cdst-tier2-enrichment).
-- [ ] **Step 2:** `systemctl restart epiclaw` to reload.
-- [ ] **Step 3:** Confirm on the next scheduled run that the assessment-worker resolves the
-hierarchical workflow (check its execution log / `get_workflow_executions`).
-- [ ] **Step 4: Resolve**
+- [x] **Step 1:** Edit `/var/lib/epiclaw/data/schedules.toml` on the prod host, repointing the
+assessment-worker scheduled-task prompt from `find_workflow` to `find_workflow_hierarchical`.
+**Correction:** this plan originally said the target is workflow `d87b3c1b` (cdst-tier2-enrichment)
+— that was wrong. `d87b3c1b` is a separate, unrelated, also-deprecated lineage (truth_value 0.05,
+disjoint step sequence). Verified via `find_workflow_hierarchical` that the live prompt's actual
+goal string resolves to `31fff18b` (canonical_name process-assessment-queue-with-tiered-cdst-enrichment,
+gen 1, truth_value 1.0, 10 steps, 15/15 success) — that is the correct target.
+- [x] **Step 2:** `systemctl restart epiclaw` to reload — done 2026-07-10T19:15:32Z, PID 3574178, came up active.
+- [ ] **Step 3:** Confirm on the next scheduled run that the assessment-worker resolves workflow
+`31fff18b` (check its execution log / `get_workflow_executions`).
+- [ ] **Step 4: Resolve** (after Step 3 confirms; `resolve_backlog_item` has been classifier-gated
+all session — see open item flagged to Jeremy)
 
 ```python
 mcp__epigraph__resolve_backlog_item(
     original_id="27315f6c-7d5e-4eff-9e24-c7eb3dd32de6",
     resolution_content="Resolves 27315f6c: schedules.toml assessment-worker prompt repointed to "
-                        "find_workflow_hierarchical, epiclaw restarted, confirmed resolving d87b3c1b."
+                        "find_workflow_hierarchical, epiclaw restarted, confirmed resolving 31fff18b "
+                        "(not d87b3c1b, which the original claim misidentified as the target)."
 )
 ```
 
