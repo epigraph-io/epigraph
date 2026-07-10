@@ -277,6 +277,16 @@ pub async fn query_claims(
             .into_iter()
             .collect();
 
+    // Populate labels via a single batch round-trip for all returned ids
+    // (backlog babd5904: this handler previously hardcoded `labels: Vec::new()`
+    // while get_claim on the same id returned them). Batch fetch avoids the
+    // N+1 fan-out of per-claim get_labels calls; the helper does NOT filter on
+    // is_current so superseded rows (which list_by_truth_range returns) keep
+    // their labels, matching get_labels' label source. A missing id → no labels.
+    let labels_map = ClaimRepository::labels_by_ids(&server.pool, &ids)
+        .await
+        .map_err(internal_error)?;
+
     let results: Vec<ClaimResponse> = claims
         .into_iter()
         .map(|c| {
@@ -294,7 +304,7 @@ pub async fn query_claims(
                 agent_id: c.agent_id.as_uuid().to_string(),
                 content_hash,
                 created_at: c.created_at.to_rfc3339(),
-                labels: Vec::new(),
+                labels: labels_map.get(&id).cloned().unwrap_or_default(),
                 is_current: true,
                 supersedes: None,
             }
