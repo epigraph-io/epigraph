@@ -1068,16 +1068,29 @@ mcp__epigraph__resolve_backlog_item(original_id="88a09fd2-ea9c-4333-92c1-5c03803
 
 **Claim:** `1bcaed94-7651-457b-aded-7dc6b100f744`
 
-- [ ] **Step 1:** After embedding generation in `submit_claim`, add `SELECT id, embedding <-> $embed AS dist FROM claims WHERE is_current = true ORDER BY dist LIMIT 5`.
-- [ ] **Step 2:** `dist < 0.05` → return the existing claim id (semantic duplicate, no insert).
-`dist < 0.15` → insert with a `near-duplicate` label appended (soft flag). Otherwise insert normally.
-- [ ] **Step 3:** Expose `novelty_threshold: Option<f64>` on `submit_claim` (default `0.05`,
+> **DONE (2026-07-10), PR #324 open — NEEDS JEREMY'S MERGE DECISION.** Implemented with a
+> content-hash pre-check ordering fix (see PR body) and cosine `<=>` distance (not literal `<->`;
+> justified — HNSW index is `vector_cosine_ops`). Task review: Approved, no Critical/Important
+> findings. **Three flagged concerns in the PR body, #1 is a merge-blocking decision, not a
+> defect:** (1) corpus-wide cross-agent suppression can drop independent corroboration
+> (plan-mandated scope, but a real DST-epistemic tradeoff); (2) the 0.05 default makes the gate
+> ACTIVE for every existing caller once merged, not an inert opt-in; (3) minor — `memorize`'s
+> `ReturnExisting` response echoes unpersisted `tags`.
+
+- [x] **Step 1:** After embedding generation in `submit_claim`, add `SELECT id, embedding <-> $embed AS dist FROM claims WHERE is_current = true ORDER BY dist LIMIT 5`. — DONE, as cosine `<=>` (see note above) via new `ClaimRepository::nearest_by_embedding`.
+- [x] **Step 2:** `dist < 0.05` → return the existing claim id (semantic duplicate, no insert).
+`dist < 0.15` → insert with a `near-duplicate` label appended (soft flag). Otherwise insert normally. — DONE (`novelty_gate::classify`).
+- [x] **Step 3:** Expose `novelty_threshold: Option<f64>` on `submit_claim` (default `0.05`,
 backward-compatible — existing callers see no behavior change unless they opt into a different
-threshold).
-- [ ] **Step 4:** Apply the same gate to `memorize`.
-- [ ] **Step 5:** Regression test: submitting a near-paraphrase of an existing claim at default
-threshold returns the existing ID; at `novelty_threshold=0.0` it always inserts (escape hatch).
-- [ ] **Step 6: Verify, commit, resolve**
+threshold). — DONE. Wire-compatible via `#[serde(default)]`; note concern #2 above re: behavior-compatible.
+- [x] **Step 4:** Apply the same gate to `memorize`. — DONE.
+- [x] **Step 5:** Regression test: submitting a near-paraphrase of an existing claim at default
+threshold returns the existing ID; at `novelty_threshold=0.0` it always inserts (escape hatch). —
+DONE at the `decide()` layer (real DB + `MockProvider`); the MCP-tool-boundary firing is
+inspection-verified only (test server's embedder is mock-only, can't fire the gate in-process) —
+disclosed limitation, reviewed and accepted.
+- [x] **Step 6: Verify, commit, resolve** — verify + commit + PR #324 DONE (fmt/clippy/test green,
+task review Approved). `resolve_backlog_item` deferred to post-merge (live graph write).
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="1bcaed94-7651-457b-aded-7dc6b100f744", resolution_content="Resolves 1bcaed94: submit_claim/memorize now gate on ANN distance to the 5 nearest is_current claims — dist<0.05 returns the existing claim (no insert), dist<0.15 inserts with a near-duplicate label. novelty_threshold param (default 0.05) is backward-compatible.")
