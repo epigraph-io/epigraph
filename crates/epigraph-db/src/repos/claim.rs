@@ -1288,6 +1288,42 @@ impl ClaimRepository {
         Ok(rows.into_iter().collect())
     }
 
+    /// Fetch `labels` for a batch of claim ids in one round-trip.
+    ///
+    /// Batch companion to [`Self::get_labels`], used by MCP `query_claims` to
+    /// populate `ClaimResponse.labels` without an N+1 fan-out of per-claim
+    /// `get_labels` calls (backlog bug `babd5904`: `query_claims` hardcoded
+    /// `labels: Vec::new()`).
+    ///
+    /// Deliberately does **NOT** filter on `is_current`. `query_claims` runs
+    /// [`Self::list_by_truth_range`], which returns superseded rows, and the
+    /// single-claim label source it mirrors (`get_labels` →
+    /// `SELECT labels FROM claims WHERE id = $1`) has no `is_current` clause
+    /// either. Filtering here would silently re-drop labels for superseded
+    /// claims — the same bug class, narrowed. A missing id is simply absent
+    /// from the map (caller treats absence as "no labels").
+    ///
+    /// Uses the runtime `query_as` form (no compile-time `.sqlx` cache entry)
+    /// to keep `cargo sqlx prepare` out of this change's footprint.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    pub async fn labels_by_ids(
+        pool: &PgPool,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, Vec<String>>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, (uuid::Uuid, Vec<String>)>(
+            "SELECT id, COALESCE(labels, ARRAY[]::text[]) FROM claims WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// List claims that contain ALL of the specified labels.
     ///
     /// Uses the GIN index on `claims.labels` for efficient `@>` containment queries.
