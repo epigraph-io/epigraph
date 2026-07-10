@@ -1457,6 +1457,19 @@ for claim_id in ["ef0cbdc5-ea41-417a-bcfd-77df8bbb1cd0", "cf7b160a-22fd-4ec5-8fd
 on the public graph), not a speculative feature. Route it into Part 2 (security) instead of Part 9
 (deferred) on the next backlog-review pass.
 
+### New item found during execution — `get_claim` intermittent stale/empty `labels`
+
+**Claim:** `696a2c77-cabc-4fb0-a13a-fb1fdbd80c89` (filed 2026-07-10, `["backlog","bug","needs-triage"]`).
+
+Reported by the 2026-07-10 orchestrator: `get_claim` intermittently returns `labels=[]` for claims
+that do have labels, non-deterministically. Breaks the assessment-worker's dedup filter (it skips
+already-processed claims by label — a stale-empty read causes reprocessing). The specific claim_id
+that triggered this was never recorded before the reporting session ended, so it isn't reproduced
+yet. Needs a fresh triage pass: reproduce via repeated `get_claim` calls on a known labeled claim,
+then check `crates/epigraph-mcp/src/tools/claims.rs`'s `get_claim` handler and
+`crates/epigraph-db/src/repos/claim.rs`'s `get_by_id` for a SELECT that omits/races on `labels`.
+Not yet scoped as a task — add to the next backlog-review pass alongside `c5e56d0c`.
+
 ---
 
 ## Part 10: Graph Maintenance (MCP tool calls only, no repo commit)
