@@ -309,6 +309,11 @@ pub async fn do_ingest_document(
     let paper_title = extraction.source.title.clone();
     let doi = resolve_doi(extraction);
     let pipeline_version = effective_pipeline_version(extraction);
+    // Attached to every claim this paper asserts so `query_claims_by_label`
+    // and `recompute_beliefs(labels=[...])` can address a paper's full claim
+    // set (backlog c9d12a95: neither could ever find it before this label
+    // existed).
+    let paper_label = format!("doi:{doi}");
 
     // ── 1. Get-or-create paper node ──
     // (Pipeline-version gate removed: node-level content-hash dedup handles
@@ -422,6 +427,11 @@ pub async fn do_ingest_document(
             .map_err(internal_error)?;
         let persisted_id: Uuid = persisted.id.into();
         let already_had_trace = persisted.trace_id.is_some();
+        // Idempotent add: also runs on the dedup branch below, so an atom
+        // shared across papers (convergence) picks up every paper's label.
+        ClaimRepository::update_labels(pool, persisted_id, std::slice::from_ref(&paper_label), &[])
+            .await
+            .map_err(internal_error)?;
         if persisted_id != planned.id || already_had_trace {
             let (_row, _was_created) = EdgeRepository::create_if_not_exists(
                 pool,
@@ -752,6 +762,9 @@ pub async fn do_ingest_document_spine(
     let paper_title = extraction.source.title.clone();
     let doi = resolve_doi(extraction);
     let pipeline_version = effective_pipeline_version(extraction);
+    // See do_ingest_document: attached to every claim so label-based lookup
+    // (recompute_beliefs, query_claims_by_label) can find this paper's set.
+    let paper_label = format!("doi:{doi}");
 
     // Atom planned IDs — skip these claims and any edges referencing them.
     let atom_planned_ids: HashSet<Uuid> = plan
@@ -871,6 +884,9 @@ pub async fn do_ingest_document_spine(
             .map_err(internal_error)?;
         let persisted_id: Uuid = persisted.id.into();
         let already_had_trace = persisted.trace_id.is_some();
+        ClaimRepository::update_labels(pool, persisted_id, std::slice::from_ref(&paper_label), &[])
+            .await
+            .map_err(internal_error)?;
 
         if persisted_id != planned.id || already_had_trace {
             let (_row, _) = EdgeRepository::create_if_not_exists(

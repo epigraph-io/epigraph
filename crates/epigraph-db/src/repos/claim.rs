@@ -500,6 +500,62 @@ impl ClaimRepository {
         Ok(row.map(|(l,)| l).unwrap_or_default())
     }
 
+    /// Get a claim by ID together with its labels in a single SQL statement.
+    ///
+    /// `get_by_id` followed by `get_labels` is two independent round trips
+    /// against the shared pool: a concurrent `update_labels` between them can
+    /// return labels inconsistent with the already-read claim row (TOCTOU).
+    /// A single-statement, single-row `SELECT` is inherently consistent under
+    /// Postgres MVCC, so this is the atomic alternative for callers (e.g. MCP
+    /// `get_claim`) that need both together.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_by_id_with_labels(
+        pool: &PgPool,
+        id: ClaimId,
+    ) -> Result<Option<(Claim, Vec<String>)>, DbError> {
+        let uuid: Uuid = id.into();
+
+        use sqlx::Row;
+        let row = sqlx::query(
+            r#"
+            SELECT id, content, truth_value, agent_id, trace_id,
+                   created_at, updated_at, is_current, supersedes, labels
+            FROM claims
+            WHERE id = $1
+            "#,
+        )
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await?;
+
+        match row {
+            Some(row) => {
+                let truth_value = TruthValue::new(row.get::<f64, _>("truth_value"))?;
+                let mut claim = claim_from_row(
+                    row.get("id"),
+                    row.get("content"),
+                    row.get("agent_id"),
+                    row.get("trace_id"),
+                    truth_value,
+                    row.get("created_at"),
+                    row.get("updated_at"),
+                );
+                // Post-fix retirement state so callers see real DB values
+                // instead of `claim_from_row`'s defaults, mirroring `get_by_id`.
+                claim.is_current = row.get::<bool, _>("is_current");
+                claim.supersedes = row
+                    .get::<Option<Uuid>, _>("supersedes")
+                    .map(ClaimId::from_uuid);
+                let labels: Vec<String> = row.get("labels");
+                Ok(Some((claim, labels)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// kNN search over `claims.embedding` (1536d) or `claims.embedding_3072`,
     /// restricted to paragraph-level (level=2) claims, optionally filtered by
     /// the paper that asserts the claim. Results are ordered by cosine
@@ -1281,6 +1337,42 @@ impl ClaimRepository {
         let rows = sqlx::query_as::<_, (uuid::Uuid, String)>(
             "SELECT id, content FROM claims \
              WHERE id = ANY($1) AND COALESCE(is_current, true) = true",
+        )
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Fetch `labels` for a batch of claim ids in one round-trip.
+    ///
+    /// Batch companion to [`Self::get_labels`], used by MCP `query_claims` to
+    /// populate `ClaimResponse.labels` without an N+1 fan-out of per-claim
+    /// `get_labels` calls (backlog bug `babd5904`: `query_claims` hardcoded
+    /// `labels: Vec::new()`).
+    ///
+    /// Deliberately does **NOT** filter on `is_current`. `query_claims` runs
+    /// [`Self::list_by_truth_range`], which returns superseded rows, and the
+    /// single-claim label source it mirrors (`get_labels` →
+    /// `SELECT labels FROM claims WHERE id = $1`) has no `is_current` clause
+    /// either. Filtering here would silently re-drop labels for superseded
+    /// claims — the same bug class, narrowed. A missing id is simply absent
+    /// from the map (caller treats absence as "no labels").
+    ///
+    /// Uses the runtime `query_as` form (no compile-time `.sqlx` cache entry)
+    /// to keep `cargo sqlx prepare` out of this change's footprint.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    pub async fn labels_by_ids(
+        pool: &PgPool,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, Vec<String>>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, (uuid::Uuid, Vec<String>)>(
+            "SELECT id, COALESCE(labels, ARRAY[]::text[]) FROM claims WHERE id = ANY($1)",
         )
         .bind(ids)
         .fetch_all(pool)
