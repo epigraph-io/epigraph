@@ -239,7 +239,7 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files:** `Cargo.toml` (workspace deps), all ~8 crates pinning `sqlx = "0.7"` (`epigraph-api`, `-cli`, `-db`, `-mcp`, `-engine`, `-embeddings`, `-ingest-executor` + engine-integration tests), `~44` files using `reqwest`, `.cargo/audit.toml`.
 
-- [ ] **Step 1: Bump sqlx to 0.8.x workspace-wide**
+- [x] **Step 1: Bump sqlx to 0.8.x workspace-wide** (commit 080defe, unified on 0.8.6)
 
 ```bash
 rg -l 'sqlx = "0.7' Cargo.toml crates/*/Cargo.toml
@@ -248,7 +248,7 @@ rg -l 'sqlx = "0.7' Cargo.toml crates/*/Cargo.toml
 Update each to `sqlx = "0.8"`, fix `Encode`/`Decode` and query-macro nullability breaks flagged by
 the compiler, bump `pgvector` to a sqlx-0.8-compatible release.
 
-- [ ] **Step 2: Regenerate the offline query cache**
+- [x] **Step 2: Regenerate the offline query cache** (part of commit 080defe, `.sqlx/` regenerated)
 
 ```bash
 DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test \
@@ -257,12 +257,12 @@ git add .sqlx/
 SQLX_OFFLINE=true cargo check --workspace --all-targets
 ```
 
-- [ ] **Step 3: Bump reqwest to 0.12.x workspace-wide**
+- [x] **Step 3: Bump reqwest to 0.12.x workspace-wide** (PR #326 — no `http`/`hyper` ripple effects
+hit; the only three crates declaring reqwest directly used a stable API surface across the bump)
 
-Cross the `http` 0.2→1.0 / `hyper` 1.0 boundary; fix ripple effects at any shared `http` type call
-site across the ~44 files.
-
-- [ ] **Step 4: Confirm the TLS stack advisories clear**
+- [x] **Step 4: Confirm the TLS stack advisories clear** (PR #326 — `cargo audit` after the bump
+shows only the two already-tracked, unrelated advisories: RUSTSEC-2026-0204 crossbeam-epoch and
+RUSTSEC-2026-0190 anyhow advisory-only; no sqlx/reqwest/TLS-stack advisories remain)
 
 ```bash
 cargo audit
