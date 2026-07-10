@@ -12,9 +12,11 @@ use epigraph_core::{
     TruthValue,
 };
 use epigraph_crypto::ContentHasher;
-use epigraph_db::{ClaimRepository, EvidenceRepository, HybridHit, ReasoningTraceRepository};
+use epigraph_db::{
+    ClaimRepository, EvidenceRepository, HybridHit, ReasoningTraceRepository, WorkflowRepository,
+};
 
-use crate::embed::HYBRID_RRF_K;
+use crate::embed::{format_pgvector, HYBRID_CANDIDATE_POOL, HYBRID_RRF_K};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -151,6 +153,39 @@ pub async fn recall(
     server: &EpiGraphMcpFull,
     params: RecallParams,
 ) -> Result<CallToolResult, McpError> {
+    // Generate the query embedding ONCE up front. Reused for both the claims
+    // dense leg and (when requested) the workflows ANN leg — recall must not
+    // re-embed the same query text twice (see `recall_post_embed`/workflows
+    // leg below). `None` on embedder failure degrades both legs: claims fall
+    // back to lexical-only (existing behavior) and the workflows leg is
+    // skipped entirely (there is no lexical fallback for goal_embedding).
+    let pgvec_opt = match server.embedder.generate(&params.query).await {
+        Ok(v) => Some(format_pgvector(&v)),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                query = %params.query,
+                "recall: embedder failed; degrading to lexical-only claims leg, no workflows leg"
+            );
+            None
+        }
+    };
+
+    recall_post_embed(server, params, pgvec_opt).await
+}
+
+/// Post-embedding pipeline: shared by `recall` and the
+/// `__test_only::recall_with_pgvec` entry point that lets integration tests
+/// skip the OpenAI embedder (no API key available in CI / sandbox), mirroring
+/// `workflows.rs`'s `find_workflow`/`find_workflow_post_embed` split.
+///
+/// Recomputes `limit`/`min_truth` from `params` internally so the two
+/// extraction sites cannot drift.
+async fn recall_post_embed(
+    server: &EpiGraphMcpFull,
+    params: RecallParams,
+    pgvec_opt: Option<String>,
+) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let min_truth = params.min_truth.unwrap_or(0.3);
     let agent_filter = parse_agent_filter(params.agent_id.as_deref()).map_err(invalid_params)?;
@@ -170,93 +205,197 @@ pub async fn recall(
     }
 
     // Hybrid retrieval: dense (claims.embedding) + lexical (content_tsv), RRF-fused.
-    // On embedder failure, degrade to lexical-only — which, unlike the old ILIKE
-    // fallback, still honors tag/agent scope because it filters in SQL.
-    let hits: Vec<HybridHit> = match server
-        .embedder
-        .search_hybrid_scoped(&params.query, limit, tags_opt, agent_filter)
+    // On embedder failure (pgvec_opt is None), degrade to lexical-only — which,
+    // unlike the old ILIKE fallback, still honors tag/agent scope because it
+    // filters in SQL.
+    let hits: Vec<HybridHit> = match pgvec_opt.as_deref() {
+        Some(pgvec) => ClaimRepository::search_hybrid_scoped(
+            &server.pool,
+            pgvec,
+            &params.query,
+            HYBRID_CANDIDATE_POOL,
+            HYBRID_RRF_K,
+            limit,
+            tags_opt,
+            agent_filter,
+        )
         .await
-    {
-        Ok(hits) => hits,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                query = %params.query,
-                "recall: hybrid embed leg failed; serving scope-honoring lexical-only"
-            );
-            ClaimRepository::search_lexical_scoped(
-                &server.pool,
-                &params.query,
-                HYBRID_RRF_K,
-                limit,
-                tags_opt,
-                agent_filter,
-            )
-            .await
-            .map_err(internal_error)?
-        }
+        .map_err(internal_error)?,
+        None => ClaimRepository::search_lexical_scoped(
+            &server.pool,
+            &params.query,
+            HYBRID_RRF_K,
+            limit,
+            tags_opt,
+            agent_filter,
+        )
+        .await
+        .map_err(internal_error)?,
     };
 
+    // Workflows ANN leg (opt-in, backlog 88a09fd2 / Task 6.3). Only runs when
+    // BOTH include_workflows=true AND the query embedding succeeded — there is
+    // no lexical fallback for workflows.goal_embedding, so on embedder failure
+    // this leg is silently absent rather than serving stale/irrelevant rows.
+    // Ranked by cosine distance (best first), independent of the claims dense+
+    // lexical fusion above; RRF-merged with the claims ranking below using the
+    // SAME k constant/formula `search_hybrid_scoped` already uses in SQL for
+    // its dense+lexical fusion (`crate::embed::HYBRID_RRF_K`), just applied in
+    // Rust across two disjoint (claim vs workflow) ranked lists instead of two
+    // legs of one list.
+    let workflow_hits: Vec<epigraph_db::WorkflowGoalEmbeddingHit> = if params.include_workflows {
+        match pgvec_opt.as_deref() {
+            Some(pgvec) => WorkflowRepository::search_by_goal_embedding(
+                &server.pool,
+                pgvec,
+                HYBRID_CANDIDATE_POOL,
+            )
+            .await
+            .map_err(internal_error)?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // RRF-merge: claims already carry a fused `rrf_score` from the SQL dense+
+    // lexical fusion — that score is used ONLY to establish the claims'
+    // relative rank order here (rank 1 = best), then discarded. Each item's
+    // merged score is a single `1/(k + rank)` term against its own list;
+    // claims and workflows are disjoint id-spaces so nothing sums across
+    // lists (unlike the dense+lexical fusion, where the SAME claim can appear
+    // in both legs and its two terms sum).
+    #[derive(Clone)]
+    enum MergedHit {
+        Claim(HybridHit),
+        Workflow(epigraph_db::WorkflowGoalEmbeddingHit),
+    }
+    let mut merged: Vec<(f64, MergedHit)> = Vec::with_capacity(hits.len() + workflow_hits.len());
+    for (idx, hit) in hits.iter().enumerate() {
+        let rank = idx as f64 + 1.0;
+        merged.push((
+            1.0 / (HYBRID_RRF_K as f64 + rank),
+            MergedHit::Claim(hit.clone()),
+        ));
+    }
+    for (idx, hit) in workflow_hits.iter().enumerate() {
+        let rank = idx as f64 + 1.0;
+        merged.push((
+            1.0 / (HYBRID_RRF_K as f64 + rank),
+            MergedHit::Workflow(hit.clone()),
+        ));
+    }
+    merged.sort_by(|a, b| b.0.total_cmp(&a.0));
+    merged.truncate(limit as usize);
+
     let mut results = Vec::new();
-    for hit in hits {
-        if let Ok(Some(claim)) =
-            ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(hit.claim_id)).await
-        {
-            let tv = claim.truth_value.value();
-            if tv >= min_truth {
-                let mut matched_via = Vec::new();
-                if hit.dense_similarity.is_some() {
-                    matched_via.push("dense".to_string());
-                }
-                if hit.in_lexical {
-                    matched_via.push("lexical".to_string());
-                }
-
-                // Additive lensed belief per returned claim. Degrade-not-fail:
-                // a compute error for ONE claim yields null + a warn, never an
-                // aborted page (spec §8). min_truth/ranking stay on `tv`.
-                let lensed_belief = match lens {
-                    Some((frame_id, perspective_id)) => {
-                        match epigraph_engine::belief_query::get_perspective_belief(
-                            &server.pool,
-                            hit.claim_id,
-                            frame_id,
-                            perspective_id,
-                        )
-                        .await
-                        {
-                            Ok(interval) => Some(LensedBelief::from_interval(
-                                frame_id,
-                                perspective_id,
-                                &interval,
-                            )),
-                            Err(e) => {
-                                tracing::warn!(
-                                    claim_id = %hit.claim_id,
-                                    error = %e,
-                                    "lensed belief compute failed; serving null lens for this claim"
-                                );
-                                None
-                            }
+    for (merged_rrf_score, merged_hit) in merged {
+        match merged_hit {
+            MergedHit::Claim(hit) => {
+                if let Ok(Some(claim)) =
+                    ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(hit.claim_id)).await
+                {
+                    let tv = claim.truth_value.value();
+                    if tv >= min_truth {
+                        let mut matched_via = Vec::new();
+                        if hit.dense_similarity.is_some() {
+                            matched_via.push("dense".to_string());
                         }
-                    }
-                    None => None,
-                };
+                        if hit.in_lexical {
+                            matched_via.push("lexical".to_string());
+                        }
 
-                results.push(RecallResult {
-                    claim_id: hit.claim_id.to_string(),
-                    content: claim.content,
-                    truth_value: tv,
-                    similarity: hit.dense_similarity.unwrap_or(0.0),
-                    rrf_score: hit.rrf_score,
-                    matched_via,
-                    lensed_belief,
-                });
+                        // Additive lensed belief per returned claim. Degrade-not-fail:
+                        // a compute error for ONE claim yields null + a warn, never an
+                        // aborted page (spec §8). min_truth/ranking stay on `tv`.
+                        let lensed_belief = match lens {
+                            Some((frame_id, perspective_id)) => {
+                                match epigraph_engine::belief_query::get_perspective_belief(
+                                    &server.pool,
+                                    hit.claim_id,
+                                    frame_id,
+                                    perspective_id,
+                                )
+                                .await
+                                {
+                                    Ok(interval) => Some(LensedBelief::from_interval(
+                                        frame_id,
+                                        perspective_id,
+                                        &interval,
+                                    )),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            claim_id = %hit.claim_id,
+                                            error = %e,
+                                            "lensed belief compute failed; serving null lens for this claim"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
+
+                        // Without a workflows leg (include_workflows=false, the
+                        // default), `merged_rrf_score` is 1/(k+rank) where rank is
+                        // the claim's position in `hits` — the SAME ordering
+                        // `hit.rrf_score` already produced (hits is sorted by
+                        // rrf_score DESC in SQL). Reporting hit.rrf_score (not
+                        // merged_rrf_score) here keeps the field byte-identical to
+                        // pre-Task-6.3 output for claims-only recall.
+                        let _ = merged_rrf_score;
+                        results.push(RecallResult {
+                            claim_id: hit.claim_id.to_string(),
+                            content: claim.content,
+                            truth_value: tv,
+                            similarity: hit.dense_similarity.unwrap_or(0.0),
+                            rrf_score: hit.rrf_score,
+                            matched_via,
+                            lensed_belief,
+                            result_type: None,
+                        });
+                    }
+                }
+            }
+            MergedHit::Workflow(hit) => {
+                if hit.truth_value >= min_truth {
+                    results.push(RecallResult {
+                        claim_id: hit.workflow_id.to_string(),
+                        content: hit.content,
+                        truth_value: hit.truth_value,
+                        similarity: hit.similarity,
+                        rrf_score: merged_rrf_score,
+                        matched_via: vec!["dense".to_string()],
+                        lensed_belief: None,
+                        result_type: Some("workflow".to_string()),
+                    });
+                }
             }
         }
     }
 
     success_json(&results)
+}
+
+#[doc(hidden)]
+pub mod __test_only {
+    use super::{recall_post_embed, EpiGraphMcpFull, McpError, RecallParams};
+    use rmcp::model::CallToolResult;
+
+    /// Integration-test entry point that skips the OpenAI embedder.
+    ///
+    /// Tests cannot call the real embedder (no API key in CI / sandbox), so
+    /// they pre-format a known pgvector literal and dispatch directly into
+    /// the post-embed pipeline. This is the same code `recall` runs after
+    /// `embedder.generate`. Mirrors `workflows.rs`'s
+    /// `__test_only::find_workflow_with_pgvec`.
+    pub async fn recall_with_pgvec(
+        server: &EpiGraphMcpFull,
+        params: RecallParams,
+        pgvec: Option<String>,
+    ) -> Result<CallToolResult, McpError> {
+        recall_post_embed(server, params, pgvec).await
+    }
 }
 
 #[cfg(test)]

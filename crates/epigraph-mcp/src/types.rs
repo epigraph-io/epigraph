@@ -324,6 +324,14 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub perspective_id: Option<String>,
+
+    #[schemars(
+        description = "When true, also search workflows.goal_embedding and RRF-merge workflow hits \
+                       into the results (tagged result_type=\"workflow\"). Default false: recall \
+                       searches claims only, byte-identical to pre-existing behavior."
+    )]
+    #[serde(default)]
+    pub include_workflows: bool,
 }
 
 // ── Ingestion ──
@@ -885,6 +893,13 @@ pub struct RecallResult {
     /// a lens-free recall is byte-identical to today.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lensed_belief: Option<LensedBelief>,
+
+    /// `Some("workflow")` for a hit sourced from `workflows.goal_embedding`
+    /// (only possible when `include_workflows=true`); omitted (not `null`)
+    /// for ordinary claim hits, so `include_workflows`-unset recall stays
+    /// byte-identical to pre-existing output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
