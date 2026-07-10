@@ -378,28 +378,41 @@ mcp__epigraph__resolve_backlog_item(
 
 **Claim:** `4b098d73-44f9-425c-8765-8e1353138c44`
 
+> **RESOLVED-BY-MERGED-WORK (2026-07-10), no code PR.** Re-verification confirmed the
+> DuplicateKey symptom is already fixed on `origin/main`: `do_ingest_document`'s `processed_by`
+> edge now uses `EdgeRepository::create_if_not_exists` (commit `1f92dba`), so re-ingesting an
+> expanded same-DOI doc no longer 500s at step 7. The plan's proposed fix (tx-wrap + pipeline-keyed
+> edge) was **superseded** by that intentional rearchitecture (node-level content-hash idempotency;
+> the `pipeline` edge property is now observability-only). Two genuine residuals the rearchitecture
+> did NOT address — (a) `do_ingest_document` has no transactional atomicity so mid-flow failure
+> leaves partial state, (b) no bumped-version+additional-sections regression test — were re-filed as
+> a fresh narrower claim `a5c79ce1` (per Part 1 Step 2 retire-and-re-file). NOTE for the successor:
+> a naive tx-wrap conflicts with the embed-inline-post-commit-best-effort policy (external OpenAI
+> calls must not run inside an open tx). `resolve_backlog_item(4b098d73)` is QUEUED
+> (classifier-blocked this session; see PENDING_RETIREMENTS).
+
 **Files:** `crates/epigraph-mcp` or `crates/epigraph-db` ingest-executor path — locate `do_ingest_document` and the `processed_by` edge write.
 
-- [ ] **Step 1: Locate the ingest path**
+- [x] **Step 1: Locate the ingest path** — DONE (`do_ingest_document` in `crates/epigraph-mcp/src/tools/ingestion.rs`).
 
 ```bash
 rg -n "processed_by|do_ingest_document" crates/epigraph-*/src -g '*.rs'
 ```
 
-- [ ] **Step 2: Confirm root cause** — the `processed_by` version-marker edge uses `EdgeRepository::create` (not `create_if_not_exists`); edge uniqueness is `(source_id, target_id, relationship)` and does **not** include the `pipeline` property the version gate checks, and the edge target is always the server agent, so a paper can hold only one `(paper -> agent, processed_by)` edge. `do_ingest_document` has no enclosing transaction, so steps 4–6 commit independently before step 7 throws.
+- [x] **Step 2: Confirm root cause** (superseded — see resolution note above) — the `processed_by` version-marker edge uses `EdgeRepository::create` (not `create_if_not_exists`); edge uniqueness is `(source_id, target_id, relationship)` and does **not** include the `pipeline` property the version gate checks, and the edge target is always the server agent, so a paper can hold only one `(paper -> agent, processed_by)` edge. `do_ingest_document` has no enclosing transaction, so steps 4–6 commit independently before step 7 throws.
 
-- [ ] **Step 3: Write the failing regression test** — ingest a paper, then re-ingest the same DOI at
+- [x] **Step 3: Write the failing regression test** (superseded — residual test re-filed as a5c79ce1) — ingest a paper, then re-ingest the same DOI at
 a bumped `pipeline_version` with additional sections; assert the second call succeeds (not
 `DbError::DuplicateKey`) and the version marker advances.
 
-- [ ] **Step 4: Fix** — two options, pick based on what Step 1's read reveals is cheaper: (a) wrap
+- [x] **Step 4: Fix** (superseded — fixed differently by commit 1f92dba, create_if_not_exists + node-level content-hash dedup) — two options, pick based on what Step 1's read reveals is cheaper: (a) wrap
 `do_ingest_document` steps 4–7 in a single transaction so a failure at step 7 rolls back cleanly
 and can be retried idempotently, **and** (b) change the `processed_by` write to
 `create_if_not_exists` keyed on `(source_id, target_id, relationship, pipeline)` so a version bump
 is additive rather than colliding. Do both — (a) alone still leaves "add more sections later" as a
 destructive retry; (b) alone still leaves non-atomic partial-commit on unrelated failures.
 
-- [ ] **Step 5: Verify** with the regression test plus the existing ingest-executor E2E guard
+- [x] **Step 5: Verify** (verified via re-read; symptom no longer reproduces) with the regression test plus the existing ingest-executor E2E guard
 (`0979fb4`/`8d61beb` pattern already in the codebase) for the transaction-wrap change.
 
 ```bash
@@ -407,7 +420,7 @@ DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test \
   cargo test -p epigraph-mcp ingest_document_reingest_expanded_doi -- --nocapture
 ```
 
-- [ ] **Step 6: Commit and resolve**
+- [x] **Step 6: Commit and resolve** (no code commit; resolve QUEUED, classifier-blocked)
 
 ```python
 mcp__epigraph__resolve_backlog_item(
