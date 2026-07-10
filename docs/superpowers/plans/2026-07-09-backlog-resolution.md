@@ -965,14 +965,37 @@ treat the claim content itself as the design spec; the steps below are the build
 
 **Claim:** `29e789fd-92fb-497f-b9bf-5dff1d96408b`
 
-- [ ] **Step 1:** Add `graph_expansion_depth: Option<u32>` param to `recall_with_context` MCP tool.
-- [ ] **Step 2:** In `crates/epigraph-db`, run the standard ANN query for top-k seeds; when
+- [x] **Step 1:** Add `graph_expansion_depth: Option<u32>` param to `recall_with_context` MCP tool.
+DONE — added to `RecallWithContextParams` in `crates/epigraph-mcp/src/tools/recall.rs`, clamped
+`[1,4]`, `None` preserves today's flat-ANN-only behaviour byte-for-byte.
+- [x] **Step 2:** In `crates/epigraph-db`, run the standard ANN query for top-k seeds; when
 `graph_expansion_depth` is set, call `traverse(node_id, depth, relationship=["supports","corroborates","elaborates"], direction="outgoing")` per seed.
-- [ ] **Step 3:** Dedup the expansion set, rerank by `rrf_score * (1 + 0.1 * in_epistemic_degree)`.
-- [ ] **Step 4:** Regression test: a claim reachable only via a 2-hop `supports` edge from an ANN
+DONE, with a scope adjustment: the real `traverse` MCP tool (`crates/epigraph-mcp/src/tools/graph.rs`)
+takes a single `relationship: Option<String>`, not a list, and returns a serialized
+`CallToolResult` — neither fits calling it per-seed with a 3-relationship filter from inside
+`recall_with_context`. Added `ClaimRepository::graph_expand_seeds` in
+`crates/epigraph-db/src/repos/claim.rs` instead: the same BFS-over-`EdgeRepository::get_by_source`
+shape `traverse` uses internally, reproduced directly against the repo layer. New constant
+`EXPANSION_RELATIONSHIPS = ["supports", "corroborates", "elaborates"]`.
+- [x] **Step 3:** Dedup the expansion set, rerank by `rrf_score * (1 + 0.1 * in_epistemic_degree)`.
+DONE, with a scope adjustment: `rrf_score` does not exist on `recall_with_context`'s hit type
+(`ClaimEmbeddingHit`, flat ANN `similarity`) — it belongs to the *other* tool, `recall`'s hybrid
+RRF-fused path (`HybridHit`). The plan conflated the two. Used `similarity` as the rerank base,
+matching what `recall_with_context` actually carries. `in_epistemic_degree` is computed by a new
+batched `GROUP BY` query, `ClaimRepository::in_epistemic_degree_batch` — one round-trip for the
+whole candidate pool, not an N+1 — over the full 7-type `link_epistemic` allowlist (now shared as
+`epigraph_db::EPISTEMIC_RELATIONSHIPS`), not just the 3 expansion-traversal types. Expanded claims
+(no ANN score of their own) are seeded into the rerank with `best_seed_similarity * 0.7^hops`.
+- [x] **Step 4:** Regression test: a claim reachable only via a 2-hop `supports` edge from an ANN
 seed (not itself ANN-close to the query) is returned when `graph_expansion_depth=2`, absent when
 unset (default-off, backward compatible).
-- [ ] **Step 5: Verify, commit, resolve**
+DONE — `crates/epigraph-mcp/tests/recall_graph_expansion.rs`, 3 tests (unset, depth=1, depth=2)
+against an A→MID→B `supports` chain with MID/B embedded orthogonally to the query so they are not
+ANN-close. Confirmed RED (positive test fails, B absent) with the expansion call disabled, GREEN
+with it enabled; negative tests pass either way (they assert absence).
+- [x] **Step 5: Verify, commit, resolve** — verify + commit DONE (this PR); **resolve is
+intentionally NOT run** — `resolve_backlog_item` is a live graph write and this task runs from a
+worktree, per the task's own instruction to leave it for post-merge.
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="29e789fd-92fb-497f-b9bf-5dff1d96408b", resolution_content="Resolves 29e789fd: recall_with_context accepts optional graph_expansion_depth, 2-hop-traversing supports/corroborates/elaborates edges from ANN seeds and reranking by rrf_score * (1 + 0.1*in_epistemic_degree). Default-off, backward-compatible.")
