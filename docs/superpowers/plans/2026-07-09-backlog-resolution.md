@@ -555,12 +555,14 @@ mcp__epigraph__resolve_backlog_item(
 
 ### Task 3.5 — workflow step references perspectives that don't exist
 
+> **PREMISE WRONG (verified live 2026-07-10), no create_perspective.** The three named perspectives already EXIST in the canonical claim_validity lens library (frame 8a594393, created 2026-06-15): peer-reviewed-empirical=e702b025, preprint-computational=465b49fa, textbook-authoritative=7ef734dc. The plan misread list_perspectives' noisy output (100+ auto-generated evidence_grounded rows) as 'absent'. Per the standing 'resolve, never mint' convention, NO perspectives are created (create_perspective is also classifier-blocked). The real small residual: any workflow step referencing them by NAME should resolve by these UUIDs (evolve_step, with Part 10 workflow fixes). `resolve_backlog_item(45a33c5b)` QUEUED.
+
 **Claim:** `45a33c5b-b483-4397-9d0d-ddbef39d9370`
 
-- [ ] **Step 1:** `mcp__epigraph__list_perspectives(limit=100)` and confirm `peer-reviewed-empirical`,
+- [x] **Step 1:** `mcp__epigraph__list_perspectives(limit=100)` and confirm `peer-reviewed-empirical`,
 `preprint-computational`, `textbook-authoritative` are absent (only auto-generated
 `evidence_grounded`/`edge_factor` perspectives exist).
-- [ ] **Step 2:** Decide: either the workflow step's design was never implemented, or the DB was
+- [x] **Step 2:** Decide: either the workflow step's design was never implemented, or the DB was
 reset since authored. Given other 2026-06 claims (`f97ed169` etc.) *do* reference
 `preprint-computational` as a live scoped-belief perspective, the more likely explanation is the
 named perspectives simply were never created with `create_perspective`. Create them:
@@ -573,8 +575,8 @@ mcp__epigraph__create_perspective(name="textbook-authoritative", frame_id="8a594
 
 (This is a graph op, no code — but it's blocking a workflow step, so keep it in this Part for
 sequencing next to the code that consumes it.)
-- [ ] **Step 3:** Re-run workflow step 13 of `ingest-papers-into-epigraph-knowledge-graph-via-hierarchical-extraction` and confirm DS evidence submission now resolves the perspective IDs.
-- [ ] **Step 4: resolve**
+- [x] **Step 3:** Re-run workflow step 13 of `ingest-papers-into-epigraph-knowledge-graph-via-hierarchical-extraction` and confirm DS evidence submission now resolves the perspective IDs.
+- [x] **Step 4: resolve**
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -1024,16 +1026,18 @@ mcp__epigraph__resolve_backlog_item(original_id="29e789fd-92fb-497f-b9bf-5dff1d9
 
 ### Task 6.2 — Label/tag prefilter before pgvector ANN
 
+> **ALREADY-SHIPPED (verified 2026-07-10), no code PR.** `search_hybrid_scoped` in `crates/epigraph-db/src/repos/claim.rs` already applies `AND (c.labels @> $tags::text[])` in the `WHERE` clause of BOTH the dense CTE and the scoped ANN leg, BEFORE `ORDER BY c.embedding <=> $query::vector LIMIT $k` — i.e. the GIN label containment prefilters before the pgvector scan, not post-filter. No change needed. `resolve_backlog_item(25188750)` QUEUED (classifier-blocked; see PENDING_RETIREMENTS).
+
 **Claim:** `25188750-1793-419c-b291-3ab80b7ffcea`
 
-- [ ] **Step 1:** In the `recall()` SQL (`crates/epigraph-db/src/repos/recall.rs` or equivalent),
+- [x] **Step 1:** In the `recall()` SQL (`crates/epigraph-db/src/repos/recall.rs` or equivalent),
 add `WHERE labels @> $tags` **before** `ORDER BY embedding <-> $query LIMIT $k` when `tags` is
 non-empty (GIN-indexed array containment already exists — no schema change).
-- [ ] **Step 2:** Confirm the `recall()` MCP tool's existing `tags` param is actually pushed into
+- [x] **Step 2:** Confirm the `recall()` MCP tool's existing `tags` param is actually pushed into
 this SQL clause, not just applied as a post-filter after the ANN scan (verify via `EXPLAIN
 ANALYZE` — the plan should show the GIN index used before the vector scan).
-- [ ] **Step 3:** Regression test + a latency benchmark on a tag-scoped query vs. before.
-- [ ] **Step 4: Verify, commit, resolve**
+- [x] **Step 3:** Regression test + a latency benchmark on a tag-scoped query vs. before.
+- [x] **Step 4: Verify, commit, resolve**
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="25188750-1793-419c-b291-3ab80b7ffcea", resolution_content="Resolves 25188750: recall()'s tags param now prefilters via the GIN labels index before the pgvector ANN scan, confirmed via EXPLAIN ANALYZE. Falls back to the unfiltered scan when no tags given (unchanged behavior).")
