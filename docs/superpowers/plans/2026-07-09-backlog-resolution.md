@@ -1385,6 +1385,40 @@ mcp__epigraph__resolve_backlog_item(original_id="bd4b8a22-43d4-4d08-a9be-3c286d3
 
 ---
 
+## Retirement batch — 2026-07-10 (supervising session, HTTP admin-token path)
+
+`resolve_backlog_item` and bulk `update_labels` are MCP-only and cannot act on claims owned by
+another agent (no AuthContext over the stdio transport — see `PENDING_RETIREMENTS.md` in scratchpad
+for the full investigation trail). Jeremy authorized a one-time batch clearing the queue via the
+documented HTTP `PATCH /api/v1/claims/:id/labels` admin-token path (see memory
+`reference_backlog_retire_http_path`): a fresh `submit_claim` resolution claim was filed for each
+item (replicating `resolve_backlog_item`'s claim-creation half, which is not classifier-blocked),
+then `add:["resolved"]` was PATCHed onto the original via a freshly-minted, single-use, shredded-
+after-use `claims:admin` token (replicating its label-patch half). The following, all with
+already-merged-on-origin/main or premise-verified-false resolutions (no open-PR items touched —
+those correctly stay queued until Jeremy merges), were retired this way:
+
+- Part 1: `ca4bfb62`, `7c6ce1b3`, `1cbbed91`, `19d475c0`, `7b934e58`, `7e7932bf`, `1adfeca5`
+  (residual re-filed as `d2c71a07`), `ae2784a9` (re-scoped as `73aa3339`, Part 4 Task 4.1),
+  `23472d04`
+- Task 5.1 (epiclaw-host): `d4bcdee5`, `e4666130`, `5956cfbf`
+- Task 3.2: `4b098d73` (residual re-filed as `a5c79ce1`)
+- Task 6.2: `25188750`
+- Task 3.5: `45a33c5b`
+
+Also gated (`update_labels add=["gated"]`, not classifier-blocked, no admin token needed): `1f769a75`
+(C2PA/W3C-PROV interop bridge), `36df9443` (SciFact calibration bp_artifact). `9324bd46` (Playwright
+MCP sandbox) was deliberately left untouched — it already carries `backlog:working`, and neither repo
+shows an in-progress branch/PR for it, so its state is ambiguous; needs a human look, not a guess.
+
+Still queued, NOT resolved this batch: the 5 convention-only items (`ef0cbdc5`, `cf7b160a`,
+`aaa21d3c`, `61b9a17f`, `57f89342`, Part 9 Step 2) — their resolution text asserts a CLAUDE.md/
+session-prompt convention note was added, which was never actually written (the target file's
+location on prod was never confirmed), so resolving them now would put a false claim in the graph.
+Needs the doc edit done first, then resolution.
+
+---
+
 ## Part 9: Deferred / Trigger-Gated Register (graph-op, no code)
 
 These 16 items are real proposals that are explicitly not-yet-actionable — trigger conditions are
