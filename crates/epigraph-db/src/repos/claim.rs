@@ -2893,6 +2893,131 @@ impl ClaimRepository {
     }
 }
 
+// ── Graph-expanded recall (Task 6.1 / claim 29e789fd) ──
+
+/// Epistemic relationship types followed by [`ClaimRepository::graph_expand_seeds`].
+///
+/// Matches the traversal set named in claim 29e789fd's design sketch
+/// (supports/corroborates/elaborates) — the "argument-chain" subset of
+/// `link_epistemic`'s full `EPISTEMIC_RELATIONSHIPS` allowlist. `contradicts`/
+/// `refutes`/`generalizes`/`specializes` are intentionally excluded: expansion
+/// is meant to pull in claims that reinforce a seed's argument, not claims
+/// that merely relate to it in some other epistemic sense.
+pub const EXPANSION_RELATIONSHIPS: &[&str] = &["supports", "corroborates", "elaborates"];
+
+/// One claim reached by [`ClaimRepository::graph_expand_seeds`], with the hop
+/// count at which it was first discovered (BFS order, so this is the shortest
+/// path length from any seed).
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+pub struct GraphExpansionHit {
+    pub claim_id: Uuid,
+    pub hops: i32,
+}
+
+impl ClaimRepository {
+    /// Bounded multi-hop BFS from a set of seed claims, following outgoing
+    /// edges whose relationship is in [`EXPANSION_RELATIONSHIPS`].
+    ///
+    /// Mirrors what the `traverse` MCP tool does internally (BFS over
+    /// `EdgeRepository::get_by_source`, filtering relationship in Rust) rather
+    /// than round-tripping through the MCP tool layer — `traverse` only
+    /// supports a single relationship string and returns a serialized
+    /// `CallToolResult`, neither of which fit a per-seed multi-relationship
+    /// expansion called from inside `recall_with_context`.
+    ///
+    /// Seed IDs themselves are never included in the result (callers already
+    /// have them as ANN hits); a claim reachable from more than one seed, or
+    /// at more than one hop count, is returned once at its shortest hop
+    /// count. `max_depth` is clamped to `[1, 4]` to match `traverse`'s bound
+    /// and keep the fan-out bounded on dense graphs.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any underlying edge query fails.
+    #[instrument(skip(pool, seed_ids))]
+    pub async fn graph_expand_seeds(
+        pool: &PgPool,
+        seed_ids: &[Uuid],
+        max_depth: u32,
+    ) -> Result<Vec<GraphExpansionHit>, DbError> {
+        let max_depth = max_depth.clamp(1, 4) as i32;
+        let seeds: std::collections::HashSet<Uuid> = seed_ids.iter().copied().collect();
+
+        let mut visited: std::collections::HashSet<Uuid> = seeds.clone();
+        let mut discovered_at: std::collections::HashMap<Uuid, i32> =
+            std::collections::HashMap::new();
+        let mut frontier: Vec<Uuid> = seed_ids.to_vec();
+        let mut depth = 0;
+
+        while depth < max_depth && !frontier.is_empty() {
+            depth += 1;
+            let mut next_frontier = Vec::new();
+            for &node in &frontier {
+                let outgoing =
+                    crate::repos::edge::EdgeRepository::get_by_source(pool, node, "claim").await?;
+                for e in outgoing {
+                    if !EXPANSION_RELATIONSHIPS.contains(&e.relationship.as_str()) {
+                        continue;
+                    }
+                    if visited.insert(e.target_id) {
+                        discovered_at.insert(e.target_id, depth);
+                        next_frontier.push(e.target_id);
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        Ok(discovered_at
+            .into_iter()
+            .map(|(claim_id, hops)| GraphExpansionHit { claim_id, hops })
+            .collect())
+    }
+
+    /// In-degree of epistemic-relationship edges (the full `link_epistemic`
+    /// allowlist: supports/corroborates/elaborates/generalizes/specializes/
+    /// contradicts/refutes) targeting each of `claim_ids`, batched in one
+    /// round-trip. Claims with no such incoming edges are simply absent from
+    /// the returned map (degree 0) rather than present with a zero — callers
+    /// should treat a missing key as 0.
+    ///
+    /// One `GROUP BY` query for the whole batch, not one query per claim: the
+    /// N+1 shape would be the naive approach given `recall_with_context`
+    /// calls this once per page over its (already small, ≤200) candidate
+    /// pool, not once per claim.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(pool, claim_ids))]
+    pub async fn in_epistemic_degree_batch(
+        pool: &PgPool,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, i64>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let relationships: Vec<String> = crate::repos::edge::EPISTEMIC_RELATIONSHIPS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows = sqlx::query!(
+            r#"
+            SELECT target_id, COUNT(*) AS "degree!"
+            FROM edges
+            WHERE target_id = ANY($1)
+              AND source_type = 'claim' AND target_type = 'claim'
+              AND relationship = ANY($2)
+            GROUP BY target_id
+            "#,
+            claim_ids,
+            &relationships[..],
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| (r.target_id, r.degree)).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
