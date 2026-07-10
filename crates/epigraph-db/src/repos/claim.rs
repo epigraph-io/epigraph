@@ -546,7 +546,9 @@ impl ClaimRepository {
                 // Post-fix retirement state so callers see real DB values
                 // instead of `claim_from_row`'s defaults, mirroring `get_by_id`.
                 claim.is_current = row.get::<bool, _>("is_current");
-                claim.supersedes = row.get::<Option<Uuid>, _>("supersedes").map(ClaimId::from_uuid);
+                claim.supersedes = row
+                    .get::<Option<Uuid>, _>("supersedes")
+                    .map(ClaimId::from_uuid);
                 let labels: Vec<String> = row.get("labels");
                 Ok(Some((claim, labels)))
             }

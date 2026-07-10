@@ -113,5 +113,8 @@ async fn get_by_id_with_labels_matches_separate_calls() {
     let mut old_sorted = labels_via_old.clone();
     old_sorted.sort();
     assert_eq!(new_sorted, old_sorted);
-    assert_eq!(new_sorted, vec!["atomic".to_string(), "backlog".to_string()]);
+    assert_eq!(
+        new_sorted,
+        vec!["atomic".to_string(), "backlog".to_string()]
+    );
 }
