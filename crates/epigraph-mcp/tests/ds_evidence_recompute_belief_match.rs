@@ -10,6 +10,7 @@
 //! rule selection before combining. Same BBA rows, two different answers.
 
 use epigraph_crypto::AgentSigner;
+use epigraph_db::PerspectiveRepository;
 use epigraph_mcp::tools::ds_auto::ensure_binary_frame;
 use epigraph_mcp::types::{RecomputeBeliefsParams, SubmitDsEvidenceParams};
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
@@ -145,6 +146,17 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
 /// divergence (submit's fixed-method `combine_two` loop vs recompute's
 /// adaptive `combine_multiple` rule selection), which a single-BBA test
 /// cannot exercise since both paths no-op when there's only one row.
+///
+/// The two submissions must land as two DISTINCT `mass_functions` rows, not
+/// upsert into one: `mass_functions_unique_per_perspective` is
+/// `UNIQUE NULLS NOT DISTINCT (claim_id, frame_id, source_agent_id,
+/// perspective_id)` (migration 034), so two submits from the same
+/// server/agent with `perspective_id: None` would collide on conflict and
+/// silently collapse to a single row, making this test degrade to a
+/// same-shape duplicate of the single-BBA case above. Giving the second
+/// submission its own perspective_id sidesteps that and forces a real
+/// second row, so `get_for_claim_frame` — and therefore both combine paths —
+/// actually folds over 2 BBAs.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool: PgPool) {
     let server = make_server(pool.clone());
@@ -157,11 +169,33 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
     .await;
     let frame_id = ensure_binary_frame(&pool).await.expect("binary frame");
 
-    for masses in [
-        serde_json::json!({"0": 0.7, "~": 0.3}),
-        serde_json::json!({"1": 0.4, "~": 0.6}),
-    ] {
-        tools::ds::submit_ds_evidence(
+    let perspective = PerspectiveRepository::create(
+        &pool,
+        &format!("ds-recompute-match-2-persp-{}", Uuid::new_v4()),
+        None,
+        None,
+        Some("analytical"),
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("create perspective");
+
+    let submissions = [
+        (
+            serde_json::json!({"0": 0.7, "~": 0.3}),
+            None::<String>, // first submit: no perspective (agent-only row)
+        ),
+        (
+            serde_json::json!({"1": 0.4, "~": 0.6}),
+            Some(perspective.id.to_string()), // second submit: distinct row via perspective_id
+        ),
+    ];
+
+    let mut last_bba_count = 0i64;
+    for (masses, perspective_id) in submissions {
+        let out = tools::ds::submit_ds_evidence(
             &server,
             SubmitDsEvidenceParams {
                 claim_id: claim.to_string(),
@@ -171,12 +205,19 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
                 reliability: Some(0.9),
                 combination_method: None,
                 gamma: None,
-                perspective_id: None,
+                perspective_id,
             },
         )
         .await
         .expect("submit_ds_evidence");
+        last_bba_count = result_json(out)["bba_count"].as_i64().expect("bba_count");
     }
+    assert_eq!(
+        last_bba_count, 2,
+        "the two submit_ds_evidence calls must land as 2 distinct mass_functions rows \
+         (not upsert into 1) for this test to exercise combine_multiple's multi-BBA fold \
+         at all — got bba_count={last_bba_count}"
+    );
 
     let submit_pignistic = cached_pignistic(&pool, claim).await;
 
