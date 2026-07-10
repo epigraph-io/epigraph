@@ -661,22 +661,27 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files:** `crates/epigraph-engine/src/` (edge-factor wiring, `auto_wire_edge_if_epistemic`), `tests/link_epistemic_smoke.rs::factorless_source_writes_durable_edge_without_wiring` (this test currently **pins the inert state and must be flipped**).
 
-- [ ] **Step 1:** Read `auto_wire_edge_if_epistemic` and confirm it only fires on `was_created=true`.
-- [ ] **Step 2:** Implement option (a) from the claim's own analysis (lowest-risk): make
+- [x] **Step 1:** Read `auto_wire_edge_if_epistemic` and confirm it only fires on `was_created=true`.
+- [x] **Step 2:** Implement option (a) from the claim's own analysis (lowest-risk): make
 `link_epistemic`/`create_edge` re-wire when the edge already exists but has no edge-factor BBA yet
 (not gated on `was_created`) — i.e., check "does a BBA exist for this edge" rather than "was this
-edge just created."
-- [ ] **Step 3:** Flip the pinned regression test:
-
-```rust
-// was: asserts B's belief is unaffected after A later gains belief (pins inert state)
-// now: write A--supports-->B while A has no belief; give A a belief; re-invoke link_epistemic;
-// assert B's pignistic_prob rises.
-#[sqlx::test]
-async fn factorless_source_wakes_up_when_source_gains_belief(pool: PgPool) { /* ... */ }
-```
-
-- [ ] **Step 4:** Verify, commit, resolve.
+edge just created." Implemented via `MassFunctionRepository::exists_for_perspective` (new,
+`crates/epigraph-db/src/repos/mass_function.rs`) keyed on `perspective_id = edge_id`; the gate in
+`auto_wire_edge_if_epistemic` (`crates/epigraph-engine/src/edge_factor.rs`) now skips only when a
+BBA already exists, not on `!was_created`. Both call sites that previously short-circuited the
+whole wiring attempt on `if was_created` — `link_epistemic.rs` (MCP) and
+`trigger_edge_ds_recomputation` in `routes/edges.rs` (HTTP `create_edge`) — now call the engine
+unconditionally (threading the real `was_created` through) so a dedup-hit re-assertion can still
+wake up; provenance/event/factor-table side effects in the HTTP route stay gated on `was_created`
+as before (drainer-retry idempotency for those is unaffected).
+- [x] **Step 3:** Flip the pinned regression test — landed as
+`factorless_source_wakes_up_when_it_later_gains_belief` in
+`crates/epigraph-mcp/tests/link_epistemic_smoke.rs` (the pinning test
+`factorless_source_writes_durable_edge_without_wiring` stays as-is; it still correctly documents
+the first-write factorless no-op half of the lifecycle, cross-referenced in its own doc comment).
+- [ ] **Step 4:** Verify, commit, resolve. Verify/commit done in this PR; `resolve_backlog_item` is
+a live-graph write intentionally deferred to a human/operator action post-merge, not run from this
+branch.
 
 ```python
 mcp__epigraph__resolve_backlog_item(
