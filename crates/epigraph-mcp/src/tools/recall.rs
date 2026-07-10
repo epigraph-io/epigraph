@@ -330,12 +330,17 @@ const GRAPH_EXPANSION_DEGREE_WEIGHT: f64 = 0.1;
 ///    a serialized `CallToolResult`).
 /// 2. Dedup: a claim already in `seeds` is never added a second time as an
 ///    expansion hit, even if graph-reachable from another seed.
-/// 3. Assign each expanded claim a base "similarity" of the CLOSEST seed
-///    that reaches it, decayed by hop count (`seed_similarity * 0.7^hops`)
-///    — expanded claims have no ANN score of their own, and this keeps them
-///    rankable alongside direct hits while ranking closer/stronger-seeded
-///    expansions above farther/weaker-seeded ones. When a claim is reachable
-///    from multiple seeds, the seed yielding the HIGHEST decayed score wins.
+/// 3. Assign each expanded claim a base "similarity" derived from the
+///    HIGHEST-similarity seed in the whole seed set, decayed by the hop
+///    count at which BFS first reached the claim
+///    (`best_seed_similarity * 0.7^hops`) — expanded claims have no ANN
+///    score of their own, and this keeps them rankable alongside direct
+///    hits while ranking closer expansions above farther ones. This is a
+///    conservative approximation, not a true per-path "closest reaching
+///    seed" score: `graph_expand_seeds`' BFS reports hop count from the
+///    frontier as a whole, not which specific seed a given path originated
+///    from, so the single highest seed similarity is used as an upper bound
+///    for every expanded claim rather than tracking per-seed provenance.
 /// 4. Rerank the combined (seed ∪ expansion) set by
 ///    `similarity * (1 + 0.1 * in_epistemic_degree)`, where
 ///    `in_epistemic_degree` is the claim's in-degree over the full

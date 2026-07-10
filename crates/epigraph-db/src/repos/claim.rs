@@ -2915,6 +2915,17 @@ pub struct GraphExpansionHit {
 }
 
 impl ClaimRepository {
+    /// Hard cap on the number of distinct claims [`Self::graph_expand_seeds`]
+    /// will discover, mirroring the `traverse` MCP tool's `node_limit`
+    /// (`.clamp(1, 100)`, default 50). Depth-clamping alone does NOT bound
+    /// the work: supports/corroborates/elaborates fan-out over up to 4 hops
+    /// on a dense graph can reach thousands of claims, each costing one
+    /// sequential `EdgeRepository::get_by_source` round-trip inside a
+    /// synchronous `recall_with_context` call. The caller's final
+    /// `raw_hits.truncate(want)` bounds the OUTPUT size, not the work done
+    /// to produce it — this cap bounds the work itself.
+    const MAX_EXPANSION_NODES: usize = 200;
+
     /// Bounded multi-hop BFS from a set of seed claims, following outgoing
     /// edges whose relationship is in [`EXPANSION_RELATIONSHIPS`].
     ///
@@ -2928,8 +2939,12 @@ impl ClaimRepository {
     /// Seed IDs themselves are never included in the result (callers already
     /// have them as ANN hits); a claim reachable from more than one seed, or
     /// at more than one hop count, is returned once at its shortest hop
-    /// count. `max_depth` is clamped to `[1, 4]` to match `traverse`'s bound
-    /// and keep the fan-out bounded on dense graphs.
+    /// count. `max_depth` is clamped to `[1, 4]` to match `traverse`'s depth
+    /// bound; the number of DISTINCT claims discovered is separately capped
+    /// at [`Self::MAX_EXPANSION_NODES`] (mirroring `traverse`'s `node_limit`)
+    /// so a dense graph can't turn one `recall_with_context` call into an
+    /// unbounded sequential BFS. When the cap is hit mid-frontier the BFS
+    /// stops immediately — same tradeoff `traverse` makes.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any underlying edge query fails.
@@ -2948,7 +2963,7 @@ impl ClaimRepository {
         let mut frontier: Vec<Uuid> = seed_ids.to_vec();
         let mut depth = 0;
 
-        while depth < max_depth && !frontier.is_empty() {
+        'bfs: while depth < max_depth && !frontier.is_empty() {
             depth += 1;
             let mut next_frontier = Vec::new();
             for &node in &frontier {
@@ -2961,6 +2976,9 @@ impl ClaimRepository {
                     if visited.insert(e.target_id) {
                         discovered_at.insert(e.target_id, depth);
                         next_frontier.push(e.target_id);
+                        if discovered_at.len() >= Self::MAX_EXPANSION_NODES {
+                            break 'bfs;
+                        }
                     }
                 }
             }
