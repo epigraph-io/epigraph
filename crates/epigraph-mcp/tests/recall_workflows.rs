@@ -47,6 +47,32 @@ async fn seed_workflow_with_goal_embedding(pool: &PgPool, goal: &str, pgvec: &st
     id
 }
 
+/// Seed a claim with `embedding` set to the given pgvec literal, so it is a
+/// real hit on the claims dense leg of `search_hybrid_scoped`
+/// (`WHERE c.embedding IS NOT NULL AND c.is_current`). `seed_claim` in
+/// `common` does NOT set `embedding`, so a plain `seed_claim` never appears
+/// in a pgvec-driven dense search — using it here would make the
+/// `include_workflows` assertions vacuously true over an empty results
+/// array. Mirrors the seed pattern in `find_workflow_semantic_test.rs`.
+async fn seed_claim_with_embedding(pool: &PgPool, content: &str, pgvec: &str) -> Uuid {
+    let agent_id = seed_agent(pool).await;
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels, embedding) \
+         VALUES ($1, $2, $3, 0.8, $4, true, ARRAY[]::text[], $5::vector)",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(&hash)
+    .bind(agent_id)
+    .bind(pgvec)
+    .execute(pool)
+    .await
+    .expect("seed claim with embedding");
+    id
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_include_workflows_true_returns_matching_workflow(pool: PgPool) {
     // A workflow whose goal text does NOT appear in any claim content, so a
@@ -56,10 +82,13 @@ async fn recall_include_workflows_true_returns_matching_workflow(pool: PgPool) {
     let pgvec = unit_pgvec_1536();
     let workflow_id = seed_workflow_with_goal_embedding(&pool, goal, &pgvec).await;
 
-    // A couple of unrelated claims so the claims leg is non-empty (recall's
-    // normal path keeps working alongside the workflows leg).
-    seed_claim(&pool, "completely unrelated claim about lichens", 0.8).await;
-    seed_claim(&pool, "another unrelated claim about tectonic plates", 0.8).await;
+    // A claim seeded with the SAME embedding, so the claims dense leg is
+    // non-empty and the merge actually interleaves two populated ranked
+    // lists (not degenerately merging one populated list against an empty
+    // one). Without this, `hits` would be empty (plain `seed_claim` sets no
+    // `embedding`) and the test would pass even if the RRF-merge/interleave
+    // logic were broken.
+    let claim_id = seed_claim_with_embedding(&pool, "an unrelated matched claim", &pgvec).await;
 
     let server = build_test_server(pool);
     let params = RecallParams {
@@ -79,18 +108,26 @@ async fn recall_include_workflows_true_returns_matching_workflow(pool: PgPool) {
     let json = first_text(&out);
     let arr = json.as_array().expect("array");
 
-    let hit = arr
+    let claim_hit = arr
+        .iter()
+        .find(|r| r["claim_id"] == claim_id.to_string())
+        .unwrap_or_else(|| panic!("claim {claim_id} not found in recall results: {arr:?}"));
+    assert!(
+        claim_hit.get("result_type").is_none(),
+        "claim hit must NOT carry result_type (omitted, not null): {claim_hit:?}"
+    );
+
+    let workflow_hit = arr
         .iter()
         .find(|r| r["claim_id"] == workflow_id.to_string())
         .unwrap_or_else(|| panic!("workflow {workflow_id} not found in recall results: {arr:?}"));
-
     assert_eq!(
-        hit["result_type"],
+        workflow_hit["result_type"],
         serde_json::json!("workflow"),
         "workflow hit must be tagged result_type=\"workflow\""
     );
     assert_eq!(
-        hit["content"],
+        workflow_hit["content"],
         serde_json::json!(goal),
         "workflow hit content must be the workflow's goal text"
     );
@@ -102,7 +139,10 @@ async fn recall_include_workflows_false_excludes_workflow_only_match(pool: PgPoo
     let pgvec = unit_pgvec_1536();
     let workflow_id = seed_workflow_with_goal_embedding(&pool, goal, &pgvec).await;
 
-    seed_claim(&pool, "completely unrelated claim about lichens", 0.8).await;
+    // Same embedded-claim seed as the true-case test: proves the claims leg
+    // is genuinely populated (non-vacuous exclusion check) rather than the
+    // whole results array being empty regardless of `include_workflows`.
+    let claim_id = seed_claim_with_embedding(&pool, "an unrelated matched claim", &pgvec).await;
 
     let server = build_test_server(pool);
     let params = RecallParams {
@@ -124,6 +164,15 @@ async fn recall_include_workflows_false_excludes_workflow_only_match(pool: PgPoo
     let json = first_text(&out);
     let arr = json.as_array().expect("array");
 
+    assert!(
+        !arr.is_empty(),
+        "sanity: the claims leg must still return the seeded embedded claim \
+         (proves this isn't a vacuous empty-array pass): {arr:?}"
+    );
+    assert!(
+        arr.iter().any(|r| r["claim_id"] == claim_id.to_string()),
+        "matching claim must still be present when include_workflows is false: {arr:?}"
+    );
     assert!(
         arr.iter().all(|r| r["claim_id"] != workflow_id.to_string()),
         "workflow must NOT appear when include_workflows is false: {arr:?}"
