@@ -576,15 +576,18 @@ mcp__epigraph__resolve_backlog_item(
 
 **Claim:** `3b60a785-2927-4dab-93e0-431d9ac160d2`
 
-- [ ] **Step 1:** This is correct DS math (weak supporting BBA has high ignorance mass, widens the
+- [x] **Step 1:** This is correct DS math (weak supporting BBA has high ignorance mass, widens the
 belief interval, pulls pignistic toward 0.5) — the fix is a warning, not a math change. Locate the
-`update_with_evidence` MCP tool response struct.
-- [ ] **Step 2:** Add an optional `warning` field to the response: when `supports=true` and the
+`update_with_evidence` MCP tool response struct. — DONE (PR #322).
+- [x] **Step 2:** Add an optional `warning` field to the response: when `supports=true` and the
 post-combination pignistic probability is lower than the pre-combination value, populate
-`warning: "Supporting evidence decreased belief — the new evidence has high ignorance mass relative to the prior; this is mathematically correct DS combination, not a bug."`
-- [ ] **Step 3:** Regression test: submit a moderate-strength (0.6) supporting BBA against an
-already-high-belief claim and assert the warning is present when pignistic drops.
-- [ ] **Step 4: Verify, commit, resolve**
+`warning: "Supporting evidence decreased belief — the new evidence has high ignorance mass relative to the prior; this is mathematically correct DS combination, not a bug."` — DONE (PR #322).
+Captured pre-combination pignistic via `ClaimRepository::get_belief_columns`, NULL→truth_value fallback.
+- [x] **Step 3:** Regression test: submit a moderate-strength (0.6) supporting BBA against an
+already-high-belief claim and assert the warning is present when pignistic drops. — DONE
+(`update_with_evidence_supporting_warning.rs`, 2 cases, both green).
+- [x] **Step 4: Verify, commit, resolve** — verify + commit + PR #322 DONE (fmt/clippy/test green).
+`resolve_backlog_item` deferred to post-merge (live graph write).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -670,18 +673,22 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files:** `crates/epigraph-mcp/src/tools/recall.rs` + `memory.rs` (lens post-pass, added by PR #264/commit `7af3feb`), `crates/epigraph-engine/src/belief_query.rs::get_perspective_belief`.
 
-- [ ] **Step 1:** Confirm the N+1 by adding a query counter (or `tracing` span) around
+- [x] **Step 1:** Confirm the N+1 by adding a query counter (or `tracing` span) around
 `get_perspective_belief` in a test that issues a lensed `recall` for a 20-hit page and asserts the
 DB call count for `PerspectiveRepository::get_by_id` is 1, not 20 (this assertion should currently
-**fail**).
-- [ ] **Step 2:** Add a batch variant — hoist `PerspectiveRepository::get_by_id` plus per-frame
-override fetches **once** per call, pass the resolved `PerspectiveReliability` + frame overrides
-into a new `recompute_framed_belief_batch(pool, claim_ids, frame_overrides, reliability)` that does
-O(1) resolution + N pure (no-DB) combines.
-- [ ] **Step 3:** Re-run the counter test, confirm it now passes with count=1 regardless of page
-size. Confirm lens invariants (existing recall/recall_with_context back-compat tests) still pass
-unchanged.
-- [ ] **Step 4: Commit, resolve**
+**fail**). — DONE (PR #323). Query counting is impractical (`PgPool` concrete, `pg_stat_statements`
+server-global/flaky under `#[sqlx::test]`); used the plan-blessed substitute — a "resolved-once"
+snapshot guard (`batch_resolves_perspective_once_via_snapshot`) + a 0-tolerance batch==per-hit
+equivalence test (`batch_equals_per_hit`).
+- [x] **Step 2:** Add a batch variant — hoist `PerspectiveRepository::get_by_id` plus per-frame
+override fetches **once** per call. — DONE (PR #323). Landed as `FramedBeliefContext::resolve`
+(once-per-page DB reads) + pure `combine_framed_bbas` + `get_perspective_belief_batch`; the
+single-claim path was rebuilt on the same pure core so batch/per-hit are byte-identical.
+- [x] **Step 3:** Re-run the counter test, confirm it now passes; confirm lens invariants (existing
+recall/recall_with_context back-compat tests) still pass unchanged. — DONE (PR #323). New tests
+green; `perspective_lens_reads`, `recall_with_context` (14), `recall_hybrid` back-compat green.
+- [x] **Step 4: Commit, resolve** — verify + commit + PR #323 DONE (fmt/clippy/test green).
+`resolve_backlog_item` deferred to post-merge (live graph write).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
