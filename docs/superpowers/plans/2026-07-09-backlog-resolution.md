@@ -825,14 +825,17 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files (epiclaw-host):** `dispatch_lens_containers`, `GroupQueue::mark_active`, `AgentReviewPanel::collect_dead_findings`.
 
-- [ ] **Step 1:** Locate `dispatch_lens_containers` and confirm it loops the 4 lenses sequentially
-without retrying a lens whose `mark_active` returned `None` (cap saturated).
-- [ ] **Step 2:** Add a retry queue: a deferred lens is re-attempted on the next dispatch cycle
-rather than silently dropped, so it eventually writes its `.lens_ran` marker.
-- [ ] **Step 3:** Regression test: saturate `foreman_max` (default 2) with 2 lenses, confirm the 3rd
-and 4th lenses still complete (retried) rather than leaving the work item `Pending` until the 1h
-staleness detector fires.
-- [ ] **Step 4: Verify, commit; can combine with Task 5.5 (same subsystem) in one PR. Resolve.**
+- [x] **Step 1:** DONE — confirmed the sequential loop with no retry.
+- [x] **Step 2:** DONE (epiclaw-host PR #93, merged) — `reconcile_one_reviewing`'s `Pending` arm now
+calls `dispatch_panel_retry` every tick (penalty-free, no `review_attempt` increment); new
+`dispatch_lens_if_absent` wrapper skips any lens with existing output so the retry can't livelock by
+letting finished lenses re-steal capped lenses' queue slots. Also fixed a slot-claim-ordering bug
+(`mark_active` now claimed BEFORE `prepare_worktree`, not after) that the retry-on-every-tick
+behavior would otherwise have exposed as a live-worktree-corruption risk.
+- [x] **Step 3:** DONE — `reviewing_pending_retries_panel_dispatch_every_tick_at_no_penalty` asserts
+retry fires and `review_attempt` stays 0.
+- [x] **Step 4: Verify, commit** DONE, combined with Task 5.5 in PR #93 (merged). **Resolve NOT YET
+fired** — `resolve_backlog_item` transport blocked this session; queued in `PENDING_RETIREMENTS.md`.
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -846,12 +849,15 @@ mcp__epigraph__resolve_backlog_item(
 
 **Claim:** `52d471a1-e4df-46ce-93c6-5c41e2639d64`
 
-- [ ] **Step 1:** In `dispatch_lens_containers`, change the sequential `await` loop over the 4 lenses
-(code_review/security/perf/arch) to a concurrent join/spawn, bounded by `GroupQueue`.
-- [ ] **Step 2:** Confirm `collect` still waits for all 4 before returning (it already does per the
-claim's correctness note — this is a pure perf change).
-- [ ] **Step 3:** Verify against the live dogfood timing — target ~4 min panel instead of ~15 min.
-- [ ] **Step 4: Commit (bundle with 5.4), resolve**
+- [x] **Step 1:** DONE (PR #93) — `dispatch_lens_containers` now `tokio::join!`s all 4 lenses via
+`dispatch_lens_if_absent`, still bounded by the same `GroupQueue::mark_active` cap (concurrent
+*attempt*, not unbounded concurrent execution).
+- [x] **Step 2:** DONE — `collect_dead_findings`'s "wait for all 4" tests pass unchanged; dispatch
+order/timing doesn't affect its on-disk marker read.
+- [ ] **Step 3:** NOT YET independently verified against live dogfood timing (only unit-tested) —
+worth spot-checking on the next real review panel run, but not blocking.
+- [x] **Step 4: Commit** DONE, bundled with 5.4 in PR #93 (merged). **Resolve NOT YET fired** — same
+transport blocker; queued.
 
 ```python
 mcp__epigraph__resolve_backlog_item(
