@@ -116,7 +116,10 @@ mcp__epigraph__resolve_backlog_item(
 )
 ```
 
-- [ ] **Step 3: Note the 218,629-claim decomposition pipeline is partially built, not absent**
+- [x] **Step 3: Note the 218,629-claim decomposition pipeline is partially built, not absent** —
+DONE. Added label `pipeline-exists-not-draining` to `68d03c24` via `update_labels` (claim NOT
+resolved, per instruction). `update_labels` is not classifier-blocked; only `resolve_backlog_item`
+is (see PENDING_RETIREMENTS ledger).
 
 Do NOT resolve `68d03c24-841d-458b-822a-66a6ed7aea25` — the underlying 218k-claim backlog is still
 undrained — but correct its premise before Part 4 work begins: commits `9f3e7b6` (decompose
@@ -422,11 +425,9 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files:** `crates/epigraph-engine/src/belief_query.rs`, `crates/epigraph-mcp/src/tools/{ds,recompute}.rs` — locate the code paths for both tools.
 
-- [ ] **Step 1: Reproduce exactly as the claim describes** — write an integration test that calls
-`submit_ds_evidence` (frame `claim_validity`, hypothesis `0`, perspective
-`testimonial-traditional`, reliability `0.8`), captures its returned `combined_belief`/`pignistic`,
-then calls `recompute_beliefs([claim_id])`, then `get_belief(claim_id, frame_id)`. Assert the
-values match.
+- [x] **Step 1: Reproduce exactly as the claim describes** — DONE (PR #317). Regression test
+`crates/epigraph-mcp/tests/ds_evidence_recompute_belief_match.rs` calls `submit_ds_evidence`, then
+`recompute_beliefs`, then reads belief and asserts the two match (with distinct BBA rows forced).
 
 ```rust
 #[sqlx::test]
@@ -441,18 +442,18 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
 }
 ```
 
-- [ ] **Step 2: Run, confirm it fails**, capturing the actual delta.
+- [x] **Step 2: Run, confirm it fails** — DONE (PR #317), RED confirmed before the fix.
 
-- [ ] **Step 3: Diagnose** — the two tools likely combine a different BBA set (e.g.
-`submit_ds_evidence` returns the result of combining against only the BBAs it just wrote in that
-call, while `recompute_beliefs` re-derives from **all** stored BBAs including ones with different
-discounting applied) or apply discounting in a different order. Read both code paths side by side
-before picking a fix — do not guess.
+- [x] **Step 3: Diagnose** — DONE (PR #317). Confirmed the two paths diverged in `ds.rs`.
 
-- [ ] **Step 4: Fix** so both paths compute belief identically for the same BBA set (single shared
-combine function, called from both call sites).
+- [x] **Step 4: Fix** so both paths compute belief identically for the same BBA set — DONE (PR #317,
+commit cd6da43 `fix(engine): unify submit_ds_evidence and recompute_beliefs combine paths` +
+test-hardening cd6da43/71aabd2). `crates/epigraph-mcp/src/tools/ds.rs`.
 
-- [ ] **Step 5: Verify and commit; resolve**
+- [x] **Step 5: Verify and commit; resolve** — verify + commit + PR #317 DONE (CI `test` green; the
+`Security audit` CI failure is the unrelated RUSTSEC-2026-0204 crossbeam advisory that PR #321
+fixes). **Resolve NOT YET fired** — `resolve_backlog_item` classifier-blocked this session; queued
+in PENDING_RETIREMENTS.
 
 ```python
 mcp__epigraph__resolve_backlog_item(
