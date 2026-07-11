@@ -733,7 +733,8 @@ schedule the full backfill as a Part 10 graph-ops task once the extractor is pro
 - [ ] **Step 2:** Design the extractor call site — most likely a post-processing step in `ingest_document` and `memorize`, feature-flagged off by default until validated.
 - [ ] **Step 3:** Implement, test against a fixture corpus, verify `query_triples`/`search_triples`/`entity_neighborhood` return non-empty results for the fixture.
 - [ ] **Step 4:** Commit; leave the backlog claim open (it's new, not yet resolvable) until the backfill lands — track via Part 10.
-- [ ] **Step 5 (companion verify, claim short ID `764d762d`):** `embedding_neighborhood_density`
+- [x] **Step 5 (companion verify, claim short ID `764d762d`):** DONE 2026-07-11 — working as
+intended, no fix needed. `embedding_neighborhood_density`
 returns all-`unknown` `by_level`/`by_source_type` breakdowns even though its similarity/sparsity
 numbers look plausible — lower confidence than the ae2784a9 finding, flagged for verification only.
 Check whether `level`/`source_type` are correctly joined in the density-aggregation SQL (likely a
@@ -743,16 +744,10 @@ fixture returns non-`unknown` breakdowns. If the join is fine and few/no claims 
 inside a 0.30-radius ball for that query (the claim's own alternative interpretation), resolve as
 "working as intended" rather than a defect.
 
-```python
-mcp__epigraph__resolve_backlog_item(
-    original_id="<full UUID for 764d762d from get_claim/query_claims_by_label(['neighborhood-density']) lookup>",
-    resolution_content="Resolves 764d762d: <either> fixed the level/source_type join in the "
-                        "embedding_neighborhood_density aggregation SQL <or> confirmed the low "
-                        "n_claims/all-unknown result was a correct reflection of a sparse "
-                        "neighborhood at radius=0.30, not a defect — pick the branch that matched "
-                        "what Step 5's investigation found."
-)
-```
+Resolved 2026-07-11 (claim `764d762d-943a-45a0-826a-db524db19e2a`): the join is correct, not broken
+— reproduced the all-unknown result at radius=0.30 (n_claims=2, both non-hierarchical), then showed
+radius=0.50 on the same query returns 212 claims with correctly-populated `by_level`/`by_source_type`.
+No code change needed.
 
 ### Task 4.2 — Lensed recall N+1 DB re-resolution
 
@@ -855,6 +850,17 @@ the concrete root cause once found (don't guess in this plan).
 - [ ] **Step 4:** Once draining is confirmed live, do **not** resolve `68d03c24` yet — track
 progress via `query_undecomposed_claims` offset/limit bisection weekly until the count trends down,
 then resolve.
+
+**DIAGNOSIS DONE 2026-07-11 — root cause confirmed as throughput, needs Jeremy's sizing call before
+editing.** The `decomposition-cycle` schedule exists and is wired correctly; the mechanism itself is
+fine. The problem is rate: `cron = "0 0 23 * * 5"` (once/week) × `--limit 50` = ~50 claims/week
+against a ≥201,000-claim backlog (confirmed via `query_undecomposed_claims` at offset=200000 still
+returning a full page) — **~77 years to drain at current rate**. Options: (1) raise `--limit` from
+50 to 1000-2000 (the MCP tool's own query cap), (2) raise frequency from weekly to daily, (3) both.
+**Not applied unilaterally — this materially changes prod LLM cost/runtime** (each decompose call is
+a `claude -p` prepaid-OAuth LLM call; a large jump risks exceeding container/session timeout or
+burning the prepaid quota). Recommend stepping up incrementally (e.g. daily `--limit 200` first,
+watch a week, then raise) rather than one giant jump — this is Jeremy's call on `schedules.toml`.
 - [ ] **Step 5 (distinct bug, found during the 2026-07-11 bridge-queue triage, claim
 `a422da87-bb7b-4c1e-9e53-aa6473faae63`):** the `decompose_claims` CLI itself fails
 non-deterministically on its write path, independent of throughput/scheduling — this may be the
@@ -873,14 +879,18 @@ logic, and fix the race (e.g. mint the token once before spawning concurrent POS
 token refresh behind a mutex/once-cell). Regression test: run with `--limit 50` against a fixture
 with real undecomposed content repeatedly and confirm zero failures across N runs.
 
-```python
-mcp__epigraph__resolve_backlog_item(
-    original_id="a422da87-bb7b-4c1e-9e53-aa6473faae63",
-    resolution_content="Resolves a422da87: fixed the token-refresh/multi-batch-POST race in "
-                        "decompose_claims that caused non-deterministic RelativeUrlWithoutBase/401 "
-                        "failures on writes with >1 atom to persist."
-)
-```
+**CORRECTION 2026-07-11 — the race theory above was wrong; do not resolve via the fix it describes.**
+Investigation found NO concurrency and NO token-refresh logic anywhere in `decompose_claims.rs` —
+atoms are persisted in a plain sequential loop, one HTTP token read once at startup. The actual root
+cause investigated: `EPIGRAPH_TOKEN` was suspected always-empty (missing mint step) — but this too
+turned out stale: `origin/main` already ships `mint_service_token` (commits `b52616c7`, `47e87b10`,
+predating this session). **PR #337** (epigraph) adds real hardening on top — fail-fast on missing
+credentials instead of a silent empty-bearer 401, `EPIGRAPH_OAUTH_TOKEN_URL` support, env-var
+hardening, 8 new tests — but **does NOT resolve `a422da87`**: it doesn't explain the reported
+non-determinism (a deterministic empty-token bug would 401 every run, not sometimes) or confirm the
+`RelativeUrlWithoutBase` variant. Progress noted on the claim via `submit_claim` (not
+`resolve_backlog_item`); claim stays open pending production log/container access to actually
+diagnose the non-determinism.
 
 ### Task 4.6 — Backfill stale cached BetP on 67 multi-BBA claims
 
@@ -1583,10 +1593,23 @@ for claim_id in ["ef0cbdc5-ea41-417a-bcfd-77df8bbb1cd0", "cf7b160a-22fd-4ec5-8fd
     )
 ```
 
-- [ ] **Step 3: Flag `c5e56d0c` for re-triage, not gating** — a multi-tenant OAuth-scoping gap on
-`host_scheduled_tasks` is a real security exposure (any host instance can run any task, results land
-on the public graph), not a speculative feature. Route it into Part 2 (security) instead of Part 9
-(deferred) on the next backlog-review pass.
+- [x] **Step 3: Flag `c5e56d0c` for re-triage, not gating** — DONE, re-triaged 2026-07-11. **Finding:
+the specific vulnerability described no longer matches current architecture.** `host_scheduled_tasks`
+(the Postgres, shared, multi-tenant table the claim describes) was replaced by a per-host-instance
+local SQLite `scheduled_tasks` table (`src/host/scheduler_db.rs`), and the only traced task-creation
+path (`upsert_ipc_task`) threads `group_folder` in from the calling context's own on-disk IPC
+directory, not from caller-supplied input — a compromised container can't spoof another group's
+`group_folder` without filesystem access outside its own mount. This appears to be an organic
+side-effect of an unrelated architecture change (filed 2026-03-24, predates the SQLite migration),
+not a deliberate fix. **NOT independently verified:** whether any OTHER task-creation path accepts a
+caller-supplied `group_folder` over a less-trusted channel (only one path was traced), and whether
+container-level sandbox isolation genuinely prevents cross-group data access (a broader question than
+task *ownership*). **Needs Jeremy's sign-off, not resolved autonomously** — re-classifying a security
+claim as "not currently exploitable" is exactly the kind of call that deserves human review. Full
+write-up: `c5e56d0c-security-retriage.md` (scratchpad). Recommend either (a) closing as
+superseded-by-architecture-change once the residual uncertainty above is checked, or (b) re-scoping
+as a feature request (OAuth-scoped task authoring) if that's the real ask independent of the
+security framing.
 
 ### New item found during execution — `get_claim` intermittent stale/empty `labels`
 
@@ -1710,11 +1733,11 @@ count trends toward zero.
 
 ### Task 10.6 — Embedding backfill (runnable now)
 
-```python
-mcp__epigraph__backfill_embeddings(limit=3505)  # or the tool's batch-size default, repeated until drained
-mcp__epigraph__resolve_backlog_item(original_id="e36224d6-f880-4fb4-b953-d5710f81a69a", resolution_content="Resolves e36224d6: ran backfill_embeddings against the 3,505-claim gap; confirmed 0 claims missing vectors afterward via a system_stats check.")
-mcp__epigraph__resolve_backlog_item(original_id="b96c999d-f59b-4ae7-8663-5ef14b31e597", resolution_content="Embedding-gap portion resolved by the same backfill_embeddings run as e36224d6; the remaining 4 data-integrity findings in this claim (belief propagation lag, ignorance drift, open-world spread, radius>0.3 nodes) are tracked separately under Task 10.2.")
-```
+- [x] **DONE 2026-07-11** — `backfill_embeddings(dry_run=true)` returned `candidates=0` corpus-wide;
+the 3,505-claim gap was already fully drained by the time this task was picked up (no manual
+backfill needed). Claim `e36224d6-f880-4fb4-b953-d5710f81a69a` resolved. `b96c999d` NOT resolved —
+still needs its own pass per Task 10.2 (the embedding-gap portion is closed, but its other findings —
+belief propagation lag, ignorance drift, open-world spread, radius>0.3 nodes — are separate).
 
 ### Task 10.7 — NDI roadmap citation cross-match
 
@@ -1736,6 +1759,11 @@ this replaces circular provenance-as-evidence, so get it right the first time.
 ### Task 10.8 — Capability audit: rewrite stale-tool workflow lineages
 
 **Claim:** `33c2aabc-d7c8-4768-887d-66d79a1a7500`
+
+- [x] **DONE 2026-07-11, no write needed** — all 3 named lineage queries collapse to one lineage,
+already at generation 7 (created 2026-05-30, after this claim's 2026-05-27 stale-tool snapshot),
+whose step content already performs the requested cleanup. Resolved; no `improve_workflow_hierarchy`
+call fired since there's nothing stale left at the head.
 
 ```python
 for lineage in [
@@ -1831,17 +1859,17 @@ These four are related: three are point-in-time signals from the same underlying
 cross-source conflict mining / thin evidence), and the fourth (`a784836c`) is a feature request to
 turn "check occasionally" into "check on a cron."
 
-- [ ] **Step 1:** Re-run the two silence-alarm checks now (`4a1912c9`'s graph-topology frame,
-`36bfc07d`'s batch-silence detector) — both are 2+ months stale; confirm whether the underlying
-conditions (0 CONTRADICTS edges on a 41-claim/36-source frame; 130 claims with 0% contradiction
-rate) still hold on the current 443k-claim graph, or whether the corpus has grown past the
-threshold that triggered them.
+- [x] **Step 1 — re-run DONE 2026-07-11, mixed disposition:** `4a1912c9` was ALREADY RESOLVED via
+its own supersession chain (`4a1912c9` → `d925bbc9` → `25ff980c` → `c690b2ad` → `7cd2d428` →
+`085058b2`, current head already carries `resolved`) — no action needed, don't re-resolve a
+non-current claim. `36bfc07d` is STILL OPEN (no resolved label) — the research_validity frame's
+chronic near-zero contradiction rate is a persistent structural condition, not a one-off; best
+subsumed by Step 4's periodic hallucination screen (`a784836c`) rather than resolved standalone.
 - [ ] **Step 2:** If still true, run `find_cross_source_matches` scoped to the flagged frame/batch
 to actively mine for contradictions rather than waiting for one to surface passively.
-- [ ] **Step 3:** For `ef730740` (evidence ratio): re-measure against the current claim/evidence
-counts (`system_stats`); this ratio only matters as a trend — if it's improved since 2026-06-11,
-resolve as tracked-and-improving; if flat or worse, escalate as a genuine ingestion-pipeline gap
-(most claims are entering the graph without evidence attachment).
+- [x] **Step 3 — DONE 2026-07-11:** For `ef730740` (evidence ratio): re-measured — was 0.19:1
+(82,916/434,485) at filing, now 0.2087:1 (92,778/444,457), a ~9% relative improvement. Resolved as
+tracked-and-improving.
 - [ ] **Step 4:** Build `a784836c`'s periodic idempotent hallucination screen as a scheduled
 workflow combining the checks already used ad hoc: (1) evidence faithfulness spot-check
 (re-fetch source URLs, verify recoverability via embedding similarity), (2) inter-claim
