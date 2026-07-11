@@ -6,6 +6,26 @@ use sqlx::PgPool;
 use tracing::instrument;
 use uuid::Uuid;
 
+/// Canonical epistemic relationship types — claim-to-claim edges that carry
+/// evidentiary weight and participate in belief propagation / sheaf
+/// consistency. Mirrors `EPISTEMIC_RELATIONSHIPS` in
+/// `epigraph-mcp::tools::link_epistemic` (the edge-writer's allowlist);
+/// `supersedes` is intentionally excluded there and here — it has dedicated
+/// semantics in `supersede_claim`, not `link_epistemic`.
+///
+/// Kept here (the lower `epigraph-db` layer) so DB-layer batch queries like
+/// [`crate::repos::claim::ClaimRepository::in_epistemic_degree_batch`] don't
+/// need to depend upward on `epigraph-mcp` for the list.
+pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
+    "supports",
+    "corroborates",
+    "elaborates",
+    "generalizes",
+    "specializes",
+    "contradicts",
+    "refutes",
+];
+
 /// A row from the edges table
 #[derive(Debug, Clone)]
 pub struct EdgeRow {
