@@ -25,7 +25,12 @@
 //! empty bearer token (which would otherwise only surface as a 401 once the
 //! run reaches its first non-empty batch).
 //!
-//! Use `--provider mock` for a dry compile/smoke without credentials.
+//! Use `--dry-run` for a credential-free smoke test (enumerates and prints
+//! undecomposed claims, returns before auth resolution and before any LLM or
+//! API call). `--provider mock` still requires either EPIGRAPH_TOKEN or a
+//! client-credentials pair to pass auth resolution before it can reach the
+//! mock LLM provider — it is no longer credential-free on its own now that
+//! auth resolution fails fast.
 
 use clap::Parser;
 use epigraph_cli::decompose::{build_batch_prompt, parse_batch_response, persist_decomposition};
