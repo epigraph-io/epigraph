@@ -100,6 +100,11 @@ name = "calibrate_matcher"
 path = "src/bin/calibrate_matcher.rs"
 required-features = ["db"]
 
+[[bin]]
+name = "export_provenance"
+path = "src/bin/export_provenance.rs"
+required-features = ["db"]
+
 [[test]]
 name = "cross_source_sweep_smoke"
 path = "tests/cross_source_sweep_smoke.rs"
