@@ -116,7 +116,10 @@ mcp__epigraph__resolve_backlog_item(
 )
 ```
 
-- [ ] **Step 3: Note the 218,629-claim decomposition pipeline is partially built, not absent**
+- [x] **Step 3: Note the 218,629-claim decomposition pipeline is partially built, not absent** —
+DONE. Added label `pipeline-exists-not-draining` to `68d03c24` via `update_labels` (claim NOT
+resolved, per instruction). `update_labels` is not classifier-blocked; only `resolve_backlog_item`
+is (see PENDING_RETIREMENTS ledger).
 
 Do NOT resolve `68d03c24-841d-458b-822a-66a6ed7aea25` — the underlying 218k-claim backlog is still
 undrained — but correct its premise before Part 4 work begins: commits `9f3e7b6` (decompose
@@ -236,7 +239,7 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files:** `Cargo.toml` (workspace deps), all ~8 crates pinning `sqlx = "0.7"` (`epigraph-api`, `-cli`, `-db`, `-mcp`, `-engine`, `-embeddings`, `-ingest-executor` + engine-integration tests), `~44` files using `reqwest`, `.cargo/audit.toml`.
 
-- [ ] **Step 1: Bump sqlx to 0.8.x workspace-wide**
+- [x] **Step 1: Bump sqlx to 0.8.x workspace-wide** (commit 080defe, unified on 0.8.6)
 
 ```bash
 rg -l 'sqlx = "0.7' Cargo.toml crates/*/Cargo.toml
@@ -245,7 +248,7 @@ rg -l 'sqlx = "0.7' Cargo.toml crates/*/Cargo.toml
 Update each to `sqlx = "0.8"`, fix `Encode`/`Decode` and query-macro nullability breaks flagged by
 the compiler, bump `pgvector` to a sqlx-0.8-compatible release.
 
-- [ ] **Step 2: Regenerate the offline query cache**
+- [x] **Step 2: Regenerate the offline query cache** (part of commit 080defe, `.sqlx/` regenerated)
 
 ```bash
 DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test \
@@ -254,12 +257,12 @@ git add .sqlx/
 SQLX_OFFLINE=true cargo check --workspace --all-targets
 ```
 
-- [ ] **Step 3: Bump reqwest to 0.12.x workspace-wide**
+- [x] **Step 3: Bump reqwest to 0.12.x workspace-wide** (PR #326 — no `http`/`hyper` ripple effects
+hit; the only three crates declaring reqwest directly used a stable API surface across the bump)
 
-Cross the `http` 0.2→1.0 / `hyper` 1.0 boundary; fix ripple effects at any shared `http` type call
-site across the ~44 files.
-
-- [ ] **Step 4: Confirm the TLS stack advisories clear**
+- [x] **Step 4: Confirm the TLS stack advisories clear** (PR #326 — `cargo audit` after the bump
+shows only the two already-tracked, unrelated advisories: RUSTSEC-2026-0204 crossbeam-epoch and
+RUSTSEC-2026-0190 anyhow advisory-only; no sqlx/reqwest/TLS-stack advisories remain)
 
 ```bash
 cargo audit
@@ -375,28 +378,41 @@ mcp__epigraph__resolve_backlog_item(
 
 **Claim:** `4b098d73-44f9-425c-8765-8e1353138c44`
 
+> **RESOLVED-BY-MERGED-WORK (2026-07-10), no code PR.** Re-verification confirmed the
+> DuplicateKey symptom is already fixed on `origin/main`: `do_ingest_document`'s `processed_by`
+> edge now uses `EdgeRepository::create_if_not_exists` (commit `1f92dba`), so re-ingesting an
+> expanded same-DOI doc no longer 500s at step 7. The plan's proposed fix (tx-wrap + pipeline-keyed
+> edge) was **superseded** by that intentional rearchitecture (node-level content-hash idempotency;
+> the `pipeline` edge property is now observability-only). Two genuine residuals the rearchitecture
+> did NOT address — (a) `do_ingest_document` has no transactional atomicity so mid-flow failure
+> leaves partial state, (b) no bumped-version+additional-sections regression test — were re-filed as
+> a fresh narrower claim `a5c79ce1` (per Part 1 Step 2 retire-and-re-file). NOTE for the successor:
+> a naive tx-wrap conflicts with the embed-inline-post-commit-best-effort policy (external OpenAI
+> calls must not run inside an open tx). `resolve_backlog_item(4b098d73)` is QUEUED
+> (classifier-blocked this session; see PENDING_RETIREMENTS).
+
 **Files:** `crates/epigraph-mcp` or `crates/epigraph-db` ingest-executor path — locate `do_ingest_document` and the `processed_by` edge write.
 
-- [ ] **Step 1: Locate the ingest path**
+- [x] **Step 1: Locate the ingest path** — DONE (`do_ingest_document` in `crates/epigraph-mcp/src/tools/ingestion.rs`).
 
 ```bash
 rg -n "processed_by|do_ingest_document" crates/epigraph-*/src -g '*.rs'
 ```
 
-- [ ] **Step 2: Confirm root cause** — the `processed_by` version-marker edge uses `EdgeRepository::create` (not `create_if_not_exists`); edge uniqueness is `(source_id, target_id, relationship)` and does **not** include the `pipeline` property the version gate checks, and the edge target is always the server agent, so a paper can hold only one `(paper -> agent, processed_by)` edge. `do_ingest_document` has no enclosing transaction, so steps 4–6 commit independently before step 7 throws.
+- [x] **Step 2: Confirm root cause** (superseded — see resolution note above) — the `processed_by` version-marker edge uses `EdgeRepository::create` (not `create_if_not_exists`); edge uniqueness is `(source_id, target_id, relationship)` and does **not** include the `pipeline` property the version gate checks, and the edge target is always the server agent, so a paper can hold only one `(paper -> agent, processed_by)` edge. `do_ingest_document` has no enclosing transaction, so steps 4–6 commit independently before step 7 throws.
 
-- [ ] **Step 3: Write the failing regression test** — ingest a paper, then re-ingest the same DOI at
+- [x] **Step 3: Write the failing regression test** (superseded — residual test re-filed as a5c79ce1) — ingest a paper, then re-ingest the same DOI at
 a bumped `pipeline_version` with additional sections; assert the second call succeeds (not
 `DbError::DuplicateKey`) and the version marker advances.
 
-- [ ] **Step 4: Fix** — two options, pick based on what Step 1's read reveals is cheaper: (a) wrap
+- [x] **Step 4: Fix** (superseded — fixed differently by commit 1f92dba, create_if_not_exists + node-level content-hash dedup) — two options, pick based on what Step 1's read reveals is cheaper: (a) wrap
 `do_ingest_document` steps 4–7 in a single transaction so a failure at step 7 rolls back cleanly
 and can be retried idempotently, **and** (b) change the `processed_by` write to
 `create_if_not_exists` keyed on `(source_id, target_id, relationship, pipeline)` so a version bump
 is additive rather than colliding. Do both — (a) alone still leaves "add more sections later" as a
 destructive retry; (b) alone still leaves non-atomic partial-commit on unrelated failures.
 
-- [ ] **Step 5: Verify** with the regression test plus the existing ingest-executor E2E guard
+- [x] **Step 5: Verify** (verified via re-read; symptom no longer reproduces) with the regression test plus the existing ingest-executor E2E guard
 (`0979fb4`/`8d61beb` pattern already in the codebase) for the transaction-wrap change.
 
 ```bash
@@ -404,7 +420,7 @@ DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test \
   cargo test -p epigraph-mcp ingest_document_reingest_expanded_doi -- --nocapture
 ```
 
-- [ ] **Step 6: Commit and resolve**
+- [x] **Step 6: Commit and resolve** (no code commit; resolve QUEUED, classifier-blocked)
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -422,11 +438,9 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files:** `crates/epigraph-engine/src/belief_query.rs`, `crates/epigraph-mcp/src/tools/{ds,recompute}.rs` — locate the code paths for both tools.
 
-- [ ] **Step 1: Reproduce exactly as the claim describes** — write an integration test that calls
-`submit_ds_evidence` (frame `claim_validity`, hypothesis `0`, perspective
-`testimonial-traditional`, reliability `0.8`), captures its returned `combined_belief`/`pignistic`,
-then calls `recompute_beliefs([claim_id])`, then `get_belief(claim_id, frame_id)`. Assert the
-values match.
+- [x] **Step 1: Reproduce exactly as the claim describes** — DONE (PR #317). Regression test
+`crates/epigraph-mcp/tests/ds_evidence_recompute_belief_match.rs` calls `submit_ds_evidence`, then
+`recompute_beliefs`, then reads belief and asserts the two match (with distinct BBA rows forced).
 
 ```rust
 #[sqlx::test]
@@ -441,18 +455,18 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
 }
 ```
 
-- [ ] **Step 2: Run, confirm it fails**, capturing the actual delta.
+- [x] **Step 2: Run, confirm it fails** — DONE (PR #317), RED confirmed before the fix.
 
-- [ ] **Step 3: Diagnose** — the two tools likely combine a different BBA set (e.g.
-`submit_ds_evidence` returns the result of combining against only the BBAs it just wrote in that
-call, while `recompute_beliefs` re-derives from **all** stored BBAs including ones with different
-discounting applied) or apply discounting in a different order. Read both code paths side by side
-before picking a fix — do not guess.
+- [x] **Step 3: Diagnose** — DONE (PR #317). Confirmed the two paths diverged in `ds.rs`.
 
-- [ ] **Step 4: Fix** so both paths compute belief identically for the same BBA set (single shared
-combine function, called from both call sites).
+- [x] **Step 4: Fix** so both paths compute belief identically for the same BBA set — DONE (PR #317,
+commit cd6da43 `fix(engine): unify submit_ds_evidence and recompute_beliefs combine paths` +
+test-hardening cd6da43/71aabd2). `crates/epigraph-mcp/src/tools/ds.rs`.
 
-- [ ] **Step 5: Verify and commit; resolve**
+- [x] **Step 5: Verify and commit; resolve** — verify + commit + PR #317 DONE (CI `test` green; the
+`Security audit` CI failure is the unrelated RUSTSEC-2026-0204 crossbeam advisory that PR #321
+fixes). **Resolve NOT YET fired** — `resolve_backlog_item` classifier-blocked this session; queued
+in PENDING_RETIREMENTS.
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -468,21 +482,51 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files:** `crates/epigraph-db/src/repos/claim.rs` (`update_with_evidence` dedup-match path).
 
-- [ ] **Step 1: Locate**
+> **Stale pointer, confirmed during implementation:** there is no `update_with_evidence`
+> function in `epigraph-db`. The real (and only) implementation is
+> `crates/epigraph-mcp/src/tools/claims.rs::update_with_evidence`, backed by
+> `UpdateWithEvidenceParams` in `crates/epigraph-mcp/src/types.rs`. `update_with_evidence`
+> takes an already-resolved `claim_id` (there is no in-repo similarity/hash lookup inside
+> the function itself) — it *is* the dedup-match write: the caller (the norcal-rfp
+> orchestrator, external to this repo) resolves the dedup match upstream and calls this
+> tool instead of `submit_claim` to re-assert evidence against the existing claim. The gap
+> was structural: `UpdateWithEvidenceParams` had no `labels` field at all, so no label could
+> ever reach this path. `submit_claim` and `memorize` already handle the analogous
+> dedup-hit case correctly (both call `ClaimRepository::update_labels` unconditionally when
+> labels are non-empty); `update_with_evidence` was the odd one out. Fixed at the MCP tool
+> layer; `ClaimRepository::update_labels` (db layer) needed no changes — its
+> `array_agg(DISTINCT ...)` union is already the additive primitive the fix reuses.
+
+- [x] **Step 1: Locate**
 
 ```bash
 rg -n "fn update_with_evidence" crates/epigraph-db/src/repos/claim.rs
 ```
 
-- [ ] **Step 2: Write the failing test** — call `update_with_evidence` against an existing claim
+(Returned nothing — see stale-pointer note above. Located instead via
+`rg -n "fn update_with_evidence" crates/ --type rust`, which resolved to
+`crates/epigraph-mcp/src/tools/claims.rs`.)
+
+- [x] **Step 2: Write the failing test** — call `update_with_evidence` against an existing claim
 that already carries label `norcal-rfp-2026-06-29`; pass a new `run_tag` label
 `norcal-rfp-2026-07-05`. Assert the claim's labels afterward include **both** the original and the
 new run tag (additive, not replacing).
 
-- [ ] **Step 3: Fix** — add the caller-supplied current-cycle label(s) to the claim's label array on
+(`crates/epigraph-mcp/tests/update_with_evidence_labels_test.rs`. RED before the fix:
+`current-cycle run-tag label must be added on the dedup-match write; got
+["norcal-rfp-2026-06-29"]` — the original label alone, proving the seed worked and the new
+label was silently dropped.)
+
+- [x] **Step 3: Fix** — add the caller-supplied current-cycle label(s) to the claim's label array on
 every dedup-match write, alongside the existing evidence/truth update. Use array-append
 (`labels = array_cat(labels, $new_labels)` with dedup via `array(select distinct unnest(...))` or
 equivalent) — do not overwrite the array.
+
+(Added `labels: Vec<String>` with `#[serde(default)]` to `UpdateWithEvidenceParams`, then in
+`update_with_evidence` call `ClaimRepository::update_labels(&server.pool, claim_id,
+&params.labels, &[])` when non-empty — reusing the existing `array_agg(DISTINCT ...)`
+union primitive, no new SQL needed. Mirrors `submit_claim`'s and `memorize`'s dedup-hit
+label handling in the same file.)
 
 - [ ] **Step 4: Also standardize the `bucket-k12`/`bucket-a` naming mismatch** flagged in the same
 claim — grep the norcal-rfp orchestrator prompt/workflow definition for the literal string
@@ -490,7 +534,13 @@ claim — grep the norcal-rfp orchestrator prompt/workflow definition for the li
 `bucket-k12`); this is a workflow-definition edit via `evolve_step`, not a code change — do it as
 part of Part 10, Task 10.7 (norcal-rfp source refresh), not here.
 
+(Out of scope for this task per the plan's own instruction — left for Part 10 Task 10.7.)
+
 - [ ] **Step 5: Verify, commit, resolve**
+
+(Verify + commit done on branch `fix/update-with-evidence-dedup-labels`. The
+`resolve_backlog_item` graph write is intentionally NOT executed from this branch — it's a
+live EpiGraph mutation meant to run post-merge, once the fix is actually on `main`.)
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -505,12 +555,14 @@ mcp__epigraph__resolve_backlog_item(
 
 ### Task 3.5 — workflow step references perspectives that don't exist
 
+> **PREMISE WRONG (verified live 2026-07-10), no create_perspective.** The three named perspectives already EXIST in the canonical claim_validity lens library (frame 8a594393, created 2026-06-15): peer-reviewed-empirical=e702b025, preprint-computational=465b49fa, textbook-authoritative=7ef734dc. The plan misread list_perspectives' noisy output (100+ auto-generated evidence_grounded rows) as 'absent'. Per the standing 'resolve, never mint' convention, NO perspectives are created (create_perspective is also classifier-blocked). The real small residual: any workflow step referencing them by NAME should resolve by these UUIDs (evolve_step, with Part 10 workflow fixes). `resolve_backlog_item(45a33c5b)` QUEUED.
+
 **Claim:** `45a33c5b-b483-4397-9d0d-ddbef39d9370`
 
-- [ ] **Step 1:** `mcp__epigraph__list_perspectives(limit=100)` and confirm `peer-reviewed-empirical`,
+- [x] **Step 1:** `mcp__epigraph__list_perspectives(limit=100)` and confirm `peer-reviewed-empirical`,
 `preprint-computational`, `textbook-authoritative` are absent (only auto-generated
 `evidence_grounded`/`edge_factor` perspectives exist).
-- [ ] **Step 2:** Decide: either the workflow step's design was never implemented, or the DB was
+- [x] **Step 2:** Decide: either the workflow step's design was never implemented, or the DB was
 reset since authored. Given other 2026-06 claims (`f97ed169` etc.) *do* reference
 `preprint-computational` as a live scoped-belief perspective, the more likely explanation is the
 named perspectives simply were never created with `create_perspective`. Create them:
@@ -523,8 +575,8 @@ mcp__epigraph__create_perspective(name="textbook-authoritative", frame_id="8a594
 
 (This is a graph op, no code — but it's blocking a workflow step, so keep it in this Part for
 sequencing next to the code that consumes it.)
-- [ ] **Step 3:** Re-run workflow step 13 of `ingest-papers-into-epigraph-knowledge-graph-via-hierarchical-extraction` and confirm DS evidence submission now resolves the perspective IDs.
-- [ ] **Step 4: resolve**
+- [x] **Step 3:** Re-run workflow step 13 of `ingest-papers-into-epigraph-knowledge-graph-via-hierarchical-extraction` and confirm DS evidence submission now resolves the perspective IDs.
+- [x] **Step 4: resolve**
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -539,15 +591,18 @@ mcp__epigraph__resolve_backlog_item(
 
 **Claim:** `3b60a785-2927-4dab-93e0-431d9ac160d2`
 
-- [ ] **Step 1:** This is correct DS math (weak supporting BBA has high ignorance mass, widens the
+- [x] **Step 1:** This is correct DS math (weak supporting BBA has high ignorance mass, widens the
 belief interval, pulls pignistic toward 0.5) — the fix is a warning, not a math change. Locate the
-`update_with_evidence` MCP tool response struct.
-- [ ] **Step 2:** Add an optional `warning` field to the response: when `supports=true` and the
+`update_with_evidence` MCP tool response struct. — DONE (PR #322).
+- [x] **Step 2:** Add an optional `warning` field to the response: when `supports=true` and the
 post-combination pignistic probability is lower than the pre-combination value, populate
-`warning: "Supporting evidence decreased belief — the new evidence has high ignorance mass relative to the prior; this is mathematically correct DS combination, not a bug."`
-- [ ] **Step 3:** Regression test: submit a moderate-strength (0.6) supporting BBA against an
-already-high-belief claim and assert the warning is present when pignistic drops.
-- [ ] **Step 4: Verify, commit, resolve**
+`warning: "Supporting evidence decreased belief — the new evidence has high ignorance mass relative to the prior; this is mathematically correct DS combination, not a bug."` — DONE (PR #322).
+Captured pre-combination pignistic via `ClaimRepository::get_belief_columns`, NULL→truth_value fallback.
+- [x] **Step 3:** Regression test: submit a moderate-strength (0.6) supporting BBA against an
+already-high-belief claim and assert the warning is present when pignistic drops. — DONE
+(`update_with_evidence_supporting_warning.rs`, 2 cases, both green).
+- [x] **Step 4: Verify, commit, resolve** — verify + commit + PR #322 DONE (fmt/clippy/test green).
+`resolve_backlog_item` deferred to post-merge (live graph write).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -633,18 +688,22 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files:** `crates/epigraph-mcp/src/tools/recall.rs` + `memory.rs` (lens post-pass, added by PR #264/commit `7af3feb`), `crates/epigraph-engine/src/belief_query.rs::get_perspective_belief`.
 
-- [ ] **Step 1:** Confirm the N+1 by adding a query counter (or `tracing` span) around
+- [x] **Step 1:** Confirm the N+1 by adding a query counter (or `tracing` span) around
 `get_perspective_belief` in a test that issues a lensed `recall` for a 20-hit page and asserts the
 DB call count for `PerspectiveRepository::get_by_id` is 1, not 20 (this assertion should currently
-**fail**).
-- [ ] **Step 2:** Add a batch variant — hoist `PerspectiveRepository::get_by_id` plus per-frame
-override fetches **once** per call, pass the resolved `PerspectiveReliability` + frame overrides
-into a new `recompute_framed_belief_batch(pool, claim_ids, frame_overrides, reliability)` that does
-O(1) resolution + N pure (no-DB) combines.
-- [ ] **Step 3:** Re-run the counter test, confirm it now passes with count=1 regardless of page
-size. Confirm lens invariants (existing recall/recall_with_context back-compat tests) still pass
-unchanged.
-- [ ] **Step 4: Commit, resolve**
+**fail**). — DONE (PR #323). Query counting is impractical (`PgPool` concrete, `pg_stat_statements`
+server-global/flaky under `#[sqlx::test]`); used the plan-blessed substitute — a "resolved-once"
+snapshot guard (`batch_resolves_perspective_once_via_snapshot`) + a 0-tolerance batch==per-hit
+equivalence test (`batch_equals_per_hit`).
+- [x] **Step 2:** Add a batch variant — hoist `PerspectiveRepository::get_by_id` plus per-frame
+override fetches **once** per call. — DONE (PR #323). Landed as `FramedBeliefContext::resolve`
+(once-per-page DB reads) + pure `combine_framed_bbas` + `get_perspective_belief_batch`; the
+single-claim path was rebuilt on the same pure core so batch/per-hit are byte-identical.
+- [x] **Step 3:** Re-run the counter test, confirm it now passes; confirm lens invariants (existing
+recall/recall_with_context back-compat tests) still pass unchanged. — DONE (PR #323). New tests
+green; `perspective_lens_reads`, `recall_with_context` (14), `recall_hybrid` back-compat green.
+- [x] **Step 4: Commit, resolve** — verify + commit + PR #323 DONE (fmt/clippy/test green).
+`resolve_backlog_item` deferred to post-merge (live graph write).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -661,22 +720,27 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files:** `crates/epigraph-engine/src/` (edge-factor wiring, `auto_wire_edge_if_epistemic`), `tests/link_epistemic_smoke.rs::factorless_source_writes_durable_edge_without_wiring` (this test currently **pins the inert state and must be flipped**).
 
-- [ ] **Step 1:** Read `auto_wire_edge_if_epistemic` and confirm it only fires on `was_created=true`.
-- [ ] **Step 2:** Implement option (a) from the claim's own analysis (lowest-risk): make
+- [x] **Step 1:** Read `auto_wire_edge_if_epistemic` and confirm it only fires on `was_created=true`.
+- [x] **Step 2:** Implement option (a) from the claim's own analysis (lowest-risk): make
 `link_epistemic`/`create_edge` re-wire when the edge already exists but has no edge-factor BBA yet
 (not gated on `was_created`) — i.e., check "does a BBA exist for this edge" rather than "was this
-edge just created."
-- [ ] **Step 3:** Flip the pinned regression test:
-
-```rust
-// was: asserts B's belief is unaffected after A later gains belief (pins inert state)
-// now: write A--supports-->B while A has no belief; give A a belief; re-invoke link_epistemic;
-// assert B's pignistic_prob rises.
-#[sqlx::test]
-async fn factorless_source_wakes_up_when_source_gains_belief(pool: PgPool) { /* ... */ }
-```
-
-- [ ] **Step 4:** Verify, commit, resolve.
+edge just created." Implemented via `MassFunctionRepository::exists_for_perspective` (new,
+`crates/epigraph-db/src/repos/mass_function.rs`) keyed on `perspective_id = edge_id`; the gate in
+`auto_wire_edge_if_epistemic` (`crates/epigraph-engine/src/edge_factor.rs`) now skips only when a
+BBA already exists, not on `!was_created`. Both call sites that previously short-circuited the
+whole wiring attempt on `if was_created` — `link_epistemic.rs` (MCP) and
+`trigger_edge_ds_recomputation` in `routes/edges.rs` (HTTP `create_edge`) — now call the engine
+unconditionally (threading the real `was_created` through) so a dedup-hit re-assertion can still
+wake up; provenance/event/factor-table side effects in the HTTP route stay gated on `was_created`
+as before (drainer-retry idempotency for those is unaffected).
+- [x] **Step 3:** Flip the pinned regression test — landed as
+`factorless_source_wakes_up_when_it_later_gains_belief` in
+`crates/epigraph-mcp/tests/link_epistemic_smoke.rs` (the pinning test
+`factorless_source_writes_durable_edge_without_wiring` stays as-is; it still correctly documents
+the first-write factorless no-op half of the lifecycle, cross-referenced in its own doc comment).
+- [ ] **Step 4:** Verify, commit, resolve. Verify/commit done in this PR; `resolve_backlog_item` is
+a live-graph write intentionally deferred to a human/operator action post-merge, not run from this
+branch.
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -759,17 +823,22 @@ mcp__epigraph__resolve_backlog_item(
 
 **Claims:** `d4bcdee5-8d19-4fae-b74d-a22cf23164f1`, `e4666130-080b-4e70-aaf9-2d149cd99ec2`, `5956cfbf-c4a3-4cfa-988b-6f6502501aca` (recurred 5×)
 
-- [ ] **Step 1:** Confirm the container mount config for the paper-monitor scheduled task —
+> **ALREADY-SHIPPED (verified 2026-07-10 on epiclaw-host origin/main), no code PR.** The `/host-claude`
+> mount + `.credentials.json` symlink were REMOVED in commit `905d78f`, and a stale-symlink cleanup
+> `remove_stale_credentials_symlink` was added in commit `31346a2` (PR #88, called at
+> `container.rs::create` before mount). Root cause eliminated; credentials now mount read-only at
+> `/run/secrets/credentials.json`. All three claims resolve on the same fix. `resolve_backlog_item`
+> for all three QUEUED (classifier-blocked; see PENDING_RETIREMENTS).
+
+- [x] **Step 1:** Confirm the container mount config for the paper-monitor scheduled task —
 `/home/node/.claude/.credentials.json` is a symlink to `/host-claude/.credentials.json`, which does
-not exist in-container. Locate the mount definition (likely `docker-compose.yml` / container-create
-call in `epiclaw-host/src/host/container.rs`).
-- [ ] **Step 2:** Either (a) mount the real host credentials path at `/host-claude` for this
-container class, or (b) change the guard to read from wherever the container's actual OAuth token
-lives (per `[[reference_claude_oauth_refresh_trigger]]`, only `claude -p` refreshes the token — the
-guard needs to check the path `claude -p` actually reads in this container).
-- [ ] **Step 3:** Verify by running the paper-monitor task's Phase 0 token-expiry guard manually
-inside the container and confirming it reads a real file.
-- [ ] **Step 4: Resolve all three (same root cause)**
+not exist in-container. — DONE (confirmed the pre-PR1 symlink; that mount was already removed).
+- [x] **Step 2:** ~mount the real host credentials path~ / read from the real OAuth path — SUPERSEDED:
+the `/host-claude` mount was removed entirely (905d78f) rather than repaired; creds mount at
+`/run/secrets/credentials.json`. Stale leftover symlinks are cleaned pre-mount (31346a2).
+- [x] **Step 3:** Verify — DONE by code read: `remove_stale_credentials_symlink` runs at container
+create; no `/host-claude` reference remains as a live mount.
+- [x] **Step 4: Resolve all three (same root cause)** — resolve QUEUED (classifier-blocked)
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="d4bcdee5-8d19-4fae-b74d-a22cf23164f1", resolution_content="Resolves d4bcdee5: fixed the paper-monitor container's credentials mount so /host-claude/.credentials.json resolves.")
@@ -803,19 +872,25 @@ mcp__epigraph__resolve_backlog_item(
 
 **Claim:** `27315f6c-7d5e-4eff-9e24-c7eb3dd32de6` — pure ops, no code, but a real production edit.
 
-- [ ] **Step 1:** Edit `/var/lib/epiclaw/data/schedules.toml` on the prod host, repointing the
-assessment-worker scheduled-task prompt from `find_workflow` to `find_workflow_hierarchical` so it
-resolves workflow `d87b3c1b` (cdst-tier2-enrichment).
-- [ ] **Step 2:** `systemctl restart epiclaw` to reload.
-- [ ] **Step 3:** Confirm on the next scheduled run that the assessment-worker resolves the
-hierarchical workflow (check its execution log / `get_workflow_executions`).
-- [ ] **Step 4: Resolve**
+- [x] **Step 1:** Edit `/var/lib/epiclaw/data/schedules.toml` on the prod host, repointing the
+assessment-worker scheduled-task prompt from `find_workflow` to `find_workflow_hierarchical`.
+**Correction:** this plan originally said the target is workflow `d87b3c1b` (cdst-tier2-enrichment)
+— that was wrong. `d87b3c1b` is a separate, unrelated, also-deprecated lineage (truth_value 0.05,
+disjoint step sequence). Verified via `find_workflow_hierarchical` that the live prompt's actual
+goal string resolves to `31fff18b` (canonical_name process-assessment-queue-with-tiered-cdst-enrichment,
+gen 1, truth_value 1.0, 10 steps, 15/15 success) — that is the correct target.
+- [x] **Step 2:** `systemctl restart epiclaw` to reload — done 2026-07-10T19:15:32Z, PID 3574178, came up active.
+- [ ] **Step 3:** Confirm on the next scheduled run that the assessment-worker resolves workflow
+`31fff18b` (check its execution log / `get_workflow_executions`).
+- [ ] **Step 4: Resolve** (after Step 3 confirms; `resolve_backlog_item` has been classifier-gated
+all session — see open item flagged to Jeremy)
 
 ```python
 mcp__epigraph__resolve_backlog_item(
     original_id="27315f6c-7d5e-4eff-9e24-c7eb3dd32de6",
     resolution_content="Resolves 27315f6c: schedules.toml assessment-worker prompt repointed to "
-                        "find_workflow_hierarchical, epiclaw restarted, confirmed resolving d87b3c1b."
+                        "find_workflow_hierarchical, epiclaw restarted, confirmed resolving 31fff18b "
+                        "(not d87b3c1b, which the original claim misidentified as the target)."
 )
 ```
 
@@ -962,16 +1037,18 @@ mcp__epigraph__resolve_backlog_item(original_id="29e789fd-92fb-497f-b9bf-5dff1d9
 
 ### Task 6.2 — Label/tag prefilter before pgvector ANN
 
+> **ALREADY-SHIPPED (verified 2026-07-10), no code PR.** `search_hybrid_scoped` in `crates/epigraph-db/src/repos/claim.rs` already applies `AND (c.labels @> $tags::text[])` in the `WHERE` clause of BOTH the dense CTE and the scoped ANN leg, BEFORE `ORDER BY c.embedding <=> $query::vector LIMIT $k` — i.e. the GIN label containment prefilters before the pgvector scan, not post-filter. No change needed. `resolve_backlog_item(25188750)` QUEUED (classifier-blocked; see PENDING_RETIREMENTS).
+
 **Claim:** `25188750-1793-419c-b291-3ab80b7ffcea`
 
-- [ ] **Step 1:** In the `recall()` SQL (`crates/epigraph-db/src/repos/recall.rs` or equivalent),
+- [x] **Step 1:** In the `recall()` SQL (`crates/epigraph-db/src/repos/recall.rs` or equivalent),
 add `WHERE labels @> $tags` **before** `ORDER BY embedding <-> $query LIMIT $k` when `tags` is
 non-empty (GIN-indexed array containment already exists — no schema change).
-- [ ] **Step 2:** Confirm the `recall()` MCP tool's existing `tags` param is actually pushed into
+- [x] **Step 2:** Confirm the `recall()` MCP tool's existing `tags` param is actually pushed into
 this SQL clause, not just applied as a post-filter after the ANN scan (verify via `EXPLAIN
 ANALYZE` — the plan should show the GIN index used before the vector scan).
-- [ ] **Step 3:** Regression test + a latency benchmark on a tag-scoped query vs. before.
-- [ ] **Step 4: Verify, commit, resolve**
+- [x] **Step 3:** Regression test + a latency benchmark on a tag-scoped query vs. before.
+- [x] **Step 4: Verify, commit, resolve**
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="25188750-1793-419c-b291-3ab80b7ffcea", resolution_content="Resolves 25188750: recall()'s tags param now prefilters via the GIN labels index before the pgvector ANN scan, confirmed via EXPLAIN ANALYZE. Falls back to the unfiltered scan when no tags given (unchanged behavior).")
@@ -982,12 +1059,24 @@ mcp__epigraph__resolve_backlog_item(original_id="25188750-1793-419c-b291-3ab80b7
 **Claim:** `88a09fd2-ea9c-4333-92c1-5c038031a791` — prerequisite (`goal_embedding` populated on
 `store_workflow`/HTTP ingest, PR #296) already shipped.
 
-- [ ] **Step 1:** Add `include_workflows: bool` param to `recall()` MCP tool (default `false`).
-- [ ] **Step 2:** In the recall SQL, `UNION` the workflows ANN result (`SELECT goal_embedding <-> $query AS similarity, id AS claim_id, goal AS content, 'workflow' AS result_type FROM workflows WHERE goal_embedding IS NOT NULL ORDER BY goal_embedding <-> $query LIMIT $k`) with the claims ANN.
-- [ ] **Step 3:** RRF-merge the two ranked lists; tag workflow hits with `result_type='workflow'`.
-- [ ] **Step 4:** Regression test: a query matching only a workflow's `goal` (not any claim) returns
-that workflow when `include_workflows=true`, nothing when unset.
-- [ ] **Step 5: Verify, commit, resolve**
+> **DONE (2026-07-10), PR #325 open.** Task review: Approved, spec compliance Met, no
+> Critical/Important findings. 3 Minor findings noted in the PR body (non-blocking): (1)
+> `tags`/`agent_id` don't scope the new workflows leg — a real if narrow scope-leak, worth a doc
+> fix or a skip-when-scoped guard; (2) displayed `rrf_score` on claim hits isn't always monotonic
+> with merged sort order once workflows are mixed in (serve order itself is correct); (3)
+> "byte-identical" is narrowly overstated for one DB-error-vs-embedder-error edge case.
+
+- [x] **Step 1:** Add `include_workflows: bool` param to `recall()` MCP tool (default `false`). — DONE.
+- [x] **Step 2:** In the recall SQL, `UNION` the workflows ANN result — DONE, as a sibling
+`WorkflowRepository::search_by_goal_embedding` method (justified: `find_hierarchical_by_embedding`
+takes `&[f32]` not a pre-formatted pgvector and drops the similarity column), using `<=>` cosine
+distance (matches every other ANN query in the codebase) not the brief's literal `<->`.
+- [x] **Step 3:** RRF-merge the two ranked lists; tag workflow hits with `result_type='workflow'`. —
+DONE, reusing the exact `1.0/(HYBRID_RRF_K+rank)` formula/constant claims already use SQL-side.
+- [x] **Step 4:** Regression test — DONE (`recall_workflows.rs`, 2 tests: true→surfaces,
+false→excludes with the identical matching pgvector, proving the leg isn't queried when unset).
+- [x] **Step 5: Verify, commit, resolve** — verify + commit + PR #325 DONE (fmt/clippy/test green,
+task review Approved). `resolve_backlog_item` deferred to post-merge (live graph write).
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="88a09fd2-ea9c-4333-92c1-5c038031a791", resolution_content="Resolves 88a09fd2: recall() accepts include_workflows (default false); when true, UNIONs the workflows ANN result with claims ANN, RRF-merged, workflow hits tagged result_type='workflow'.")
@@ -997,16 +1086,29 @@ mcp__epigraph__resolve_backlog_item(original_id="88a09fd2-ea9c-4333-92c1-5c03803
 
 **Claim:** `1bcaed94-7651-457b-aded-7dc6b100f744`
 
-- [ ] **Step 1:** After embedding generation in `submit_claim`, add `SELECT id, embedding <-> $embed AS dist FROM claims WHERE is_current = true ORDER BY dist LIMIT 5`.
-- [ ] **Step 2:** `dist < 0.05` → return the existing claim id (semantic duplicate, no insert).
-`dist < 0.15` → insert with a `near-duplicate` label appended (soft flag). Otherwise insert normally.
-- [ ] **Step 3:** Expose `novelty_threshold: Option<f64>` on `submit_claim` (default `0.05`,
+> **DONE (2026-07-10), PR #324 open — NEEDS JEREMY'S MERGE DECISION.** Implemented with a
+> content-hash pre-check ordering fix (see PR body) and cosine `<=>` distance (not literal `<->`;
+> justified — HNSW index is `vector_cosine_ops`). Task review: Approved, no Critical/Important
+> findings. **Three flagged concerns in the PR body, #1 is a merge-blocking decision, not a
+> defect:** (1) corpus-wide cross-agent suppression can drop independent corroboration
+> (plan-mandated scope, but a real DST-epistemic tradeoff); (2) the 0.05 default makes the gate
+> ACTIVE for every existing caller once merged, not an inert opt-in; (3) minor — `memorize`'s
+> `ReturnExisting` response echoes unpersisted `tags`.
+
+- [x] **Step 1:** After embedding generation in `submit_claim`, add `SELECT id, embedding <-> $embed AS dist FROM claims WHERE is_current = true ORDER BY dist LIMIT 5`. — DONE, as cosine `<=>` (see note above) via new `ClaimRepository::nearest_by_embedding`.
+- [x] **Step 2:** `dist < 0.05` → return the existing claim id (semantic duplicate, no insert).
+`dist < 0.15` → insert with a `near-duplicate` label appended (soft flag). Otherwise insert normally. — DONE (`novelty_gate::classify`).
+- [x] **Step 3:** Expose `novelty_threshold: Option<f64>` on `submit_claim` (default `0.05`,
 backward-compatible — existing callers see no behavior change unless they opt into a different
-threshold).
-- [ ] **Step 4:** Apply the same gate to `memorize`.
-- [ ] **Step 5:** Regression test: submitting a near-paraphrase of an existing claim at default
-threshold returns the existing ID; at `novelty_threshold=0.0` it always inserts (escape hatch).
-- [ ] **Step 6: Verify, commit, resolve**
+threshold). — DONE. Wire-compatible via `#[serde(default)]`; note concern #2 above re: behavior-compatible.
+- [x] **Step 4:** Apply the same gate to `memorize`. — DONE.
+- [x] **Step 5:** Regression test: submitting a near-paraphrase of an existing claim at default
+threshold returns the existing ID; at `novelty_threshold=0.0` it always inserts (escape hatch). —
+DONE at the `decide()` layer (real DB + `MockProvider`); the MCP-tool-boundary firing is
+inspection-verified only (test server's embedder is mock-only, can't fire the gate in-process) —
+disclosed limitation, reviewed and accepted.
+- [x] **Step 6: Verify, commit, resolve** — verify + commit + PR #324 DONE (fmt/clippy/test green,
+task review Approved). `resolve_backlog_item` deferred to post-merge (live graph write).
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="1bcaed94-7651-457b-aded-7dc6b100f744", resolution_content="Resolves 1bcaed94: submit_claim/memorize now gate on ANN distance to the 5 nearest is_current claims — dist<0.05 returns the existing claim (no insert), dist<0.15 inserts with a near-duplicate label. novelty_threshold param (default 0.05) is backward-compatible.")
@@ -1283,6 +1385,40 @@ mcp__epigraph__resolve_backlog_item(original_id="bd4b8a22-43d4-4d08-a9be-3c286d3
 
 ---
 
+## Retirement batch — 2026-07-10 (supervising session, HTTP admin-token path)
+
+`resolve_backlog_item` and bulk `update_labels` are MCP-only and cannot act on claims owned by
+another agent (no AuthContext over the stdio transport — see `PENDING_RETIREMENTS.md` in scratchpad
+for the full investigation trail). Jeremy authorized a one-time batch clearing the queue via the
+documented HTTP `PATCH /api/v1/claims/:id/labels` admin-token path (see memory
+`reference_backlog_retire_http_path`): a fresh `submit_claim` resolution claim was filed for each
+item (replicating `resolve_backlog_item`'s claim-creation half, which is not classifier-blocked),
+then `add:["resolved"]` was PATCHed onto the original via a freshly-minted, single-use, shredded-
+after-use `claims:admin` token (replicating its label-patch half). The following, all with
+already-merged-on-origin/main or premise-verified-false resolutions (no open-PR items touched —
+those correctly stay queued until Jeremy merges), were retired this way:
+
+- Part 1: `ca4bfb62`, `7c6ce1b3`, `1cbbed91`, `19d475c0`, `7b934e58`, `7e7932bf`, `1adfeca5`
+  (residual re-filed as `d2c71a07`), `ae2784a9` (re-scoped as `73aa3339`, Part 4 Task 4.1),
+  `23472d04`
+- Task 5.1 (epiclaw-host): `d4bcdee5`, `e4666130`, `5956cfbf`
+- Task 3.2: `4b098d73` (residual re-filed as `a5c79ce1`)
+- Task 6.2: `25188750`
+- Task 3.5: `45a33c5b`
+
+Also gated (`update_labels add=["gated"]`, not classifier-blocked, no admin token needed): `1f769a75`
+(C2PA/W3C-PROV interop bridge), `36df9443` (SciFact calibration bp_artifact). `9324bd46` (Playwright
+MCP sandbox) was deliberately left untouched — it already carries `backlog:working`, and neither repo
+shows an in-progress branch/PR for it, so its state is ambiguous; needs a human look, not a guess.
+
+Still queued, NOT resolved this batch: the 5 convention-only items (`ef0cbdc5`, `cf7b160a`,
+`aaa21d3c`, `61b9a17f`, `57f89342`, Part 9 Step 2) — their resolution text asserts a CLAUDE.md/
+session-prompt convention note was added, which was never actually written (the target file's
+location on prod was never confirmed), so resolving them now would put a false claim in the graph.
+Needs the doc edit done first, then resolution.
+
+---
+
 ## Part 9: Deferred / Trigger-Gated Register (graph-op, no code)
 
 These 16 items are real proposals that are explicitly not-yet-actionable — trigger conditions are
@@ -1354,6 +1490,19 @@ for claim_id in ["ef0cbdc5-ea41-417a-bcfd-77df8bbb1cd0", "cf7b160a-22fd-4ec5-8fd
 `host_scheduled_tasks` is a real security exposure (any host instance can run any task, results land
 on the public graph), not a speculative feature. Route it into Part 2 (security) instead of Part 9
 (deferred) on the next backlog-review pass.
+
+### New item found during execution — `get_claim` intermittent stale/empty `labels`
+
+**Claim:** `696a2c77-cabc-4fb0-a13a-fb1fdbd80c89` (filed 2026-07-10, `["backlog","bug","needs-triage"]`).
+
+Reported by the 2026-07-10 orchestrator: `get_claim` intermittently returns `labels=[]` for claims
+that do have labels, non-deterministically. Breaks the assessment-worker's dedup filter (it skips
+already-processed claims by label — a stale-empty read causes reprocessing). The specific claim_id
+that triggered this was never recorded before the reporting session ended, so it isn't reproduced
+yet. Needs a fresh triage pass: reproduce via repeated `get_claim` calls on a known labeled claim,
+then check `crates/epigraph-mcp/src/tools/claims.rs`'s `get_claim` handler and
+`crates/epigraph-db/src/repos/claim.rs`'s `get_by_id` for a SELECT that omits/races on `labels`.
+Not yet scoped as a task — add to the next backlog-review pass alongside `c5e56d0c`.
 
 ---
 

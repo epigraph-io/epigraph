@@ -53,7 +53,7 @@ epigraph-cli = { workspace = true, optional = true }  # LlmClient trait + Anthro
 # epigraph-isomorphism = { git = "...", optional = true }
 hmac = "0.12"  # HMAC signing for webhook payloads
 sha2 = "0.10"  # SHA-256 for webhook HMAC signatures
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }  # HTTP client for webhook delivery
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }  # HTTP client for webhook delivery
 
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"], optional = true }
 
