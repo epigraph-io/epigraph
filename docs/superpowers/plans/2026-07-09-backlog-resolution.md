@@ -935,18 +935,45 @@ own investigation before any action. Jeremy also flagged: don't assume "undecomp
 decomposition" — many may simply need dedup against content that already has decomposed atoms
 elsewhere.
 
-- [ ] **Step 6 (proposed, NOT yet built):** a dry-run sizing tool — for each Cluster-A-pattern
-undecomposed claim (agent `f741ab67`, and any other agents that show the same overlapping-submission
-signature once checked), run a pgvector similarity search against claims that are already sources or
-targets of a `decomposes_to` edge; report (not write) matches above a similarity threshold (start
-~0.85, tune against the confirmed pair's 0.75-0.91 range seen in `recall()` scoring) so the actual
-size of the "duplicate-of-already-decomposed" fraction can be measured across the full backlog
-before any `mark_duplicate` calls run at scale. One-off recall() calls per claim don't scale to
-200k+ rows — this wants a direct SQL/pgvector nearest-neighbor query (or a small Rust CLI following
-the `hypothesis`/`method_search` embedding-query pattern), not per-claim MCP calls. Needs Jeremy's
-review of the sizing report before any bulk `mark_duplicate` execution — threshold-based semantic
-dedup at this scale has real false-positive risk (distinct facts that are superficially similar,
-e.g. different shapes' moment-of-inertia formulas, must not get merged).
+- [x] **Step 6 — BUILT AND RUN 2026-07-11 (PR pending, epigraph branch `task-dedup-sizing`):**
+`dedup_sizing` CLI (`crates/epigraph-cli/src/bin/dedup_sizing.rs`), read-only, never calls
+`mark_duplicate`. Splits into two tiers rather than trusting a single similarity threshold —
+Tier 1 (exact `content_hash` match against claims already on a `decomposes_to` edge — safe, zero
+embeddings, zero false-positive risk) and Tier 2 (cosine-similarity nearest-neighbor on existing
+embeddings — approximate, flagged needs-review).
+
+**REVISED FINDING — the duplicate pattern is much bigger than Cluster A, and Tier 2 is NOT safe
+even at high similarity.** Run against production (read-only, full 218,780-claim undecomposed
+backlog):
+- **Tier 1 (exact-hash, safe): 149,688 claims — 68.4% of the entire undecomposed backlog** are
+  byte-identical duplicates of claims that already have decomposed atoms elsewhere. This spans
+  **20+ distinct agents** (not just `f741ab67` — top agents by count: `f741ab67` 47,914,
+  `ea2c3921` 22,335, `9a087aa4` 19,923, `673056a6` 16,050, `3e16d85e` 15,725, plus 15 more in the
+  hundreds-to-thousands range), and **94% is same-agent self-duplication** (an agent duplicating
+  its own earlier submission) vs 6% cross-agent (different agents independently submitting
+  identical text — likely genuinely common facts). Cluster A (`f741ab67`) was real but was only
+  ~32% of the total exact-duplicate population, not the whole story.
+- **Tier 2 (semantic similarity) is unsafe as an automated signal, confirmed empirically, not just
+  theorized:** at similarity 0.85-0.88 AND even at 0.95-0.96, the tool surfaced clear false
+  positives on this corpus's heavily templated building-code content — e.g. "CBC ... TMS 403" vs
+  "TMS 402" (different code section), "Type IV-HT bearing walls ... 1 hour" vs "Type IV-C ... 2
+  hours" (different construction types, different fire ratings), masonry *minimum* strength
+  confused with a different section's *maximum* strength. Same template, different number —
+  cosine similarity does not reliably separate these from true paraphrase-duplicates (also present
+  in the same similarity band). **Recommendation: only Tier 1 (exact hash) is safe for unattended
+  `mark_duplicate` at scale. Tier 2 output is a lead list for human review, not an action list —
+  do not threshold-and-auto-merge it.**
+
+This substantially changes Task 4.5's throughput math too: if 68.4% of the "218,629 undecomposed"
+count needs `mark_duplicate` (a cheap DB write) rather than an LLM `decompose_claims` call, the
+*actual* LLM-bound decomposition backlog is closer to ~69,000 claims, not 218,629 — makes the
+throughput-tuning question (Step 2 above) far less urgent once Tier 1 dedup runs.
+
+**Not yet executed — needs Jeremy's go-ahead:** running `mark_duplicate` for the 149,688 Tier 1
+matches at scale (soft-retire, `is_current=false` + null embedding, canonical claim untouched, per
+Jeremy's earlier decision). The `dedup_sizing` CLI only reports; a separate write-path CLI
+(mirroring this one's Tier 1 query but calling `ClaimRepository::mark_duplicate` per match, batched
+with progress logging) would still need to be built for actual execution.
 
 ### Task 4.6 — Backfill stale cached BetP on 67 multi-BBA claims
 
