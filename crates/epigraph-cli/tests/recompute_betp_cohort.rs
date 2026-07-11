@@ -11,9 +11,11 @@
 //!       dynamic derivation (issue #197) never saw when it was originally
 //!       written against the raw `source_strength` model.
 //!
-//! This test asserts `select_cohort` returns exactly the multi-BBA hub claim
-//! and the "~"-shape single-BBA claim, and excludes a simple single-BBA claim
-//! (masses only on `"0"`/`"0,1"` keys) that needs no recompute.
+//! This test asserts `select_cohort` returns exactly the multi-BBA hub claim,
+//! the "~"-shape single-BBA claim, and a lone-"1"-key single-BBA claim
+//! (covering both arms of population (b)'s `masses ? '1' OR masses ? '~'`
+//! predicate independently), and excludes a simple single-BBA claim (masses
+//! only on `"0"`/`"0,1"` keys) that needs no recompute.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -127,6 +129,21 @@ async fn select_cohort_includes_multi_bba_hub_and_tilde_shape_excludes_simple(po
     )
     .await;
 
+    // (b) Single-BBA claim with a non-simple lone "1" key — mass on the
+    // non-supported hypothesis by itself, not just as part of "0,1". Covers
+    // the other arm of the `masses ? '1' OR masses ? '~'` predicate
+    // independently of the "~" case above.
+    let lone_one_claim = seed_claim(&pool, claim_owner, "single BBA with lone '1' key").await;
+    let lone_one_source = seed_agent(&pool).await;
+    seed_bba(
+        &pool,
+        lone_one_claim,
+        frame_id,
+        lone_one_source,
+        serde_json::json!({"0,1": 0.6, "1": 0.4}),
+    )
+    .await;
+
     // Excluded: single-BBA claim with only simple positive keys ("0"/"0,1") —
     // no "1" or "~" key present, so no recompute is due.
     let simple_claim = seed_claim(&pool, claim_owner, "single BBA simple shape").await;
@@ -149,6 +166,10 @@ async fn select_cohort_includes_multi_bba_hub_and_tilde_shape_excludes_simple(po
     assert!(
         cohort.contains(&tilde_claim),
         "cohort must include the single-BBA '~'-shape claim: {cohort:?}"
+    );
+    assert!(
+        cohort.contains(&lone_one_claim),
+        "cohort must include the single-BBA lone-'1'-key claim: {cohort:?}"
     );
     assert!(
         !cohort.contains(&simple_claim),
