@@ -767,29 +767,51 @@ async fn recall_with_context_post_embed(
     // value). Per-claim degrade-not-fail: a compute error for ONE hit yields
     // null + a warn, never an aborted page (spec §8).
     if let Some((frame_id, perspective_id)) = lens {
-        for hit in &mut results {
-            match epigraph_engine::belief_query::get_perspective_belief(
-                &server.pool,
-                hit.paragraph_id,
-                frame_id,
-                perspective_id,
-            )
-            .await
-            {
-                Ok(interval) => {
-                    hit.lensed_belief = Some(crate::types::LensedBelief::from_interval(
-                        frame_id,
-                        perspective_id,
-                        &interval,
-                    ));
+        // Batch the lens post-pass so the perspective row + per-frame overrides
+        // are resolved ONCE for the whole page, not once per hit (the N+1 fixed
+        // in backlog 9e33ddf7). Per-hit degrade-not-fail is preserved: each
+        // claim carries its own `Result`, so one malformed claim warns + serves
+        // a null lens without aborting the page.
+        let claim_ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
+        match epigraph_engine::belief_query::get_perspective_belief_batch(
+            &server.pool,
+            &claim_ids,
+            frame_id,
+            perspective_id,
+        )
+        .await
+        {
+            Ok(intervals) => {
+                let mut by_claim: std::collections::HashMap<Uuid, _> =
+                    intervals.into_iter().collect();
+                for hit in &mut results {
+                    match by_claim.remove(&hit.paragraph_id) {
+                        Some(Ok(interval)) => {
+                            hit.lensed_belief = Some(crate::types::LensedBelief::from_interval(
+                                frame_id,
+                                perspective_id,
+                                &interval,
+                            ));
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                claim_id = %hit.paragraph_id,
+                                error = %e,
+                                "lensed belief compute failed; serving null lens for this claim"
+                            );
+                        }
+                        None => {}
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        claim_id = %hit.paragraph_id,
-                        error = %e,
-                        "lensed belief compute failed; serving null lens for this claim"
-                    );
-                }
+            }
+            Err(e) => {
+                // Page-level failure (e.g. frame vanished): degrade the whole
+                // lens to null rather than abort the recall, matching the
+                // per-hit degrade-not-fail contract.
+                tracing::warn!(
+                    error = %e,
+                    "lensed belief batch failed; serving null lens for this page"
+                );
             }
         }
     }
