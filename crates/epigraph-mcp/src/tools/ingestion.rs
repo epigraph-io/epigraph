@@ -356,29 +356,33 @@ pub async fn do_ingest_document(
             | epigraph_ingest::document::schema::SourceType::Textbook
     );
     let parsed_fallback;
-    let authors: &[epigraph_ingest::common::schema::AuthorEntry] =
-        if extraction.source.authors.is_empty() && byline_eligible {
-            parsed_fallback = extraction
-                .source_text
-                .as_deref()
-                .map(epigraph_ingest::document::byline::parse_byline_authors)
-                .unwrap_or_default();
-            if parsed_fallback.is_empty() {
-                tracing::warn!(
-                    paper = %paper_title,
-                    "ingest_document: source.authors empty and no byline recovered from body; paper will have no author agents"
-                );
-            } else {
-                tracing::info!(
-                    paper = %paper_title,
-                    count = parsed_fallback.len(),
-                    "ingest_document: source.authors empty; recovered authors from body byline fallback"
-                );
-            }
-            &parsed_fallback
+    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if extraction
+        .source
+        .authors
+        .is_empty()
+        && byline_eligible
+    {
+        parsed_fallback = extraction
+            .source_text
+            .as_deref()
+            .map(epigraph_ingest::document::byline::parse_byline_authors)
+            .unwrap_or_default();
+        if parsed_fallback.is_empty() {
+            tracing::warn!(
+                paper = %paper_title,
+                "ingest_document: source.authors empty and no byline recovered from body; paper will have no author agents"
+            );
         } else {
-            &extraction.source.authors
-        };
+            tracing::info!(
+                paper = %paper_title,
+                count = parsed_fallback.len(),
+                "ingest_document: source.authors empty; recovered authors from body byline fallback"
+            );
+        }
+        &parsed_fallback
+    } else {
+        &extraction.source.authors
+    };
     for (idx, author) in authors.iter().enumerate() {
         if author.name.is_empty() {
             continue;
@@ -855,29 +859,33 @@ pub async fn do_ingest_document_spine(
             | epigraph_ingest::document::schema::SourceType::Textbook
     );
     let parsed_fallback;
-    let authors: &[epigraph_ingest::common::schema::AuthorEntry] =
-        if extraction.source.authors.is_empty() && byline_eligible {
-            parsed_fallback = extraction
-                .source_text
-                .as_deref()
-                .map(epigraph_ingest::document::byline::parse_byline_authors)
-                .unwrap_or_default();
-            if parsed_fallback.is_empty() {
-                tracing::warn!(
-                    paper = %paper_title,
-                    "ingest_document_spine: source.authors empty and no byline recovered from body; paper will have no author agents"
-                );
-            } else {
-                tracing::info!(
-                    paper = %paper_title,
-                    count = parsed_fallback.len(),
-                    "ingest_document_spine: source.authors empty; recovered authors from body byline fallback"
-                );
-            }
-            &parsed_fallback
+    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if extraction
+        .source
+        .authors
+        .is_empty()
+        && byline_eligible
+    {
+        parsed_fallback = extraction
+            .source_text
+            .as_deref()
+            .map(epigraph_ingest::document::byline::parse_byline_authors)
+            .unwrap_or_default();
+        if parsed_fallback.is_empty() {
+            tracing::warn!(
+                paper = %paper_title,
+                "ingest_document_spine: source.authors empty and no byline recovered from body; paper will have no author agents"
+            );
         } else {
-            &extraction.source.authors
-        };
+            tracing::info!(
+                paper = %paper_title,
+                count = parsed_fallback.len(),
+                "ingest_document_spine: source.authors empty; recovered authors from body byline fallback"
+            );
+        }
+        &parsed_fallback
+    } else {
+        &extraction.source.authors
+    };
     for (idx, author) in authors.iter().enumerate() {
         if author.name.is_empty() {
             continue;
