@@ -345,33 +345,40 @@ pub async fn do_ingest_document(
     // no `source_text` and silently no-ops). The parser is conservative and
     // returns empty when unsure — it never fabricates a placeholder author, so
     // the empty-fallback case preserves the pre-existing behavior exactly.
+    //
+    // Gated on `source_type` Paper/Textbook: only those follow the
+    // title→authors→abstract convention the byline parser assumes. Reports,
+    // legal, transcripts etc. put institution/label lines where a byline would
+    // be, so running the parser there is pure false-positive downside.
+    let byline_eligible = matches!(
+        extraction.source.source_type,
+        epigraph_ingest::document::schema::SourceType::Paper
+            | epigraph_ingest::document::schema::SourceType::Textbook
+    );
     let parsed_fallback;
-    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if extraction
-        .source
-        .authors
-        .is_empty()
-    {
-        parsed_fallback = extraction
-            .source_text
-            .as_deref()
-            .map(epigraph_ingest::document::byline::parse_byline_authors)
-            .unwrap_or_default();
-        if parsed_fallback.is_empty() {
-            tracing::warn!(
-                paper = %paper_title,
-                "ingest_document: source.authors empty and no byline recovered from body; paper will have no author agents"
-            );
+    let authors: &[epigraph_ingest::common::schema::AuthorEntry] =
+        if extraction.source.authors.is_empty() && byline_eligible {
+            parsed_fallback = extraction
+                .source_text
+                .as_deref()
+                .map(epigraph_ingest::document::byline::parse_byline_authors)
+                .unwrap_or_default();
+            if parsed_fallback.is_empty() {
+                tracing::warn!(
+                    paper = %paper_title,
+                    "ingest_document: source.authors empty and no byline recovered from body; paper will have no author agents"
+                );
+            } else {
+                tracing::info!(
+                    paper = %paper_title,
+                    count = parsed_fallback.len(),
+                    "ingest_document: source.authors empty; recovered authors from body byline fallback"
+                );
+            }
+            &parsed_fallback
         } else {
-            tracing::info!(
-                paper = %paper_title,
-                count = parsed_fallback.len(),
-                "ingest_document: source.authors empty; recovered authors from body byline fallback"
-            );
-        }
-        &parsed_fallback
-    } else {
-        &extraction.source.authors
-    };
+            &extraction.source.authors
+        };
     for (idx, author) in authors.iter().enumerate() {
         if author.name.is_empty() {
             continue;
@@ -839,34 +846,38 @@ pub async fn do_ingest_document_spine(
     // Same defensive backstop as `do_ingest_document` (backlog a55aac45): the
     // spine path is the recommended two-phase entry and shares the empty-authors
     // failure mode, so recover the byline from `source_text` when the structured
-    // author list is absent. Conservative parser; empty ⇒ pre-existing behavior.
+    // author list is absent. Gated on Paper/Textbook source_type (see the
+    // `do_ingest_document` rationale). Conservative parser; empty ⇒ pre-existing
+    // behavior.
+    let byline_eligible = matches!(
+        extraction.source.source_type,
+        epigraph_ingest::document::schema::SourceType::Paper
+            | epigraph_ingest::document::schema::SourceType::Textbook
+    );
     let parsed_fallback;
-    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if extraction
-        .source
-        .authors
-        .is_empty()
-    {
-        parsed_fallback = extraction
-            .source_text
-            .as_deref()
-            .map(epigraph_ingest::document::byline::parse_byline_authors)
-            .unwrap_or_default();
-        if parsed_fallback.is_empty() {
-            tracing::warn!(
-                paper = %paper_title,
-                "ingest_document_spine: source.authors empty and no byline recovered from body; paper will have no author agents"
-            );
+    let authors: &[epigraph_ingest::common::schema::AuthorEntry] =
+        if extraction.source.authors.is_empty() && byline_eligible {
+            parsed_fallback = extraction
+                .source_text
+                .as_deref()
+                .map(epigraph_ingest::document::byline::parse_byline_authors)
+                .unwrap_or_default();
+            if parsed_fallback.is_empty() {
+                tracing::warn!(
+                    paper = %paper_title,
+                    "ingest_document_spine: source.authors empty and no byline recovered from body; paper will have no author agents"
+                );
+            } else {
+                tracing::info!(
+                    paper = %paper_title,
+                    count = parsed_fallback.len(),
+                    "ingest_document_spine: source.authors empty; recovered authors from body byline fallback"
+                );
+            }
+            &parsed_fallback
         } else {
-            tracing::info!(
-                paper = %paper_title,
-                count = parsed_fallback.len(),
-                "ingest_document_spine: source.authors empty; recovered authors from body byline fallback"
-            );
-        }
-        &parsed_fallback
-    } else {
-        &extraction.source.authors
-    };
+            &extraction.source.authors
+        };
     for (idx, author) in authors.iter().enumerate() {
         if author.name.is_empty() {
             continue;

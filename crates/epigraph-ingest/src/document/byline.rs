@@ -100,14 +100,70 @@ fn split_author_segments(line: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Lowercased organizational / publication keywords that betray an institution,
+/// publisher, or document-label line masquerading as a name. A segment
+/// containing any of these is never a personal name, so its presence
+/// disqualifies the whole candidate byline. This closes the false-positive
+/// where a short Title-Case line like "Nuclear Regulatory Commission" or
+/// "Stanford University" (token-shaped like a 2–3 word name) would otherwise
+/// mint a bogus author agent. Conservative by design: over-rejecting is safe.
+const ORG_KEYWORDS: &[&str] = &[
+    "university",
+    "institute",
+    "institution",
+    "college",
+    "commission",
+    "committee",
+    "department",
+    "laboratory",
+    "laboratories",
+    "corporation",
+    "company",
+    "incorporated",
+    "limited",
+    "society",
+    "association",
+    "foundation",
+    "center",
+    "centre",
+    "council",
+    "agency",
+    "administration",
+    "ministry",
+    "bureau",
+    "office",
+    "division",
+    "consortium",
+    "organization",
+    "organisation",
+    "journal",
+    "press",
+    "publishing",
+    "publishers",
+    "review",
+    "proceedings",
+    "report",
+    "hospital",
+    "school",
+    "faculty",
+];
+
 /// A segment is name-shaped when it is 2–4 whitespace tokens, each token being
 /// an initial (`J.`) or a Capitalized word, with no digits and no all-caps
-/// acronyms. This rejects title fragments ("Attention Is All You Need" is 5
-/// tokens with no comma → one over-long segment) while accepting real names
-/// ("Jane Q. Smith", "A. Turing").
+/// acronyms, AND it contains no organizational keyword. This rejects title
+/// fragments ("Attention Is All You Need" is 5 tokens with no comma → one
+/// over-long segment) and institution lines ("Stanford University") while
+/// accepting real names ("Jane Q. Smith", "A. Turing").
 fn segment_is_name_shaped(seg: &str) -> bool {
     let tokens: Vec<&str> = seg.split_whitespace().collect();
     if tokens.len() < 2 || tokens.len() > 4 {
+        return false;
+    }
+    if tokens.iter().any(|t| {
+        let lowered = t.to_ascii_lowercase();
+        let word = lowered.trim_matches('.').trim();
+        ORG_KEYWORDS.contains(&word)
+    }) {
         return false;
     }
     tokens.iter().all(|t| token_is_name_shaped(t))
@@ -250,6 +306,39 @@ Body.
     #[test]
     fn empty_input_yields_empty() {
         assert!(parse_byline_authors("").is_empty());
+    }
+
+    #[test]
+    fn institution_line_is_not_parsed_as_an_author() {
+        // Adversarial false-positive guard: a short Title-Case institution line
+        // on the second content line is name-shaped by token rules but is NOT a
+        // person. It must be rejected — minting it as an author agent would
+        // pollute co-authorship edges.
+        let text = "\
+Annual Safety Report
+
+Nuclear Regulatory Commission
+
+Abstract
+Contents.
+";
+        assert!(
+            parse_byline_authors(text).is_empty(),
+            "institution line must not parse as an author"
+        );
+    }
+
+    #[test]
+    fn university_affiliation_line_is_not_parsed_as_an_author() {
+        let text = "\
+A Preprint
+
+Stanford University
+
+Abstract
+Body.
+";
+        assert!(parse_byline_authors(text).is_empty());
     }
 
     #[test]
