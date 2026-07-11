@@ -641,6 +641,80 @@ mcp__epigraph__resolve_backlog_item(
 )
 ```
 
+### Task 3.8 — `cites` relationship missing from `link_epistemic`'s allowlist, forcing a raw-HTTP dead end
+
+**Claim:** `47afad2e-8bff-434a-b3dd-921c23a6e904` (found during the 2026-07-11 bridge-queue triage;
+recurred unfixed since 2026-06-23, ~3 weeks, across every daily conflict-resolution scan).
+
+**Files:** `crates/epigraph-mcp/src/tools/link_epistemic.rs` (the relationship allowlist).
+
+The daily conflict-resolution workflow's "cites-edge pinning" step needs to create
+`relationship="cites"` edges from a new backlog claim to its conflict src/tgt nodes (secondary
+redundancy for graph-traversal discovery; primary dedup already works via `pair_key` labels, so
+this is not data-loss-critical, but it's a real, cleanly-diagnosed gap). The step currently falls
+back to raw `POST /api/v1/edges`, which 401s from the agent container: the endpoint requires a
+Bearer JWT, but the only container-available credentials are opaque 64-char keys
+(`EPICLAW_AGENT_KEY`, `EPIGRAPH_SERVICE_SECRET`, no JWT structure), and no token-mint endpoint is
+reachable (`/api/v1/auth/token`, `/auth/token`, `/api/v1/service/token`, `/api/v1/tokens` all 404).
+
+- [ ] **Step 1:** Confirm `link_epistemic`'s current allowlist (`supports`/`corroborates`/
+`elaborates`/`generalizes`/`specializes`/`contradicts`/`refutes`) and `link_hierarchical`'s
+(`decomposes_to`/`section_follows`/`continues_argument`) — neither currently accepts `cites`.
+- [ ] **Step 2:** Add `cites` to `link_epistemic`'s allowed relationships (the reporting claim's own
+recommended fix, and the cleanest option since the conflict-resolution step is MCP-native
+everywhere else in that workflow). Confirm whether `cites` should trigger DS recomputation like
+`supports`/`contradicts` do, or stay non-evidential like `variant_of` — `cites` is a citation/
+provenance link, not an epistemic claim about the relationship between the two nodes, so the
+non-evidential path is likely correct; verify against `is_evidential_relationship` in
+`crates/epigraph-api/src/routes/edges.rs`.
+- [ ] **Step 3:** Regression test: call `link_epistemic` with `relationship="cites"` from one claim
+to another, confirm the edge is created and (per Step 2's finding) does or doesn't trigger
+`trigger_edge_ds_recomputation`.
+- [ ] **Step 4:** Verify, commit, resolve.
+
+```python
+mcp__epigraph__resolve_backlog_item(
+    original_id="47afad2e-8bff-434a-b3dd-921c23a6e904",
+    resolution_content="Resolves 47afad2e: link_epistemic now accepts relationship='cites', "
+                        "letting the conflict-resolution workflow's cites-edge pinning step run "
+                        "MCP-natively instead of hitting the JWT-only POST /api/v1/edges dead end "
+                        "from the agent container."
+)
+```
+
+### Task 3.9 — Re-verify: cross-agent `resolve_backlog_item` may already be fixed
+
+**Claims:** `7bc12188-1ba9-4a99-b9f6-0b33da58fbb4` (found during the 2026-07-11 bridge-queue triage),
+plus related open claims `69ac99d4-01c1-4ac5-b586-e4b98a7408b5`, `a4cc08a6-d822-4a1b-bcf6-3a3013114e04`,
+`1113a750-afa7-4e4b-87a0-2b8d46386984` — all describe the same recurring symptom (an agent cannot
+retire a backlog claim owned by a different agent via `resolve_backlog_item` over MCP).
+
+**Important nuance found during triage — do not just re-fix blind:** claim `1cbbed91` (this exact
+symptom) was already marked `resolved` earlier this session, crediting commit `056163b`
+("fix(mcp): grant stdio transport implicit admin for resolve_backlog_item only" — makes
+`require_owner_admin_or_service` return `Ok()` immediately when `auth=None`, since stdio is treated
+as an OS-level trust boundary). Yet the supervising session hit the identical ownership error
+repeatedly for the rest of this session, requiring a manual HTTP admin-token workaround every time
+— suggesting either the fix never actually applied to the live binary, or something narrower than
+expected. **However**, a quick post-redeploy probe (calling `resolve_backlog_item` on a nonexistent
+claim ID) returned a clean "claim not found" error rather than an ownership/AuthContext error —
+meaning the auth gate itself may now be passing through correctly on the freshly-redeployed binary,
+and the whole session's workaround-usage may simply predate today's redeploy picking up commit
+`056163b` for the first time.
+
+- [ ] **Step 1:** On the current live `epigraph-mcp` binary (confirm it's post-2026-07-11's redeploy,
+which rebuilt from fresh `origin/main`), attempt a REAL `resolve_backlog_item` call over stdio MCP
+on a genuine cross-agent-owned claim that is actually ready to resolve (not a synthetic test claim —
+don't write false content into the graph). If it succeeds without the ownership error, the fix is
+confirmed live and this task is done — resolve all four claims above noting the fix was already
+correct, just not previously verified against a freshly-redeployed binary.
+- [ ] **Step 2:** If it still fails with the ownership/AuthContext error even post-redeploy, then
+`056163b`'s fix has a real gap (possibly: the stdio-vs-HTTP transport detection isn't triggering
+correctly, or a regression landed after 2026-06-29). Diagnose and fix for real in that case — do not
+just re-apply the HTTP-admin-token workaround as if it were a permanent solution.
+- [ ] **Step 3:** Resolve `7bc12188`, `69ac99d4`, `a4cc08a6`, `1113a750` once confirmed fixed (either
+newly or as an already-correct fix now properly verified).
+
 ---
 
 ## Part 4: Pipeline, Scale & Architecture (`epigraph`)
@@ -781,6 +855,32 @@ the concrete root cause once found (don't guess in this plan).
 - [ ] **Step 4:** Once draining is confirmed live, do **not** resolve `68d03c24` yet — track
 progress via `query_undecomposed_claims` offset/limit bisection weekly until the count trends down,
 then resolve.
+- [ ] **Step 5 (distinct bug, found during the 2026-07-11 bridge-queue triage, claim
+`a422da87-bb7b-4c1e-9e53-aa6473faae63`):** the `decompose_claims` CLI itself fails
+non-deterministically on its write path, independent of throughput/scheduling — this may be the
+*actual* root cause of Step 1-4's draining problem, check this FIRST. Two distinct error variants
+observed on identical invocations (`decompose_claims --limit 50`): `reqwest::Error { kind: Builder,
+source: RelativeUrlWithoutBase }` and `reqwest::Error { kind: Status(401) }` against
+`POST /api/v1/claims`. `--limit 1` succeeds (no atoms found, write path never exercised); `--limit
+10`/`--limit 50` reliably hit one of the two errors. OAuth token minting independently verified
+working (manual curl against the token endpoint returns a valid `claims:write`-scoped token) — this
+rules out credential misconfiguration. The pattern (URL-builder crash on some runs, 401 on others,
+same invocation) points to a race in the binary's token-refresh/multi-batch-POST logic: some
+concurrent async POSTs fire before the OAuth token is populated (401), and a token-refresh code path
+builds a relative URL instead of joining against the API base (`RelativeUrlWithoutBase`). Locate the
+decompose_claims CLI source (likely `crates/epigraph-cli/src/bin/`), find the token-refresh/batch-POST
+logic, and fix the race (e.g. mint the token once before spawning concurrent POSTs, or serialize
+token refresh behind a mutex/once-cell). Regression test: run with `--limit 50` against a fixture
+with real undecomposed content repeatedly and confirm zero failures across N runs.
+
+```python
+mcp__epigraph__resolve_backlog_item(
+    original_id="a422da87-bb7b-4c1e-9e53-aa6473faae63",
+    resolution_content="Resolves a422da87: fixed the token-refresh/multi-batch-POST race in "
+                        "decompose_claims that caused non-deterministic RelativeUrlWithoutBase/401 "
+                        "failures on writes with >1 atom to persist."
+)
+```
 
 ### Task 4.6 — Backfill stale cached BetP on 67 multi-BBA claims
 
@@ -1660,8 +1760,20 @@ referenced by a live workflow before removing.
 
 ### Task 10.10 — norcal-rfp source-list refresh (15 items, one `evolve_step` pass)
 
+> **Scope gap found during the 2026-07-11 bridge-queue triage:** the `source_updates` dict below
+> only enumerates 10 entries despite this task's own header claiming 15 — it was missing the
+> Bucket B / CCD-district cluster entirely (claim `cfb70ad7-6cd9-4129-bfc7-584ae432952e`, not
+> `resolved`). Added below. Re-check whether the other 4 missing items exist elsewhere in the
+> plan or are a second genuine gap before considering this task complete.
+
 ```python
 source_updates = {
+    "bucket-b-ccd": "3 of ~14 Bucket B (CCD+UC) sources returning 404/minimal content as of "
+                     "2026-06-29: Foothill-De Anza CCD (fhda.edu/administration/purchasing/ -> 404), "
+                     "San Mateo County CCD (smccd.edu/.../purchasingbids/ -> 404), Contra Costa CCD "
+                     "(4cd.edu/.../BidOpportunities.aspx -> minimal content). URLs likely changed; "
+                     "needs adaptive recovery (search each district's current procurement page URL "
+                     "and update), per cfb70ad7. Resolve cfb70ad7 once updated.",
     "cal-eprocure": "confirmed chronically unreliable across 3+ cycles (502/timeout/403); "
                      "de-prioritize or switch to FI$Cal SCPRS search API once Task 8.7's "
                      "HigherGov/SAM.gov REST feeds land, per f5ca8653/c0f74915",
