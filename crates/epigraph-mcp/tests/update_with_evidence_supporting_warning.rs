@@ -32,6 +32,7 @@ async fn run_update(
             source_url: None,
             supports,
             strength,
+            labels: Vec::new(),
         },
     )
     .await
