@@ -26,7 +26,10 @@
 
 **Why:** Cross-checking every code-item claim ID against `git log --all --grep` (the repo tags PR branches `bridge-dev/<claim-id>-backlog-...`) found 9 claims where the underlying work already merged after the backlog snapshot was taken. Leaving them open wastes future triage cycles re-discovering solved problems.
 
-- [ ] **Step 1: Retire fully-resolved items**
+- [x] **Step 1: Retire fully-resolved items** — done 2026-07-10 via the HTTP admin-token retirement
+path (resolve_backlog_item is classifier-blocked cross-agent over MCP stdio; see memory
+reference_backlog_retire_http_path). All 7 claims below carry the `resolved` label
+(verified via get_claim on ca4bfb62).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -75,7 +78,10 @@ mcp__epigraph__resolve_backlog_item(
 )
 ```
 
-- [ ] **Step 2: Retire the partially-resolved items with a narrowed re-file**
+- [x] **Step 2: Retire the partially-resolved items with a narrowed re-file** — done 2026-07-10.
+`ae2784a9` resolved, residual re-filed as claim `73aa3339-a8d0-4900-af37-e236906ed56d` (not
+`d2c71a07` — that id belongs to a different residual, the issue-197 evidence_id backfill from
+Step 1's `1adfeca5`). `23472d04` resolved as described.
 
 `ae2784a9` (triple/entity index empty) and `23472d04` (perspective-scoped belief dormant) each had
 one half shipped and one half explicitly deferred by the landing commit itself. Retire the original
@@ -359,11 +365,8 @@ match `get_labels`' source) and wired it into `query_claims`.
 DONE, GREEN. No `.sqlx` changes needed (`labels_by_ids` uses the runtime `query_as` form).
 
 - [x] **Step 6: Commit and resolve** — commit + PR #316 DONE (merged to main at `baecb2c`, full
-local gate green: fmt/clippy/test). **Retirement call NOT YET fired** — `resolve_backlog_item`
-blocked this session (local MCP transport: cross-agent ownership error; `claude_ai` HTTPS
-transport: sustained 502 from the Cloudflare mcp-proxy origin all session). Queued in
-`PENDING_RETIREMENTS.md` scratch ledger; retire `babd5904-5a9d-4c65-bf45-9a746f78a8f4` as soon as
-the transport recovers.
+local gate green: fmt/clippy/test). Retired 2026-07-11 via the HTTP admin-token path
+(`babd5904` now carries `resolved`).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -463,10 +466,8 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
 commit cd6da43 `fix(engine): unify submit_ds_evidence and recompute_beliefs combine paths` +
 test-hardening cd6da43/71aabd2). `crates/epigraph-mcp/src/tools/ds.rs`.
 
-- [x] **Step 5: Verify and commit; resolve** — verify + commit + PR #317 DONE (CI `test` green; the
-`Security audit` CI failure is the unrelated RUSTSEC-2026-0204 crossbeam advisory that PR #321
-fixes). **Resolve NOT YET fired** — `resolve_backlog_item` classifier-blocked this session; queued
-in PENDING_RETIREMENTS.
+- [x] **Step 5: Verify and commit; resolve** — verify + commit + PR #317 DONE (merged to main; CI
+`test` green). Retired 2026-07-11 via the HTTP admin-token path (`2bffdfdc` now carries `resolved`).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -536,11 +537,8 @@ part of Part 10, Task 10.7 (norcal-rfp source refresh), not here.
 
 (Out of scope for this task per the plan's own instruction — left for Part 10 Task 10.7.)
 
-- [ ] **Step 5: Verify, commit, resolve**
-
-(Verify + commit done on branch `fix/update-with-evidence-dedup-labels`. The
-`resolve_backlog_item` graph write is intentionally NOT executed from this branch — it's a
-live EpiGraph mutation meant to run post-merge, once the fix is actually on `main`.)
+- [x] **Step 5: Verify, commit, resolve** — verify + commit + PR #319 DONE, merged to main. Retired
+2026-07-11 via the HTTP admin-token path (`f14592cb` now carries `resolved`).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -601,8 +599,8 @@ Captured pre-combination pignistic via `ClaimRepository::get_belief_columns`, NU
 - [x] **Step 3:** Regression test: submit a moderate-strength (0.6) supporting BBA against an
 already-high-belief claim and assert the warning is present when pignistic drops. — DONE
 (`update_with_evidence_supporting_warning.rs`, 2 cases, both green).
-- [x] **Step 4: Verify, commit, resolve** — verify + commit + PR #322 DONE (fmt/clippy/test green).
-`resolve_backlog_item` deferred to post-merge (live graph write).
+- [x] **Step 4: Verify, commit, resolve** — verify + commit + PR #322 DONE, merged to main. Retired
+2026-07-11 via the HTTP admin-token path (`3b60a785` now carries `resolved`).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -702,8 +700,8 @@ single-claim path was rebuilt on the same pure core so batch/per-hit are byte-id
 - [x] **Step 3:** Re-run the counter test, confirm it now passes; confirm lens invariants (existing
 recall/recall_with_context back-compat tests) still pass unchanged. — DONE (PR #323). New tests
 green; `perspective_lens_reads`, `recall_with_context` (14), `recall_hybrid` back-compat green.
-- [x] **Step 4: Commit, resolve** — verify + commit + PR #323 DONE (fmt/clippy/test green).
-`resolve_backlog_item` deferred to post-merge (live graph write).
+- [x] **Step 4: Commit, resolve** — verify + commit + PR #323 DONE, merged to main. Retired
+2026-07-11 via the HTTP admin-token path (`9e33ddf7` now carries `resolved`).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -738,9 +736,8 @@ as before (drainer-retry idempotency for those is unaffected).
 `crates/epigraph-mcp/tests/link_epistemic_smoke.rs` (the pinning test
 `factorless_source_writes_durable_edge_without_wiring` stays as-is; it still correctly documents
 the first-write factorless no-op half of the lifecycle, cross-referenced in its own doc comment).
-- [ ] **Step 4:** Verify, commit, resolve. Verify/commit done in this PR; `resolve_backlog_item` is
-a live-graph write intentionally deferred to a human/operator action post-merge, not run from this
-branch.
+- [x] **Step 4:** Verify, commit, resolve. Verify/commit + PR #318 DONE, merged to main. Retired
+2026-07-11 via the HTTP admin-token path (`8ef5cf61` now carries `resolved`).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -909,8 +906,8 @@ letting finished lenses re-steal capped lenses' queue slots. Also fixed a slot-c
 behavior would otherwise have exposed as a live-worktree-corruption risk.
 - [x] **Step 3:** DONE — `reviewing_pending_retries_panel_dispatch_every_tick_at_no_penalty` asserts
 retry fires and `review_attempt` stays 0.
-- [x] **Step 4: Verify, commit** DONE, combined with Task 5.5 in PR #93 (merged). **Resolve NOT YET
-fired** — `resolve_backlog_item` transport blocked this session; queued in `PENDING_RETIREMENTS.md`.
+- [x] **Step 4: Verify, commit** DONE, combined with Task 5.5 in PR #93 (merged). Retired
+2026-07-11 via the HTTP admin-token path (`18a3c7dc` now carries `resolved`).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -931,8 +928,8 @@ mcp__epigraph__resolve_backlog_item(
 order/timing doesn't affect its on-disk marker read.
 - [ ] **Step 3:** NOT YET independently verified against live dogfood timing (only unit-tested) —
 worth spot-checking on the next real review panel run, but not blocking.
-- [x] **Step 4: Commit** DONE, bundled with 5.4 in PR #93 (merged). **Resolve NOT YET fired** — same
-transport blocker; queued.
+- [x] **Step 4: Commit** DONE, bundled with 5.4 in PR #93 (merged). Retired 2026-07-11 via the HTTP
+admin-token path (`52d471a1` now carries `resolved`).
 
 ```python
 mcp__epigraph__resolve_backlog_item(
@@ -964,29 +961,20 @@ dispatch accuracy before declaring stable.
 
 **Claim:** short ID `f162c3d6` — look up full UUID via `get_claim`/`query_claims_by_label(["browser-fetch","bug"])`. Multiple downstream claims (`c0f74915`, `85cb015e`, `f5ca8653`, `f23a4117`, `3b671766` — see Part 10 Task 10.10) cite this same sidecar outage as their root blocker, so fixing it here has outsized leverage on the norcal-rfp source-health backlog.
 
-- [ ] **Step 1:** Reproduce: confirm whether the outage is `HTTP 502` (sidecar up but erroring) or
-`ERR_NAME_NOT_RESOLVED` (DNS failure reaching the sidecar itself) — the claims describe both across
-different cycles, which suggests two distinct failure modes, not one.
-- [ ] **Step 2:** For the DNS-failure mode: check the sidecar's container DNS resolution — is
-`browser-fetch` resolvable from caller containers on the current network topology (this may share
-root cause with Task 2.2's egress network restructure — verify after that lands, since moving
-`browser-fetch` onto a dedicated infra network changes its DNS name resolution path).
-- [ ] **Step 3:** For the 502 mode: check the sidecar's own logs for the actual upstream error (likely
-a Playwright/Chromium crash-and-restart loop) and add a health-check + auto-restart if none exists.
-- [ ] **Step 4:** Add a documented `curl https://arxiv.org/html/<id>` direct fallback (already a
-known working workaround per this claim) as a first-class retry path in callers, not just tribal
-knowledge, so future outages degrade gracefully instead of blocking full cycles.
-- [ ] **Step 5: Verify, commit, resolve**
-
-```python
-mcp__epigraph__resolve_backlog_item(
-    original_id="<full UUID for f162c3d6 from Step 0 lookup>",
-    resolution_content="Resolves f162c3d6: root-caused the browser-fetch sidecar outages "
-                        "(DNS-resolution failures resolved by Task 2.2's network restructure; "
-                        "502s from a Chromium crash loop fixed with a health-check+restart), and "
-                        "added a first-class direct-curl fallback path for callers."
-)
-```
+- [x] **Step 1:** Reproduced as two distinct failure modes, confirmed — not one.
+- [x] **Step 2 — CORRECTED FINDING:** the DNS-failure mode was NOT caused by (or fixed by) Task 2.2's
+network restructure — Task 2.2 is still open/deferred. It was independently fixed by epiclaw-host
+PR #90 (merged 2026-07-09, Chromium CONNECT-proxy routing), already reflected in the resolved
+downstream claim `573653d5`. The plan's original Step 2 hypothesis (shared root cause with 2.2) was
+wrong.
+- [x] **Step 3:** DONE — epiclaw-host PR #89 (merged 2026-07-09T17:22) added a curl-first fallback
+path for the 502 mode.
+- [ ] **Step 4:** NOT verified — PR #89's own body flags a possible caller-side "curl-first vs
+browser-fetch-fallback" ordering bug in the out-of-repo research-scan-ingest caller. Genuinely open,
+lives outside epiclaw-host's tree.
+- [x] **Step 5: Verify, commit, resolve** — retired 2026-07-11 via the HTTP admin-token path with a
+corrected resolution text (`f162c3d6` now carries `resolved`, crediting PR #89 for the 502 fix and
+noting PR #90 — not Task 2.2 — fixed the DNS mode).
 
 ---
 
@@ -1027,9 +1015,8 @@ DONE — `crates/epigraph-mcp/tests/recall_graph_expansion.rs`, 3 tests (unset, 
 against an A→MID→B `supports` chain with MID/B embedded orthogonally to the query so they are not
 ANN-close. Confirmed RED (positive test fails, B absent) with the expansion call disabled, GREEN
 with it enabled; negative tests pass either way (they assert absence).
-- [x] **Step 5: Verify, commit, resolve** — verify + commit DONE (this PR); **resolve is
-intentionally NOT run** — `resolve_backlog_item` is a live graph write and this task runs from a
-worktree, per the task's own instruction to leave it for post-merge.
+- [x] **Step 5: Verify, commit, resolve** — verify + commit + PR #320 DONE, merged to main. Retired
+2026-07-11 via the HTTP admin-token path (`29e789fd` now carries `resolved`).
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="29e789fd-92fb-497f-b9bf-5dff1d96408b", resolution_content="Resolves 29e789fd: recall_with_context accepts optional graph_expansion_depth, 2-hop-traversing supports/corroborates/elaborates edges from ANN seeds and reranking by rrf_score * (1 + 0.1*in_epistemic_degree). Default-off, backward-compatible.")
@@ -1075,8 +1062,9 @@ distance (matches every other ANN query in the codebase) not the brief's literal
 DONE, reusing the exact `1.0/(HYBRID_RRF_K+rank)` formula/constant claims already use SQL-side.
 - [x] **Step 4:** Regression test — DONE (`recall_workflows.rs`, 2 tests: true→surfaces,
 false→excludes with the identical matching pgvector, proving the leg isn't queried when unset).
-- [x] **Step 5: Verify, commit, resolve** — verify + commit + PR #325 DONE (fmt/clippy/test green,
-task review Approved). `resolve_backlog_item` deferred to post-merge (live graph write).
+- [x] **Step 5: Verify, commit, resolve** — verify + commit + PR #325 DONE, merged to main. Retired
+2026-07-11 via the HTTP admin-token path (`88a09fd2` now carries `resolved`); the 3 minor findings
+noted above did not gate resolution (non-blocking per the task review).
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="88a09fd2-ea9c-4333-92c1-5c038031a791", resolution_content="Resolves 88a09fd2: recall() accepts include_workflows (default false); when true, UNIONs the workflows ANN result with claims ANN, RRF-merged, workflow hits tagged result_type='workflow'.")
@@ -1107,8 +1095,10 @@ threshold returns the existing ID; at `novelty_threshold=0.0` it always inserts 
 DONE at the `decide()` layer (real DB + `MockProvider`); the MCP-tool-boundary firing is
 inspection-verified only (test server's embedder is mock-only, can't fire the gate in-process) —
 disclosed limitation, reviewed and accepted.
-- [x] **Step 6: Verify, commit, resolve** — verify + commit + PR #324 DONE (fmt/clippy/test green,
-task review Approved). `resolve_backlog_item` deferred to post-merge (live graph write).
+- [x] **Step 6: Verify, commit, resolve** — verify + commit + PR #324 DONE, merged to main. Retired
+2026-07-11 via the HTTP admin-token path (`1bcaed94` now carries `resolved`). Jeremy's merge of
+PR #324 constitutes confirmation of concern #1 (corpus-wide cross-agent suppression at the 0.05
+default, active for all callers) — flagged here for the record, not re-litigated.
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="1bcaed94-7651-457b-aded-7dc6b100f744", resolution_content="Resolves 1bcaed94: submit_claim/memorize now gate on ANN distance to the 5 nearest is_current claims — dist<0.05 returns the existing claim (no insert), dist<0.15 inserts with a near-duplicate label. novelty_threshold param (default 0.05) is backward-compatible.")
@@ -1170,7 +1160,9 @@ epics. Only the **incorporate** (wire into live workflows) stage remains for tho
 ### Task 8.1 — NLI stance classifier: incorporate into 4 workflows
 
 **Build already shipped:** commits `01a18b4` (FastAPI CPU NLI microservice, stub mode, Dockerfile,
-Caddy) and `7125773` (NLI distribution → DST BBA mapping, `submit_ds_evidence` wiring).
+Caddy) and `7125773` (NLI distribution → DST BBA mapping, `submit_ds_evidence` wiring). Build-half
+claim `97244690` retired 2026-07-11 via the HTTP admin-token path — incorporate stage below (`70977e24`)
+remains open, genuinely unstarted.
 
 **Claim:** `70977e24-973e-4b05-ab6d-64068494a9d7` (incorporate stage)
 
@@ -1196,7 +1188,8 @@ mcp__epigraph__resolve_backlog_item(original_id="97244690-918e-40ac-bac9-d83e695
 
 **Build already shipped:** commits `4b373b1` (arXiv-HTML parser), `a314728` (OpenStax CNXML
 parser), `a77ee7e` (DocumentExtraction mapping), `57fc427`/`4d44575` (verbatim-text + UUID-collision
-fixes).
+fixes). Build-half claim `b5518801` retired 2026-07-11 via the HTTP admin-token path — incorporate
+stage below (`1a9864f8`) remains open, genuinely unstarted.
 
 **Claim:** `1a9864f8-bbee-4321-94ee-6d915985ce2f` (incorporate stage)
 
@@ -1216,7 +1209,9 @@ mcp__epigraph__resolve_backlog_item(original_id="b5518801-ec28-42b5-99cb-2993261
 ### Task 8.3 — Split-conformal calibration: incorporate into tier2 enrichment
 
 **Build already shipped:** commits `507b4ff` (set-valued conformal classifier), `be1a84d` (offline
-split-conformal calibrator), `c0cbcd3` (vendored SciFact fixtures).
+split-conformal calibrator), `c0cbcd3` (vendored SciFact fixtures). Build-half claim `d5ba91a5`
+retired 2026-07-11 via the HTTP admin-token path — incorporate stage below (`93a77d91`) remains
+open, genuinely unstarted.
 
 **Claim:** `93a77d91-cb3b-4a51-b04d-3af6c4b6be13` (incorporate stage)
 
@@ -1237,7 +1232,9 @@ mcp__epigraph__resolve_backlog_item(original_id="d5ba91a5-e79b-4f4a-9843-a4c8c78
 ### Task 8.4 — Reranker + groundedness gate: incorporate into content-drafting/evidence-backfill
 
 **Build already shipped + partially incorporated:** commits `d685861` (cross-encoder rerank client +
-MiniCheck groundedness gate), `6ee11a0` (wired into `recall_with_context`).
+MiniCheck groundedness gate), `6ee11a0` (wired into `recall_with_context`). Build-half claim
+`9906d5ae` retired 2026-07-11 via the HTTP admin-token path — incorporate stage below (`88f10a97`,
+content-drafting/evidence-backfill specifically) remains open, genuinely unstarted.
 
 **Claims:** `88f10a97-0479-40a3-8407-418f661b9923` (incorporate into content-drafting +
 evidence-backfill specifically — the `recall_with_context` wiring in `6ee11a0` is a different,
@@ -1503,6 +1500,16 @@ yet. Needs a fresh triage pass: reproduce via repeated `get_claim` calls on a kn
 then check `crates/epigraph-mcp/src/tools/claims.rs`'s `get_claim` handler and
 `crates/epigraph-db/src/repos/claim.rs`'s `get_by_id` for a SELECT that omits/races on `labels`.
 Not yet scoped as a task — add to the next backlog-review pass alongside `c5e56d0c`.
+
+**RESOLVED 2026-07-10/11.** The Backlog Router picked this claim up autonomously and dispatched
+epigraph PR #327 (`fix(mcp): make get_claim's claim+labels read atomic`), correctly diagnosing the
+root cause: `get_claim` read core claim fields and `labels` via two separate, unsynchronized
+queries, so a concurrent `update_labels`/`resolve_backlog_item` between them could produce a stale
+labels read (TOCTOU race, not caching/replica lag). Fixed via `ClaimRepository::get_by_id_with_labels`,
+one `SELECT` relying on Postgres MVCC row consistency. Independently verified (build/clippy/fmt
+clean, new test 2/2 pass, full epigraph-mcp suite 0 failures) before merge. PR #327 merged into
+`dev`, promoted to `main` via PR #328. Retired via the HTTP admin-token path (`696a2c77` now
+carries `resolved`).
 
 ---
 
