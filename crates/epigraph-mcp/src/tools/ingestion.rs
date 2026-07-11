@@ -666,6 +666,13 @@ pub async fn do_ingest_document(
     })
 }
 
+/// Convert a DOI into a slug form safe for use as a URL path segment or
+/// canonical name: every `/` becomes `-`. Casing is left untouched.
+#[allow(dead_code)] // not yet wired into a caller; covered by unit tests below
+fn doi_to_slug(doi: &str) -> String {
+    doi.replace('/', "-")
+}
+
 fn resolve_doi(extraction: &DocumentExtraction) -> String {
     if let Some(d) = &extraction.source.doi {
         return d.clone();
@@ -1147,5 +1154,18 @@ mod tests {
             .await
             .expect("gate query");
         assert_eq!(hit, Some(paper_id));
+    }
+
+    #[test]
+    fn doi_to_slug_replaces_slash() {
+        assert_eq!(
+            doi_to_slug("10.48550/arXiv.2606.04990"),
+            "10.48550-arXiv.2606.04990"
+        );
+    }
+
+    #[test]
+    fn doi_to_slug_replaces_all_slashes() {
+        assert_eq!(doi_to_slug("10.1000/xyz/123/abc"), "10.1000-xyz-123-abc");
     }
 }

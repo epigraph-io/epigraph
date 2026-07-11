@@ -332,13 +332,10 @@ pub async fn get_claim(
         crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
     }
 
-    let claim = ClaimRepository::get_by_id(&server.pool, claim_id)
+    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&server.pool, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
-    let labels = ClaimRepository::get_labels(&server.pool, claim_id)
-        .await
-        .map_err(internal_error)?;
     let access = check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
     let (content, content_hash) =
         crate::tools::redaction::redact_content(access, &claim.content, &claim.content_hash);
