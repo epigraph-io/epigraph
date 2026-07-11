@@ -19,9 +19,14 @@
 //!   canonical strings; `supersedes` is intentionally excluded — it has
 //!   dedicated semantics in `supersede_claim`),
 //! - idempotent on `(source, target, relationship)`: a re-hit returns the
-//!   existing edge with `was_created=false`, `belief_wired=false`, and performs
-//!   no re-wire (matching the HTTP route, where wiring only fires on first
-//!   creation).
+//!   existing edge with `was_created=false` and never re-creates the durable
+//!   edge row or re-emits `edge.added`. Belief wiring, however, is NOT gated
+//!   on `was_created` alone: a re-hit still attempts the wire, and
+//!   `belief_wired=true` on that re-hit exactly when no BBA has ever been
+//!   materialized for this edge_id AND the source now has a belief interval
+//!   — the "factorless source wakes up later" case (backlog claim
+//!   8ef5cf61-7382-43a4-85cb-565d76ba3f06). Once a BBA exists for the edge,
+//!   further re-hits are stable no-ops again (`belief_wired=false`).
 //!
 //! Deferred vs the HTTP route (tracked as follow-ups): per-edge provenance
 //! recording, 1-hop `propagate_to_dependents` (an HTTP-only concern per the
@@ -143,46 +148,55 @@ pub async fn do_link_epistemic(
     .await
     .map_err(internal_error)?;
 
-    // Belief wiring only fires on first creation (mirrors the HTTP route, where
-    // an idempotent re-hit returns the stored row and never re-wires).
+    // Belief wiring fires whenever no BBA has ever been materialized for this
+    // edge yet — NOT simply on first creation. An edge can be written durably
+    // while its source is "factorless" (no belief interval); if the source
+    // later acquires belief and the SAME edge is re-asserted, `was_created`
+    // is `false` on that call but the wake-up must still fire (backlog claim
+    // 8ef5cf61-7382-43a4-85cb-565d76ba3f06). `auto_wire_edge_if_epistemic`
+    // itself resolves the "already wired?" check (via
+    // `MassFunctionRepository::exists_for_perspective`) and is a no-op once a
+    // BBA exists for this edge_id, so it's safe to attempt on every call.
     //
     // The BBA is attributed to the SOURCE claim's agent_id ("A's author asserts
     // A SUPPORTS B"), NOT the caller — exactly as the HTTP wrapper
     // `trigger_edge_ds_recomputation` does. Resolved here via a runtime query
     // (no `query!` macro → zero .sqlx offline-data churn).
     let mut belief_wired = false;
+    let source_agent_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(source_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(internal_error)?;
+
+    if let Some(agent_id) = source_agent_id {
+        // Best-effort: a recompute error must not lose the durable edge.
+        // `belief_wired` is true ONLY when the engine actually materialized
+        // a BBA and recomputed the target (`Wired`). The other outcomes
+        // (SourceFactorless / Vacuous / NonEpistemic / already-wired / None-on-error)
+        // move no belief, so we honestly report `belief_wired=false`.
+        let outcome = auto_wire_edge_if_epistemic(
+            pool,
+            was_created,
+            edge_row.id,
+            source_id,
+            "claim",
+            target_id,
+            "claim",
+            &params.relationship,
+            agent_id,
+        )
+        .await;
+        belief_wired = matches!(outcome, Some(EdgeFactorOutcome::Wired));
+    }
+
     if was_created {
-        let source_agent_id: Option<uuid::Uuid> =
-            sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
-                .bind(source_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(internal_error)?;
-
-        if let Some(agent_id) = source_agent_id {
-            // Best-effort: a recompute error must not lose the durable edge.
-            // `belief_wired` is true ONLY when the engine actually materialized
-            // a BBA and recomputed the target (`Wired`). The other outcomes
-            // (SourceFactorless / Vacuous / NonEpistemic / None-on-error) move
-            // no belief, so we honestly report `belief_wired=false`.
-            let outcome = auto_wire_edge_if_epistemic(
-                pool,
-                true, // was_created already gated above
-                edge_row.id,
-                source_id,
-                "claim",
-                target_id,
-                "claim",
-                &params.relationship,
-                agent_id,
-            )
-            .await;
-            belief_wired = matches!(outcome, Some(EdgeFactorOutcome::Wired));
-        }
-
         // Emit the durable `edge.added` event (best-effort; never fail the call
         // on a publish error). Actor = the MCP signer agent, mirroring
-        // `emit_tool_invoked`'s actor resolution.
+        // `emit_tool_invoked`'s actor resolution. Scoped to genuine creation
+        // only — a re-assertion of an existing edge (including a wake-up
+        // wire) must not re-emit `edge.added`.
         let actor_id = server.agent_id().await.ok();
         let _ = EventRepository::publish_or_log(
             pool,

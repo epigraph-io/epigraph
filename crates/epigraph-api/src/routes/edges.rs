@@ -127,7 +127,8 @@ pub fn is_valid_relationship(s: &str) -> bool {
     VALID_RELATIONSHIPS.contains(&s)
 }
 
-/// Trigger DS recomputation on the target claim when an epistemic edge is created.
+/// Trigger DS recomputation on the target claim when an epistemic edge is
+/// created OR re-asserted.
 ///
 /// Delegates to `epigraph_engine::edge_factor::auto_wire_edge_if_epistemic`,
 /// which uses the canonical `binary_truth` frame and the `RestrictionKind`
@@ -135,12 +136,26 @@ pub fn is_valid_relationship(s: &str) -> bool {
 /// 1-hop propagation to dependents (reasoning-trace input chain) — an
 /// HTTP-only concern that doesn't belong in the engine factor module.
 ///
+/// `was_created` is passed straight through to the engine gate rather than
+/// hardcoded — the engine no longer gates wiring on "was this edge just
+/// created" alone. An edge can be written durably while its source is
+/// "factorless" (no belief interval), and a LATER re-assertion of the same
+/// (source, target, relationship) — `was_created=false` since the edge
+/// already exists — must still wake up and wire once the source has since
+/// acquired belief (backlog claim 8ef5cf61-7382-43a4-85cb-565d76ba3f06).
+/// `auto_wire_edge_if_epistemic` self-gates on "does a BBA already exist for
+/// this edge_id", so calling it on every dedup hit is safe/idempotent: an
+/// already-wired edge is a no-op re-check (one `SELECT EXISTS`), not a
+/// re-wire.
+///
 /// BBA attribution: the source claim's `agent_id` is used as the BBA's
 /// `source_agent_id`, mirroring the legacy semantics ("A's author asserts
 /// A SUPPORTS B").
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn trigger_edge_ds_recomputation(
     pool: &sqlx::PgPool,
+    was_created: bool,
     edge_id: uuid::Uuid,
     source_claim_id: uuid::Uuid,
     target_claim_id: uuid::Uuid,
@@ -164,7 +179,7 @@ async fn trigger_edge_ds_recomputation(
 
     let outcome = auto_wire_edge_if_epistemic(
         pool,
-        true, // caller already gated on was_created
+        was_created,
         edge_id,
         source_claim_id,
         source_type,
@@ -176,8 +191,8 @@ async fn trigger_edge_ds_recomputation(
     .await;
 
     // Only propagate when we actually wired a factor — the other outcomes
-    // (Vacuous / SourceFactorless / NonEpistemic / wrapper-gate skip) leave
-    // target belief unchanged so dependents don't need recomputing.
+    // (Vacuous / SourceFactorless / NonEpistemic / already-wired / wrapper-gate
+    // skip) leave target belief unchanged so dependents don't need recomputing.
     if !matches!(outcome, Some(EdgeFactorOutcome::Wired)) {
         return Ok(());
     }
@@ -541,10 +556,47 @@ pub async fn create_edge(
         valid_to: edge_row.valid_to,
     };
 
-    // ── Side effects: only run when we actually created a new edge ──
-    // A dedup hit (was_created=false) is by design semantically idempotent;
-    // re-running provenance / DS / events would defeat the whole purpose of
-    // if_not_exists for drainer retries.
+    // Edge-triggered DS recomputation. Deliberately OUTSIDE the `if
+    // was_created` block below: an edge can be written durably while its
+    // source is "factorless" (no belief interval yet), and a later
+    // re-assertion of the SAME edge (a dedup hit, `was_created=false`) must
+    // still wake up and wire once the source has since acquired belief
+    // (backlog claim 8ef5cf61-7382-43a4-85cb-565d76ba3f06) — otherwise the
+    // wake-up is a permanent no-op. `trigger_edge_ds_recomputation` /
+    // `auto_wire_edge_if_epistemic` self-gate on "does a BBA already exist
+    // for this edge_id", so calling this on every dedup hit is safe: an
+    // already-wired edge is a cheap no-op re-check, not a re-wire — drainer
+    // retries stay idempotent. The engine self-filters via
+    // `RestrictionKind::Neutral` on non-epistemic relationships, so the
+    // wrapper handles all 13 epistemic types (supports/corroborates/
+    // contradicts/refutes/refines/...) instead of just the 4 evidentials.
+    if let Err(e) = trigger_edge_ds_recomputation(
+        pool,
+        was_created,
+        edge_id,
+        request.source_id,
+        request.target_id,
+        &request.source_type,
+        &request.target_type,
+        &request.relationship,
+    )
+    .await
+    {
+        tracing::warn!(
+            edge_id = %edge_id,
+            source_id = %request.source_id,
+            target_id = %request.target_id,
+            relationship = %request.relationship,
+            error = %e,
+            "Edge-triggered DS recomputation failed; edge created successfully"
+        );
+    }
+
+    // ── Remaining side effects: only run when we actually created a new edge ──
+    // A dedup hit (was_created=false) is by design semantically idempotent for
+    // these; re-running provenance / factor-creation / events would defeat the
+    // whole purpose of if_not_exists for drainer retries. DS recomputation
+    // (above) is the one exception — see its comment for why.
     if was_created {
         // Record provenance when OAuth2-authenticated
         if let Some(axum::Extension(ref auth)) = auth_ctx {
@@ -567,31 +619,6 @@ pub async fn create_edge(
             {
                 tracing::warn!(edge_id = %edge_id, error = %e, "Failed to record edge provenance");
             }
-        }
-
-        // Edge-triggered DS recomputation. The engine self-filters via
-        // `RestrictionKind::Neutral` on non-epistemic relationships, so the
-        // wrapper handles all 13 epistemic types (supports/corroborates/
-        // contradicts/refutes/refines/...) instead of just the 4 evidentials.
-        if let Err(e) = trigger_edge_ds_recomputation(
-            pool,
-            edge_id,
-            request.source_id,
-            request.target_id,
-            &request.source_type,
-            &request.target_type,
-            &request.relationship,
-        )
-        .await
-        {
-            tracing::warn!(
-                edge_id = %edge_id,
-                source_id = %request.source_id,
-                target_id = %request.target_id,
-                relationship = %request.relationship,
-                error = %e,
-                "Edge-triggered DS recomputation failed; edge created successfully"
-            );
         }
 
         // P2a: Auto-create factor for epistemic edges

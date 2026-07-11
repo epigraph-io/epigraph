@@ -300,6 +300,38 @@ impl MassFunctionRepository {
         Ok(rows)
     }
 
+    /// Whether any mass function row has already been materialized for the
+    /// given `perspective_id`.
+    ///
+    /// Edge-factor BBAs (see `epigraph_engine::edge_factor::auto_wire_ds_for_edge`)
+    /// are persisted with `perspective_id = edge_id`, so this doubles as
+    /// "has this edge ever been wired" — the existence check the
+    /// edge-creation wake-up gate (backlog 8ef5cf61) uses to decide whether
+    /// a re-asserted edge should attempt wiring even when `was_created` is
+    /// `false` (e.g. the source claim was factorless on first write and has
+    /// since acquired a belief interval).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn exists_for_perspective(
+        pool: &PgPool,
+        perspective_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM mass_functions WHERE perspective_id = $1
+            )
+            "#,
+        )
+        .bind(perspective_id)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(exists)
+    }
+
     /// Delete all mass functions for a claim
     ///
     /// Returns the number of rows deleted.
