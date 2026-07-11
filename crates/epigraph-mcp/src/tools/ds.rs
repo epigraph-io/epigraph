@@ -172,63 +172,62 @@ pub async fn submit_ds_evidence(
     .await
     .map_err(internal_error)?;
 
-    // Retrieve all BBAs for combination
-    let all_bbas = MassFunctionRepository::get_for_claim_frame(&server.pool, claim_id, frame_id)
+    // Count stored BBAs for the response (bba_count is informational only).
+    let bba_count = MassFunctionRepository::get_for_claim_frame(&server.pool, claim_id, frame_id)
+        .await
+        .map_err(internal_error)?
+        .len();
+
+    // Combine + persist the claim's cached belief via the SAME code path
+    // `recompute_beliefs` uses (`recompute_claim_belief_on_frame` ->
+    // `recompute_combined_belief`), instead of re-deriving it here with a
+    // second, divergent implementation. Backlog 2bffdfdc: the old inline
+    // combine here used raw stored masses with no dynamic reliability
+    // discount and a fixed-method pairwise loop, while `recompute_beliefs`
+    // applies the issue-197 discount chain and adaptive rule selection —
+    // same BBA rows, two different answers. Delegating here makes the two
+    // tools compute identically by construction.
+    //
+    // `params.combination_method`, `params.gamma`, and `params.hypothesis_index`
+    // no longer influence the stored/returned belief: the shared recompute
+    // path always resolves method adaptively (via `combine_multiple`) and
+    // targets hypothesis index 0 (the canonical binary_truth convention).
+    // This is the accepted consequence of unification, not a follow-up bug.
+    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(&server.pool, claim_id, frame_id)
         .await
         .map_err(internal_error)?;
 
-    // Combine all BBAs
-    let gamma = params.gamma;
-    let combined = if all_bbas.len() <= 1 {
-        mass_fn.clone()
-    } else {
-        let mut mass_fns = Vec::new();
-        for row in &all_bbas {
-            let mf = parse_masses_json(&frame, &row.masses)?;
-            mass_fns.push(mf);
-        }
-        let mut result = mass_fns[0].clone();
-        for mf in &mass_fns[1..] {
-            result = combine_two(&result, mf, method, gamma)?;
-        }
-        result
-    };
-
-    // Compute belief/plausibility for the hypothesis
-    let target = FocalElement::positive(BTreeSet::from([params.hypothesis_index as usize]));
-    let bel = epigraph_ds::measures::belief(&combined, &target);
-    let pl = epigraph_ds::measures::plausibility(&combined, &target);
-    let ign = pl - bel;
-    let betp =
-        epigraph_ds::measures::pignistic_probability(&combined, params.hypothesis_index as usize);
-
-    let conflict = combined.mass_of_conflict();
-    let missing = combined.mass_of_missing();
-
-    // Update claim's DS columns
-    MassFunctionRepository::update_claim_belief(
-        &server.pool,
-        claim_id,
-        bel,
-        pl,
-        conflict,
-        Some(betp),
-        missing,
+    // Read back exactly what the shared recompute path just wrote, so the
+    // response can never drift from what a later `recompute_beliefs` call
+    // (with no new evidence) would produce.
+    let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing): (
+        f64,
+        f64,
+        f64,
+        Option<f64>,
+        f64,
+    ) = sqlx::query_as(
+        "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing
+         FROM claims WHERE id = $1",
     )
+    .bind(claim_id)
+    .fetch_one(&server.pool)
     .await
     .map_err(internal_error)?;
+    let betp = pignistic_prob.unwrap_or(0.0);
+    let ign = plausibility - belief;
 
     success_json(&DsEvidenceResponse {
         mass_function_id: mf_id.to_string(),
         claim_id: claim_id.to_string(),
         frame_id: frame_id.to_string(),
-        belief: bel,
-        plausibility: pl,
+        belief,
+        plausibility,
         ignorance: ign,
         pignistic_prob: betp,
-        mass_on_conflict: conflict,
-        mass_on_missing: missing,
-        bba_count: all_bbas.len() as i64,
+        mass_on_conflict: mass_on_empty,
+        mass_on_missing,
+        bba_count: bba_count as i64,
         method_used: method_name,
     })
 }
