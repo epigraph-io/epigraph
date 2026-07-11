@@ -86,7 +86,8 @@ pub use repos::{
     RefreshTokenRepository, RefreshTokenRow, ResolvedStep, ScopedBeliefRepository,
     SecurityEventRepository, SecurityEventRow, SheafRepository, TaskRepository, TaskRow,
     TripleRepository, TripleRow, WorkflowExecutionRepository, WorkflowExecutionRow,
-    WorkflowListRow, WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS,
+    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    EXPANSION_RELATIONSHIPS,
 };
 
 // Re-export sqlx types that users will need

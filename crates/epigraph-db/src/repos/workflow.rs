@@ -47,6 +47,19 @@ pub struct WorkflowListRow {
     pub properties: serde_json::Value,
 }
 
+/// One hit from [`WorkflowRepository::search_by_goal_embedding`] — the ANN
+/// leg `recall()` RRF-merges with its claims dense+lexical leg.
+///
+/// `similarity` is `1 - cosine_distance` in `[0, 1]`, matching the convention
+/// used by `ClaimEmbeddingHit`/`HybridHit.dense_similarity`.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct WorkflowGoalEmbeddingHit {
+    pub workflow_id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub similarity: f64,
+}
+
 /// Row type returned by `WorkflowRepository::search_hierarchical_by_text`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct HierarchicalWorkflowRow {
@@ -723,6 +736,43 @@ impl WorkflowRepository {
             .bind(limit)
             .fetch_all(pool)
             .await
+    }
+
+    /// ANN search over `workflows.goal_embedding` shaped for `recall()`'s
+    /// workflows leg: takes a pre-formatted pgvector literal (like
+    /// `ClaimRepository::search_hybrid_scoped`/`search_by_embedding_scoped`,
+    /// so callers reuse ONE query embedding across claims + workflows), and
+    /// returns `similarity = 1 - cosine_distance` per row so `recall` can
+    /// populate `RecallResult.similarity` the same way it does for claim
+    /// hits.
+    ///
+    /// Distinct from `find_hierarchical_by_embedding`: that helper takes
+    /// `&[f32]`, drops the distance/similarity column from its outer SELECT
+    /// (only used for existence/ordering, not surfaced), and carries
+    /// `resolve_to_latest`/threshold semantics recall doesn't need. This is
+    /// a lighter sibling: no truth-value floor here (recall applies its own
+    /// `min_truth` uniformly across claims + workflows after the merge, same
+    /// as it already does for claim hits).
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn search_by_goal_embedding(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        limit: i64,
+    ) -> Result<Vec<WorkflowGoalEmbeddingHit>, sqlx::Error> {
+        sqlx::query_as::<_, WorkflowGoalEmbeddingHit>(
+            "SELECT id AS workflow_id, goal AS content, truth_value, \
+                    (1 - (goal_embedding <=> $1::vector))::float8 AS similarity \
+             FROM workflows \
+             WHERE goal_embedding IS NOT NULL \
+             ORDER BY goal_embedding <=> $1::vector \
+             LIMIT $2",
+        )
+        .bind(query_embedding_pgvector)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
     }
 
     /// Write the embedding vector for a hierarchical workflow's goal text.
