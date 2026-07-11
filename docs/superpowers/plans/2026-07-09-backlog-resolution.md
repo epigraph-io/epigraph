@@ -904,6 +904,50 @@ re-diagnose `a422da87` (progress claim `f239dc24`) until PR #338 merges, at leas
 has produced a log (success or reproduced failure with full diagnostic detail), and a human has
 reviewed it — revisit ~2026-07-18.**
 
+**TEXTBOOK-DUPLICATE HYPOTHESIS TESTED 2026-07-11 (per Jeremy's direction) — CONFIRMED, refined from
+"flat vs. hierarchical ingestion" to "same agent, overlapping submissions, only some already
+decomposed."** Jeremy's hypothesis was that undecomposed backlog claims are duplicates of textbook
+content already ingested (and decomposed) earlier. `query_undecomposed_claims` probes across
+offsets 0/50k/100k/150k/199k show this backlog is **not uniform** — at least two structurally
+different clusters:
+
+- **Cluster A (agent `f741ab67`, 2026-02-18 to ~03-02, physics/chemistry/CBC-building-code textbook
+  facts):** hypothesis directly confirmed with a concrete pair. Undecomposed claim `25907a10`
+  ("Moment of inertia of a thin hollow spherical shell... I = (2/3)*M*R^2", created 2026-02-18) is a
+  content-duplicate of atom `20421580` ("The moment of inertia for a thin spherical shell... I =
+  (2/3)*M*R^2", created 2026-03-02), which already exists as a `decomposes_to` child of a *different*
+  compound claim `e515aa07` ("Moments of inertia for common shapes...", created 2026-02-20) —
+  **same agent (`f741ab67`) for all three**, confirmed via `get_claim`/`get_neighborhood`/
+  `get_provenance`. Not two ingestion pipelines — one content-generation agent submitted overlapping
+  physics facts multiple times (sometimes as standalone atomic claims, sometimes bundled into
+  compound claims that later got decomposed), and the still-undecomposed queue contains claims that
+  duplicate atoms that already exist under other claim IDs. This directly explains part of why the
+  backlog isn't draining: some fraction of the "218,629 undecomposed" count needs deduplication
+  against existing atoms, not an LLM decompose call.
+- **Cluster B (offset 150k+, heterogeneous `agent_id`s, disconnected trivia-style facts):** does
+  NOT fit the same story — no single source document, no obvious already-decomposed duplicate found
+  on spot-check. Left as a separate, still-open question — do not assume it shares Cluster A's cause.
+
+**Jeremy's decision (2026-07-11):** confirmed matches should be retired via `mark_duplicate`
+(soft-retire: `supersedes` + `is_current=false`, canonical claim untouched — matches this project's
+append-only ledger model, never hard delete). Scope for now: **Cluster A only**; Cluster B needs its
+own investigation before any action. Jeremy also flagged: don't assume "undecomposed" == "needs
+decomposition" — many may simply need dedup against content that already has decomposed atoms
+elsewhere.
+
+- [ ] **Step 6 (proposed, NOT yet built):** a dry-run sizing tool — for each Cluster-A-pattern
+undecomposed claim (agent `f741ab67`, and any other agents that show the same overlapping-submission
+signature once checked), run a pgvector similarity search against claims that are already sources or
+targets of a `decomposes_to` edge; report (not write) matches above a similarity threshold (start
+~0.85, tune against the confirmed pair's 0.75-0.91 range seen in `recall()` scoring) so the actual
+size of the "duplicate-of-already-decomposed" fraction can be measured across the full backlog
+before any `mark_duplicate` calls run at scale. One-off recall() calls per claim don't scale to
+200k+ rows — this wants a direct SQL/pgvector nearest-neighbor query (or a small Rust CLI following
+the `hypothesis`/`method_search` embedding-query pattern), not per-claim MCP calls. Needs Jeremy's
+review of the sizing report before any bulk `mark_duplicate` execution — threshold-based semantic
+dedup at this scale has real false-positive risk (distinct facts that are superficially similar,
+e.g. different shapes' moment-of-inertia formulas, must not get merged).
+
 ### Task 4.6 — Backfill stale cached BetP on 67 multi-BBA claims
 
 **Claim:** short ID `f2521c53` — look up the full UUID via `get_claim`/`query_claims_by_label(["belief-inflation"])` at execution time. This claim's acceptance criteria are already
