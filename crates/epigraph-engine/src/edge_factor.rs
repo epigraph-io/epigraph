@@ -353,6 +353,55 @@ pub async fn recompute_claim_belief_on_frame(
     Ok(true)
 }
 
+/// Write-free variant of [`recompute_claim_belief_on_frame`]: loads the frame
+/// and every BBA on (claim, frame), runs the identical discount+combine
+/// pipeline as [`recompute_combined_belief`], and returns the resulting
+/// scalars instead of writing them to `claims`.
+///
+/// Added for `epigraph-cli/src/bin/recompute_betp.rs`'s `--dry-run` mode: it
+/// needs to show "recomputed value if we wrote it" without mutating state.
+/// `recompute_claim_belief_on_frame` cannot be reused directly for that —
+/// each `epigraph-db` repo call borrows its own pooled connection, so
+/// wrapping the call in a caller-side transaction and rolling back does NOT
+/// prevent the write (the write lands on a different connection than the one
+/// the rollback applies to). Splitting the pure compute out of the write is
+/// the only reliable way to preview without a DB side effect.
+///
+/// Returns `Ok(None)` if the claim has no BBAs on `frame_id` (mirrors
+/// `recompute_claim_belief_on_frame`'s `Ok(false)`).
+///
+/// # Errors
+/// Same failure modes as [`recompute_claim_belief_on_frame`].
+pub async fn preview_claim_belief_on_frame(
+    pool: &PgPool,
+    claim_id: Uuid,
+    frame_id: Uuid,
+) -> Result<Option<CombinedBeliefPreview>, String> {
+    let row = FrameRepository::get_by_id(pool, frame_id)
+        .await
+        .map_err(|e| format!("frame get_by_id: {e}"))?
+        .ok_or_else(|| format!("frame {frame_id} not found"))?;
+    let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
+        .map_err(|e| format!("build frame {}: {e}", row.name))?;
+    compute_combined_belief(pool, claim_id, frame_id, &frame).await
+}
+
+/// Pure result of combining every BBA on a (claim, frame) pair: the same
+/// scalars [`recompute_combined_belief`] writes to `claims`, plus the CDST
+/// classification label when the frame is the canonical binary frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CombinedBeliefPreview {
+    pub belief: f64,
+    pub plausibility: f64,
+    pub pignistic_prob: f64,
+    pub conflict_k: f64,
+    pub missing_mass: f64,
+    /// CDST classification label, only computed on the canonical binary
+    /// frame (mirrors the `frame.id == BINARY_FRAME_NAME` gate in
+    /// `recompute_combined_belief`).
+    pub classification: Option<String>,
+}
+
 /// Compute the effective Shafer reliability discount for a single BBA
 /// at combine time.
 ///
@@ -638,17 +687,29 @@ fn warn_on_unknown_evidence_type_keys(
     }
 }
 
-async fn recompute_combined_belief(
+/// Pure compute half of the combine pipeline: load every BBA on (claim,
+/// frame), discount + combine, and derive the resulting Bel/Pl/BetP/
+/// conflict/missing scalars (plus the CDST classification label on the
+/// binary frame). Does not touch the database beyond the read-only loads
+/// (`mass_functions`, calibration, per-frame overrides).
+///
+/// Factored out of [`recompute_combined_belief`] so
+/// [`preview_claim_belief_on_frame`] can share the exact same combine
+/// pipeline (same calibration lookups, same reliability derivation, same
+/// classifier) without also performing the `UPDATE claims ...` write —
+/// see that function's doc comment for why a caller-side rolled-back
+/// transaction can't substitute for this split.
+async fn compute_combined_belief(
     pool: &PgPool,
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
-) -> Result<(), String> {
+) -> Result<Option<CombinedBeliefPreview>, String> {
     let all_rows = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
         .await
         .map_err(|e| format!("get_for_claim_frame: {e}"))?;
     if all_rows.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     // Phase 2 (issue #197): the combine path no longer trusts the
@@ -730,25 +791,12 @@ async fn recompute_combined_belief(
     let conflict = combined.mass_of_conflict();
     let missing = combined.mass_of_missing();
 
-    MassFunctionRepository::update_claim_belief(
-        pool,
-        claim_id,
-        bel,
-        pl,
-        conflict,
-        Some(betp),
-        missing,
-    )
-    .await
-    .map_err(|e| format!("update_claim_belief: {e}"))?;
-
     // CDST classification — a verdict on the COMBINED belief via the
     // deterministic BetP 7-rule cascade. Defined only on the canonical binary
     // {TRUE, FALSE} frame (supported = idx 0, contradicted = idx 1); other
-    // frames write the frame-agnostic belief scalars above but leave
-    // `claims.classification` untouched. Thresholds come from `calibration`
+    // frames leave classification unset. Thresholds come from `calibration`
     // (operator-tunable, same load as the discount path).
-    if frame.id == BINARY_FRAME_NAME {
+    let classification = if frame.id == BINARY_FRAME_NAME {
         let thresholds = &calibration.classifier_thresholds;
         // theta = closed-world full-frame ignorance m({0,1}); the open-world
         // missing mass is excluded (Smets TBM), matching the legacy
@@ -776,7 +824,49 @@ async fn recompute_combined_belief(
             has_opposing,
             thresholds,
         );
-        MassFunctionRepository::update_claim_classification(pool, claim_id, &label.to_string())
+        Some(label.to_string())
+    } else {
+        None
+    };
+
+    Ok(Some(CombinedBeliefPreview {
+        belief: bel,
+        plausibility: pl,
+        pignistic_prob: betp,
+        conflict_k: conflict,
+        missing_mass: missing,
+        classification,
+    }))
+}
+
+/// Write half of the combine pipeline: run [`compute_combined_belief`] and
+/// persist the result to `claims.{belief, plausibility, pignistic_prob,
+/// conflict_k, missing_mass}` (and `classification` on the binary frame).
+/// No-ops (does not write) when the claim has no BBAs on `frame_id`.
+async fn recompute_combined_belief(
+    pool: &PgPool,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    frame: &FrameOfDiscernment,
+) -> Result<(), String> {
+    let Some(preview) = compute_combined_belief(pool, claim_id, frame_id, frame).await? else {
+        return Ok(());
+    };
+
+    MassFunctionRepository::update_claim_belief(
+        pool,
+        claim_id,
+        preview.belief,
+        preview.plausibility,
+        preview.conflict_k,
+        Some(preview.pignistic_prob),
+        preview.missing_mass,
+    )
+    .await
+    .map_err(|e| format!("update_claim_belief: {e}"))?;
+
+    if let Some(label) = preview.classification {
+        MassFunctionRepository::update_claim_classification(pool, claim_id, &label)
             .await
             .map_err(|e| format!("update_claim_classification: {e}"))?;
     }
