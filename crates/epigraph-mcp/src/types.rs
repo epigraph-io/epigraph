@@ -758,6 +758,28 @@ pub struct SubmitDsEvidenceParams {
 
     #[schemars(description = "Perspective UUID for scoped combination (optional)")]
     pub perspective_id: Option<String>,
+
+    #[schemars(
+        description = "Evidence classification tag (e.g. 'empirical', 'testimonial', 'statistical') \
+                       used to key the calibrated per-source-class reliability prior \
+                       (epigraph_engine::edge_factor::effective_source_strength / calibration.toml \
+                       [evidence_type_weights]) instead of the caller-supplied `reliability` float. \
+                       When omitted (default), behavior is unchanged: the raw `reliability` float is \
+                       applied and the BBA is stored with evidence_type=NULL, matching every \
+                       pre-existing caller byte-for-byte."
+    )]
+    #[serde(default)]
+    pub evidence_type: Option<String>,
+
+    #[schemars(
+        description = "Locality classification of this evidence vs. the claim's asserting paper: \
+                       'intra' (self-cite / methodological overlap) applies the calibrated intra-locality \
+                       discount on top of the evidence_type weight; 'cross' or 'unknown' apply no locality \
+                       discount. Only consulted when `evidence_type` is also supplied — otherwise ignored \
+                       and the BBA is stored with locality_tag='unknown' as before. Default: 'unknown'."
+    )]
+    #[serde(default)]
+    pub locality_tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
