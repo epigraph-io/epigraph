@@ -15,6 +15,7 @@ pub mod link_epistemic;
 pub mod link_hierarchical;
 pub mod matching;
 pub mod memory;
+pub mod novelty_gate;
 pub mod paper_queries;
 pub mod perspectives;
 pub mod provenance;
