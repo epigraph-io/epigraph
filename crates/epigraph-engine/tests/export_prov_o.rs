@@ -6,15 +6,22 @@
 //! Fixture graph:
 //!
 //!   root_claim  -- derived_from --> child_claim   (child derives from root)
-//!   prior_claim -- supersedes   --> child_claim   (child supersedes prior)
+//!   child_claim -- supersedes   --> prior_claim    (child supersedes prior)
 //!
-//! Both edges are `source_id = <ancestor>`, `target_id = child_claim`:
-//! `LineageRepository`'s recursive CTEs (`get_lineage`, `get_ancestor_ids`)
-//! walk `edges e ON e.source_id = c.id ... JOIN lineage l ON e.target_id =
-//! l.id`, i.e. an ancestor is reached by an edge whose `source_id` is the
-//! ancestor and whose `target_id` is the already-known (descendant) claim.
-//! This fixture matches that existing, production convention rather than
-//! inventing a new one.
+//! `derived_from`: `source_id = <ancestor>`, `target_id = <descendant>` —
+//! matches `LineageRepository`'s recursive CTEs (`get_lineage`,
+//! `get_ancestor_ids`), which walk `edges e ON e.source_id = c.id ... JOIN
+//! lineage l ON e.target_id = l.id`, i.e. an ancestor is reached by an edge
+//! whose `source_id` is the ancestor and whose `target_id` is the
+//! already-known (descendant) claim.
+//!
+//! `supersedes`: the OPPOSITE direction — `source_id = <new/current claim>`,
+//! `target_id = <old/superseded claim>`. This is not a choice made for this
+//! module; it is how the two production write paths
+//! (`ClaimRepository::supersede` and `ClaimRepository::evolve_step`) both
+//! actually insert the edge (`source_id` bound to the newly-inserted claim,
+//! `target_id` bound to the claim being superseded). The fixture mirrors
+//! real data rather than the more "natural"-looking old-to-new direction.
 
 use epigraph_engine::export::prov::export_provenance_prov_o;
 use sqlx::postgres::PgPoolOptions;
@@ -97,22 +104,65 @@ async fn export_maps_predicates_and_leaves_edges_relationship_column_unchanged()
     let child_claim = insert_claim(&pool, agent, "Derived claim under test").await;
 
     let derives_edge_id = insert_edge(&pool, root_claim, child_claim, "derived_from").await;
-    let supersedes_edge_id = insert_edge(&pool, prior_claim, child_claim, "supersedes").await;
+    // Real direction (see module doc comment above): source = new claim,
+    // target = superseded claim.
+    let supersedes_edge_id = insert_edge(&pool, child_claim, prior_claim, "supersedes").await;
 
     let document = export_provenance_prov_o(&pool, child_claim, Some(5))
         .await
         .expect("export should succeed");
 
-    // The exported JSON-LD must carry the PROV-O predicates, not the
-    // internal relationship strings.
-    let serialized = serde_json::to_string(&document).unwrap();
+    // All three claims — root (ancestor), child (root of the export), and
+    // prior (reached only via the one-hop supersedes expansion) — must be
+    // present as entities. `prior_claim` is the case that proves the
+    // one-hop supersedes expansion works: `get_ancestor_ids` alone would
+    // never surface it (see module doc comment).
+    let entities = document["entities"].as_array().expect("entities array");
+    let entity_ids: Vec<&str> = entities
+        .iter()
+        .map(|e| e["@id"].as_str().unwrap())
+        .collect();
+    assert!(entity_ids.contains(&format!("claim:{root_claim}").as_str()));
+    assert!(entity_ids.contains(&format!("claim:{child_claim}").as_str()));
     assert!(
-        serialized.contains("prov:wasDerivedFrom"),
-        "expected prov:wasDerivedFrom in export, got: {serialized}"
+        entity_ids.contains(&format!("claim:{prior_claim}").as_str()),
+        "prior_claim must be reachable via the one-hop supersedes expansion, got entities: {entity_ids:?}"
     );
-    assert!(
-        serialized.contains("prov:wasRevisionOf"),
-        "expected prov:wasRevisionOf in export, got: {serialized}"
+
+    // The exported JSON-LD must carry the PROV-O predicates, not the
+    // internal relationship strings, and — critically — with the correct
+    // subject/object direction per relationship type (derived_from and
+    // supersedes are inverted in the underlying edges table).
+    let relations = document["relations"].as_array().expect("relations array");
+
+    let derived_from_relation = relations
+        .iter()
+        .find(|r| r["predicate"] == "prov:wasDerivedFrom")
+        .unwrap_or_else(|| panic!("expected a prov:wasDerivedFrom relation, got: {relations:?}"));
+    assert_eq!(
+        derived_from_relation["prov:generatedEntity"],
+        format!("claim:{child_claim}"),
+        "child_claim (the newer claim) must be the generated entity for wasDerivedFrom"
+    );
+    assert_eq!(
+        derived_from_relation["prov:usedEntity"],
+        format!("claim:{root_claim}"),
+        "root_claim (the ancestor) must be the used entity for wasDerivedFrom"
+    );
+
+    let supersedes_relation = relations
+        .iter()
+        .find(|r| r["predicate"] == "prov:wasRevisionOf")
+        .unwrap_or_else(|| panic!("expected a prov:wasRevisionOf relation, got: {relations:?}"));
+    assert_eq!(
+        supersedes_relation["prov:generatedEntity"],
+        format!("claim:{child_claim}"),
+        "child_claim (the new claim) must be the generated entity for wasRevisionOf"
+    );
+    assert_eq!(
+        supersedes_relation["prov:usedEntity"],
+        format!("claim:{prior_claim}"),
+        "prior_claim (the superseded claim) must be the used entity for wasRevisionOf"
     );
 
     // Re-query the edges table directly: the raw `relationship` column must

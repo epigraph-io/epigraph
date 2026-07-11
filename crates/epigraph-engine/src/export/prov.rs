@@ -27,6 +27,17 @@
 //! `CLAUDE.md` reserves `supersedes` specifically for epistemic-replacement
 //! semantics. So the mapping in this module is applied only when building
 //! the exported JSON-LD document; the underlying row is never touched.
+//!
+//! # Scope: no `prov:Activity` nodes (yet)
+//!
+//! `get_provenance` (the existing MCP tool) maps `reasoning_traces` rows to
+//! `prov:Activity`. This module deliberately does not: it emits the
+//! activity-less shorthand form of derivation (`entity1 prov:wasDerivedFrom
+//! entity2`, which PROV-O explicitly permits as short for "some activity
+//! generated entity1 by using entity2") rather than reconstructing full
+//! Entity-Activity-Agent triples. Adding `reasoning_traces` as `prov:Activity`
+//! nodes (as `get_provenance` already does) is a natural follow-up once
+//! there's a concrete consumer that needs the activity-level detail.
 
 /// Map an internal `edges.relationship` value to its PROV-O predicate,
 /// for use in exported JSON-LD only. Returns `None` for relationship types
@@ -51,12 +62,45 @@ pub fn relationship_to_prov_predicate(relationship: &str) -> Option<&'static str
     }
 }
 
+/// `edges.relationship` values are not all written in the same direction.
+/// `derived_from`-family edges (and everything else this module maps) point
+/// **ancestor -> descendant** (`source_id` = the older/ancestor claim,
+/// `target_id` = the newer/descendant claim) — this is the convention
+/// `LineageRepository`'s recursive CTEs assume. `supersedes` is the
+/// opposite: both production write paths
+/// (`ClaimRepository::supersede` and `ClaimRepository::evolve_step`) insert
+/// it as `source_id` = the *new* claim, `target_id` = the claim being
+/// superseded. This helper returns, for a mapped relationship, which edge
+/// endpoint is the PROV-O "generated" (newer) entity and which is the
+/// "used" (older/source) entity — so callers don't have to hardcode the
+/// direction per relationship type at each call site.
+fn prov_relation_endpoints(
+    relationship: &str,
+    source_id: uuid::Uuid,
+    target_id: uuid::Uuid,
+) -> (uuid::Uuid, uuid::Uuid) {
+    if relationship == "supersedes" {
+        // source = new claim (generated), target = old claim (used).
+        (source_id, target_id)
+    } else {
+        // derived_from / derives_from / generated / uses_evidence:
+        // source = ancestor (used), target = descendant (generated).
+        (target_id, source_id)
+    }
+}
+
 /// Build a PROV-O JSON-LD document describing the provenance of
 /// `root_claim_id`: the claim itself, every ancestor claim reachable via
-/// claim-to-claim edges (up to `max_depth`, default 100 — mirrors
-/// [`epigraph_db::LineageRepository::get_lineage`]'s default), the edges
-/// between them mapped to PROV-O predicates, and the authoring agent of
-/// each claim as a `prov:Agent`.
+/// `derived_from`-family claim-to-claim edges (up to `max_depth`, default
+/// 100 — mirrors [`epigraph_db::LineageRepository::get_lineage`]'s
+/// default), one hop of `supersedes` predecessors for each of those claims,
+/// the edges between them mapped to PROV-O predicates, and the authoring
+/// agent of each claim as a `prov:Agent`.
+///
+/// `supersedes` is only expanded one hop per claim (not recursively) in
+/// this first pass — deeper supersession *chains* (claims that themselves
+/// supersede a claim already reached via a supersedes edge) are a follow-up;
+/// see the module's PR description.
 ///
 /// This is **read-only**: it issues only `SELECT`s (via
 /// `LineageRepository`, `EdgeRepository`, `ClaimRepository`,
@@ -79,19 +123,46 @@ pub async fn export_provenance_prov_o(
     use epigraph_core::domain::ids::{AgentId, ClaimId};
     use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, LineageRepository};
 
+    // --- Pass 1: assemble the full claim set ---------------------------
+    //
+    // `get_ancestor_ids` walks the ancestor-first convention
+    // (`derived_from`-family edges); it includes the root itself. It does
+    // NOT reach a claim's supersedes-predecessor, because that edge's
+    // *target* (the old claim) is never itself an edge *source* pointing
+    // at something already in the lineage — the direction is inverted
+    // relative to what the CTE looks for. So we add supersedes targets
+    // explicitly, one hop per claim already in the set.
     let ancestor_ids = LineageRepository::get_ancestor_ids(pool, root_claim_id, max_depth).await?;
-
-    // `get_ancestor_ids` includes the root itself at depth 0; dedupe just in
-    // case callers pass a claim with no ancestors.
     let mut claim_ids = ancestor_ids;
     if !claim_ids.contains(&root_claim_id) {
         claim_ids.push(root_claim_id);
     }
 
+    let mut supersedes_targets = Vec::new();
+    for &claim_id in &claim_ids {
+        let outgoing = EdgeRepository::get_by_source(pool, claim_id, "claim").await?;
+        for edge in outgoing {
+            if edge.target_type == "claim"
+                && edge.relationship == "supersedes"
+                && !claim_ids.contains(&edge.target_id)
+            {
+                supersedes_targets.push(edge.target_id);
+            }
+        }
+    }
+    for id in supersedes_targets {
+        if !claim_ids.contains(&id) {
+            claim_ids.push(id);
+        }
+    }
+
+    // --- Pass 2: emit entities, agents, and relations -------------------
+
     let mut entities = Vec::new();
     let mut agents_seen = std::collections::HashSet::new();
     let mut agent_entities = Vec::new();
     let mut relations = Vec::new();
+    let mut edges_seen = std::collections::HashSet::new();
 
     for &claim_id in &claim_ids {
         let Some(claim) = ClaimRepository::get_by_id(pool, ClaimId::from_uuid(claim_id)).await?
@@ -126,28 +197,37 @@ pub async fn export_provenance_prov_o(
             "predicate": "prov:wasAttributedTo",
         }));
 
-        // Inbound edges (ancestor -> this claim) carry the derivation and
-        // supersession relationships in this schema: `LineageRepository`'s
-        // recursive CTEs treat `edges.source_id` as the ancestor and
-        // `edges.target_id` as the descendant already in the lineage
-        // (`JOIN edges e ON e.source_id = c.id ... e.target_id = l.id`), so
-        // we mirror that direction here rather than inventing a new one.
-        let edges = EdgeRepository::get_by_target(pool, claim_id, "claim").await?;
-        for edge in edges {
-            if edge.source_type != "claim" || !claim_ids.contains(&edge.source_id) {
+        // Collect claim-to-claim edges touching this claim from both
+        // directions — `derived_from` edges have this claim as the
+        // `target_id` (see doc comment on `prov_relation_endpoints`),
+        // `supersedes` edges have this claim as the `source_id`. Dedup by
+        // edge id since a claim can appear on both sides across the loop
+        // (e.g. the root is both a target of its ancestor's edge and a
+        // source of its own supersedes edge).
+        let mut claim_edges = EdgeRepository::get_by_target(pool, claim_id, "claim").await?;
+        claim_edges.extend(EdgeRepository::get_by_source(pool, claim_id, "claim").await?);
+
+        for edge in claim_edges {
+            if !edges_seen.insert(edge.id) {
+                continue;
+            }
+            if edge.source_type != "claim"
+                || edge.target_type != "claim"
+                || !claim_ids.contains(&edge.source_id)
+                || !claim_ids.contains(&edge.target_id)
+            {
                 continue;
             }
             let Some(predicate) = relationship_to_prov_predicate(&edge.relationship) else {
                 continue;
             };
+            let (generated, used) =
+                prov_relation_endpoints(&edge.relationship, edge.source_id, edge.target_id);
             relations.push(serde_json::json!({
                 "@id": format!("edge:{}", edge.id),
                 "@type": "prov:Relation",
-                // PROV-O reads "target wasDerivedFrom source": the claim
-                // this edge points at is the derived/newer entity, and the
-                // edge's source is the ancestor entity it was derived from.
-                "prov:generatedEntity": format!("claim:{}", edge.target_id),
-                "prov:usedEntity": format!("claim:{}", edge.source_id),
+                "prov:generatedEntity": format!("claim:{generated}"),
+                "prov:usedEntity": format!("claim:{used}"),
                 "predicate": predicate,
                 "source_relationship": edge.relationship,
             }));
