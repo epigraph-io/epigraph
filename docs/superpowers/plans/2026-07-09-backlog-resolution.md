@@ -892,6 +892,18 @@ non-determinism (a deterministic empty-token bug would 401 every run, not someti
 `resolve_backlog_item`); claim stays open pending production log/container access to actually
 diagnose the non-determinism.
 
+**LOG COLLECTION ACTIONED 2026-07-11 (per Jeremy's direction):** rather than guessing further,
+**PR #338** adds targeted diagnostic logging to `decompose_claims` (resolved `api_base` at startup —
+tests the hypothesis that a bare `host:port` without a scheme would produce exactly
+`RelativeUrlWithoutBase` on this binary's one HTTP client; token provenance/length, never the value;
+on a failed POST, the exact URL + HTTP status + response body, previously discarded by
+`error_for_status()?`). The `decomposition-cycle` scheduled prompt (`schedules.toml`) was updated to
+persist FULL output to a durable per-run logfile under `/workspace/group/decompose-logs/` (was
+`tail -6`, discarding everything) — `epiclaw.service` restarted to pick it up. **Do not resolve or
+re-diagnose `a422da87` (progress claim `f239dc24`) until PR #338 merges, at least one scheduled run
+has produced a log (success or reproduced failure with full diagnostic detail), and a human has
+reviewed it — revisit ~2026-07-18.**
+
 ### Task 4.6 — Backfill stale cached BetP on 67 multi-BBA claims
 
 **Claim:** short ID `f2521c53` — look up the full UUID via `get_claim`/`query_claims_by_label(["belief-inflation"])` at execution time. This claim's acceptance criteria are already
