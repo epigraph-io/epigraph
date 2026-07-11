@@ -287,37 +287,6 @@ pub async fn recall(
                     matched_via.push("lexical".to_string());
                 }
 
-                // Additive lensed belief per returned claim. Degrade-not-fail:
-                // a compute error for ONE claim yields null + a warn, never an
-                // aborted page (spec §8). min_truth/ranking stay on `tv`.
-                let lensed_belief = match lens {
-                    Some((frame_id, perspective_id)) => {
-                        match epigraph_engine::belief_query::get_perspective_belief(
-                            &server.pool,
-                            hit.claim_id,
-                            frame_id,
-                            perspective_id,
-                        )
-                        .await
-                        {
-                            Ok(interval) => Some(LensedBelief::from_interval(
-                                frame_id,
-                                perspective_id,
-                                &interval,
-                            )),
-                            Err(e) => {
-                                tracing::warn!(
-                                    claim_id = %hit.claim_id,
-                                    error = %e,
-                                    "lensed belief compute failed; serving null lens for this claim"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    None => None,
-                };
-
                 results.push(RecallResult {
                     claim_id: hit.claim_id.to_string(),
                     content: claim.content,
@@ -325,8 +294,65 @@ pub async fn recall(
                     similarity: hit.dense_similarity.unwrap_or(0.0),
                     rrf_score: hit.rrf_score,
                     matched_via,
-                    lensed_belief,
+                    // Populated by the bounded lens post-pass below (once per
+                    // page), keyed by claim_id. None until then.
+                    lensed_belief: None,
                 });
+            }
+        }
+    }
+
+    // Bounded lens post-pass: when a lens is active, resolve the perspective row
+    // + per-frame overrides ONCE for the whole page (the N+1 fix, backlog
+    // 9e33ddf7) instead of once per claim, then annotate each already-built
+    // result keyed by claim_id. Per-claim degrade-not-fail is preserved: each
+    // claim carries its own `Result`, so one malformed claim warns + serves a
+    // null lens without aborting the page (spec §8). min_truth/ranking stayed
+    // on the global `tv` above and are untouched here.
+    if let Some((frame_id, perspective_id)) = lens {
+        let claim_ids: Vec<uuid::Uuid> = results
+            .iter()
+            .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+            .collect();
+        match epigraph_engine::belief_query::get_perspective_belief_batch(
+            &server.pool,
+            &claim_ids,
+            frame_id,
+            perspective_id,
+        )
+        .await
+        {
+            Ok(intervals) => {
+                let mut by_claim: std::collections::HashMap<uuid::Uuid, _> =
+                    intervals.into_iter().collect();
+                for r in &mut results {
+                    let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
+                        continue;
+                    };
+                    match by_claim.remove(&cid) {
+                        Some(Ok(interval)) => {
+                            r.lensed_belief = Some(LensedBelief::from_interval(
+                                frame_id,
+                                perspective_id,
+                                &interval,
+                            ));
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                claim_id = %cid,
+                                error = %e,
+                                "lensed belief compute failed; serving null lens for this claim"
+                            );
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "lensed belief batch failed; serving null lens for this page"
+                );
             }
         }
     }

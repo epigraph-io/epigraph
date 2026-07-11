@@ -265,6 +265,15 @@ pub struct UpdateWithEvidenceParams {
 
     #[schemars(description = "Source URL or DOI for this evidence (optional)")]
     pub source_url: Option<String>,
+
+    #[schemars(
+        description = "Optional labels to add to the claim (e.g. current-cycle run tags like \
+                        'norcal-rfp-2026-07-05'). Additive: merged into the claim's existing \
+                        label array via ClaimRepository::update_labels, never overwrites \
+                        pre-existing labels — matches submit_claim/memorize's dedup-hit behavior."
+    )]
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 // ── Provenance ──
@@ -865,6 +874,12 @@ pub struct UpdateResponse {
     pub plausibility: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pignistic_prob: Option<f64>,
+    /// Populated ONLY when supporting evidence *lowered* the pignistic
+    /// probability (weak/high-ignorance-mass BBA on a claim with no prior DS
+    /// state). This is mathematically correct Dempster-Shafer combination —
+    /// the warning exists so callers don't mistake it for a bug.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

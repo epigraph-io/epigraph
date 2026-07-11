@@ -66,7 +66,8 @@ pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
     ClaimBeliefColumns, ClaimEmbeddingHit, ClaimPairDistance, ClaimRepository, EvolveStepResult,
-    HybridHit, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
+    GraphExpansionHit, HybridHit, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
+    EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
