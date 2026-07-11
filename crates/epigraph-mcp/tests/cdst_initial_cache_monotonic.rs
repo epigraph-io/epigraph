@@ -66,6 +66,7 @@ async fn adding_supporting_evidence_does_not_drop_cached_betp(pool: sqlx::PgPool
             source_url: None,
             supports: true,
             strength: 0.8,
+            labels: vec![],
         },
     )
     .await;

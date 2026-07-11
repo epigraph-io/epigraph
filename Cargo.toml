@@ -90,7 +90,7 @@ ascent = "0.8"
 axum = { version = "0.7", features = ["macros"] }
 
 # Database
-sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls", "macros", "migrate"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls", "macros", "migrate"] }
 
 # Vectors for embeddings
 pgvector = { version = "0.4", features = ["sqlx"] }
@@ -107,7 +107,7 @@ utoipa = { version = "5", features = ["chrono", "uuid"] }
 
 # CLI & Utilities
 clap = "4"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
 rmcp = { version = "0.15", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 schemars = "1"
 csv = "1.3"

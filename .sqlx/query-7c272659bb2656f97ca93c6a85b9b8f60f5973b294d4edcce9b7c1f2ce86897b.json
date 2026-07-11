@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT target_id, COUNT(*) AS \"degree!\"\n            FROM edges\n            WHERE target_id = ANY($1)\n              AND source_type = 'claim' AND target_type = 'claim'\n              AND relationship = ANY($2)\n            GROUP BY target_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "degree!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "7c272659bb2656f97ca93c6a85b9b8f60f5973b294d4edcce9b7c1f2ce86897b"
+}
