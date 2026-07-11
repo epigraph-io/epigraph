@@ -145,6 +145,7 @@ async fn cross_frame_supporting_evidence_does_not_drop_betp() {
             source_url: None,
             supports: true,
             strength: 0.9,
+            labels: vec![],
         },
     )
     .await;
