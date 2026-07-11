@@ -75,7 +75,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 pub async fn submit_claim(
     server: &EpiGraphMcpFull,
-    params: SubmitClaimParams,
+    mut params: SubmitClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let methodology = parse_methodology(&params.methodology).map_err(invalid_params)?;
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
@@ -94,6 +94,100 @@ pub async fn submit_claim(
     let content_hash = ContentHasher::hash(params.content.as_bytes());
     claim.content_hash = content_hash;
     claim.signature = Some(server.signer.sign(&content_hash));
+
+    // Write-side semantic novelty gate (backlog 1bcaed94, Task 6.4). Runs
+    // ONLY on genuinely new content: a read-only content-hash existence
+    // check happens FIRST so an exact-content resubmit takes the existing
+    // create_claim_idempotent dedup path unchanged (no embedding call, no
+    // gate, byte-identical to pre-gate behavior — the gate augments that
+    // path, it does not replace it). See crate::tools::novelty_gate.
+    let is_exact_resubmit = {
+        let mut conn = server.pool.acquire().await.map_err(internal_error)?;
+        ClaimRepository::find_by_content_hash_and_agent(&mut conn, &content_hash, agent_id)
+            .await
+            .map_err(internal_error)?
+            .is_some()
+    };
+    let mut pending_embedding: Option<String> = None;
+    if !is_exact_resubmit {
+        let novelty_threshold = params
+            .novelty_threshold
+            .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
+        if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
+            &server.pool,
+            server.embedder.as_ref(),
+            &params.content,
+            novelty_threshold,
+        )
+        .await
+        {
+            if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) = decision
+            {
+                // Semantic duplicate: suppress the insert entirely and
+                // report the existing claim, mirroring the shape of a
+                // content-hash dedup hit (no new Evidence/Trace/edges/DS).
+                //
+                // Two deliberate differences from the content-hash dedup
+                // this composes with, both intended per the backlog spec
+                // (nearest_by_embedding scans ALL is_current claims, not
+                // scoped to this agent):
+                //   1. `existing_id` can belong to ANOTHER agent's claim —
+                //      unlike find_by_content_hash_and_agent's same-agent
+                //      dedup, semantic novelty is corpus-wide. CONCRETE
+                //      CONSEQUENCE: if agent B asserts a near-paraphrase of
+                //      a fact agent A already asserted, B's submission is
+                //      suppressed at the default threshold and B receives
+                //      A's claim id — with NO independent AUTHORED edge,
+                //      Evidence, or ReasoningTrace recorded for B. In a
+                //      Dempster-Shafer system where independent
+                //      corroboration from a second source is itself
+                //      evidentiary signal (BBA combination), that is a real
+                //      loss of corroboration data, not just a dedup nicety.
+                //      This is what the backlog spec asks for (no agent
+                //      filter on the ANN query) — flagging it here for a
+                //      future owner to reconsider, not changing it
+                //      unilaterally.
+                //   2. `params.labels` (the CALLER's requested labels on
+                //      THIS submission) are silently dropped here, since
+                //      nothing is inserted. `resolve_backlog_item` is
+                //      unaffected (it hardcodes novelty_threshold=0.0 so
+                //      this branch never fires for it).
+                let existing =
+                    ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(existing_id))
+                        .await
+                        .map_err(internal_error)?
+                        .ok_or_else(|| {
+                            internal_error(format!(
+                            "novelty gate: nearest claim {existing_id} vanished before read-back"
+                        ))
+                        })?;
+                return success_json(&SubmitClaimResponse {
+                    claim_id: existing_id.to_string(),
+                    truth_value: existing.truth_value.value(),
+                    content_hash: ContentHasher::to_hex(&existing.content_hash),
+                    embedded: false,
+                    belief: None,
+                    plausibility: None,
+                    pignistic_prob: None,
+                    frame_id: None,
+                });
+            }
+            // Insert / InsertFlagged: stash the already-generated,
+            // pgvector-formatted embedding so the was_created branch below
+            // can store it directly instead of paying for a second
+            // embedding call via embed_and_store.
+            pending_embedding = Some(pgvec);
+            if matches!(
+                decision,
+                crate::tools::novelty_gate::GateDecision::InsertFlagged
+            ) && !params.labels.iter().any(|l| l == "near-duplicate")
+            {
+                params.labels.push("near-duplicate".to_string());
+            }
+        }
+        // embedder failure (None): fall through exactly as before this
+        // feature existed — insert, then embed best-effort post-insert.
+    }
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
@@ -218,10 +312,24 @@ pub async fn submit_claim(
         }
         let ds = ds_result.ok();
 
-        let embedded = server
-            .embedder
-            .embed_and_store(claim_uuid, &params.content)
-            .await;
+        // Reuse the novelty gate's already-generated vector when we have
+        // one (avoids a second OpenAI call for the same content). Only the
+        // gate's own embedder-failure path (`pending_embedding = None`)
+        // falls back to `embed_and_store`'s independent generate-and-store.
+        let embedded = if let Some(pgvec) = pending_embedding.take() {
+            match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
+                Ok(stored) => stored,
+                Err(e) => {
+                    tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
+                    false
+                }
+            }
+        } else {
+            server
+                .embedder
+                .embed_and_store(claim_uuid, &params.content)
+                .await
+        };
 
         let final_truth = ds
             .as_ref()
@@ -332,13 +440,10 @@ pub async fn get_claim(
         crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
     }
 
-    let claim = ClaimRepository::get_by_id(&server.pool, claim_id)
+    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&server.pool, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
-    let labels = ClaimRepository::get_labels(&server.pool, claim_id)
-        .await
-        .map_err(internal_error)?;
     let access = check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
     let (content, content_hash) =
         crate::tools::redaction::redact_content(access, &claim.content, &claim.content_hash);
@@ -473,6 +578,21 @@ pub async fn update_with_evidence(
     let before = claim.truth_value.value();
     let strength = params.strength.clamp(0.0, 1.0);
 
+    // Capture pre-combination pignistic to detect the counterintuitive-but-correct
+    // case where SUPPORTING evidence lowers belief (Task 3.6, backlog 3b60a785).
+    // Compare pignistic-vs-pignistic. `get_belief_columns` reads the persisted
+    // `pignistic_prob` column (distinct from `truth_value`; see claim.rs docs).
+    // It is NULL for a claim with no prior DS state — in that case fall back to
+    // `truth_value` (`before`), which is the belief the fresh BBA is combined
+    // against. The monotonicity clamp in `auto_wire_ds_update` bounds BetP below
+    // by the prior column value for supports=true, so the warning is only ever
+    // reachable on the NULL-column (no-prior-DS-state) path.
+    let pre_pignistic =
+        ClaimRepository::get_belief_columns(&server.pool, ClaimId::from_uuid(claim_id))
+            .await
+            .map_err(internal_error)?
+            .and_then(|c| c.pignistic_prob);
+
     // Load type_weight from calibration (replaces deleted evidence_weight())
     // I-3: use helper that checks CALIBRATION_PATH env var before relative path
     let weight = load_evidence_type_weight(&params.evidence_type);
@@ -498,6 +618,30 @@ pub async fn update_with_evidence(
         .await
         .map_err(internal_error)?;
 
+    // Additive label merge on the dedup-match write, mirroring submit_claim's
+    // and memorize's dedup-hit behavior: labels union into the claim's
+    // existing array (ClaimRepository::update_labels dedupes via
+    // array_agg(DISTINCT ...)), never overwriting labels from the claim's
+    // original creation cycle. Fixes backlog f14592cb: run-tag labels (e.g.
+    // norcal-rfp-2026-07-05) were previously dropped on every call because
+    // UpdateWithEvidenceParams had no labels field at all.
+    if !params.labels.is_empty() {
+        ClaimRepository::update_labels(&server.pool, claim_id, &params.labels, &[])
+            .await
+            .map_err(internal_error)?;
+    }
+
+    // Warn when SUPPORTING evidence lowered the pignistic probability. Compare
+    // pignistic-to-pignistic; when the claim had no prior DS state the column is
+    // NULL, so fall back to the truth_value the fresh BBA combined against.
+    let pre_belief = pre_pignistic.unwrap_or(before);
+    let warning = (params.supports && ds.pignistic_prob < pre_belief).then(|| {
+        "Supporting evidence decreased belief — the new evidence has high \
+         ignorance mass relative to the prior; this is mathematically correct \
+         DS combination, not a bug."
+            .to_string()
+    });
+
     success_json(&UpdateResponse {
         claim_id: claim_id.to_string(),
         truth_before: before,
@@ -506,6 +650,7 @@ pub async fn update_with_evidence(
         belief: Some(ds.belief),
         plausibility: Some(ds.plausibility),
         pignistic_prob: Some(ds.pignistic_prob),
+        warning,
     })
 }
 
@@ -623,6 +768,10 @@ pub async fn resolve_backlog_item(
             "Backlog claim {original_id} retired by agent assertion via resolve_backlog_item."
         )),
         labels: vec!["resolved".to_string()],
+        // Resolution claims are operational provenance records, not
+        // epistemic content competing for novelty against the corpus —
+        // never suppress or flag them via the semantic gate.
+        novelty_threshold: Some(0.0),
     };
     let submit_result = submit_claim(server, submit_params).await?;
     let resolution_id = extract_submit_claim_id(&submit_result)?;

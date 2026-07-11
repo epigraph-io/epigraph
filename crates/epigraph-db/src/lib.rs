@@ -73,20 +73,21 @@ pub use repos::{
     EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceRepository, EvidenceSearchResult,
     EvolveStepResult, ExperimentRepository, ExperimentResultRepository, ExperimentResultRow,
     ExperimentRow, FactorRepository, FrameRepository, GapAnalysisResult, GapChallengeRow,
-    GapRecord, GapRepository, GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository,
-    GroupRow, HierarchicalWorkflowRow, HybridHit, IndexCounts, KeyEpochRow,
-    LearningEventRepository, LearningEventRow, LineageHead, LineageRepository,
-    MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow, MembershipRow, MentionRow,
-    MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
-    MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
-    OAuthClientRepository, OAuthClientRow, OwnershipRepository, PaperRepository, PaperRow,
-    PatchClaimDiff, PatchClaimInput, PatternTemplateRepository, PatternTemplateRow,
-    PerspectiveRepository, ProvenanceLogRow, ProvenanceRepository, ReEncryptionKeyRepository,
-    ReEncryptionKeyRow, ReasoningTraceRepository, RefreshTokenRepository, RefreshTokenRow,
-    ResolvedStep, ScopedBeliefRepository, SecurityEventRepository, SecurityEventRow,
-    SheafRepository, TaskRepository, TaskRow, TripleRepository, TripleRow,
-    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
-    WorkflowRecallResult, WorkflowRepository,
+    GapRecord, GapRepository, GraphExpansionHit, GroupKeyEpochRepository,
+    GroupMembershipRepository, GroupRepository, GroupRow, HierarchicalWorkflowRow, HybridHit,
+    IndexCounts, KeyEpochRow, LearningEventRepository, LearningEventRow, LineageHead,
+    LineageRepository, MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow,
+    MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes,
+    MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper,
+    MethodUsageExample, NearestClaimHit, OAuthClientRepository, OAuthClientRow,
+    OwnershipRepository, PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput,
+    PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository, ProvenanceLogRow,
+    ProvenanceRepository, ReEncryptionKeyRepository, ReEncryptionKeyRow, ReasoningTraceRepository,
+    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, ScopedBeliefRepository,
+    SecurityEventRepository, SecurityEventRow, SheafRepository, TaskRepository, TaskRow,
+    TripleRepository, TripleRow, WorkflowExecutionRepository, WorkflowExecutionRow,
+    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    EXPANSION_RELATIONSHIPS,
 };
 
 // Re-export sqlx types that users will need
@@ -97,7 +98,7 @@ pub use repos::activity::ActivityRow;
 pub use repos::community::{CommunityMemberRow, CommunityRow};
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
-pub use repos::edge::{AttributedClaimRow, EdgeRow};
+pub use repos::edge::{AttributedClaimRow, EdgeRow, EPISTEMIC_RELATIONSHIPS};
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
 pub use repos::mass_function::MassFunctionRow;

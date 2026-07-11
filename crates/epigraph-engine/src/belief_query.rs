@@ -227,60 +227,107 @@ pub async fn get_perspective_belief(
     })
 }
 
-/// Recompute the combined mass function for a framed claim, discounting each
-/// stored BBA by its effective reliability before Dempster combination.
+/// The per-frame reliability inputs a framed-belief combination needs, resolved
+/// ONCE per `(frame)` and reused across every claim on a page.
 ///
-/// Reliability is resolved through `effective_source_strength`'s tier chain
-/// (per-frame override → global calibration → stored `source_strength`), with
-/// locality applied. When `perspective` is `Some`, the perspective's
-/// frame-function overrides sit at the top of that chain for both the
-/// evidence-type weight and the locality factor. This is the single path both
-/// `get_belief` (perspective = `None`) and `get_perspective_belief` use, so a
-/// no-opinion perspective reproduces the global belief exactly, and both agree
-/// with the cached `claims.pignistic_prob`.
+/// Hoisting these out of the per-claim combine is what eliminates the lensed
+/// recall N+1: the perspective row, the two per-frame override lookups, and the
+/// calibration config are frame/perspective-scoped, not claim-scoped, so a
+/// 20-hit page previously re-resolved all four 20 times. [`FramedBeliefContext`]
+/// captures them so the batch path resolves them once (see
+/// [`get_perspective_belief_batch`]) and the pure combine
+/// ([`combine_framed_bbas`]) touches the DB zero more times.
+struct FramedBeliefContext {
+    calibration: CalibrationConfig,
+    per_frame_intra: Option<f64>,
+    per_frame_weights: Option<std::collections::HashMap<String, f64>>,
+    perspective: Option<PerspectiveReliability>,
+}
+
+impl FramedBeliefContext {
+    /// Resolve the frame-scoped reliability inputs from the DB exactly once.
+    ///
+    /// Per-frame loads are best-effort: a DB error there falls back to global
+    /// calibration (`.ok().flatten()`) rather than failing the read — matching
+    /// the pre-refactor `recompute_framed_belief` semantics exactly. When
+    /// `perspective_id` is `Some`, the perspective row is resolved and an
+    /// unknown/empty perspective reduces to no opinion (`unwrap_or_default`),
+    /// so a lensed read over an un-configured observer equals the global read.
+    async fn resolve(
+        pool: &PgPool,
+        frame_id: Uuid,
+        perspective_id: Option<Uuid>,
+    ) -> Result<Self, BeliefQueryError> {
+        let calibration = CalibrationConfig::from_workspace_root()
+            .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback());
+        let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
+            .await
+            .ok()
+            .flatten();
+        let per_frame_weights =
+            FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
+                .await
+                .ok()
+                .flatten();
+        let perspective = match perspective_id {
+            Some(pid) => Some(
+                PerspectiveRepository::get_by_id(pool, pid)
+                    .await?
+                    .map(|p| PerspectiveReliability {
+                        source_reliability: p.source_reliability().unwrap_or_default(),
+                        locality_reliability: p.locality_reliability().unwrap_or_default(),
+                    })
+                    .unwrap_or_default(),
+            ),
+            None => None,
+        };
+        Ok(Self {
+            calibration,
+            per_frame_intra,
+            per_frame_weights,
+            perspective,
+        })
+    }
+}
+
+/// Combine a claim's stored BBAs into one mass function — the pure (no-DB) core
+/// shared by the single-claim and batch framed-belief paths.
 ///
-/// Calibration and the per-frame overrides are loaded once. Per-frame loads are
-/// best-effort: a DB error there falls back to global calibration rather than
-/// failing the read. Returns `Ok(None)` only when `rows` is empty.
-async fn recompute_framed_belief(
-    pool: &PgPool,
-    frame_id: Uuid,
+/// Each BBA is discounted by its effective reliability (the
+/// `effective_source_strength` tier chain: per-frame override → global
+/// calibration → stored `source_strength`, with locality applied; the
+/// perspective overrides sit at the top when present) before the SAME adaptive
+/// combination rule the recompute/write path uses (`combine_multiple`). All
+/// reliability inputs arrive pre-resolved in `ctx`, so this function issues no
+/// queries — the caller resolves `ctx` once and calls this per claim.
+///
+/// Returns `Ok(None)` only when `rows` is empty.
+fn combine_framed_bbas(
     frame: &FrameOfDiscernment,
     rows: &[MassFunctionRow],
-    perspective: Option<&PerspectiveReliability>,
+    ctx: &FramedBeliefContext,
 ) -> Result<Option<MassFunction>, BeliefQueryError> {
     if rows.is_empty() {
         return Ok(None);
     }
 
-    let calibration = CalibrationConfig::from_workspace_root()
-        .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback());
-    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
-        .await
-        .ok()
-        .flatten();
-    let per_frame_weights = FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
-        .await
-        .ok()
-        .flatten();
-
     let mut mass_fns: Vec<MassFunction> = Vec::with_capacity(rows.len());
     for row in rows {
         let mf = MassFunction::from_json_masses(frame.clone(), &row.masses)
             .map_err(BeliefQueryError::ParseMasses)?;
-        let alpha = match perspective {
+        let alpha = match ctx.perspective.as_ref() {
             Some(p) => effective_source_strength_with_perspective(
                 row,
-                per_frame_intra,
-                per_frame_weights.as_ref(),
-                &calibration,
+                ctx.per_frame_intra,
+                ctx.per_frame_weights.as_ref(),
+                &ctx.calibration,
                 p,
             ),
             None => effective_source_strength(
                 row,
-                per_frame_intra,
-                per_frame_weights.as_ref(),
-                &calibration,
+                ctx.per_frame_intra,
+                ctx.per_frame_weights.as_ref(),
+                &ctx.calibration,
             ),
         };
         mass_fns.push(combination::discount(&mf, alpha).map_err(BeliefQueryError::Ds)?);
@@ -294,6 +341,134 @@ async fn recompute_framed_belief(
     let (combined, _reports) =
         combination::combine_multiple(&mass_fns, 0.9).map_err(BeliefQueryError::Ds)?;
     Ok(Some(combined))
+}
+
+/// Recompute the combined mass function for a framed claim, discounting each
+/// stored BBA by its effective reliability before Dempster combination.
+///
+/// This is the single-claim path both `get_belief` (perspective = `None`) and
+/// `get_perspective_belief` use. It resolves the frame-scoped reliability
+/// context ([`FramedBeliefContext::resolve`]) once, then delegates the actual
+/// combination to the pure [`combine_framed_bbas`]. The batch path
+/// ([`get_perspective_belief_batch`]) resolves the SAME context once and reuses
+/// it across a whole page — that is the N+1 fix; both paths share
+/// `combine_framed_bbas`, so their values are identical.
+///
+/// Returns `Ok(None)` only when `rows` is empty.
+async fn recompute_framed_belief(
+    pool: &PgPool,
+    frame_id: Uuid,
+    frame: &FrameOfDiscernment,
+    rows: &[MassFunctionRow],
+    perspective: Option<&PerspectiveReliability>,
+) -> Result<Option<MassFunction>, BeliefQueryError> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    // Preserve the pre-refactor semantics: this path is only reached with an
+    // already-resolved `PerspectiveReliability` (or `None`), so build the
+    // context from the per-frame/calibration loads plus the passed reliability
+    // rather than re-resolving the perspective row.
+    let calibration = CalibrationConfig::from_workspace_root()
+        .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback());
+    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
+        .await
+        .ok()
+        .flatten();
+    let per_frame_weights = FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
+        .await
+        .ok()
+        .flatten();
+    let ctx = FramedBeliefContext {
+        calibration,
+        per_frame_intra,
+        per_frame_weights,
+        perspective: perspective.cloned(),
+    };
+
+    combine_framed_bbas(frame, rows, &ctx)
+}
+
+/// Batch sibling of [`get_perspective_belief`]: compute the lensed belief for a
+/// whole page of claims under one `(frame, perspective)` lens, resolving the
+/// perspective row + per-frame overrides + calibration **exactly once** for the
+/// entire page instead of once per claim.
+///
+/// This is the fix for the lensed-recall N+1 (backlog
+/// `9e33ddf7-53cb-4a5f-bcd3-1396f55c0f99`): the per-hit `recall`/`memory` loops
+/// previously called [`get_perspective_belief`] once per hit, and each call
+/// re-resolved the same frame row, perspective row, and per-frame override rows
+/// from the DB. Here [`FramedBeliefContext::resolve`] runs once; only the
+/// per-claim frame-assignment and BBA fetches (genuinely claim-scoped) remain in
+/// the loop, and the combine ([`combine_framed_bbas`]) is pure.
+///
+/// Degrade-not-fail is preserved at the item level: the result is a per-claim
+/// `Result`, so a single malformed claim's error is isolated and the caller can
+/// warn + serve a null lens for that claim without aborting the page (spec §8).
+/// A hard `Err` on the whole call means only that the frame or a page-level
+/// resolution failed. Each `Ok(BeliefInterval)` is byte-identical to the value
+/// [`get_perspective_belief`] would return for that claim.
+///
+/// # Errors
+/// `FrameNotFound` if `frame_id` is absent; `Db` on a page-level query failure.
+pub async fn get_perspective_belief_batch(
+    pool: &PgPool,
+    claim_ids: &[Uuid],
+    frame_id: Uuid,
+    perspective_id: Uuid,
+) -> Result<Vec<(Uuid, Result<BeliefInterval, BeliefQueryError>)>, BeliefQueryError> {
+    let frame_row = FrameRepository::get_by_id(pool, frame_id)
+        .await?
+        .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
+    let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
+
+    // Resolve perspective + per-frame overrides + calibration ONCE per page.
+    // This is the hoist that removes the N+1.
+    let ctx = FramedBeliefContext::resolve(pool, frame_id, Some(perspective_id)).await?;
+
+    let mut out = Vec::with_capacity(claim_ids.len());
+    for &claim_id in claim_ids {
+        out.push((
+            claim_id,
+            perspective_belief_for_claim(pool, claim_id, frame_id, &frame, &ctx).await,
+        ));
+    }
+    Ok(out)
+}
+
+/// Compute one claim's lensed belief given an already-resolved
+/// [`FramedBeliefContext`]. Only the frame-assignment and BBA fetches here are
+/// claim-scoped; everything else was hoisted into `ctx`. Mirrors the tail of
+/// [`get_perspective_belief`] exactly so the two produce identical intervals.
+async fn perspective_belief_for_claim(
+    pool: &PgPool,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    frame: &FrameOfDiscernment,
+    ctx: &FramedBeliefContext,
+) -> Result<BeliefInterval, BeliefQueryError> {
+    let assignment = FrameRepository::get_claim_assignment(pool, claim_id, frame_id).await?;
+    let hypothesis_index = assignment.and_then(|a| a.hypothesis_index).unwrap_or(0) as usize;
+
+    let all_bbas = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id).await?;
+    if all_bbas.is_empty() {
+        return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
+    }
+
+    let combined = combine_framed_bbas(frame, &all_bbas, ctx)?
+        .expect("all_bbas is non-empty so combination yields Some");
+
+    let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
+    Ok(BeliefInterval {
+        belief: epigraph_ds::measures::belief(&combined, &target),
+        plausibility: epigraph_ds::measures::plausibility(&combined, &target),
+        pignistic_prob: epigraph_ds::measures::pignistic_probability(&combined, hypothesis_index),
+        mass_on_conflict: combined.mass_of_conflict(),
+        mass_on_missing: combined.mass_of_missing(),
+        framed: true,
+        source: "recomputed_perspective".to_string(),
+    })
 }
 
 // The frame-function reliability composition (perspective × per-frame ×

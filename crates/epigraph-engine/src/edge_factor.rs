@@ -10,7 +10,9 @@
 //! Lives in `epigraph-engine` (not `epigraph-mcp`) so both the MCP edge-creation
 //! path and the HTTP `POST /api/v1/edges` path can share a single algorithm.
 //! The `auto_wire_edge_if_epistemic` wrapper adds the standard gates
-//! (was_created + claim→claim) for use at edge-creation call sites.
+//! (claim→claim, plus "no BBA has ever been materialized for this edge yet" —
+//! NOT simply `was_created`, see that function's doc comment for why) for use
+//! at edge-creation call sites.
 
 use sqlx::PgPool;
 use std::collections::{BTreeSet, HashMap};
@@ -240,11 +242,28 @@ pub async fn auto_wire_ds_for_edge(
 }
 
 /// Fire `auto_wire_ds_for_edge` from an edge-creation call site, gated on
-/// whether the edge was newly created and connects two claim nodes.
+/// whether the edge connects two claim nodes AND (was just created OR has
+/// never been wired).
+///
+/// The `was_created` flag alone is not sufficient: an edge can be written
+/// durably while its source claim is "factorless" (no belief interval yet —
+/// see [`EdgeFactorOutcome::SourceFactorless`]), and later re-asserted via
+/// the same call site once the source acquires belief. That re-assertion
+/// hits `was_created=false` (the edge already exists) but must still attempt
+/// wiring — otherwise the wake-up is a permanent no-op (backlog claim
+/// 8ef5cf61-7382-43a4-85cb-565d76ba3f06). So the real gate is "has a BBA
+/// EVER been materialized for this edge_id" (checked via
+/// `MassFunctionRepository::exists_for_perspective`, since edge-factor BBAs
+/// are persisted keyed by `perspective_id = edge_id`): skip only when one
+/// already exists, regardless of `was_created`. This makes the wake-up
+/// idempotent — once wired, further re-hits on the same edge are no-ops
+/// again, matching the pre-fix behavior for the common (believed-source)
+/// case.
 ///
 /// Best-effort: failures are logged at `warn` and swallowed. Returns `None`
-/// when the edge wasn't newly created, sources/targets aren't claims, or the
-/// auto-wire call failed. Returns `Some(outcome)` when the trigger fired.
+/// when sources/targets aren't claims, a BBA already exists for this edge,
+/// or the auto-wire call failed. Returns `Some(outcome)` when the trigger
+/// fired.
 #[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_edge_if_epistemic(
     pool: &PgPool,
@@ -257,8 +276,21 @@ pub async fn auto_wire_edge_if_epistemic(
     relationship: &str,
     agent_id: Uuid,
 ) -> Option<EdgeFactorOutcome> {
-    if !was_created || source_type != "claim" || target_type != "claim" {
+    if source_type != "claim" || target_type != "claim" {
         return None;
+    }
+    if !was_created {
+        match MassFunctionRepository::exists_for_perspective(pool, edge_id).await {
+            Ok(true) => return None,
+            Ok(false) => {} // never wired — attempt the wake-up below
+            Err(e) => {
+                tracing::warn!(
+                    edge = %edge_id,
+                    "edge auto-wire wake-up check failed: {e}",
+                );
+                return None;
+            }
+        }
     }
     match auto_wire_ds_for_edge(pool, edge_id, agent_id, source_id, target_id, relationship).await {
         Ok(outcome) => Some(outcome),

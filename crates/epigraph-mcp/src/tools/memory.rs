@@ -32,14 +32,77 @@ pub async fn memorize(
     let agent_id_typed = AgentId::from_uuid(agent_id);
     let pub_key = server.signer.public_key();
     let confidence = params.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
-    let tags = params.tags.unwrap_or_default();
+    let mut tags = params.tags.unwrap_or_default();
 
     let raw_truth = (confidence * 0.6).clamp(0.01, 0.99);
     let truth_value = TruthValue::clamped(raw_truth);
 
     let mut claim = Claim::new(params.content.clone(), agent_id_typed, pub_key, truth_value);
-    claim.content_hash = ContentHasher::hash(params.content.as_bytes());
+    let content_hash = ContentHasher::hash(params.content.as_bytes());
+    claim.content_hash = content_hash;
     claim.signature = Some(server.signer.sign(&claim.content_hash));
+
+    // Write-side semantic novelty gate (backlog 1bcaed94, Task 6.4) — same
+    // shape as `submit_claim`'s wiring, see `crate::tools::novelty_gate`
+    // module docs for the full rationale (content-hash check first so an
+    // exact resubmit is unaffected; gate only runs on genuinely new content).
+    let is_exact_resubmit = {
+        let mut conn = server.pool.acquire().await.map_err(internal_error)?;
+        ClaimRepository::find_by_content_hash_and_agent(&mut conn, &content_hash, agent_id)
+            .await
+            .map_err(internal_error)?
+            .is_some()
+    };
+    let mut pending_embedding: Option<String> = None;
+    if !is_exact_resubmit {
+        let novelty_threshold = params
+            .novelty_threshold
+            .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
+        if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
+            &server.pool,
+            server.embedder.as_ref(),
+            &params.content,
+            novelty_threshold,
+        )
+        .await
+        {
+            if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) = decision
+            {
+                // See submit_claim's identical branch (claims.rs) for the
+                // full rationale on both deliberate differences from
+                // content-hash dedup: corpus-wide (cross-agent) suppression
+                // — with the same epistemic-corroboration-loss consequence
+                // for memorize's caller — and this submission's `tags`
+                // being dropped since nothing is inserted.
+                let existing =
+                    ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(existing_id))
+                        .await
+                        .map_err(internal_error)?
+                        .ok_or_else(|| {
+                            internal_error(format!(
+                            "novelty gate: nearest claim {existing_id} vanished before read-back"
+                        ))
+                        })?;
+                return success_json(&MemorizeResponse {
+                    claim_id: existing_id.to_string(),
+                    truth_value: existing.truth_value.value(),
+                    embedded: false,
+                    tags,
+                    belief: None,
+                    plausibility: None,
+                    pignistic_prob: None,
+                });
+            }
+            pending_embedding = Some(pgvec);
+            if matches!(
+                decision,
+                crate::tools::novelty_gate::GateDecision::InsertFlagged
+            ) && !tags.iter().any(|t| t == "near-duplicate")
+            {
+                tags.push("near-duplicate".to_string());
+            }
+        }
+    }
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
@@ -113,10 +176,22 @@ pub async fn memorize(
             }
         };
 
-        let embedded = server
-            .embedder
-            .embed_and_store(claim_uuid, &params.content)
-            .await;
+        // Reuse the novelty gate's already-generated vector when available,
+        // matching submit_claim's pattern — avoids a second OpenAI call.
+        let embedded = if let Some(pgvec) = pending_embedding.take() {
+            match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
+                Ok(stored) => stored,
+                Err(e) => {
+                    tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
+                    false
+                }
+            }
+        } else {
+            server
+                .embedder
+                .embed_and_store(claim_uuid, &params.content)
+                .await
+        };
 
         (raw_truth, ds, embedded)
     } else {
@@ -305,37 +380,6 @@ async fn recall_post_embed(
                             matched_via.push("lexical".to_string());
                         }
 
-                        // Additive lensed belief per returned claim. Degrade-not-fail:
-                        // a compute error for ONE claim yields null + a warn, never an
-                        // aborted page (spec §8). min_truth/ranking stay on `tv`.
-                        let lensed_belief = match lens {
-                            Some((frame_id, perspective_id)) => {
-                                match epigraph_engine::belief_query::get_perspective_belief(
-                                    &server.pool,
-                                    hit.claim_id,
-                                    frame_id,
-                                    perspective_id,
-                                )
-                                .await
-                                {
-                                    Ok(interval) => Some(LensedBelief::from_interval(
-                                        frame_id,
-                                        perspective_id,
-                                        &interval,
-                                    )),
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            claim_id = %hit.claim_id,
-                                            error = %e,
-                                            "lensed belief compute failed; serving null lens for this claim"
-                                        );
-                                        None
-                                    }
-                                }
-                            }
-                            None => None,
-                        };
-
                         // Without a workflows leg (include_workflows=false, the
                         // default), `merged_rrf_score` is 1/(k+rank) where rank is
                         // the claim's position in `hits` — the SAME ordering
@@ -351,7 +395,10 @@ async fn recall_post_embed(
                             similarity: hit.dense_similarity.unwrap_or(0.0),
                             rrf_score: hit.rrf_score,
                             matched_via,
-                            lensed_belief,
+                            // Populated by the bounded lens post-pass below (once
+                            // per page, backlog 9e33ddf7's N+1 fix), keyed by
+                            // claim_id. None until then.
+                            lensed_belief: None,
                             result_type: None,
                         });
                     }
@@ -365,11 +412,70 @@ async fn recall_post_embed(
                         truth_value: hit.truth_value,
                         similarity: hit.similarity,
                         rrf_score: merged_rrf_score,
+                        // Workflows aren't claims, so the batch lens post-pass's
+                        // claim_id-keyed lookup below never matches a workflow_id
+                        // — lensed_belief stays None for workflow-origin results,
+                        // which is correct (lensing is a claim-belief concept).
                         matched_via: vec!["dense".to_string()],
                         lensed_belief: None,
                         result_type: Some("workflow".to_string()),
                     });
                 }
+            }
+        }
+    }
+
+    // Bounded lens post-pass: when a lens is active, resolve the perspective row
+    // + per-frame overrides ONCE for the whole page (the N+1 fix, backlog
+    // 9e33ddf7) instead of once per claim, then annotate each already-built
+    // result keyed by claim_id. Per-claim degrade-not-fail is preserved: each
+    // claim carries its own `Result`, so one malformed claim warns + serves a
+    // null lens without aborting the page (spec §8). min_truth/ranking stayed
+    // on the global `tv` above and are untouched here.
+    if let Some((frame_id, perspective_id)) = lens {
+        let claim_ids: Vec<uuid::Uuid> = results
+            .iter()
+            .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+            .collect();
+        match epigraph_engine::belief_query::get_perspective_belief_batch(
+            &server.pool,
+            &claim_ids,
+            frame_id,
+            perspective_id,
+        )
+        .await
+        {
+            Ok(intervals) => {
+                let mut by_claim: std::collections::HashMap<uuid::Uuid, _> =
+                    intervals.into_iter().collect();
+                for r in &mut results {
+                    let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
+                        continue;
+                    };
+                    match by_claim.remove(&cid) {
+                        Some(Ok(interval)) => {
+                            r.lensed_belief = Some(LensedBelief::from_interval(
+                                frame_id,
+                                perspective_id,
+                                &interval,
+                            ));
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                claim_id = %cid,
+                                error = %e,
+                                "lensed belief compute failed; serving null lens for this claim"
+                            );
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "lensed belief batch failed; serving null lens for this page"
+                );
             }
         }
     }

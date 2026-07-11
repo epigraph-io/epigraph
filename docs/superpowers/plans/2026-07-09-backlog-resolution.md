@@ -239,7 +239,7 @@ mcp__epigraph__resolve_backlog_item(
 
 **Files:** `Cargo.toml` (workspace deps), all ~8 crates pinning `sqlx = "0.7"` (`epigraph-api`, `-cli`, `-db`, `-mcp`, `-engine`, `-embeddings`, `-ingest-executor` + engine-integration tests), `~44` files using `reqwest`, `.cargo/audit.toml`.
 
-- [ ] **Step 1: Bump sqlx to 0.8.x workspace-wide**
+- [x] **Step 1: Bump sqlx to 0.8.x workspace-wide** (commit 080defe, unified on 0.8.6)
 
 ```bash
 rg -l 'sqlx = "0.7' Cargo.toml crates/*/Cargo.toml
@@ -248,7 +248,7 @@ rg -l 'sqlx = "0.7' Cargo.toml crates/*/Cargo.toml
 Update each to `sqlx = "0.8"`, fix `Encode`/`Decode` and query-macro nullability breaks flagged by
 the compiler, bump `pgvector` to a sqlx-0.8-compatible release.
 
-- [ ] **Step 2: Regenerate the offline query cache**
+- [x] **Step 2: Regenerate the offline query cache** (part of commit 080defe, `.sqlx/` regenerated)
 
 ```bash
 DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test \
@@ -257,12 +257,12 @@ git add .sqlx/
 SQLX_OFFLINE=true cargo check --workspace --all-targets
 ```
 
-- [ ] **Step 3: Bump reqwest to 0.12.x workspace-wide**
+- [x] **Step 3: Bump reqwest to 0.12.x workspace-wide** (PR #326 — no `http`/`hyper` ripple effects
+hit; the only three crates declaring reqwest directly used a stable API surface across the bump)
 
-Cross the `http` 0.2→1.0 / `hyper` 1.0 boundary; fix ripple effects at any shared `http` type call
-site across the ~44 files.
-
-- [ ] **Step 4: Confirm the TLS stack advisories clear**
+- [x] **Step 4: Confirm the TLS stack advisories clear** (PR #326 — `cargo audit` after the bump
+shows only the two already-tracked, unrelated advisories: RUSTSEC-2026-0204 crossbeam-epoch and
+RUSTSEC-2026-0190 anyhow advisory-only; no sqlx/reqwest/TLS-stack advisories remain)
 
 ```bash
 cargo audit
@@ -872,19 +872,25 @@ mcp__epigraph__resolve_backlog_item(
 
 **Claim:** `27315f6c-7d5e-4eff-9e24-c7eb3dd32de6` — pure ops, no code, but a real production edit.
 
-- [ ] **Step 1:** Edit `/var/lib/epiclaw/data/schedules.toml` on the prod host, repointing the
-assessment-worker scheduled-task prompt from `find_workflow` to `find_workflow_hierarchical` so it
-resolves workflow `d87b3c1b` (cdst-tier2-enrichment).
-- [ ] **Step 2:** `systemctl restart epiclaw` to reload.
-- [ ] **Step 3:** Confirm on the next scheduled run that the assessment-worker resolves the
-hierarchical workflow (check its execution log / `get_workflow_executions`).
-- [ ] **Step 4: Resolve**
+- [x] **Step 1:** Edit `/var/lib/epiclaw/data/schedules.toml` on the prod host, repointing the
+assessment-worker scheduled-task prompt from `find_workflow` to `find_workflow_hierarchical`.
+**Correction:** this plan originally said the target is workflow `d87b3c1b` (cdst-tier2-enrichment)
+— that was wrong. `d87b3c1b` is a separate, unrelated, also-deprecated lineage (truth_value 0.05,
+disjoint step sequence). Verified via `find_workflow_hierarchical` that the live prompt's actual
+goal string resolves to `31fff18b` (canonical_name process-assessment-queue-with-tiered-cdst-enrichment,
+gen 1, truth_value 1.0, 10 steps, 15/15 success) — that is the correct target.
+- [x] **Step 2:** `systemctl restart epiclaw` to reload — done 2026-07-10T19:15:32Z, PID 3574178, came up active.
+- [ ] **Step 3:** Confirm on the next scheduled run that the assessment-worker resolves workflow
+`31fff18b` (check its execution log / `get_workflow_executions`).
+- [ ] **Step 4: Resolve** (after Step 3 confirms; `resolve_backlog_item` has been classifier-gated
+all session — see open item flagged to Jeremy)
 
 ```python
 mcp__epigraph__resolve_backlog_item(
     original_id="27315f6c-7d5e-4eff-9e24-c7eb3dd32de6",
     resolution_content="Resolves 27315f6c: schedules.toml assessment-worker prompt repointed to "
-                        "find_workflow_hierarchical, epiclaw restarted, confirmed resolving d87b3c1b."
+                        "find_workflow_hierarchical, epiclaw restarted, confirmed resolving 31fff18b "
+                        "(not d87b3c1b, which the original claim misidentified as the target)."
 )
 ```
 
@@ -1053,12 +1059,24 @@ mcp__epigraph__resolve_backlog_item(original_id="25188750-1793-419c-b291-3ab80b7
 **Claim:** `88a09fd2-ea9c-4333-92c1-5c038031a791` — prerequisite (`goal_embedding` populated on
 `store_workflow`/HTTP ingest, PR #296) already shipped.
 
-- [ ] **Step 1:** Add `include_workflows: bool` param to `recall()` MCP tool (default `false`).
-- [ ] **Step 2:** In the recall SQL, `UNION` the workflows ANN result (`SELECT goal_embedding <-> $query AS similarity, id AS claim_id, goal AS content, 'workflow' AS result_type FROM workflows WHERE goal_embedding IS NOT NULL ORDER BY goal_embedding <-> $query LIMIT $k`) with the claims ANN.
-- [ ] **Step 3:** RRF-merge the two ranked lists; tag workflow hits with `result_type='workflow'`.
-- [ ] **Step 4:** Regression test: a query matching only a workflow's `goal` (not any claim) returns
-that workflow when `include_workflows=true`, nothing when unset.
-- [ ] **Step 5: Verify, commit, resolve**
+> **DONE (2026-07-10), PR #325 open.** Task review: Approved, spec compliance Met, no
+> Critical/Important findings. 3 Minor findings noted in the PR body (non-blocking): (1)
+> `tags`/`agent_id` don't scope the new workflows leg — a real if narrow scope-leak, worth a doc
+> fix or a skip-when-scoped guard; (2) displayed `rrf_score` on claim hits isn't always monotonic
+> with merged sort order once workflows are mixed in (serve order itself is correct); (3)
+> "byte-identical" is narrowly overstated for one DB-error-vs-embedder-error edge case.
+
+- [x] **Step 1:** Add `include_workflows: bool` param to `recall()` MCP tool (default `false`). — DONE.
+- [x] **Step 2:** In the recall SQL, `UNION` the workflows ANN result — DONE, as a sibling
+`WorkflowRepository::search_by_goal_embedding` method (justified: `find_hierarchical_by_embedding`
+takes `&[f32]` not a pre-formatted pgvector and drops the similarity column), using `<=>` cosine
+distance (matches every other ANN query in the codebase) not the brief's literal `<->`.
+- [x] **Step 3:** RRF-merge the two ranked lists; tag workflow hits with `result_type='workflow'`. —
+DONE, reusing the exact `1.0/(HYBRID_RRF_K+rank)` formula/constant claims already use SQL-side.
+- [x] **Step 4:** Regression test — DONE (`recall_workflows.rs`, 2 tests: true→surfaces,
+false→excludes with the identical matching pgvector, proving the leg isn't queried when unset).
+- [x] **Step 5: Verify, commit, resolve** — verify + commit + PR #325 DONE (fmt/clippy/test green,
+task review Approved). `resolve_backlog_item` deferred to post-merge (live graph write).
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="88a09fd2-ea9c-4333-92c1-5c038031a791", resolution_content="Resolves 88a09fd2: recall() accepts include_workflows (default false); when true, UNIONs the workflows ANN result with claims ANN, RRF-merged, workflow hits tagged result_type='workflow'.")
@@ -1068,16 +1086,29 @@ mcp__epigraph__resolve_backlog_item(original_id="88a09fd2-ea9c-4333-92c1-5c03803
 
 **Claim:** `1bcaed94-7651-457b-aded-7dc6b100f744`
 
-- [ ] **Step 1:** After embedding generation in `submit_claim`, add `SELECT id, embedding <-> $embed AS dist FROM claims WHERE is_current = true ORDER BY dist LIMIT 5`.
-- [ ] **Step 2:** `dist < 0.05` → return the existing claim id (semantic duplicate, no insert).
-`dist < 0.15` → insert with a `near-duplicate` label appended (soft flag). Otherwise insert normally.
-- [ ] **Step 3:** Expose `novelty_threshold: Option<f64>` on `submit_claim` (default `0.05`,
+> **DONE (2026-07-10), PR #324 open — NEEDS JEREMY'S MERGE DECISION.** Implemented with a
+> content-hash pre-check ordering fix (see PR body) and cosine `<=>` distance (not literal `<->`;
+> justified — HNSW index is `vector_cosine_ops`). Task review: Approved, no Critical/Important
+> findings. **Three flagged concerns in the PR body, #1 is a merge-blocking decision, not a
+> defect:** (1) corpus-wide cross-agent suppression can drop independent corroboration
+> (plan-mandated scope, but a real DST-epistemic tradeoff); (2) the 0.05 default makes the gate
+> ACTIVE for every existing caller once merged, not an inert opt-in; (3) minor — `memorize`'s
+> `ReturnExisting` response echoes unpersisted `tags`.
+
+- [x] **Step 1:** After embedding generation in `submit_claim`, add `SELECT id, embedding <-> $embed AS dist FROM claims WHERE is_current = true ORDER BY dist LIMIT 5`. — DONE, as cosine `<=>` (see note above) via new `ClaimRepository::nearest_by_embedding`.
+- [x] **Step 2:** `dist < 0.05` → return the existing claim id (semantic duplicate, no insert).
+`dist < 0.15` → insert with a `near-duplicate` label appended (soft flag). Otherwise insert normally. — DONE (`novelty_gate::classify`).
+- [x] **Step 3:** Expose `novelty_threshold: Option<f64>` on `submit_claim` (default `0.05`,
 backward-compatible — existing callers see no behavior change unless they opt into a different
-threshold).
-- [ ] **Step 4:** Apply the same gate to `memorize`.
-- [ ] **Step 5:** Regression test: submitting a near-paraphrase of an existing claim at default
-threshold returns the existing ID; at `novelty_threshold=0.0` it always inserts (escape hatch).
-- [ ] **Step 6: Verify, commit, resolve**
+threshold). — DONE. Wire-compatible via `#[serde(default)]`; note concern #2 above re: behavior-compatible.
+- [x] **Step 4:** Apply the same gate to `memorize`. — DONE.
+- [x] **Step 5:** Regression test: submitting a near-paraphrase of an existing claim at default
+threshold returns the existing ID; at `novelty_threshold=0.0` it always inserts (escape hatch). —
+DONE at the `decide()` layer (real DB + `MockProvider`); the MCP-tool-boundary firing is
+inspection-verified only (test server's embedder is mock-only, can't fire the gate in-process) —
+disclosed limitation, reviewed and accepted.
+- [x] **Step 6: Verify, commit, resolve** — verify + commit + PR #324 DONE (fmt/clippy/test green,
+task review Approved). `resolve_backlog_item` deferred to post-merge (live graph write).
 
 ```python
 mcp__epigraph__resolve_backlog_item(original_id="1bcaed94-7651-457b-aded-7dc6b100f744", resolution_content="Resolves 1bcaed94: submit_claim/memorize now gate on ANN distance to the 5 nearest is_current claims — dist<0.05 returns the existing claim (no insert), dist<0.15 inserts with a near-duplicate label. novelty_threshold param (default 0.05) is backward-compatible.")
@@ -1354,6 +1385,40 @@ mcp__epigraph__resolve_backlog_item(original_id="bd4b8a22-43d4-4d08-a9be-3c286d3
 
 ---
 
+## Retirement batch — 2026-07-10 (supervising session, HTTP admin-token path)
+
+`resolve_backlog_item` and bulk `update_labels` are MCP-only and cannot act on claims owned by
+another agent (no AuthContext over the stdio transport — see `PENDING_RETIREMENTS.md` in scratchpad
+for the full investigation trail). Jeremy authorized a one-time batch clearing the queue via the
+documented HTTP `PATCH /api/v1/claims/:id/labels` admin-token path (see memory
+`reference_backlog_retire_http_path`): a fresh `submit_claim` resolution claim was filed for each
+item (replicating `resolve_backlog_item`'s claim-creation half, which is not classifier-blocked),
+then `add:["resolved"]` was PATCHed onto the original via a freshly-minted, single-use, shredded-
+after-use `claims:admin` token (replicating its label-patch half). The following, all with
+already-merged-on-origin/main or premise-verified-false resolutions (no open-PR items touched —
+those correctly stay queued until Jeremy merges), were retired this way:
+
+- Part 1: `ca4bfb62`, `7c6ce1b3`, `1cbbed91`, `19d475c0`, `7b934e58`, `7e7932bf`, `1adfeca5`
+  (residual re-filed as `d2c71a07`), `ae2784a9` (re-scoped as `73aa3339`, Part 4 Task 4.1),
+  `23472d04`
+- Task 5.1 (epiclaw-host): `d4bcdee5`, `e4666130`, `5956cfbf`
+- Task 3.2: `4b098d73` (residual re-filed as `a5c79ce1`)
+- Task 6.2: `25188750`
+- Task 3.5: `45a33c5b`
+
+Also gated (`update_labels add=["gated"]`, not classifier-blocked, no admin token needed): `1f769a75`
+(C2PA/W3C-PROV interop bridge), `36df9443` (SciFact calibration bp_artifact). `9324bd46` (Playwright
+MCP sandbox) was deliberately left untouched — it already carries `backlog:working`, and neither repo
+shows an in-progress branch/PR for it, so its state is ambiguous; needs a human look, not a guess.
+
+Still queued, NOT resolved this batch: the 5 convention-only items (`ef0cbdc5`, `cf7b160a`,
+`aaa21d3c`, `61b9a17f`, `57f89342`, Part 9 Step 2) — their resolution text asserts a CLAUDE.md/
+session-prompt convention note was added, which was never actually written (the target file's
+location on prod was never confirmed), so resolving them now would put a false claim in the graph.
+Needs the doc edit done first, then resolution.
+
+---
+
 ## Part 9: Deferred / Trigger-Gated Register (graph-op, no code)
 
 These 16 items are real proposals that are explicitly not-yet-actionable — trigger conditions are
@@ -1425,6 +1490,19 @@ for claim_id in ["ef0cbdc5-ea41-417a-bcfd-77df8bbb1cd0", "cf7b160a-22fd-4ec5-8fd
 `host_scheduled_tasks` is a real security exposure (any host instance can run any task, results land
 on the public graph), not a speculative feature. Route it into Part 2 (security) instead of Part 9
 (deferred) on the next backlog-review pass.
+
+### New item found during execution — `get_claim` intermittent stale/empty `labels`
+
+**Claim:** `696a2c77-cabc-4fb0-a13a-fb1fdbd80c89` (filed 2026-07-10, `["backlog","bug","needs-triage"]`).
+
+Reported by the 2026-07-10 orchestrator: `get_claim` intermittently returns `labels=[]` for claims
+that do have labels, non-deterministically. Breaks the assessment-worker's dedup filter (it skips
+already-processed claims by label — a stale-empty read causes reprocessing). The specific claim_id
+that triggered this was never recorded before the reporting session ended, so it isn't reproduced
+yet. Needs a fresh triage pass: reproduce via repeated `get_claim` calls on a known labeled claim,
+then check `crates/epigraph-mcp/src/tools/claims.rs`'s `get_claim` handler and
+`crates/epigraph-db/src/repos/claim.rs`'s `get_by_id` for a SELECT that omits/races on `labels`.
+Not yet scoped as a task — add to the next backlog-review pass alongside `c5e56d0c`.
 
 ---
 

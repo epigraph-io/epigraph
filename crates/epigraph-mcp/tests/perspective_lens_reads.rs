@@ -262,6 +262,7 @@ fn rwc_params(
         groundedness_gate: None,
         frame_id: frame_id.map(|f| f.to_string()),
         perspective_id: perspective_id.map(|p| p.to_string()),
+        graph_expansion_depth: None,
     }
 }
 

@@ -143,6 +143,7 @@ async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &P
             source_url: None,
             reasoning: None,
             labels: vec![],
+            novelty_threshold: None,
         },
     )
     .await

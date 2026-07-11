@@ -32,6 +32,18 @@ pub struct ClaimEmbeddingHit {
     pub similarity: f64,
 }
 
+/// Result row for [`ClaimRepository::nearest_by_embedding`].
+///
+/// `distance` is raw pgvector cosine distance (`<=>`), in `[0, 2]`, 0 =
+/// identical direction. Unlike [`ClaimEmbeddingHit::similarity`] this is NOT
+/// inverted, because the write-side novelty gate (backlog `1bcaed94`)
+/// thresholds directly on distance (`dist < 0.05` / `dist < 0.15`).
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct NearestClaimHit {
+    pub claim_id: Uuid,
+    pub distance: f64,
+}
+
 /// One fused hit from [`ClaimRepository::search_hybrid_scoped`] /
 /// [`ClaimRepository::search_lexical_scoped`].
 ///
@@ -500,6 +512,62 @@ impl ClaimRepository {
         Ok(row.map(|(l,)| l).unwrap_or_default())
     }
 
+    /// Get a claim by ID together with its labels in a single SQL statement.
+    ///
+    /// `get_by_id` followed by `get_labels` is two independent round trips
+    /// against the shared pool: a concurrent `update_labels` between them can
+    /// return labels inconsistent with the already-read claim row (TOCTOU).
+    /// A single-statement, single-row `SELECT` is inherently consistent under
+    /// Postgres MVCC, so this is the atomic alternative for callers (e.g. MCP
+    /// `get_claim`) that need both together.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_by_id_with_labels(
+        pool: &PgPool,
+        id: ClaimId,
+    ) -> Result<Option<(Claim, Vec<String>)>, DbError> {
+        let uuid: Uuid = id.into();
+
+        use sqlx::Row;
+        let row = sqlx::query(
+            r#"
+            SELECT id, content, truth_value, agent_id, trace_id,
+                   created_at, updated_at, is_current, supersedes, labels
+            FROM claims
+            WHERE id = $1
+            "#,
+        )
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await?;
+
+        match row {
+            Some(row) => {
+                let truth_value = TruthValue::new(row.get::<f64, _>("truth_value"))?;
+                let mut claim = claim_from_row(
+                    row.get("id"),
+                    row.get("content"),
+                    row.get("agent_id"),
+                    row.get("trace_id"),
+                    truth_value,
+                    row.get("created_at"),
+                    row.get("updated_at"),
+                );
+                // Post-fix retirement state so callers see real DB values
+                // instead of `claim_from_row`'s defaults, mirroring `get_by_id`.
+                claim.is_current = row.get::<bool, _>("is_current");
+                claim.supersedes = row
+                    .get::<Option<Uuid>, _>("supersedes")
+                    .map(ClaimId::from_uuid);
+                let labels: Vec<String> = row.get("labels");
+                Ok(Some((claim, labels)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// kNN search over `claims.embedding` (1536d) or `claims.embedding_3072`,
     /// restricted to paragraph-level (level=2) claims, optionally filtered by
     /// the paper that asserts the claim. Results are ordered by cosine
@@ -646,6 +714,45 @@ impl ClaimRepository {
         .bind(limit)
         .bind(tags_owned)
         .bind(agent_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// ANN lookup backing the write-side semantic novelty gate (backlog
+    /// `1bcaed94`, Task 6.4): the `limit` nearest `is_current` claims to
+    /// `query_embedding_pgvector`, ordered closest-first by cosine distance
+    /// (`<=>`, matching `idx_claims_embedding_hnsw`'s `vector_cosine_ops` and
+    /// every other ANN query in this repo — the backlog plan's SQL sketch
+    /// wrote `<->` (L2), but L2 is neither index-accelerated here nor
+    /// calibrated for the 0.05/0.15 thresholds).
+    ///
+    /// Excludes `embedding IS NULL` (no defined distance) and
+    /// `is_current = false` rows (superseded/retired claims must never
+    /// suppress a new near-paraphrase insert).
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn nearest_by_embedding(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        limit: i64,
+    ) -> Result<Vec<NearestClaimHit>, DbError> {
+        let rows = sqlx::query_as::<_, NearestClaimHit>(
+            r#"
+            SELECT id AS claim_id,
+                   (embedding <=> $1::vector)::float8 AS distance
+            FROM claims
+            WHERE embedding IS NOT NULL
+              AND is_current
+            ORDER BY embedding <=> $1::vector
+            LIMIT $2
+            "#,
+        )
+        .bind(query_embedding_pgvector)
+        .bind(limit)
         .fetch_all(pool)
         .await?;
 
@@ -2890,6 +2997,149 @@ impl ClaimRepository {
             before_trace,
             after_trace,
         })
+    }
+}
+
+// ── Graph-expanded recall (Task 6.1 / claim 29e789fd) ──
+
+/// Epistemic relationship types followed by [`ClaimRepository::graph_expand_seeds`].
+///
+/// Matches the traversal set named in claim 29e789fd's design sketch
+/// (supports/corroborates/elaborates) — the "argument-chain" subset of
+/// `link_epistemic`'s full `EPISTEMIC_RELATIONSHIPS` allowlist. `contradicts`/
+/// `refutes`/`generalizes`/`specializes` are intentionally excluded: expansion
+/// is meant to pull in claims that reinforce a seed's argument, not claims
+/// that merely relate to it in some other epistemic sense.
+pub const EXPANSION_RELATIONSHIPS: &[&str] = &["supports", "corroborates", "elaborates"];
+
+/// One claim reached by [`ClaimRepository::graph_expand_seeds`], with the hop
+/// count at which it was first discovered (BFS order, so this is the shortest
+/// path length from any seed).
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+pub struct GraphExpansionHit {
+    pub claim_id: Uuid,
+    pub hops: i32,
+}
+
+impl ClaimRepository {
+    /// Hard cap on the number of distinct claims [`Self::graph_expand_seeds`]
+    /// will discover, mirroring the `traverse` MCP tool's `node_limit`
+    /// (`.clamp(1, 100)`, default 50). Depth-clamping alone does NOT bound
+    /// the work: supports/corroborates/elaborates fan-out over up to 4 hops
+    /// on a dense graph can reach thousands of claims, each costing one
+    /// sequential `EdgeRepository::get_by_source` round-trip inside a
+    /// synchronous `recall_with_context` call. The caller's final
+    /// `raw_hits.truncate(want)` bounds the OUTPUT size, not the work done
+    /// to produce it — this cap bounds the work itself.
+    const MAX_EXPANSION_NODES: usize = 200;
+
+    /// Bounded multi-hop BFS from a set of seed claims, following outgoing
+    /// edges whose relationship is in [`EXPANSION_RELATIONSHIPS`].
+    ///
+    /// Mirrors what the `traverse` MCP tool does internally (BFS over
+    /// `EdgeRepository::get_by_source`, filtering relationship in Rust) rather
+    /// than round-tripping through the MCP tool layer — `traverse` only
+    /// supports a single relationship string and returns a serialized
+    /// `CallToolResult`, neither of which fit a per-seed multi-relationship
+    /// expansion called from inside `recall_with_context`.
+    ///
+    /// Seed IDs themselves are never included in the result (callers already
+    /// have them as ANN hits); a claim reachable from more than one seed, or
+    /// at more than one hop count, is returned once at its shortest hop
+    /// count. `max_depth` is clamped to `[1, 4]` to match `traverse`'s depth
+    /// bound; the number of DISTINCT claims discovered is separately capped
+    /// at [`Self::MAX_EXPANSION_NODES`] (mirroring `traverse`'s `node_limit`)
+    /// so a dense graph can't turn one `recall_with_context` call into an
+    /// unbounded sequential BFS. When the cap is hit mid-frontier the BFS
+    /// stops immediately — same tradeoff `traverse` makes.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any underlying edge query fails.
+    #[instrument(skip(pool, seed_ids))]
+    pub async fn graph_expand_seeds(
+        pool: &PgPool,
+        seed_ids: &[Uuid],
+        max_depth: u32,
+    ) -> Result<Vec<GraphExpansionHit>, DbError> {
+        let max_depth = max_depth.clamp(1, 4) as i32;
+        let seeds: std::collections::HashSet<Uuid> = seed_ids.iter().copied().collect();
+
+        let mut visited: std::collections::HashSet<Uuid> = seeds.clone();
+        let mut discovered_at: std::collections::HashMap<Uuid, i32> =
+            std::collections::HashMap::new();
+        let mut frontier: Vec<Uuid> = seed_ids.to_vec();
+        let mut depth = 0;
+
+        'bfs: while depth < max_depth && !frontier.is_empty() {
+            depth += 1;
+            let mut next_frontier = Vec::new();
+            for &node in &frontier {
+                let outgoing =
+                    crate::repos::edge::EdgeRepository::get_by_source(pool, node, "claim").await?;
+                for e in outgoing {
+                    if !EXPANSION_RELATIONSHIPS.contains(&e.relationship.as_str()) {
+                        continue;
+                    }
+                    if visited.insert(e.target_id) {
+                        discovered_at.insert(e.target_id, depth);
+                        next_frontier.push(e.target_id);
+                        if discovered_at.len() >= Self::MAX_EXPANSION_NODES {
+                            break 'bfs;
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        Ok(discovered_at
+            .into_iter()
+            .map(|(claim_id, hops)| GraphExpansionHit { claim_id, hops })
+            .collect())
+    }
+
+    /// In-degree of epistemic-relationship edges (the full `link_epistemic`
+    /// allowlist: supports/corroborates/elaborates/generalizes/specializes/
+    /// contradicts/refutes) targeting each of `claim_ids`, batched in one
+    /// round-trip. Claims with no such incoming edges are simply absent from
+    /// the returned map (degree 0) rather than present with a zero — callers
+    /// should treat a missing key as 0.
+    ///
+    /// One `GROUP BY` query for the whole batch, not one query per claim: the
+    /// N+1 shape would be the naive approach given `recall_with_context`
+    /// calls this once per page over its (already small, ≤200) candidate
+    /// pool, not once per claim.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(pool, claim_ids))]
+    pub async fn in_epistemic_degree_batch(
+        pool: &PgPool,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, i64>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let relationships: Vec<String> = crate::repos::edge::EPISTEMIC_RELATIONSHIPS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows = sqlx::query!(
+            r#"
+            SELECT target_id, COUNT(*) AS "degree!"
+            FROM edges
+            WHERE target_id = ANY($1)
+              AND source_type = 'claim' AND target_type = 'claim'
+              AND relationship = ANY($2)
+            GROUP BY target_id
+            "#,
+            claim_ids,
+            &relationships[..],
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| (r.target_id, r.degree)).collect())
     }
 }
 

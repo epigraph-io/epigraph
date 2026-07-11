@@ -120,6 +120,17 @@ pub struct RecallWithContextParams {
     /// with `frame_id`. The perspective's source/locality reliability re-weights
     /// each hit's BBAs on-read.
     pub perspective_id: Option<String>,
+    /// When set, after the normal ANN seed retrieval, follow outgoing
+    /// supports/corroborates/elaborates edges up to this many hops from each
+    /// ANN seed and fold the reached claims into the candidate pool (deduped
+    /// against the seeds), reranked by
+    /// `similarity * (1 + 0.1 * in_epistemic_degree)` before the usual
+    /// `min_truth`/context-enrichment pipeline runs. `None` (the default)
+    /// preserves today's flat-ANN-only behaviour byte-for-byte. Clamped to
+    /// `[1, 4]` to match the `traverse` MCP tool's depth bound. Composes with
+    /// `diverse`/`rerank` — expansion runs on whichever seed pool those
+    /// stages already produced.
+    pub graph_expansion_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -302,6 +313,110 @@ pub async fn recall_with_context(
     .await
 }
 
+/// Weight applied to `in_epistemic_degree` in the graph-expansion rerank
+/// formula: `similarity * (1 + GRAPH_EXPANSION_DEGREE_WEIGHT * in_degree)`.
+/// Matches the coefficient named in claim 29e789fd's design sketch.
+const GRAPH_EXPANSION_DEGREE_WEIGHT: f64 = 0.1;
+
+/// Stage 4 of [`recall_with_context_post_embed`]: fold graph-reachable
+/// claims into the ANN seed pool and rerank the combined set.
+///
+/// 1. BFS up to `depth` hops (clamped `[1,4]`) from every seed in `seeds`,
+///    following outgoing supports/corroborates/elaborates edges
+///    ([`epigraph_db::EXPANSION_RELATIONSHIPS`]) — the same edge-walk
+///    `traverse` does internally, reproduced directly against
+///    `ClaimRepository`/`EdgeRepository` rather than round-tripping the MCP
+///    tool layer (which only takes a single relationship string and returns
+///    a serialized `CallToolResult`).
+/// 2. Dedup: a claim already in `seeds` is never added a second time as an
+///    expansion hit, even if graph-reachable from another seed.
+/// 3. Assign each expanded claim a base "similarity" derived from the
+///    HIGHEST-similarity seed in the whole seed set, decayed by the hop
+///    count at which BFS first reached the claim
+///    (`best_seed_similarity * 0.7^hops`) — expanded claims have no ANN
+///    score of their own, and this keeps them rankable alongside direct
+///    hits while ranking closer expansions above farther ones. This is a
+///    conservative approximation, not a true per-path "closest reaching
+///    seed" score: `graph_expand_seeds`' BFS reports hop count from the
+///    frontier as a whole, not which specific seed a given path originated
+///    from, so the single highest seed similarity is used as an upper bound
+///    for every expanded claim rather than tracking per-seed provenance.
+/// 4. Rerank the combined (seed ∪ expansion) set by
+///    `similarity * (1 + 0.1 * in_epistemic_degree)`, where
+///    `in_epistemic_degree` is the claim's in-degree over the full
+///    `link_epistemic` allowlist ([`epigraph_db::EPISTEMIC_RELATIONSHIPS`] —
+///    all 7 types, not just the 3 traversal types: a claim's authority is a
+///    function of everyone who has weighed in on it, including
+///    `contradicts`/`refutes`, not only the reinforcing subset), computed in
+///    one batched `GROUP BY` query
+///    ([`epigraph_db::ClaimRepository::in_epistemic_degree_batch`]) — not
+///    one query per claim.
+async fn apply_graph_expansion(
+    pool: &sqlx::PgPool,
+    seeds: Vec<epigraph_db::ClaimEmbeddingHit>,
+    depth: u32,
+) -> Result<Vec<epigraph_db::ClaimEmbeddingHit>, McpError> {
+    let seed_ids: Vec<Uuid> = seeds.iter().map(|h| h.claim_id).collect();
+    let seed_similarity: std::collections::HashMap<Uuid, f64> =
+        seeds.iter().map(|h| (h.claim_id, h.similarity)).collect();
+
+    let expansion = epigraph_db::ClaimRepository::graph_expand_seeds(pool, &seed_ids, depth)
+        .await
+        .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
+
+    // Best (highest) decayed score per expanded claim, in case it's
+    // reachable from more than one seed at different hop counts / seed
+    // similarities. graph_expand_seeds already dedupes to each claim's
+    // SHORTEST hop count overall, but that shortest path may not originate
+    // from the highest-similarity seed, so we still need a max-fold here
+    // rather than trusting hop count alone as the tiebreak.
+    const HOP_DECAY: f64 = 0.7;
+    let mut expanded_similarity: std::collections::HashMap<Uuid, f64> =
+        std::collections::HashMap::new();
+    for hit in &expansion {
+        // graph_expand_seeds reports hops from the frontier as a whole, not
+        // per-originating-seed, so approximate the base with the highest
+        // seed similarity available — a conservative upper bound that still
+        // makes expanded claims rank below their strongest supporting seed
+        // once hop decay is applied.
+        let best_seed_similarity = seed_similarity.values().cloned().fold(0.0_f64, f64::max);
+        let score = best_seed_similarity * HOP_DECAY.powi(hit.hops);
+        expanded_similarity
+            .entry(hit.claim_id)
+            .and_modify(|s| *s = s.max(score))
+            .or_insert(score);
+    }
+
+    let mut combined = seeds;
+    for (claim_id, similarity) in expanded_similarity {
+        combined.push(epigraph_db::ClaimEmbeddingHit {
+            claim_id,
+            similarity,
+        });
+    }
+
+    if combined.is_empty() {
+        return Ok(combined);
+    }
+
+    let all_ids: Vec<Uuid> = combined.iter().map(|h| h.claim_id).collect();
+    let degree = epigraph_db::ClaimRepository::in_epistemic_degree_batch(pool, &all_ids)
+        .await
+        .map_err(|e| internal_error(format!("in_epistemic_degree_batch: {e}")))?;
+
+    combined.sort_by(|a, b| {
+        let score = |h: &epigraph_db::ClaimEmbeddingHit| {
+            let d = degree.get(&h.claim_id).copied().unwrap_or(0) as f64;
+            h.similarity * (1.0 + GRAPH_EXPANSION_DEGREE_WEIGHT * d)
+        };
+        score(b)
+            .partial_cmp(&score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(combined)
+}
+
 /// Post-embedding pipeline: shared by `recall_with_context` and the
 /// `__test_only::recall_with_context_with_pgvec` entry point that lets
 /// integration tests skip the OpenAI embedder (no API key available in
@@ -429,6 +544,22 @@ async fn recall_with_context_post_embed(
             corpus_scope,
             centroid_dim_used: centroid_dim,
         });
+    }
+
+    // Stage 4: graph expansion (Task 6.1 / claim 29e789fd). Default-off —
+    // `None` reproduces today's flat-ANN-only `raw_hits` exactly. When set,
+    // follow outgoing supports/corroborates/elaborates edges up to
+    // `graph_expansion_depth` hops from each ANN seed, fold the reached
+    // claims into the pool (deduped against the seeds — a claim that's both
+    // an ANN seed and graph-reachable is not double-counted), and rerank the
+    // combined set by `similarity * (1 + 0.1 * in_epistemic_degree)`.
+    //
+    // Runs BEFORE the optional cross-encoder rerank stage so `rerank=true`
+    // (when both are set) re-ranks the graph-expanded pool, not just the raw
+    // ANN seeds — matching "expand seeds, then rank" rather than "rank seeds,
+    // then expand the winners".
+    if let Some(depth) = params.graph_expansion_depth {
+        raw_hits = apply_graph_expansion(&server.pool, raw_hits, depth).await?;
     }
 
     // Stage 4.5: cross-encoder rerank + optional groundedness gate over the
@@ -636,29 +767,51 @@ async fn recall_with_context_post_embed(
     // value). Per-claim degrade-not-fail: a compute error for ONE hit yields
     // null + a warn, never an aborted page (spec §8).
     if let Some((frame_id, perspective_id)) = lens {
-        for hit in &mut results {
-            match epigraph_engine::belief_query::get_perspective_belief(
-                &server.pool,
-                hit.paragraph_id,
-                frame_id,
-                perspective_id,
-            )
-            .await
-            {
-                Ok(interval) => {
-                    hit.lensed_belief = Some(crate::types::LensedBelief::from_interval(
-                        frame_id,
-                        perspective_id,
-                        &interval,
-                    ));
+        // Batch the lens post-pass so the perspective row + per-frame overrides
+        // are resolved ONCE for the whole page, not once per hit (the N+1 fixed
+        // in backlog 9e33ddf7). Per-hit degrade-not-fail is preserved: each
+        // claim carries its own `Result`, so one malformed claim warns + serves
+        // a null lens without aborting the page.
+        let claim_ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
+        match epigraph_engine::belief_query::get_perspective_belief_batch(
+            &server.pool,
+            &claim_ids,
+            frame_id,
+            perspective_id,
+        )
+        .await
+        {
+            Ok(intervals) => {
+                let mut by_claim: std::collections::HashMap<Uuid, _> =
+                    intervals.into_iter().collect();
+                for hit in &mut results {
+                    match by_claim.remove(&hit.paragraph_id) {
+                        Some(Ok(interval)) => {
+                            hit.lensed_belief = Some(crate::types::LensedBelief::from_interval(
+                                frame_id,
+                                perspective_id,
+                                &interval,
+                            ));
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                claim_id = %hit.paragraph_id,
+                                error = %e,
+                                "lensed belief compute failed; serving null lens for this claim"
+                            );
+                        }
+                        None => {}
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        claim_id = %hit.paragraph_id,
-                        error = %e,
-                        "lensed belief compute failed; serving null lens for this claim"
-                    );
-                }
+            }
+            Err(e) => {
+                // Page-level failure (e.g. frame vanished): degrade the whole
+                // lens to null rather than abort the recall, matching the
+                // per-hit degrade-not-fail contract.
+                tracing::warn!(
+                    error = %e,
+                    "lensed belief batch failed; serving null lens for this page"
+                );
             }
         }
     }
