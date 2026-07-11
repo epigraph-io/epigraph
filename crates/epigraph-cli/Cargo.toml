@@ -91,6 +91,11 @@ path = "src/bin/dedup_sizing.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "dedup_execute"
+path = "src/bin/dedup_execute.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "embed_backfill"
 path = "src/bin/embed_backfill.rs"
 required-features = ["db"]
