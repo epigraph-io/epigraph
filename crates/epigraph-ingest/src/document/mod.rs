@@ -1,6 +1,7 @@
 //! Document-specific (paper / textbook / report / …) extraction and ingest.
 
 pub mod builder;
+pub mod byline;
 pub mod schema;
 pub mod structure;
 
