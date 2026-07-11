@@ -332,13 +332,10 @@ pub async fn get_claim(
         crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
     }
 
-    let claim = ClaimRepository::get_by_id(&server.pool, claim_id)
+    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&server.pool, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
-    let labels = ClaimRepository::get_labels(&server.pool, claim_id)
-        .await
-        .map_err(internal_error)?;
     let access = check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
     let (content, content_hash) =
         crate::tools::redaction::redact_content(access, &claim.content, &claim.content_hash);
@@ -473,6 +470,21 @@ pub async fn update_with_evidence(
     let before = claim.truth_value.value();
     let strength = params.strength.clamp(0.0, 1.0);
 
+    // Capture pre-combination pignistic to detect the counterintuitive-but-correct
+    // case where SUPPORTING evidence lowers belief (Task 3.6, backlog 3b60a785).
+    // Compare pignistic-vs-pignistic. `get_belief_columns` reads the persisted
+    // `pignistic_prob` column (distinct from `truth_value`; see claim.rs docs).
+    // It is NULL for a claim with no prior DS state — in that case fall back to
+    // `truth_value` (`before`), which is the belief the fresh BBA is combined
+    // against. The monotonicity clamp in `auto_wire_ds_update` bounds BetP below
+    // by the prior column value for supports=true, so the warning is only ever
+    // reachable on the NULL-column (no-prior-DS-state) path.
+    let pre_pignistic =
+        ClaimRepository::get_belief_columns(&server.pool, ClaimId::from_uuid(claim_id))
+            .await
+            .map_err(internal_error)?
+            .and_then(|c| c.pignistic_prob);
+
     // Load type_weight from calibration (replaces deleted evidence_weight())
     // I-3: use helper that checks CALIBRATION_PATH env var before relative path
     let weight = load_evidence_type_weight(&params.evidence_type);
@@ -511,6 +523,17 @@ pub async fn update_with_evidence(
             .map_err(internal_error)?;
     }
 
+    // Warn when SUPPORTING evidence lowered the pignistic probability. Compare
+    // pignistic-to-pignistic; when the claim had no prior DS state the column is
+    // NULL, so fall back to the truth_value the fresh BBA combined against.
+    let pre_belief = pre_pignistic.unwrap_or(before);
+    let warning = (params.supports && ds.pignistic_prob < pre_belief).then(|| {
+        "Supporting evidence decreased belief — the new evidence has high \
+         ignorance mass relative to the prior; this is mathematically correct \
+         DS combination, not a bug."
+            .to_string()
+    });
+
     success_json(&UpdateResponse {
         claim_id: claim_id.to_string(),
         truth_before: before,
@@ -519,6 +542,7 @@ pub async fn update_with_evidence(
         belief: Some(ds.belief),
         plausibility: Some(ds.plausibility),
         pignistic_prob: Some(ds.pignistic_prob),
+        warning,
     })
 }
 

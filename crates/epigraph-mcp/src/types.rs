@@ -862,6 +862,12 @@ pub struct UpdateResponse {
     pub plausibility: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pignistic_prob: Option<f64>,
+    /// Populated ONLY when supporting evidence *lowered* the pignistic
+    /// probability (weak/high-ignorance-mass BBA on a claim with no prior DS
+    /// state). This is mathematically correct Dempster-Shafer combination —
+    /// the warning exists so callers don't mistake it for a bug.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
