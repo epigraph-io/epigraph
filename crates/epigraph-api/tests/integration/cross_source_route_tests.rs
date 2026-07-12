@@ -194,3 +194,41 @@ async fn returns_corroborates_edges_and_pending_candidates(pool: PgPool) {
     assert!((cand.score - 0.7).abs() < 1e-5);
     let _ = (&cand.id, &cand.status, &cand.features);
 }
+
+#[derive(Debug, Deserialize)]
+struct ListedCandidate {
+    id: String,
+    claim_a: String,
+    claim_a_excerpt: String,
+    claim_b: String,
+    claim_b_excerpt: String,
+    score: f32,
+    verifier_verdict: Option<String>,
+    verifier_rationale: Option<String>,
+    created_at: String,
+}
+
+// NOTE: this route is registered in routes/mod.rs (Task 3 of the
+// 2026-07-11 xsm-telegram-approval plan) — this test only passes once
+// that registration lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_candidates_returns_pending_with_excerpts(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    sqlx::query(
+        "INSERT INTO match_candidates (claim_a, claim_b, score, features, status, verifier_verdict, verifier_rationale)
+         VALUES ($1, $2, 0.81, $3, 'pending', 'paraphrase', 'test rationale text')",
+    )
+    .bind(lo)
+    .bind(hi)
+    .bind(SqlxJson(serde_json::json!({"embed_cosine": 0.81})))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let router = create_test_router(pool);
+    let resp = get(&router, "/api/v1/match_candidates?status=pending&limit=100").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "list requires a bearer token");
+}

@@ -10,11 +10,13 @@
 //! 404 when the claim doesn't exist. 200 with empty arrays when it exists
 //! but has no matches.
 
+use axum::extract::Query;
 use axum::{
     extract::{Path, State},
     Json,
 };
 use serde::Serialize;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::{errors::ApiError, state::AppState};
@@ -131,4 +133,99 @@ pub async fn get_cross_source_matches(
         corroborates: Vec::new(),
         pending: Vec::new(),
     }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ListCandidatesQuery {
+    pub status: Option<String>,
+    pub limit: i64,
+}
+
+#[derive(Serialize)]
+pub struct PendingCandidateOut {
+    pub id: String,
+    pub claim_a: String,
+    pub claim_a_excerpt: String,
+    pub claim_b: String,
+    pub claim_b_excerpt: String,
+    pub score: f32,
+    pub verifier_verdict: Option<String>,
+    pub verifier_rationale: Option<String>,
+    pub created_at: String,
+}
+
+fn excerpt(content: Option<&String>) -> String {
+    match content {
+        Some(c) => {
+            let trimmed: String = c.chars().take(200).collect();
+            if c.chars().count() > 200 {
+                format!("{trimmed}…")
+            } else {
+                trimmed
+            }
+        }
+        None => "(claim not found)".to_string(),
+    }
+}
+
+#[cfg(feature = "db")]
+pub async fn list_candidates(
+    State(state): State<AppState>,
+    Query(q): Query<ListCandidatesQuery>,
+) -> Result<Json<Vec<PendingCandidateOut>>, ApiError> {
+    let status_ref = match q.status.as_deref() {
+        Some(s @ ("pending" | "promoted" | "rejected" | "stale")) => Some(s),
+        Some(other) => {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "status must be one of pending|promoted|rejected|stale, got {other}"
+                ),
+            });
+        }
+        None => None,
+    };
+
+    let repo = epigraph_db::MatchCandidateRepo::new(state.db_pool.clone());
+    let rows = map_sqlx(repo.list(status_ref, q.limit).await)?;
+
+    let mut claim_ids: Vec<Uuid> = Vec::with_capacity(rows.len() * 2);
+    for r in &rows {
+        claim_ids.push(r.claim_a);
+        claim_ids.push(r.claim_b);
+    }
+    claim_ids.sort_unstable();
+    claim_ids.dedup();
+
+    let content_rows: Vec<(Uuid, String)> = map_sqlx(
+        sqlx::query_as("SELECT id, content FROM claims WHERE id = ANY($1)")
+            .bind(&claim_ids)
+            .fetch_all(&state.db_pool)
+            .await,
+    )?;
+    let content_by_id: HashMap<Uuid, String> = content_rows.into_iter().collect();
+
+    let out = rows
+        .into_iter()
+        .map(|r| PendingCandidateOut {
+            id: r.id.to_string(),
+            claim_a_excerpt: excerpt(content_by_id.get(&r.claim_a)),
+            claim_a: r.claim_a.to_string(),
+            claim_b_excerpt: excerpt(content_by_id.get(&r.claim_b)),
+            claim_b: r.claim_b.to_string(),
+            score: r.score,
+            verifier_verdict: r.verifier_verdict,
+            verifier_rationale: r.verifier_rationale,
+            created_at: r.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(out))
+}
+
+#[cfg(not(feature = "db"))]
+pub async fn list_candidates(
+    State(_state): State<AppState>,
+    Query(_q): Query<ListCandidatesQuery>,
+) -> Result<Json<Vec<PendingCandidateOut>>, ApiError> {
+    Ok(Json(Vec::new()))
 }
