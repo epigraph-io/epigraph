@@ -119,13 +119,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("EPIGRAPH_API_URL").ok(),
     );
 
+    eprintln!("api_base={api_base}");
+
     // EPIGRAPH_TOKEN if present; otherwise attempt client_credentials mint so
     // container deployments work without a token-mint preamble in the schedule.
+    // Diagnostic-only: never log the token value itself, only its provenance
+    // and length (distinguishes "empty" from "present but wrong" without
+    // leaking the credential — backlog a422da87's reported non-determinism
+    // needs exactly this to disambiguate an auth failure from a URL-builder
+    // failure across repeated scheduled runs).
     let token = {
         let t = std::env::var("EPIGRAPH_TOKEN").unwrap_or_default();
         if t.is_empty() {
-            mint_service_token(&api_base).await.unwrap_or_default()
+            match mint_service_token(&api_base).await {
+                Some(minted) => {
+                    eprintln!(
+                        "token: minted via client_credentials (len={})",
+                        minted.len()
+                    );
+                    minted
+                }
+                None => {
+                    eprintln!(
+                        "token: EPIGRAPH_TOKEN unset AND client_credentials mint failed \
+                         (missing creds or mint request error) — proceeding with an EMPTY \
+                         bearer token, every API write below will 401"
+                    );
+                    String::new()
+                }
+            }
         } else {
+            eprintln!("token: using EPIGRAPH_TOKEN from env (len={})", t.len());
             t
         }
     };
@@ -179,8 +203,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // content_hash. Without this flag the API returns 409;
                         // with it, create_or_get returns the existing claim ID so
                         // persist_decomposition can re-wire edges idempotently.
-                        let resp = http
-                            .post(format!("{api_base}/api/v1/claims"))
+                        // Diagnostic-only (backlog a422da87): build+log the URL BEFORE
+                        // sending, so a RelativeUrlWithoutBase-style construction bug
+                        // is visible even if the request itself never reaches the wire.
+                        let url = format!("{api_base}/api/v1/claims");
+                        eprintln!("POST {url}");
+                        let resp = match http
+                            .post(&url)
                             .bearer_auth(&token)
                             .json(&serde_json::json!({
                                 "content": atom_text,
@@ -194,8 +223,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "labels": ["atom", format!("generality:{generality}")],
                             }))
                             .send()
-                            .await?;
-                        let v: serde_json::Value = resp.error_for_status()?.json().await?;
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!(
+                                    "POST {url} FAILED before a response was received: \
+                                     is_builder={} is_request={} is_connect={} is_timeout={} \
+                                     detail={e}",
+                                    e.is_builder(),
+                                    e.is_request(),
+                                    e.is_connect(),
+                                    e.is_timeout()
+                                );
+                                return Err(e.into());
+                            }
+                        };
+                        let status = resp.status();
+                        if !status.is_success() {
+                            let body = resp.text().await.unwrap_or_default();
+                            eprintln!("POST {url} -> HTTP {status}, body={body}");
+                            return Err(format!("POST {url} -> HTTP {status}: {body}").into());
+                        }
+                        let v: serde_json::Value = resp.json().await?;
                         let id = v
                             .get("id")
                             .or_else(|| v.get("claim_id"))
