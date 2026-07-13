@@ -182,6 +182,10 @@ epigraph-api = { workspace = true }
 axum = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# decompose_claims's mint_service_token unit tests (src/bin/decompose_claims.rs):
+# same pin epigraph-api/Cargo.toml already uses for its OAuth provider tests,
+# so this adds no new dependency version to the lockfile.
+wiremock = "0.6"
 
 [lints]
 workspace = true
