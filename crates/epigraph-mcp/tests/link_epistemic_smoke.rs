@@ -500,6 +500,85 @@ async fn structural_relationship_is_rejected(pool: PgPool) {
     );
 }
 
+// ── cites is accepted (structural, non-belief-affecting) — backlog 47afad2e ──
+
+/// `cites` is accepted via the separate `STRUCTURAL_RELATIONSHIPS` allow-list
+/// (kept apart from `EPISTEMIC_RELATIONSHIPS` so the coverage guard's
+/// all-non-Neutral invariant stays intact — see `link_epistemic.rs`'s
+/// `cites_is_structural_and_maps_to_neutral` unit test for that half). This
+/// test proves the END-TO-END behavior through the same MCP path
+/// `supports_raises_target_belief_and_is_idempotent` exercises above: the
+/// edge is created, but — unlike `supports` — the target's belief does NOT
+/// move, because `cites` maps to `RestrictionKind::Neutral` and
+/// `auto_wire_edge_if_epistemic` no-ops on Neutral relationships.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cites_edge_is_created_but_does_not_move_belief(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+    // Same high-commitment source as the `supports` test, so a failure to
+    // no-op couldn't hide behind `SourceFactorless`.
+    let source = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let target = seed_claim(&pool, "cited claim", 0.5).await;
+
+    assert!(
+        read_betp(&pool, target).await.is_none(),
+        "target must start with NULL pignistic_prob (no BBA yet)"
+    );
+
+    let result = do_link_epistemic(
+        &server,
+        LinkEpistemicParams {
+            source_claim_id: source.to_string(),
+            target_claim_id: target.to_string(),
+            relationship: "cites".to_string(),
+            properties: None,
+        },
+    )
+    .await
+    .expect("cites must be accepted by link_epistemic");
+    let resp = parse_response(&result);
+
+    assert!(resp.was_created, "first cites call must create the edge");
+    assert_eq!(resp.relationship, "cites");
+    assert!(
+        !resp.belief_wired,
+        "cites is structural/Neutral — it must NOT wire belief"
+    );
+    assert_eq!(
+        edge_count(&pool, source, target, "cites").await,
+        1,
+        "exactly one cites edge must exist"
+    );
+    assert!(
+        read_betp(&pool, target).await.is_none(),
+        "target's pignistic_prob must remain NULL — a cites edge must not materialize a BBA"
+    );
+
+    // Idempotent re-hit: same as the epistemic relationships, a second call
+    // with the same (source, target, relationship) must not create a
+    // duplicate edge or attempt to re-wire.
+    let second = do_link_epistemic(
+        &server,
+        LinkEpistemicParams {
+            source_claim_id: source.to_string(),
+            target_claim_id: target.to_string(),
+            relationship: "cites".to_string(),
+            properties: None,
+        },
+    )
+    .await
+    .expect("re-hit must succeed (idempotent)");
+    let second_resp = parse_response(&second);
+    assert!(
+        !second_resp.was_created,
+        "re-hit must report was_created=false"
+    );
+    assert_eq!(
+        edge_count(&pool, source, target, "cites").await,
+        1,
+        "re-hit must not create a duplicate edge"
+    );
+}
+
 // ── validation: supersedes is excluded (belongs to supersede_claim) ─────────
 
 #[sqlx::test(migrations = "../../migrations")]

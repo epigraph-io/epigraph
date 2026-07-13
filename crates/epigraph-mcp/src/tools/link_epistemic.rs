@@ -15,9 +15,14 @@
 //! Tight contract:
 //! - both endpoints are existing claims (`source_type`/`target_type` are always
 //!   `"claim"`, not caller-controllable),
-//! - `relationship` must be one of [`EPISTEMIC_RELATIONSHIPS`] (lowercase
-//!   canonical strings; `supersedes` is intentionally excluded — it has
-//!   dedicated semantics in `supersede_claim`),
+//! - `relationship` must be one of [`EPISTEMIC_RELATIONSHIPS`] or
+//!   [`STRUCTURAL_RELATIONSHIPS`] (lowercase canonical strings; `supersedes`
+//!   is intentionally excluded — it has dedicated semantics in
+//!   `supersede_claim`). The structural set (currently just `cites`) is kept
+//!   separate because its members map to `RestrictionKind::Neutral` by
+//!   design — belief-wiring already no-ops on Neutral, so accepting them
+//!   here just lets citation/provenance edges be created MCP-natively
+//!   without a doomed detour through the raw HTTP edges route.
 //! - idempotent on `(source, target, relationship)`: a re-hit returns the
 //!   existing edge with `was_created=false` and never re-creates the durable
 //!   edge row or re-emits `edge.added`. Belief wiring, however, is NOT gated
@@ -72,6 +77,24 @@ fn is_epistemic_relationship(s: &str) -> bool {
     EPISTEMIC_RELATIONSHIPS.contains(&s)
 }
 
+/// Structural (non-belief-affecting) relations `link_epistemic` also accepts,
+/// kept deliberately SEPARATE from `EPISTEMIC_RELATIONSHIPS`.
+///
+/// Unlike the epistemic set, these are expected to map to
+/// `RestrictionKind::Neutral` — a citation/provenance link is not an
+/// epistemic claim about the relationship between two nodes, so it must not
+/// move belief. Folding `cites` into `EPISTEMIC_RELATIONSHIPS` would break
+/// `every_epistemic_relationship_maps_to_non_neutral`'s all-non-Neutral
+/// invariant (and its hard count=7 assertion) below, so it gets its own
+/// allow-list instead. `auto_wire_edge_if_epistemic` already no-ops safely on
+/// `Neutral` relationships (see `epigraph_engine::edge_factor`'s
+/// short-circuit), so no changes are needed to the belief-wiring path itself.
+pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &["cites"];
+
+fn is_structural_relationship(s: &str) -> bool {
+    STRUCTURAL_RELATIONSHIPS.contains(&s)
+}
+
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
@@ -95,12 +118,18 @@ pub async fn do_link_epistemic(
     let source_id = parse_uuid(&params.source_claim_id)?;
     let target_id = parse_uuid(&params.target_claim_id)?;
 
-    // Tight allow-list — lowercase canonical epistemic relations only.
-    if !is_epistemic_relationship(&params.relationship) {
+    // Tight allow-list — lowercase canonical epistemic relations, plus the
+    // separate structural set (currently just `cites`; see
+    // STRUCTURAL_RELATIONSHIPS doc comment for why it isn't folded into
+    // EPISTEMIC_RELATIONSHIPS).
+    if !is_epistemic_relationship(&params.relationship)
+        && !is_structural_relationship(&params.relationship)
+    {
         return Err(invalid_params(format!(
-            "invalid relationship '{}'. Valid epistemic types: {}",
+            "invalid relationship '{}'. Valid epistemic types: {}. Valid structural types: {}",
             params.relationship,
             EPISTEMIC_RELATIONSHIPS.join(", "),
+            STRUCTURAL_RELATIONSHIPS.join(", "),
         )));
     }
 
@@ -282,6 +311,37 @@ mod tests {
                  EPISTEMIC_RELATIONSHIPS or fix the engine mapping. Got: {kind:?}"
             );
         }
+    }
+
+    /// `cites` is a citation/provenance link, not an epistemic claim about the
+    /// relationship between two nodes — it is DELIBERATELY `Neutral` (does not
+    /// move belief). This is the mirror image of the coverage guard above:
+    /// `cites` must NOT be added to `EPISTEMIC_RELATIONSHIPS` (that would break
+    /// `every_epistemic_relationship_maps_to_non_neutral`'s all-non-Neutral
+    /// invariant and its hard count=7 assertion), but `link_epistemic` must
+    /// still accept it via the separate `STRUCTURAL_RELATIONSHIPS` allow-list
+    /// so the conflict-resolution workflow's cites-edge pinning step can run
+    /// MCP-natively (backlog 47afad2e).
+    #[test]
+    fn cites_is_structural_and_maps_to_neutral() {
+        let profile = RestrictionProfile::scientific();
+        assert!(
+            is_structural_relationship("cites"),
+            "'cites' must be accepted via STRUCTURAL_RELATIONSHIPS"
+        );
+        assert!(
+            !is_epistemic_relationship("cites"),
+            "'cites' must NOT be in EPISTEMIC_RELATIONSHIPS (it is Neutral by design, which \
+             would break the all-non-Neutral coverage guard)"
+        );
+        assert!(
+            matches!(
+                restriction_kind_with_profile("cites", &profile),
+                RestrictionKind::Neutral
+            ),
+            "'cites' must map to RestrictionKind::Neutral — a citation link is not an \
+             epistemic claim and must not move belief"
+        );
     }
 
     /// Pin the polarity split from the spec §4 table: the five positive
