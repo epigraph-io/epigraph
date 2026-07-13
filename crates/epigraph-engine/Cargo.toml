@@ -118,5 +118,9 @@ path = "tests/rerank_pipeline.rs"
 name = "alt_set_cdst_integration"
 path = "tests/alt_set_cdst_integration.rs"
 
+[[test]]
+name = "export_prov_o"
+path = "tests/export_prov_o.rs"
+
 [lints]
 workspace = true

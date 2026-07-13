@@ -39,6 +39,7 @@ pub mod epistemic_interval;
 pub mod error_mass;
 pub mod errors;
 pub mod evidence;
+pub mod export;
 pub mod interval_bp;
 pub mod lifecycle;
 pub mod matching;
