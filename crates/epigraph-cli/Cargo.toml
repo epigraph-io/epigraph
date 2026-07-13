@@ -17,6 +17,11 @@ path = "src/bin/recompute_claim_belief.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "recompute_betp"
+path = "src/bin/recompute_betp.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "ingest_literature"
 path = "src/bin/ingest_literature.rs"
 
@@ -104,6 +109,16 @@ required-features = ["db"]
 name = "cross_source_sweep_smoke"
 path = "tests/cross_source_sweep_smoke.rs"
 required-features = ["genai"]
+
+[[test]]
+name = "recompute_betp_cohort"
+path = "tests/recompute_betp_cohort.rs"
+required-features = ["db"]
+
+[[test]]
+name = "recompute_betp_run"
+path = "tests/recompute_betp_run.rs"
+required-features = ["db"]
 
 [[bin]]
 name = "bootstrap_clients"
