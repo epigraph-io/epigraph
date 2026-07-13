@@ -471,6 +471,15 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/policy-challenges/:id/resolve",
             post(policies::resolve_challenge),
+        )
+        // Cross-source match candidates — write/list endpoints, require auth + scope
+        .route(
+            "/api/v1/match_candidates",
+            get(cross_source::list_candidates),
+        )
+        .route(
+            "/api/v1/match_candidates/:id/decide",
+            post(cross_source::decide_candidate),
         );
 
     // Auth middleware stack (outermost runs first):
@@ -1030,6 +1039,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/claims/:id/cross_source_matches",
             get(cross_source::get_cross_source_matches),
+        )
+        .route(
+            "/api/v1/match_candidates",
+            get(cross_source::list_candidates),
         )
         .route("/api/v1/edges", get(edges::list_edges))
         .route("/api/v1/papers", get(papers::list_papers))
