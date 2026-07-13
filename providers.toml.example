@@ -1,4 +1,6 @@
 # Example providers.toml — copy to providers.toml and edit, or set EPIGRAPH_PROVIDERS_CONFIG to override path.
+# providers.toml itself is gitignored (it holds real allowlisted emails); this
+# checked-in copy is the template new deployments start from.
 
 [[provider]]
 name              = "google"
@@ -17,7 +19,7 @@ auto_provision    = true
 # authorized external users; empty list = allow ALL (insecure). Add emails/domains
 # before relying on this in prod. With auto_provision=true, any identity NOT on this
 # allowlist is refused (HTTP 403) before any client is created.
-allowed_emails    = ["jeremy.barton@gmail.com"]
+allowed_emails    = []
 # allowed_domains = ["baros.associates"]
 default_scopes = [
   "claims:read", "claims:write", "claims:challenge",
