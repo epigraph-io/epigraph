@@ -284,3 +284,31 @@ async fn resolve_challenge_with_admin_scope_returns_200() {
         resp.text().await.unwrap_or_default()
     );
 }
+
+// ── decide_match_candidate ──────────────────────────────────────────────────
+
+/// No token → 401.
+#[tokio::test(flavor = "multi_thread")]
+async fn decide_candidate_without_token_returns_401() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let candidate_id = Uuid::new_v4();
+    let body = serde_json::json!({ "verdict": "reject" });
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/v1/match_candidates/{candidate_id}/decide"
+        ))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        401,
+        "expected 401 Unauthorized; got {} — body={}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+}

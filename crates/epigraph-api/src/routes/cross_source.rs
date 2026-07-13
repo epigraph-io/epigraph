@@ -229,3 +229,97 @@ pub async fn list_candidates(
 ) -> Result<Json<Vec<PendingCandidateOut>>, ApiError> {
     Ok(Json(Vec::new()))
 }
+
+#[derive(serde::Deserialize)]
+pub struct DecideCandidateRequest {
+    pub verdict: String,
+}
+
+#[cfg(feature = "db")]
+pub async fn decide_candidate(
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<DecideCandidateRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "decide_candidate requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
+    let repo = epigraph_db::MatchCandidateRepo::new(state.db_pool.clone());
+    let row = map_sqlx(repo.get(id).await)?;
+
+    if row.status != "pending" {
+        return Err(ApiError::Conflict {
+            reason: format!("candidate {id} already decided (status={})", row.status),
+        });
+    }
+
+    match req.verdict.as_str() {
+        "promote" => {
+            let all_current = epigraph_db::ClaimRepository::are_all_current(
+                &state.db_pool,
+                &[row.claim_a, row.claim_b],
+            )
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: e.to_string(),
+            })?;
+            if !all_current {
+                return Err(ApiError::BadRequest {
+                    message: format!(
+                        "cannot promote candidate {id}: both claims must be current \
+                         (is_current=true)"
+                    ),
+                });
+            }
+
+            repo.set_status(id, "promoted", auth.agent_id)
+                .await
+                .map_err(|e| ApiError::DatabaseError {
+                    message: e.to_string(),
+                })?;
+
+            let props = serde_json::json!({
+                "candidate_id": id,
+                "score": row.score,
+                "features": row.features,
+                "verifier_verdict": row.verifier_verdict,
+                "decided_by": auth.agent_id,
+                "source": "cross_source_matcher",
+            });
+            epigraph_db::EdgeRepository::create_symmetric_if_absent(
+                &state.db_pool,
+                row.claim_a,
+                row.claim_b,
+                "CORROBORATES",
+                props,
+            )
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: e.to_string(),
+            })?;
+        }
+        "reject" => {
+            repo.set_status(id, "rejected", auth.agent_id)
+                .await
+                .map_err(|e| ApiError::DatabaseError {
+                    message: e.to_string(),
+                })?;
+        }
+        other => {
+            return Err(ApiError::BadRequest {
+                message: format!("verdict must be 'promote' or 'reject', got {other}"),
+            });
+        }
+    }
+
+    let updated = map_sqlx(repo.get(id).await)?;
+    Ok(Json(serde_json::json!({
+        "id": updated.id.to_string(),
+        "status": updated.status,
+    })))
+}
