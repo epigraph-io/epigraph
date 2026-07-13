@@ -96,6 +96,8 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
             combination_method: None,
             gamma: None,
             perspective_id: None,
+            evidence_type: None,
+            locality_tag: None,
         },
     )
     .await
@@ -206,6 +208,8 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
                 combination_method: None,
                 gamma: None,
                 perspective_id,
+                evidence_type: None,
+                locality_tag: None,
             },
         )
         .await

@@ -125,12 +125,46 @@ pub async fn submit_ds_evidence(
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())
         .map_err(internal_error)?;
 
-    // Parse and optionally discount the mass function
+    // Parse the mass function. Reliability handling forks on whether the
+    // caller opted into calibrated per-source-class discounting:
+    //
+    // - `evidence_type` supplied: store the RAW (undiscounted) masses plus
+    //   the resolved `evidence_type`/`locality_tag` metadata, and let the
+    //   existing shared recompute path below
+    //   (`recompute_claim_belief_on_frame` -> `recompute_combined_belief` ->
+    //   `epigraph_engine::edge_factor::effective_source_strength`) derive
+    //   the calibrated discount from that metadata + `calibration.toml`
+    //   ([evidence_type_weights], locality composition) at combine time —
+    //   the same discount authority `auto_wire_ds_update` already uses
+    //   (issue #197 Phase 2/4). We must NOT also pre-discount here: this
+    //   function already reads its returned belief back from the `claims`
+    //   row *after* delegating to that same recompute path (backlog
+    //   2bffdfdc), so a pre-discount would double-apply the calibrated
+    //   weight (e.g. testimonial 0.6 x 0.6 = 0.36) while `params.reliability`
+    //   is simply ignored in favor of the calibrated prior.
+    // - `evidence_type` omitted (default): EXACT pre-change behavior —
+    //   pre-discount the stored masses by the raw `params.reliability`
+    //   float and store `evidence_type = NULL`, `locality_tag = "unknown"`,
+    //   so `effective_source_strength` falls through to its legacy/unknown
+    //   tiers exactly as it did before this change. `locality_tag` alone
+    //   (without `evidence_type`) is a no-op for the same reason: step (1)
+    //   of `effective_source_strength` fires whenever `evidence_type` is
+    //   `None` and never reaches locality composition, so we fold that case
+    //   into the legacy branch too rather than silently accepting a
+    //   parameter that couldn't affect anything.
     let mut mass_fn = parse_masses_json(&frame, &params.masses)?;
-    let reliability = params.reliability.unwrap_or(1.0).clamp(0.0, 1.0);
-    if reliability < 1.0 {
-        mass_fn =
-            epigraph_ds::combination::discount(&mass_fn, reliability).map_err(internal_error)?;
+    let calibrated_evidence_type = params.evidence_type.as_deref().filter(|s| !s.is_empty());
+    let stored_locality_tag = if calibrated_evidence_type.is_some() {
+        params.locality_tag.as_deref().unwrap_or("unknown")
+    } else {
+        "unknown"
+    };
+    if calibrated_evidence_type.is_none() {
+        let reliability = params.reliability.unwrap_or(1.0).clamp(0.0, 1.0);
+        if reliability < 1.0 {
+            mass_fn = epigraph_ds::combination::discount(&mass_fn, reliability)
+                .map_err(internal_error)?;
+        }
     }
 
     // Ensure claim-frame assignment exists
@@ -155,6 +189,11 @@ pub async fn submit_ds_evidence(
     )
     .map_err(internal_error)?;
 
+    // source_strength stays NULL either way: the calibrated path derives
+    // reliability dynamically from evidence_type at recompute time
+    // (effective_source_strength), and the legacy path already baked the
+    // raw `reliability` float into the pre-discounted masses above rather
+    // than caching it here — unchanged from pre-change behavior.
     let mf_id = MassFunctionRepository::store_with_perspective(
         &server.pool,
         claim_id,
@@ -165,9 +204,9 @@ pub async fn submit_ds_evidence(
         None,
         Some(&method_name),
         None,
-        None,
-        "unknown", // MCP ds entrypoint lacks evidence-DOI vs paper context (issue #197)
-        None,      // manual DS submission has no evidence row in scope (issue #197 Phase 3)
+        calibrated_evidence_type, // NULL unless caller opted in (backlog a2b71568)
+        stored_locality_tag,      // "unknown" unless evidence_type was also supplied
+        None, // manual DS submission has no evidence row in scope (issue #197 Phase 3)
     )
     .await
     .map_err(internal_error)?;
