@@ -230,5 +230,9 @@ async fn list_candidates_returns_pending_with_excerpts(pool: PgPool) {
 
     let router = create_test_router(pool);
     let resp = get(&router, "/api/v1/match_candidates?status=pending&limit=100").await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "list requires a bearer token");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "list requires a bearer token"
+    );
 }
