@@ -238,6 +238,20 @@ pub struct AppState {
     /// Empty by default — server still works for agent/service auth and existing tokens,
     /// but external `grant_type=*` requests return 400 unsupported_grant_type.
     pub providers: Arc<ProviderRegistry>,
+
+    /// entity_types registry cache: `type_name` -> resolved [`EntityTypeEntry`].
+    ///
+    /// The single source of truth (in-process) for BOTH edge entity-type
+    /// validity (`is_valid_entity_type` = `contains_key`) and existence
+    /// checking (`entity_exists`). Uses a `std::sync::RwLock` (like
+    /// `revoked_tokens`) so reads stay synchronous on the hot path.
+    ///
+    /// Primed by [`AppState::load_entity_type_cache`] at startup (the sync
+    /// `with_db` constructors can't `SELECT`, so it starts empty and is loaded
+    /// just after the pool connects — see server.rs). Also self-heals via
+    /// read-through-on-miss in `entity_exists` / the admin write-through.
+    #[cfg(feature = "db")]
+    pub entity_type_cache: Arc<std::sync::RwLock<HashMap<String, epigraph_db::EntityTypeEntry>>>,
 }
 
 /// API configuration options
@@ -325,6 +339,7 @@ impl AppState {
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -387,6 +402,7 @@ impl AppState {
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -453,6 +469,7 @@ impl AppState {
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -486,6 +503,38 @@ impl AppState {
     /// Get a reference to the audit log for logging security events
     pub fn audit(&self) -> &InMemorySecurityAuditLog {
         &self.audit_log
+    }
+
+    /// Prime the `entity_type_cache` from the `entity_types` registry.
+    ///
+    /// The sync `with_db*` constructors cannot `SELECT` (they receive a
+    /// possibly-lazy pool), so the cache starts empty and this loader is called
+    /// once at startup right after the pool connects (see server.rs), and by
+    /// tests right after `with_db`. Owned-table (`is_optional=false`) absence is
+    /// a loud `tracing::error!` — an epigraph-owned backing table that failed
+    /// `to_regclass` means the schema is broken.
+    ///
+    /// # Errors
+    /// Returns the underlying `DbError` if the registry query fails.
+    #[cfg(feature = "db")]
+    pub async fn load_entity_type_cache(&self) -> Result<(), epigraph_db::DbError> {
+        let entries = epigraph_db::EntityTypeRepository::list_all(&self.db_pool).await?;
+        let mut map = HashMap::with_capacity(entries.len());
+        for (name, entry) in entries {
+            if !entry.is_optional && entry.table.is_some() && !entry.table_present {
+                tracing::error!(
+                    entity_type = %name,
+                    schema = %entry.schema,
+                    table = ?entry.table,
+                    "Owned entity-type backing table absent at cache load — edges of this type will fail loud"
+                );
+            }
+            map.insert(name, entry);
+        }
+        if let Ok(mut cache) = self.entity_type_cache.write() {
+            *cache = map;
+        }
+        Ok(())
     }
 
     /// Set the rate limiter for this state (builder pattern)

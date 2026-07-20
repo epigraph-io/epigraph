@@ -420,6 +420,11 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/admin/clients/:id/approve",
             post(admin::approve_client),
         )
+        // entity_types registry: register a non-core type (entity-types:write scope)
+        .route(
+            "/api/v1/admin/entity-types",
+            post(admin::register_entity_type),
+        )
         // Agent key management
         .route(
             "/api/v1/agents/:id/keys/rotate",

@@ -22,27 +22,6 @@ use uuid::Uuid;
 #[cfg(feature = "db")]
 use epigraph_db::EdgeRepository;
 
-/// Valid entity types (must match the DB CHECK constraint from migration 053)
-const VALID_ENTITY_TYPES: &[&str] = &[
-    "claim",
-    "agent",
-    "evidence",
-    "trace",
-    "node",
-    "activity",
-    "paper",
-    "perspective",
-    "community",
-    "context",
-    "frame",
-    "analysis",
-    "experiment",
-    "experiment_result",
-    "propaganda_technique",
-    "coalition",
-    "synthesis",
-];
-
 /// Valid relationship types for edge creation
 const VALID_RELATIONSHIPS: &[&str] = &[
     "supports",
@@ -119,8 +98,117 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "INSTANTIATES", // claim → claim (paper claim is an instance of textbook concept; cross-source anchor 2026-05-18-cross-source-anchor §3)
 ];
 
-pub fn is_valid_entity_type(s: &str) -> bool {
-    VALID_ENTITY_TYPES.contains(&s)
+/// Whether `s` is a registered entity type, per the in-process registry cache.
+///
+/// The registry (`entity_types` table, cached in `AppState::entity_type_cache`)
+/// is the single source of truth: `is_valid_entity_type` (validity) and
+/// `entity_exists` (existence) both resolve through this ONE cache, so the two
+/// can never drift.
+///
+/// READ-THROUGH-ON-MISS (multi-replica correctness): a cache miss re-fetches
+/// from the `entity_types` table and populates the cache, so a type registered
+/// on replica A resolves on replica B without a restart. This MUST mirror
+/// `entity_exists`' read-through — otherwise the `create_edge` validity gate
+/// (which runs first) would 400 an A-registered type on B before
+/// `entity_exists` is ever reached, making its read-through dead code for that
+/// path. Hence this is `async`.
+#[cfg(feature = "db")]
+pub async fn is_valid_entity_type(state: &AppState, s: &str) -> bool {
+    // Fast path: sync cache hit.
+    if state
+        .entity_type_cache
+        .read()
+        .map(|cache| cache.contains_key(s))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    // Miss: read-through from the registry and populate the cache on hit, so the
+    // subsequent `entity_exists` gets a cache hit rather than a second lookup.
+    match epigraph_db::EntityTypeRepository::get_by_name(&state.db_pool, s).await {
+        Ok(Some((name, fetched))) => {
+            if let Ok(mut cache) = state.entity_type_cache.write() {
+                cache.entry(name).or_insert(fetched);
+            }
+            true
+        }
+        Ok(None) => false, // genuinely unregistered
+        Err(e) => {
+            tracing::error!(
+                entity_type = %s,
+                error = %e,
+                "entity_types read-through lookup failed in is_valid_entity_type"
+            );
+            false
+        }
+    }
+}
+
+/// Sorted list of registered entity-type names, for validation error messages.
+#[cfg(feature = "db")]
+fn valid_entity_type_names(state: &AppState) -> Vec<String> {
+    let mut names: Vec<String> = state
+        .entity_type_cache
+        .read()
+        .map(|cache| cache.keys().cloned().collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Postgres-identifier guard: `^[a-z_][a-z0-9_]*$` AND length ≤ 63.
+///
+/// Defense-in-depth for the dynamic-SQL path in `entity_exists`: even though
+/// the `entity_types` CHECK regexes constrain identifiers at rest, a doctored
+/// cache entry must never reach string interpolation without re-passing this.
+#[cfg(feature = "db")]
+pub(crate) fn is_pg_ident(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Sensitive tables a registered (non-core) entity type may NEVER point at.
+///
+/// `is_pg_ident` alone is authorization-blind: a well-formed identifier can name
+/// a secrets table (`oauth_clients`, `refresh_tokens`, …). Without this guard a
+/// caller holding `entity-types:write` could register a non-core type targeting
+/// `oauth_clients`, then use `POST /api/v1/edges` as a row-existence /
+/// column-enumeration oracle against it (201 if the row exists, 404 if not).
+/// Registration is denied (400) for these, AND `entity_exists` re-checks them
+/// for non-core entries (defense in depth) before building any SQL.
+///
+/// Grepped from the migrations (`CREATE TABLE … {oauth_*,refresh_tokens,
+/// security_events,agent_keys,authorizers,authorization_votes}`), all of which
+/// carry a `uuid id` PK and would otherwise be a viable oracle target.
+#[cfg(feature = "db")]
+pub(crate) const SENSITIVE_TABLES: &[&str] = &[
+    "oauth_clients",
+    "oauth_authorization_codes",
+    "oauth_authorize_sessions",
+    "refresh_tokens",
+    "agent_keys",
+    "security_events",
+    "authorizers",
+    "authorization_votes",
+];
+
+/// Whether registering / existence-checking `table` in `schema` is permitted for
+/// a NON-core entity type. Enforces the spec's least-privilege posture:
+/// registration is pinned to the `public` schema and forbidden from naming any
+/// [`SENSITIVE_TABLES`] entry. Core (migration-seeded, trusted) entries are NOT
+/// subject to this — callers gate on `is_core` before invoking it, so seeded
+/// core types (e.g. `agent -> agents`) are never affected.
+#[cfg(feature = "db")]
+pub(crate) fn is_registrable_target(schema: &str, table: &str) -> bool {
+    schema == "public" && !SENSITIVE_TABLES.contains(&table)
 }
 
 pub fn is_valid_relationship(s: &str) -> bool {
@@ -424,24 +512,24 @@ pub async fn create_edge(
         crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
     }
 
-    // Validate entity types
-    if !is_valid_entity_type(&request.source_type) {
+    // Validate entity types against the registry cache (single source of truth).
+    if !is_valid_entity_type(&state, &request.source_type).await {
         return Err(ApiError::ValidationError {
             field: "source_type".to_string(),
             reason: format!(
                 "Invalid source_type '{}'. Valid types: {}",
                 request.source_type,
-                VALID_ENTITY_TYPES.join(", ")
+                valid_entity_type_names(&state).join(", ")
             ),
         });
     }
-    if !is_valid_entity_type(&request.target_type) {
+    if !is_valid_entity_type(&state, &request.target_type).await {
         return Err(ApiError::ValidationError {
             field: "target_type".to_string(),
             reason: format!(
                 "Invalid target_type '{}'. Valid types: {}",
                 request.target_type,
-                VALID_ENTITY_TYPES.join(", ")
+                valid_entity_type_names(&state).join(", ")
             ),
         });
     }
@@ -470,14 +558,14 @@ pub async fn create_edge(
     let pool = &state.db_pool;
 
     // Verify source entity exists
-    if !entity_exists(pool, request.source_id, &request.source_type).await? {
+    if !entity_exists(&state, request.source_id, &request.source_type).await? {
         return Err(ApiError::NotFound {
             entity: request.source_type.clone(),
             id: request.source_id.to_string(),
         });
     }
     // Verify target entity exists
-    if !entity_exists(pool, request.target_id, &request.target_type).await? {
+    if !entity_exists(&state, request.target_id, &request.target_type).await? {
         return Err(ApiError::NotFound {
             entity: request.target_type.clone(),
             id: request.target_id.to_string(),
@@ -1227,70 +1315,138 @@ pub async fn relate_claims(
     })
 }
 
-/// Check whether an entity with the given ID exists in the appropriate table.
+/// Check whether an entity with the given ID exists in its backing table,
+/// resolved through the `entity_types` registry cache.
+///
+/// Hot path: 0 queries for unknown / table-less (`node`) / absent-optional
+/// types; exactly 1 `EXISTS` query otherwise. No per-call `to_regclass` and no
+/// per-call registry SELECT — `table_present` is folded into the cache at load.
+///
+/// Read-through-on-miss: a type not in the local cache is re-fetched from the
+/// registry (under a write lock, double-checked) and inserted, so a type
+/// registered on replica A resolves on replica B without a restart. A confirmed
+/// miss is negative-cached only implicitly (it returns `Ok(false)` and the
+/// upstream validity gate rejects unknown types anyway).
 #[cfg(feature = "db")]
-async fn entity_exists(
-    pool: &epigraph_db::PgPool,
-    id: Uuid,
-    entity_type: &str,
-) -> Result<bool, ApiError> {
-    let exists: bool = match entity_type {
-        "claim" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("DB check failed: {e}"),
-            })?,
-        "agent" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1)")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("DB check failed: {e}"),
-            })?,
-        "evidence" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM evidence WHERE id = $1)")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("DB check failed: {e}"),
-            })?,
-        "trace" => {
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM reasoning_traces WHERE id = $1)")
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("DB check failed: {e}"),
-                })?
+async fn entity_exists(state: &AppState, id: Uuid, entity_type: &str) -> Result<bool, ApiError> {
+    // 1. Cache lookup (sync read).
+    let mut entry = state
+        .entity_type_cache
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(entity_type).cloned());
+
+    // 1b. Read-through-on-miss: re-fetch from the registry and populate.
+    if entry.is_none() {
+        match epigraph_db::EntityTypeRepository::get_by_name(&state.db_pool, entity_type).await {
+            Ok(Some((name, fetched))) => {
+                if let Ok(mut cache) = state.entity_type_cache.write() {
+                    // Double-check: another writer may have inserted meanwhile.
+                    let e = cache.entry(name).or_insert(fetched);
+                    entry = Some(e.clone());
+                }
+            }
+            Ok(None) => return Ok(false), // genuinely unregistered
+            Err(e) => {
+                return Err(ApiError::InternalError {
+                    message: format!("entity_types registry lookup failed: {e}"),
+                });
+            }
         }
-        "propaganda_technique" => {
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM propaganda_techniques WHERE id = $1)")
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("DB check failed: {e}"),
-                })?
-        }
-        "coalition" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM coalitions WHERE id = $1)")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("DB check failed: {e}"),
-            })?,
-        "paper" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM papers WHERE id = $1)")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("DB check failed: {e}"),
-            })?,
-        _ => false, // Unknown types already rejected by validation above
+    }
+
+    let Some(entry) = entry else {
+        return Ok(false); // unknown; validation rejects upstream
     };
-    Ok(exists)
+
+    // 2. Table-less type (e.g. `node`) — never existence-checked here.
+    let Some(table) = entry.table.as_deref() else {
+        return Ok(false);
+    };
+
+    // 3. Defense-in-depth: re-apply the identifier guard before any interpolation.
+    if !is_pg_ident(&entry.schema) || !is_pg_ident(table) || !is_pg_ident(&entry.id_column) {
+        tracing::error!(
+            entity_type = %entity_type,
+            schema = %entry.schema,
+            table = %table,
+            id_column = %entry.id_column,
+            "entity_types registry entry has a non-identifier field — refusing to build SQL"
+        );
+        return Ok(false);
+    }
+
+    // 3b. Defense-in-depth authorization: a NON-core registered entry must
+    // never resolve against a sensitive/denylisted table or a non-public
+    // schema, even if it slipped past registration (e.g. a doctored cache
+    // entry or a row inserted before this guard existed). Core entries are
+    // migration-seeded and trusted — `agent -> agents` etc. must still resolve
+    // — so the denylist is gated on `!entry.is_core`.
+    if !entry.is_core && !is_registrable_target(&entry.schema, table) {
+        tracing::error!(
+            entity_type = %entity_type,
+            schema = %entry.schema,
+            table = %table,
+            "non-core entity_types entry targets a denylisted/non-public table — refusing existence check"
+        );
+        return Ok(false);
+    }
+
+    // 4. Absent backing table (folded at load, not probed per call).
+    if !entry.table_present {
+        return if entry.is_optional {
+            Ok(false) // foreign/absent-tolerant -> does not exist
+        } else {
+            Err(ApiError::InternalError {
+                message: format!(
+                    "Owned entity-type '{entity_type}' backing table {}.{} is absent",
+                    entry.schema, table
+                ),
+            })
+        };
+    }
+
+    // 5. Exactly one EXISTS query. Identifiers are double-quoted (validated
+    // above); the uuid is ALWAYS a bound $1 param, never interpolated.
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM \"{}\".\"{}\" WHERE \"{}\" = $1)",
+        entry.schema, table, entry.id_column
+    );
+    match sqlx::query_scalar::<_, bool>(&sql)
+        .bind(id)
+        .fetch_one(&state.db_pool)
+        .await
+    {
+        Ok(exists) => Ok(exists),
+        Err(e) => {
+            if entry.is_optional {
+                // Optional/foreign table query error -> treat as "does not exist".
+                tracing::warn!(
+                    entity_type = %entity_type,
+                    error = %e,
+                    "EXISTS check on optional entity table failed; treating as absent"
+                );
+                Ok(false)
+            } else {
+                // Never surface the raw Postgres error to the client: for a
+                // non-optional type whose table is present but (e.g.) id_column
+                // is wrong, the raw text ("column ... does not exist") is a
+                // schema-disclosure / column-enumeration oracle. Log the detail
+                // server-side; return a generic message.
+                tracing::error!(
+                    entity_type = %entity_type,
+                    schema = %entry.schema,
+                    table = %table,
+                    id_column = %entry.id_column,
+                    error = %e,
+                    "entity existence EXISTS query failed on an owned type"
+                );
+                Err(ApiError::InternalError {
+                    message: "entity existence check failed".to_string(),
+                })
+            }
+        }
+    }
 }
 
 /// Query edges by source, target, or relationship
@@ -2404,17 +2560,13 @@ pub async fn claim_neighborhood(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_valid_entity_types() {
-        assert!(is_valid_entity_type("claim"));
-        assert!(is_valid_entity_type("agent"));
-        assert!(is_valid_entity_type("evidence"));
-        assert!(is_valid_entity_type("trace"));
-        assert!(is_valid_entity_type("node"));
-        assert!(!is_valid_entity_type("invalid"));
-        assert!(!is_valid_entity_type(""));
-        assert!(!is_valid_entity_type("CLAIM")); // Case sensitive
-    }
+    // NOTE: `test_valid_entity_types` was removed when entity-type validity
+    // moved from the hardcoded `VALID_ENTITY_TYPES` const to the registry
+    // cache. `is_valid_entity_type` now takes `&AppState` and reads a loaded
+    // `entity_type_cache`, so validity is asserted against a real DB in the
+    // db_tests `is_valid_entity_type_covers_all_seeded_types` (all 23 seeded
+    // types incl. the 6 DB-only ones; rejects 'invalid'/''/'CLAIM'). A pure
+    // no-DB unit test can no longer populate the cache.
 
     #[test]
     fn test_valid_relationships() {
@@ -2623,8 +2775,17 @@ mod db_tests {
 
     // ── Test scaffolding ──
 
-    fn test_state(pool: PgPool) -> AppState {
-        AppState::with_db(pool, ApiConfig::default())
+    /// Build state AND prime the entity_types registry cache. `with_db` is
+    /// sync and cannot load the cache, so every test path that reaches
+    /// create_edge (whose sync validity gate reads the cache) MUST await this
+    /// — an empty cache 400s all edge writes at validation.
+    async fn test_state(pool: PgPool) -> AppState {
+        let state = AppState::with_db(pool, ApiConfig::default());
+        state
+            .load_entity_type_cache()
+            .await
+            .expect("load entity_types cache");
+        state
     }
 
     /// Router exposing the edges write/read routes under test.
@@ -2703,7 +2864,7 @@ mod db_tests {
         let source_id = seed_claim(&pool, agent_id, "edge-test source").await;
         let target_id = seed_claim(&pool, agent_id, "edge-test target").await;
 
-        let state = test_state(pool.clone());
+        let state = test_state(pool.clone()).await;
         let router = edges_router(state);
 
         // First POST creates the edge.
@@ -2798,7 +2959,7 @@ mod db_tests {
                 .await
                 .unwrap();
 
-        let state = test_state(pool.clone());
+        let state = test_state(pool.clone()).await;
         let router = edges_router(state);
 
         let response = router
@@ -2839,7 +3000,7 @@ mod db_tests {
         .await
         .unwrap();
 
-        let state = test_state(pool.clone());
+        let state = test_state(pool.clone()).await;
         let router = edges_router(state);
 
         let cutoff = chrono::Utc::now();
@@ -2897,7 +3058,7 @@ mod db_tests {
         .await
         .unwrap();
 
-        let state = test_state(pool.clone());
+        let state = test_state(pool.clone()).await;
         let router = edges_router(state);
 
         let response = router
@@ -2953,7 +3114,7 @@ mod db_tests {
         .await
         .unwrap();
 
-        let state = test_state(pool.clone());
+        let state = test_state(pool.clone()).await;
         let router = edges_router(state);
 
         let response = router
@@ -3034,7 +3195,7 @@ mod db_tests {
         let source_id = seed_claim(&pool, agent_id, "stored-row source").await;
         let target_id = seed_claim(&pool, agent_id, "stored-row target").await;
 
-        let state = test_state(pool.clone());
+        let state = test_state(pool.clone()).await;
         let router = edges_router(state);
 
         // First POST stores properties = {"weight": 0.7, "from": "first"}.
@@ -3205,7 +3366,7 @@ mod db_tests {
         .await
         .unwrap();
 
-        let state = test_state(pool.clone());
+        let state = test_state(pool.clone()).await;
         let router = edges_router(state);
 
         let response = router
@@ -3377,7 +3538,7 @@ mod db_tests {
         .await
         .unwrap();
 
-        let state = test_state(pool.clone());
+        let state = test_state(pool.clone()).await;
         let router = edges_router(state);
 
         let resp = router
@@ -3454,7 +3615,7 @@ mod db_tests {
         .await
         .unwrap();
 
-        let state = test_state(pool.clone());
+        let state = test_state(pool.clone()).await;
         let router = edges_router(state);
 
         let cutoff = chrono::Utc::now();
@@ -3496,5 +3657,390 @@ mod db_tests {
                 "expected exactly one {event_type} event for this edge_id"
             );
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // entity_types registry (Phase 1 + Phase 2)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// All 23 seeded types are valid; the 6 DB-only ones the old Rust list
+    /// omitted are present; case-variants and junk are rejected. This absorbs
+    /// the ex-`edges_validation.rs::synthesis_entity_type_is_valid` coverage.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn is_valid_entity_type_covers_all_seeded_types(pool: PgPool) {
+        let state = test_state(pool).await;
+        // The 6 DB-only types + synthesis (ex-external test) + a core sample.
+        for t in [
+            "source_artifact",
+            "span",
+            "entity",
+            "task",
+            "event",
+            "workflow",
+            "synthesis",
+            "coalition",
+            "propaganda_technique",
+            "claim",
+            "node",
+            "frame",
+        ] {
+            assert!(is_valid_entity_type(&state, t).await, "{t} should be valid");
+        }
+        // Exactly the 23 seeded rows.
+        assert_eq!(valid_entity_type_names(&state).len(), 23);
+        // Rejections.
+        for bad in ["invalid", "", "CLAIM", "public.claims"] {
+            assert!(
+                !is_valid_entity_type(&state, bad).await,
+                "{bad:?} must be invalid"
+            );
+        }
+    }
+
+    /// Single-source-of-truth: every cached key is `is_valid_entity_type==true`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn every_cached_key_is_valid(pool: PgPool) {
+        let state = test_state(pool).await;
+        let keys = valid_entity_type_names(&state);
+        assert!(!keys.is_empty());
+        for k in keys {
+            assert!(is_valid_entity_type(&state, &k).await);
+        }
+    }
+
+    /// #344 regression: claim→{frame,perspective,analysis,experiment_result}
+    /// against REAL rows returns 201, not 404. These are the types the old
+    /// hardcoded `entity_exists` match omitted (it fell to `_ => false`).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn regression_344_claim_to_non_claim_targets(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let claim = seed_claim(&pool, agent_id, "src claim #344").await;
+
+        // Seed a real row of each target type (schemas per migrations 001/023).
+        let frame: Uuid = sqlx::query_scalar(
+            "INSERT INTO frames (name, hypotheses) VALUES ('f-344', ARRAY['h1','h2']) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let perspective: Uuid =
+            sqlx::query_scalar("INSERT INTO perspectives (name) VALUES ('p-344') RETURNING id")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let analysis: Uuid = sqlx::query_scalar(
+            "INSERT INTO analyses (analysis_type, method_description, agent_id) \
+             VALUES ('gap', 'x', $1) RETURNING id",
+        )
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let experiment: Uuid = sqlx::query_scalar(
+            "INSERT INTO experiments (hypothesis_id, created_by) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(claim)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let exp_result: Uuid = sqlx::query_scalar(
+            "INSERT INTO experiment_results (experiment_id, data_source) \
+             VALUES ($1, 'manual') RETURNING id",
+        )
+        .bind(experiment)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone()).await;
+
+        // Primary assertion: the HTTP contract. create_edge claim->{these four}
+        // through the real router must return 201 CREATED (not the pre-#344 404
+        // the hardcoded `entity_exists` match produced by falling to `_ =>
+        // false`). This exercises request wiring + the FK/trigger path, not just
+        // the internal helper.
+        for (ttype, tid) in [
+            ("frame", frame),
+            ("perspective", perspective),
+            ("analysis", analysis),
+            ("experiment_result", exp_result),
+        ] {
+            let router = edges_router(state.clone());
+            let body = Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "source_id": claim,
+                    "target_id": tid,
+                    "source_type": "claim",
+                    "target_type": ttype,
+                    // `relates_to` is in VALID_RELATIONSHIPS; using an invalid
+                    // relationship would 400 and be misread as a type failure.
+                    "relationship": "relates_to",
+                }))
+                .unwrap(),
+            );
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/edges")
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::CREATED,
+                "create_edge claim->{ttype} must be 201, not 404 (#344 regression)"
+            );
+        }
+
+        // Supplement: the internal existence helper resolves each real row.
+        for (ttype, tid) in [
+            ("frame", frame),
+            ("perspective", perspective),
+            ("analysis", analysis),
+            ("experiment_result", exp_result),
+        ] {
+            let ok = entity_exists(&state, tid, ttype).await.unwrap();
+            assert!(ok, "entity_exists({ttype}) against a real row must be true");
+        }
+    }
+
+    /// Optional-table tolerance: on a CI DB with no `syntheses` table,
+    /// entity_exists('synthesis', id) is Ok(false) — never a 500.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn optional_table_absent_returns_ok_false(pool: PgPool) {
+        // syntheses does not exist in epigraph migrations.
+        let state = test_state(pool).await;
+        let got = entity_exists(&state, Uuid::new_v4(), "synthesis").await;
+        assert!(
+            matches!(got, Ok(false)),
+            "optional absent -> Ok(false); got {got:?}"
+        );
+    }
+
+    /// Owned-table loudness: an is_optional=false type whose table is absent
+    /// yields InternalError (fail-loud), not a silent false.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn owned_table_absent_is_internal_error(pool: PgPool) {
+        // Register a NON-core owned type pointing at a table that doesn't exist,
+        // then load the cache so table_present=false with is_optional=false.
+        sqlx::query(
+            "INSERT INTO entity_types (type_name, table_name, is_optional, is_core) \
+             VALUES ('phantom_owned', 'does_not_exist_tbl', false, false)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = test_state(pool).await;
+        let got = entity_exists(&state, Uuid::new_v4(), "phantom_owned").await;
+        assert!(
+            matches!(got, Err(ApiError::InternalError { .. })),
+            "owned absent -> InternalError; got {got:?}"
+        );
+    }
+
+    /// Injection at rest: the CHECK regexes reject metacharacter-laden
+    /// table_name values.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn injection_check_rejects_bad_table_name(pool: PgPool) {
+        for bad in ["claims; DROP TABLE claims", "a\"b", "public.claims"] {
+            let res = sqlx::query(
+                "INSERT INTO entity_types (type_name, table_name, is_core) VALUES ('inj_t', $1, false)",
+            )
+            .bind(bad)
+            .execute(&pool)
+            .await;
+            assert!(res.is_err(), "CHECK must reject table_name={bad:?}");
+        }
+    }
+
+    /// Injection defense-in-depth: a doctored cache entry with a bad identifier
+    /// yields Ok(false) via is_pg_ident — SQL is never built.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn injection_doctored_cache_entry_never_builds_sql(pool: PgPool) {
+        let state = test_state(pool).await;
+        // Bypass the DB CHECK by poking the in-memory cache directly.
+        {
+            let mut cache = state.entity_type_cache.write().unwrap();
+            cache.insert(
+                "evil".to_string(),
+                epigraph_db::EntityTypeEntry {
+                    schema: "public".to_string(),
+                    table: Some("claims\"; DROP TABLE claims; --".to_string()),
+                    id_column: "id".to_string(),
+                    is_optional: false,
+                    is_core: false,
+                    table_present: true,
+                },
+            );
+        }
+        let got = entity_exists(&state, Uuid::new_v4(), "evil").await;
+        assert!(
+            matches!(got, Ok(false)),
+            "bad identifier must short-circuit to Ok(false); got {got:?}"
+        );
+    }
+
+    /// Phase 2 END-TO-END (the money test): a real `syntheses` table + row +
+    /// claim; create_edge synthesis→claim returns 201 — it passes BOTH the FK
+    /// (synthesis is seeded in entity_types) AND the rewritten trigger's
+    /// registry-driven EXISTS arm.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn phase2_synthesis_edge_end_to_end(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let claim = seed_claim(&pool, agent_id, "synthesis target claim").await;
+
+        // Create a minimal syntheses table + a row. Do this BEFORE loading the
+        // cache so table_present=true is folded in.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS syntheses (id uuid PRIMARY KEY DEFAULT gen_random_uuid())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let synth: Uuid = sqlx::query_scalar(
+            "INSERT INTO syntheses (id) VALUES (gen_random_uuid()) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Load the cache AFTER syntheses exists.
+        let state = test_state(pool.clone()).await;
+        let router = edges_router(state);
+
+        let body = Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "source_id": synth,
+                "target_id": claim,
+                "source_type": "synthesis",
+                "target_type": "claim",
+                "relationship": "WAS_DERIVED_FROM",
+            }))
+            .unwrap(),
+        );
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "synthesis->claim edge must be 201 (FK + trigger both pass)"
+        );
+    }
+
+    /// Phase 2 FK — SCHEMA-LEVEL. Assert the two registry FKs actually exist and
+    /// are validated in the catalog.
+    ///
+    /// This is the ONLY way to isolate the FK: an edge INSERT of an unregistered
+    /// type cannot behaviorally distinguish the FK from the pre-existing
+    /// BEFORE-ROW trigger (`trigger_validate_edge_refs`), because Postgres fires
+    /// BEFORE-ROW triggers before FK checks and that trigger RAISEs with
+    /// `ERRCODE = 'foreign_key_violation'` (also 23503). So a 23503 from an
+    /// INSERT proves the TRIGGER, not the FK. We assert the FK at the catalog
+    /// level instead: both `edges_source_type_fkey` / `edges_target_type_fkey`
+    /// exist with `contype='f'`, `convalidated=true`, referencing
+    /// `entity_types`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn phase2_registry_fks_exist_and_validated(pool: PgPool) {
+        for fk in ["edges_source_type_fkey", "edges_target_type_fkey"] {
+            // pg_constraint.contype is a `"char"`; cast to text so sqlx maps it
+            // to String. confrelid -> the referenced table's relname.
+            let row: Option<(String, bool, String)> = sqlx::query_as(
+                "SELECT c.contype::text, c.convalidated, ft.relname::text \
+                 FROM pg_constraint c \
+                 JOIN pg_class ft ON ft.oid = c.confrelid \
+                 WHERE c.conname = $1",
+            )
+            .bind(fk)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            let (contype, convalidated, reftable) =
+                row.unwrap_or_else(|| panic!("FK constraint {fk} must exist"));
+            assert_eq!(contype, "f", "{fk} must be a FOREIGN KEY constraint");
+            assert!(convalidated, "{fk} must be VALIDATEd");
+            assert_eq!(reftable, "entity_types", "{fk} must reference entity_types");
+        }
+    }
+
+    /// Phase 2 — unregistered types are REJECTED, and registering + creating the
+    /// backing row makes the edge insertable.
+    ///
+    /// NOTE ON ATTRIBUTION: the 23503 on the first INSERT is raised by the
+    /// BEFORE-ROW trigger `trigger_validate_edge_refs` (which fires before the
+    /// FK), not by the FK itself — see `phase2_registry_fks_exist_and_validated`
+    /// for the FK proof. This test proves the end-to-end rejection + the
+    /// happy-path after registration.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn phase2_unregistered_type_rejected_then_registered_succeeds(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let claim = seed_claim(&pool, agent_id, "fk target").await;
+
+        // Direct INSERT bypassing the app layer: 'widget' is unregistered, so
+        // the trigger (and, were it reached, the FK) rejects it with 23503.
+        let res = sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'widget', $2, 'claim', 'relates_to')",
+        )
+        .bind(claim)
+        .bind(claim)
+        .execute(&pool)
+        .await;
+        let err = res.expect_err("unregistered source_type must be rejected");
+        let code = err
+            .as_database_error()
+            .and_then(|e| e.code())
+            .map(|c| c.to_string());
+        assert_eq!(
+            code.as_deref(),
+            Some("23503"),
+            "expected rejection with SQLSTATE 23503"
+        );
+
+        // Register the type AND create its backing table + a real row: the
+        // trigger existence-checks the ROW (via the registry-driven EXISTS arm),
+        // not merely the registration, so a registered type with no row still
+        // fails. Mirror the money test.
+        sqlx::query("CREATE TABLE widgets (id uuid PRIMARY KEY DEFAULT gen_random_uuid())")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let widget: Uuid =
+            sqlx::query_scalar("INSERT INTO widgets (id) VALUES (gen_random_uuid()) RETURNING id")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO entity_types (type_name, table_name, is_optional, is_core) \
+             VALUES ('widget', 'widgets', true, false)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Same INSERT now succeeds: the type is registered (FK satisfied) AND
+        // the widgets row exists (trigger EXISTS arm satisfied).
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'widget', $2, 'claim', 'relates_to')",
+        )
+        .bind(widget)
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("edge insert succeeds after registering the type AND creating the row");
     }
 }
