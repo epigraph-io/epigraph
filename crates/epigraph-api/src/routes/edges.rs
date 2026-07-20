@@ -1265,22 +1265,56 @@ async fn entity_exists(
                     message: format!("DB check failed: {e}"),
                 })?
         }
+        // `propaganda_techniques` / `coalitions` are absent from this repo's
+        // migrations (their code cites "migration 053", but 053 here is
+        // unrelated — apparent migration drift). They exist only in the shared
+        // prod DB, so — like `syntheses` below — guard with to_regclass: where
+        // the table exists the real EXISTS check runs (unchanged prod behavior);
+        // on a migrated CI/dev DB the arm returns false instead of erroring on
+        // a missing relation, which previously turned a not-found into a 500.
         "propaganda_technique" => {
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM propaganda_techniques WHERE id = $1)")
+            let has_table: bool = sqlx::query_scalar(
+                "SELECT to_regclass('public.propaganda_techniques') IS NOT NULL",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB check failed: {e}"),
+            })?;
+            if has_table {
+                sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM propaganda_techniques WHERE id = $1)",
+                )
                 .bind(id)
                 .fetch_one(pool)
                 .await
                 .map_err(|e| ApiError::InternalError {
                     message: format!("DB check failed: {e}"),
                 })?
+            } else {
+                false
+            }
         }
-        "coalition" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM coalitions WHERE id = $1)")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("DB check failed: {e}"),
-            })?,
+        "coalition" => {
+            let has_table: bool =
+                sqlx::query_scalar("SELECT to_regclass('public.coalitions') IS NOT NULL")
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| ApiError::InternalError {
+                        message: format!("DB check failed: {e}"),
+                    })?;
+            if has_table {
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM coalitions WHERE id = $1)")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| ApiError::InternalError {
+                        message: format!("DB check failed: {e}"),
+                    })?
+            } else {
+                false
+            }
+        }
         "paper" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM papers WHERE id = $1)")
             .bind(id)
             .fetch_one(pool)
@@ -1288,6 +1322,101 @@ async fn entity_exists(
             .map_err(|e| ApiError::InternalError {
                 message: format!("DB check failed: {e}"),
             })?,
+        // ── Owned tables present in epigraph's own migrations (001 / 023) ──
+        // Kept as DIRECT existence checks (no to_regclass guard) so a future
+        // typo'd table name surfaces as a CI failure instead of silently
+        // returning false. All use the `id` UUID PK.
+        "activity" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM activities WHERE id = $1)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB check failed: {e}"),
+            })?,
+        "perspective" => {
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM perspectives WHERE id = $1)")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("DB check failed: {e}"),
+                })?
+        }
+        "community" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB check failed: {e}"),
+            })?,
+        "context" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contexts WHERE id = $1)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB check failed: {e}"),
+            })?,
+        "frame" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM frames WHERE id = $1)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB check failed: {e}"),
+            })?,
+        "analysis" => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM analyses WHERE id = $1)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB check failed: {e}"),
+            })?,
+        "experiment" => {
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM experiments WHERE id = $1)")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("DB check failed: {e}"),
+                })?
+        }
+        "experiment_result" => {
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM experiment_results WHERE id = $1)")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("DB check failed: {e}"),
+                })?
+        }
+        // `syntheses` is owned by episcience and exists ONLY in the shared prod
+        // DB — it is absent from epigraph-only DBs (including CI, which runs
+        // just epigraph's own migrations). Guard with to_regclass so this arm
+        // returns false (not a DB error) when the table isn't present, while
+        // still gating existence correctly where it is.
+        "synthesis" => {
+            let has_table: bool =
+                sqlx::query_scalar("SELECT to_regclass('public.syntheses') IS NOT NULL")
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| ApiError::InternalError {
+                        message: format!("DB check failed: {e}"),
+                    })?;
+            if has_table {
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM syntheses WHERE id = $1)")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| ApiError::InternalError {
+                        message: format!("DB check failed: {e}"),
+                    })?
+            } else {
+                false
+            }
+        }
+        // `node` is a valid edge endpoint type with no backing table anywhere;
+        // returning false (rather than querying a nonexistent `nodes` table)
+        // preserves the pre-existing behavior for this type.
+        "node" => false,
         _ => false, // Unknown types already rejected by validation above
     };
     Ok(exists)
@@ -3494,6 +3623,88 @@ mod db_tests {
                 matching.len(),
                 1,
                 "expected exactly one {event_type} event for this edge_id"
+            );
+        }
+    }
+
+    /// Insert a bare `perspective` row and return its id. `perspective` is
+    /// epigraph-owned (migration 001), so this works against a CI-migrated DB
+    /// and lets us exercise a NON-claim source in `create_edge`.
+    async fn seed_perspective(pool: &PgPool, name: &str) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>("INSERT INTO perspectives (name) VALUES ($1) RETURNING id")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// #344 regression: a `perspective`-sourced edge must create successfully.
+    ///
+    /// Before the fix, `entity_exists` only handled 7 of the 17 valid entity
+    /// types; `perspective` fell through to `_ => false`, so this POST 404'd
+    /// with "perspective not found" even though the row existed. With the new
+    /// arm it resolves the row and the edge is created (201). This is the
+    /// RED→GREEN proof of the fix.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_perspective_source_resolves_and_creates(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let perspective_id = seed_perspective(&pool, "entity-exists-test perspective").await;
+        let claim_id = seed_claim(&pool, agent_id, "entity-exists-test claim").await;
+
+        let state = test_state(pool.clone());
+        let router = edges_router(state);
+
+        // PERSPECTIVE_OF is a valid relationship (perspective → claim). The
+        // generic edges route validates relationship against a flat allow-list
+        // with no per-pair constraint, so the (perspective, claim) endpoints
+        // are what the entity-existence check must resolve.
+        let body = Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "source_id": perspective_id,
+                "target_id": claim_id,
+                "source_type": "perspective",
+                "target_type": "claim",
+                "relationship": "PERSPECTIVE_OF",
+            }))
+            .unwrap(),
+        );
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "perspective-sourced edge must create (404 = entity_exists regressed for 'perspective')"
+        );
+    }
+
+    /// Drift guard: `entity_exists` must return `Ok(false)` — never `Err` — for
+    /// EVERY type in `VALID_ENTITY_TYPES` against a CI-migrated DB with a random
+    /// (nonexistent) id. Any future valid type added without a working
+    /// existence arm falls to `_ => false` and would still pass here, but a
+    /// typo'd table name in an owned arm (a DIRECT check, no to_regclass guard)
+    /// raises a DB error → `Err` → this test fails, surfacing the drift in CI.
+    ///
+    /// `synthesis` returns `Ok(false)` because its to_regclass guard sees no
+    /// `syntheses` table on a CI DB; `node` returns `Ok(false)` (no backing
+    /// table).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn entity_exists_returns_ok_false_for_all_valid_types(pool: PgPool) {
+        for &entity_type in VALID_ENTITY_TYPES {
+            let result = entity_exists(&pool, Uuid::new_v4(), entity_type).await;
+            assert!(
+                matches!(result, Ok(false)),
+                "entity_exists must return Ok(false) for valid type '{entity_type}', got {result:?}"
             );
         }
     }
