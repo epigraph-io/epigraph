@@ -4,34 +4,8 @@
 //! Tests skip automatically when the database is unavailable.
 
 use epigraph_engine::matching::source_key::derive_source_key;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-// --- pool helpers (project pattern) ---
-
-async fn try_test_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&url)
-        .await
-        .ok()?;
-    sqlx::migrate!("../../migrations").run(&pool).await.expect("test DB migrations failed — likely a description/version mismatch with existing _sqlx_migrations; use a fresh DB");
-    Some(pool)
-}
-
-macro_rules! test_pool_or_skip {
-    () => {{
-        match try_test_pool().await {
-            Some(p) => p,
-            None => {
-                eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                return;
-            }
-        }
-    }};
-}
 
 // --- seed helpers ---
 
@@ -73,6 +47,30 @@ async fn insert_claim(pool: &PgPool, agent_id: Uuid) -> Uuid {
     insert_claim_with_properties(pool, agent_id, serde_json::json!({})).await
 }
 
+async fn insert_paper(pool: &PgPool, doi: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO papers (id, doi, title) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(doi)
+        .bind(format!("paper {}", id))
+        .execute(pool)
+        .await
+        .expect("insert paper");
+    id
+}
+
+async fn insert_asserts_edge(pool: &PgPool, paper_id: Uuid, claim_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship)
+         VALUES ($1, 'paper', $2, 'claim', 'asserts')",
+    )
+    .bind(paper_id)
+    .bind(claim_id)
+    .execute(pool)
+    .await
+    .expect("insert asserts edge");
+}
+
 async fn insert_derived_from(pool: &PgPool, child: Uuid, parent: Uuid) {
     // source_type and target_type are NOT NULL; both are 'claim' here.
     sqlx::query(
@@ -89,16 +87,17 @@ async fn insert_derived_from(pool: &PgPool, child: Uuid, parent: Uuid) {
 // --- tests ---
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn derive_extracts_paper_doi_from_properties(pool: PgPool) {
+async fn derive_extracts_paper_doi_from_asserts_edge(pool: PgPool) {
+    // Canonical paper provenance is relational: the DOI lives on the papers
+    // row and is reached via a paper -asserts-> claim edge, NOT in
+    // properties->>'paper_doi' (which no write path ever populates).
     let agent_id = insert_agent(&pool).await;
-    let claim_id = insert_claim_with_properties(
-        &pool,
-        agent_id,
-        serde_json::json!({"paper_doi": "10.1/abc"}),
-    )
-    .await;
+    let claim_id = insert_claim(&pool, agent_id).await;
+    let paper_id = insert_paper(&pool, "10.1/regression").await;
+    insert_asserts_edge(&pool, paper_id, claim_id).await;
+
     let key = derive_source_key(&pool, claim_id).await.expect("derive");
-    assert_eq!(key.paper_doi.as_deref(), Some("10.1/abc"));
+    assert_eq!(key.paper_doi.as_deref(), Some("10.1/regression"));
     assert_eq!(key.agent_id, agent_id);
     assert_eq!(key.ingestion_run_id, None);
     assert_eq!(key.derivation_root, None);

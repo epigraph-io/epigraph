@@ -55,10 +55,20 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
             .fetch_one(pool)
             .await?;
 
-    let paper_doi = props
-        .get("paper_doi")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    // Canonical paper provenance is relational: paper -asserts-> claim, with
+    // the DOI on the papers row. The properties->>'paper_doi' JSON field is
+    // never written anywhere in the repo, so reading it always yielded None,
+    // making the same-source filter a silent no-op on real data. Resolve the
+    // asserting paper's DOI via the edge instead.
+    let paper_doi = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT p.doi FROM edges e JOIN papers p ON p.id = e.source_id \
+         WHERE e.target_id = $1 AND e.source_type = 'paper' \
+         AND e.relationship = 'asserts' LIMIT 1",
+    )
+    .bind(claim_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
 
     let ingestion_run_id = props
         .get("ingestion_run_id")
