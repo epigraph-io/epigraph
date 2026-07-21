@@ -15,7 +15,19 @@
 
 /// Scopes that gate admin-only operations. These are EXCLUDED from `wo` and
 /// `ro`; included in `admin`.
-pub const ADMIN_ONLY_SCOPES: &[&str] = &["claims:admin", "clients:admin"];
+///
+/// `entity-types:write` gates `POST /api/v1/admin/entity-types` (the registry
+/// registration endpoint). It is deliberately ADMIN-ONLY, NOT a generic write
+/// scope: the registry threat model treats downstream read-write token holders
+/// as adversarial (that is the whole reason for the `is_core` hijack guard and
+/// the table denylist). Granting it to every `epigraph-wo` token via
+/// `WRITE_SCOPES` would defeat least privilege — any ordinary write client
+/// could register a non-core type pointing at a (denylisted, but still) new
+/// table. Keeping it here means only `epigraph-admin` auto-gets it among the
+/// three canonical roles; a dedicated registrar can still be minted with
+/// exactly `["entity-types:write"]` (narrow, and distinct from
+/// `clients:admin`/`claims:admin`).
+pub const ADMIN_ONLY_SCOPES: &[&str] = &["claims:admin", "clients:admin", "entity-types:write"];
 
 /// Read scopes. These are included in all three roles.
 pub const READ_SCOPES: &[&str] = &[
@@ -136,6 +148,29 @@ mod tests {
             assert!(scopes_for(name).is_some(), "{name} should resolve");
         }
         assert!(scopes_for("not-a-canonical-name").is_none());
+    }
+
+    #[test]
+    fn entity_types_write_is_admin_only() {
+        // Least privilege: entity-types:write must be admin-only. A generic
+        // read-write (`wo`) token must NOT auto-receive it — the registry
+        // threat model treats downstream write clients as adversarial.
+        let ro: HashSet<String> = read_only_scopes().into_iter().collect();
+        let wo: HashSet<String> = read_write_scopes().into_iter().collect();
+        let admin: HashSet<String> = admin_scopes().into_iter().collect();
+
+        assert!(
+            !ro.contains("entity-types:write"),
+            "ro must NOT include entity-types:write"
+        );
+        assert!(
+            !wo.contains("entity-types:write"),
+            "wo must NOT include entity-types:write (least privilege)"
+        );
+        assert!(
+            admin.contains("entity-types:write"),
+            "admin must include entity-types:write"
+        );
     }
 
     #[test]

@@ -234,8 +234,345 @@ pub async fn approve_client(
 }
 
 // =============================================================================
+// ENTITY-TYPE REGISTRATION
+// =============================================================================
+
+/// Body for `POST /api/v1/admin/entity-types`.
+///
+/// `type_name` is required. `schema_name` defaults to `public`, `id_column` to
+/// `id`, `is_optional` to `false`. `table_name` may be omitted for a table-less
+/// type. All identifier fields are validated with `is_pg_ident`.
+#[derive(Debug, Deserialize)]
+pub struct RegisterEntityTypeRequest {
+    pub type_name: String,
+    pub schema_name: Option<String>,
+    pub table_name: Option<String>,
+    pub id_column: Option<String>,
+    #[serde(default)]
+    pub is_optional: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterEntityTypeResponse {
+    pub type_name: String,
+    pub schema_name: String,
+    pub table_name: Option<String>,
+    pub id_column: String,
+    pub is_optional: bool,
+    pub is_core: bool,
+    /// Whether the backing table currently resolves (via `to_regclass`).
+    pub table_present: bool,
+}
+
+/// POST /api/v1/admin/entity-types
+///
+/// Register (or update) a NON-core entity type so edges may reference it end to
+/// end. Guarded by the narrow `entity-types:write` scope (least privilege — NOT
+/// `clients:admin`).
+///
+/// HIJACK GUARD: an attempt to remap a `is_core=true` type (e.g. `claim`)
+/// returns 403 and leaves the row untouched — a downstream can never repoint a
+/// core type at a table it controls.
+///
+/// On success the local `entity_type_cache` is written through (with
+/// `table_present` recomputed via `to_regclass`) so the new type resolves on
+/// this replica without a restart.
+#[cfg(feature = "db")]
+pub async fn register_entity_type(
+    State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::middleware::bearer::AuthContext>,
+    Json(req): Json<RegisterEntityTypeRequest>,
+) -> Result<(StatusCode, Json<RegisterEntityTypeResponse>), ApiError> {
+    crate::middleware::scopes::check_scopes(&auth, &["entity-types:write"])?;
+
+    use crate::routes::edges::is_pg_ident;
+
+    // Validate all identifiers up front (400 on any bad shape).
+    let schema_name = req.schema_name.as_deref().unwrap_or("public");
+    let id_column = req.id_column.as_deref().unwrap_or("id");
+
+    if !is_pg_ident(&req.type_name) {
+        return Err(ApiError::ValidationError {
+            field: "type_name".to_string(),
+            reason: "type_name must match ^[a-z_][a-z0-9_]*$ (len ≤ 63)".to_string(),
+        });
+    }
+    if !is_pg_ident(schema_name) {
+        return Err(ApiError::ValidationError {
+            field: "schema_name".to_string(),
+            reason: "schema_name must match ^[a-z_][a-z0-9_]*$ (len ≤ 63)".to_string(),
+        });
+    }
+    if !is_pg_ident(id_column) {
+        return Err(ApiError::ValidationError {
+            field: "id_column".to_string(),
+            reason: "id_column must match ^[a-z_][a-z0-9_]*$ (len ≤ 63)".to_string(),
+        });
+    }
+    if let Some(ref table) = req.table_name {
+        if !is_pg_ident(table) {
+            return Err(ApiError::ValidationError {
+                field: "table_name".to_string(),
+                reason: "table_name must match ^[a-z_][a-z0-9_]*$ (len ≤ 63)".to_string(),
+            });
+        }
+    }
+
+    // AUTHORIZATION (not injection): a well-formed identifier can still name a
+    // secrets table. Constrain registrable targets to the `public` schema and
+    // deny the sensitive-table denylist, so a registrar cannot point a non-core
+    // type at oauth_clients / refresh_tokens / … and turn the edge endpoint into
+    // a row-existence / column-enumeration oracle. Only enforced when a backing
+    // table is named (table-less types like `node` are unaffected).
+    use crate::routes::edges::is_registrable_target;
+    if let Some(ref table) = req.table_name {
+        if !is_registrable_target(schema_name, table) {
+            return Err(ApiError::ValidationError {
+                field: "table_name".to_string(),
+                reason: format!(
+                    "schema/table '{schema_name}.{table}' is not a registrable target \
+                     (must be in schema 'public' and not a reserved/sensitive table)"
+                ),
+            });
+        }
+    }
+
+    // HIJACK GUARD: refuse to touch a core type.
+    use epigraph_db::EntityTypeRepository;
+    if let Some(true) = EntityTypeRepository::core_status(&state.db_pool, &req.type_name)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?
+    {
+        return Err(ApiError::Forbidden {
+            reason: format!("core entity type '{}' is immutable", req.type_name),
+        });
+    }
+
+    // Upsert (is_core forced false; registered_by = caller).
+    let (name, entry) = EntityTypeRepository::upsert_non_core(
+        &state.db_pool,
+        &req.type_name,
+        schema_name,
+        req.table_name.as_deref(),
+        id_column,
+        req.is_optional,
+        auth.client_id,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+    })?;
+
+    // Write-through the local cache so this replica resolves the type immediately.
+    let response = RegisterEntityTypeResponse {
+        type_name: name.clone(),
+        schema_name: entry.schema.clone(),
+        table_name: entry.table.clone(),
+        id_column: entry.id_column.clone(),
+        is_optional: entry.is_optional,
+        is_core: entry.is_core,
+        table_present: entry.table_present,
+    };
+    if let Ok(mut cache) = state.entity_type_cache.write() {
+        cache.insert(name, entry);
+    }
+
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+// =============================================================================
 // TESTS
 // =============================================================================
+
+#[cfg(all(test, feature = "db"))]
+mod db_tests {
+    use super::*;
+    use crate::state::{ApiConfig, AppState};
+    use epigraph_auth::{AuthContext, ClientType};
+    use sqlx::PgPool;
+
+    fn admin_auth(scopes: &[&str]) -> AuthContext {
+        AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: None,
+            owner_id: None,
+            client_type: ClientType::Service,
+            scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            jti: Uuid::new_v4(),
+        }
+    }
+
+    async fn state_with_cache(pool: PgPool) -> AppState {
+        let state = AppState::with_db(pool, ApiConfig::default());
+        state.load_entity_type_cache().await.unwrap();
+        state
+    }
+
+    /// Hijack guard: remapping a core type (`claim`) returns 403 and leaves the
+    /// row untouched.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_hijack_guard_blocks_core(pool: PgPool) {
+        let state = state_with_cache(pool.clone()).await;
+        let result = register_entity_type(
+            axum::extract::State(state),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(RegisterEntityTypeRequest {
+                type_name: "claim".to_string(),
+                schema_name: Some("public".to_string()),
+                table_name: Some("attacker_claims".to_string()),
+                id_column: Some("id".to_string()),
+                is_optional: false,
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ApiError::Forbidden { .. })),
+            "core remap must be 403; got {result:?}"
+        );
+
+        // Row is unchanged: claim still points at claims and is_core.
+        let (table, is_core): (Option<String>, bool) = sqlx::query_as(
+            "SELECT table_name, is_core FROM entity_types WHERE type_name = 'claim'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(table.as_deref(), Some("claims"));
+        assert!(is_core);
+    }
+
+    /// Registering a new non-core type persists it, marks it non-core, and
+    /// write-through populates the cache.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_creates_non_core(pool: PgPool) {
+        let state = state_with_cache(pool.clone()).await;
+        let (status, Json(resp)) = register_entity_type(
+            axum::extract::State(state.clone()),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(RegisterEntityTypeRequest {
+                type_name: "widget".to_string(),
+                schema_name: None,
+                table_name: Some("widgets".to_string()),
+                id_column: None,
+                is_optional: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.type_name, "widget");
+        assert!(!resp.is_core);
+        // Cache write-through.
+        assert!(state
+            .entity_type_cache
+            .read()
+            .unwrap()
+            .contains_key("widget"));
+        // Persisted with registered_by set (non-NULL).
+        let registered_by: Option<Uuid> =
+            sqlx::query_scalar("SELECT registered_by FROM entity_types WHERE type_name = 'widget'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(registered_by.is_some());
+    }
+
+    /// Bad identifier -> 400, nothing written.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_rejects_bad_identifier(pool: PgPool) {
+        let state = state_with_cache(pool.clone()).await;
+        let result = register_entity_type(
+            axum::extract::State(state),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(RegisterEntityTypeRequest {
+                type_name: "Bad Name".to_string(),
+                schema_name: None,
+                table_name: None,
+                id_column: None,
+                is_optional: false,
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(ApiError::ValidationError { .. })));
+    }
+
+    /// Security: registration MUST refuse to point a non-core type at a
+    /// sensitive table (oauth_clients) or a non-public schema — otherwise the
+    /// edge endpoint becomes a row-existence oracle against secrets. Denied with
+    /// 400 and nothing persisted.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_rejects_sensitive_table(pool: PgPool) {
+        let state = state_with_cache(pool.clone()).await;
+
+        // (a) sensitive table in public schema -> 400.
+        let leak = register_entity_type(
+            axum::extract::State(state.clone()),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(RegisterEntityTypeRequest {
+                type_name: "leak".to_string(),
+                schema_name: Some("public".to_string()),
+                table_name: Some("oauth_clients".to_string()),
+                id_column: Some("id".to_string()),
+                is_optional: true,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(leak, Err(ApiError::ValidationError { .. })),
+            "registering oauth_clients must be 400; got {leak:?}"
+        );
+
+        // (b) non-public schema -> 400 (cross-schema reads are out of scope).
+        let cross_schema = register_entity_type(
+            axum::extract::State(state.clone()),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(RegisterEntityTypeRequest {
+                type_name: "sneaky".to_string(),
+                schema_name: Some("pg_catalog".to_string()),
+                table_name: Some("pg_class".to_string()),
+                id_column: Some("oid".to_string()),
+                is_optional: true,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(cross_schema, Err(ApiError::ValidationError { .. })),
+            "non-public schema must be 400; got {cross_schema:?}"
+        );
+
+        // Nothing was persisted for either attempt.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entity_types WHERE type_name IN ('leak', 'sneaky')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "no sensitive/cross-schema type may persist");
+    }
+
+    /// Missing the entity-types:write scope -> 403.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_requires_scope(pool: PgPool) {
+        let state = state_with_cache(pool).await;
+        let result = register_entity_type(
+            axum::extract::State(state),
+            axum::Extension(admin_auth(&["claims:read"])),
+            Json(RegisterEntityTypeRequest {
+                type_name: "widget".to_string(),
+                schema_name: None,
+                table_name: Some("widgets".to_string()),
+                id_column: None,
+                is_optional: true,
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(ApiError::Forbidden { .. })));
+    }
+}
 
 #[cfg(all(test, not(feature = "db")))]
 mod tests {

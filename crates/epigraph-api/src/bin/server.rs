@@ -242,6 +242,17 @@ async fn main() {
         );
 
         let state = AppState::with_db(pool, config).with_embedding_service(embedding_service);
+
+        // Prime the entity_types registry cache. `with_db` is sync and can't
+        // SELECT, so the cache loads here — after migrations (054 seeds the
+        // registry) and after the pool is live. A failure is fatal: an empty
+        // cache would 400 every edge write at the validity gate.
+        state
+            .load_entity_type_cache()
+            .await
+            .expect("Failed to load entity_types registry cache");
+        tracing::info!("entity_types registry cache loaded");
+
         (state, job_pool)
     };
 

@@ -23,6 +23,7 @@ pub mod edge;
 pub mod edge_encryption;
 pub mod embedding_share;
 pub mod entity;
+pub mod entity_type;
 pub mod event;
 pub mod evidence;
 pub mod evidence_encryption;
@@ -80,6 +81,7 @@ pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
 pub use divergence::DivergenceRepository;
 pub use edge::EdgeRepository;
 pub use entity::{EntityRepository, EntityRow};
+pub use entity_type::{EntityTypeEntry, EntityTypeRepository};
 pub use event::{EventRepository, EventRow};
 pub use evidence::{EvidenceRepository, EvidenceSearchResult};
 pub use experiment::{
