@@ -140,6 +140,11 @@ name = "backfill_factors"
 path = "src/bin/backfill_factors.rs"
 required-features = ["db"]
 
+[[bin]]
+name = "retire_match_candidates"
+path = "src/bin/retire_match_candidates.rs"
+required-features = ["db"]
+
 [dependencies]
 epigraph-core = { workspace = true }
 epigraph-engine = { workspace = true }
