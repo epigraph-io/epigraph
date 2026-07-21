@@ -6,31 +6,8 @@ use epigraph_engine::matching::blocker::{
 };
 use epigraph_engine::matching::calibration::EligibilityConfig;
 use epigraph_engine::matching::source_key::SourceFilterConfig;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-async fn try_test_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&url)
-        .await
-        .ok()?;
-    sqlx::migrate!("../../migrations").run(&pool).await.expect("test DB migrations failed — likely a description/version mismatch with existing _sqlx_migrations; use a fresh DB");
-    Some(pool)
-}
-macro_rules! test_pool_or_skip {
-    () => {
-        match try_test_pool().await {
-            Some(p) => p,
-            None => {
-                eprintln!("Skipping DB test");
-                return;
-            }
-        }
-    };
-}
 
 async fn insert_agent(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
@@ -68,14 +45,55 @@ async fn insert_claim_with_props_and_hash(
     id
 }
 
+async fn insert_paper(pool: &PgPool, doi: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO papers (id, doi, title) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(doi)
+        .bind(format!("paper {}", id))
+        .execute(pool)
+        .await
+        .expect("insert paper");
+    id
+}
+
+async fn insert_asserts_edge(pool: &PgPool, paper_id: Uuid, claim_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship)
+         VALUES ($1, 'paper', $2, 'claim', 'asserts')",
+    )
+    .bind(paper_id)
+    .bind(claim_id)
+    .execute(pool)
+    .await
+    .expect("insert asserts edge");
+}
+
+/// Regression for the silent-no-op cross-source filter (promoted CORROBORATES
+/// pair 530d00be): two claims asserted by the SAME paper via the relational
+/// `paper -asserts-> claim` edge must be filtered out as same-source. On the
+/// pre-fix code, `derive_source_key` read `properties->>'paper_doi'` (never
+/// written), so both keys had `paper_doi = None`, `both_eq(None,None)=false`,
+/// and the pair slipped through as cross-source — this test would fail.
+///
+/// Load-bearing design: the two claims share an IDENTICAL `content_hash` so
+/// `ContentHashBlocker` EMITS the candidate (defeating the empty-candidate
+/// tautology), but use DISTINCT agents so agent-blocking is not the cause and
+/// the `(content_hash, agent_id)` UNIQUE constraint holds. The shared paper,
+/// reachable only via the asserts edge, is the ONLY same-source signal present.
 #[sqlx::test(migrations = "../../migrations")]
-async fn same_paper_pairs_are_filtered_out(pool: PgPool) {
+async fn same_paper_via_asserts_edge_is_filtered_out(pool: PgPool) {
     let a1 = insert_agent(&pool).await;
     let a2 = insert_agent(&pool).await;
-    let hash = [9u8; 32];
-    let props = serde_json::json!({"paper_doi": "10.1/sameforboth"});
-    let _seed = insert_claim_with_props_and_hash(&pool, a1, props.clone(), &hash).await;
-    let _peer = insert_claim_with_props_and_hash(&pool, a2, props.clone(), &hash).await;
+    let hash = [42u8; 32];
+    // No paper_doi in properties, no derived_from edges: the ONLY provenance
+    // link is the relational asserts edge to a shared paper.
+    let seed = insert_claim_with_props_and_hash(&pool, a1, serde_json::json!({}), &hash).await;
+    let peer = insert_claim_with_props_and_hash(&pool, a2, serde_json::json!({}), &hash).await;
+
+    let paper_id = insert_paper(&pool, "10.1/regression").await;
+    insert_asserts_edge(&pool, paper_id, seed).await;
+    insert_asserts_edge(&pool, paper_id, peer).await;
 
     let blockers: Vec<Box<dyn Blocker>> = vec![
         Box::new(ContentHashBlocker),
@@ -84,7 +102,7 @@ async fn same_paper_pairs_are_filtered_out(pool: PgPool) {
     let pairs = union_block(
         &pool,
         &blockers,
-        &[_seed],
+        &[seed],
         SourceFilterConfig::default(),
         &EligibilityConfig::default(),
     )
@@ -93,7 +111,50 @@ async fn same_paper_pairs_are_filtered_out(pool: PgPool) {
 
     assert!(
         pairs.is_empty(),
-        "same-paper pair should be filtered out, got {:?}",
+        "same-paper pair resolved via asserts edge must be filtered out, got {:?}",
+        pairs
+    );
+}
+
+/// Positive control for the relational paper resolution: two claims asserted
+/// by DIFFERENT papers (distinct DOIs), each via its own `asserts` edge, must
+/// SURVIVE `union_block` as a genuine cross-source pair. This closes the loop
+/// on `same_paper_via_asserts_edge_is_filtered_out` — that test proves the
+/// filter FIRES on a shared paper, this one proves it DISCRIMINATES by DOI and
+/// doesn't over-match (e.g. collapse any two paper-asserted claims to
+/// same-source, or drop the `p.doi` predicate). Shares a `content_hash` so
+/// `ContentHashBlocker` emits the candidate; distinct agents so agent-blocking
+/// is not involved. The shared-vs-distinct paper is the ONLY difference from
+/// the filtered-out case.
+#[sqlx::test(migrations = "../../migrations")]
+async fn different_papers_via_asserts_edges_survive_as_cross_source(pool: PgPool) {
+    let a1 = insert_agent(&pool).await;
+    let a2 = insert_agent(&pool).await;
+    let hash = [43u8; 32];
+    let seed = insert_claim_with_props_and_hash(&pool, a1, serde_json::json!({}), &hash).await;
+    let peer = insert_claim_with_props_and_hash(&pool, a2, serde_json::json!({}), &hash).await;
+
+    // Two DISTINCT papers with different DOIs — a genuine cross-source pair.
+    let paper_a = insert_paper(&pool, "10.1/cross-A").await;
+    let paper_b = insert_paper(&pool, "10.1/cross-B").await;
+    insert_asserts_edge(&pool, paper_a, seed).await;
+    insert_asserts_edge(&pool, paper_b, peer).await;
+
+    let blockers: Vec<Box<dyn Blocker>> = vec![Box::new(ContentHashBlocker)];
+    let pairs = union_block(
+        &pool,
+        &blockers,
+        &[seed],
+        SourceFilterConfig::default(),
+        &EligibilityConfig::default(),
+    )
+    .await
+    .expect("union_block");
+
+    assert_eq!(
+        pairs.len(),
+        1,
+        "claims from DIFFERENT papers must survive as a cross-source pair, got {:?}",
         pairs
     );
 }
@@ -132,8 +193,10 @@ async fn insert_claim_labeled(
 async fn workflow_step_claims_are_excluded_by_hygiene(pool: PgPool) {
     let a1 = insert_agent(&pool).await;
     let a2 = insert_agent(&pool).await;
-    // Different paper_doi → the source-key filter does NOT drop these, so the
-    // hygiene filter is the only thing that can.
+    // No asserts edges are inserted, so post-fix both claims resolve
+    // paper_doi = None and the source-key filter does NOT drop them (None does
+    // not match None); the hygiene filter is the only thing that can. (The
+    // props below are inert — properties->>'paper_doi' is no longer read.)
     let props_a = serde_json::json!({"paper_doi": "10.1/HYGI-A"});
     let props_b = serde_json::json!({"paper_doi": "10.1/HYGI-B"});
     let blockers: Vec<Box<dyn Blocker>> = vec![Box::new(ContentHashBlocker)];
