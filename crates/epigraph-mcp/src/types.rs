@@ -1073,6 +1073,50 @@ pub struct LinkHierarchicalResponse {
     pub created: bool,
 }
 
+/// Parameters for the `link_alternative` MCP tool.
+///
+/// Promotes two existing claims into a mutually-exclusive alternative pair by
+/// writing the **symmetric** `alternative_of` edge that `suggest_alternative_sets`
+/// documents but no other tool can create (`link_epistemic` rejects the
+/// relationship; `link_hierarchical` only takes structural types). The edge is
+/// direction-agnostic — `{claim_a, claim_b}` is one edge regardless of order
+/// (migration 042's `edges_alternative_of_symmetric_uniq`) — and deliberately
+/// inert at write time: its belief effect flows later through CDST BP's
+/// max-plausibility combine over the `alternative_set` view, not a Dempster
+/// re-wire here. Idempotent on the unordered pair: a re-hit returns the existing
+/// `edge_id` with `created=false`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LinkAlternativeParams {
+    #[schemars(description = "UUID of the first competing claim")]
+    pub claim_a: String,
+
+    #[schemars(description = "UUID of the second competing claim")]
+    pub claim_b: String,
+
+    #[schemars(
+        description = "Optional UUID of the shared target the two claims are rival supporters of. Validated and stored on the edge for provenance."
+    )]
+    #[serde(default)]
+    pub target_claim_id: Option<String>,
+
+    #[schemars(
+        description = "Optional human rationale for why these two claims are alternatives. Stored on the edge."
+    )]
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
+/// Response for the `link_alternative` MCP tool.
+///
+/// `created=true` means the symmetric `alternative_of` edge was newly inserted;
+/// `created=false` means an edge already linked the pair (in either direction)
+/// and its existing `edge_id` is returned (idempotent re-runs).
+#[derive(Debug, Serialize)]
+pub struct LinkAlternativeResponse {
+    pub edge_id: String,
+    pub created: bool,
+}
+
 /// Parameters for the `link_epistemic` MCP tool.
 ///
 /// Wires two existing claims with a **belief-affecting** epistemic relationship

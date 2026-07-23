@@ -554,6 +554,17 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Promote two existing claims into a mutually-exclusive alternative_of pair — the symmetric edge suggest_alternative_sets tells you to submit but link_epistemic/link_hierarchical cannot create. Direction-agnostic and idempotent on the unordered {claim_a, claim_b} pair (migration 042's symmetric index): re-runs return the existing edge_id with created=false. Optional target_claim_id (the shared target the two claims are rival supporters of) and rationale are validated and stored on the edge. Deliberately inert at write time — the belief effect of an alternative set flows later through CDST max-plausibility combine over the alternative_set view, not a Dempster re-wire here."
+    )]
+    async fn link_alternative(
+        &self,
+        Parameters(params): Parameters<crate::types::LinkAlternativeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::link_alternative::link_alternative(self, params).await
+    }
+
+    #[tool(
         description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it). On first creation, builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief, then emits an edge.added event; the response reports was_created, belief_wired, and the target's resulting {belief, plausibility, pignistic_prob}. Idempotent on (source, target, relationship): a re-hit returns the existing edge with was_created=false and belief_wired=false (no re-wire). For supersedes use supersede_claim instead."
     )]
     async fn link_epistemic(
