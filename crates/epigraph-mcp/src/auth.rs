@@ -27,6 +27,22 @@ use epigraph_auth::{AuthContext, JwtConfig};
 /// Single source so both 401 arms emit the same value.
 const INVALID_TOKEN: &str = "invalid_token";
 
+/// The raw (still-encoded) Bearer token string, captured by
+/// [`bearer_auth_middleware`] after successful validation and stashed in the
+/// request extensions alongside [`AuthContext`].
+///
+/// The federation gateway needs the *verbatim* caller token to forward it to a
+/// downstream extension MCP: rmcp's `StreamableHttpClientTransportConfig`
+/// `auth_header` is set once at transport construction and there is no per-call
+/// token slot, so the gateway builds a fresh transport per federated call using
+/// this token. `AuthContext` alone is insufficient because it is the *decoded*
+/// claims, not the signed string the downstream server will re-validate.
+///
+/// Present only on the HTTP path (stdio has no Bearer header); federated calls
+/// over stdio therefore have no token to forward.
+#[derive(Clone)]
+pub struct RawBearerToken(pub String);
+
 #[derive(Clone)]
 pub struct McpAuthState {
     pub jwt_config: Arc<JwtConfig>,
@@ -52,6 +68,10 @@ pub async fn bearer_auth_middleware(
                 Ok(claims) => {
                     let auth: AuthContext = claims.into();
                     req.extensions_mut().insert(auth);
+                    // Stash the raw, still-signed token so the federation gateway
+                    // can forward it verbatim to a downstream extension MCP.
+                    req.extensions_mut()
+                        .insert(RawBearerToken(token.to_string()));
                     next.run(req).await
                 }
                 Err(_) => unauthorized(state.resource_metadata_url.as_deref(), INVALID_TOKEN),
