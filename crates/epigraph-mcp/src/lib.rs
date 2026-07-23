@@ -4,6 +4,7 @@ pub mod auth;
 pub mod claim_helper;
 pub mod embed;
 pub mod errors;
+pub mod federation;
 pub mod scope_map;
 pub mod server;
 pub mod tools;

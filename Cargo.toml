@@ -108,7 +108,7 @@ utoipa = { version = "5", features = ["chrono", "uuid"] }
 # CLI & Utilities
 clap = "4"
 reqwest = { version = "0.12", features = ["json"] }
-rmcp = { version = "0.15", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "0.15", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "client", "transport-streamable-http-client-reqwest"] }
 schemars = "1"
 csv = "1.3"
 futures = "0.3"

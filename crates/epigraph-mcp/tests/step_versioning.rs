@@ -52,7 +52,7 @@ async fn seed_versioned_step(pool: &PgPool, agent: Uuid, lineage: Uuid, content:
         .as_bytes()
         .iter()
         .copied()
-        .chain(std::iter::repeat_n(0u8, 16))
+        .chain(std::iter::repeat(0u8).take(16))
         .take(32)
         .collect();
     sqlx::query(
