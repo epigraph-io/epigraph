@@ -53,11 +53,12 @@ async fn insert_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
 
 async fn seed_runs(pool: &PgPool, wf: Uuid, successes: usize, failures: usize) {
     let base = chrono::Utc::now();
-    let mut i = 0i64;
-    for succ in std::iter::repeat(true)
+    for (i, succ) in std::iter::repeat(true)
         .take(successes)
         .chain(std::iter::repeat(false).take(failures))
+        .enumerate()
     {
+        let i = i as i64;
         BehavioralExecutionRepository::create(
             pool,
             BehavioralExecutionRow {
@@ -77,7 +78,6 @@ async fn seed_runs(pool: &PgPool, wf: Uuid, successes: usize, failures: usize) {
         )
         .await
         .unwrap();
-        i += 1;
     }
 }
 

@@ -6,8 +6,10 @@
 //! occur with a single claim, so this test seeds TWO claims with DIFFERENT
 //! access (one public, one private-owned-by-a-stranger), queries as a
 //! non-owner, and asserts each claim gets ITS OWN decision:
-//!   - the public claim → full content + real content_hash
-//!   - the private claim → "[REDACTED]" content + blank content_hash
+//!
+//! - the public claim → full content + real content_hash
+//! - the private claim → "[REDACTED]" content + blank content_hash
+//!
 //! Under a zip/order mispairing the two decisions swap and BOTH assertions
 //! fail; under a deleted/inverted redaction branch the private assertions fail;
 //! under the content_hash oracle leak the blank-hash assertion fails.
