@@ -1,6 +1,7 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::wildcard_imports)]
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use http::request::Parts;
@@ -35,6 +36,18 @@ pub struct EpiGraphMcpFull {
     /// of not widening a ~30-caller signature); `main` and any caller that has a
     /// registry use `new_with_federation`/`new_shared_with_federation`.
     pub(crate) federation: Arc<crate::federation::FederationRegistry>,
+    /// `(llm_model, llm_prompt_hash)` when this server's agent identity was
+    /// derived deterministically from an LLM config (see `main::select_signer`),
+    /// else `None`. When `Some`, `agent_id()`'s CREATE branch records these on
+    /// the freshly-created agent row via `AgentRepository::set_llm_properties`.
+    /// `None` (the default for every unconfigured process) preserves the legacy
+    /// behavior exactly — no properties are written.
+    pub(crate) llm_identity: Option<(String, String)>,
+    /// Per-session memoization of auth-lineage principals already linked via an
+    /// `OPERATED_BY` edge, so `call_tool` writes that edge at most once per
+    /// distinct `auth.agent_id` per session (a fast in-memory short-circuit; the
+    /// DB `create_if_not_exists` is the actual dedup authority). Empty at boot.
+    pub(crate) seen_auth_lineage: Arc<Mutex<HashSet<uuid::Uuid>>>,
 }
 
 impl EpiGraphMcpFull {
@@ -53,9 +66,34 @@ impl EpiGraphMcpFull {
             a
         } else {
             let agent = epigraph_core::Agent::new(pub_key, Some("mcp-agent".to_string()));
-            epigraph_db::AgentRepository::create(&self.pool, &agent)
+            let created = epigraph_db::AgentRepository::create(&self.pool, &agent)
                 .await
-                .map_err(internal_error)?
+                .map_err(internal_error)?;
+            // CREATE branch ONLY: record the derived LLM identity on the fresh
+            // row. Best-effort — a failure here must not break agent resolution
+            // or any downstream dispatch (the agent still exists and is usable;
+            // it just lacks the provenance annotation). The FOUND branch above
+            // deliberately does NOT re-set properties: an identical-config
+            // process reuses the SAME pubkey -> same row -> properties already
+            // set by whoever created it first.
+            if let Some((model, prompt_hash)) = &self.llm_identity {
+                if let Err(e) = epigraph_db::AgentRepository::set_llm_properties(
+                    &self.pool,
+                    created.id.as_uuid(),
+                    model,
+                    prompt_hash,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        agent_id = %created.id.as_uuid(),
+                        error = ?e,
+                        "failed to record LLM identity on newly-created agent; \
+                         continuing without provenance annotation"
+                    );
+                }
+            }
+            created
         };
         let id = agent.id.as_uuid();
         *cached = Some(id);
@@ -93,6 +131,81 @@ impl EpiGraphMcpFull {
             }),
         )
         .await;
+    }
+
+    /// Record an `OPERATED_BY` auth-lineage edge from THIS MCP agent to the
+    /// principal a caller authenticated as:
+    ///   `mcp_agent --OPERATED_BY--> principal`   (prov:actedOnBehalfOf)
+    ///
+    /// Called from `call_tool` once the caller's `AuthContext.agent_id` is known
+    /// (HTTP path only; `None`/stdio -> no call). Factored out of `call_tool`,
+    /// and made `pub`, so integration tests can exercise this wiring **without
+    /// synthesizing a full `rmcp::service::RequestContext`** (mirrors
+    /// [`emit_tool_invoked`](Self::emit_tool_invoked)).
+    ///
+    /// Semantics:
+    /// - `principal == None` -> no-op (nothing to attribute).
+    /// - Memoized per session via `seen_auth_lineage`: a principal already linked
+    ///   in this session short-circuits before touching the DB. The DB
+    ///   `create_if_not_exists` is the true idempotency authority (exactly one
+    ///   edge across processes); the set is only a fast in-memory guard.
+    /// - **Best-effort**: any failure (e.g. a stale `principal` that no longer
+    ///   exists, which trips the `validate_edge_reference` existence trigger) is
+    ///   logged at WARN and swallowed. The caller's tool result is NEVER affected.
+    ///
+    /// `OPERATED_BY` is an agent→agent relationship in the edge vocabulary
+    /// (`epigraph_core::edge::relationships::OPERATED_BY`, also in the HTTP
+    /// `VALID_RELATIONSHIPS` allow-list); `create_if_not_exists` does no
+    /// relationship-vocab validation, so the write is accepted whenever both
+    /// agent rows exist.
+    pub async fn record_auth_lineage(&self, principal: Option<uuid::Uuid>) {
+        let Some(principal) = principal else {
+            return;
+        };
+        // Fast per-session short-circuit (lock released before any await on the DB).
+        let already_seen = { self.seen_auth_lineage.lock().await.contains(&principal) };
+        if already_seen {
+            return;
+        }
+
+        let mcp_agent = match self.agent_id().await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    principal = %principal,
+                    error = ?e,
+                    "could not resolve MCP agent_id for auth-lineage edge; skipping"
+                );
+                return;
+            }
+        };
+
+        match epigraph_db::EdgeRepository::create_if_not_exists(
+            &self.pool,
+            mcp_agent,
+            "agent",
+            principal,
+            "agent",
+            epigraph_core::edge::relationships::OPERATED_BY,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => {
+                self.seen_auth_lineage.lock().await.insert(principal);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    mcp_agent = %mcp_agent,
+                    principal = %principal,
+                    error = ?e,
+                    "failed to write OPERATED_BY auth-lineage edge; \
+                     continuing (tool result unaffected)"
+                );
+            }
+        }
     }
 
     /// Return a JSON array of all registered MCP tools (name, description, schema).
@@ -208,6 +321,7 @@ impl EpiGraphMcpFull {
             embedder,
             read_only,
             Arc::new(crate::federation::FederationRegistry::empty()),
+            None,
         )
     }
 
@@ -222,6 +336,7 @@ impl EpiGraphMcpFull {
         embedder: McpEmbedder,
         read_only: bool,
         federation: Arc<crate::federation::FederationRegistry>,
+        llm_identity: Option<(String, String)>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -231,6 +346,8 @@ impl EpiGraphMcpFull {
             embedder: Arc::new(embedder),
             read_only,
             federation,
+            llm_identity,
+            seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -251,6 +368,7 @@ impl EpiGraphMcpFull {
             embedder,
             read_only,
             Arc::new(crate::federation::FederationRegistry::empty()),
+            None,
         )
     }
 
@@ -265,6 +383,7 @@ impl EpiGraphMcpFull {
         embedder: Arc<McpEmbedder>,
         read_only: bool,
         federation: Arc<crate::federation::FederationRegistry>,
+        llm_identity: Option<(String, String)>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -274,6 +393,8 @@ impl EpiGraphMcpFull {
             embedder,
             read_only,
             federation,
+            llm_identity,
+            seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -1318,6 +1439,16 @@ impl ServerHandler for EpiGraphMcpFull {
         // **DO NOT remove this line without updating
         // `tests/event_log_wiring_tests.rs::tool_dispatch_emits_tool_invoked_event`.**
         self.emit_tool_invoked(&request.name).await;
+
+        // ── Auth-lineage provenance (OPERATED_BY) ───────────────────────────
+        // When the caller authenticated under a user/agent scope, record that
+        // THIS MCP agent acted on behalf of that principal
+        // (`mcp_agent --OPERATED_BY--> auth.agent_id`, prov:actedOnBehalfOf).
+        // `auth.agent_id == None`, or stdio (no `Parts` -> `auth_owned == None`),
+        // writes NO edge. Best-effort + per-session memoized inside the helper;
+        // borrow `auth_owned` here (it is MOVED just below into `context`).
+        self.record_auth_lineage(auth_owned.as_ref().and_then(|a| a.agent_id))
+            .await;
 
         // Propagate the HTTP-side `AuthContext` (set by
         // `auth::bearer_auth_middleware` and forwarded by
