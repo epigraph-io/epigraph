@@ -74,9 +74,7 @@ pub async fn evolve_step(
             ));
         }
         parse_uuid(params.parent_id.trim())?
-    } else if let (Some(name), Some(idx)) =
-        (params.canonical_name.as_deref(), params.step_index)
-    {
+    } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
         epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, name, idx, true)
             .await
             .map_err(internal_error)?

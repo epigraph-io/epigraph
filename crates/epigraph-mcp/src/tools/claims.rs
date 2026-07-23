@@ -556,9 +556,7 @@ pub async fn update_with_evidence(
             ));
         }
         parse_uuid(params.claim_id.trim())?
-    } else if let (Some(name), Some(idx)) =
-        (params.canonical_name.as_deref(), params.step_index)
-    {
+    } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
         epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, name, idx, true)
             .await
             .map_err(internal_error)?

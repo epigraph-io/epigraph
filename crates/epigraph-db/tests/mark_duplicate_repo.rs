@@ -303,8 +303,15 @@ async fn mark_duplicate_with_shared_alternative_of_edge_succeeds(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(sup, Some(canonical), "dup.supersedes should point at canonical");
-    assert!(!is_current, "dup must not be is_current after mark_duplicate");
+    assert_eq!(
+        sup,
+        Some(canonical),
+        "dup.supersedes should point at canonical"
+    );
+    assert!(
+        !is_current,
+        "dup must not be is_current after mark_duplicate"
+    );
 
     // canonical must remain current.
     let (canon_current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
@@ -320,7 +327,10 @@ async fn mark_duplicate_with_shared_alternative_of_edge_succeeds(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(total, 1, "the redundant dup-side alternative_of edge should be gone");
+    assert_eq!(
+        total, 1,
+        "the redundant dup-side alternative_of edge should be gone"
+    );
 
     // No alternative_of edge may remain on the retired dup.
     let touching_dup: i64 = sqlx::query_scalar(
@@ -331,7 +341,10 @@ async fn mark_duplicate_with_shared_alternative_of_edge_succeeds(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(touching_dup, 0, "no alternative_of edge should remain on the retired dup");
+    assert_eq!(
+        touching_dup, 0,
+        "no alternative_of edge should remain on the retired dup"
+    );
 
     // The canonical↔third symmetric pair must survive exactly once.
     let canon_third: i64 = sqlx::query_scalar(
@@ -344,7 +357,10 @@ async fn mark_duplicate_with_shared_alternative_of_edge_succeeds(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(canon_third, 1, "canonical↔third alternative_of pair must survive");
+    assert_eq!(
+        canon_third, 1,
+        "canonical↔third alternative_of pair must survive"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

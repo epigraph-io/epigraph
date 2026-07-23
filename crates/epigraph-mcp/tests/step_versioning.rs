@@ -92,8 +92,8 @@ async fn evolve_step_supersedes_flips_head(pool: PgPool) {
     let v1 = seed_versioned_step(&pool, agent, lineage, "step v1 content").await;
 
     let params = EvolveStepParams {
-            canonical_name: None,
-            step_index: None,
+        canonical_name: None,
+        step_index: None,
         step_lineage_id: lineage.to_string(),
         parent_id: v1.to_string(),
         content: "step v2 content".to_string(),
@@ -176,11 +176,15 @@ async fn evolve_step_addresses_by_canonical_name_and_index(pool: PgPool) {
 
     // step1's head is now v2; step0 is untouched (proves the index selected the
     // right step).
-    let heads1 = ClaimRepository::latest_in_lineage(&pool, lin1).await.unwrap();
+    let heads1 = ClaimRepository::latest_in_lineage(&pool, lin1)
+        .await
+        .unwrap();
     assert_eq!(heads1.len(), 1);
     assert_eq!(heads1[0].content, "step1 v2 via name");
 
-    let heads0 = ClaimRepository::latest_in_lineage(&pool, lin0).await.unwrap();
+    let heads0 = ClaimRepository::latest_in_lineage(&pool, lin0)
+        .await
+        .unwrap();
     assert_eq!(heads0.len(), 1);
     assert_eq!(heads0[0].content, "step0 v1", "wrong step was addressed");
 }
@@ -272,8 +276,8 @@ async fn evolve_step_rejects_level_0_or_1(pool: PgPool) {
         let result = evolve_step(
             &server,
             EvolveStepParams {
-            canonical_name: None,
-            step_index: None,
+                canonical_name: None,
+                step_index: None,
                 step_lineage_id: lineage.to_string(),
                 parent_id: v1.to_string(),
                 content: "v2".to_string(),

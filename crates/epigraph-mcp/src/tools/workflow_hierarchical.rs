@@ -428,9 +428,10 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_outcome_404s_for_unknown_workflow(pool: sqlx::PgPool) {
         let bogus = Uuid::new_v4();
-        let err = do_report_hierarchical_outcome_via_pool(&pool, bogus, true, &[], None, None, None)
-            .await
-            .expect_err("unknown workflow id must error");
+        let err =
+            do_report_hierarchical_outcome_via_pool(&pool, bogus, true, &[], None, None, None)
+                .await
+                .expect_err("unknown workflow id must error");
         assert!(err.message.contains("no hierarchical workflow"));
     }
 }
