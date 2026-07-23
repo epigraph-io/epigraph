@@ -655,6 +655,12 @@ pub struct ReportHierarchicalOutcomeParams {
     pub quality: Option<f64>,
 
     #[schemars(
+        description = "Optional run/variant label for parameter-sweep executions (e.g. 'joint-63bp', 'V2'). Persisted on the behavioral_executions row and surfaced by get_workflow_executions so sweep variants are machine-distinguishable rather than tellable apart only by prose."
+    )]
+    #[serde(default)]
+    pub run_label: Option<String>,
+
+    #[schemars(
         description = "Your specific goal for this run. More specific goal text improves future affinity matching."
     )]
     pub goal_text: Option<String>,

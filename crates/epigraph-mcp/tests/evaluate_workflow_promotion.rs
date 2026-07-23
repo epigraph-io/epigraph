@@ -72,6 +72,7 @@ async fn seed_runs(pool: &PgPool, wf: Uuid, successes: usize, failures: usize) {
                 total_steps: 1,
                 created_at: base + chrono::Duration::seconds(i),
                 step_claim_id: None,
+                run_label: None,
             },
             None,
         )

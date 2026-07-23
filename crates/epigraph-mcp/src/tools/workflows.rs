@@ -70,6 +70,7 @@ pub async fn get_workflow_executions(
                 "total_steps": r.total_steps,
                 "tool_pattern": r.tool_pattern,
                 "step_beliefs": r.step_beliefs,
+                "run_label": r.run_label,
                 "created_at": r.created_at,
             })
         })
@@ -691,6 +692,7 @@ pub async fn report_workflow_outcome(
             &step_executions,
             params.quality,
             params.goal_text.as_deref(),
+            None,
         )
         .await;
     }
@@ -833,6 +835,7 @@ pub async fn report_workflow_outcome(
         total_steps,
         created_at: chrono::Utc::now(),
         step_claim_id: None,
+        run_label: None,
     };
 
     if let Err(e) = BehavioralExecutionRepository::create(
