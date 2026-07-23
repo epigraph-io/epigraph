@@ -818,6 +818,57 @@ impl AgentRepository {
         Ok(())
     }
 
+    /// Merge LLM-identity provenance into an agent's `properties` JSONB.
+    ///
+    /// Sets `llm_model`, `llm_prompt_hash`, and `source = "mcp-llm-agent"`.
+    /// The `properties || $2::jsonb` concatenation MERGES the object: keys
+    /// already present in `properties` but absent from the patch survive; only
+    /// the three keys here are added/overwritten. This never clobbers the full
+    /// blob (unlike `SET properties = $2`).
+    ///
+    /// Deliberately separate from `create()` per the repo blast-radius rule:
+    /// `create()` has many callers and must not learn about LLM identity.
+    ///
+    /// Idempotent: re-running with the same values yields the same properties.
+    ///
+    /// # Errors
+    /// Returns `DbError::NotFound` if no agent with the given ID exists.
+    /// Returns `DbError::QueryFailed` for other database errors.
+    #[instrument(skip(pool))]
+    pub async fn set_llm_properties(
+        pool: &PgPool,
+        agent_id: Uuid,
+        model: &str,
+        prompt_hash: &str,
+    ) -> Result<(), DbError> {
+        let patch = serde_json::json!({
+            "llm_model": model,
+            "llm_prompt_hash": prompt_hash,
+            "source": "mcp-llm-agent",
+        });
+
+        let result = sqlx::query!(
+            r#"
+            UPDATE agents
+            SET properties = properties || $2::jsonb, updated_at = NOW()
+            WHERE id = $1
+            "#,
+            agent_id,
+            patch,
+        )
+        .execute(pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound {
+                entity: "Agent".to_string(),
+                id: agent_id,
+            });
+        }
+
+        Ok(())
+    }
+
     /// Return all agents with a given role value.
     ///
     /// # Errors
