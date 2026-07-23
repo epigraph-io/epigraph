@@ -109,6 +109,21 @@ pub struct FederationRegistry {
 }
 
 impl FederationRegistry {
+    /// An empty registry with no mounted extensions. Used as the default
+    /// federation for the plain `EpiGraphMcpFull::new`/`new_shared` constructors
+    /// (which keep their pre-federation signatures) and whenever
+    /// `EPIGRAPH_MCP_EXTENSIONS` is absent — the gateway then behaves exactly as
+    /// it did before federation. Unlike [`build`](Self::build) this is sync and
+    /// infallible: no network I/O, no collisions possible.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            extensions: Vec::new(),
+            routes: HashMap::new(),
+            discovery_token: String::new(),
+        }
+    }
+
     /// Build a registry from parsed extension configs, connecting a discovery
     /// session to each and caching its (prefixed) tool list.
     ///

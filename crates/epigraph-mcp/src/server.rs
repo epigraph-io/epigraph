@@ -26,6 +26,15 @@ pub struct EpiGraphMcpFull {
     pub(crate) agent_db_id: Arc<Mutex<Option<uuid::Uuid>>>,
     pub(crate) embedder: Arc<McpEmbedder>,
     pub(crate) read_only: bool,
+    /// The federation gateway's routing table over downstream extension MCPs.
+    /// Built once in `main` (from `EPIGRAPH_MCP_EXTENSIONS`) and injected into
+    /// both transport paths. When no extensions are configured this is an empty
+    /// registry ([`crate::federation::FederationRegistry::empty`]) and the server
+    /// behaves exactly as it did pre-federation. The plain `new`/`new_shared`
+    /// constructors default to empty (mirroring the `claim_from_row` house rule
+    /// of not widening a ~30-caller signature); `main` and any caller that has a
+    /// registry use `new_with_federation`/`new_shared_with_federation`.
+    pub(crate) federation: Arc<crate::federation::FederationRegistry>,
 }
 
 impl EpiGraphMcpFull {
@@ -136,6 +145,43 @@ impl EpiGraphMcpFull {
         Ok(())
     }
 
+    /// Scope gate for FEDERATED tools, kept deliberately separate from
+    /// [`enforce_tool_scope`](Self::enforce_tool_scope).
+    ///
+    /// Federated tools are NOT in the static `SCOPE_MAP` (its coverage is a
+    /// compile-time invariant over kernel tools only), so the static gate would
+    /// fail them closed with "no scope mapping". Instead the required scope comes
+    /// from the extension's `EPIGRAPH_MCP_EXTENSIONS` config (`scope=…`), passed
+    /// here as `required`. Same fail-closed shape as the static gate: no
+    /// `AuthContext` (stdio, or middleware bypassed) is a hard reject, and a
+    /// caller lacking the extension's scope is forbidden.
+    pub fn enforce_federated_scope(
+        auth: Option<&epigraph_auth::AuthContext>,
+        tool_name: &str,
+        required: &str,
+    ) -> Result<(), McpError> {
+        let Some(auth) = auth else {
+            return Err(McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::Borrowed(
+                    "Unauthorized: federated tools require a Bearer token (no auth context; \
+                     not available over stdio)",
+                ),
+                data: None,
+            });
+        };
+        if !auth.has_scope(required) {
+            return Err(McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::Owned(format!(
+                    "Forbidden: federated tool '{tool_name}' requires scope '{required}'"
+                )),
+                data: None,
+            });
+        }
+        Ok(())
+    }
+
     /// Return an error if the server is in read-only mode.
     pub(crate) fn reject_if_read_only(&self) -> Result<(), McpError> {
         if self.read_only {
@@ -156,6 +202,27 @@ impl EpiGraphMcpFull {
 impl EpiGraphMcpFull {
     #[must_use]
     pub fn new(pool: PgPool, signer: AgentSigner, embedder: McpEmbedder, read_only: bool) -> Self {
+        Self::new_with_federation(
+            pool,
+            signer,
+            embedder,
+            read_only,
+            Arc::new(crate::federation::FederationRegistry::empty()),
+        )
+    }
+
+    /// Like [`new`](Self::new) but with a caller-supplied federation registry.
+    /// `main` uses this for the stdio path so stdio's `list_tools` surfaces the
+    /// same federated tools as the HTTP path (the registry is populated at build
+    /// time with the discovery service token, independent of transport).
+    #[must_use]
+    pub fn new_with_federation(
+        pool: PgPool,
+        signer: AgentSigner,
+        embedder: McpEmbedder,
+        read_only: bool,
+        federation: Arc<crate::federation::FederationRegistry>,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             pool,
@@ -163,16 +230,41 @@ impl EpiGraphMcpFull {
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder: Arc::new(embedder),
             read_only,
+            federation,
         }
     }
 
     /// Create from pre-wrapped `Arc` values (for HTTP transport factory closure).
+    /// Federation defaults to empty; the HTTP factory in `main` uses
+    /// [`new_shared_with_federation`](Self::new_shared_with_federation) to inject
+    /// the live registry per session.
     #[must_use]
     pub fn new_shared(
         pool: PgPool,
         signer: Arc<AgentSigner>,
         embedder: Arc<McpEmbedder>,
         read_only: bool,
+    ) -> Self {
+        Self::new_shared_with_federation(
+            pool,
+            signer,
+            embedder,
+            read_only,
+            Arc::new(crate::federation::FederationRegistry::empty()),
+        )
+    }
+
+    /// Like [`new_shared`](Self::new_shared) but with a caller-supplied
+    /// federation registry. The HTTP transport factory closure in `main` clones
+    /// the one `Arc<FederationRegistry>` built at boot into every per-session
+    /// server via this constructor.
+    #[must_use]
+    pub fn new_shared_with_federation(
+        pool: PgPool,
+        signer: Arc<AgentSigner>,
+        embedder: Arc<McpEmbedder>,
+        read_only: bool,
+        federation: Arc<crate::federation::FederationRegistry>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -181,6 +273,7 @@ impl EpiGraphMcpFull {
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder,
             read_only,
+            federation,
         }
     }
 
@@ -1067,7 +1160,13 @@ impl EpiGraphMcpFull {
         description = "List all MCP tools available on this server. Returns the name, description, and full JSON Schema for every registered tool — including tools your client may have DEFERRED (name visible but schema not loaded). Use this for runtime tool discovery and to load the schema of any tool your client could not call directly. The list reflects the live server state, including newly deployed tools not yet stored in the knowledge graph."
     )]
     async fn list_mcp_tools(&self) -> Result<CallToolResult, McpError> {
-        let tools = self.tool_router.list_all();
+        // Kernel tools + every federated tool the gateway advertises, matching
+        // `ServerHandler::list_tools`. `server_instructions` directs clients here
+        // to enumerate every tool with its schema, so the federated tools must be
+        // present or a deferred-schema client following that guidance would never
+        // discover them.
+        let mut tools = self.tool_router.list_all();
+        tools.extend(self.federation.list_federated_tools());
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&tools).map_err(crate::errors::internal_error)?,
         )]))
@@ -1139,6 +1238,10 @@ impl ServerHandler for EpiGraphMcpFull {
         // the stdio process boundary is the trust gate and no auth check applies.
         let is_http_call;
         let auth_owned: Option<epigraph_auth::AuthContext>;
+        // The verbatim caller bearer, present only on the HTTP path (stashed by
+        // `auth::bearer_auth_middleware`). Needed to forward to a downstream
+        // extension MCP on a federated call.
+        let raw_token: Option<String>;
         {
             let http_parts = context.extensions.get::<Parts>();
             is_http_call = http_parts.is_some();
@@ -1148,6 +1251,55 @@ impl ServerHandler for EpiGraphMcpFull {
             auth_owned = http_parts
                 .and_then(|p| p.extensions.get::<epigraph_auth::AuthContext>())
                 .cloned();
+            raw_token = http_parts
+                .and_then(|p| p.extensions.get::<crate::auth::RawBearerToken>())
+                .map(|t| t.0.clone());
+        }
+
+        // FEDERATION BRANCH — only for names the static tool router does NOT own.
+        // Must intercept BEFORE the static scope gate below: that gate fails
+        // closed for any name absent from `SCOPE_MAP`, and federated tools are
+        // deliberately not in `SCOPE_MAP`. Kept outside the `is_http_call` guard
+        // so a stdio federated call reaches `enforce_federated_scope` and fails
+        // closed there (no `AuthContext`) rather than falling through to a bare
+        // "unknown tool" from the router. A genuinely-unknown name (neither
+        // static nor federated) still falls through to the static path and its
+        // fail-closed gate, exactly as before.
+        if self.tool_router.get(&request.name).is_none() {
+            if let Some(ext) = self.federation.route(&request.name) {
+                let ext_name = ext.name.clone();
+                let ext_scope = ext.scope.clone();
+                // (a) enforce the extension's configured scope against the caller.
+                if let Err(err) =
+                    Self::enforce_federated_scope(auth_owned.as_ref(), &request.name, &ext_scope)
+                {
+                    self.emit_tool_invoked(&format!("denied:{}:{}", ext_name, request.name))
+                        .await;
+                    return Err(err);
+                }
+                // (b) require the caller's raw bearer to forward downstream.
+                let Some(token) = raw_token else {
+                    return Err(McpError {
+                        code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                        message: std::borrow::Cow::Borrowed(
+                            "Unauthorized: no Bearer token to forward to the downstream \
+                             extension (federated tools are unavailable over stdio)",
+                        ),
+                        data: None,
+                    });
+                };
+                // (c) durable audit event, namespaced by the owning extension.
+                self.emit_tool_invoked(&format!("{}:{}", ext_name, request.name))
+                    .await;
+                // (d) proxy to the downstream on a fresh caller-token session.
+                // `McpError` IS `rmcp::ErrorData`, so `internal_error` yields the
+                // handler's error type directly (no further conversion).
+                return self
+                    .federation
+                    .invoke(&request.name, &token, request.arguments)
+                    .await
+                    .map_err(crate::errors::internal_error);
+            }
         }
 
         if is_http_call {
@@ -1191,15 +1343,28 @@ impl ServerHandler for EpiGraphMcpFull {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        // Kernel tools first, then every federated tool the gateway currently
+        // advertises. Static-first mirrors `call_tool`'s resolution order: a
+        // kernel tool always wins a name clash (the operator resolves clashes
+        // between an extension and the kernel with a `prefix=`).
+        let mut tools = self.tool_router.list_all();
+        tools.extend(self.federation.list_federated_tools());
         Ok(rmcp::model::ListToolsResult {
-            tools: self.tool_router.list_all(),
+            tools,
             meta: None,
             next_cursor: None,
         })
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        self.tool_router.get(name).cloned()
+        // Static router first (kernel tools win name clashes, as in call_tool),
+        // then fall back to a federated tool from the routing map.
+        self.tool_router.get(name).cloned().or_else(|| {
+            self.federation
+                .list_federated_tools()
+                .into_iter()
+                .find(|t| t.name.as_ref() == name)
+        })
     }
 }
 

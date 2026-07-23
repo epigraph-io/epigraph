@@ -177,11 +177,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create embedder
     let embedder = McpEmbedder::new(pool.clone(), cli.openai_api_key);
 
+    // ── Federation gateway ──────────────────────────────────────────────
+    // Parse EPIGRAPH_MCP_EXTENSIONS and mount each downstream extension MCP.
+    // Built ONCE here and cloned (via the Arc) into every per-session server on
+    // both transport paths, so the discovery-cached tool list is shared. Absent
+    // env -> empty registry -> the gateway behaves exactly as pre-federation.
+    // A malformed EPIGRAPH_MCP_EXTENSIONS is a hard boot error (fail fast rather
+    // than silently drop an extension); a tool-name COLLISION between two
+    // extensions is likewise fatal (ambiguous routing). An individual extension
+    // being unreachable at startup is NOT fatal — it is logged and mounted
+    // unhealthy inside `build`.
+    let ext_env = std::env::var("EPIGRAPH_MCP_EXTENSIONS").ok();
+    let ext_configs = epigraph_mcp::federation::config::parse_extensions(ext_env.as_deref())
+        .map_err(|e| format!("EPIGRAPH_MCP_EXTENSIONS: {e}"))?;
+    // Discovery uses a gateway SERVICE token (never a caller token): the
+    // persistent discovery session is authenticated with it to drive
+    // list_all_tools. Per-call INVOCATION uses the caller's raw bearer instead.
+    let discovery_token = std::env::var("EPIGRAPH_MCP_DISCOVERY_TOKEN")
+        .or_else(|_| std::env::var("EPIGRAPH_SERVICE_TOKEN"))
+        .unwrap_or_default();
+    if !ext_configs.is_empty() && discovery_token.is_empty() {
+        tracing::warn!(
+            "EPIGRAPH_MCP_EXTENSIONS is set but no EPIGRAPH_MCP_DISCOVERY_TOKEN / \
+             EPIGRAPH_SERVICE_TOKEN — federated discovery will send an empty bearer \
+             and likely fail; extensions will mount unhealthy"
+        );
+    }
+    let federation = Arc::new(
+        epigraph_mcp::federation::FederationRegistry::build(ext_configs, &discovery_token)
+            .await
+            .map_err(|e| format!("federation gateway build failed: {e}"))?,
+    );
+    let federated_tool_count = federation.list_federated_tools().len();
+    if federation.is_empty() {
+        tracing::info!(
+            "Federation gateway: no extensions configured (EPIGRAPH_MCP_EXTENSIONS unset)"
+        );
+    } else {
+        tracing::info!(
+            federated_tools = federated_tool_count,
+            "Federation gateway: mounted {} federated tool(s) across configured extension(s)",
+            federated_tool_count
+        );
+    }
+
     let tool_count = EpiGraphMcpFull::all_tools_json()
         .as_array()
         .map_or(0, Vec::len);
     let mode = if cli.read_only { "read-only" } else { "full" };
-    tracing::info!("EpiGraph MCP server running in {mode} ({tool_count} tools) mode");
+    tracing::info!(
+        "EpiGraph MCP server running in {mode} ({tool_count} kernel + {federated_tool_count} federated tools) mode"
+    );
 
     if let Some(addr) = &cli.listen {
         // ── HTTP transport (TCP or Unix socket) ────────────────────────
@@ -194,14 +240,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let signer = Arc::new(signer);
         let embedder = Arc::new(embedder);
         let read_only = cli.read_only;
+        let federation = federation.clone();
 
         let service = StreamableHttpService::new(
             move || {
-                Ok(EpiGraphMcpFull::new_shared(
+                Ok(EpiGraphMcpFull::new_shared_with_federation(
                     pool.clone(),
                     signer.clone(),
                     embedder.clone(),
                     read_only,
+                    federation.clone(),
                 ))
             },
             Arc::new(LocalSessionManager::default()),
@@ -238,7 +286,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         epigraph_mcp::serve_with_listener(addr, router).await?;
     } else {
         // ── Stdio transport (default) ───────────────────────────────────
-        let server = EpiGraphMcpFull::new(pool, signer, embedder, cli.read_only);
+        // Inject the same federation registry so stdio's `list_tools` surfaces
+        // federated tools too (discovery ran at build time with the service
+        // token, independent of transport). Note: over stdio there is no caller
+        // Bearer, so a federated `tools/call` will fail closed in
+        // `enforce_federated_scope` (no AuthContext) — listing works, invoking
+        // does not, which is the intended v1 behavior.
+        let server =
+            EpiGraphMcpFull::new_with_federation(pool, signer, embedder, cli.read_only, federation);
         let service = server.serve(rmcp::transport::stdio()).await.map_err(|e| {
             tracing::error!("MCP serve error: {e}");
             e
