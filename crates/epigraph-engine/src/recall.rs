@@ -14,7 +14,7 @@
 //! MCP behaviour.
 
 use epigraph_core::ClaimId;
-use epigraph_db::{ClaimRepository, EvidenceRepository, PgPool};
+use epigraph_db::{ClaimRepository, PgPool};
 use epigraph_embeddings::EmbeddingService;
 use thiserror::Error;
 
@@ -79,7 +79,11 @@ pub async fn recall(
     // Try semantic search first.
     let results = if let Ok(embedding) = embedder.generate_query(query).await {
         let pgvec = format_pgvector(&embedding);
-        match EvidenceRepository::search_by_embedding(pool, &pgvec, limit_i64).await {
+        // ANN over `claims.embedding` (is_current, all levels) — NOT
+        // `evidence.embedding`, which is a permanently-empty column: searching
+        // it made this semantic leg always return nothing and silently starved
+        // downstream callers (episcience synthesis stage-1 seeding).
+        match ClaimRepository::search_by_embedding_current(pool, &pgvec, limit_i64).await {
             Ok(hits) => {
                 let mut results = Vec::new();
                 for hit in hits {
