@@ -2916,6 +2916,46 @@ impl ClaimRepository {
         .execute(&mut *tx)
         .await?;
 
+        // Symmetric-collision guard for `alternative_of` (migration 042).
+        //
+        // That relationship is governed by `edges_alternative_of_symmetric_uniq`,
+        // a UNIQUE index on `(LEAST(source_id,target_id), GREATEST(source_id,target_id))`
+        // — so the pair {A,B} is unique *regardless of direction*.  The two
+        // directional pre-deletes above only recognise same-`(source,target,
+        // relationship)` triples, so they miss the case where `dup` and
+        // `canonical` are joined to a common third claim T by `alternative_of`
+        // edges of *opposite* orientation (e.g. `dup→T` and `T→canonical`).
+        // Migrating `dup→canonical` would then rewrite `dup→T` into `canonical→T`,
+        // whose symmetric key {canonical,T} collides with the existing `T→canonical`
+        // edge, tripping the unique index and rolling the whole transaction back
+        // before `is_current` is flipped (backlog 2905150e / issue #286).
+        //
+        // Pre-delete the redundant dup-side `alternative_of` edge whenever
+        // `canonical` already shares a symmetric `alternative_of` edge with the
+        // same third claim.  Edges where `canonical` is itself an endpoint are
+        // left for the self-loop guards in the migration UPDATEs below.
+        sqlx::query(
+            "DELETE FROM edges AS e \
+             WHERE e.relationship = 'alternative_of' \
+               AND e.source_type = 'claim' AND e.target_type = 'claim' \
+               AND (e.source_id = $2 OR e.target_id = $2) \
+               AND e.source_id != $1 AND e.target_id != $1 \
+               AND EXISTS ( \
+                   SELECT 1 FROM edges e2 \
+                   WHERE e2.relationship = 'alternative_of' \
+                     AND e2.source_type = 'claim' AND e2.target_type = 'claim' \
+                     AND e2.id <> e.id \
+                     AND LEAST(e2.source_id, e2.target_id) = \
+                         LEAST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
+                     AND GREATEST(e2.source_id, e2.target_id) = \
+                         GREATEST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
+               )",
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query(
             "UPDATE edges SET target_id = $1 \
              WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
