@@ -456,6 +456,55 @@ impl WorkflowRepository {
         Ok(resolved)
     }
 
+    /// Resolve `(canonical_name, step_index)` to a single step claim UUID for the
+    /// name+index addressing mode of `evolve_step` / `update_with_evidence`
+    /// (issue #352). Targets the **latest generation** of the named workflow and
+    /// the same `executes`-edge ordering as [`resolve_steps_to_heads`], so the
+    /// three step-facing tools address steps identically to
+    /// `report_hierarchical_outcome`.
+    ///
+    /// With `prefer_head = true` returns the current head of the step's lineage
+    /// (what `evolve_step` should branch from and where fresh evidence should
+    /// land), falling back to the frozen original when the lineage is empty or
+    /// legacy; with `prefer_head = false` returns the frozen original step claim.
+    /// Returns `Ok(None)` when the workflow name is unknown or `step_index` is
+    /// out of range.
+    ///
+    /// # Errors
+    /// Returns `DbError` if a database query fails.
+    pub async fn resolve_step_claim(
+        pool: &PgPool,
+        canonical_name: &str,
+        step_index: usize,
+        prefer_head: bool,
+    ) -> Result<Option<Uuid>, DbError> {
+        let Some(max_gen) = Self::max_generation_by_canonical(pool, canonical_name)
+            .await
+            .map_err(DbError::from)?
+        else {
+            return Ok(None);
+        };
+        let Some(workflow_id) = Self::find_root_by_canonical(pool, canonical_name, max_gen)
+            .await
+            .map_err(DbError::from)?
+        else {
+            return Ok(None);
+        };
+        let steps = Self::resolve_steps_to_heads(pool, workflow_id).await?;
+        let Some(step) = steps.into_iter().nth(step_index) else {
+            return Ok(None);
+        };
+        let target = if prefer_head {
+            step.heads
+                .first()
+                .map(|h| h.id)
+                .unwrap_or(step.frozen_claim_id)
+        } else {
+            step.frozen_claim_id
+        };
+        Ok(Some(target))
+    }
+
     /// Batched variant of [`resolve_steps_to_heads`] — resolves all workflows
     /// in a single pair of round-trips (one seed query + one head query)
     /// instead of O(N × M) calls.

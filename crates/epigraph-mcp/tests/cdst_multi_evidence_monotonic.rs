@@ -43,6 +43,8 @@ async fn add_evidence(
     let res = epigraph_mcp::tools::claims::update_with_evidence(
         server,
         UpdateWithEvidenceParams {
+            canonical_name: None,
+            step_index: None,
             claim_id: claim_id.to_string(),
             evidence_type: evidence_type.to_string(),
             evidence_data: note.to_string(),

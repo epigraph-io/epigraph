@@ -26,6 +26,8 @@ async fn run_update(
     let result = epigraph_mcp::tools::claims::update_with_evidence(
         server,
         UpdateWithEvidenceParams {
+            canonical_name: None,
+            step_index: None,
             claim_id: claim_id.to_string(),
             evidence_type: "empirical".into(),
             evidence_data: format!("evidence strength={strength} supports={supports}"),

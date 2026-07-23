@@ -244,8 +244,23 @@ pub struct VerifyClaimParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpdateWithEvidenceParams {
-    #[schemars(description = "The UUID of the claim to update")]
+    #[schemars(
+        description = "The UUID of the claim to update (id-mode). Provide this, OR both canonical_name and step_index to address a workflow step by name."
+    )]
+    #[serde(default)]
     pub claim_id: String,
+
+    #[schemars(
+        description = "(name-mode) Canonical workflow name; with step_index, resolves to the current head of that step's lineage — the same executes-edge walk report_hierarchical_outcome uses. Alternative to claim_id."
+    )]
+    #[serde(default)]
+    pub canonical_name: Option<String>,
+
+    #[schemars(
+        description = "(name-mode) Zero-based step index within the workflow (used with canonical_name)."
+    )]
+    #[serde(default)]
+    pub step_index: Option<usize>,
 
     #[schemars(
         description = "The new evidence text. Stored permanently for human audit — not just hashed."
