@@ -147,13 +147,21 @@ async fn llm_identity_stamps_properties_and_collapses_to_one_agent(pool: PgPool)
         "identical (model, prompt) config must collapse to ONE agent"
     );
 
-    // Still exactly one row after the second resolution (no duplicate created).
-    let rows_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE id = $1")
-        .bind(id1)
+    // The real collapse invariant: exactly ONE agents row carries the derived
+    // public key. Counting by `id` (as `id1`) would MISS a broken FOUND branch
+    // that inserted a second row with the SAME public key but a fresh random id —
+    // `id1 == id2` could still hold (both resolved by pubkey) while a duplicate
+    // silently exists. Counting by public_key is what actually detects it.
+    let pk = keypair_from_llm_agent(MODEL, PROMPT).public_key();
+    let rows_for_pk: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE public_key = $1")
+        .bind(pk.as_slice())
         .fetch_one(&pool)
         .await
-        .expect("count agents after reuse");
-    assert_eq!(rows_after, 1, "reuse must not create a second agent row");
+        .expect("count agents by public key");
+    assert_eq!(
+        rows_for_pk, 1,
+        "identical (model, prompt) must collapse to exactly one agent row (by public key)"
+    );
 }
 
 /// Control: a server with NO `llm_identity` (the legacy generate/agent-key
@@ -219,13 +227,30 @@ async fn lineage_writes_exactly_one_operated_by_edge_idempotently(pool: PgPool) 
         "first call must write exactly one OPERATED_BY edge"
     );
 
-    // Repeat: the per-session memo short-circuits, and even if it did not the DB
-    // create_if_not_exists would refuse a duplicate. Either way -> still one.
+    // Same-instance repeat: the per-session memo short-circuits before the DB.
+    // This documents the in-process fast path but, on its own, would still pass
+    // even if DB-level dedup were broken — so it cannot stand as the idempotency
+    // proof.
     server.record_auth_lineage(Some(principal)).await;
     assert_eq!(
         count_operated_by(&pool, mcp_agent, principal).await,
         1,
-        "repeat call must NOT write a second edge"
+        "same-instance repeat: memo short-circuits, no second edge"
+    );
+
+    // Cross-instance repeat: a SECOND server (fresh, empty memo; same derived
+    // identity + pool) resolves to the SAME mcp agent and calls
+    // `record_auth_lineage` with nothing memoized — so the in-process set CANNOT
+    // mask a broken DB path here. Only `create_if_not_exists`'s existence check
+    // stands between this call and a duplicate edge. THIS is the cross-process
+    // idempotency the headline property requires; it FAILS if DB dedup regresses.
+    let server2 = llm_server(pool.clone());
+    server2.record_auth_lineage(Some(principal)).await;
+    assert_eq!(
+        count_operated_by(&pool, mcp_agent, principal).await,
+        1,
+        "cross-instance repeat: create_if_not_exists must refuse the duplicate \
+         with an empty memo"
     );
 
     // Sanity: the edge really is agent->agent with the OPERATED_BY relationship.
