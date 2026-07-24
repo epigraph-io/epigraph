@@ -153,9 +153,32 @@ pub fn keypair_from_name(name: &str) -> AgentSigner {
 /// changing the derived identity on any prompt change.
 #[must_use]
 pub fn keypair_from_llm_agent(model_id: &str, system_prompt: &str) -> AgentSigner {
-    let model_id = model_id.trim();
     let prompt_hash = blake3::hash(system_prompt.as_bytes()).to_hex();
-    let seed_input = format!("llm-agent:{model_id}:{prompt_hash}");
+    keypair_from_llm_agent_prehashed(model_id, prompt_hash.as_str())
+}
+
+/// Derive a deterministic Ed25519 keypair for an LLM-driven agent from a
+/// **pre-hashed** prompt.
+///
+/// This is the sibling of [`keypair_from_llm_agent`] for callers that already
+/// hold the BLAKE3 lowercase-hex digest of the system prompt (e.g. the prompt
+/// is never materialized in the process, only its hash is provided via
+/// `EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH`). The seed is
+/// `"llm-agent:{model_id.trim()}:{prompt_hash_hex}"`, identical to what
+/// [`keypair_from_llm_agent`] produces when given the raw prompt whose BLAKE3
+/// lowercase-hex digest equals `prompt_hash_hex`.
+///
+/// # Silent-orphan trap
+///
+/// `prompt_hash_hex` MUST be the digest, not the raw prompt. Passing a raw
+/// prompt here would embed the literal prompt text into the seed, yielding a
+/// key that differs from the [`keypair_from_llm_agent`] path — a distinct,
+/// silently-orphaned identity. Feed [`keypair_from_llm_agent`] the raw prompt;
+/// feed this the precomputed hash.
+#[must_use]
+pub fn keypair_from_llm_agent_prehashed(model_id: &str, prompt_hash_hex: &str) -> AgentSigner {
+    let model_id = model_id.trim();
+    let seed_input = format!("llm-agent:{model_id}:{prompt_hash_hex}");
     keypair_from_seed(&seed_input)
 }
 
@@ -340,6 +363,75 @@ mod tests {
 
         assert_ne!(base, model_changed);
         assert_ne!(base, prompt_changed);
+    }
+
+    #[test]
+    fn prehashed_matches_raw_prompt_path() {
+        // (a) round-trip guard: hashing the prompt then feeding the digest to
+        // _prehashed must be byte-identical to the internal-hash path. If this
+        // ever diverges, the _HASH env path silently forks the identity.
+        let model = "gpt-4.1";
+        let prompt = "You are a careful analyst.";
+        let hash = blake3::hash(prompt.as_bytes()).to_hex();
+
+        let raw = keypair_from_llm_agent(model, prompt);
+        let prehashed = keypair_from_llm_agent_prehashed(model, hash.as_str());
+        assert_eq!(
+            raw.public_key(),
+            prehashed.public_key(),
+            "prehashed path must reproduce the raw-prompt key exactly"
+        );
+    }
+
+    #[test]
+    fn prehashed_derivation_is_deterministic() {
+        // (b) two calls with the same (model, hash) yield the same key.
+        let model = "claude-opus-4";
+        let hash = blake3::hash(b"some system prompt").to_hex();
+        let s1 = keypair_from_llm_agent_prehashed(model, hash.as_str());
+        let s2 = keypair_from_llm_agent_prehashed(model, hash.as_str());
+        assert_eq!(s1.public_key(), s2.public_key());
+    }
+
+    #[test]
+    fn prehashed_different_prompt_hash_yields_different_key() {
+        // (c) a different prompt (hence a different digest) must produce a
+        // different identity.
+        let model = "gpt-4.1";
+        let h1 = blake3::hash(b"You are a careful analyst.").to_hex();
+        let h2 = blake3::hash(b"You are a terse analyst.").to_hex();
+        let s1 = keypair_from_llm_agent_prehashed(model, h1.as_str());
+        let s2 = keypair_from_llm_agent_prehashed(model, h2.as_str());
+        assert_ne!(s1.public_key(), s2.public_key());
+    }
+
+    #[test]
+    fn prehashed_trims_model_id() {
+        // (d) model.trim() is applied, so surrounding whitespace (e.g. from a
+        // sloppily-set env var) collapses to one identity rather than forking.
+        let hash = blake3::hash(b"prompt").to_hex();
+        let padded = keypair_from_llm_agent_prehashed("  gpt-4.1  ", hash.as_str());
+        let clean = keypair_from_llm_agent_prehashed("gpt-4.1", hash.as_str());
+        assert_eq!(padded.public_key(), clean.public_key());
+    }
+
+    #[test]
+    fn prehashed_raw_prompt_is_the_silent_orphan_trap() {
+        // (e) NEGATIVE: misusing _prehashed by passing the RAW prompt instead
+        // of its digest yields a DIFFERENT key than the correct hashed path.
+        // This documents (and pins) the silent-orphan hazard the two-function
+        // split exists to prevent — feeding a raw prompt to _prehashed embeds
+        // literal prompt text into the seed instead of the 64-hex digest.
+        let model = "gpt-4.1";
+        let prompt = "You are a careful analyst.";
+
+        let correct = keypair_from_llm_agent(model, prompt);
+        let misused = keypair_from_llm_agent_prehashed(model, prompt);
+        assert_ne!(
+            correct.public_key(),
+            misused.public_key(),
+            "raw prompt fed to _prehashed must NOT collide with the hashed path"
+        );
     }
 
     #[test]
