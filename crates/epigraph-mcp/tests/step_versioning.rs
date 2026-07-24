@@ -92,6 +92,8 @@ async fn evolve_step_supersedes_flips_head(pool: PgPool) {
     let v1 = seed_versioned_step(&pool, agent, lineage, "step v1 content").await;
 
     let params = EvolveStepParams {
+        canonical_name: None,
+        step_index: None,
         step_lineage_id: lineage.to_string(),
         parent_id: v1.to_string(),
         content: "step v2 content".to_string(),
@@ -120,6 +122,73 @@ async fn evolve_step_supersedes_flips_head(pool: PgPool) {
     );
 }
 
+/// Regression test for issue #352: evolve_step can address a step by
+/// `(canonical_name, step_index)` — resolved server-side through the workflow's
+/// `executes` edges — without threading `parent_id`/`step_lineage_id` from a
+/// prior `find_workflow_hierarchical` lookup.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_addresses_by_canonical_name_and_index(pool: PgPool) {
+    let server = build_server(pool.clone());
+    let agent = insert_seed_agent(&pool).await;
+
+    let lin0 = Uuid::new_v4();
+    let lin1 = Uuid::new_v4();
+    let step0 = seed_versioned_step(&pool, agent, lin0, "step0 v1").await;
+    let step1 = seed_versioned_step(&pool, agent, lin1, "step1 v1").await;
+
+    // A workflow whose `executes` edges point at the two steps, in order.
+    let wf = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, generation, goal, metadata) \
+         VALUES ($1, 'name-mode-wf', 0, 'goal', '{}'::jsonb)",
+    )
+    .bind(wf)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (i, s) in [step0, step1].iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, created_at) \
+             VALUES (gen_random_uuid(), $1, 'workflow', $2, 'claim', 'executes', NOW() + make_interval(secs => $3::int))",
+        )
+        .bind(wf)
+        .bind(*s)
+        .bind(i as i32)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Address step index 1 purely by workflow name — no ids supplied.
+    let params = EvolveStepParams {
+        canonical_name: Some("name-mode-wf".to_string()),
+        step_index: Some(1),
+        step_lineage_id: String::new(),
+        parent_id: String::new(),
+        content: "step1 v2 via name".to_string(),
+        edge_type: "supersedes".to_string(),
+        rationale: None,
+        level: Some(2),
+    };
+    evolve_step(&server, params)
+        .await
+        .expect("name-mode evolve_step must resolve and succeed");
+
+    // step1's head is now v2; step0 is untouched (proves the index selected the
+    // right step).
+    let heads1 = ClaimRepository::latest_in_lineage(&pool, lin1)
+        .await
+        .unwrap();
+    assert_eq!(heads1.len(), 1);
+    assert_eq!(heads1[0].content, "step1 v2 via name");
+
+    let heads0 = ClaimRepository::latest_in_lineage(&pool, lin0)
+        .await
+        .unwrap();
+    assert_eq!(heads0.len(), 1);
+    assert_eq!(heads0[0].content, "step0 v1", "wrong step was addressed");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
     let server = build_server(pool.clone());
@@ -132,6 +201,8 @@ async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
     evolve_step(
         &server,
         EvolveStepParams {
+            canonical_name: None,
+            step_index: None,
             step_lineage_id: lineage.to_string(),
             parent_id: v1.to_string(),
             content: "v1 + agent A refinement".to_string(),
@@ -147,6 +218,8 @@ async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
     evolve_step(
         &server,
         EvolveStepParams {
+            canonical_name: None,
+            step_index: None,
             step_lineage_id: lineage.to_string(),
             parent_id: v1.to_string(),
             content: "v1 + agent B refinement".to_string(),
@@ -178,6 +251,8 @@ async fn evolve_step_rejects_bad_edge_type(pool: PgPool) {
     let result = evolve_step(
         &server,
         EvolveStepParams {
+            canonical_name: None,
+            step_index: None,
             step_lineage_id: lineage.to_string(),
             parent_id: v1.to_string(),
             content: "v2".to_string(),
@@ -201,6 +276,8 @@ async fn evolve_step_rejects_level_0_or_1(pool: PgPool) {
         let result = evolve_step(
             &server,
             EvolveStepParams {
+                canonical_name: None,
+                step_index: None,
                 step_lineage_id: lineage.to_string(),
                 parent_id: v1.to_string(),
                 content: "v2".to_string(),
@@ -282,6 +359,8 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     evolve_step(
         &server,
         EvolveStepParams {
+            canonical_name: None,
+            step_index: None,
             step_lineage_id: lineage_a.to_string(),
             parent_id: s0_v1.to_string(),
             content: "step 0 v2 (refined)".to_string(),
@@ -305,6 +384,8 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     evolve_step(
         &server,
         EvolveStepParams {
+            canonical_name: None,
+            step_index: None,
             step_lineage_id: lineage_b.to_string(),
             parent_id: s1_v1.to_string(),
             content: "step 1 v2 — agent A".to_string(),
@@ -318,6 +399,8 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     evolve_step(
         &server,
         EvolveStepParams {
+            canonical_name: None,
+            step_index: None,
             step_lineage_id: lineage_b.to_string(),
             parent_id: s1_v1.to_string(),
             content: "step 1 v2 — agent B".to_string(),

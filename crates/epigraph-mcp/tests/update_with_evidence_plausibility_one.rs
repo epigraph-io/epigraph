@@ -29,6 +29,8 @@ async fn update_with_evidence_does_not_violate_plausibility_bounds_at_one(pool: 
     let result = epigraph_mcp::tools::claims::update_with_evidence(
         &server,
         UpdateWithEvidenceParams {
+            canonical_name: None,
+            step_index: None,
             claim_id: claim_id.to_string(),
             evidence_type: "empirical".into(),
             evidence_data: "Supporting observation that narrows belief but \

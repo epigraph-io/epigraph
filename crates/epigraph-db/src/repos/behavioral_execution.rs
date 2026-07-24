@@ -35,6 +35,8 @@ pub struct BehavioralExecutionRow {
     pub total_steps: i32,
     pub created_at: DateTime<Utc>,
     pub step_claim_id: Option<uuid::Uuid>,
+    /// Optional run/variant label distinguishing rows of a parameter sweep.
+    pub run_label: Option<String>,
 }
 
 /// Repository for `behavioral_executions` table operations.
@@ -68,18 +70,18 @@ impl BehavioralExecutionRepository {
                     id, workflow_id, goal_text, goal_embedding,
                     success, step_beliefs, tool_pattern,
                     quality, deviation_count, total_steps, created_at,
-                    step_claim_id
+                    step_claim_id, run_label
                 )
                 VALUES (
                     $1, $2, $3, $4::vector,
                     $5, $6, $7,
                     $8, $9, $10, $11,
-                    $12
+                    $12, $13
                 )
                 RETURNING id, workflow_id, goal_text,
                           success, step_beliefs, tool_pattern,
                           quality, deviation_count, total_steps, created_at,
-                          step_claim_id
+                          step_claim_id, run_label
                 "#,
             )
             .bind(row.id)
@@ -94,6 +96,7 @@ impl BehavioralExecutionRepository {
             .bind(row.total_steps)
             .bind(row.created_at)
             .bind(row.step_claim_id)
+            .bind(&row.run_label)
             .fetch_one(pool)
             .await
         } else {
@@ -103,18 +106,18 @@ impl BehavioralExecutionRepository {
                     id, workflow_id, goal_text,
                     success, step_beliefs, tool_pattern,
                     quality, deviation_count, total_steps, created_at,
-                    step_claim_id
+                    step_claim_id, run_label
                 )
                 VALUES (
                     $1, $2, $3,
                     $4, $5, $6,
                     $7, $8, $9, $10,
-                    $11
+                    $11, $12
                 )
                 RETURNING id, workflow_id, goal_text,
                           success, step_beliefs, tool_pattern,
                           quality, deviation_count, total_steps, created_at,
-                          step_claim_id
+                          step_claim_id, run_label
                 "#,
             )
             .bind(row.id)
@@ -128,6 +131,7 @@ impl BehavioralExecutionRepository {
             .bind(row.total_steps)
             .bind(row.created_at)
             .bind(row.step_claim_id)
+            .bind(&row.run_label)
             .fetch_one(pool)
             .await
         }
@@ -204,7 +208,7 @@ impl BehavioralExecutionRepository {
             SELECT id, workflow_id, goal_text,
                    success, step_beliefs, tool_pattern,
                    quality, deviation_count, total_steps, created_at,
-                   step_claim_id
+                   step_claim_id, run_label
             FROM behavioral_executions
             WHERE workflow_id = $1
             ORDER BY created_at DESC
@@ -464,6 +468,7 @@ mod tests {
             total_steps: 1,
             created_at: chrono::Utc::now(),
             step_claim_id: Some(claim_id),
+            run_label: None,
         };
         BehavioralExecutionRepository::create(&pool, row, None)
             .await
@@ -523,6 +528,7 @@ mod tests {
             total_steps: 1,
             created_at: base + chrono::Duration::seconds(secs),
             step_claim_id: None,
+            run_label: None,
         };
         for (wfid, secs, goal) in [
             (wf, 0, "oldest"),
@@ -594,6 +600,7 @@ mod tests {
                     total_steps: 1,
                     created_at: base + chrono::Duration::seconds(i as i64),
                     step_claim_id: None,
+                    run_label: None,
                 },
                 None,
             )

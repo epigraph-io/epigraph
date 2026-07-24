@@ -244,6 +244,67 @@ impl EdgeRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Symmetric idempotent create that also returns the edge id.
+    ///
+    /// Same bidirectional-dedup contract as [`Self::create_symmetric_if_absent`]
+    /// (`(a,b)` and `(b,a)` with the same `relationship` are one edge), but
+    /// returns `(edge_id, was_created)` so a caller can echo the id back:
+    /// `was_created = true` with the freshly-inserted id, or `false` with the
+    /// id of the pre-existing symmetric edge. Purpose-built for the
+    /// `link_alternative` MCP tool over `alternative_of` (migration 042's
+    /// `edges_alternative_of_symmetric_uniq`). Runtime `sqlx::query*` — no
+    /// `.sqlx/` prepared-cache entry.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, properties))]
+    pub async fn create_symmetric_if_absent_returning(
+        pool: &PgPool,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<(Uuid, bool), DbError> {
+        let inserted: Option<Uuid> = sqlx::query_scalar(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type,
+                                relationship, properties)
+             SELECT $1, 'claim', $2, 'claim', $3, $4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM edges
+                 WHERE ((source_id = $1 AND target_id = $2)
+                     OR (source_id = $2 AND target_id = $1))
+                   AND relationship = $3
+             )
+             RETURNING id",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(relationship)
+        .bind(Json(properties))
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(id) = inserted {
+            return Ok((id, true));
+        }
+
+        // Dedup hit — surface the id of the existing symmetric edge.
+        let existing: Uuid = sqlx::query_scalar(
+            "SELECT id FROM edges
+             WHERE ((source_id = $1 AND target_id = $2)
+                 OR (source_id = $2 AND target_id = $1))
+               AND relationship = $3
+             LIMIT 1",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(relationship)
+        .fetch_one(pool)
+        .await?;
+
+        Ok((existing, false))
+    }
+
     /// Get edges by source entity
     ///
     /// # Errors

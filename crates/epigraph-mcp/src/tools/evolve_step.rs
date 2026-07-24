@@ -15,10 +15,24 @@ use crate::server::EpiGraphMcpFull;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EvolveStepParams {
-    /// Existing lineage UUID. Required.
-    pub step_lineage_id: String,
-    /// Claim being superseded or branched from. Required.
+    /// (id-mode) Claim being superseded or branched from. Provide this, OR both
+    /// `canonical_name` and `step_index` to address the step by name.
+    #[serde(default)]
     pub parent_id: String,
+    /// (name-mode) Canonical workflow name; with `step_index`, resolves the
+    /// parent to the current head of that step's lineage — the same
+    /// `executes`-edge walk `report_hierarchical_outcome` uses. Alternative to
+    /// `parent_id`.
+    #[serde(default)]
+    pub canonical_name: Option<String>,
+    /// (name-mode) Zero-based step index within the workflow (used with
+    /// `canonical_name`).
+    #[serde(default)]
+    pub step_index: Option<usize>,
+    /// Deprecated / ignored: the lineage is derived from the parent claim, so
+    /// this is retained only for backward compatibility with older callers.
+    #[serde(default)]
+    pub step_lineage_id: String,
     /// New step content.
     pub content: String,
     /// "supersedes" (linear refinement) or "revises" (concurrent branch).
@@ -50,7 +64,30 @@ pub async fn evolve_step(
         return Err(invalid_params("content must not be empty".to_string()));
     }
 
-    let parent_uuid = parse_uuid(&params.parent_id)?;
+    // Two addressing modes, exactly one required: id-mode (`parent_id`) or
+    // name-mode (`canonical_name` + `step_index`), the latter resolved through
+    // the same `executes`-edge walk `report_hierarchical_outcome` uses (#352).
+    let parent_uuid = if !params.parent_id.trim().is_empty() {
+        if params.canonical_name.is_some() || params.step_index.is_some() {
+            return Err(invalid_params(
+                "provide EITHER parent_id OR (canonical_name + step_index), not both",
+            ));
+        }
+        parse_uuid(params.parent_id.trim())?
+    } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
+        epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, name, idx, true)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"
+                ))
+            })?
+    } else {
+        return Err(invalid_params(
+            "provide a parent step: either `parent_id`, or both `canonical_name` and `step_index`",
+        ));
+    };
     let agent_id = server.agent_id().await?;
 
     let result = epigraph_db::ClaimRepository::evolve_step(

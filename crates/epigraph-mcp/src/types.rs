@@ -244,8 +244,23 @@ pub struct VerifyClaimParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpdateWithEvidenceParams {
-    #[schemars(description = "The UUID of the claim to update")]
+    #[schemars(
+        description = "The UUID of the claim to update (id-mode). Provide this, OR both canonical_name and step_index to address a workflow step by name."
+    )]
+    #[serde(default)]
     pub claim_id: String,
+
+    #[schemars(
+        description = "(name-mode) Canonical workflow name; with step_index, resolves to the current head of that step's lineage — the same executes-edge walk report_hierarchical_outcome uses. Alternative to claim_id."
+    )]
+    #[serde(default)]
+    pub canonical_name: Option<String>,
+
+    #[schemars(
+        description = "(name-mode) Zero-based step index within the workflow (used with canonical_name)."
+    )]
+    #[serde(default)]
+    pub step_index: Option<usize>,
 
     #[schemars(
         description = "The new evidence text. Stored permanently for human audit — not just hashed."
@@ -655,6 +670,12 @@ pub struct ReportHierarchicalOutcomeParams {
     pub quality: Option<f64>,
 
     #[schemars(
+        description = "Optional run/variant label for parameter-sweep executions (e.g. 'joint-63bp', 'V2'). Persisted on the behavioral_executions row and surfaced by get_workflow_executions so sweep variants are machine-distinguishable rather than tellable apart only by prose."
+    )]
+    #[serde(default)]
+    pub run_label: Option<String>,
+
+    #[schemars(
         description = "Your specific goal for this run. More specific goal text improves future affinity matching."
     )]
     pub goal_text: Option<String>,
@@ -973,7 +994,7 @@ pub struct IngestDocumentParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IngestDocumentInlineParams {
     #[schemars(
-        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, and an optional top-level source_text. When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent on paragraph and atom content hashes (node-level): re-ingesting an abstract then the full paper is safe — existing paragraph/atom nodes dedup and only new content is written."
+        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, and an optional top-level source_text. When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span; when it is absent — the case for AUTHORED records (an ELN entry, run summary, or anything with no external source to quote) — the guard is skipped and each paragraph's text is trusted as-is, so this is a supported SINGLE-CALL path with no `structure_source` / `ingest_document_spine` prerequisite. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent on paragraph and atom content hashes (node-level): re-ingesting an abstract then the full paper is safe — existing paragraph/atom nodes dedup and only new content is written."
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
@@ -1069,6 +1090,50 @@ pub struct LinkHierarchicalParams {
 /// existed and the existing edge_id is returned (idempotent re-runs).
 #[derive(Debug, Serialize)]
 pub struct LinkHierarchicalResponse {
+    pub edge_id: String,
+    pub created: bool,
+}
+
+/// Parameters for the `link_alternative` MCP tool.
+///
+/// Promotes two existing claims into a mutually-exclusive alternative pair by
+/// writing the **symmetric** `alternative_of` edge that `suggest_alternative_sets`
+/// documents but no other tool can create (`link_epistemic` rejects the
+/// relationship; `link_hierarchical` only takes structural types). The edge is
+/// direction-agnostic — `{claim_a, claim_b}` is one edge regardless of order
+/// (migration 042's `edges_alternative_of_symmetric_uniq`) — and deliberately
+/// inert at write time: its belief effect flows later through CDST BP's
+/// max-plausibility combine over the `alternative_set` view, not a Dempster
+/// re-wire here. Idempotent on the unordered pair: a re-hit returns the existing
+/// `edge_id` with `created=false`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LinkAlternativeParams {
+    #[schemars(description = "UUID of the first competing claim")]
+    pub claim_a: String,
+
+    #[schemars(description = "UUID of the second competing claim")]
+    pub claim_b: String,
+
+    #[schemars(
+        description = "Optional UUID of the shared target the two claims are rival supporters of. Validated and stored on the edge for provenance."
+    )]
+    #[serde(default)]
+    pub target_claim_id: Option<String>,
+
+    #[schemars(
+        description = "Optional human rationale for why these two claims are alternatives. Stored on the edge."
+    )]
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
+/// Response for the `link_alternative` MCP tool.
+///
+/// `created=true` means the symmetric `alternative_of` edge was newly inserted;
+/// `created=false` means an edge already linked the pair (in either direction)
+/// and its existing `edge_id` is returned (idempotent re-runs).
+#[derive(Debug, Serialize)]
+pub struct LinkAlternativeResponse {
     pub edge_id: String,
     pub created: bool,
 }

@@ -50,6 +50,8 @@ async fn add_evidence(
     update_with_evidence(
         server,
         UpdateWithEvidenceParams {
+            canonical_name: None,
+            step_index: None,
             claim_id: claim.to_string(),
             evidence_type: evidence_type.to_string(),
             evidence_data: note.to_string(),

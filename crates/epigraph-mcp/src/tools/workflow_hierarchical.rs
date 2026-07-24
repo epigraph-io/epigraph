@@ -170,6 +170,7 @@ pub async fn report_hierarchical_outcome(
         &params.step_executions,
         params.quality,
         params.goal_text.as_deref(),
+        params.run_label.as_deref(),
     )
     .await
 }
@@ -185,6 +186,7 @@ pub async fn do_report_hierarchical_outcome_via_pool(
     step_executions: &[HierarchicalStepExecution],
     quality: Option<f64>,
     goal_text: Option<&str>,
+    run_label: Option<&str>,
 ) -> Result<CallToolResult, McpError> {
     // 1. Confirm hierarchical workflow exists.
     let row: Option<(serde_json::Value,)> =
@@ -289,6 +291,7 @@ pub async fn do_report_hierarchical_outcome_via_pool(
             total_steps: 1,
             created_at: report_ts,
             step_claim_id,
+            run_label: run_label.map(str::to_string),
         };
         if let Err(e) = epigraph_db::BehavioralExecutionRepository::create(pool, row, None).await {
             tracing::warn!(workflow_id = %workflow_id, "behavioral_executions write failed: {e}");
@@ -385,6 +388,7 @@ mod tests {
             &steps,
             None,
             Some("smoke run"),
+            None,
         )
         .await
         .expect("outcome must succeed");
@@ -424,9 +428,10 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_outcome_404s_for_unknown_workflow(pool: sqlx::PgPool) {
         let bogus = Uuid::new_v4();
-        let err = do_report_hierarchical_outcome_via_pool(&pool, bogus, true, &[], None, None)
-            .await
-            .expect_err("unknown workflow id must error");
+        let err =
+            do_report_hierarchical_outcome_via_pool(&pool, bogus, true, &[], None, None, None)
+                .await
+                .expect_err("unknown workflow id must error");
         assert!(err.message.contains("no hierarchical workflow"));
     }
 }

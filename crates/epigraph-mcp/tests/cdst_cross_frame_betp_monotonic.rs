@@ -139,6 +139,8 @@ async fn cross_frame_supporting_evidence_does_not_drop_betp() {
     let res = epigraph_mcp::tools::claims::update_with_evidence(
         &server,
         UpdateWithEvidenceParams {
+            canonical_name: None,
+            step_index: None,
             claim_id: claim_id.to_string(),
             evidence_type: "empirical".into(),
             evidence_data: "Independent empirical observation supporting the claim.".into(),

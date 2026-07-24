@@ -69,6 +69,7 @@ async fn get_workflow_executions_returns_recent_rows(pool: PgPool) {
             total_steps: 2,
             created_at: base + chrono::Duration::seconds(i as i64),
             step_claim_id: None,
+            run_label: None,
         };
         BehavioralExecutionRepository::create(&pool, row, None)
             .await

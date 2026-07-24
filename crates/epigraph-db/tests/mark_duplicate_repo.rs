@@ -261,6 +261,108 @@ async fn mark_duplicate_with_shared_neighbor_edge_succeeds(pool: PgPool) {
     );
 }
 
+/// Regression test for backlog 2905150e / issue #286: mark_duplicate returned
+/// HTTP 500 "Duplicate entity already exists" when `dup` and `canonical` were
+/// both joined to a common third claim by `alternative_of` edges.
+///
+/// `alternative_of` is governed by a *symmetric* unique index (migration 042,
+/// `edges_alternative_of_symmetric_uniq` on `LEAST/GREATEST(source_id,target_id)`),
+/// so the directional diamond pre-deletes exercised by
+/// `mark_duplicate_with_shared_neighbor_edge_succeeds` do not catch it. The
+/// failing shape is two edges of *opposite* orientation:
+///
+///   `dup →[alternative_of]→ third`  AND  `third →[alternative_of]→ canonical`
+///
+/// Migrating `dup→canonical` rewrites the first into `canonical→third`, whose
+/// symmetric key {canonical,third} collides with the surviving `third→canonical`
+/// edge. The fix pre-deletes the redundant dup-side `alternative_of` edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_with_shared_alternative_of_edge_succeeds(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, agent, "canonical").await;
+    let dup = seed_claim(&pool, agent, "duplicate").await;
+    let third = seed_claim(&pool, agent, "third").await;
+
+    // Opposite orientations the directional pre-deletes miss.
+    seed_edge(&pool, dup, third, "alternative_of").await;
+    seed_edge(&pool, third, canonical, "alternative_of").await;
+
+    // Before the fix this returned Err(DuplicateKey) / HTTP 500.
+    ClaimRepository::mark_duplicate(
+        &pool,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("mark_duplicate must succeed despite a symmetric alternative_of collision");
+
+    // dup must be retired.
+    let (sup, is_current): (Option<Uuid>, bool) =
+        sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        sup,
+        Some(canonical),
+        "dup.supersedes should point at canonical"
+    );
+    assert!(
+        !is_current,
+        "dup must not be is_current after mark_duplicate"
+    );
+
+    // canonical must remain current.
+    let (canon_current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+        .bind(canonical)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(canon_current, "canonical must remain is_current");
+
+    // Exactly one alternative_of edge survives — the canonical↔third pair.
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM edges WHERE relationship = 'alternative_of'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        total, 1,
+        "the redundant dup-side alternative_of edge should be gone"
+    );
+
+    // No alternative_of edge may remain on the retired dup.
+    let touching_dup: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges WHERE relationship = 'alternative_of' \
+         AND (source_id = $1 OR target_id = $1)",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        touching_dup, 0,
+        "no alternative_of edge should remain on the retired dup"
+    );
+
+    // The canonical↔third symmetric pair must survive exactly once.
+    let canon_third: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges WHERE relationship = 'alternative_of' \
+         AND LEAST(source_id, target_id) = LEAST($1, $2) \
+         AND GREATEST(source_id, target_id) = GREATEST($1, $2)",
+    )
+    .bind(canonical)
+    .bind(third)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        canon_third, 1,
+        "canonical↔third alternative_of pair must survive"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_duplicate_rejects_missing_canonical(pool: PgPool) {
     let agent = seed_agent(&pool).await;

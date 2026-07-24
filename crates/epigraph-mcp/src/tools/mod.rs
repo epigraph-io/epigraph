@@ -11,6 +11,7 @@ pub mod evolve_step;
 pub mod graph;
 pub mod ingestion;
 pub mod lens;
+pub mod link_alternative;
 pub mod link_epistemic;
 pub mod link_hierarchical;
 pub mod matching;

@@ -79,6 +79,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("ingest_document_inline", "claims:write"),
     ("ingest_document_spine", "claims:write"),
     ("ingest_workflow", "claims:write"),
+    ("link_alternative", "claims:write"),
     ("link_epistemic", "claims:write"),
     ("link_hierarchical", "claims:write"),
     ("memorize", "claims:write"),

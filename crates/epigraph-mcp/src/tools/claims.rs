@@ -546,7 +546,30 @@ pub async fn update_with_evidence(
     server: &EpiGraphMcpFull,
     params: UpdateWithEvidenceParams,
 ) -> Result<CallToolResult, McpError> {
-    let claim_id = parse_uuid(&params.claim_id)?;
+    // Two addressing modes, exactly one required: id-mode (`claim_id`) or
+    // name-mode (`canonical_name` + `step_index`), the latter resolved through
+    // the same `executes`-edge walk `report_hierarchical_outcome` uses (#352).
+    let claim_id = if !params.claim_id.trim().is_empty() {
+        if params.canonical_name.is_some() || params.step_index.is_some() {
+            return Err(invalid_params(
+                "provide EITHER claim_id OR (canonical_name + step_index), not both",
+            ));
+        }
+        parse_uuid(params.claim_id.trim())?
+    } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
+        epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, name, idx, true)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"
+                ))
+            })?
+    } else {
+        return Err(invalid_params(
+            "provide a claim to update: either `claim_id`, or both `canonical_name` and `step_index`",
+        ));
+    };
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
 

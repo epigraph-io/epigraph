@@ -522,7 +522,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent on paragraph and atom content hashes (node-level): re-ingesting a full paper after its abstract was ingested is safe — existing nodes dedup and only new content is written. For the two-phase flow that saves LLM atomization cost, use ingest_document_spine first."
+        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent on paragraph and atom content hashes (node-level): re-ingesting a full paper after its abstract was ingested is safe — existing nodes dedup and only new content is written. For AUTHORED records (an ELN entry, run summary, or other content with no external source to quote) omit the top-level source_text: the verbatim guard is then skipped and this is a supported SINGLE-CALL path — structure_source / ingest_document_spine are NOT required and exist only to re-verify EXTRACTED text byte-for-byte. For the two-phase flow that saves LLM atomization cost on extracted papers, use ingest_document_spine first."
     )]
     async fn ingest_document_inline(
         &self,
@@ -533,7 +533,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Deterministically structure raw markdown/plaintext into a verbatim DocumentExtraction (sections + paragraphs as byte-exact source slices, source_text + spans populated, atoms EMPTY). Fill atoms per paragraph and resubmit via ingest_document_inline. Read-only / no DB writes."
+        description = "Deterministically structure raw markdown/plaintext into a verbatim DocumentExtraction (sections + paragraphs as byte-exact source slices, source_text + spans populated, atoms EMPTY). This is for EXTRACTED source text that must be re-verified byte-for-byte; AUTHORED records (ELN entries, run summaries) need no structuring step and can call ingest_document_inline directly with source_text omitted. Fill atoms per paragraph and resubmit via ingest_document_inline. Read-only / no DB writes."
     )]
     async fn structure_source(
         &self,
@@ -551,6 +551,17 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
         tools::link_hierarchical::link_hierarchical(self, params).await
+    }
+
+    #[tool(
+        description = "Promote two existing claims into a mutually-exclusive alternative_of pair — the symmetric edge suggest_alternative_sets tells you to submit but link_epistemic/link_hierarchical cannot create. Direction-agnostic and idempotent on the unordered {claim_a, claim_b} pair (migration 042's symmetric index): re-runs return the existing edge_id with created=false. Optional target_claim_id (the shared target the two claims are rival supporters of) and rationale are validated and stored on the edge. Deliberately inert at write time — the belief effect of an alternative set flows later through CDST max-plausibility combine over the alternative_set view, not a Dempster re-wire here."
+    )]
+    async fn link_alternative(
+        &self,
+        Parameters(params): Parameters<crate::types::LinkAlternativeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::link_alternative::link_alternative(self, params).await
     }
 
     #[tool(

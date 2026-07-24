@@ -726,6 +726,7 @@ pub async fn report_outcome(
         total_steps,
         created_at: chrono::Utc::now(),
         step_claim_id: None,
+        run_label: None,
     };
 
     if let Err(e) = epigraph_db::BehavioralExecutionRepository::create(
@@ -1027,6 +1028,7 @@ pub async fn report_hierarchical_outcome(
                 total_steps: 1,
                 created_at: report_ts,
                 step_claim_id,
+                run_label: None,
             };
             if let Err(e) =
                 epigraph_db::BehavioralExecutionRepository::create(&state.db_pool, row, None).await
@@ -1276,6 +1278,7 @@ pub async fn record_behavioral_execution(
         total_steps: body.total_steps,
         created_at: chrono::Utc::now(),
         step_claim_id: None,
+        run_label: None,
     };
 
     let created = epigraph_db::BehavioralExecutionRepository::create(
