@@ -553,6 +553,7 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
         frame_id: None,
         perspective_id: None,
         graph_expansion_depth: None,
+        exclude_contested: false,
     };
 
     let result = recall_with_context(&server, params).await;
@@ -946,6 +947,7 @@ fn diverse_params_with_pool(
         frame_id: None,
         perspective_id: None,
         graph_expansion_depth: None,
+        exclude_contested: false,
     }
 }
 
@@ -1341,5 +1343,192 @@ async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
     assert!(
         diverse_themes.contains(&theme_a) && diverse_themes.contains(&theme_b),
         "diverse selection should contain both theme_a (relevance) and theme_b (coverage); got {diverse_themes:?}"
+    );
+}
+
+/// F3 (backlog 34d3400d): a contested paragraph hit carries the dispute
+/// annotation through `recall_with_context`, and an uncontested hit on the
+/// same page omits the fields entirely.
+///
+/// This surface keys its post-passes on `paragraph_id` rather than a
+/// `claim_id` field, so it is the one most likely to silently annotate
+/// nothing if the post-pass collects the wrong id — hence a dedicated test
+/// rather than relying on the plain-`recall` coverage.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/dispute", "Dispute test").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+
+    let contested =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "contested para", &pgvec, None).await;
+    let clean =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "clean para", &pgvec, None).await;
+
+    // Two live contesters (differing truth) plus one retracted contester that
+    // must NOT count — the is_current filter is the easiest thing to lose in a
+    // refactor of the post-pass.
+    let strong: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+         VALUES ('strong rebuttal', sha256('strong rebuttal'::bytea), 0.9, $1, true) RETURNING id",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("seed strong contester");
+    let weak: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+         VALUES ('weak rebuttal', sha256('weak rebuttal'::bytea), 0.4, $1, true) RETURNING id",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("seed weak contester");
+    let retracted: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+         VALUES ('retracted rebuttal', sha256('retracted rebuttal'::bytea), 0.9, $1, false)
+         RETURNING id",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("seed retracted contester");
+
+    for (src, rel) in [
+        (strong, "contradicts"),
+        (weak, "refutes"),
+        (retracted, "contradicts"),
+    ] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship)
+             VALUES ($1, $2, 'claim', 'claim', $3)",
+        )
+        .bind(src)
+        .bind(contested)
+        .bind(rel)
+        .execute(&pool)
+        .await
+        .expect("seed dispute edge");
+    }
+
+    let server = build_test_server(pool.clone());
+    let result = recall_with_context_with_pgvec(
+        &server,
+        diverse_params(false, None, None, 10),
+        1536,
+        &pgvec,
+    )
+    .await
+    .expect("recall_with_context ok");
+
+    // Parse as raw JSON, not the typed struct: field ABSENCE is the assertion,
+    // and a typed struct with defaults would mask it.
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("text content");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse JSON");
+    let results = json["results"].as_array().expect("results array");
+
+    let contested_row = results
+        .iter()
+        .find(|r| r["paragraph_id"] == contested.to_string())
+        .expect("contested paragraph returned");
+    assert_eq!(
+        contested_row["dispute_count"],
+        serde_json::json!(2),
+        "two live contesters; the retracted one must not count"
+    );
+    assert_eq!(contested_row["is_contested"], serde_json::json!(true));
+    let ids = contested_row["contesting_claim_ids"]
+        .as_array()
+        .expect("contesting ids present");
+    assert_eq!(
+        ids[0],
+        serde_json::json!(strong.to_string()),
+        "strongest contester ranks first"
+    );
+    assert!(
+        !ids.iter()
+            .any(|v| *v == serde_json::json!(retracted.to_string())),
+        "retracted contester must not be surfaced"
+    );
+
+    let clean_row = results
+        .iter()
+        .find(|r| r["paragraph_id"] == clean.to_string())
+        .expect("uncontested paragraph returned");
+    assert!(
+        clean_row.get("dispute_count").is_none(),
+        "uncontested hit omits dispute_count entirely (byte-identical to pre-F3)"
+    );
+    assert!(
+        clean_row.get("is_contested").is_none(),
+        "uncontested hit omits is_contested"
+    );
+}
+
+/// F5 (backlog 8cbffa0e): `recall_with_context` must write its OWN audit row,
+/// tagged with its own tool name. The plain `recall` path logging is not
+/// evidence that this surface does — they are separate handlers.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_writes_its_own_audit_row(pool: PgPool) {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/audit", "Audit test").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "audited para", &pgvec, None).await;
+
+    let server = build_test_server(pool.clone());
+    let result = recall_with_context_with_pgvec(
+        &server,
+        diverse_params(false, None, None, 10),
+        1536,
+        &pgvec,
+    )
+    .await
+    .expect("recall_with_context ok");
+
+    // The response cites the audit row it wrote.
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("text");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse");
+    let event_id = json["recall_event_id"]
+        .as_str()
+        .expect("recall_event_id must be returned so a caller can cite the retrieval");
+
+    // The write is spawned; poll for it.
+    let mut row: Option<(String, Vec<Uuid>)> = None;
+    for _ in 0..50 {
+        if let Some(r) = sqlx::query!(
+            "SELECT tool, returned_claim_ids FROM recall_events WHERE id = $1::uuid",
+            Uuid::parse_str(event_id).unwrap()
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        {
+            row = Some((r.tool, r.returned_claim_ids));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let (tool, ids) = row.expect("the cited audit row must actually exist");
+    assert_eq!(
+        tool, "recall_with_context",
+        "the row must be attributed to THIS surface, not to plain recall"
+    );
+    assert!(
+        ids.contains(&para),
+        "the audit row records the paragraph ids actually returned"
     );
 }

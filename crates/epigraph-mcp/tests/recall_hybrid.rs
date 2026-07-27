@@ -33,7 +33,8 @@ fn parse_results(result: rmcp::model::CallToolResult) -> serde_json::Value {
         .iter()
         .find_map(|c| c.as_text().map(|t| t.text.clone()))
         .expect("text content");
-    serde_json::from_str(&text).expect("parse Vec<RecallResult> JSON")
+    serde_json::from_str::<serde_json::Value>(&text).expect("parse recall envelope")["results"]
+        .clone()
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -65,6 +66,7 @@ async fn recall_falls_back_to_scope_honoring_lexical_when_embedder_down(pool: Pg
         frame_id: None,
         perspective_id: None,
         include_workflows: false,
+        exclude_contested: false,
     };
     let out = recall(&server, params).await.expect("recall ok");
     let arr = parse_results(out);

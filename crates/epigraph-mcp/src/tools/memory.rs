@@ -400,6 +400,11 @@ async fn recall_post_embed(
                             // claim_id. None until then.
                             lensed_belief: None,
                             result_type: None,
+                            // Populated by the bounded dispute post-pass below
+                            // (backlog 34d3400d), keyed by claim_id.
+                            dispute_count: 0,
+                            is_contested: false,
+                            contesting_claim_ids: Vec::new(),
                         });
                     }
                 }
@@ -419,6 +424,12 @@ async fn recall_post_embed(
                         matched_via: vec!["dense".to_string()],
                         lensed_belief: None,
                         result_type: Some("workflow".to_string()),
+                        // Dispute is a claim-belief concept; workflows are not
+                        // claims, so the post-pass below skips them and these
+                        // stay at their uncontested defaults.
+                        dispute_count: 0,
+                        is_contested: false,
+                        contesting_claim_ids: Vec::new(),
                     });
                 }
             }
@@ -480,7 +491,109 @@ async fn recall_post_embed(
         }
     }
 
-    success_json(&results)
+    // Bounded dispute post-pass (backlog 34d3400d): one batched follow-up query
+    // over the ids this page already returned, NOT a join inside the ANN/RRF
+    // SQL — the signal must not put the HNSW plan at risk. Same shape as the
+    // lens post-pass above: once per page, keyed by claim_id, degrade-not-fail
+    // (a failed dispute lookup serves an unannotated page rather than failing
+    // the recall).
+    //
+    // Ranking is deliberately untouched: per MemSyco-Bench the failure mode is
+    // MISSING signal, not mis-ordering, so dispute informs the caller without
+    // re-ranking behind their back.
+    {
+        let claim_ids: Vec<uuid::Uuid> = results
+            .iter()
+            .filter(|r| r.result_type.is_none()) // workflows aren't claims
+            .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+            .collect();
+        match ClaimRepository::dispute_batch(&server.pool, &claim_ids).await {
+            Ok(mut by_claim) => {
+                for r in &mut results {
+                    let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
+                        continue;
+                    };
+                    // Absent key == uncontested (repo contract), so the
+                    // default 0/false/[] below is the correct reading.
+                    if let Some(d) = by_claim.remove(&cid) {
+                        r.dispute_count = d.dispute_count.max(0) as u32;
+                        r.is_contested = d.dispute_count > 0;
+                        r.contesting_claim_ids = d.contesting_claim_ids;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "dispute batch failed; serving page without dispute annotations"
+                );
+            }
+        }
+
+        // Post-filter, applied AFTER ranking and truncation — so a page whose
+        // hits are contested comes back short rather than back-filling with
+        // worse-ranked material. This matches how `min_truth` already behaves
+        // (merged.truncate(limit) runs before the min_truth drop above).
+        if params.exclude_contested {
+            results.retain(|r| !r.is_contested);
+        }
+    }
+
+    // Id is minted HERE, not read back from the insert: the write is spawned,
+    // so the response must be able to cite the event without awaiting it.
+    let event_id = uuid::Uuid::new_v4();
+
+    // Recall audit log (backlog 8cbffa0e). Fire-and-forget AFTER the response
+    // is fully built: an audit-write failure must never fail, delay, or alter
+    // a recall that already has its results — same best-effort contract as
+    // post-commit embedding. Spawned, so the caller does not wait on it.
+    {
+        let returned_claim_ids: Vec<uuid::Uuid> = results
+            .iter()
+            .filter(|r| r.result_type.is_none()) // claims only; workflows are a different id-space
+            .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+            .collect();
+        // Resolved before the spawn: agent identity comes from the request's
+        // auth context, which does not outlive this call.
+        let agent_id = server.agent_id().await.ok();
+        let event = epigraph_db::NewRecallEvent {
+            id: event_id,
+            agent_id,
+            tool: "recall".to_string(),
+            query_text: params.query.clone(),
+            query_pgvector: pgvec_opt.clone(),
+            params: serde_json::json!({
+                "limit": limit,
+                "min_truth": min_truth,
+                "tags": tags,
+                "agent_filter": agent_filter,
+                "include_workflows": params.include_workflows,
+                "exclude_contested": params.exclude_contested,
+            }),
+            returned_claim_ids,
+        };
+        let pool = server.pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
+                tracing::warn!(error = %e, "recall audit log failed; recall itself unaffected");
+            }
+        });
+    }
+
+    success_json(&RecallEnvelope {
+        results,
+        recall_event_id: Some(event_id.to_string()),
+    })
+}
+
+/// Response envelope carrying the audit-event id alongside the hits, so an
+/// agent can cite which retrieval fed a downstream decision (composes with the
+/// PROV-O layer from PR #334).
+#[derive(serde::Serialize)]
+struct RecallEnvelope {
+    results: Vec<RecallResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recall_event_id: Option<String>,
 }
 
 #[doc(hidden)]

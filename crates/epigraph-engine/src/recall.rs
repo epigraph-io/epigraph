@@ -41,6 +41,14 @@ pub struct RecallResult {
     pub truth_value: f64,
     /// Cosine similarity to the query embedding (0.0 if text-search fallback).
     pub similarity: f64,
+    /// Number of `is_current` claims contesting this one via
+    /// `contradicts`/`refutes` (backlog 34d3400d). `0` when uncontested.
+    pub dispute_count: u32,
+    /// `true` iff `dispute_count > 0`. Surfaced alongside `truth_value`, not
+    /// instead of it — contested does not mean false, it means unsettled.
+    pub is_contested: bool,
+    /// The three strongest contesters (by their own `truth_value`).
+    pub contesting_claim_ids: Vec<uuid::Uuid>,
 }
 
 /// Format a `Vec<f32>` as a pgvector string literal `[a,b,c,...]`.
@@ -77,8 +85,10 @@ pub async fn recall(
     let limit_i64 = limit as i64;
 
     // Try semantic search first.
+    let mut pgvec_for_audit: Option<String> = None;
     let results = if let Ok(embedding) = embedder.generate_query(query).await {
         let pgvec = format_pgvector(&embedding);
+        pgvec_for_audit = Some(pgvec.clone());
         // ANN over `claims.embedding` (is_current, all levels) — NOT
         // `evidence.embedding`, which is a permanently-empty column: searching
         // it made this semantic leg always return nothing and silently starved
@@ -97,6 +107,11 @@ pub async fn recall(
                                 content: claim.content,
                                 truth_value: tv,
                                 similarity: hit.similarity,
+                                // Annotated by the batched dispute post-pass
+                                // below, keyed by claim_id.
+                                dispute_count: 0,
+                                is_contested: false,
+                                contesting_claim_ids: Vec::new(),
                             });
                         }
                     }
@@ -114,7 +129,90 @@ pub async fn recall(
         text_search_fallback(pool, query, limit_i64, min_truth).await?
     };
 
+    let mut results = results;
+    annotate_disputes(pool, &mut results).await;
+
+    // Recall audit log (backlog 8cbffa0e). This is the LIBRARY path — episcience
+    // synthesis calls it directly, with no MCP request and therefore no auth
+    // context, so the row carries agent_id = NULL. Migration 058 made that
+    // column nullable for exactly this caller: a retrieval that fed a synthesis
+    // decision is worth auditing even when no agent identity is attached, and
+    // `tool` still distinguishes it from the MCP surfaces.
+    log_recall_event(
+        pool,
+        query,
+        pgvec_for_audit.as_deref(),
+        limit,
+        min_truth,
+        &results,
+    )
+    .await;
+
     Ok(results)
+}
+
+/// Fire-and-forget recall audit write for the library path.
+///
+/// Best-effort like its MCP siblings: a failed audit write warns and leaves the
+/// already-computed results untouched.
+async fn log_recall_event(
+    pool: &PgPool,
+    query: &str,
+    pgvec: Option<&str>,
+    limit: usize,
+    min_truth: f64,
+    results: &[RecallResult],
+) {
+    let returned_claim_ids: Vec<uuid::Uuid> = results
+        .iter()
+        .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+        .collect();
+    let event = epigraph_db::NewRecallEvent {
+        id: uuid::Uuid::new_v4(),
+        agent_id: None,
+        tool: "engine::recall".to_string(),
+        query_text: query.to_string(),
+        query_pgvector: pgvec.map(ToString::to_string),
+        params: serde_json::json!({ "limit": limit, "min_truth": min_truth }),
+        returned_claim_ids,
+    };
+    if let Err(e) = epigraph_db::RecallEventRepository::log(pool, event).await {
+        tracing::warn!(error = %e, "engine recall audit log failed; recall unaffected");
+    }
+}
+
+/// Batched dispute annotation (backlog 34d3400d), shared by the semantic and
+/// text-fallback paths so the two cannot drift.
+///
+/// Best-effort by design: a dispute-lookup failure warns and serves the page
+/// unannotated rather than failing a recall that already has its results. The
+/// signal informs the caller; it never re-ranks and never gates retrieval.
+async fn annotate_disputes(pool: &PgPool, results: &mut [RecallResult]) {
+    let claim_ids: Vec<uuid::Uuid> = results
+        .iter()
+        .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+        .collect();
+    match ClaimRepository::dispute_batch(pool, &claim_ids).await {
+        Ok(mut by_claim) => {
+            for r in results.iter_mut() {
+                let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
+                    continue;
+                };
+                // Absent key == uncontested, per the repo contract.
+                if let Some(d) = by_claim.remove(&cid) {
+                    r.dispute_count = d.dispute_count.max(0) as u32;
+                    r.is_contested = d.dispute_count > 0;
+                    r.contesting_claim_ids = d.contesting_claim_ids;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "dispute batch failed; serving recall page without dispute annotations"
+            );
+        }
+    }
 }
 
 /// Text-search fallback via `ClaimRepository::list` with `ILIKE` filter.
@@ -133,6 +231,11 @@ async fn text_search_fallback(
             content: c.content,
             truth_value: c.truth_value.value(),
             similarity: 0.0,
+            // Annotated by `annotate_disputes` once the caller has the page —
+            // the fallback path returns into `recall`, which runs the pass.
+            dispute_count: 0,
+            is_contested: false,
+            contesting_claim_ids: Vec::new(),
         })
         .collect())
 }

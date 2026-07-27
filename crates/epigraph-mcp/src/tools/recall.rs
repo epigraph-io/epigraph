@@ -131,6 +131,48 @@ pub struct RecallWithContextParams {
     /// `diverse`/`rerank` — expansion runs on whichever seed pool those
     /// stages already produced.
     pub graph_expansion_depth: Option<u32>,
+    /// When `true`, drop hits that are actively contested (any `is_current`
+    /// claim `contradicts`/`refutes` them). Applied AFTER ranking and context
+    /// enrichment, so a page may come back short rather than back-filling with
+    /// worse-ranked material. Default `false`: contested hits are returned,
+    /// annotated with `dispute_count` / `is_contested` / `contesting_claim_ids`.
+    #[serde(default)]
+    pub exclude_contested: bool,
+}
+
+/// Spawn the fire-and-forget recall audit write (backlog 8cbffa0e).
+///
+/// Shared by the empty-result early return and the main path so the two
+/// cannot drift. A zero-result recall is deliberately logged too: "this query
+/// returned nothing at that time" is exactly the kind of claim an audit needs
+/// to be able to settle.
+///
+/// The id is minted by the caller rather than read back from the insert,
+/// because the write is not awaited.
+fn spawn_recall_audit(
+    server: &EpiGraphMcpFull,
+    event_id: Uuid,
+    agent_id: Option<Uuid>,
+    query: &str,
+    pgvec: &str,
+    params_json: serde_json::Value,
+    returned_claim_ids: Vec<Uuid>,
+) {
+    let event = epigraph_db::NewRecallEvent {
+        id: event_id,
+        agent_id,
+        tool: "recall_with_context".to_string(),
+        query_text: query.to_string(),
+        query_pgvector: Some(pgvec.to_string()),
+        params: params_json,
+        returned_claim_ids,
+    };
+    let pool = server.pool.clone();
+    tokio::spawn(async move {
+        if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
+            tracing::warn!(error = %e, "recall_with_context audit log failed; recall unaffected");
+        }
+    });
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -138,6 +180,11 @@ pub struct RecallWithContextResponse {
     pub results: Vec<RecallHit>,
     pub corpus_scope: CorpusScope,
     pub centroid_dim_used: u32,
+    /// Id of the audit row logged for this retrieval (backlog 8cbffa0e), so a
+    /// caller can cite which recall fed a downstream decision. Omitted when
+    /// the audit write was not attempted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,6 +220,18 @@ pub struct RecallHit {
     pub neighbor_paragraphs: Vec<NeighborParagraph>,
     pub neighbor_paragraphs_total: usize,
     pub neighbor_paragraphs_truncated: bool,
+    /// Number of `is_current` claims contesting this paragraph via
+    /// `contradicts`/`refutes` (backlog 34d3400d). `0` when uncontested.
+    /// Uncapped, unlike `contesting_claim_ids`.
+    #[serde(skip_serializing_if = "crate::types::is_zero_u32")]
+    pub dispute_count: u32,
+    /// `true` iff `dispute_count > 0`. Surfaced ALONGSIDE `truth_value`, not
+    /// instead of it — contested means unsettled, not false.
+    #[serde(skip_serializing_if = "crate::types::is_false")]
+    pub is_contested: bool,
+    /// The three strongest contesters (by their own `truth_value`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub contesting_claim_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -539,10 +598,21 @@ async fn recall_with_context_post_embed(
         let corpus_scope = compute_corpus_scope(&server.pool)
             .await
             .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
+        let event_id = Uuid::new_v4();
+        spawn_recall_audit(
+            server,
+            event_id,
+            server.agent_id().await.ok(),
+            &params.query,
+            pgvec,
+            serde_json::json!({"limit": limit, "min_truth": min_truth, "empty": true}),
+            vec![],
+        );
         return success_json(&RecallWithContextResponse {
             results: vec![],
             corpus_scope,
             centroid_dim_used: centroid_dim,
+            recall_event_id: Some(event_id.to_string()),
         });
     }
 
@@ -758,6 +828,11 @@ async fn recall_with_context_post_embed(
             neighbor_paragraphs,
             neighbor_paragraphs_total,
             neighbor_paragraphs_truncated,
+            // Populated by the bounded dispute post-pass below (after the
+            // loop), once per page, keyed by paragraph_id.
+            dispute_count: 0,
+            is_contested: false,
+            contesting_claim_ids: Vec::new(),
         });
     }
 
@@ -816,14 +891,82 @@ async fn recall_with_context_post_embed(
         }
     }
 
+    // Bounded dispute post-pass (backlog 34d3400d), the same batched shape as
+    // `tools::memory::recall`'s — one follow-up query over the ids this page
+    // already returned, never a join inside the ANN/RRF SQL.
+    //
+    // Keyed on `paragraph_id`: paragraphs ARE claims (level-2 rows in the same
+    // table), so `dispute_batch` takes them directly, exactly as the lens
+    // post-pass above does.
+    //
+    // Scope: TOP-LEVEL hits only. The `atoms`/`siblings`/`corroborates`/
+    // `neighbor_paragraphs` children are context for a hit, not results the
+    // caller is being asked to act on, and annotating them would multiply the
+    // id set by the fan-out of every hit. A caller that needs a child's
+    // dispute status can recall it as a hit in its own right.
+    {
+        let paragraph_ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
+        match epigraph_db::ClaimRepository::dispute_batch(&server.pool, &paragraph_ids).await {
+            Ok(mut by_claim) => {
+                for hit in &mut results {
+                    // Absent key == uncontested, per the repo contract.
+                    if let Some(d) = by_claim.remove(&hit.paragraph_id) {
+                        hit.dispute_count = d.dispute_count.max(0) as u32;
+                        hit.is_contested = d.dispute_count > 0;
+                        hit.contesting_claim_ids = d.contesting_claim_ids;
+                    }
+                }
+            }
+            Err(e) => {
+                // Degrade-not-fail, matching the lens contract above: serve the
+                // page unannotated rather than lose results already retrieved.
+                tracing::warn!(
+                    error = %e,
+                    "dispute batch failed; serving page without dispute annotations"
+                );
+            }
+        }
+
+        // Post-filter after ranking/enrichment — a page may come back short
+        // rather than back-fill with worse-ranked material (same precedent as
+        // `min_truth`).
+        if params.exclude_contested {
+            results.retain(|h| !h.is_contested);
+        }
+    }
+
     let corpus_scope = compute_corpus_scope(&server.pool)
         .await
         .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
+
+    // Recall audit log (backlog 8cbffa0e) — same fire-and-forget contract as
+    // `tools::memory::recall`: spawned after the response is assembled so an
+    // audit failure can never fail or delay a retrieval that already
+    // succeeded. Id is minted here rather than read back from the insert.
+    let event_id = Uuid::new_v4();
+    spawn_recall_audit(
+        server,
+        event_id,
+        server.agent_id().await.ok(),
+        &params.query,
+        pgvec,
+        serde_json::json!({
+            "limit": limit,
+            "min_truth": min_truth,
+            "centroid_dim": centroid_dim,
+            "diverse": params.diverse,
+            "rerank": params.rerank,
+            "graph_expansion_depth": params.graph_expansion_depth,
+            "exclude_contested": params.exclude_contested,
+        }),
+        results.iter().map(|h| h.paragraph_id).collect(),
+    );
 
     success_json(&RecallWithContextResponse {
         results,
         corpus_scope,
         centroid_dim_used: centroid_dim,
+        recall_event_id: Some(event_id.to_string()),
     })
 }
 

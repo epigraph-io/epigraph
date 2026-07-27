@@ -46,7 +46,9 @@ pub mod pattern_template;
 pub mod perspective;
 pub mod political;
 pub mod provenance;
+pub mod provenance_chain;
 pub mod re_encryption_key;
+pub mod recall_event;
 pub mod refresh_token;
 pub mod scoped_belief;
 pub mod security_event;
@@ -66,9 +68,10 @@ pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    ClaimBeliefColumns, ClaimEmbeddingHit, ClaimPairDistance, ClaimRepository, EvolveStepResult,
-    GraphExpansionHit, HybridHit, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
-    EXPANSION_RELATIONSHIPS,
+    ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimNeighbor, ClaimPairDistance,
+    ClaimRepository, ConsolidateMode, ConsolidateResult, EvolveStepResult, GraphExpansionHit,
+    HybridHit, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SweepCandidate,
+    CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
@@ -104,6 +107,13 @@ pub use perspective::PerspectiveRepository;
 pub use political::{
     AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,
     PropagandaTechniqueRow, PropagationStepRow, TimelineClaimRow,
+};
+pub use provenance_chain::{
+    ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge, ProvenanceNode, MAX_CHAIN_NODES,
+    PROVENANCE_INCOMING, PROVENANCE_OUTGOING,
+};
+pub use recall_event::{
+    NewRecallEvent, RecallEventRepository, RecallEventRow, DEFAULT_RETENTION_DAYS,
 };
 pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;

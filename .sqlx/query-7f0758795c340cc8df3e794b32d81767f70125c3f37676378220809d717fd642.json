@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE claims\n            SET supersedes = $1, is_current = false, embedding = NULL, updated_at = NOW()\n            WHERE id = ANY($2)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7f0758795c340cc8df3e794b32d81767f70125c3f37676378220809d717fd642"
+}

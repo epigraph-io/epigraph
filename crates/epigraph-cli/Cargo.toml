@@ -91,6 +91,11 @@ path = "src/bin/decompose_claims.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "prune_recall_events"
+path = "src/bin/prune_recall_events.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "embed_backfill"
 path = "src/bin/embed_backfill.rs"
 required-features = ["db"]

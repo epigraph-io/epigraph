@@ -550,6 +550,65 @@ impl EpiGraphMcpFull {
         tools::provenance::get_provenance(self, params).await
     }
 
+    #[tool(
+        description = "Trace the full derivation chain behind a conclusion claim in ONE call \
+                       — walks supports/corroborates/elaborates/decomposes_to backwards and \
+                       supersedes forwards, returning nodes in topological order (evidence \
+                       first, conclusion last) plus the connecting edges. Cycles are reported, \
+                       not errors; superseded ancestors are included and flagged."
+    )]
+    async fn get_provenance_chain(
+        &self,
+        Parameters(params): Parameters<crate::types::GetProvenanceChainParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::provenance_chain::get_provenance_chain(self, params).await
+    }
+
+    #[tool(
+        description = "Query the recall audit log — which claims a recall query returned, \
+                       for which agent, when. Filter by claim_id to answer 'which queries \
+                       ever surfaced this claim?'. query_embedding_hash distinguishes a \
+                       corpus change from an embedder change when a replayed query differs."
+    )]
+    async fn get_recall_events(
+        &self,
+        Parameters(params): Parameters<crate::types::GetRecallEventsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::recall_events::get_recall_events(self, params).await
+    }
+
+    #[tool(
+        description = "Consolidate 2..=20 near-duplicate claims into ONE caller-synthesized \
+                       claim. Each source is retired with a forwarding pointer to the merged \
+                       claim, its edges migrated (cross-source duplicates collapsed so \
+                       Dempster-Shafer mass is not double-counted), and lineage recorded as \
+                       supersedes edges plus properties.merge. The caller supplies \
+                       merged_content; the server never calls an LLM."
+    )]
+    async fn consolidate_claims(
+        &self,
+        Parameters(params): Parameters<crate::types::ConsolidateClaimsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::consolidate::consolidate_claims(self, params).await
+    }
+
+    #[tool(
+        description = "Sweep a page of the corpus for semantic near-duplicates, clustering them \
+                       with union-find and picking a survivor per cluster (highest truth, \
+                       earliest wins ties). DRY RUN BY DEFAULT. Exact restatements are \
+                       collapsed via mark_duplicate when dry_run=false; clusters that merely \
+                       resemble each other are returned as merge_candidates for \
+                       consolidate_claims so no wording is discarded. Resumable via offset."
+    )]
+    async fn sweep_semantic_duplicates(
+        &self,
+        Parameters(params): Parameters<crate::types::SweepSemanticDuplicatesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::dedup_sweep::sweep_semantic_duplicates(self, params).await
+    }
+
     // ── Alternative-set candidate finder (1 tool) ──
 
     #[tool(

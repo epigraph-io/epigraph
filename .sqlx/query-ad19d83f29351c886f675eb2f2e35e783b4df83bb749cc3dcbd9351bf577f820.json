@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT e.target_id,\n                   COUNT(*) AS \"dispute_count!\",\n                   (array_agg(e.source_id ORDER BY src.truth_value DESC, src.id))[1:3]\n                       AS \"contesting_claim_ids!\"\n            FROM edges e\n            JOIN claims src ON src.id = e.source_id AND src.is_current\n            WHERE e.target_id = ANY($1)\n              AND e.source_type = 'claim' AND e.target_type = 'claim'\n              AND e.relationship IN ('contradicts', 'refutes')\n            GROUP BY e.target_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "dispute_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "contesting_claim_ids!",
+        "type_info": "UuidArray"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "ad19d83f29351c886f675eb2f2e35e783b4df83bb749cc3dcbd9351bf577f820"
+}

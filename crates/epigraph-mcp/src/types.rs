@@ -299,6 +299,122 @@ pub struct GetProvenanceParams {
     pub claim_id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SweepSemanticDuplicatesParams {
+    #[schemars(
+        description = "Cosine DISTANCE below which two claims are near-duplicates \
+                       (0.0 = identical). Default 0.10."
+    )]
+    #[serde(default)]
+    pub similarity_threshold: Option<f64>,
+
+    #[schemars(
+        description = "Restrict the sweep to these agent UUIDs. Default: cross-agent — the \
+                       duplicate corpus spans 20+ agents, so scoping to one usually misses \
+                       the duplicates."
+    )]
+    #[serde(default)]
+    pub agent_scope: Option<Vec<String>>,
+
+    #[schemars(description = "Restrict the sweep to claims carrying ALL these labels.")]
+    #[serde(default)]
+    pub labels_scope: Option<Vec<String>>,
+
+    #[schemars(
+        description = "When true (the DEFAULT), report clusters without mutating anything. \
+                       Set false to actually collapse exact-restatement clusters."
+    )]
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+
+    #[schemars(description = "Claims scanned this call (default 500, capped 2000).")]
+    #[serde(default)]
+    pub limit: Option<i64>,
+
+    #[schemars(description = "Resume offset for paging through the corpus (default 0).")]
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ConsolidateClaimsParams {
+    #[schemars(
+        description = "UUIDs of the 2..=20 is_current claims to merge. Each is retired with a \
+                       forwarding pointer to the merged claim."
+    )]
+    pub source_claim_ids: Vec<String>,
+
+    #[schemars(
+        description = "The synthesized replacement text. The CALLER synthesizes this — the \
+                       server never invokes an LLM."
+    )]
+    pub merged_content: String,
+
+    #[schemars(description = "One of: merge | abstract | rewrite.")]
+    pub mode: String,
+
+    #[schemars(description = "Why these claims were consolidated; recorded on the lineage edges.")]
+    pub reason: String,
+
+    #[schemars(
+        description = "Confidence for the merged claim. Defaults to the highest source \
+                       truth_value * 0.95, so a merge never claims more certainty than its \
+                       best input."
+    )]
+    #[serde(default)]
+    pub confidence: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetRecallEventsParams {
+    #[schemars(description = "Only events logged by this agent UUID.")]
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
+    #[schemars(
+        description = "Only events whose result set CONTAINED this claim UUID — \
+                       'which queries ever surfaced this claim?'"
+    )]
+    #[serde(default)]
+    pub claim_id: Option<String>,
+
+    #[schemars(description = "Only events at or after this RFC3339 timestamp.")]
+    #[serde(default)]
+    pub since: Option<String>,
+
+    #[schemars(description = "Only events at or before this RFC3339 timestamp.")]
+    #[serde(default)]
+    pub until: Option<String>,
+
+    #[schemars(description = "Max events to return (default 50, capped at 500).")]
+    #[serde(default)]
+    pub limit: Option<i64>,
+
+    #[schemars(description = "Skip this many events (default 0).")]
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetProvenanceChainParams {
+    #[schemars(description = "The UUID of the conclusion claim to trace backwards from")]
+    pub claim_id: String,
+
+    #[schemars(description = "How many derivation hops to walk. Clamped to 1..=8. Default 4.")]
+    #[serde(default)]
+    pub max_depth: Option<u8>,
+
+    #[schemars(
+        description = "Restrict the traversal to these relationships. Default: \
+                       supports, corroborates, elaborates, decomposes_to, supersedes. \
+                       Traversal DIRECTION per relationship is fixed by the schema \
+                       (supersedes is followed outgoing, the rest incoming) and is not \
+                       caller-selectable."
+    )]
+    #[serde(default)]
+    pub relationships: Option<Vec<String>>,
+}
+
 // ── Memory ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -368,6 +484,16 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub include_workflows: bool,
+
+    #[schemars(
+        description = "When true, drop claims that are actively contested (any is_current claim \
+                       contradicts/refutes them) from the results. Applied AFTER ranking, so a \
+                       page may come back short rather than back-filling with worse-ranked hits. \
+                       Default false: contested claims are returned, annotated with dispute_count \
+                       / is_contested / contesting_claim_ids."
+    )]
+    #[serde(default)]
+    pub exclude_contested: bool,
 }
 
 // ── Ingestion ──
@@ -970,6 +1096,38 @@ pub struct RecallResult {
     /// byte-identical to pre-existing output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_type: Option<String>,
+
+    /// Number of `is_current` claims contesting this one via
+    /// `contradicts`/`refutes` (backlog 34d3400d). `0` when uncontested.
+    /// Uncapped, unlike `contesting_claim_ids` — `30` and `3` are
+    /// distinguishable.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub dispute_count: u32,
+
+    /// `true` iff `dispute_count > 0`. Surfaced alongside `truth_value`, never
+    /// instead of it: a contested claim is not necessarily false, it is
+    /// claim the caller should not treat as settled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_contested: bool,
+
+    /// The three strongest contesters (by their own `truth_value`), so a
+    /// caller can surface the counter-evidence without a second round-trip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contesting_claim_ids: Vec<uuid::Uuid>,
+}
+
+/// `skip_serializing_if` helper: keeps an uncontested hit byte-identical to
+/// pre-F3 recall output (the field is omitted, not emitted as `0`).
+///
+/// Shared with `tools::recall`'s `RecallHit` so both dispute-annotated
+/// surfaces omit-on-default identically.
+pub(crate) fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// `skip_serializing_if` helper — see [`is_zero_u32`].
+pub(crate) fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Serialize)]
