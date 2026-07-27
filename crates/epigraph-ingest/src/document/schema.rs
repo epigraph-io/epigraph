@@ -37,6 +37,14 @@ pub struct DocumentSource {
     pub title: String,
     #[serde(default)]
     pub doi: Option<String>,
+    /// Caller-supplied stable identity for a document that has no DOI — an ELN
+    /// entry, a run summary, an internal report. When `doi` is absent (or a
+    /// placeholder like `"unknown"`), this is what the document's identity key
+    /// is derived from, so re-ingesting the same record converges on one node
+    /// while unrelated records stay distinct. Prefer this over `doi: "unknown"`
+    /// for any `source_type` that has no external identifier (issue #356).
+    #[serde(default)]
+    pub external_id: Option<String>,
     #[serde(default)]
     pub uri: Option<String>,
     #[serde(default)]
