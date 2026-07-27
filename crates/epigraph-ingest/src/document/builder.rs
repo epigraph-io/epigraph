@@ -73,6 +73,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
             confidence: 1.0,
             methodology: None,
             evidence_type: None,
+            axis: None,
             supporting_text: None,
             enrichment: serde_json::json!({}),
         });
@@ -105,6 +106,9 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
             confidence: 1.0,
             methodology: None,
             evidence_type: None,
+            // Structural spine nodes (thesis, section) are not DS-wired, so an
+            // axis on them would have nothing to place.
+            axis: None,
             supporting_text: None,
             enrichment: serde_json::json!({}),
         });
@@ -131,6 +135,25 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 paragraph.evidence_type.as_deref(),
             );
 
+            // Declared labeled axis (issue #222), from the paragraph or
+            // inherited from its section, plus per-atom label overrides.
+            //
+            // `build_ingest_plan` is infallible by contract, and
+            // `axis::validate_axes` is the gate that rejects a malformed
+            // declaration with a path-qualified message — every write path calls
+            // it first. A failure here therefore means a caller bypassed the
+            // gate: assert loudly in dev/test, and in release fall back to the
+            // binary default rather than panicking mid-plan.
+            let resolved = crate::document::axis::resolve_paragraph_axes(paragraph, section);
+            debug_assert!(
+                resolved.is_ok(),
+                "unvalidated axis at {para_path}: {:?} — call axis::validate_axes before \
+                 build_ingest_plan",
+                resolved.as_ref().err()
+            );
+            let (para_axis, atom_axes) =
+                resolved.unwrap_or_else(|_| (None, vec![None; paragraph.atoms.len()]));
+
             claims.push(PlannedClaim {
                 id: para_id,
                 content: paragraph.text.clone(),
@@ -145,6 +168,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 confidence: paragraph.confidence,
                 methodology: paragraph.methodology.clone(),
                 evidence_type: para_evidence_type.clone(),
+                axis: para_axis,
                 supporting_text: Some(paragraph.text.clone()),
                 enrichment: enrichment.clone(),
             });
@@ -177,6 +201,9 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                     confidence: paragraph.confidence,
                     methodology: paragraph.methodology.clone(),
                     evidence_type: para_evidence_type.clone(),
+                    // Atoms are the DS-wired units, so this is the placement
+                    // that actually reaches a mass function.
+                    axis: atom_axes.get(ai).cloned().flatten(),
                     supporting_text: Some(paragraph.text.clone()),
                     enrichment: enrichment.clone(),
                 });

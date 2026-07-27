@@ -4,6 +4,19 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Resolved axis placement for one planned claim (issue #222): the frame to
+/// wire its BBA on, and which hypothesis index within that frame it asserts.
+///
+/// Produced from an `AxisDeclaration` after validation, so `hypothesis_index`
+/// is guaranteed to be in range for `hypotheses` and `hypotheses.len() >= 2`.
+/// `None` on a `PlannedClaim` means the default binary `{TRUE, FALSE}` frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedAxis {
+    pub frame: String,
+    pub hypotheses: Vec<String>,
+    pub hypothesis_index: usize,
+}
+
 /// A planned claim to be persisted.
 #[derive(Debug, Clone)]
 pub struct PlannedClaim {
@@ -15,6 +28,8 @@ pub struct PlannedClaim {
     pub confidence: f64,
     pub methodology: Option<String>,
     pub evidence_type: Option<String>,
+    /// Declared labeled axis this claim sits on, or `None` for `binary_truth`.
+    pub axis: Option<PlannedAxis>,
     pub supporting_text: Option<String>,
     pub enrichment: serde_json::Value,
 }

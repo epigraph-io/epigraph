@@ -55,6 +55,11 @@ fn structured_doc_to_extraction(doc: StructuredDoc, source: DocumentSource) -> D
                 start: h.start,
                 end: h.end,
             }),
+            // Deterministic structuring cannot infer a labeled axis from raw
+            // bytes (issue #222). The agent adds `axis` to the paragraphs (or
+            // sections) it wants placed on one before resubmitting via
+            // `ingest_document_inline`.
+            axis: None,
             paragraphs: s
                 .paragraphs
                 .into_iter()
@@ -69,6 +74,8 @@ fn structured_doc_to_extraction(doc: StructuredDoc, source: DocumentSource) -> D
                     confidence: 0.8,
                     methodology: Some("verbatim_structurer".to_string()),
                     evidence_type: None,
+                    axis: None,
+                    axis_labels: Vec::new(),
                     page: None,
                     instruments_used: Vec::new(),
                     reagents_involved: Vec::new(),
@@ -355,6 +362,12 @@ pub async fn do_ingest_document(
     epigraph_ingest::document::structure::verify_extraction_verbatim(extraction)
         .map_err(|e| invalid_params(format!("verbatim guard failed: {e}")))?;
 
+    // Declared-axis guard (issue #222): reject a malformed axis before any DB
+    // write. Fail closed — silently degrading to the binary frame would record a
+    // belief about TRUE for a claim the caller placed on a labeled hypothesis.
+    epigraph_ingest::document::axis::validate_axes(extraction)
+        .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
+
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
     let agent_id = server.agent_id().await?;
@@ -630,6 +643,8 @@ pub async fn do_ingest_document(
                 confidence,
                 weight,
                 evidence_type: planned.evidence_type.clone(),
+                // Declared labeled axis, or None for the binary frame (#222).
+                axis: planned.axis.clone(),
             });
         }
 
@@ -781,9 +796,7 @@ const SYNTHETIC_KEY_PREFIX: &str = "urn:epigraph:doc:";
 /// not as an identity: keying on them collapsed every DOI-less document onto a
 /// single shared `papers` row (issue #356 — one node had accrued 1244 claims
 /// from at least four unrelated sources, with their author lists unioned).
-const DOI_PLACEHOLDERS: [&str; 8] = [
-    "unknown", "n/a", "na", "none", "null", "nil", "-", "tbd",
-];
+const DOI_PLACEHOLDERS: [&str; 8] = ["unknown", "n/a", "na", "none", "null", "nil", "-", "tbd"];
 
 /// True when `s` is empty/whitespace or one of the [`DOI_PLACEHOLDERS`].
 fn is_placeholder_id(s: &str) -> bool {
@@ -960,6 +973,12 @@ pub async fn do_ingest_document_spine(
 ) -> Result<CallToolResult, McpError> {
     epigraph_ingest::document::structure::verify_extraction_verbatim(extraction)
         .map_err(|e| invalid_params(format!("verbatim guard failed: {e}")))?;
+
+    // Declared-axis guard (issue #222): reject a malformed axis before any DB
+    // write. Fail closed — silently degrading to the binary frame would record a
+    // belief about TRUE for a claim the caller placed on a labeled hypothesis.
+    epigraph_ingest::document::axis::validate_axes(extraction)
+        .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
@@ -1457,10 +1476,7 @@ mod tests {
     fn arxiv_uri_still_resolves_to_arxiv_doi() {
         let mut s = src("A preprint");
         s.uri = Some("https://arxiv.org/abs/2606.04990".to_string());
-        assert_eq!(
-            resolve_doi(&extraction_of(s)),
-            "10.48550/arXiv.2606.04990"
-        );
+        assert_eq!(resolve_doi(&extraction_of(s)), "10.48550/arXiv.2606.04990");
     }
 
     /// The core of #356: two unrelated DOI-less documents must NOT share a key.
@@ -1537,7 +1553,10 @@ mod tests {
     fn placeholder_external_id_falls_back_to_metadata() {
         let mut a = src("Report X");
         a.external_id = Some("unknown".to_string());
-        assert_eq!(resolve_doi(&extraction_of(a)), resolve_doi(&extraction_of(src("Report X"))));
+        assert_eq!(
+            resolve_doi(&extraction_of(a)),
+            resolve_doi(&extraction_of(src("Report X")))
+        );
     }
 
     /// Authors participate in metadata-derived identity, so the two documents

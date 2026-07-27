@@ -96,6 +96,9 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
                 confidence: c.confidence.clamp(0.0, 1.0),
                 weight: epigraph_core::Methodology::Extraction.weight_modifier(),
                 evidence_type: c.evidence_type.clone(),
+                // Workflow steps carry no axis declaration; the workflow builder
+                // always plans `axis: None`, so this is the binary frame (#222).
+                axis: c.axis.clone(),
             })
             .collect();
         if !ds_entries.is_empty() {

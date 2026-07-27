@@ -54,6 +54,9 @@ pub struct BatchDsEntry {
     /// (per-perspective) can key reliability on it. `None` → untagged BBA
     /// (falls back to the stored `source_strength` / α = 1.0).
     pub evidence_type: Option<String>,
+    /// Declared labeled axis to place this claim on (issue #222). `None` → the
+    /// canonical binary `{TRUE, FALSE}` frame, i.e. today's behaviour.
+    pub axis: Option<epigraph_ingest::common::plan::PlannedAxis>,
 }
 
 /// Canonical binary frame name.
@@ -65,32 +68,63 @@ const BINARY_HYPOTHESES: [&str; 2] = ["TRUE", "FALSE"];
 ///
 /// Handles race conditions: get → create → fallback get.
 pub async fn ensure_binary_frame(pool: &PgPool) -> Result<Uuid, String> {
-    // Fast path: frame already exists
-    if let Some(row) = FrameRepository::get_by_name(pool, BINARY_FRAME_NAME)
+    let hyps: Vec<String> = BINARY_HYPOTHESES.iter().map(|s| (*s).to_string()).collect();
+    ensure_axis_frame(
+        pool,
+        BINARY_FRAME_NAME,
+        &hyps,
+        Some("Canonical binary frame: {TRUE, FALSE}"),
+    )
+    .await
+}
+
+/// Get-or-create a frame by name over `hypotheses` — the generalization of
+/// [`ensure_binary_frame`] to any declared labeled axis (issue #222).
+///
+/// Frames dedupe by NAME (the DB has a unique index on it), so an existing frame
+/// under this name is reused. Its stored hypotheses must match `hypotheses`
+/// exactly, including order: the index a label resolves to is positional, so
+/// reusing a same-named frame with a different list would silently place claims
+/// on a different hypothesis than the caller declared. That mismatch is an error.
+///
+/// Handles the create race the same way as before: get → create → fallback get.
+pub async fn ensure_axis_frame(
+    pool: &PgPool,
+    name: &str,
+    hypotheses: &[String],
+    description: Option<&str>,
+) -> Result<Uuid, String> {
+    // Fast path: frame already exists — verify the axis agrees before reuse.
+    if let Some(row) = FrameRepository::get_by_name(pool, name)
         .await
         .map_err(|e| format!("get_by_name: {e}"))?
     {
+        if row.hypotheses != hypotheses {
+            return Err(format!(
+                "frame {name:?} already exists over {:?}, but this claim declares {hypotheses:?}; \
+                 a frame name denotes one ordered axis (issue #222)",
+                row.hypotheses
+            ));
+        }
         return Ok(row.id);
     }
 
-    // Create it
-    let hyps: Vec<String> = BINARY_HYPOTHESES.iter().map(|s| (*s).to_string()).collect();
-    match FrameRepository::create(
-        pool,
-        BINARY_FRAME_NAME,
-        Some("Canonical binary frame: {TRUE, FALSE}"),
-        &hyps,
-    )
-    .await
-    {
+    match FrameRepository::create(pool, name, description, hypotheses).await {
         Ok(row) => Ok(row.id),
         Err(_) => {
-            // Race: another connection created it first — re-fetch
-            FrameRepository::get_by_name(pool, BINARY_FRAME_NAME)
+            // Race: another connection created it first — re-fetch and re-verify.
+            let row = FrameRepository::get_by_name(pool, name)
                 .await
                 .map_err(|e| format!("fallback get_by_name: {e}"))?
-                .map(|r| r.id)
-                .ok_or_else(|| "binary_truth frame missing after create attempt".to_string())
+                .ok_or_else(|| format!("frame {name:?} missing after create attempt"))?;
+            if row.hypotheses != hypotheses {
+                return Err(format!(
+                    "frame {name:?} was concurrently created over {:?}, but this claim declares \
+                     {hypotheses:?}",
+                    row.hypotheses
+                ));
+            }
+            Ok(row.id)
         }
     }
 }
@@ -113,8 +147,24 @@ fn build_binary_bba(
     weight: f64,
     supports: bool,
 ) -> Result<MassFunction, String> {
-    let mass = (confidence * weight).clamp(0.01, 0.99);
     let idx = usize::from(!supports); // 0=TRUE, 1=FALSE
+    build_bba_on_index(frame, confidence, weight, idx)
+}
+
+/// Simple-support BBA placing `m({idx}) = (confidence*weight).clamp(0.01, 0.99)`
+/// with the remainder on Θ — [`build_binary_bba`] generalized to any hypothesis
+/// index on any frame (issue #222).
+///
+/// Same mass SHAPE as the binary case, just aimed at the declared label instead
+/// of TRUE/FALSE, so all the discounting and combination behaviour downstream is
+/// unchanged.
+fn build_bba_on_index(
+    frame: &FrameOfDiscernment,
+    confidence: f64,
+    weight: f64,
+    idx: usize,
+) -> Result<MassFunction, String> {
+    let mass = (confidence * weight).clamp(0.01, 0.99);
     MassFunction::simple(frame.clone(), BTreeSet::from([idx]), mass)
         .map_err(|e| format!("build BBA: {e}"))
 }
@@ -149,12 +199,33 @@ fn binary_frame() -> Result<FrameOfDiscernment, String> {
         .map_err(|e| format!("binary frame: {e}"))
 }
 
+/// Construct a `FrameOfDiscernment` for a declared axis (issue #222).
+fn axis_frame(name: &str, hypotheses: &[String]) -> Result<FrameOfDiscernment, String> {
+    FrameOfDiscernment::new(name.to_string(), hypotheses.to_vec())
+        .map_err(|e| format!("axis frame {name:?}: {e}"))
+}
+
 /// Compute Bel/Pl/BetP for hypothesis 0 (TRUE) from a combined mass function.
 fn compute_measures(combined: &MassFunction) -> (Prob, Prob, Prob, Prob, Prob) {
-    let target = FocalElement::positive(BTreeSet::from([0_usize])); // TRUE
+    compute_measures_on_index(combined, 0)
+}
+
+/// Compute Bel/Pl/BetP for an arbitrary hypothesis index (issue #222).
+///
+/// On the binary frame `idx` is 0 and this is exactly [`compute_measures`]. On a
+/// declared axis it must be the index the claim asserts — reporting Bel(index 0)
+/// for a claim placed on `moderate` would cache a belief about `ineffective`.
+/// This matches how the read side already behaves:
+/// `epigraph_engine::belief_query` targets the claim's stored
+/// `claim_frames.hypothesis_index`.
+fn compute_measures_on_index(
+    combined: &MassFunction,
+    idx: usize,
+) -> (Prob, Prob, Prob, Prob, Prob) {
+    let target = FocalElement::positive(BTreeSet::from([idx]));
     let bel = measures::belief(combined, &target);
     let pl = measures::plausibility(combined, &target);
-    let betp = measures::pignistic_probability(combined, 0);
+    let betp = measures::pignistic_probability(combined, idx);
     let conflict = combined.mass_of_conflict();
     let missing = combined.mass_of_missing();
     (bel, pl, betp, conflict, missing)
@@ -474,8 +545,14 @@ pub async fn auto_wire_ds_update(
 
 /// Auto-wire DS for a **batch** of new claims (used by ingestion).
 ///
-/// Gets the frame once, then wires each claim sequentially. Individual
-/// failures are logged and skipped.
+/// Resolves the binary frame once and each declared axis frame once (cached by
+/// name), then wires each claim sequentially. Individual failures are logged and
+/// skipped.
+///
+/// The returned `Uuid` is the `binary_truth` frame — the batch's default frame,
+/// and what `ds_frame_id` on the ingest response has always meant. Claims placed
+/// on a declared axis (issue #222) are wired on their own frame; read those back
+/// per claim via `claim_frames` rather than from this single id.
 pub async fn auto_wire_ds_batch(
     pool: &PgPool,
     entries: &[BatchDsEntry],
@@ -485,12 +562,45 @@ pub async fn auto_wire_ds_batch(
         return Err("empty batch".to_string());
     }
 
-    let frame_id = ensure_binary_frame(pool).await?;
-    let frame = binary_frame()?;
+    let binary_frame_id = ensure_binary_frame(pool).await?;
+    let binary = binary_frame()?;
+    // Axis frames resolved on first use, keyed by frame name. Keeps a sweep of N
+    // atoms on one axis to a single get-or-create round trip, as the binary path
+    // has always had.
+    let mut axis_frames: std::collections::HashMap<String, (Uuid, FrameOfDiscernment)> =
+        std::collections::HashMap::new();
     let mut wired = 0_usize;
 
     for entry in entries {
-        if let Err(e) = wire_single_batch_entry(pool, &frame, frame_id, entry, agent_id).await {
+        let resolved = match &entry.axis {
+            None => Ok((binary_frame_id, binary.clone(), 0_usize)),
+            Some(axis) => match axis_frames.get(&axis.frame) {
+                Some((id, frame)) => Ok((*id, frame.clone(), axis.hypothesis_index)),
+                None => match ensure_axis_frame(pool, &axis.frame, &axis.hypotheses, None).await {
+                    Err(e) => Err(e),
+                    Ok(id) => match axis_frame(&axis.frame, &axis.hypotheses) {
+                        Err(e) => Err(e),
+                        Ok(frame) => {
+                            axis_frames.insert(axis.frame.clone(), (id, frame.clone()));
+                            Ok((id, frame, axis.hypothesis_index))
+                        }
+                    },
+                },
+            },
+        };
+        let (frame_id, frame, idx) = match resolved {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    claim_id = %entry.claim_id,
+                    "ds_auto batch skip (axis frame): {e}"
+                );
+                continue;
+            }
+        };
+
+        if let Err(e) = wire_single_batch_entry(pool, &frame, frame_id, idx, entry, agent_id).await
+        {
             tracing::warn!(
                 claim_id = %entry.claim_id,
                 "ds_auto batch skip: {e}"
@@ -500,21 +610,29 @@ pub async fn auto_wire_ds_batch(
         wired += 1;
     }
 
-    Ok((frame_id, wired))
+    Ok((binary_frame_id, wired))
 }
 
 /// Wire a single claim in a batch context (frame already resolved).
+///
+/// `hypothesis_index` is the hypothesis the claim asserts — 0 (TRUE) on the
+/// binary frame, or the declared label's index on an axis (issue #222). It is
+/// both the BBA's focal element and the `claim_frames.hypothesis_index` the
+/// belief readers target.
 async fn wire_single_batch_entry(
     pool: &PgPool,
     frame: &FrameOfDiscernment,
     frame_id: Uuid,
+    hypothesis_index: usize,
     entry: &BatchDsEntry,
     agent_id: Uuid,
 ) -> Result<(), String> {
-    let bba = build_binary_bba(frame, entry.confidence, entry.weight, true)?;
+    let bba = build_bba_on_index(frame, entry.confidence, entry.weight, hypothesis_index)?;
     let masses_json = mass_to_json(&bba)?;
 
-    FrameRepository::assign_claim(pool, entry.claim_id, frame_id, Some(0))
+    let idx_i32 = i32::try_from(hypothesis_index)
+        .map_err(|_| format!("hypothesis_index {hypothesis_index} out of range"))?;
+    FrameRepository::assign_claim(pool, entry.claim_id, frame_id, Some(idx_i32))
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
 
@@ -552,4 +670,173 @@ async fn wire_single_batch_entry(
         .map_err(|e| format!("recompute initial cache: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn potency_frame() -> FrameOfDiscernment {
+        axis_frame(
+            "anxiolytic_potency",
+            &[
+                "ineffective".to_string(),
+                "mild".to_string(),
+                "moderate".to_string(),
+                "strong".to_string(),
+            ],
+        )
+        .expect("4-hypothesis frame")
+    }
+
+    /// The generalized builder must reproduce the binary builder exactly on the
+    /// binary frame — the backward-compatibility guarantee for issue #222.
+    #[test]
+    fn binary_builder_is_the_index_builder_at_0_and_1() {
+        let frame = binary_frame().expect("binary frame");
+        for (supports, idx) in [(true, 0_usize), (false, 1_usize)] {
+            let via_binary = build_binary_bba(&frame, 0.8, 0.9, supports).expect("binary BBA");
+            let via_index = build_bba_on_index(&frame, 0.8, 0.9, idx).expect("indexed BBA");
+            assert_eq!(
+                mass_to_json(&via_binary).expect("json"),
+                mass_to_json(&via_index).expect("json"),
+                "supports={supports} must equal index {idx}"
+            );
+        }
+    }
+
+    /// Mass lands on the DECLARED hypothesis, with the remainder on Θ — the same
+    /// simple-support shape the binary path uses, just aimed elsewhere.
+    #[test]
+    fn axis_bba_places_mass_on_the_declared_index() {
+        let frame = potency_frame();
+        let bba = build_bba_on_index(&frame, 0.8, 0.9, 2).expect("BBA on 'moderate'");
+        let expected = (0.8_f64 * 0.9).clamp(0.01, 0.99);
+
+        let on_moderate = bba.mass_of(&FocalElement::positive(BTreeSet::from([2_usize])));
+        assert!(
+            (on_moderate - expected).abs() < 1e-12,
+            "m({{moderate}}) = {on_moderate}, want {expected}"
+        );
+        // Nothing on the sibling hypotheses: a claim placed on `moderate` asserts
+        // nothing about `mild` or `strong` beyond the shared ignorance mass.
+        for other in [0_usize, 1, 3] {
+            let m = bba.mass_of(&FocalElement::positive(BTreeSet::from([other])));
+            assert!(m.abs() < 1e-12, "unexpected mass {m} on hypothesis {other}");
+        }
+        let theta = bba.mass_of(&FocalElement::theta(&frame));
+        assert!(
+            (theta - (1.0 - expected)).abs() < 1e-12,
+            "remainder must sit on Theta, got {theta}"
+        );
+    }
+
+    /// The crux of the correctness argument: measures must be read at the
+    /// declared index. Reading index 0 for a claim placed on `moderate` reports
+    /// belief in `ineffective`.
+    #[test]
+    fn measures_at_the_declared_index_differ_from_index_zero() {
+        let frame = potency_frame();
+        let bba = build_bba_on_index(&frame, 0.9, 1.0, 2).expect("BBA on 'moderate'");
+
+        let (bel_at_2, _, betp_at_2, _, _) = compute_measures_on_index(&bba, 2);
+        let (bel_at_0, _, betp_at_0, _, _) = compute_measures_on_index(&bba, 0);
+
+        assert!(
+            (bel_at_2 - 0.9).abs() < 1e-12,
+            "Bel(moderate) should be the asserted mass, got {bel_at_2}"
+        );
+        assert!(
+            bel_at_0.abs() < 1e-12,
+            "Bel(ineffective) must be 0 — nothing was asserted about it, got {bel_at_0}"
+        );
+        assert!(
+            betp_at_2 > betp_at_0,
+            "BetP(moderate)={betp_at_2} must exceed BetP(ineffective)={betp_at_0}"
+        );
+    }
+
+    /// `compute_measures` (the binary entry point) must stay identical to the
+    /// generalized form at index 0, so no existing caller changes behaviour.
+    #[test]
+    fn compute_measures_is_index_zero() {
+        let frame = binary_frame().expect("binary frame");
+        let bba = build_binary_bba(&frame, 0.7, 0.8, true).expect("BBA");
+        assert_eq!(compute_measures(&bba), compute_measures_on_index(&bba, 0));
+    }
+
+    /// Every hypothesis on the axis is reachable, including the last index —
+    /// guards an off-by-one in the label→index resolution.
+    #[test]
+    fn every_hypothesis_index_is_addressable() {
+        let frame = potency_frame();
+        for idx in 0..4_usize {
+            let bba = build_bba_on_index(&frame, 0.6, 1.0, idx).expect("BBA");
+            let (bel, _, _, _, _) = compute_measures_on_index(&bba, idx);
+            assert!((bel - 0.6).abs() < 1e-12, "index {idx} gave Bel {bel}");
+        }
+    }
+
+    /// An index outside the frame is a construction error, not a silent
+    /// placement on some other hypothesis.
+    #[test]
+    fn out_of_range_index_is_an_error() {
+        let frame = potency_frame();
+        assert!(build_bba_on_index(&frame, 0.5, 1.0, 4).is_err());
+    }
+
+    /// Division of responsibility: `FrameOfDiscernment::new` only rejects an
+    /// EMPTY frame (and silently dedupes), so the "at least 2 distinct
+    /// hypotheses" contract is enforced upstream by
+    /// `epigraph_ingest::document::axis` validation, not here. This pins that
+    /// split so a future reader does not assume the DS layer guards it.
+    #[test]
+    fn axis_frame_rejects_only_the_empty_frame() {
+        assert!(axis_frame("empty", &[]).is_err());
+        // A degenerate 1-hypothesis frame is accepted at this layer...
+        assert!(axis_frame("solo", &["only".to_string()]).is_ok());
+        // ...and rejected by the ingest-side validator that callers go through.
+        let decl = epigraph_ingest::document::schema::AxisDeclaration {
+            frame: "solo".to_string(),
+            hypotheses: vec!["only".to_string()],
+            label: "only".to_string(),
+        };
+        let para = epigraph_ingest::document::schema::Paragraph {
+            text: "p".to_string(),
+            span: None,
+            atoms: vec!["a".to_string()],
+            generality: Vec::new(),
+            confidence: 0.8,
+            methodology: None,
+            evidence_type: None,
+            axis: Some(decl),
+            axis_labels: Vec::new(),
+            page: None,
+            instruments_used: Vec::new(),
+            reagents_involved: Vec::new(),
+            conditions: Vec::new(),
+        };
+        let section = epigraph_ingest::document::schema::Section {
+            title: "s".to_string(),
+            heading_span: None,
+            axis: None,
+            paragraphs: vec![],
+        };
+        assert!(
+            epigraph_ingest::document::axis::resolve_paragraph_axes(&para, &section).is_err(),
+            "the ingest-side validator must reject a 1-hypothesis axis"
+        );
+    }
+
+    /// Mass is clamped into [0.01, 0.99] on an axis exactly as on the binary
+    /// frame, so a 0-confidence or 1.0-confidence claim stays combinable.
+    #[test]
+    fn axis_mass_is_clamped_like_the_binary_path() {
+        let frame = potency_frame();
+        let lo = build_bba_on_index(&frame, 0.0, 1.0, 1).expect("BBA");
+        let hi = build_bba_on_index(&frame, 1.0, 1.0, 1).expect("BBA");
+        let m = |b: &MassFunction| b.mass_of(&FocalElement::positive(BTreeSet::from([1_usize])));
+        assert!((m(&lo) - 0.01).abs() < 1e-12, "got {}", m(&lo));
+        assert!((m(&hi) - 0.99).abs() < 1e-12, "got {}", m(&hi));
+    }
 }
