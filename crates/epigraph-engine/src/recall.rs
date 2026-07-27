@@ -85,8 +85,10 @@ pub async fn recall(
     let limit_i64 = limit as i64;
 
     // Try semantic search first.
+    let mut pgvec_for_audit: Option<String> = None;
     let results = if let Ok(embedding) = embedder.generate_query(query).await {
         let pgvec = format_pgvector(&embedding);
+        pgvec_for_audit = Some(pgvec.clone());
         // ANN over `claims.embedding` (is_current, all levels) — NOT
         // `evidence.embedding`, which is a permanently-empty column: searching
         // it made this semantic leg always return nothing and silently starved
@@ -129,7 +131,54 @@ pub async fn recall(
 
     let mut results = results;
     annotate_disputes(pool, &mut results).await;
+
+    // Recall audit log (backlog 8cbffa0e). This is the LIBRARY path — episcience
+    // synthesis calls it directly, with no MCP request and therefore no auth
+    // context, so the row carries agent_id = NULL. Migration 058 made that
+    // column nullable for exactly this caller: a retrieval that fed a synthesis
+    // decision is worth auditing even when no agent identity is attached, and
+    // `tool` still distinguishes it from the MCP surfaces.
+    log_recall_event(
+        pool,
+        query,
+        pgvec_for_audit.as_deref(),
+        limit,
+        min_truth,
+        &results,
+    )
+    .await;
+
     Ok(results)
+}
+
+/// Fire-and-forget recall audit write for the library path.
+///
+/// Best-effort like its MCP siblings: a failed audit write warns and leaves the
+/// already-computed results untouched.
+async fn log_recall_event(
+    pool: &PgPool,
+    query: &str,
+    pgvec: Option<&str>,
+    limit: usize,
+    min_truth: f64,
+    results: &[RecallResult],
+) {
+    let returned_claim_ids: Vec<uuid::Uuid> = results
+        .iter()
+        .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+        .collect();
+    let event = epigraph_db::NewRecallEvent {
+        id: uuid::Uuid::new_v4(),
+        agent_id: None,
+        tool: "engine::recall".to_string(),
+        query_text: query.to_string(),
+        query_pgvector: pgvec.map(ToString::to_string),
+        params: serde_json::json!({ "limit": limit, "min_truth": min_truth }),
+        returned_claim_ids,
+    };
+    if let Err(e) = epigraph_db::RecallEventRepository::log(pool, event).await {
+        tracing::warn!(error = %e, "engine recall audit log failed; recall unaffected");
+    }
 }
 
 /// Batched dispute annotation (backlog 34d3400d), shared by the semantic and
