@@ -8,10 +8,12 @@
 # advisory still turns it red as actionable signal rather than drowning in a
 # permanently-red check.
 #
-# Tracking: EpiGraph backlog claim a2fa31b1-b733-4f32-bdc2-6a0f0bd4c4ef
-# (sqlx 0.7->0.8 + reqwest 0.11->0.12 migrations). Remove entries from the
-# "deferred" group below as those migrations land. Re-review the "no fix"
-# group periodically in case upstream ships a patch.
+# Remove entries from a "deferred" group as the migration that clears them
+# lands; re-review the "no fix" group periodically in case upstream ships a
+# patch. The sqlx 0.7->0.8 + reqwest 0.11->0.12 migrations (issue #287, backlog
+# a2fa31b1-b733-4f32-bdc2-6a0f0bd4c4ef) have landed, and their five suppressions
+# are gone from the list below — those advisories are now genuinely fixed rather
+# than suppressed.
 
 [advisories]
 ignore = [
@@ -34,13 +36,15 @@ ignore = [
                          #   not bound directly to a public interface.
                          #   Track in a follow-up backlog item.
 
-    # ── Deferred — cleared by the tracked migrations (backlog a2fa31b1) ──────
-    "RUSTSEC-2024-0363", # sqlx 0.7.4 binary-protocol cast. Fixed by sqlx 0.8.
-    "RUSTSEC-2026-0098", # rustls-webpki 0.101.7 name-constraint (URI). Old TLS
-                         #   stack via reqwest 0.11 + sqlx 0.7 -> rustls 0.21;
-                         #   cleared by reqwest 0.12 + sqlx 0.8.
-    "RUSTSEC-2026-0099", # rustls-webpki 0.101.7 name-constraint (wildcard).
-    "RUSTSEC-2026-0104", # rustls-webpki 0.101.7 CRL-parse panic.
-    "RUSTSEC-2025-0134", # rustls-pemfile 1.0.4 unmaintained. Same old TLS
-                         #   stack; reqwest 0.12 + sqlx 0.8 move to pemfile 2.x.
+    # ── FIXED, not suppressed (issue #287) ──────────────────────────────────
+    # RUSTSEC-2024-0363 (sqlx 0.7.4 binary-protocol cast),
+    # RUSTSEC-2026-0098 / -0099 (rustls-webpki 0.101.7 name-constraint),
+    # RUSTSEC-2026-0104 (rustls-webpki 0.101.7 CRL-parse panic) and
+    # RUSTSEC-2025-0134 (rustls-pemfile 1.0.4 unmaintained) were suppressed here
+    # pending the TLS/DB dependency migration. That migration has landed —
+    # Cargo.lock now resolves sqlx 0.8.6, reqwest 0.12.28, rustls 0.23.x,
+    # rustls-webpki 0.103.x and rustls-pemfile 2.x, none of which are in the
+    # affected ranges — so the suppressions are deleted rather than carried.
+    # Do not re-add them: a reappearance means a dependency regressed onto the
+    # old TLS/DB stack and `cargo audit` should say so.
 ]
