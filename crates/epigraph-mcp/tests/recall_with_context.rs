@@ -1470,3 +1470,65 @@ async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
         "uncontested hit omits is_contested"
     );
 }
+
+/// F5 (backlog 8cbffa0e): `recall_with_context` must write its OWN audit row,
+/// tagged with its own tool name. The plain `recall` path logging is not
+/// evidence that this surface does — they are separate handlers.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_writes_its_own_audit_row(pool: PgPool) {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/audit", "Audit test").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "audited para", &pgvec, None).await;
+
+    let server = build_test_server(pool.clone());
+    let result = recall_with_context_with_pgvec(
+        &server,
+        diverse_params(false, None, None, 10),
+        1536,
+        &pgvec,
+    )
+    .await
+    .expect("recall_with_context ok");
+
+    // The response cites the audit row it wrote.
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("text");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse");
+    let event_id = json["recall_event_id"]
+        .as_str()
+        .expect("recall_event_id must be returned so a caller can cite the retrieval");
+
+    // The write is spawned; poll for it.
+    let mut row: Option<(String, Vec<Uuid>)> = None;
+    for _ in 0..50 {
+        if let Some(r) = sqlx::query!(
+            "SELECT tool, returned_claim_ids FROM recall_events WHERE id = $1::uuid",
+            Uuid::parse_str(event_id).unwrap()
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        {
+            row = Some((r.tool, r.returned_claim_ids));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let (tool, ids) = row.expect("the cited audit row must actually exist");
+    assert_eq!(
+        tool, "recall_with_context",
+        "the row must be attributed to THIS surface, not to plain recall"
+    );
+    assert!(
+        ids.contains(&para),
+        "the audit row records the paragraph ids actually returned"
+    );
+}

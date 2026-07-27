@@ -48,6 +48,7 @@ pub mod political;
 pub mod provenance;
 pub mod provenance_chain;
 pub mod re_encryption_key;
+pub mod recall_event;
 pub mod refresh_token;
 pub mod scoped_belief;
 pub mod security_event;
@@ -109,6 +110,9 @@ pub use political::{
 pub use provenance_chain::{
     ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge, ProvenanceNode, MAX_CHAIN_NODES,
     PROVENANCE_INCOMING, PROVENANCE_OUTGOING,
+};
+pub use recall_event::{
+    NewRecallEvent, RecallEventRepository, RecallEventRow, DEFAULT_RETENTION_DAYS,
 };
 pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;

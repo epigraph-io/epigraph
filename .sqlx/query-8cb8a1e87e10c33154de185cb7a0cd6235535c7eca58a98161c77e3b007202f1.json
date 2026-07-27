@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM recall_events\n            WHERE created_at < NOW() - make_interval(days => $1)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8cb8a1e87e10c33154de185cb7a0cd6235535c7eca58a98161c77e3b007202f1"
+}

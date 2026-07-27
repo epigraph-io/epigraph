@@ -33,7 +33,8 @@ fn parse_results(result: rmcp::model::CallToolResult) -> serde_json::Value {
         .iter()
         .find_map(|c| c.as_text().map(|t| t.text.clone()))
         .expect("text content");
-    serde_json::from_str(&text).expect("parse Vec<RecallResult> JSON")
+    serde_json::from_str::<serde_json::Value>(&text).expect("parse recall envelope")["results"]
+        .clone()
 }
 
 #[sqlx::test(migrations = "../../migrations")]

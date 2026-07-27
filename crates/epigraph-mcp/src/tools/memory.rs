@@ -539,7 +539,61 @@ async fn recall_post_embed(
         }
     }
 
-    success_json(&results)
+    // Id is minted HERE, not read back from the insert: the write is spawned,
+    // so the response must be able to cite the event without awaiting it.
+    let event_id = uuid::Uuid::new_v4();
+
+    // Recall audit log (backlog 8cbffa0e). Fire-and-forget AFTER the response
+    // is fully built: an audit-write failure must never fail, delay, or alter
+    // a recall that already has its results — same best-effort contract as
+    // post-commit embedding. Spawned, so the caller does not wait on it.
+    {
+        let returned_claim_ids: Vec<uuid::Uuid> = results
+            .iter()
+            .filter(|r| r.result_type.is_none()) // claims only; workflows are a different id-space
+            .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+            .collect();
+        // Resolved before the spawn: agent identity comes from the request's
+        // auth context, which does not outlive this call.
+        let agent_id = server.agent_id().await.ok();
+        let event = epigraph_db::NewRecallEvent {
+            id: event_id,
+            agent_id,
+            tool: "recall".to_string(),
+            query_text: params.query.clone(),
+            query_pgvector: pgvec_opt.clone(),
+            params: serde_json::json!({
+                "limit": limit,
+                "min_truth": min_truth,
+                "tags": tags,
+                "agent_filter": agent_filter,
+                "include_workflows": params.include_workflows,
+                "exclude_contested": params.exclude_contested,
+            }),
+            returned_claim_ids,
+        };
+        let pool = server.pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
+                tracing::warn!(error = %e, "recall audit log failed; recall itself unaffected");
+            }
+        });
+    }
+
+    success_json(&RecallEnvelope {
+        results,
+        recall_event_id: Some(event_id.to_string()),
+    })
+}
+
+/// Response envelope carrying the audit-event id alongside the hits, so an
+/// agent can cite which retrieval fed a downstream decision (composes with the
+/// PROV-O layer from PR #334).
+#[derive(serde::Serialize)]
+struct RecallEnvelope {
+    results: Vec<RecallResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recall_event_id: Option<String>,
 }
 
 #[doc(hidden)]

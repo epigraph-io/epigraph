@@ -140,11 +140,51 @@ pub struct RecallWithContextParams {
     pub exclude_contested: bool,
 }
 
+/// Spawn the fire-and-forget recall audit write (backlog 8cbffa0e).
+///
+/// Shared by the empty-result early return and the main path so the two
+/// cannot drift. A zero-result recall is deliberately logged too: "this query
+/// returned nothing at that time" is exactly the kind of claim an audit needs
+/// to be able to settle.
+///
+/// The id is minted by the caller rather than read back from the insert,
+/// because the write is not awaited.
+fn spawn_recall_audit(
+    server: &EpiGraphMcpFull,
+    event_id: Uuid,
+    agent_id: Option<Uuid>,
+    query: &str,
+    pgvec: &str,
+    params_json: serde_json::Value,
+    returned_claim_ids: Vec<Uuid>,
+) {
+    let event = epigraph_db::NewRecallEvent {
+        id: event_id,
+        agent_id,
+        tool: "recall_with_context".to_string(),
+        query_text: query.to_string(),
+        query_pgvector: Some(pgvec.to_string()),
+        params: params_json,
+        returned_claim_ids,
+    };
+    let pool = server.pool.clone();
+    tokio::spawn(async move {
+        if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
+            tracing::warn!(error = %e, "recall_with_context audit log failed; recall unaffected");
+        }
+    });
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RecallWithContextResponse {
     pub results: Vec<RecallHit>,
     pub corpus_scope: CorpusScope,
     pub centroid_dim_used: u32,
+    /// Id of the audit row logged for this retrieval (backlog 8cbffa0e), so a
+    /// caller can cite which recall fed a downstream decision. Omitted when
+    /// the audit write was not attempted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -558,10 +598,21 @@ async fn recall_with_context_post_embed(
         let corpus_scope = compute_corpus_scope(&server.pool)
             .await
             .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
+        let event_id = Uuid::new_v4();
+        spawn_recall_audit(
+            server,
+            event_id,
+            server.agent_id().await.ok(),
+            &params.query,
+            pgvec,
+            serde_json::json!({"limit": limit, "min_truth": min_truth, "empty": true}),
+            vec![],
+        );
         return success_json(&RecallWithContextResponse {
             results: vec![],
             corpus_scope,
             centroid_dim_used: centroid_dim,
+            recall_event_id: Some(event_id.to_string()),
         });
     }
 
@@ -888,10 +939,34 @@ async fn recall_with_context_post_embed(
         .await
         .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
 
+    // Recall audit log (backlog 8cbffa0e) — same fire-and-forget contract as
+    // `tools::memory::recall`: spawned after the response is assembled so an
+    // audit failure can never fail or delay a retrieval that already
+    // succeeded. Id is minted here rather than read back from the insert.
+    let event_id = Uuid::new_v4();
+    spawn_recall_audit(
+        server,
+        event_id,
+        server.agent_id().await.ok(),
+        &params.query,
+        pgvec,
+        serde_json::json!({
+            "limit": limit,
+            "min_truth": min_truth,
+            "centroid_dim": centroid_dim,
+            "diverse": params.diverse,
+            "rerank": params.rerank,
+            "graph_expansion_depth": params.graph_expansion_depth,
+            "exclude_contested": params.exclude_contested,
+        }),
+        results.iter().map(|h| h.paragraph_id).collect(),
+    );
+
     success_json(&RecallWithContextResponse {
         results,
         corpus_scope,
         centroid_dim_used: centroid_dim,
+        recall_event_id: Some(event_id.to_string()),
     })
 }
 

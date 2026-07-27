@@ -648,7 +648,7 @@ async fn plain_recall_lens_attaches_diverging_belief(pool: PgPool) {
 
     // No lens → the recalled claim has NO lensed_belief key (back-compat).
     let plain = recall_one(None, None).await.expect("recall plain");
-    let plain_arr = parse_json(&plain);
+    let plain_arr = parse_json(&plain)["results"].clone();
     let p_hit = plain_arr
         .as_array()
         .unwrap()
@@ -661,7 +661,8 @@ async fn plain_recall_lens_attaches_diverging_belief(pool: PgPool) {
     );
 
     let recall_belief = |body: &Value| -> f64 {
-        body.as_array()
+        body["results"]
+            .as_array()
             .unwrap()
             .iter()
             .find(|h| h["claim_id"].as_str() == Some(&fx.claim_id.to_string()))
@@ -772,7 +773,7 @@ async fn plain_recall_lens_degrades_one_bad_claim_without_failing_page(pool: PgP
     .await
     .expect("recall must return Ok — one bad claim must not abort the whole page");
 
-    let arr = parse_json(&result);
+    let arr = parse_json(&result)["results"].clone();
     let hits = arr.as_array().expect("recall returns an array");
     let find = |id: Uuid| {
         hits.iter()

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tool, returned_claim_ids FROM recall_events WHERE id = $1::uuid",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tool",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "returned_claim_ids",
+        "type_info": "UuidArray"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "4315f8fbefd5796ca83ea1137e3de53f22c52e71aa4eb96827e91cd48cbc5bfd"
+}

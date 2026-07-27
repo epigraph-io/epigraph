@@ -300,6 +300,36 @@ pub struct GetProvenanceParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetRecallEventsParams {
+    #[schemars(description = "Only events logged by this agent UUID.")]
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
+    #[schemars(
+        description = "Only events whose result set CONTAINED this claim UUID — \
+                       'which queries ever surfaced this claim?'"
+    )]
+    #[serde(default)]
+    pub claim_id: Option<String>,
+
+    #[schemars(description = "Only events at or after this RFC3339 timestamp.")]
+    #[serde(default)]
+    pub since: Option<String>,
+
+    #[schemars(description = "Only events at or before this RFC3339 timestamp.")]
+    #[serde(default)]
+    pub until: Option<String>,
+
+    #[schemars(description = "Max events to return (default 50, capped at 500).")]
+    #[serde(default)]
+    pub limit: Option<i64>,
+
+    #[schemars(description = "Skip this many events (default 0).")]
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetProvenanceChainParams {
     #[schemars(description = "The UUID of the conclusion claim to trace backwards from")]
     pub claim_id: String,

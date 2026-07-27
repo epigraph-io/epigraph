@@ -564,6 +564,19 @@ impl EpiGraphMcpFull {
         tools::provenance_chain::get_provenance_chain(self, params).await
     }
 
+    #[tool(
+        description = "Query the recall audit log — which claims a recall query returned, \
+                       for which agent, when. Filter by claim_id to answer 'which queries \
+                       ever surfaced this claim?'. query_embedding_hash distinguishes a \
+                       corpus change from an embedder change when a replayed query differs."
+    )]
+    async fn get_recall_events(
+        &self,
+        Parameters(params): Parameters<crate::types::GetRecallEventsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::recall_events::get_recall_events(self, params).await
+    }
+
     // ── Alternative-set candidate finder (1 tool) ──
 
     #[tool(

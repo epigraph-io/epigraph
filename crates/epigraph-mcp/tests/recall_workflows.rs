@@ -107,7 +107,7 @@ async fn recall_include_workflows_true_returns_matching_workflow(pool: PgPool) {
         .await
         .expect("recall_with_pgvec ok");
     let json = first_text(&out);
-    let arr = json.as_array().expect("array");
+    let arr = json["results"].as_array().expect("results array");
 
     let claim_hit = arr
         .iter()
@@ -164,7 +164,7 @@ async fn recall_include_workflows_false_excludes_workflow_only_match(pool: PgPoo
         .await
         .expect("recall_with_pgvec ok");
     let json = first_text(&out);
-    let arr = json.as_array().expect("array");
+    let arr = json["results"].as_array().expect("results array");
 
     assert!(
         !arr.is_empty(),
