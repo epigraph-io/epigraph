@@ -4378,3 +4378,148 @@ impl ClaimRepository {
         })
     }
 }
+
+/// One near-duplicate neighbour of a seed claim.
+#[derive(Debug, Clone)]
+pub struct ClaimNeighbor {
+    pub claim_id: Uuid,
+    pub distance: f64,
+    pub truth_value: f64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A claim eligible for the dedup sweep.
+#[derive(Debug, Clone)]
+pub struct SweepCandidate {
+    pub id: Uuid,
+    pub truth_value: f64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ClaimRepository {
+    /// Page through `is_current` claims that carry an embedding and are
+    /// eligible for semantic deduplication (backlog e3732d16).
+    ///
+    /// Exclusions are policy, not optimisation:
+    /// - `telemetry`-labelled claims are never embedded by design (CLAUDE.md),
+    ///   so they cannot participate in an ANN sweep at all.
+    /// - claims carrying `properties->>'level'` are document-structure rows
+    ///   (spine/paragraph/atom). Near-identical paragraphs across two papers
+    ///   are a legitimate corpus fact, not a duplicate to collapse.
+    /// - claims whose `supersedes` is already set have been merged or
+    ///   deduplicated once; re-processing them would rewrite settled lineage.
+    ///
+    /// Ordered by `created_at, id` so `offset` paging is stable across calls —
+    /// the sweep is resumable by design, since the corpus is far larger than
+    /// one invocation should touch.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(pool))]
+    pub async fn enumerate_current_embedded(
+        pool: &PgPool,
+        agent_scope: Option<&[Uuid]>,
+        labels_scope: Option<&[String]>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<SweepCandidate>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, truth_value, created_at
+            FROM claims
+            WHERE is_current
+              AND embedding IS NOT NULL
+              AND supersedes IS NULL
+              AND NOT (labels @> ARRAY['telemetry']::text[])
+              AND properties->>'level' IS NULL
+              AND ($1::uuid[] IS NULL OR agent_id = ANY($1))
+              AND ($2::text[] IS NULL OR labels @> $2)
+            ORDER BY created_at, id
+            LIMIT $3 OFFSET $4
+            "#,
+            agent_scope,
+            labels_scope,
+            limit.clamp(1, 2000),
+            offset.max(0),
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| SweepCandidate {
+                id: r.id,
+                truth_value: r.truth_value,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
+    /// Nearest `is_current` neighbours of a STORED claim, by cosine distance.
+    ///
+    /// Mirrors [`Self::nearest_by_embedding`] but seeds from a row already in
+    /// the table rather than a caller-supplied vector, which is what a sweep
+    /// over existing claims needs.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(pool))]
+    pub async fn nearest_neighbors_of_claim(
+        pool: &PgPool,
+        claim_id: Uuid,
+        k: i64,
+    ) -> Result<Vec<ClaimNeighbor>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT c2.id, c2.truth_value, c2.created_at,
+                   (c2.embedding <=> (SELECT embedding FROM claims WHERE id = $1)) AS "distance!"
+            FROM claims c2
+            WHERE c2.is_current
+              AND c2.embedding IS NOT NULL
+              AND c2.supersedes IS NULL
+              AND c2.id != $1
+              AND NOT (c2.labels @> ARRAY['telemetry']::text[])
+              AND c2.properties->>'level' IS NULL
+            ORDER BY c2.embedding <=> (SELECT embedding FROM claims WHERE id = $1)
+            LIMIT $2
+            "#,
+            claim_id,
+            k.clamp(1, 50),
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| ClaimNeighbor {
+                claim_id: r.id,
+                distance: r.distance,
+                truth_value: r.truth_value,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
+    /// Content hashes for a set of claims, so a sweep can tell an exact
+    /// restatement (safe to `mark_duplicate`) from a merely-similar pair
+    /// (needs synthesis via `consolidate`).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(pool, ids))]
+    pub async fn content_hashes_for(
+        pool: &PgPool,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<u8>>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query!(
+            "SELECT id, content_hash FROM claims WHERE id = ANY($1)",
+            ids,
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.id, r.content_hash)).collect())
+    }
+}

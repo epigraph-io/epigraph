@@ -300,6 +300,43 @@ pub struct GetProvenanceParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SweepSemanticDuplicatesParams {
+    #[schemars(
+        description = "Cosine DISTANCE below which two claims are near-duplicates \
+                       (0.0 = identical). Default 0.10."
+    )]
+    #[serde(default)]
+    pub similarity_threshold: Option<f64>,
+
+    #[schemars(
+        description = "Restrict the sweep to these agent UUIDs. Default: cross-agent — the \
+                       duplicate corpus spans 20+ agents, so scoping to one usually misses \
+                       the duplicates."
+    )]
+    #[serde(default)]
+    pub agent_scope: Option<Vec<String>>,
+
+    #[schemars(description = "Restrict the sweep to claims carrying ALL these labels.")]
+    #[serde(default)]
+    pub labels_scope: Option<Vec<String>>,
+
+    #[schemars(
+        description = "When true (the DEFAULT), report clusters without mutating anything. \
+                       Set false to actually collapse exact-restatement clusters."
+    )]
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+
+    #[schemars(description = "Claims scanned this call (default 500, capped 2000).")]
+    #[serde(default)]
+    pub limit: Option<i64>,
+
+    #[schemars(description = "Resume offset for paging through the corpus (default 0).")]
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ConsolidateClaimsParams {
     #[schemars(
         description = "UUIDs of the 2..=20 is_current claims to merge. Each is retired with a \

@@ -593,6 +593,22 @@ impl EpiGraphMcpFull {
         tools::consolidate::consolidate_claims(self, params).await
     }
 
+    #[tool(
+        description = "Sweep a page of the corpus for semantic near-duplicates, clustering them \
+                       with union-find and picking a survivor per cluster (highest truth, \
+                       earliest wins ties). DRY RUN BY DEFAULT. Exact restatements are \
+                       collapsed via mark_duplicate when dry_run=false; clusters that merely \
+                       resemble each other are returned as merge_candidates for \
+                       consolidate_claims so no wording is discarded. Resumable via offset."
+    )]
+    async fn sweep_semantic_duplicates(
+        &self,
+        Parameters(params): Parameters<crate::types::SweepSemanticDuplicatesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::dedup_sweep::sweep_semantic_duplicates(self, params).await
+    }
+
     // ── Alternative-set candidate finder (1 tool) ──
 
     #[tool(

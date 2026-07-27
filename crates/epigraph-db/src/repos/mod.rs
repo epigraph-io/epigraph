@@ -68,10 +68,10 @@ pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimPairDistance, ClaimRepository,
-    ConsolidateMode, ConsolidateResult, EvolveStepResult, GraphExpansionHit, HybridHit,
-    LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput, CONSOLIDATE_MAX_SOURCES,
-    CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
+    ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimNeighbor, ClaimPairDistance,
+    ClaimRepository, ConsolidateMode, ConsolidateResult, EvolveStepResult, GraphExpansionHit,
+    HybridHit, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SweepCandidate,
+    CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
