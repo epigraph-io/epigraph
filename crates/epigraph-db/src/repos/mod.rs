@@ -46,6 +46,7 @@ pub mod pattern_template;
 pub mod perspective;
 pub mod political;
 pub mod provenance;
+pub mod provenance_chain;
 pub mod re_encryption_key;
 pub mod refresh_token;
 pub mod scoped_belief;
@@ -104,6 +105,10 @@ pub use perspective::PerspectiveRepository;
 pub use political::{
     AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,
     PropagandaTechniqueRow, PropagationStepRow, TimelineClaimRow,
+};
+pub use provenance_chain::{
+    ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge, ProvenanceNode, MAX_CHAIN_NODES,
+    PROVENANCE_INCOMING, PROVENANCE_OUTGOING,
 };
 pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;

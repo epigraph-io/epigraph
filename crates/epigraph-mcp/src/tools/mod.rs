@@ -20,6 +20,7 @@ pub mod novelty_gate;
 pub mod paper_queries;
 pub mod perspectives;
 pub mod provenance;
+pub mod provenance_chain;
 pub mod rdf;
 pub mod recall;
 pub mod redaction;

@@ -550,6 +550,20 @@ impl EpiGraphMcpFull {
         tools::provenance::get_provenance(self, params).await
     }
 
+    #[tool(
+        description = "Trace the full derivation chain behind a conclusion claim in ONE call \
+                       — walks supports/corroborates/elaborates/decomposes_to backwards and \
+                       supersedes forwards, returning nodes in topological order (evidence \
+                       first, conclusion last) plus the connecting edges. Cycles are reported, \
+                       not errors; superseded ancestors are included and flagged."
+    )]
+    async fn get_provenance_chain(
+        &self,
+        Parameters(params): Parameters<crate::types::GetProvenanceChainParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::provenance_chain::get_provenance_chain(self, params).await
+    }
+
     // ── Alternative-set candidate finder (1 tool) ──
 
     #[tool(

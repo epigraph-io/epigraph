@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, content, truth_value, labels, is_current\n            FROM claims\n            WHERE id = ANY($1)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "content",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "truth_value",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "labels",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 4,
+        "name": "is_current",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3b7287177719808771665d854f72f1b3e08dfea02e1c11b64af146811ec4ee9f"
+}

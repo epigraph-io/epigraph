@@ -299,6 +299,26 @@ pub struct GetProvenanceParams {
     pub claim_id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetProvenanceChainParams {
+    #[schemars(description = "The UUID of the conclusion claim to trace backwards from")]
+    pub claim_id: String,
+
+    #[schemars(description = "How many derivation hops to walk. Clamped to 1..=8. Default 4.")]
+    #[serde(default)]
+    pub max_depth: Option<u8>,
+
+    #[schemars(
+        description = "Restrict the traversal to these relationships. Default: \
+                       supports, corroborates, elaborates, decomposes_to, supersedes. \
+                       Traversal DIRECTION per relationship is fixed by the schema \
+                       (supersedes is followed outgoing, the rest incoming) and is not \
+                       caller-selectable."
+    )]
+    #[serde(default)]
+    pub relationships: Option<Vec<String>>,
+}
+
 // ── Memory ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
