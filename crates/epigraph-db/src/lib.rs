@@ -64,7 +64,7 @@ pub use pool::{create_pool, create_pool_from_options, create_pool_with_options};
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentRepository, AnalysisRecord,
     AnalysisRepository, BehavioralExecutionRepository, BehavioralExecutionRow, ChallengeRepository,
-    ChallengeRow, ClaimBeliefColumns, ClaimEmbeddingHit, ClaimEncryptionRepository,
+    ChallengeRow, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository,
     ClaimEncryptionRow, ClaimNeighborBetpRow, ClaimRepository, ClaimSummary, ClaimThemeRepository,
     ClaimThemeRow, ClaimVersionRepository, ClaimVersionRow, CommunityRepository, ContextRepository,
     CounterfactualRepository, CounterfactualRow, DivergenceRepository, EdgeEncryptionRepository,

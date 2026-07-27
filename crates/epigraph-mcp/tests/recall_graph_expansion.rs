@@ -180,6 +180,7 @@ fn base_params(depth: Option<u32>, limit: u32) -> RecallWithContextParams {
         frame_id: None,
         perspective_id: None,
         graph_expansion_depth: depth,
+        exclude_contested: false,
     }
 }
 

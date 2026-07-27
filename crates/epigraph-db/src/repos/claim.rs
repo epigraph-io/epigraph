@@ -3181,6 +3181,83 @@ impl ClaimRepository {
 
         Ok(rows.into_iter().map(|r| (r.target_id, r.degree)).collect())
     }
+
+    /// Live-dispute signal for each of `claim_ids`, batched in one round-trip
+    /// (backlog 34d3400d).
+    ///
+    /// Deliberately narrower than [`Self::in_epistemic_degree_batch`], which
+    /// counts the whole `EPISTEMIC_RELATIONSHIPS` allowlist: only
+    /// `contradicts`/`refutes` constitute dispute, and only from a contester
+    /// that is still `is_current`. A superseded challenger is not live
+    /// counter-evidence — without that filter a retracted contester would mark
+    /// its target contested permanently.
+    ///
+    /// Claims with no live dispute are ABSENT from the returned map rather
+    /// than present with a zero (same contract as
+    /// [`Self::in_epistemic_degree_batch`]); callers treat a missing key as
+    /// uncontested.
+    ///
+    /// `contesting_claim_ids` is capped at the three strongest contesters
+    /// (by contesting `truth_value` DESC) so a heavily-disputed claim cannot
+    /// bloat a recall page; `dispute_count` is the UNCAPPED total, so callers
+    /// can tell "3 contesters" from "30".
+    ///
+    /// This is a post-fix batch query over ids already returned by retrieval —
+    /// deliberately NOT a join inside the ANN/RRF SQL, which would put the
+    /// HNSW plan at risk for a signal that does not affect ranking.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(pool, claim_ids))]
+    pub async fn dispute_batch(
+        pool: &PgPool,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, ClaimDispute>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query!(
+            r#"
+            SELECT e.target_id,
+                   COUNT(*) AS "dispute_count!",
+                   (array_agg(e.source_id ORDER BY src.truth_value DESC, src.id))[1:3]
+                       AS "contesting_claim_ids!"
+            FROM edges e
+            JOIN claims src ON src.id = e.source_id AND src.is_current
+            WHERE e.target_id = ANY($1)
+              AND e.source_type = 'claim' AND e.target_type = 'claim'
+              AND e.relationship IN ('contradicts', 'refutes')
+            GROUP BY e.target_id
+            "#,
+            claim_ids,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.target_id,
+                    ClaimDispute {
+                        dispute_count: r.dispute_count,
+                        contesting_claim_ids: r.contesting_claim_ids,
+                    },
+                )
+            })
+            .collect())
+    }
+}
+
+/// Live-dispute signal for a single claim, as returned by
+/// [`ClaimRepository::dispute_batch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimDispute {
+    /// Total number of `is_current` claims contesting this one via
+    /// `contradicts`/`refutes`. Uncapped.
+    pub dispute_count: i64,
+    /// The three strongest contesters (by their own `truth_value` DESC).
+    pub contesting_claim_ids: Vec<Uuid>,
 }
 
 #[cfg(test)]

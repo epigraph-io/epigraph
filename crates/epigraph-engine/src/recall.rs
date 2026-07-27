@@ -41,6 +41,14 @@ pub struct RecallResult {
     pub truth_value: f64,
     /// Cosine similarity to the query embedding (0.0 if text-search fallback).
     pub similarity: f64,
+    /// Number of `is_current` claims contesting this one via
+    /// `contradicts`/`refutes` (backlog 34d3400d). `0` when uncontested.
+    pub dispute_count: u32,
+    /// `true` iff `dispute_count > 0`. Surfaced alongside `truth_value`, not
+    /// instead of it — contested does not mean false, it means unsettled.
+    pub is_contested: bool,
+    /// The three strongest contesters (by their own `truth_value`).
+    pub contesting_claim_ids: Vec<uuid::Uuid>,
 }
 
 /// Format a `Vec<f32>` as a pgvector string literal `[a,b,c,...]`.
@@ -97,6 +105,11 @@ pub async fn recall(
                                 content: claim.content,
                                 truth_value: tv,
                                 similarity: hit.similarity,
+                                // Annotated by the batched dispute post-pass
+                                // below, keyed by claim_id.
+                                dispute_count: 0,
+                                is_contested: false,
+                                contesting_claim_ids: Vec::new(),
                             });
                         }
                     }
@@ -114,7 +127,43 @@ pub async fn recall(
         text_search_fallback(pool, query, limit_i64, min_truth).await?
     };
 
+    let mut results = results;
+    annotate_disputes(pool, &mut results).await;
     Ok(results)
+}
+
+/// Batched dispute annotation (backlog 34d3400d), shared by the semantic and
+/// text-fallback paths so the two cannot drift.
+///
+/// Best-effort by design: a dispute-lookup failure warns and serves the page
+/// unannotated rather than failing a recall that already has its results. The
+/// signal informs the caller; it never re-ranks and never gates retrieval.
+async fn annotate_disputes(pool: &PgPool, results: &mut [RecallResult]) {
+    let claim_ids: Vec<uuid::Uuid> = results
+        .iter()
+        .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+        .collect();
+    match ClaimRepository::dispute_batch(pool, &claim_ids).await {
+        Ok(mut by_claim) => {
+            for r in results.iter_mut() {
+                let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
+                    continue;
+                };
+                // Absent key == uncontested, per the repo contract.
+                if let Some(d) = by_claim.remove(&cid) {
+                    r.dispute_count = d.dispute_count.max(0) as u32;
+                    r.is_contested = d.dispute_count > 0;
+                    r.contesting_claim_ids = d.contesting_claim_ids;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "dispute batch failed; serving recall page without dispute annotations"
+            );
+        }
+    }
 }
 
 /// Text-search fallback via `ClaimRepository::list` with `ILIKE` filter.
@@ -133,6 +182,11 @@ async fn text_search_fallback(
             content: c.content,
             truth_value: c.truth_value.value(),
             similarity: 0.0,
+            // Annotated by `annotate_disputes` once the caller has the page —
+            // the fallback path returns into `recall`, which runs the pass.
+            dispute_count: 0,
+            is_contested: false,
+            contesting_claim_ids: Vec::new(),
         })
         .collect())
 }

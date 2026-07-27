@@ -400,6 +400,11 @@ async fn recall_post_embed(
                             // claim_id. None until then.
                             lensed_belief: None,
                             result_type: None,
+                            // Populated by the bounded dispute post-pass below
+                            // (backlog 34d3400d), keyed by claim_id.
+                            dispute_count: 0,
+                            is_contested: false,
+                            contesting_claim_ids: Vec::new(),
                         });
                     }
                 }
@@ -419,6 +424,12 @@ async fn recall_post_embed(
                         matched_via: vec!["dense".to_string()],
                         lensed_belief: None,
                         result_type: Some("workflow".to_string()),
+                        // Dispute is a claim-belief concept; workflows are not
+                        // claims, so the post-pass below skips them and these
+                        // stay at their uncontested defaults.
+                        dispute_count: 0,
+                        is_contested: false,
+                        contesting_claim_ids: Vec::new(),
                     });
                 }
             }
@@ -477,6 +488,54 @@ async fn recall_post_embed(
                     "lensed belief batch failed; serving null lens for this page"
                 );
             }
+        }
+    }
+
+    // Bounded dispute post-pass (backlog 34d3400d): one batched follow-up query
+    // over the ids this page already returned, NOT a join inside the ANN/RRF
+    // SQL — the signal must not put the HNSW plan at risk. Same shape as the
+    // lens post-pass above: once per page, keyed by claim_id, degrade-not-fail
+    // (a failed dispute lookup serves an unannotated page rather than failing
+    // the recall).
+    //
+    // Ranking is deliberately untouched: per MemSyco-Bench the failure mode is
+    // MISSING signal, not mis-ordering, so dispute informs the caller without
+    // re-ranking behind their back.
+    {
+        let claim_ids: Vec<uuid::Uuid> = results
+            .iter()
+            .filter(|r| r.result_type.is_none()) // workflows aren't claims
+            .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+            .collect();
+        match ClaimRepository::dispute_batch(&server.pool, &claim_ids).await {
+            Ok(mut by_claim) => {
+                for r in &mut results {
+                    let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
+                        continue;
+                    };
+                    // Absent key == uncontested (repo contract), so the
+                    // default 0/false/[] below is the correct reading.
+                    if let Some(d) = by_claim.remove(&cid) {
+                        r.dispute_count = d.dispute_count.max(0) as u32;
+                        r.is_contested = d.dispute_count > 0;
+                        r.contesting_claim_ids = d.contesting_claim_ids;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "dispute batch failed; serving page without dispute annotations"
+                );
+            }
+        }
+
+        // Post-filter, applied AFTER ranking and truncation — so a page whose
+        // hits are contested comes back short rather than back-filling with
+        // worse-ranked material. This matches how `min_truth` already behaves
+        // (merged.truncate(limit) runs before the min_truth drop above).
+        if params.exclude_contested {
+            results.retain(|r| !r.is_contested);
         }
     }
 
