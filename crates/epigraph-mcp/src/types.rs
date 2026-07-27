@@ -300,6 +300,35 @@ pub struct GetProvenanceParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ConsolidateClaimsParams {
+    #[schemars(
+        description = "UUIDs of the 2..=20 is_current claims to merge. Each is retired with a \
+                       forwarding pointer to the merged claim."
+    )]
+    pub source_claim_ids: Vec<String>,
+
+    #[schemars(
+        description = "The synthesized replacement text. The CALLER synthesizes this — the \
+                       server never invokes an LLM."
+    )]
+    pub merged_content: String,
+
+    #[schemars(description = "One of: merge | abstract | rewrite.")]
+    pub mode: String,
+
+    #[schemars(description = "Why these claims were consolidated; recorded on the lineage edges.")]
+    pub reason: String,
+
+    #[schemars(
+        description = "Confidence for the merged claim. Defaults to the highest source \
+                       truth_value * 0.95, so a merge never claims more certainty than its \
+                       best input."
+    )]
+    #[serde(default)]
+    pub confidence: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetRecallEventsParams {
     #[schemars(description = "Only events logged by this agent UUID.")]
     #[serde(default)]

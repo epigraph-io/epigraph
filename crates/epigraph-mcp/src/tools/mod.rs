@@ -3,6 +3,7 @@ pub mod batch;
 pub mod cdst_maintenance;
 pub mod challenges;
 pub mod claims;
+pub mod consolidate;
 pub mod ds;
 pub mod ds_auto;
 pub mod embeddings;

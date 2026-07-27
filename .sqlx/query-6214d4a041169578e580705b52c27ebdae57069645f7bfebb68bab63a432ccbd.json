@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE edges SET target_id = $1\n                WHERE id = ANY($2) AND target_type = 'claim' AND target_id = ANY($3)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6214d4a041169578e580705b52c27ebdae57069645f7bfebb68bab63a432ccbd"
+}

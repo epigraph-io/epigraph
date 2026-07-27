@@ -4006,3 +4006,375 @@ mod label_tests {
         assert!(ClaimRepository::MAX_AGENT_CLAIMS > 0);
     }
 }
+
+/// How a consolidation restates its sources. Recorded in
+/// `properties.merge.mode`; the server does not interpret it — the caller
+/// supplies the synthesized content either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsolidateMode {
+    /// Combined restatement of all sources.
+    Merge,
+    /// Higher-level generalisation over the sources.
+    Abstract,
+    /// Refined restatement (typically N=2, near-identical inputs).
+    Rewrite,
+}
+
+impl ConsolidateMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Abstract => "abstract",
+            Self::Rewrite => "rewrite",
+        }
+    }
+
+    /// Parse a wire-format mode string.
+    ///
+    /// # Errors
+    /// Returns the offending string when it is not a known mode.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "merge" => Ok(Self::Merge),
+            "abstract" => Ok(Self::Abstract),
+            "rewrite" => Ok(Self::Rewrite),
+            other => Err(other.to_string()),
+        }
+    }
+}
+
+/// Outcome of [`ClaimRepository::consolidate`].
+#[derive(Debug, Clone)]
+pub struct ConsolidateResult {
+    pub merged_id: Uuid,
+    pub superseded: Vec<Uuid>,
+    pub edges_migrated: u64,
+    pub edges_deduped: u64,
+    /// `true` when an identical merged claim by this agent already existed and
+    /// was returned instead of inserting a second one.
+    pub already_existed: bool,
+}
+
+/// Minimum / maximum sources accepted by one consolidation.
+pub const CONSOLIDATE_MIN_SOURCES: usize = 2;
+pub const CONSOLIDATE_MAX_SOURCES: usize = 20;
+
+impl ClaimRepository {
+    /// Merge 2..=20 `is_current` claims into one new claim (backlog 44b19521).
+    ///
+    /// The CALLER supplies `merged_content`: synthesis is an agent-side
+    /// concern, storage is the server's — the same division of labour as
+    /// `epigraph-ingest-executor`.
+    ///
+    /// # Why the mark_duplicate convention, not supersede's
+    ///
+    /// `claims.supersedes` is a single UUID and an N→1 merge has N parents, so
+    /// the supersede convention (new row points at the one row it replaced)
+    /// cannot express this. Each retired source instead gets
+    /// `supersedes = merged_id` as a forwarding pointer — the `mark_duplicate`
+    /// convention — which additionally makes `mark_duplicate`'s existing
+    /// "already superseded; refusing to overwrite" guard protect merged
+    /// sources for free. The reverse fan-out is carried by N `supersedes`
+    /// EDGES (merged → source) plus `properties.merge`.
+    ///
+    /// # Edge collision classes
+    ///
+    /// Unlike `mark_duplicate`'s canonical, the merged claim is brand new and
+    /// therefore has no pre-existing edges — so the "diamond" class cannot
+    /// arise here. What can, and is new to N→1, is the CROSS-SOURCE class:
+    /// `T→[REL]→s1` and `T→[REL]→s2` both migrate onto `T→[REL]→merged`.
+    ///
+    /// That matters for two distinct reasons, confirmed by
+    /// `docs/architecture/audit-edge-collision-mark-duplicate.md`:
+    /// - `alternative_of` carries a symmetric partial unique index
+    ///   (`edges_alternative_of_symmetric_uniq`, migration 042), so a collision
+    ///   is a HARD error that rolls the whole merge back. Because the index is
+    ///   keyed on `(LEAST, GREATEST)` it is direction-agnostic, so those edges
+    ///   are deduped ignoring direction.
+    /// - Every other relationship collides SILENTLY (migration 018 dropped the
+    ///   triple-uniqueness constraint and nothing re-added it), producing
+    ///   duplicate rows that feed the same Dempster-Shafer mass twice through
+    ///   `auto_create_factor_from_edge`. Belief corruption, not an error.
+    ///
+    /// `AUTHORED` is excluded from deduplication (migration 017 explicitly
+    /// allows it to accumulate) and `supersedes` from migration entirely.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` on a bad source set (wrong count,
+    /// duplicates, non-current, already-superseded) and `DbError::NotFound`
+    /// when a source id does not exist.
+    #[instrument(skip(pool, merged_content), fields(n_sources = source_ids.len()))]
+    #[allow(clippy::too_many_lines)]
+    pub async fn consolidate(
+        pool: &PgPool,
+        source_ids: &[Uuid],
+        merged_content: &str,
+        merged_truth: f64,
+        mode: ConsolidateMode,
+        reason: &str,
+        acting_agent_id: Uuid,
+    ) -> Result<ConsolidateResult, DbError> {
+        let protocol = |m: String| DbError::QueryFailed {
+            source: sqlx::Error::Protocol(m),
+        };
+
+        if source_ids.len() < CONSOLIDATE_MIN_SOURCES || source_ids.len() > CONSOLIDATE_MAX_SOURCES
+        {
+            return Err(protocol(format!(
+                "consolidate: need {CONSOLIDATE_MIN_SOURCES}..={CONSOLIDATE_MAX_SOURCES} sources, got {}",
+                source_ids.len()
+            )));
+        }
+        let unique: std::collections::HashSet<Uuid> = source_ids.iter().copied().collect();
+        if unique.len() != source_ids.len() {
+            return Err(protocol("consolidate: duplicate source ids".into()));
+        }
+        if merged_content.trim().is_empty() {
+            return Err(protocol("consolidate: merged_content is empty".into()));
+        }
+
+        let mut tx = pool.begin().await?;
+
+        // Lock every source up front so a concurrent merge/supersede cannot
+        // interleave between validation and retirement.
+        let locked = sqlx::query!(
+            r#"
+            SELECT id, is_current, supersedes, labels
+            FROM claims WHERE id = ANY($1) FOR UPDATE
+            "#,
+            source_ids,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if locked.len() != source_ids.len() {
+            let found: std::collections::HashSet<Uuid> = locked.iter().map(|r| r.id).collect();
+            let missing = source_ids.iter().find(|id| !found.contains(id));
+            return Err(DbError::NotFound {
+                entity: "Claim".into(),
+                id: missing.copied().unwrap_or_default(),
+            });
+        }
+        for r in &locked {
+            if !r.is_current {
+                return Err(protocol(format!(
+                    "consolidate: source {} is not current",
+                    r.id
+                )));
+            }
+            if r.supersedes.is_some() {
+                return Err(protocol(format!(
+                    "consolidate: source {} is already superseded; refusing to re-merge",
+                    r.id
+                )));
+            }
+        }
+
+        // Labels union across sources (same carry rationale as supersede).
+        // Properties are deliberately NOT carried — a blanket copy propagates
+        // whatever bug the merge may be fixing.
+        let mut labels: Vec<String> = locked
+            .iter()
+            .flat_map(|r| r.labels.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        labels.sort();
+
+        let merge_props = serde_json::json!({
+            "merge": {
+                "mode": mode.as_str(),
+                "merged_from": source_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "merged_at": chrono::Utc::now().to_rfc3339(),
+                "reason": reason,
+            }
+        });
+        let content_hash = epigraph_crypto::ContentHasher::hash(merged_content.as_bytes()).to_vec();
+
+        // Post-107 (content_hash, agent_id) uniqueness: an identical merged
+        // claim by this agent is returned rather than erroring (novelty-gate
+        // style), so a retried merge is idempotent instead of fatal.
+        if let Some(existing) = sqlx::query!(
+            "SELECT id FROM claims WHERE content_hash = $1 AND agent_id = $2",
+            content_hash.as_slice(),
+            acting_agent_id,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            tx.rollback().await?;
+            return Ok(ConsolidateResult {
+                merged_id: existing.id,
+                superseded: vec![],
+                edges_migrated: 0,
+                edges_deduped: 0,
+                already_existed: true,
+            });
+        }
+
+        let merged_id = sqlx::query_scalar!(
+            r#"
+            INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current,
+                                labels, properties)
+            VALUES ($1, $2, $3, $4, true, $5, $6)
+            RETURNING id
+            "#,
+            merged_content,
+            content_hash.as_slice(),
+            merged_truth.clamp(0.0, 1.0),
+            acting_agent_id,
+            &labels[..],
+            merge_props,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // ── Edge migration ──
+        //
+        // Collect every non-supersedes edge touching a source, dropping those
+        // interior to the merge (both endpoints inside the source set) — those
+        // would collapse to merged→merged self-loops.
+        let candidates = sqlx::query!(
+            r#"
+            SELECT id, source_id, target_id, source_type, target_type,
+                   relationship, created_at
+            FROM edges
+            WHERE relationship != 'supersedes'
+              AND ( (source_id = ANY($1) AND source_type = 'claim')
+                 OR (target_id = ANY($1) AND target_type = 'claim') )
+            ORDER BY created_at, id
+            "#,
+            source_ids,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let src_set: &std::collections::HashSet<Uuid> = &unique;
+        let mut to_delete: Vec<Uuid> = Vec::new();
+        let mut survivors: Vec<Uuid> = Vec::new();
+        let mut seen: std::collections::HashSet<(Uuid, String, String, i8)> =
+            std::collections::HashSet::new();
+
+        for e in &candidates {
+            let src_in = e.source_type == "claim" && src_set.contains(&e.source_id);
+            let tgt_in = e.target_type == "claim" && src_set.contains(&e.target_id);
+
+            if src_in && tgt_in {
+                // Interior to the merge: would become merged→merged.
+                to_delete.push(e.id);
+                continue;
+            }
+            // AUTHORED is allowed to accumulate (migration 017) — migrate, never dedupe.
+            if e.relationship == "AUTHORED" {
+                survivors.push(e.id);
+                continue;
+            }
+
+            let (other, other_type) = if src_in {
+                (e.target_id, e.target_type.clone())
+            } else {
+                (e.source_id, e.source_type.clone())
+            };
+            // alternative_of's unique index is keyed on (LEAST, GREATEST) and
+            // is therefore direction-agnostic; every other relationship
+            // duplicates per-direction.
+            let direction = if e.relationship == "alternative_of" {
+                0
+            } else if src_in {
+                1
+            } else {
+                -1
+            };
+            let key = (other, other_type, e.relationship.clone(), direction);
+            if seen.insert(key) {
+                survivors.push(e.id);
+            } else {
+                // Earliest edge already claimed this slot (ORDER BY created_at, id).
+                to_delete.push(e.id);
+            }
+        }
+
+        let mut edges_deduped = 0_u64;
+        if !to_delete.is_empty() {
+            edges_deduped = sqlx::query!("DELETE FROM edges WHERE id = ANY($1)", &to_delete[..])
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
+
+        let mut edges_migrated = 0_u64;
+        if !survivors.is_empty() {
+            edges_migrated += sqlx::query!(
+                r#"
+                UPDATE edges SET source_id = $1
+                WHERE id = ANY($2) AND source_type = 'claim' AND source_id = ANY($3)
+                "#,
+                merged_id,
+                &survivors[..],
+                source_ids,
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+            edges_migrated += sqlx::query!(
+                r#"
+                UPDATE edges SET target_id = $1
+                WHERE id = ANY($2) AND target_type = 'claim' AND target_id = ANY($3)
+                "#,
+                merged_id,
+                &survivors[..],
+                source_ids,
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+
+        // Retire sources. One statement: chk_deprecated_no_embedding (migration
+        // 052) is a per-statement CHECK, so is_current=false and embedding=NULL
+        // must land together.
+        sqlx::query!(
+            r#"
+            UPDATE claims
+            SET supersedes = $1, is_current = false, embedding = NULL, updated_at = NOW()
+            WHERE id = ANY($2)
+            "#,
+            merged_id,
+            source_ids,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // Reverse fan-out: merged → each source, mirroring supersede()'s edge.
+        for src in source_ids {
+            sqlx::query!(
+                r#"
+                INSERT INTO edges (source_id, source_type, target_id, target_type,
+                                   relationship, properties)
+                VALUES ($1, 'claim', $2, 'claim', 'supersedes', $3)
+                "#,
+                merged_id,
+                src,
+                serde_json::json!({
+                    "reason": reason,
+                    "mode": mode.as_str(),
+                    "merged_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(ConsolidateResult {
+            merged_id,
+            superseded: source_ids.to_vec(),
+            edges_migrated,
+            edges_deduped,
+            already_existed: false,
+        })
+    }
+}

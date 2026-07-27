@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO edges (source_id, source_type, target_id, target_type,\n                                   relationship, properties)\n                VALUES ($1, 'claim', $2, 'claim', 'supersedes', $3)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6d323d599c1955a349baf28709b8024ee713c14ac27e4b7e9319a3685f841b73"
+}

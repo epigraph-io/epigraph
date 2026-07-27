@@ -577,6 +577,22 @@ impl EpiGraphMcpFull {
         tools::recall_events::get_recall_events(self, params).await
     }
 
+    #[tool(
+        description = "Consolidate 2..=20 near-duplicate claims into ONE caller-synthesized \
+                       claim. Each source is retired with a forwarding pointer to the merged \
+                       claim, its edges migrated (cross-source duplicates collapsed so \
+                       Dempster-Shafer mass is not double-counted), and lineage recorded as \
+                       supersedes edges plus properties.merge. The caller supplies \
+                       merged_content; the server never calls an LLM."
+    )]
+    async fn consolidate_claims(
+        &self,
+        Parameters(params): Parameters<crate::types::ConsolidateClaimsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::consolidate::consolidate_claims(self, params).await
+    }
+
     // ── Alternative-set candidate finder (1 tool) ──
 
     #[tool(
