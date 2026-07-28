@@ -21,6 +21,24 @@ use crate::errors::DbError;
 /// Default retention window; override with `RECALL_EVENTS_RETENTION_DAYS`.
 pub const DEFAULT_RETENTION_DAYS: i32 = 90;
 
+/// `events.event_type` values safe to delete on a retention schedule.
+///
+/// This is an ALLOWLIST, deliberately — not a denylist of types to keep. A new
+/// event type added later is then never silently swept: it simply is not
+/// pruned until someone adds it here on purpose. The inverse (prune everything
+/// except a keep-list) would silently start deleting any future type.
+///
+/// `tool.invoked` is pure telemetry: the payload is `{"tool", "read_only"}`
+/// with no query, result, or provenance content, so nothing is recoverable
+/// from it that is not better recorded elsewhere.
+///
+/// NOT included, and not to be added without an explicit decision:
+/// `claim.created` / `edge.added` / `agent.registered` / `claim.challenged` /
+/// `conflict.*` / `synthesis.*` / `workflow.*` — these are the graph's
+/// provenance record, and deleting them destroys history that cannot be
+/// reconstructed.
+pub const PRUNABLE_EVENT_TYPES: &[&str] = &["tool.invoked"];
+
 /// One logged recall query.
 #[derive(Debug, Clone)]
 pub struct RecallEventRow {
@@ -156,9 +174,17 @@ impl RecallEventRepository {
     }
 
     /// Delete rows older than `retention_days`, returning how many were
-    /// removed. Recall volume greatly exceeds claim volume, so this table
-    /// grows without bound if nothing prunes it; the daily reconciler calls
-    /// this.
+    /// removed.
+    ///
+    /// MEASURED, not assumed (prod, 2026-07-28): recall runs ~30x/day
+    /// (2,378 `tool.invoked` events over 79 days), so at 90-day retention this
+    /// table stabilises around **half a megabyte**. The original design note —
+    /// "recall volume greatly exceeds claim volume" — was inherited from the
+    /// design doc and never checked against production; it is wrong. Retention
+    /// here is housekeeping, NOT a disk-exhaustion control.
+    ///
+    /// The genuinely unbounded table is `events` (73k rows since 2026-03-06,
+    /// nothing prunes it) — see [`Self::prune_telemetry_events`].
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the delete fails.
@@ -175,5 +201,64 @@ impl RecallEventRepository {
         .execute(pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// Delete telemetry rows from `events` older than `retention_days`,
+    /// returning how many were removed.
+    ///
+    /// Only types in [`PRUNABLE_EVENT_TYPES`] are touched. `events` is the
+    /// table that actually grows without bound here — 73,236 rows had
+    /// accumulated since 2026-03-06 with nothing pruning them — but most of
+    /// its volume (`claim.created`, 51k rows) is provenance and must survive.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the delete fails.
+    #[instrument(skip(pool))]
+    pub async fn prune_telemetry_events(
+        pool: &PgPool,
+        retention_days: i32,
+    ) -> Result<u64, DbError> {
+        let days = retention_days.max(1);
+        let types: Vec<String> = PRUNABLE_EVENT_TYPES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let result = sqlx::query!(
+            r#"
+            DELETE FROM events
+            WHERE event_type = ANY($1)
+              AND created_at < NOW() - make_interval(days => $2)
+            "#,
+            &types[..],
+            days,
+        )
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Count telemetry rows that [`Self::prune_telemetry_events`] would delete.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(pool))]
+    pub async fn count_prunable_events(pool: &PgPool, retention_days: i32) -> Result<i64, DbError> {
+        let days = retention_days.max(1);
+        let types: Vec<String> = PRUNABLE_EVENT_TYPES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let row = sqlx::query!(
+            r#"
+            SELECT COUNT(*) AS "n!" FROM events
+            WHERE event_type = ANY($1)
+              AND created_at < NOW() - make_interval(days => $2)
+            "#,
+            &types[..],
+            days,
+        )
+        .fetch_one(pool)
+        .await?;
+        Ok(row.n)
     }
 }

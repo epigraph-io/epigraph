@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM events\n            WHERE event_type = ANY($1)\n              AND created_at < NOW() - make_interval(days => $2)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b4262f305bc417089503dd0fc096eae8d140c7694dcdffb19c4013340ab168b6"
+}
