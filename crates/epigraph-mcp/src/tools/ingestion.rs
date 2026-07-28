@@ -55,6 +55,11 @@ fn structured_doc_to_extraction(doc: StructuredDoc, source: DocumentSource) -> D
                 start: h.start,
                 end: h.end,
             }),
+            // Deterministic structuring cannot infer a labeled axis from raw
+            // bytes (issue #222). The agent adds `axis` to the paragraphs (or
+            // sections) it wants placed on one before resubmitting via
+            // `ingest_document_inline`.
+            axis: None,
             paragraphs: s
                 .paragraphs
                 .into_iter()
@@ -69,6 +74,8 @@ fn structured_doc_to_extraction(doc: StructuredDoc, source: DocumentSource) -> D
                     confidence: 0.8,
                     methodology: Some("verbatim_structurer".to_string()),
                     evidence_type: None,
+                    axis: None,
+                    axis_labels: Vec::new(),
                     page: None,
                     instruments_used: Vec::new(),
                     reagents_involved: Vec::new(),
@@ -164,6 +171,7 @@ pub async fn ingest_document(
 
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
+    let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     let bg = EpiGraphMcpFull::new_shared(
         server.pool.clone(),
         Arc::clone(&server.signer),
@@ -176,12 +184,7 @@ pub async fn ingest_document(
             tracing::warn!(doi = doi_log, "background ingest_document failed: {e:?}");
         }
     });
-    success_json(&serde_json::json!({
-        "status": "queued",
-        "doi": doi,
-        "title": title,
-        "note": "DB writes are running as a detached background task. Call check_already_ingested to confirm completion before assuming the write landed."
-    }))
+    success_json(&queued_response(&doi, &title, paper_id))
 }
 
 /// Inline (typed-param) counterpart to [`ingest_document`]. Takes a
@@ -196,6 +199,7 @@ pub async fn ingest_document_inline(
     let extraction = params.extraction;
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
+    let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     let bg = EpiGraphMcpFull::new_shared(
         server.pool.clone(),
         Arc::clone(&server.signer),
@@ -211,12 +215,59 @@ pub async fn ingest_document_inline(
             );
         }
     });
-    success_json(&serde_json::json!({
+    success_json(&queued_response(&doi, &title, paper_id))
+}
+
+/// Create (or fetch) the document's `papers` row **synchronously**, before the
+/// ingest is handed to a detached task, so the caller gets an id it can address
+/// what it just wrote by. Idempotent on the identity key, and the background
+/// `do_ingest_document` calls the same get-or-create, so this only moves the
+/// node creation earlier — it does not create a second row.
+///
+/// Previously both ingest entry points returned `{doi, status, title, note}`
+/// with no id at all (issue #356): a caller could not reference, verify, or
+/// link the document it had just created.
+async fn ensure_paper_node(
+    server: &EpiGraphMcpFull,
+    extraction: &DocumentExtraction,
+    doi: &str,
+) -> Result<Uuid, McpError> {
+    PaperRepository::get_or_create(
+        &server.pool,
+        doi,
+        Some(&extraction.source.title),
+        extraction.source.journal.as_deref(),
+    )
+    .await
+    .map_err(internal_error)
+}
+
+/// Shared response body for the two queued ingest entry points.
+fn queued_response(doi: &str, title: &str, paper_id: Uuid) -> serde_json::Value {
+    let mut note = String::from(
+        "DB writes are running as a detached background task. Call check_already_ingested \
+         (or query_paper) with the returned `document_key` to confirm completion before \
+         assuming the write landed.",
+    );
+    if is_synthetic_key(doi) {
+        note.push_str(
+            " This document has no DOI, so `document_key` was SYNTHESIZED from its identity \
+             — it is the key to poll and label with, not a real DOI. Set source.external_id \
+             to pin the key to your own run id so re-ingests converge on this same node.",
+        );
+    }
+    serde_json::json!({
         "status": "queued",
+        // `paper_id` is the addressable node; `document_key` is what `papers.doi`,
+        // the `doi:<key>` claim label, and check_already_ingested are keyed on.
+        "paper_id": paper_id,
+        "document_key": doi,
+        "synthesized_key": is_synthetic_key(doi),
+        // Retained under its original name for callers that already read it.
         "doi": doi,
         "title": title,
-        "note": "DB writes are running as a detached background task. Call check_already_ingested to confirm completion before assuming the write landed."
-    }))
+        "note": note,
+    })
 }
 
 /// Pool-only gate check: returns `Some(paper_id)` iff a paper with `doi`
@@ -260,6 +311,17 @@ pub async fn check_already_ingested(
     server: &EpiGraphMcpFull,
     params: CheckAlreadyIngestedParams,
 ) -> Result<CallToolResult, McpError> {
+    // A placeholder is not an identity. Answering the gate for `doi: "unknown"`
+    // used to report on whatever shared bucket every DOI-less document had
+    // collapsed into (issue #356); fail loudly and point at the real key instead.
+    if is_placeholder_id(&params.doi) {
+        return Err(invalid_params(format!(
+            "{:?} is a placeholder, not a document identity. Documents with no DOI are keyed \
+             on a synthesized `urn:epigraph:doc:*` key — pass the `document_key` the ingest \
+             call returned (set source.external_id to control it).",
+            params.doi
+        )));
+    }
     let pipeline = params
         .pipeline_version
         .unwrap_or_else(|| PIPELINE_VERSION_BASE.to_string());
@@ -299,6 +361,12 @@ pub async fn do_ingest_document(
     // drift can never reach a verbatim_v2 node. No-op for Tier 2 (no source_text).
     epigraph_ingest::document::structure::verify_extraction_verbatim(extraction)
         .map_err(|e| invalid_params(format!("verbatim guard failed: {e}")))?;
+
+    // Declared-axis guard (issue #222): reject a malformed axis before any DB
+    // write. Fail closed — silently degrading to the binary frame would record a
+    // belief about TRUE for a claim the caller placed on a labeled hypothesis.
+    epigraph_ingest::document::axis::validate_axes(extraction)
+        .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
@@ -575,6 +643,8 @@ pub async fn do_ingest_document(
                 confidence,
                 weight,
                 evidence_type: planned.evidence_type.clone(),
+                // Declared labeled axis, or None for the binary frame (#222).
+                axis: planned.axis.clone(),
             });
         }
 
@@ -699,6 +769,7 @@ pub async fn do_ingest_document(
     success_json(&IngestDocumentResponse {
         paper_id: paper_id.to_string(),
         paper_title,
+        synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,
         claims_ingested: claim_ids.len() - dedup_count,
@@ -718,18 +789,123 @@ fn doi_to_slug(doi: &str) -> String {
     doi.replace('/', "-")
 }
 
+/// URN prefix for a synthesized (non-DOI) document identity key.
+const SYNTHETIC_KEY_PREFIX: &str = "urn:epigraph:doc:";
+
+/// Values callers pass to mean "this document has no DOI". Treated as ABSENT,
+/// not as an identity: keying on them collapsed every DOI-less document onto a
+/// single shared `papers` row (issue #356 — one node had accrued 1244 claims
+/// from at least four unrelated sources, with their author lists unioned).
+const DOI_PLACEHOLDERS: [&str; 8] = ["unknown", "n/a", "na", "none", "null", "nil", "-", "tbd"];
+
+/// True when `s` is empty/whitespace or one of the [`DOI_PLACEHOLDERS`].
+fn is_placeholder_id(s: &str) -> bool {
+    let t = s.trim();
+    t.is_empty() || DOI_PLACEHOLDERS.contains(&t.to_ascii_lowercase().as_str())
+}
+
+/// Legible-but-bounded slug for the human-readable half of a synthetic key:
+/// lowercased, non-alphanumerics collapsed to single `-`, capped at 48 bytes on
+/// a char boundary. Only a debugging aid — uniqueness comes from the hash half.
+fn key_slug(s: &str) -> String {
+    let mut out = String::with_capacity(48);
+    let mut pending_dash = false;
+    for ch in s.chars() {
+        if out.len() >= 48 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            pending_dash = true;
+        }
+    }
+    out
+}
+
+/// Synthesize a stable identity key for a document with no usable DOI.
+///
+/// Shape: `urn:epigraph:doc:<slug>-<16 hex>`. The hash half is the identity;
+/// the slug is there so the key is recognisable in logs and `doi:<key>` labels.
+///
+/// Two hashing bases, in priority order:
+///
+/// 1. `source.external_id` — the caller's own run/entry id. Identity is the
+///    external id ALONE, so a re-ingest that corrects the title or adds authors
+///    converges on the same node.
+/// 2. Otherwise the source metadata tuple (title, type, journal, year, sorted
+///    authors). Deterministic, but a title edit yields a new node — which is
+///    why `external_id` is the documented path for authored records.
+fn synthetic_document_key(source: &DocumentSource) -> String {
+    let (basis, slug_seed) = match source.external_id.as_deref() {
+        Some(ext) if !is_placeholder_id(ext) => {
+            (format!("external_id\u{1f}{}", ext.trim()), ext.to_string())
+        }
+        _ => {
+            let mut authors: Vec<String> = source
+                .authors
+                .iter()
+                .map(|a| a.name.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            authors.sort_unstable();
+            authors.dedup();
+            let basis = format!(
+                "title\u{1f}{}\u{1e}type\u{1f}{:?}\u{1e}journal\u{1f}{}\u{1e}year\u{1f}{}\u{1e}authors\u{1f}{}",
+                source.title.trim().to_ascii_lowercase(),
+                source.source_type,
+                source.journal.as_deref().unwrap_or("").trim(),
+                source.year.map_or_else(String::new, |y| y.to_string()),
+                authors.join(","),
+            );
+            (basis, source.title.clone())
+        }
+    };
+    let digest = ContentHasher::to_hex(&ContentHasher::hash(basis.as_bytes()));
+    let slug = key_slug(&slug_seed);
+    if slug.is_empty() {
+        format!("{SYNTHETIC_KEY_PREFIX}{}", &digest[..16])
+    } else {
+        format!("{SYNTHETIC_KEY_PREFIX}{slug}-{}", &digest[..16])
+    }
+}
+
+/// True when `key` was synthesized by [`synthetic_document_key`] rather than
+/// being a real DOI/URI the caller supplied.
+fn is_synthetic_key(key: &str) -> bool {
+    key.starts_with(SYNTHETIC_KEY_PREFIX)
+}
+
+/// Resolve the identity key a document's `papers` row is keyed on.
+///
+/// Priority: real DOI → arXiv id parsed from `uri` → `uri` → synthesized key.
+/// Placeholder DOIs/URIs (`"unknown"`, `"n/a"`, empty, …) are treated as absent
+/// so they fall through to synthesis instead of becoming a shared bucket.
 fn resolve_doi(extraction: &DocumentExtraction) -> String {
     if let Some(d) = &extraction.source.doi {
-        return d.clone();
+        if !is_placeholder_id(d) {
+            return d.trim().to_string();
+        }
+        tracing::warn!(
+            doi = %d,
+            title = %extraction.source.title,
+            "ingest: placeholder DOI treated as absent; synthesizing a stable document key (issue #356). Pass source.external_id to control this key."
+        );
     }
     if let Some(uri) = &extraction.source.uri {
-        // Hand-rolled arXiv pattern: \d{4}\.\d{4,5}
-        if let Some(arxiv) = find_arxiv_id(uri) {
-            return format!("10.48550/arXiv.{arxiv}");
+        if !is_placeholder_id(uri) {
+            // Hand-rolled arXiv pattern: \d{4}\.\d{4,5}
+            if let Some(arxiv) = find_arxiv_id(uri) {
+                return format!("10.48550/arXiv.{arxiv}");
+            }
+            return uri.trim().to_string();
         }
-        return uri.clone();
     }
-    "unknown".to_string()
+    synthetic_document_key(&extraction.source)
 }
 
 fn find_arxiv_id(s: &str) -> Option<String> {
@@ -797,6 +973,12 @@ pub async fn do_ingest_document_spine(
 ) -> Result<CallToolResult, McpError> {
     epigraph_ingest::document::structure::verify_extraction_verbatim(extraction)
         .map_err(|e| invalid_params(format!("verbatim guard failed: {e}")))?;
+
+    // Declared-axis guard (issue #222): reject a malformed axis before any DB
+    // write. Fail closed — silently degrading to the binary frame would record a
+    // belief about TRUE for a claim the caller placed on a labeled hypothesis.
+    epigraph_ingest::document::axis::validate_axes(extraction)
+        .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
@@ -1150,6 +1332,7 @@ pub async fn do_ingest_document_spine(
     success_json(&IngestDocumentSpineResponse {
         paper_id: paper_id.to_string(),
         paper_title,
+        synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,
         paragraphs_new: para_new_count,
@@ -1251,5 +1434,199 @@ mod tests {
     #[test]
     fn doi_to_slug_replaces_all_slashes() {
         assert_eq!(doi_to_slug("10.1000/xyz/123/abc"), "10.1000-xyz-123-abc");
+    }
+
+    // ── Document identity keying (issue #356) ──────────────────────────────
+
+    fn src(title: &str) -> DocumentSource {
+        DocumentSource {
+            title: title.to_string(),
+            doi: None,
+            external_id: None,
+            uri: None,
+            source_type: epigraph_ingest::document::schema::SourceType::InternalDocument,
+            authors: Vec::new(),
+            journal: None,
+            year: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    fn extraction_of(source: DocumentSource) -> DocumentExtraction {
+        DocumentExtraction {
+            source,
+            thesis: None,
+            thesis_derivation: Default::default(),
+            sections: Vec::new(),
+            relationships: Vec::new(),
+            source_text: None,
+        }
+    }
+
+    #[test]
+    fn real_doi_is_used_verbatim() {
+        let mut s = src("A paper");
+        s.doi = Some("10.1000/xyz123".to_string());
+        let key = resolve_doi(&extraction_of(s));
+        assert_eq!(key, "10.1000/xyz123");
+        assert!(!is_synthetic_key(&key));
+    }
+
+    #[test]
+    fn arxiv_uri_still_resolves_to_arxiv_doi() {
+        let mut s = src("A preprint");
+        s.uri = Some("https://arxiv.org/abs/2606.04990".to_string());
+        assert_eq!(resolve_doi(&extraction_of(s)), "10.48550/arXiv.2606.04990");
+    }
+
+    /// The core of #356: two unrelated DOI-less documents must NOT share a key.
+    #[test]
+    fn distinct_doi_less_documents_get_distinct_keys() {
+        let a = resolve_doi(&extraction_of(src("V4 pre-flight: layered 18HB joint")));
+        let b = resolve_doi(&extraction_of(src("Anatomy & Physiology, Ch. 1")));
+        assert!(is_synthetic_key(&a) && is_synthetic_key(&b));
+        assert_ne!(a, b, "unrelated DOI-less documents collapsed onto one key");
+    }
+
+    /// Every placeholder spelling is treated as absent, not as an identity — so
+    /// none of them lands on a shared bucket, and none equals another document's key.
+    #[test]
+    fn placeholder_dois_are_treated_as_absent() {
+        let baseline = resolve_doi(&extraction_of(src("Run 3 summary")));
+        for placeholder in ["unknown", "UNKNOWN", " n/a ", "", "None", "-", "TBD"] {
+            let mut s = src("Run 3 summary");
+            s.doi = Some(placeholder.to_string());
+            let key = resolve_doi(&extraction_of(s));
+            assert!(
+                is_synthetic_key(&key),
+                "placeholder {placeholder:?} was kept as an identity key: {key}"
+            );
+            // Same document metadata ⇒ same synthesized key regardless of which
+            // placeholder spelling the caller used.
+            assert_eq!(key, baseline);
+        }
+        // ...and a *different* document with the same placeholder does not collide.
+        let mut other = src("Run 4 summary");
+        other.doi = Some("unknown".to_string());
+        assert_ne!(resolve_doi(&extraction_of(other)), baseline);
+    }
+
+    #[test]
+    fn synthesized_key_is_stable_across_calls() {
+        let s = src("Run 3 summary");
+        assert_eq!(
+            resolve_doi(&extraction_of(s.clone())),
+            resolve_doi(&extraction_of(s))
+        );
+    }
+
+    /// `external_id` pins identity: a re-ingest that corrects the title (the
+    /// exact case that used to overwrite the shared node's title) converges on
+    /// the same node instead of forking a new one.
+    #[test]
+    fn external_id_pins_identity_across_metadata_edits() {
+        let mut a = src("ELN entry: variant V2");
+        a.external_id = Some("eln-run-2026-07-23-v2".to_string());
+        let mut b = src("ELN entry: variant V2 (joint_bp=84, corrected)");
+        b.external_id = Some("eln-run-2026-07-23-v2".to_string());
+        b.year = Some(2026);
+        assert_eq!(
+            resolve_doi(&extraction_of(a)),
+            resolve_doi(&extraction_of(b))
+        );
+    }
+
+    #[test]
+    fn distinct_external_ids_do_not_collide() {
+        let mut a = src("Sweep variant");
+        a.external_id = Some("eln-run-v2".to_string());
+        let mut b = src("Sweep variant");
+        b.external_id = Some("eln-run-v3".to_string());
+        assert_ne!(
+            resolve_doi(&extraction_of(a)),
+            resolve_doi(&extraction_of(b)),
+            "two sweep variants with the same title shared one node"
+        );
+    }
+
+    #[test]
+    fn placeholder_external_id_falls_back_to_metadata() {
+        let mut a = src("Report X");
+        a.external_id = Some("unknown".to_string());
+        assert_eq!(
+            resolve_doi(&extraction_of(a)),
+            resolve_doi(&extraction_of(src("Report X")))
+        );
+    }
+
+    /// Authors participate in metadata-derived identity, so the two documents
+    /// whose author lists got unioned in #356 key apart even given one title.
+    #[test]
+    fn authors_disambiguate_same_titled_documents() {
+        let mut a = src("Overview");
+        a.authors = vec![epigraph_ingest::common::schema::AuthorEntry {
+            name: "Lawrence J. Gitman".to_string(),
+            affiliations: Vec::new(),
+            roles: Vec::new(),
+        }];
+        let mut b = src("Overview");
+        b.authors = vec![epigraph_ingest::common::schema::AuthorEntry {
+            name: "Amit Shah".to_string(),
+            affiliations: Vec::new(),
+            roles: Vec::new(),
+        }];
+        assert_ne!(
+            resolve_doi(&extraction_of(a)),
+            resolve_doi(&extraction_of(b))
+        );
+    }
+
+    #[test]
+    fn author_order_does_not_change_the_key() {
+        let mk = |names: [&str; 2]| {
+            let mut s = src("Joint work");
+            s.authors = names
+                .iter()
+                .map(|n| epigraph_ingest::common::schema::AuthorEntry {
+                    name: (*n).to_string(),
+                    affiliations: Vec::new(),
+                    roles: Vec::new(),
+                })
+                .collect();
+            resolve_doi(&extraction_of(s))
+        };
+        assert_eq!(mk(["Ada", "Grace"]), mk(["Grace", "Ada"]));
+    }
+
+    #[test]
+    fn synthetic_key_shape_is_urn_slug_hash() {
+        let mut s = src("V4 pre-flight: layered 18HB compliant joint");
+        s.external_id = Some("eln/run 42".to_string());
+        let key = resolve_doi(&extraction_of(s));
+        let rest = key
+            .strip_prefix(SYNTHETIC_KEY_PREFIX)
+            .expect("synthetic keys are URN-prefixed");
+        let (slug, hash) = rest.rsplit_once('-').expect("slug-hash shape");
+        assert_eq!(slug, "eln-run-42");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// A title of only non-alphanumerics leaves an empty slug; the key must
+    /// still be a well-formed, unique URN rather than a dangling prefix.
+    #[test]
+    fn empty_slug_still_yields_a_valid_key() {
+        let key = resolve_doi(&extraction_of(src("!!! ???")));
+        let rest = key.strip_prefix(SYNTHETIC_KEY_PREFIX).expect("prefixed");
+        assert_eq!(rest.len(), 16);
+        assert!(rest.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn key_slug_is_bounded_and_collapses_separators() {
+        let long = "a".repeat(200);
+        assert!(key_slug(&long).len() <= 48);
+        assert_eq!(key_slug("Hello   World -- Again"), "hello-world-again");
+        assert_eq!(key_slug("  leading and trailing  "), "leading-and-trailing");
     }
 }

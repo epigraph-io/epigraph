@@ -1176,6 +1176,10 @@ pub struct IngestDocumentSpineResponse {
     pub paper_id: String,
     pub paper_title: String,
     pub doi: String,
+    /// `true` when `doi` is a `urn:epigraph:doc:*` key synthesized because the
+    /// document carries no DOI — it is this document's identity, not a real DOI
+    /// (issue #356). Poll and label with it exactly as returned.
+    pub synthesized_key: bool,
     pub authors: Vec<AuthorResponse>,
     pub paragraphs_new: usize,
     pub paragraphs_deduped: usize,
@@ -1359,6 +1363,10 @@ pub struct IngestDocumentResponse {
     pub paper_id: String,
     pub paper_title: String,
     pub doi: String,
+    /// `true` when `doi` is a `urn:epigraph:doc:*` key synthesized because the
+    /// document carries no DOI — it is this document's identity, not a real DOI
+    /// (issue #356). Poll and label with it exactly as returned.
+    pub synthesized_key: bool,
     pub authors: Vec<AuthorResponse>,
     pub claims_ingested: usize,
     pub claims_embedded: usize,
@@ -1373,7 +1381,12 @@ pub struct IngestDocumentResponse {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CheckAlreadyIngestedParams {
-    #[schemars(description = "DOI of the paper to check.")]
+    #[schemars(
+        description = "Document identity key to check: a real DOI, or the `document_key` \
+                       an ingest call returned for a document with no DOI (a \
+                       `urn:epigraph:doc:*` key). Placeholders like \"unknown\" are \
+                       rejected — they are not an identity."
+    )]
     pub doi: String,
     #[schemars(
         description = "Pipeline version. Omit to use the current hierarchical extraction pipeline."

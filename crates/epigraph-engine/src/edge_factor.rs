@@ -784,10 +784,31 @@ async fn compute_combined_belief(
         c
     };
 
-    let target = FocalElement::positive(BTreeSet::from([0_usize]));
+    // Which hypothesis these cached scalars are ABOUT. On the canonical binary
+    // frame this is 0 (TRUE) for every claim, so the binary path is unchanged.
+    // On a multi-hypothesis frame — a declared labeled axis (issue #222), or any
+    // claim `submit_ds_evidence` assigned a non-zero index — hardcoding 0 cached
+    // Bel/Pl/BetP for the WRONG hypothesis: "Bel(ineffective)" for a claim
+    // placed on "moderate". The read side (`belief_query::get_belief`,
+    // `get_perspective_belief`, `get_perspective_belief_batch`) has always
+    // targeted the claim's stored `claim_frames.hypothesis_index`; this makes the
+    // cache writer agree with it, so a `recompute_beliefs` can no longer
+    // overwrite an axis claim's cache with a belief about index 0.
+    //
+    // Missing assignment or NULL index ⇒ 0, matching the read side's
+    // `unwrap_or(0)`.
+    let hypothesis_index = FrameRepository::get_claim_assignment(pool, claim_id, frame_id)
+        .await
+        .map_err(|e| format!("get_claim_assignment: {e}"))?
+        .and_then(|a| a.hypothesis_index)
+        .and_then(|i| usize::try_from(i).ok())
+        .filter(|i| *i < frame.hypothesis_count())
+        .unwrap_or(0);
+
+    let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
     let bel = measures::belief(&combined, &target);
     let pl = measures::plausibility(&combined, &target);
-    let betp = measures::pignistic_probability(&combined, 0);
+    let betp = measures::pignistic_probability(&combined, hypothesis_index);
     let conflict = combined.mass_of_conflict();
     let missing = combined.mass_of_missing();
 
@@ -800,9 +821,15 @@ async fn compute_combined_belief(
         let thresholds = &calibration.classifier_thresholds;
         // theta = closed-world full-frame ignorance m({0,1}); the open-world
         // missing mass is excluded (Smets TBM), matching the legacy
-        // `compute_betp` the cascade was calibrated against. `betp` (above) is
-        // pignistic(idx 0) = betp_supported.
+        // `compute_betp` the cascade was calibrated against.
         let theta = combined.mass_of(&FocalElement::positive(BTreeSet::from([0_usize, 1_usize])));
+        // The cascade is defined on (betp_supported, betp_unsupported) = (idx 0,
+        // idx 1) specifically, so take idx 0 explicitly rather than reusing the
+        // assignment-targeted `betp` above. They are the same value for every
+        // normal binary claim (assigned index 0); they differ only for a claim
+        // deliberately assigned index 1 on the binary frame, where feeding
+        // pignistic(1) in as "supported" would invert the verdict.
+        let betp_supported = measures::pignistic_probability(&combined, 0);
         let betp_unsup = measures::pignistic_probability(&combined, 1);
         // has_opposing: does any single source BBA lean toward contradiction?
         // Post-#197 a `refutes`/`contradicts` edge auto-wires a Negative-leaning
@@ -819,7 +846,7 @@ async fn compute_combined_belief(
         let label = crate::classifier::classify(
             conflict,
             theta,
-            betp,
+            betp_supported,
             betp_unsup,
             has_opposing,
             thresholds,

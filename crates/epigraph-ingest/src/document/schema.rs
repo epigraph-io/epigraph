@@ -37,6 +37,14 @@ pub struct DocumentSource {
     pub title: String,
     #[serde(default)]
     pub doi: Option<String>,
+    /// Caller-supplied stable identity for a document that has no DOI — an ELN
+    /// entry, a run summary, an internal report. When `doi` is absent (or a
+    /// placeholder like `"unknown"`), this is what the document's identity key
+    /// is derived from, so re-ingesting the same record converges on one node
+    /// while unrelated records stay distinct. Prefer this over `doi: "unknown"`
+    /// for any `source_type` that has no external identifier (issue #356).
+    #[serde(default)]
+    pub external_id: Option<String>,
     #[serde(default)]
     pub uri: Option<String>,
     #[serde(default)]
@@ -64,12 +72,43 @@ pub enum SourceType {
     Tabular,
 }
 
+/// A declared, labeled axis to place a claim on, instead of the default binary
+/// `{TRUE, FALSE}` frame (issue #222).
+///
+/// Use this ONLY for genuinely multi-valued field axes that do not decompose
+/// into a single proposition — ordinal scales (`{ineffective, mild, moderate,
+/// strong}`, `{A, B, C, D}`) and categorical/field partitions (`{vata, pitta,
+/// kapha}`). A binary opposition (`safe`/`harmful`, `efficacious`/`ineffective`)
+/// does NOT need an axis: model it as a proposition on `{TRUE, FALSE}`, where
+/// "harmful" is mass on FALSE. Fanning a categorical axis out into N binary
+/// claims instead loses the mutual exclusivity the DS combination relies on.
+///
+/// Frames are deduped by name, so repeated ingests converge on one axis. The
+/// hypothesis list must match an existing frame of the same name exactly —
+/// a mismatch is an error rather than a silent second axis.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AxisDeclaration {
+    /// Frame name, e.g. `"anxiolytic_potency"`. Must not be `"binary_truth"` —
+    /// that is the reserved default frame.
+    pub frame: String,
+    /// The axis's mutually-exclusive, exhaustive hypotheses in a stable order,
+    /// e.g. `["ineffective", "mild", "moderate", "strong"]`. At least 2.
+    pub hypotheses: Vec<String>,
+    /// Which hypothesis this claim asserts, e.g. `"moderate"`. Must be one of
+    /// `hypotheses`.
+    pub label: String,
+}
+
 /// A section within the document.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Section {
     pub title: String,
     #[serde(default)]
     pub heading_span: Option<ByteSpan>,
+    /// Default axis for every paragraph in this section that does not declare
+    /// its own. Lets a whole section share one declaration (issue #222).
+    #[serde(default)]
+    pub axis: Option<AxisDeclaration>,
     #[serde(default)]
     pub paragraphs: Vec<Paragraph>,
 }
@@ -96,6 +135,17 @@ pub struct Paragraph {
     /// unrecognised value is dropped to `None`.
     #[serde(default)]
     pub evidence_type: Option<String>,
+    /// Declared labeled axis for this paragraph's atoms — the DS-wired units
+    /// (issue #222). Omit for the default binary `{TRUE, FALSE}` frame, which is
+    /// what almost every claim wants. Overrides the section's `axis`.
+    #[serde(default)]
+    pub axis: Option<AxisDeclaration>,
+    /// Per-atom label overrides on the resolved `axis`, positional against
+    /// `atoms` (same convention as `generality`). An empty string, a missing
+    /// entry, or a shorter array leaves that atom on the axis's own `label`.
+    /// Ignored when no axis is in effect.
+    #[serde(default)]
+    pub axis_labels: Vec<String>,
     #[serde(default)]
     pub page: Option<u32>,
     #[serde(default)]

@@ -46,6 +46,7 @@ async fn adding_supporting_evidence_does_not_drop_cached_betp(pool: sqlx::PgPool
             confidence: 0.9,
             weight: 0.9,
             evidence_type: Some("circumstantial".to_string()),
+            axis: None,
         }],
         agent,
     )

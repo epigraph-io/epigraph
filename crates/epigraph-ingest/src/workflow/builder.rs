@@ -50,6 +50,9 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
             confidence: 1.0,
             methodology: None,
             evidence_type: None,
+            // Workflow steps are placed on the default binary frame; labeled
+            // axes are a document-ingest declaration (issue #222).
+            axis: None,
             supporting_text: None,
             enrichment: serde_json::json!({}),
         });
@@ -108,6 +111,9 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
             confidence: 1.0,
             methodology: None,
             evidence_type: None,
+            // Workflow steps are placed on the default binary frame; labeled
+            // axes are a document-ingest declaration (issue #222).
+            axis: None,
             supporting_text: None,
             enrichment: serde_json::json!({}),
         });
@@ -151,6 +157,9 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                 confidence: step.confidence,
                 methodology: None,
                 evidence_type: step_evidence_type.clone(),
+                // Workflow steps are placed on the default binary frame; labeled
+                // axes are a document-ingest declaration (issue #222).
+                axis: None,
                 supporting_text: Some(step.rationale.clone()),
                 enrichment: serde_json::json!({}),
             });
@@ -185,6 +194,9 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                     confidence: step.confidence,
                     methodology: None,
                     evidence_type: step_evidence_type.clone(),
+                    // Workflow steps are placed on the default binary frame; labeled
+                    // axes are a document-ingest declaration (issue #222).
+                    axis: None,
                     supporting_text: Some(step.rationale.clone()),
                     enrichment: serde_json::json!({}),
                 });
