@@ -883,7 +883,21 @@ pub struct SubmitDsEvidenceParams {
     #[schemars(description = "0-based index of the hypothesis this claim represents in the frame")]
     pub hypothesis_index: i32,
 
+    // `with` pins the advertised schema to `{"type":"object",
+    // "additionalProperties":{"type":"number"}}`. A bare `serde_json::Value`
+    // renders as schemars' permissive schema with no `type`, and clients that
+    // build arguments from the schema then stringify the object and the call
+    // is rejected. The map type mirrors what the handler actually parses —
+    // `MassFunction::from_json_masses` deserializes into `BTreeMap<String, f64>`.
+    //
+    // `serde_json::Number`, not `f64`: `f64` would additionally emit
+    // `"format":"double"`, and a certain mass of 1.0 reaches us as the JSON
+    // integer `1` (`JSON.stringify(1.0) === "1"`), which serde happily coerces
+    // but a client-side validator treating `format` as an assertion could
+    // reject. Advertising a bare `"type":"number"` keeps the schema exactly as
+    // permissive as the handler.
     #[schemars(
+        with = "std::collections::BTreeMap<String, serde_json::Number>",
         description = "Mass assignments: {'0': 0.6, '0,1': 0.3, '~0,1': 0.1}. Keys: comma-separated indices (positive) or ~-prefixed (negative/complement). '' = conflict, '~' = open-world ignorance."
     )]
     pub masses: serde_json::Value,
@@ -1240,7 +1254,10 @@ pub struct LinkHierarchicalParams {
     )]
     pub relationship: String,
 
-    #[schemars(description = "Optional arbitrary JSON object attached to the edge.")]
+    #[schemars(
+        with = "Option<std::collections::BTreeMap<String, serde_json::Value>>",
+        description = "Optional arbitrary JSON object attached to the edge."
+    )]
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
 }
@@ -1323,7 +1340,10 @@ pub struct LinkEpistemicParams {
     )]
     pub relationship: String,
 
-    #[schemars(description = "Optional arbitrary JSON object attached to the edge.")]
+    #[schemars(
+        with = "Option<std::collections::BTreeMap<String, serde_json::Value>>",
+        description = "Optional arbitrary JSON object attached to the edge."
+    )]
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
 }
@@ -1659,7 +1679,10 @@ pub struct PatchClaimParams {
     pub claim_id: String,
     #[schemars(description = "New trace_id (must reference an existing reasoning_traces row)")]
     pub trace_id: Option<String>,
-    #[schemars(description = "JSONB to merge into properties")]
+    #[schemars(
+        with = "Option<std::collections::BTreeMap<String, serde_json::Value>>",
+        description = "JSONB to merge into properties"
+    )]
     pub properties: Option<serde_json::Value>,
     #[schemars(description = "Labels to add")]
     #[serde(default)]
@@ -1713,7 +1736,10 @@ pub struct PublishEventParams {
     #[schemars(description = "UUID of the actor (agent) triggering this event")]
     pub actor_id: Option<String>,
 
-    #[schemars(description = "JSON payload with event details")]
+    #[schemars(
+        with = "std::collections::BTreeMap<String, serde_json::Value>",
+        description = "JSON payload with event details"
+    )]
     pub payload: serde_json::Value,
 }
 
