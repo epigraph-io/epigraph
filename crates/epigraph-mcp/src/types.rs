@@ -105,7 +105,7 @@ pub struct SubmitClaimParams {
     pub content: String,
 
     #[schemars(
-        description = "Methodology: bayesian_inference, deductive_logic, inductive_generalization, expert_elicitation, statistical_analysis, meta_analysis"
+        description = "How the claim was derived. Use direct_observation (aliases: observation, observational) when you saw it yourself — a run, a test failure, a measured defect; this is the usual answer for an engineering finding. Other accepted values: instrumental, statistical_analysis, computational, negative_result, bayesian_inference, deductive_logic, theoretical_derivation, formal_proof, inductive_generalization, meta_analysis, abductive, visual_inspection, extraction, legal_document_review, textbook_assertion, expert_elicitation."
     )]
     pub methodology: String,
 
