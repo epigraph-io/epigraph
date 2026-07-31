@@ -3,6 +3,25 @@
 //! Tools are typed operations that agents can invoke. Every tool execution
 //! produces provenance metadata linking the output to the invoking agent,
 //! task, and correlation context.
+//!
+//! # This is NOT the MCP extension point
+//!
+//! The [`Tool`] trait and [`ToolRegistry`] below look exactly like the seam a
+//! downstream product would implement to add tools to EpiGraph's MCP server.
+//! They are not, and no crate in this workspace currently depends on this one.
+//!
+//! `epigraph-mcp` has no extension trait at all — it contains zero `pub trait`
+//! declarations, and its tool router is a compile-time `#[tool_router]` impl
+//! block. Per the federation gateway design:
+//!
+//! > Its tool router and `scope_map` are a closed set with no extension point.
+//!
+//! Downstream products extend EpiGraph **out of process**: run your own `rmcp`
+//! server on loopback streamable-HTTP and mount it on the gateway via
+//! `EPIGRAPH_MCP_EXTENSIONS`. See `epigraph-mcp/src/federation/` and
+//! `docs/superpowers/specs/2026-07-23-mcp-federation-gateway-design.md`.
+//! `episcience` is the reference implementation, and notably does not depend on
+//! `epigraph-mcp`.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
