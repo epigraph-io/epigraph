@@ -3,6 +3,26 @@
 This file is loaded into any Claude Code / agent session opened in this repo.
 Project-wide rules below; module-specific rules live next to their code.
 
+## Adding MCP tools — `epigraph-tools` is not the extension point
+
+`crates/epigraph-tools` defines a `Tool` trait and a `ToolRegistry`. Despite the
+names, that is **not** how tools reach the MCP server, and no crate in this
+workspace depends on it.
+
+`epigraph-mcp` has no extension trait — zero `pub trait` declarations, and a
+compile-time `#[tool_router]` impl block. Its router and `scope_map` are a
+closed set by design.
+
+- **Kernel tool** → add it to the `#[tool_router] impl` in
+  `epigraph-mcp/src/server.rs` *and* to `SCOPE_MAP` in `scope_map.rs` (a
+  coverage test fails until you do).
+- **Downstream product** → run a separate `rmcp` server on loopback
+  streamable-HTTP and mount it via `EPIGRAPH_MCP_EXTENSIONS`. See
+  `epigraph-mcp/src/federation/` and
+  `docs/superpowers/specs/2026-07-23-mcp-federation-gateway-design.md`.
+  `episcience` is the reference implementation. Do **not** add federated tools
+  to `SCOPE_MAP` — they are gated by the `scope=` in the env var instead.
+
 ## Retiring backlog items
 
 When you complete or refute a claim labelled `backlog`, **always use
