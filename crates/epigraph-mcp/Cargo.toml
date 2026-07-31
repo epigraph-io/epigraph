@@ -10,6 +10,9 @@ repository.workspace = true
 [dependencies]
 # Internal crates — the whole point: delegate, don't reimplement
 epigraph-auth = { workspace = true }
+# Needed to classify JWT rejection reasons for logging; `epigraph-auth`
+# already surfaces `jsonwebtoken::errors::Error` from `validate_token`.
+jsonwebtoken = "9"
 epigraph-core = { workspace = true }
 epigraph-crypto = { workspace = true }
 epigraph-db = { workspace = true }
