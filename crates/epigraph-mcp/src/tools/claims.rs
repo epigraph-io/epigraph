@@ -537,6 +537,12 @@ pub async fn get_claim(
                 epigraph_engine::BeliefQueryError::FrameNotFound(fid) => {
                     invalid_params(format!("frame {fid} not found"))
                 }
+                // Unreachable in practice — the claim row was fetched above —
+                // but mapping it keeps the engine's not-found signal from
+                // degrading into a 500 if that ordering ever changes.
+                epigraph_engine::BeliefQueryError::ClaimNotFound(cid) => {
+                    invalid_params(format!("claim {cid} not found"))
+                }
                 epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
                     invalid_params(format!("invalid mass function: {msg}"))
                 }
