@@ -27,6 +27,29 @@ use epigraph_auth::{AuthContext, JwtConfig};
 /// Single source so both 401 arms emit the same value.
 const INVALID_TOKEN: &str = "invalid_token";
 
+/// Static, non-secret label for why a Bearer token was rejected.
+///
+/// The wire response deliberately stays a uniform `invalid_token` (RFC 6750 —
+/// the client must not be told *why*, or the 401 becomes an oracle). That
+/// leaves the operator with nothing: an expired token, a wrong shared secret,
+/// and a token minted for the HTTP API's audience all produced byte-identical
+/// 401s and no log line. This restores the distinction server-side only.
+///
+/// Returns a fixed `&'static str` rather than the `Error`'s `Display`, so no
+/// token-derived bytes can reach a log sink through this path.
+fn rejection_reason(kind: &jsonwebtoken::errors::ErrorKind) -> &'static str {
+    use jsonwebtoken::errors::ErrorKind as K;
+    match kind {
+        K::ExpiredSignature => "expired",
+        K::InvalidSignature => "bad_signature",
+        K::InvalidIssuer => "bad_issuer",
+        K::InvalidAudience => "bad_audience",
+        K::ImmatureSignature => "not_yet_valid",
+        K::InvalidToken | K::Base64(_) | K::Json(_) | K::Utf8(_) => "malformed",
+        _ => "other",
+    }
+}
+
 /// The raw (still-encoded) Bearer token string, captured by
 /// [`bearer_auth_middleware`] after successful validation and stashed in the
 /// request extensions alongside [`AuthContext`].
@@ -74,10 +97,31 @@ pub async fn bearer_auth_middleware(
                         .insert(RawBearerToken(token.to_string()));
                     next.run(req).await
                 }
-                Err(_) => unauthorized(state.resource_metadata_url.as_deref(), INVALID_TOKEN),
+                Err(e) => {
+                    let reason = rejection_reason(e.kind());
+                    // A bad signature means the caller is presenting a token
+                    // this server did not mint — misconfiguration or probing,
+                    // either way worth seeing at default log levels. Expiry is
+                    // routine and stays at debug so it cannot drown the journal.
+                    if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::InvalidSignature) {
+                        tracing::warn!(reason, "MCP bearer token rejected");
+                    } else {
+                        tracing::debug!(reason, "MCP bearer token rejected");
+                    }
+                    unauthorized(state.resource_metadata_url.as_deref(), INVALID_TOKEN)
+                }
             }
         }
-        _ => unauthorized(state.resource_metadata_url.as_deref(), INVALID_TOKEN),
+        _ => {
+            // Distinguishes "sent nothing" from "sent something invalid" — the
+            // two were previously indistinguishable in the journal, and they
+            // point at different misconfigurations.
+            tracing::debug!(
+                reason = "missing_or_non_bearer_header",
+                "MCP request rejected"
+            );
+            unauthorized(state.resource_metadata_url.as_deref(), INVALID_TOKEN)
+        }
     }
 }
 
@@ -197,5 +241,92 @@ mod tests {
             .unwrap();
         assert_eq!(www, "Bearer error=\"invalid_token\"");
         assert!(!www.contains("resource_metadata"), "got: {www}");
+    }
+
+    // ── Rejection-reason classification (issue #367) ──
+
+    /// Mint a token that is already expired, via a negative TTL.
+    fn expired_token(secret: &[u8]) -> String {
+        let cfg = JwtConfig::from_secret(secret);
+        cfg.issue_access_token(
+            uuid::Uuid::new_v4(),
+            vec!["claims:read".to_string()],
+            "service",
+            None,
+            None,
+            chrono::Duration::minutes(-5),
+        )
+        .unwrap()
+        .0
+    }
+
+    fn valid_token(secret: &[u8]) -> String {
+        let cfg = JwtConfig::from_secret(secret);
+        cfg.issue_access_token(
+            uuid::Uuid::new_v4(),
+            vec!["claims:read".to_string()],
+            "service",
+            None,
+            None,
+            chrono::Duration::minutes(5),
+        )
+        .unwrap()
+        .0
+    }
+
+    const SECRET: &[u8] = b"this-secret-is-at-least-32-bytes-long!!";
+    const WRONG_SECRET: &[u8] = b"a-completely-different-32-byte-key!!xx";
+
+    #[test]
+    fn expired_token_classifies_as_expired() {
+        let cfg = JwtConfig::from_secret(SECRET);
+        let err = cfg.validate_token(&expired_token(SECRET)).unwrap_err();
+        assert_eq!(rejection_reason(err.kind()), "expired");
+    }
+
+    #[test]
+    fn wrong_secret_classifies_as_bad_signature() {
+        // The case that most needs to be visible: a caller presenting a token
+        // this server did not mint. Previously indistinguishable from expiry.
+        let cfg = JwtConfig::from_secret(SECRET);
+        let err = cfg.validate_token(&valid_token(WRONG_SECRET)).unwrap_err();
+        assert_eq!(rejection_reason(err.kind()), "bad_signature");
+    }
+
+    #[test]
+    fn garbage_classifies_as_malformed() {
+        let cfg = JwtConfig::from_secret(SECRET);
+        let err = cfg.validate_token("not-a-jwt").unwrap_err();
+        assert_eq!(rejection_reason(err.kind()), "malformed");
+    }
+
+    #[test]
+    fn expiry_and_bad_signature_are_distinguishable() {
+        // The whole point of #367: these two produce identical wire responses,
+        // so if the classifier collapses them the operator is blind again.
+        let cfg = JwtConfig::from_secret(SECRET);
+        let expired = rejection_reason(
+            cfg.validate_token(&expired_token(SECRET))
+                .unwrap_err()
+                .kind(),
+        );
+        let bad_sig = rejection_reason(
+            cfg.validate_token(&valid_token(WRONG_SECRET))
+                .unwrap_err()
+                .kind(),
+        );
+        assert_ne!(expired, bad_sig);
+    }
+
+    #[test]
+    fn reasons_never_contain_token_material() {
+        // `rejection_reason` returns fixed &'static str, never the Error's
+        // Display. Guards against someone "helpfully" switching to `{e}`, which
+        // can echo decoded token fragments into logs.
+        let cfg = JwtConfig::from_secret(SECRET);
+        let token = valid_token(WRONG_SECRET);
+        let reason = rejection_reason(cfg.validate_token(&token).unwrap_err().kind());
+        assert!(!reason.contains(&token[..16]));
+        assert!(reason.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
     }
 }

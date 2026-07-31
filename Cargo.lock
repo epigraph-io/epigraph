@@ -1557,6 +1557,7 @@ dependencies = [
  "epigraph-interfaces",
  "hex",
  "http 1.4.0",
+ "jsonwebtoken",
  "openssl",
  "rand 0.8.5",
  "reqwest",
