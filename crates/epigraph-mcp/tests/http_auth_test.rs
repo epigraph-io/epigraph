@@ -500,3 +500,160 @@ async fn unauthenticated_http_passes_scope_gate() {
         );
     }
 }
+
+// ─── Tests 6-10: Host/Origin allowlist (DNS-rebinding guard) ──────────────
+//
+// The workspace pins rmcp 0.15, whose StreamableHttpServerConfig has no
+// allowed_hosts/allowed_origins knob and which validates neither header (that
+// landed in rmcp 1.4.0, CVE-2026-42559 class). A browser on the listener's host
+// loading a hostile page whose DNS rebinds to 127.0.0.1:<port> could therefore
+// reach /mcp and drive every tool. `host_guard` closes that at the header level.
+//
+// Driven through `tower::ServiceExt::oneshot` rather than a live socket: reqwest
+// rewrites `Host` from the request URL, so a live-server test could not actually
+// send the rebound header these cases turn on.
+
+use epigraph_mcp::host_guard::{host_guard_middleware, HostAllowlist};
+use tower::ServiceExt;
+
+/// The name an operator would add for a reverse-proxied deployment (Caddy's
+/// `reverse_proxy` forwards the client's original `Host`, so the public name
+/// must be allowlisted or every proxied request 403s).
+const PROXY_HOST: &str = "mcp.example.com";
+
+/// Router shaped exactly like `main.rs`'s TCP branch: MCP service, then the
+/// Bearer layer, then the Host guard applied LAST so it is OUTERMOST and runs
+/// FIRST. The nesting order is load-bearing — a rebound request must be refused
+/// on its headers before auth decides anything about it.
+async fn boot_guarded_router() -> axum::Router {
+    let allowlist = HostAllowlist::for_tcp_listener("127.0.0.1:3100", &[PROXY_HOST.to_string()]);
+    boot_router()
+        .await
+        .layer(axum::middleware::from_fn_with_state(
+            allowlist,
+            host_guard_middleware,
+        ))
+}
+
+/// A well-formed `initialize` POST with a caller-chosen `Host` (and optional
+/// `Origin`) — i.e. exactly what a rebound browser tab would emit.
+fn init_request(
+    host: &str,
+    origin: Option<&str>,
+    bearer: Option<&str>,
+) -> axum::http::Request<axum::body::Body> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "rebind-test", "version": "0.1"}
+        }
+    });
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("Host", host)
+        .header("Accept", ACCEPT)
+        .header("Content-Type", CONTENT_TYPE);
+    if let Some(origin) = origin {
+        builder = builder.header("Origin", origin);
+    }
+    if let Some(token) = bearer {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    builder
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn status_of(req: axum::http::Request<axum::body::Body>) -> u16 {
+    boot_guarded_router()
+        .await
+        .oneshot(req)
+        .await
+        .expect("router is infallible")
+        .status()
+        .as_u16()
+}
+
+/// The attack, with a VALID credential: a rebound `Host` must be refused before
+/// auth ever runs. Using a good token is what makes this test load-bearing —
+/// with the guard removed this request returns 200 and a live MCP session, so a
+/// 401-based assertion would not distinguish the fixed build from the broken one.
+#[tokio::test]
+async fn rebound_host_is_refused_even_with_a_valid_token() {
+    let token = mint_token(SECRET, &["claims:read"]);
+    assert_eq!(
+        status_of(init_request("evil.example", None, Some(&token))).await,
+        403,
+        "a rebound Host must be refused outright, not handed a session"
+    );
+    // Fully-qualified spelling of the same name — the standard allowlist bypass.
+    assert_eq!(
+        status_of(init_request("evil.example.", None, Some(&token))).await,
+        403
+    );
+}
+
+/// The guard must not swallow the request pipeline: an allowlisted `Host`
+/// reaches the Bearer layer, which then rejects the credential-less request with
+/// 401 (NOT 403). This is the pairing that proves the 403 above came from the
+/// Host check and that legitimate loopback traffic still flows.
+#[tokio::test]
+async fn allowlisted_hosts_fall_through_to_the_bearer_layer() {
+    for host in ["127.0.0.1:3100", "localhost", "[::1]:3100", PROXY_HOST] {
+        assert_eq!(
+            status_of(init_request(host, None, None)).await,
+            401,
+            "allowlisted Host {host:?} must reach the auth layer, not be 403'd"
+        );
+    }
+}
+
+/// A hostile page reaching the listener carries its own `Origin` even when the
+/// `Host` looks local (e.g. a proxy or a client that rewrites Host). The Origin
+/// check is the second, independent gate.
+#[tokio::test]
+async fn hostile_origin_is_refused_under_an_allowlisted_host() {
+    let token = mint_token(SECRET, &["claims:read"]);
+    for origin in ["http://evil.example", "https://evil.example:8443", "null"] {
+        assert_eq!(
+            status_of(init_request("127.0.0.1:3100", Some(origin), Some(&token))).await,
+            403,
+            "Origin {origin:?} must be refused"
+        );
+    }
+}
+
+/// A legitimate local browser client (dev UI on :5173) must still be served, or
+/// the guard breaks the localhost case it exists to protect.
+#[tokio::test]
+async fn allowlisted_origin_falls_through_to_the_bearer_layer() {
+    assert_eq!(
+        status_of(init_request(
+            "127.0.0.1:3100",
+            Some("http://localhost:5173"),
+            None
+        ))
+        .await,
+        401,
+        "an allowlisted Origin must reach the auth layer, not be 403'd"
+    );
+}
+
+/// A request with no `Host` at all (and no URI authority to fall back on) has
+/// nothing to check, so it fails closed rather than defaulting to allowed.
+#[tokio::test]
+async fn request_without_a_host_header_is_refused() {
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("Accept", ACCEPT)
+        .header("Content-Type", CONTENT_TYPE)
+        .body(axum::body::Body::from("{}"))
+        .unwrap();
+    assert_eq!(status_of(req).await, 403);
+}
