@@ -19,14 +19,80 @@ use epigraph_db::PatchClaimInput;
 use epigraph_db::{ClaimRepository, EdgeRepository, EvidenceRepository, ReasoningTraceRepository};
 use uuid::Uuid;
 
+/// Resolve an agent-supplied methodology string to a [`Methodology`].
+///
+/// The accepted vocabulary is the union of three sets, and nothing else — that
+/// rule is what keeps this function from drifting into ad-hoc synonyms:
+///
+/// 1. every canonical key in `calibration.toml` `[methodology_profiles]` and
+///    every alias in `[methodology_aliases]`. The DS calibrator already has a
+///    tuned profile for each; rejecting one here means the write surface will
+///    not accept a methodology the belief engine is calibrated to score.
+///    Enforced by `tests::the_calibrated_methodology_vocabulary_is_accepted`.
+/// 2. the serde (snake_case) name of every `Methodology` variant, so a value
+///    read back off a stored `ReasoningTrace` round-trips. Enforced by
+///    `tests::every_methodology_variant_is_reachable_from_the_mcp_surface`.
+/// 3. `direct_observation` / `observation` — the plain-language names for the
+///    dominant evidence mode of an engineering defect report (BL-9).
+///
+/// Hyphens normalize to underscores, so calibration's `"meta-analysis"` alias
+/// resolves too.
+///
+/// `Methodology` is deliberately coarser (9 variants) than the calibration
+/// vocabulary (15 profiles + 14 aliases), so several strings share a variant.
+/// The enum is the trust-modifier bucket; the calibration key is the tuned
+/// mass profile.
 fn parse_methodology(s: &str) -> Result<Methodology, String> {
     match s.to_lowercase().replace('-', "_").as_str() {
         "bayesian_inference" | "bayesian" => Ok(Methodology::BayesianInference),
-        "deductive_logic" | "deductive" => Ok(Methodology::Deductive),
-        "inductive_generalization" | "inductive" => Ok(Methodology::Inductive),
-        "expert_elicitation" | "expert" => Ok(Methodology::Heuristic),
-        "statistical_analysis" | "statistical" => Ok(Methodology::Instrumental),
-        "meta_analysis" | "meta" => Ok(Methodology::FormalProof),
+
+        "deductive_logic" | "deductive" | "deductive_reasoning" | "theoretical_derivation" => {
+            Ok(Methodology::Deductive)
+        }
+
+        // meta-analysis is a statistical synthesis over a population of prior
+        // studies — an inductive generalization, not a formal proof. It used to
+        // map to FormalProof, handing the single highest trust modifier in the
+        // system (1.2, above Deductive's 1.1) to an empirical synthesis that
+        // calibration.toml itself ranks BELOW deductive_logic (0.80 vs 0.85).
+        "inductive_generalization" | "inductive" | "meta_analysis" | "meta" => {
+            Ok(Methodology::Inductive)
+        }
+
+        "abductive" => Ok(Methodology::Abductive),
+
+        // Direct observation lands on Instrumental by the repo's own authority:
+        // calibration.toml [methodology_aliases] maps
+        // `experimental_observation = "instrumental"`. `statistical_analysis`
+        // stays here to agree with the sibling mapping
+        // `ingestion::methodology_from_planned`.
+        "statistical_analysis"
+        | "statistical"
+        | "statistical_inference"
+        | "instrumental"
+        | "instrumental_measurement"
+        | "computational"
+        | "computational_simulation"
+        | "observational"
+        | "observation"
+        | "direct_observation"
+        | "experimental_observation"
+        | "negative_result" => Ok(Methodology::Instrumental),
+
+        "visual_inspection" => Ok(Methodology::VisualInspection),
+
+        // Reading an assertion out of a document, rather than deriving or
+        // measuring it.
+        "extraction"
+        | "llm_extraction"
+        | "literature_synthesis"
+        | "legal_document_review"
+        | "textbook_assertion" => Ok(Methodology::Extraction),
+
+        "formal_proof" | "proof" | "mathematical_proof" => Ok(Methodology::FormalProof),
+
+        "expert_elicitation" | "expert" | "testimonial" | "heuristic" => Ok(Methodology::Heuristic),
+
         other => Err(format!("unknown methodology: {other}")),
     }
 }
@@ -470,6 +536,12 @@ pub async fn get_claim(
             .map_err(|e| match e {
                 epigraph_engine::BeliefQueryError::FrameNotFound(fid) => {
                     invalid_params(format!("frame {fid} not found"))
+                }
+                // Unreachable in practice — the claim row was fetched above —
+                // but mapping it keeps the engine's not-found signal from
+                // degrading into a 500 if that ordering ever changes.
+                epigraph_engine::BeliefQueryError::ClaimNotFound(cid) => {
+                    invalid_params(format!("claim {cid} not found"))
                 }
                 epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
                     invalid_params(format!("invalid mass function: {msg}"))
@@ -953,4 +1025,198 @@ pub async fn query_undecomposed_claims(
         .collect();
 
     success_json(&results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_methodology;
+    use epigraph_core::Methodology;
+    use epigraph_engine::calibration::CalibrationConfig;
+
+    /// The canonical accepted string for every [`Methodology`] variant.
+    ///
+    /// The `match` is exhaustive **on purpose**: adding a tenth variant to
+    /// `Methodology` breaks this file at compile time, forcing whoever adds it
+    /// to also give it a route in through the MCP write surface. Three variants
+    /// (`Abductive`, `Extraction`, `VisualInspection`) sat unreachable from
+    /// `parse_methodology` precisely because nothing enforced this.
+    const fn canonical_token(m: Methodology) -> &'static str {
+        match m {
+            Methodology::Deductive => "deductive_logic",
+            Methodology::Inductive => "inductive_generalization",
+            Methodology::Abductive => "abductive",
+            Methodology::Instrumental => "instrumental",
+            Methodology::Extraction => "extraction",
+            Methodology::BayesianInference => "bayesian_inference",
+            Methodology::VisualInspection => "visual_inspection",
+            Methodology::FormalProof => "formal_proof",
+            Methodology::Heuristic => "expert_elicitation",
+        }
+    }
+
+    const ALL_METHODOLOGIES: [Methodology; 9] = [
+        Methodology::Deductive,
+        Methodology::Inductive,
+        Methodology::Abductive,
+        Methodology::Instrumental,
+        Methodology::Extraction,
+        Methodology::BayesianInference,
+        Methodology::VisualInspection,
+        Methodology::FormalProof,
+        Methodology::Heuristic,
+    ];
+
+    #[test]
+    fn every_methodology_variant_is_reachable_from_the_mcp_surface() {
+        for m in ALL_METHODOLOGIES {
+            let token = canonical_token(m);
+            assert_eq!(
+                parse_methodology(token),
+                Ok(m),
+                "Methodology::{m:?} has no accepted string on the submit_claim \
+                 surface — an agent can never record a claim under it"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_observation_is_an_accepted_methodology() {
+        // BL-9: the dominant evidence mode for an engineering defect is "I ran
+        // it and watched it fail". Every one of these was rejected outright.
+        // Instrumental is the repo's own answer: calibration.toml
+        // [methodology_aliases] maps `experimental_observation = "instrumental"`.
+        for s in [
+            "direct_observation",
+            "observation",
+            "observational",
+            "experimental_observation",
+            "Direct-Observation",
+        ] {
+            assert_eq!(
+                parse_methodology(s),
+                Ok(Methodology::Instrumental),
+                "{s:?} must be accepted as direct observation"
+            );
+        }
+    }
+
+    #[test]
+    fn meta_analysis_is_an_inductive_generalization_not_a_formal_proof() {
+        for s in ["meta_analysis", "meta-analysis", "meta"] {
+            assert_eq!(
+                parse_methodology(s),
+                Ok(Methodology::Inductive),
+                "{s:?} must resolve to an inductive generalization over studies"
+            );
+        }
+        // The concrete harm of the old mapping, stated on the single scale it
+        // lives on: FormalProof (1.2) is the highest trust modifier in the
+        // system, above Deductive (1.1). A statistical synthesis of prior
+        // studies must not outrank deductive logic — calibration.toml ranks
+        // meta_analysis 0.80 BELOW deductive_logic 0.85.
+        let meta = parse_methodology("meta_analysis").expect("meta_analysis parses");
+        assert!(
+            meta.weight_modifier() < Methodology::Deductive.weight_modifier(),
+            "meta-analysis weight {} must be below deductive logic's {}",
+            meta.weight_modifier(),
+            Methodology::Deductive.weight_modifier()
+        );
+    }
+
+    #[test]
+    fn previously_unreachable_variants_now_parse() {
+        assert_eq!(parse_methodology("abductive"), Ok(Methodology::Abductive));
+        assert_eq!(parse_methodology("extraction"), Ok(Methodology::Extraction));
+        assert_eq!(
+            parse_methodology("visual_inspection"),
+            Ok(Methodology::VisualInspection)
+        );
+        // FormalProof lost its only (mis-mapped) route when meta_analysis was
+        // retargeted; it must keep one under its own name.
+        assert_eq!(
+            parse_methodology("formal_proof"),
+            Ok(Methodology::FormalProof)
+        );
+    }
+
+    /// Drift guard, mirroring `tests/evidence_type_vocab.rs`: a methodology the
+    /// DS calibrator has a tuned profile for must not be rejected by the write
+    /// surface that produces the claims it calibrates.
+    #[test]
+    fn the_calibrated_methodology_vocabulary_is_accepted() {
+        let cal =
+            CalibrationConfig::from_workspace_root().expect("load workspace calibration.toml");
+
+        // Non-vacuity. `from_workspace_root()` does NOT error when
+        // calibration.toml is unreadable — it silently returns
+        // `default_for_phase2_fallback()`, whose maps are all EMPTY, which
+        // would make both loops below iterate zero times and pass trivially.
+        assert!(
+            cal.methodology_profiles.contains_key("observational"),
+            "calibration.toml did not load (empty fallback) — this test would \
+             otherwise pass vacuously"
+        );
+        assert!(
+            cal.methodology_aliases
+                .contains_key("experimental_observation"),
+            "calibration.toml aliases did not load — this test would otherwise \
+             pass vacuously"
+        );
+
+        for key in cal
+            .methodology_profiles
+            .keys()
+            .filter(|k| k.as_str() != "default")
+        {
+            assert!(
+                parse_methodology(key).is_ok(),
+                "calibration.toml [methodology_profiles] has a tuned profile for \
+                 {key:?} but the MCP submit_claim surface rejects it"
+            );
+        }
+        for alias in cal.methodology_aliases.keys() {
+            assert!(
+                parse_methodology(alias).is_ok(),
+                "calibration.toml [methodology_aliases] accepts {alias:?} but the \
+                 MCP submit_claim surface rejects it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_five_correct_pre_existing_mappings_are_preserved() {
+        // BL-9 changed exactly one existing arm (meta_analysis). These five are
+        // load-bearing for already-stored traces and must not move.
+        assert_eq!(
+            parse_methodology("bayesian_inference"),
+            Ok(Methodology::BayesianInference)
+        );
+        assert_eq!(
+            parse_methodology("deductive_logic"),
+            Ok(Methodology::Deductive)
+        );
+        assert_eq!(
+            parse_methodology("inductive_generalization"),
+            Ok(Methodology::Inductive)
+        );
+        // `resolve_backlog_item` defaults to this string on every backlog
+        // retirement; calibration ranks expert_elicitation lowest (0.45 support
+        // / 0.45 ignorance) and Heuristic is the lowest weight (0.5).
+        assert_eq!(
+            parse_methodology("expert_elicitation"),
+            Ok(Methodology::Heuristic)
+        );
+        // Agrees with the sibling mapping `ingestion::methodology_from_planned`,
+        // which maps "statistical" | "instrumental" | "computational" the same way.
+        assert_eq!(
+            parse_methodology("statistical_analysis"),
+            Ok(Methodology::Instrumental)
+        );
+    }
+
+    #[test]
+    fn an_unknown_methodology_is_still_rejected() {
+        assert!(parse_methodology("vibes").is_err());
+        assert!(parse_methodology("").is_err());
+    }
 }

@@ -22,13 +22,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
 use epigraph_ds::{FocalElement, FrameOfDiscernment, MassFunction};
 use epigraph_mcp::tools::claims::get_claim;
-use epigraph_mcp::tools::ds::get_belief;
+use epigraph_mcp::tools::ds::{get_belief, scoped_belief};
 use epigraph_mcp::tools::memory::recall;
 use epigraph_mcp::tools::perspectives::list_perspectives;
 use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 use epigraph_mcp::tools::recall::RecallWithContextParams;
-use epigraph_mcp::types::{GetBeliefParams, GetClaimParams, ListPerspectivesParams, RecallParams};
-use rmcp::model::CallToolResult;
+use epigraph_mcp::types::{
+    GetBeliefParams, GetClaimParams, ListPerspectivesParams, RecallParams, ScopedBeliefParams,
+};
+use rmcp::model::{CallToolResult, ErrorCode};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -954,5 +956,100 @@ async fn list_perspectives_surfaces_reliability_maps(pool: PgPool) {
     assert!(
         plain_row["locality_reliability"].is_null(),
         "unmapped perspective locality_reliability must be null: {plain_row}"
+    );
+}
+
+// ── BL-3: "no evidence in this frame" vs "claim does not exist" ──────────────
+
+/// Backlog BL-3. `scoped_belief`'s frame-function path used to answer a
+/// fabricated claim UUID with a byte-identical body to a real claim that simply
+/// carries no BBAs in the frame (`BeliefInterval::empty_frame`), because the
+/// engine short-circuited on `all_bbas.is_empty()` without ever touching the
+/// claims table. A caller could not tell a typo from a genuine evidence gap.
+///
+/// Both branches are asserted in one fixture so the test is discriminating
+/// rather than one-sided:
+///   A. fabricated `00000000-0000-4000-8000-000000000000` → INVALID_PARAMS
+///      naming the claim as not found (NOT an INTERNAL_ERROR — the engine's
+///      `ClaimNotFound` must be mapped, not swallowed by the catch-all).
+///   B. a real, freshly inserted claim with zero BBAs on the SAME frame and the
+///      SAME perspective → still a well-formed empty-evidence body
+///      (Bel=0, Pl=1, BetP=1/2 on the binary frame).
+///
+/// Frame and perspective are the real seeded ones in both legs, so neither
+/// `FrameNotFound` nor a perspective quirk can be what makes leg A fail.
+#[sqlx::test(migrations = "../../migrations")]
+async fn scoped_belief_distinguishes_missing_claim_from_empty_evidence(pool: PgPool) {
+    let fx = seed_fixture(&pool, &unit_pgvec()).await;
+    let server = build_test_server(pool.clone());
+
+    // ── A. fabricated claim id ───────────────────────────────────────────────
+    let fabricated = Uuid::parse_str("00000000-0000-4000-8000-000000000000").unwrap();
+    let err = scoped_belief(
+        &server,
+        ScopedBeliefParams {
+            claim_id: fabricated.to_string(),
+            scope_type: "perspective".to_string(),
+            scope_id: fx.skeptic_id.to_string(),
+            frame_id: Some(fx.frame_id.to_string()),
+        },
+    )
+    .await
+    .expect_err("a nonexistent claim must NOT return a success body");
+    assert_eq!(
+        err.code,
+        ErrorCode::INVALID_PARAMS,
+        "not-found must surface as INVALID_PARAMS (codebase convention), not \
+         INTERNAL_ERROR — an unmapped BeliefQueryError::ClaimNotFound would be a 500: {err:?}"
+    );
+    assert!(
+        err.message.contains(&fabricated.to_string()) && err.message.contains("not found"),
+        "error must name the missing claim: {}",
+        err.message
+    );
+
+    // ── B. real claim, no BBAs on this frame ────────────────────────────────
+    let agent = insert_agent(&pool).await;
+    let evidence_free = insert_paragraph_claim(&pool, agent, &unit_pgvec()).await;
+    let ok = scoped_belief(
+        &server,
+        ScopedBeliefParams {
+            claim_id: evidence_free.to_string(),
+            scope_type: "perspective".to_string(),
+            scope_id: fx.skeptic_id.to_string(),
+            frame_id: Some(fx.frame_id.to_string()),
+        },
+    )
+    .await
+    .expect("a real claim with no BBAs must still return a well-formed body");
+    let body = parse_json(&ok);
+    assert_eq!(
+        body["claim_id"].as_str(),
+        Some(evidence_free.to_string().as_str()),
+        "body must echo the queried claim: {body}"
+    );
+    assert_eq!(
+        body["belief"].as_f64(),
+        Some(0.0),
+        "empty evidence keeps Bel=0: {body}"
+    );
+    assert_eq!(
+        body["plausibility"].as_f64(),
+        Some(1.0),
+        "empty evidence keeps Pl=1: {body}"
+    );
+    assert_eq!(
+        body["pignistic_prob"].as_f64(),
+        Some(0.5),
+        "empty evidence on a 2-hypothesis frame keeps BetP=1/2: {body}"
+    );
+
+    // ── C. the claim under test: the two are now distinguishable ────────────
+    // Before the fix leg A returned exactly leg B's body with a different
+    // claim_id echoed back, so this pairing is what BL-3 reports.
+    assert_eq!(
+        body["scope_id"].as_str(),
+        Some(fx.skeptic_id.to_string().as_str()),
+        "the empty-evidence body stays fully populated: {body}"
     );
 }

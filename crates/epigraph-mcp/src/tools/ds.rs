@@ -322,6 +322,9 @@ pub async fn get_belief(
                 epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
                     invalid_params(format!("frame {id} not found"))
                 }
+                epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
+                    invalid_params(format!("claim {id} not found"))
+                }
                 epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
                     invalid_params(format!("invalid mass function: {msg}"))
                 }
@@ -505,6 +508,12 @@ pub async fn scoped_belief(
             .map_err(|e| match e {
                 epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
                     invalid_params(format!("frame {id} not found"))
+                }
+                // Without this arm the engine's new not-found signal would fall
+                // through to `internal_error` and turn a precise diagnostic
+                // into a 500.
+                epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
+                    invalid_params(format!("claim {id} not found"))
                 }
                 epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
                     invalid_params(format!("invalid mass function: {msg}"))

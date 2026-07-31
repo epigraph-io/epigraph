@@ -13,14 +13,47 @@
 use crate::mass::{FocalElement, MassFunction};
 use epigraph_core::TruthValue;
 
+/// Normalize a raw measure onto the closed unit interval `[0.0, 1.0]`.
+///
+/// This is deliberately **not** `f64::clamp`. `clamp` is defined as
+/// "return `self` unless it is outside the bounds", and `-0.0 < 0.0` is false,
+/// so `(-0.0).clamp(0.0, 1.0)` returns `-0.0` with its sign bit intact
+/// (`0x8000_0000_0000_0000`). A `-0.0` satisfies the `claims_belief_bounds`
+/// CHECK constraint and is therefore persisted verbatim, where it leaks into
+/// the divergence cache and into any downstream sign-sensitive comparison.
+/// `clamp` also propagates `NaN` unchanged, and in Postgres `NaN > 1.0`, so a
+/// `NaN` measure turns a claim write into a constraint violation.
+///
+/// This is not hypothetical: `impl Sum for f64` folds from `-0.0` (the true
+/// additive identity, since `-0.0 + x == x` for every `x`), so the `.sum()` in
+/// `belief`/`plausibility` returns `-0.0` whenever no focal element passes the
+/// filter — every vacuous mass function, every target disjoint from the
+/// support.
+///
+/// Explicit comparisons collapse every non-finite and every non-positive input
+/// (including `-0.0`, `NaN`, and both infinities) to a positive `0.0`. Note
+/// this makes `+inf` map to `0.0` rather than saturating to `1.0`: a
+/// non-finite belief is garbage input, and `0.0` is the conservative value.
+#[must_use]
+fn normalize_unit_interval(x: f64) -> f64 {
+    if !x.is_finite() || x <= 0.0 {
+        0.0
+    } else if x >= 1.0 {
+        1.0
+    } else {
+        x
+    }
+}
+
 /// Belief: sum of masses of all positive focal elements that are subsets of target
 ///
 /// `Bel(A)` = sum `m(B)` for all B positive with `B.subset` subset of `A.subset`, B non-empty
 ///
 /// Complement elements are excluded — they represent "outside" evidence.
 ///
-/// Result is clamped to [0, 1]; without the clamp, repeated folds accumulate
-/// floating-point drift that trips the `claims_belief_bounds` CHECK constraint.
+/// Result is normalized onto [0, 1] via `normalize_unit_interval`; without it,
+/// repeated folds accumulate floating-point drift that trips the
+/// `claims_belief_bounds` CHECK constraint.
 #[must_use]
 pub fn belief(m: &MassFunction, target: &FocalElement) -> f64 {
     if target.complement {
@@ -36,7 +69,7 @@ pub fn belief(m: &MassFunction, target: &FocalElement) -> f64 {
         })
         .map(|(_, &mass)| mass)
         .sum();
-    raw.clamp(0.0, 1.0)
+    normalize_unit_interval(raw)
 }
 
 /// Plausibility: sum of masses of all positive focal elements intersecting target
@@ -45,8 +78,9 @@ pub fn belief(m: &MassFunction, target: &FocalElement) -> f64 {
 ///
 /// Complement elements are excluded.
 ///
-/// Result is clamped to [0, 1]; without the clamp, repeated folds accumulate
-/// floating-point drift that trips the `claims_plausibility_bounds` CHECK constraint.
+/// Result is normalized onto [0, 1] via `normalize_unit_interval`; without it,
+/// repeated folds accumulate floating-point drift that trips the
+/// `claims_plausibility_bounds` CHECK constraint.
 #[must_use]
 pub fn plausibility(m: &MassFunction, target: &FocalElement) -> f64 {
     if target.complement {
@@ -60,7 +94,7 @@ pub fn plausibility(m: &MassFunction, target: &FocalElement) -> f64 {
         })
         .map(|(_, &mass)| mass)
         .sum();
-    raw.clamp(0.0, 1.0)
+    normalize_unit_interval(raw)
 }
 
 /// Belief interval [Bel(A), Pl(A)]
@@ -122,17 +156,11 @@ pub fn pignistic_probability(m: &MassFunction, hypothesis_idx: usize) -> f64 {
         .sum();
 
     // Floating-point combination can produce tiny negative values (e.g. -0.0) when
-    // non_classical_mass is close to 1.0 and sum underflows. Use explicit
-    // comparisons — clamp() preserves IEEE 754 -0.0 sign, which would cause
-    // -0.0 to be stored verbatim in the divergence cache.
-    let result = sum * normalizer;
-    if result.is_nan() || !result.is_finite() || result <= 0.0 {
-        return 0.0_f64;
-    }
-    if result >= 1.0 {
-        return 1.0_f64;
-    }
-    result
+    // non_classical_mass is close to 1.0 and sum underflows, and can produce a
+    // non-finite result when the normalizer blows up. `normalize_unit_interval`
+    // (not `clamp`) strips the IEEE 754 -0.0 sign that would otherwise be stored
+    // verbatim in the divergence cache.
+    normalize_unit_interval(sum * normalizer)
 }
 
 /// Commonality function: total mass of all positive supersets of target
@@ -240,7 +268,13 @@ pub fn beta_to_cbpa(
     Ok(MassFunction::from_raw(frame.clone(), masses))
 }
 
-/// Clamp the five belief-measure fields written to `claims` to `[0.0, 1.0]`.
+/// Normalize the five belief-measure fields written to `claims` onto `[0.0, 1.0]`.
+///
+/// Each field goes through `normalize_unit_interval`, not `f64::clamp`: `clamp`
+/// would return `-0.0` unchanged (it is not "outside" the bounds) and would
+/// propagate `NaN`. `-0.0` satisfies the CHECK constraints below and is
+/// persisted verbatim; `NaN` fails them, because Postgres orders `NaN` above
+/// every other double, so it turns the write into a constraint violation.
 ///
 /// Three of the five — `belief`, `plausibility`, `mass_on_empty` — are enforced
 /// at the DB level by `claims_belief_bounds`, `claims_plausibility_bounds`, and
@@ -262,11 +296,11 @@ pub fn clamp_claim_belief_measures(
     mass_on_missing: f64,
 ) -> (f64, f64, Option<f64>, f64, f64) {
     (
-        belief.clamp(0.0, 1.0),
-        plausibility.clamp(0.0, 1.0),
-        pignistic_prob.map(|p| p.clamp(0.0, 1.0)),
-        mass_on_empty.clamp(0.0, 1.0),
-        mass_on_missing.clamp(0.0, 1.0),
+        normalize_unit_interval(belief),
+        normalize_unit_interval(plausibility),
+        pignistic_prob.map(normalize_unit_interval),
+        normalize_unit_interval(mass_on_empty),
+        normalize_unit_interval(mass_on_missing),
     )
 }
 
@@ -764,6 +798,203 @@ mod clamp_tests {
     fn preserves_none_pignistic() {
         let (_, _, betp, _, _) = clamp_claim_belief_measures(0.4, 0.9, None, 0.1, 0.05);
         assert_eq!(betp, None);
+    }
+
+    // ======== gh#364B: IEEE 754 sign / non-finite normalization ========
+    //
+    // NOTE for future readers: `assert_eq!(x, 0.0)` PASSES for `-0.0`, because
+    // IEEE 754 defines `-0.0 == 0.0`. Every assertion below therefore inspects
+    // the SIGN BIT via `is_sign_positive()`. An equality-only assertion here
+    // would be a tautology that passes on the pre-fix `.clamp(0.0, 1.0)` code.
+
+    /// `f64::clamp` returns `self` when it is not outside the bounds, and
+    /// `-0.0 < 0.0` is false, so the pre-fix helper handed `-0.0` (bit pattern
+    /// `0x8000_0000_0000_0000`) straight to `UPDATE claims SET belief = ...`.
+    #[test]
+    fn negative_zero_is_normalized_to_positive_zero_on_all_five_fields() {
+        let neg_zero = -0.0_f64;
+        assert!(
+            neg_zero.is_sign_negative(),
+            "test setup: literal -0.0 must carry the sign bit"
+        );
+
+        let (bel, pl, betp, me, mm) =
+            clamp_claim_belief_measures(neg_zero, neg_zero, Some(neg_zero), neg_zero, neg_zero);
+
+        assert!(
+            bel.is_sign_positive(),
+            "belief kept -0.0: bits {:#x}",
+            bel.to_bits()
+        );
+        assert!(
+            pl.is_sign_positive(),
+            "plausibility kept -0.0: bits {:#x}",
+            pl.to_bits()
+        );
+        let betp = betp.expect("pignistic_prob stays Some");
+        assert!(
+            betp.is_sign_positive(),
+            "pignistic_prob kept -0.0: bits {:#x}",
+            betp.to_bits()
+        );
+        assert!(
+            me.is_sign_positive(),
+            "mass_on_empty kept -0.0: bits {:#x}",
+            me.to_bits()
+        );
+        assert!(
+            mm.is_sign_positive(),
+            "mass_on_missing kept -0.0: bits {:#x}",
+            mm.to_bits()
+        );
+
+        // Belt and braces: the canonical positive zero has an all-zero bit pattern.
+        assert_eq!(bel.to_bits(), 0_u64);
+    }
+
+    /// A tiny negative underflow (not merely `-0.0`) must also land on `+0.0`,
+    /// since `.clamp` maps `-1e-18` to `+0.0` but the sign question only shows
+    /// up for the exact `-0.0` input — this pins both halves of the branch.
+    #[test]
+    fn tiny_negative_underflow_lands_on_positive_zero() {
+        let (bel, ..) = clamp_claim_belief_measures(-1e-18, 0.5, None, 0.0, 0.0);
+        assert_eq!(bel, 0.0);
+        assert!(bel.is_sign_positive(), "bits {:#x}", bel.to_bits());
+    }
+
+    /// `NaN.clamp(0.0, 1.0)` returns `NaN`. Postgres orders `NaN` above every
+    /// other double, so a `NaN` belief fails `claims_belief_bounds` and aborts
+    /// the write instead of being silently corrected.
+    #[test]
+    fn nan_is_normalized_to_zero_rather_than_propagated() {
+        let nan = f64::NAN;
+        let (bel, pl, betp, me, mm) = clamp_claim_belief_measures(nan, nan, Some(nan), nan, nan);
+
+        for (name, v) in [
+            ("belief", bel),
+            ("plausibility", pl),
+            ("pignistic_prob", betp.expect("stays Some")),
+            ("mass_on_empty", me),
+            ("mass_on_missing", mm),
+        ] {
+            assert!(!v.is_nan(), "{name} propagated NaN");
+            assert!(v.is_finite(), "{name} is not finite: {v}");
+            assert!((0.0..=1.0).contains(&v), "{name} out of range: {v}");
+            assert!(v.is_sign_positive(), "{name} bits {:#x}", v.to_bits());
+        }
+    }
+
+    /// Both infinities collapse to `+0.0`. This is a deliberate behaviour
+    /// change: `.clamp` saturated `+inf` to `1.0`, which would write a
+    /// maximally-confident belief from garbage input. Unifying on the
+    /// `pignistic_probability` guard's semantics treats any non-finite measure
+    /// as no-information instead.
+    #[test]
+    fn infinities_collapse_to_zero_not_to_one() {
+        let (bel, pl, ..) =
+            clamp_claim_belief_measures(f64::INFINITY, f64::NEG_INFINITY, None, 0.0, 0.0);
+        assert_eq!(bel, 0.0, "+inf must not saturate to 1.0");
+        assert!(bel.is_sign_positive());
+        assert_eq!(pl, 0.0);
+        assert!(pl.is_sign_positive());
+    }
+}
+
+#[cfg(test)]
+mod normalize_unit_interval_tests {
+    use super::normalize_unit_interval;
+
+    #[test]
+    fn strips_the_negative_zero_sign_bit() {
+        let out = normalize_unit_interval(-0.0);
+        assert_eq!(
+            out.to_bits(),
+            0_u64,
+            "expected +0.0, got bits {:#x}",
+            out.to_bits()
+        );
+        assert!(out.is_sign_positive());
+    }
+
+    #[test]
+    fn maps_non_finite_inputs_to_positive_zero() {
+        for input in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let out = normalize_unit_interval(input);
+            assert!(!out.is_nan(), "NaN escaped for input {input}");
+            assert_eq!(out, 0.0, "input {input} did not collapse to 0.0");
+            assert!(out.is_sign_positive(), "input {input} produced -0.0");
+        }
+    }
+
+    #[test]
+    fn saturates_above_one_and_below_zero() {
+        assert_eq!(normalize_unit_interval(1.5), 1.0);
+        assert_eq!(normalize_unit_interval(1.0), 1.0);
+        let below = normalize_unit_interval(-0.5);
+        assert_eq!(below, 0.0);
+        assert!(below.is_sign_positive());
+    }
+
+    #[test]
+    fn passes_interior_values_through_unchanged() {
+        for v in [f64::MIN_POSITIVE, 1e-300, 0.5, 0.999_999_999] {
+            assert!((normalize_unit_interval(v) - v).abs() < f64::EPSILON * v.max(1.0));
+        }
+    }
+}
+
+#[cfg(test)]
+mod pignistic_sign_tests {
+    use super::{belief, normalize_unit_interval, pignistic_probability, plausibility};
+    use crate::frame::FrameOfDiscernment;
+    use crate::mass::{FocalElement, MassFunction};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// This is the PRIMARY `-0.0` path, not an edge case.
+    ///
+    /// `impl Sum for f64` folds from `-0.0` — the true additive identity for
+    /// f64, since `-0.0 + x == x` for every `x` including `-0.0`, whereas
+    /// `+0.0 + -0.0 == +0.0`. So `belief`'s `.sum()` over an empty filter
+    /// returns `-0.0`, and the pre-fix `.clamp(0.0, 1.0)` preserved it
+    /// (`-0.0 < 0.0` is false). Measured directly: for a vacuous mass
+    /// function with a positive target, the raw sum was
+    /// `0x8000_0000_0000_0000` and `.clamp` returned the same bits.
+    ///
+    /// Every vacuous mass function, and every target disjoint from all focal
+    /// elements, hits this. Both functions now normalize at the return site.
+    #[test]
+    fn belief_and_plausibility_of_unsupported_target_are_positive_zero() {
+        let frame = FrameOfDiscernment::new("t", vec!["a".into(), "b".into()]).unwrap();
+        let mut masses = BTreeMap::new();
+        masses.insert(FocalElement::vacuous(), 1.0);
+        let m = MassFunction::from_raw(frame, masses);
+        let target = FocalElement::positive(BTreeSet::from([0]));
+
+        let bel = belief(&m, &target);
+        assert_eq!(bel, 0.0);
+        assert!(bel.is_sign_positive(), "belief bits {:#x}", bel.to_bits());
+
+        let pl = plausibility(&m, &target);
+        assert!(
+            pl.is_sign_positive(),
+            "plausibility bits {:#x}",
+            pl.to_bits()
+        );
+    }
+
+    /// The all-conflict short circuit and the normalized path must agree on
+    /// sign, so the divergence cache never sees `-0.0` from either exit.
+    #[test]
+    fn pignistic_all_conflict_returns_positive_zero() {
+        let frame = FrameOfDiscernment::new("t", vec!["a".into(), "b".into()]).unwrap();
+        let mut masses = BTreeMap::new();
+        masses.insert(FocalElement::positive(BTreeSet::new()), 1.0);
+        let m = MassFunction::from_raw(frame, masses);
+
+        let betp = pignistic_probability(&m, 0);
+        assert_eq!(betp, 0.0);
+        assert!(betp.is_sign_positive(), "bits {:#x}", betp.to_bits());
+        assert_eq!(betp.to_bits(), normalize_unit_interval(-0.0).to_bits());
     }
 }
 

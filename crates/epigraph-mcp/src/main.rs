@@ -11,14 +11,21 @@
 //! # Stdio transport (default — for Claude Code / .mcp.json integration)
 //! epigraph-mcp-full --database-url postgres://user:pass@host/db
 //!
-//! # HTTP transport with Bearer auth (production)
+//! # HTTP transport with Bearer auth (the only supported TCP mode)
 //! epigraph-mcp-full --database-url postgres://... --listen 127.0.0.1:8080 \
-//!   --jwt-secret "<HMAC secret matching epigraph-api's JWT_SECRET>"
+//!   --jwt-secret "<HMAC secret matching epigraph-api's JWT_SECRET>" \
+//!   --allowed-host mcp.example.com          # add the name a reverse proxy forwards
 //!
-//! # Unauthenticated HTTP (unix socket behind filesystem perms, or local dev)
+//! # Unauthenticated HTTP — unix socket ONLY (behind filesystem perms).
+//! # The same flag on a TCP --listen is refused at startup.
 //! epigraph-mcp-full --database-url postgres://... --listen unix:/run/mcp.sock \
 //!   --allow-unauthenticated-http
 //! ```
+//!
+//! Every TCP listener enforces a `Host`/`Origin` allowlist (`localhost`,
+//! `127.0.0.1`, `::1`, the `--listen` authority, plus `--allowed-host`) as the
+//! DNS-rebinding defense rmcp 0.15 does not provide. A reverse-proxied
+//! deployment MUST add the public name, since Caddy forwards the client's Host.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -53,9 +60,9 @@ struct Cli {
     /// Unix sockets close the localhost-bypass surface: only processes with filesystem
     /// access can connect. If omitted, uses stdio transport.
     ///
-    /// Requires either `--jwt-secret` (Bearer auth, recommended for production) or
-    /// `--allow-unauthenticated-http` (for unix-socket listeners behind filesystem
-    /// permissions, or local dev).
+    /// A TCP address requires `--jwt-secret` (Bearer auth); a unix path may use
+    /// either `--jwt-secret` or `--allow-unauthenticated-http`. TCP listeners also
+    /// enforce a `Host`/`Origin` allowlist — see `--allowed-host`.
     #[arg(long)]
     listen: Option<String>,
 
@@ -70,13 +77,33 @@ struct Cli {
 
     /// Acknowledge that HTTP transport exposes all MCP tools without authentication.
     ///
-    /// One of two accepted modes when `--listen` is used. Use this for unix-socket
-    /// listeners behind filesystem permissions, or for local dev. For network-exposed
-    /// HTTP, use `--jwt-secret` instead. Mutually exclusive with `--jwt-secret`.
+    /// Accepted ONLY for a unix-socket listener (`--listen unix:/abs/path`), whose
+    /// filesystem permissions are the trust gate. Rejected for a TCP `--listen`
+    /// address: a TCP listener is reachable by every local process AND by a browser
+    /// whose DNS rebinds to it, so combining it with this flag exposes the full write
+    /// surface with no credential. For a TCP listener use `--jwt-secret`.
+    /// Mutually exclusive with `--jwt-secret`.
     ///
     /// See: https://github.com/epigraph-io/epigraph/issues/122
     #[arg(long)]
     allow_unauthenticated_http: bool,
+
+    /// Additional `Host` / `Origin` authority to accept on the HTTP listener
+    /// (repeatable; comma-separated in the env var).
+    ///
+    /// The listener rejects any request whose `Host` — or, when present, `Origin`
+    /// — is outside its allowlist, which is the DNS-rebinding defense rmcp 0.15
+    /// does not provide. The allowlist always contains `localhost`, `127.0.0.1`,
+    /// `::1` and the `--listen` authority; a reverse-proxied deployment must add
+    /// the public name the proxy forwards (e.g. `5-78-124-36.nip.io`), because
+    /// Caddy's `reverse_proxy` preserves the client's original `Host`.
+    /// Ports are ignored in the comparison.
+    #[arg(
+        long = "allowed-host",
+        env = "EPIGRAPH_MCP_ALLOWED_HOSTS",
+        value_delimiter = ','
+    )]
+    allowed_host: Vec<String>,
 
     /// Start in read-only mode (query tools only, write operations return errors)
     #[arg(long)]
@@ -196,6 +223,56 @@ fn select_signer(
     })
 }
 
+/// Validate the `(--listen, --jwt-secret, --allow-unauthenticated-http)`
+/// combination, returning the operator-facing rejection reason on failure.
+///
+/// The stdio process boundary is the default trust gate; `--listen` removes it,
+/// so serving requires either Bearer auth or an explicit, *narrowly scoped*
+/// opt-out. The opt-out is scoped to unix sockets: that is the case its own
+/// documentation cites ("behind filesystem permissions"), and it is the only
+/// listener kind a browser cannot reach — so it is the only one where running
+/// with no credential is not a remote-code-execution-by-rebinding surface.
+///
+/// Extracted (and pure over its inputs) so every arm is unit-testable without a
+/// process or a database, mirroring `select_signer`. This is not merely stylistic:
+/// `create_pool` connects EAGERLY, so a subprocess test of an *accepting* arm
+/// would sail past the gate and then hang/fail on the DB, proving nothing about
+/// the gate. `tests/jwt_secret_gate_test.rs` still covers the rejecting arms
+/// end-to-end, which is what proves `main` actually calls this.
+fn check_listen_auth_mode(
+    listen: &str,
+    jwt_secret: Option<&str>,
+    allow_unauthenticated_http: bool,
+) -> Result<(), String> {
+    match (jwt_secret, allow_unauthenticated_http) {
+        (Some(secret), false) => epigraph_auth::assert_production_secret(secret.as_bytes())
+            .map_err(|reason| format!("--jwt-secret rejected: {reason}")),
+        (None, true) => {
+            if epigraph_mcp::is_unix_listener(listen) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "--allow-unauthenticated-http is permitted only for a unix-socket listener\n\
+                     (--listen unix:/abs/path), whose filesystem permissions are the trust gate.\n\
+                     --listen {listen} is a TCP address: it is reachable by any local process and\n\
+                     by a browser whose DNS rebinds to it, which would drive every write tool with\n\
+                     no credential. Use --jwt-secret <SECRET>, or move the listener to a unix socket.\n\
+                     See https://github.com/epigraph-io/epigraph/issues/122."
+                ))
+            }
+        }
+        (Some(_), true) => {
+            Err("--jwt-secret and --allow-unauthenticated-http are mutually exclusive.".to_string())
+        }
+        (None, false) => Err(
+            "--listen requires either --jwt-secret <SECRET> (Bearer auth) or\n\
+             --allow-unauthenticated-http (unix-socket listeners only, behind filesystem\n\
+             permissions). See https://github.com/epigraph-io/epigraph/issues/122."
+                .to_string(),
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Logging to stderr (stdout reserved for MCP JSON-RPC in stdio mode)
@@ -209,34 +286,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    // Safety gate for the HTTP transport. The stdio process boundary is the
-    // default trust gate; HTTP removes it. To start with --listen, the operator
-    // must either supply a JWT secret (Bearer auth) or explicitly opt out of
-    // auth (e.g., a unix-socket listener behind filesystem permissions).
-    if cli.listen.is_some() {
-        match (cli.jwt_secret.as_deref(), cli.allow_unauthenticated_http) {
-            (Some(secret), false) => {
-                if let Err(reason) = epigraph_auth::assert_production_secret(secret.as_bytes()) {
-                    eprintln!("ERROR: --jwt-secret rejected: {reason}");
-                    std::process::exit(1);
-                }
-                // authenticated path
-            }
-            (None, true) => {} // operator-acknowledged unauthenticated path
-            (Some(_), true) => {
-                eprintln!(
-                    "ERROR: --jwt-secret and --allow-unauthenticated-http are mutually exclusive."
-                );
-                std::process::exit(1);
-            }
-            (None, false) => {
-                eprintln!(
-                    "ERROR: --listen requires either --jwt-secret <SECRET> (Bearer auth) or\n\
-                     --allow-unauthenticated-http (e.g., for a unix-socket listener behind\n\
-                     filesystem permissions). See https://github.com/epigraph-io/epigraph/issues/122."
-                );
-                std::process::exit(1);
-            }
+    // Safety gate for the HTTP transport (see `check_listen_auth_mode`). Runs
+    // before the DB connect so a misconfiguration surfaces immediately rather
+    // than after a connection timeout.
+    if let Some(listen) = cli.listen.as_deref() {
+        if let Err(reason) = check_listen_auth_mode(
+            listen,
+            cli.jwt_secret.as_deref(),
+            cli.allow_unauthenticated_http,
+        ) {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
         }
     }
 
@@ -402,6 +462,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             router
         };
 
+        // ── DNS-rebinding guard (CVE-2026-42559 class) ──────────────────
+        // rmcp 0.15's StreamableHttpServerConfig has no allowed_hosts /
+        // allowed_origins knob and the crate validates neither header, so a
+        // browser pointed at a page whose DNS rebinds to this listener could
+        // otherwise drive every tool. Applied LAST, i.e. OUTERMOST, so it runs
+        // BEFORE the auth layer: a rebound request is refused on its headers
+        // alone. TCP only — a unix socket is unreachable from a browser, so the
+        // guard would add no security there while risking a 403 on the one
+        // listener kind allowed to run unauthenticated.
+        let router = if epigraph_mcp::is_unix_listener(addr) {
+            tracing::info!(
+                "Unix-socket listener: Host/Origin allowlist not applied (a unix socket has no \
+                 DNS-rebinding surface); filesystem permissions are the trust gate"
+            );
+            router
+        } else {
+            let allowlist =
+                epigraph_mcp::host_guard::HostAllowlist::for_tcp_listener(addr, &cli.allowed_host);
+            tracing::info!(
+                allowed_hosts = %allowlist.describe(),
+                "Host/Origin allowlist active on the MCP HTTP listener (DNS-rebinding guard); \
+                 extend it with --allowed-host / EPIGRAPH_MCP_ALLOWED_HOSTS"
+            );
+            router.layer(axum::middleware::from_fn_with_state(
+                allowlist,
+                epigraph_mcp::host_guard::host_guard_middleware,
+            ))
+        };
+
         tracing::info!("Starting EpiGraph MCP server in {mode} mode on {addr}");
         epigraph_mcp::serve_with_listener(addr, router).await?;
     } else {
@@ -430,6 +519,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod listen_auth_gate_tests {
+    use super::check_listen_auth_mode;
+
+    const TCP: &str = "127.0.0.1:3100";
+    const UNIX: &str = "unix:/run/epigraph-mcp.sock";
+    const GOOD_SECRET: &str = "a-real-production-secret-of-at-least-32-bytes";
+
+    /// The escalating case this gate was tightened for: a TCP listener served
+    /// with NO credential. `epigraph-mcp-http.service` ran exactly this
+    /// (`--listen 127.0.0.1:3100 --allow-unauthenticated-http`), and the
+    /// unauthenticated path injects a permissive AuthContext, so every write
+    /// tool was callable by anything that could open a loopback socket —
+    /// including a browser whose DNS rebound to it. It must not start.
+    #[test]
+    fn tcp_listener_with_no_credential_is_refused() {
+        for listen in [TCP, "0.0.0.0:3100", "[::1]:3100", "localhost:3100"] {
+            let err = check_listen_auth_mode(listen, None, true)
+                .expect_err("unauthenticated TCP listener must be refused");
+            assert!(
+                err.contains("unix-socket"),
+                "rejection must point the operator at the unix-socket alternative; got: {err}"
+            );
+        }
+    }
+
+    /// The case the flag's own documentation cites — a unix socket behind
+    /// filesystem permissions — must STILL be accepted. Without this the change
+    /// would be a blanket removal of the flag rather than a narrowing, and the
+    /// socket deployment would break.
+    #[test]
+    fn unix_listener_with_no_credential_is_still_accepted() {
+        assert!(check_listen_auth_mode(UNIX, None, true).is_ok());
+    }
+
+    /// A TCP listener WITH a real Bearer secret is the supported production
+    /// shape and must remain accepted — the narrowing keys on the missing
+    /// credential, not on the transport being TCP.
+    #[test]
+    fn tcp_listener_with_a_real_jwt_secret_is_accepted() {
+        assert!(check_listen_auth_mode(TCP, Some(GOOD_SECRET), false).is_ok());
+    }
+
+    /// Pre-existing guards must survive the extraction: the committed dev
+    /// literal is still refused, and the two modes are still mutually exclusive
+    /// (so a stray `--allow-unauthenticated-http` cannot quietly disable a
+    /// supplied secret).
+    #[test]
+    fn preexisting_secret_guards_survive_the_extraction() {
+        let dev = check_listen_auth_mode(
+            TCP,
+            Some("epigraph-dev-secret-change-in-production!!"),
+            false,
+        )
+        .expect_err("dev literal must be refused");
+        assert!(dev.contains("--jwt-secret rejected"), "got: {dev}");
+
+        let short = check_listen_auth_mode(TCP, Some("too-short"), false)
+            .expect_err("a sub-32-byte secret must be refused");
+        assert!(short.contains("--jwt-secret rejected"), "got: {short}");
+
+        let both = check_listen_auth_mode(TCP, Some(GOOD_SECRET), true)
+            .expect_err("both modes at once must be refused");
+        assert!(both.contains("mutually exclusive"), "got: {both}");
+
+        // ...including on a unix listener, where the unauth path is otherwise legal.
+        assert!(check_listen_auth_mode(UNIX, Some(GOOD_SECRET), true).is_err());
+    }
+
+    /// `--listen` with neither mode selected is still refused on both transports
+    /// (this arm never depended on the TCP/unix distinction).
+    #[test]
+    fn listen_with_no_mode_selected_is_refused() {
+        for listen in [TCP, UNIX] {
+            let err = check_listen_auth_mode(listen, None, false)
+                .expect_err("--listen with no auth mode must be refused");
+            assert!(err.contains("--jwt-secret"), "got: {err}");
+        }
+    }
 }
 
 #[cfg(test)]

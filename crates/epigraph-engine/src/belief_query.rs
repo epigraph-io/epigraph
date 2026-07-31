@@ -179,8 +179,10 @@ pub async fn get_belief(
 /// `get_belief`.
 ///
 /// # Errors
-/// `FrameNotFound` if `frame_id` is absent; `ParseMasses`/`Ds` on malformed or
-/// uncombinable BBAs; `Db` on query failure.
+/// `FrameNotFound` if `frame_id` is absent; `ClaimNotFound` if `claim_id` names
+/// no claim row (checked only when the claim carries no BBAs in this frame —
+/// see below); `ParseMasses`/`Ds` on malformed or uncombinable BBAs; `Db` on
+/// query failure.
 pub async fn get_perspective_belief(
     pool: &PgPool,
     claim_id: Uuid,
@@ -197,6 +199,20 @@ pub async fn get_perspective_belief(
 
     let all_bbas = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id).await?;
     if all_bbas.is_empty() {
+        // An empty BBA set is ambiguous on its own: it is equally the signature
+        // of a real claim with no evidence in this frame AND of a `claim_id`
+        // that names nothing at all, so without this probe a typo'd UUID
+        // returns a byte-identical `empty_frame` body and the caller cannot
+        // tell the two apart. Probe ONLY on this branch — `mass_functions
+        // .claim_id` is `REFERENCES claims(id)`, so a non-empty BBA set already
+        // proves the claim row exists — which keeps the evidence-bearing path
+        // at zero extra queries.
+        if ClaimRepository::get_by_id(pool, ClaimId::from_uuid(claim_id))
+            .await?
+            .is_none()
+        {
+            return Err(BeliefQueryError::ClaimNotFound(claim_id));
+        }
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
     }
 

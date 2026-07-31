@@ -5,6 +5,7 @@ pub mod claim_helper;
 pub mod embed;
 pub mod errors;
 pub mod federation;
+pub mod host_guard;
 pub mod scope_map;
 pub mod server;
 pub mod tools;
@@ -20,6 +21,29 @@ pub use server::EpiGraphMcpFull;
 pub fn list_tools() -> serde_json::Value {
     EpiGraphMcpFull::all_tools_json()
 }
+
+/// Does this `--listen` spec name a Unix-domain socket rather than a TCP address?
+///
+/// The single discriminator between the two listener kinds, shared by
+/// [`serve_with_listener`] (which binds accordingly), the startup auth gate in
+/// `main.rs` (unauthenticated serving is permitted only for the unix case, whose
+/// trust gate is filesystem permissions), and the router build (the Host/Origin
+/// DNS-rebinding guard is attached only for the TCP case). Keeping one function
+/// means those three decisions cannot drift apart.
+///
+/// Deliberately not `#[cfg(unix)]`-gated: on a non-unix target
+/// [`serve_with_listener`] would fall through and attempt a TCP bind of a
+/// `unix:`-prefixed string, which fails loudly — far better than a gate that
+/// silently classifies the same string differently from the code that binds it.
+#[must_use]
+pub fn is_unix_listener(listen: &str) -> bool {
+    listen.starts_with(UNIX_LISTEN_PREFIX)
+}
+
+/// The `--listen` prefix that selects a Unix-domain socket. One literal, so
+/// [`is_unix_listener`] and [`serve_with_listener`] cannot disagree about what
+/// counts as a unix listener.
+pub const UNIX_LISTEN_PREFIX: &str = "unix:";
 
 /// Serve `router` on the given `listen` spec.
 ///
@@ -37,7 +61,7 @@ pub fn list_tools() -> serde_json::Value {
 #[allow(clippy::missing_panics_doc)]
 pub async fn serve_with_listener(listen: &str, router: axum::Router) -> std::io::Result<()> {
     #[cfg(unix)]
-    if let Some(path) = listen.strip_prefix("unix:") {
+    if let Some(path) = listen.strip_prefix(UNIX_LISTEN_PREFIX) {
         // Best-effort cleanup of a stale socket from a previous run.
         //
         // NOTE: AF_UNIX has no SO_REUSEADDR equivalent. If two MCP processes
