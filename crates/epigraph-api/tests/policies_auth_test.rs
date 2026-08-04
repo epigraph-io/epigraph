@@ -435,3 +435,89 @@ async fn decide_candidate_already_decided_returns_409() {
         resp.text().await.unwrap_or_default()
     );
 }
+
+// ── list_match_candidates ───────────────────────────────────────────────────
+//
+// `list_candidates` reads pending cross-source match candidates *and* the
+// verbatim content excerpts of both claims in each pair. It must fail closed
+// on its own rather than relying on the router placing it behind the
+// protected chain — the `#[cfg(not(feature = "db"))]` router registers this
+// same path under `public`, which is exactly the placement that would make a
+// scope-less handler fail open.
+
+/// No token → 401.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_candidates_without_token_returns_401() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/match_candidates?status=pending&limit=10"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        401,
+        "expected 401 Unauthorized; got {} — body={}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+}
+
+/// claims:write token (insufficient for a read endpoint) → 403.
+///
+/// `epigraph_auth::check_scopes` is strictly conjunctive with no read/write
+/// ladder, so `claims:write` alone does NOT confer `claims:read`. Mirrors
+/// `decide_candidate_with_wrong_scope_returns_403`, which asserts the dual.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_candidates_with_wrong_scope_returns_403() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let token = common::test_bearer_token_with_scopes(&["claims:write"]);
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/match_candidates?status=pending&limit=10"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        403,
+        "expected 403 Forbidden; got {} — body={}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+}
+
+/// claims:read token → 200 (positive control: the guard admits the right scope).
+#[tokio::test(flavor = "multi_thread")]
+async fn list_candidates_with_claims_read_returns_200() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let token = common::test_bearer_token_with_scopes(&["claims:read"]);
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/match_candidates?status=pending&limit=10"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "expected 200 OK; got {} — body={}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+}
