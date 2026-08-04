@@ -168,11 +168,29 @@ fn excerpt(content: Option<&String>) -> String {
     }
 }
 
+/// Lists cross-source match candidates, including verbatim content excerpts of
+/// both claims in each pair.
+///
+/// Fails closed on its own rather than trusting router placement: the
+/// `#[cfg(feature = "db")]` router puts this path in the protected chain, but
+/// the `#[cfg(not(feature = "db"))]` router registers the same path under
+/// `public`. Guarding here means the handler cannot leak claim content if it is
+/// ever re-placed in a public chain. `claims:read` matches the MCP twin of this
+/// operation (`list_match_candidates` in `epigraph-mcp/src/scope_map.rs`);
+/// the sibling `decide_candidate` requires `claims:write`, as does its MCP twin.
 #[cfg(feature = "db")]
 pub async fn list_candidates(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Query(q): Query<ListCandidatesQuery>,
 ) -> Result<Json<Vec<PendingCandidateOut>>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "list_candidates requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:read"])?;
+
     let status_ref = match q.status.as_deref() {
         Some(s @ ("pending" | "promoted" | "rejected" | "stale")) => Some(s),
         Some(other) => {
