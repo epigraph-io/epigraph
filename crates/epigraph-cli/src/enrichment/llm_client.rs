@@ -11,8 +11,11 @@
 //!   `CLAUDE_CODE_OAUTH_TOKEN` (Max plan, `Authorization: Bearer`) and falls
 //!   back to `ANTHROPIC_API_KEY` (`x-api-key`).
 //! - [`MockLlmClient`] — pre-configured or empty responses, used by tests.
+//! - [`FixtureLlmClient`] — deterministic, file-driven answers to a
+//!   `decompose_claims` batch prompt. Deliberately NOT registered (see its
+//!   docs): registry membership would make it auto-detect-eligible.
 //!
-//! Both impl `epigraph_interfaces::LlmProvider`. Call
+//! All three impl `epigraph_interfaces::LlmProvider`. Call
 //! [`register_builtin_llm_providers`] from each binary's `main` to install
 //! them into the kernel's process-wide registry. Private / enterprise
 //! extensions register themselves the same way and outrank built-ins in
@@ -127,6 +130,152 @@ impl LlmProvider for MockLlmClient {
         };
 
         Ok(value)
+    }
+}
+
+// =============================================================================
+// FIXTURE CLIENT (deterministic, file-driven — for end-to-end write-path tests)
+// =============================================================================
+
+/// Deterministic [`LlmProvider`] that answers a `decompose_claims` batch prompt
+/// from a caller-supplied fixture file instead of calling a model.
+///
+/// Motivation: `MockLlmClient` has an empty response vec, so `complete_json`
+/// returns `[]`, `decompose::parse_batch_response` yields nothing, and
+/// `persist_decomposition` is never reached — the atom/edge write path is
+/// unreachable without a live `CLAUDE_CODE_OAUTH_TOKEN`. This client closes
+/// that gap without spending a real LLM call.
+///
+/// # Fixture format
+///
+/// A JSON object keyed by the **exact claim text**, whose values are the same
+/// shape the model is asked to emit:
+///
+/// ```json
+/// {
+///   "gravity bends light and time dilates near mass": {
+///     "atoms": ["Gravity bends light", "Time dilates near mass"],
+///     "generality": [0, 1]
+///   }
+/// }
+/// ```
+///
+/// # Why keyed by claim text, not by index
+///
+/// The batch response the parser consumes is keyed by the claim's *position in
+/// the prompt*, and `ClaimRepository::list_undecomposed` does not guarantee a
+/// stable order. A fixture that hardcoded `{"0": …}` would silently attach
+/// atoms to the WRONG parent whenever the ordering changed, while still
+/// reporting "N atoms, N edges" — a passing-looking run with corrupt edges.
+/// Keying on claim text and resolving positions from the prompt that was
+/// actually handed to us makes the mapping order-independent, and makes the
+/// atoms genuinely derived from the input claims.
+///
+/// # Not in the provider registry — by construction
+///
+/// This type is deliberately NOT registered by
+/// [`register_builtin_llm_providers`] and NOT reachable through
+/// [`create_llm_client`]. `epigraph_interfaces::default_llm_provider` skips
+/// only the literal name `"mock"`, so any *registered* active provider becomes
+/// eligible for `--provider epigraph` auto-detect whenever Anthropic
+/// credentials are absent. Registering a fixture provider would therefore make
+/// canned atoms silently writable in production. Selection stays local to the
+/// `decompose_claims` binary, behind an explicit `--provider fixture` flag plus
+/// an explicit fixture-path env var.
+#[derive(Debug)]
+pub struct FixtureLlmClient {
+    /// Claim text -> the decomposition object for that claim.
+    by_claim_text: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl FixtureLlmClient {
+    /// Load a fixture from a JSON file.
+    ///
+    /// # Errors
+    /// Returns `LlmError::NotAvailable` if the file cannot be read, and
+    /// `LlmError::MalformedResponse` if it is not a JSON object.
+    pub fn from_path(path: &std::path::Path) -> Result<Self, LlmError> {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            LlmError::NotAvailable(format!("fixture file {} unreadable: {e}", path.display()))
+        })?;
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| LlmError::MalformedResponse {
+                message: format!("fixture file {} is not valid JSON: {e}", path.display()),
+            })?;
+        Self::from_json(&value)
+    }
+
+    /// Build a fixture from an already-parsed JSON object.
+    ///
+    /// # Errors
+    /// Returns `LlmError::MalformedResponse` if `value` is not a JSON object.
+    pub fn from_json(value: &serde_json::Value) -> Result<Self, LlmError> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| LlmError::MalformedResponse {
+                message: "fixture must be a JSON object keyed by claim text".to_string(),
+            })?;
+        Ok(Self {
+            by_claim_text: obj
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<std::collections::HashMap<_, _>>(),
+        })
+    }
+
+    /// Extract `(index, claim_text)` pairs from a `build_batch_prompt` body.
+    /// Claim lines have the form `[<idx>] <statement>`; every other line of the
+    /// prompt (rules, the example output) is ignored.
+    fn indexed_claims(prompt: &str) -> Vec<(usize, &str)> {
+        prompt
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix('[')?;
+                let close = rest.find(']')?;
+                let idx: usize = rest[..close].parse().ok()?;
+                Some((idx, rest[close + 1..].trim_start()))
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for FixtureLlmClient {
+    fn name(&self) -> &str {
+        "fixture"
+    }
+
+    fn model_name(&self) -> &str {
+        "fixture"
+    }
+
+    fn is_active(&self) -> bool {
+        // Never registered, so this is never consulted by `default_llm_provider`.
+        true
+    }
+
+    async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
+        let indexed = Self::indexed_claims(prompt);
+        // A prompt with no `[idx] statement` lines means `build_batch_prompt`'s
+        // format drifted (or a non-decompose prompt was routed here). Fail loudly
+        // rather than silently returning an empty batch, which would look like a
+        // clean no-op run.
+        if indexed.is_empty() {
+            return Err(LlmError::MalformedResponse {
+                message: "fixture provider found no `[idx] statement` lines in the prompt; \
+                          it only answers decompose batch prompts"
+                    .to_string(),
+            });
+        }
+        // Claims absent from the fixture are simply omitted from the response —
+        // the parser then yields no decomposition for them and nothing is written.
+        let mut out = serde_json::Map::new();
+        for (idx, text) in indexed {
+            if let Some(decomp) = self.by_claim_text.get(text) {
+                out.insert(idx.to_string(), decomp.clone());
+            }
+        }
+        Ok(serde_json::Value::Object(out))
     }
 }
 
@@ -649,6 +798,52 @@ mod tests {
             "error must mention 'epigraph': {msg}"
         );
     }
+
+    /// A prompt that is not a decompose batch prompt (no `[idx] statement`
+    /// lines) must ERROR, not return an empty batch. An empty batch would be
+    /// indistinguishable from "nothing to decompose" and would make a
+    /// format drift in `build_batch_prompt` look like a clean no-op run.
+    #[tokio::test]
+    async fn fixture_rejects_a_prompt_with_no_indexed_claims() {
+        let client =
+            FixtureLlmClient::from_json(&serde_json::json!({"a claim": {"atoms": ["x", "y"]}}))
+                .unwrap();
+        let err = client
+            .complete_json("Summarize the following text please.")
+            .await
+            .expect_err("a non-decompose prompt must be rejected");
+        assert!(matches!(err, LlmError::MalformedResponse { .. }), "{err}");
+    }
+
+    /// The fixture resolves batch positions from the prompt it is handed, so
+    /// the same fixture answers the same claim at whatever index it appears.
+    #[tokio::test]
+    async fn fixture_keys_its_response_by_position_in_the_prompt() {
+        let client = FixtureLlmClient::from_json(&serde_json::json!({
+            "beta claim": {"atoms": ["b1", "b2"], "generality": [0, 1]}
+        }))
+        .unwrap();
+        let prompt = crate::decompose::build_batch_prompt(&[(0, "alpha claim"), (1, "beta claim")]);
+        let out = client.complete_json(&prompt).await.unwrap();
+        // "beta claim" sat at index 1, so the response is keyed "1"; the
+        // uncovered "alpha claim" is absent rather than fabricated.
+        assert_eq!(out["1"]["atoms"], serde_json::json!(["b1", "b2"]));
+        assert!(
+            out.get("0").is_none(),
+            "claims absent from the fixture must not be answered: {out}"
+        );
+    }
+
+    // NOTE: the assertion that `fixture` is NOT registry-visible deliberately
+    // lives in the `decompose_claims` bin's test module, not here. It must call
+    // `register_builtin_llm_providers`, and this module's `register_*` /
+    // `create_llm_client` tests mutate process-global env: the registry is
+    // installed behind a `Once`, so whichever test fires it first decides
+    // whether `AnthropicClient` is registered at all. libtest starts tests in
+    // name order, and a `fixture_*`-named test sorts ahead of
+    // `test_create_llm_client_prefers_oauth`, firing the `Once` before that
+    // test exports its credentials and breaking it. The bin is a separate test
+    // process with no env-mutating tests, so the assertion is stable there.
 
     // The trait + registry semantics live in `epigraph_interfaces::llm`
     // and are tested there. These cli-side tests cover only the
