@@ -136,7 +136,9 @@ fn strip_code_fence(raw: &str) -> String {
 }
 
 #[cfg(feature = "db")]
-pub use db_writes::{persist_decomposition, PersistOutcome};
+pub use db_writes::{
+    persist_decomposition, run_decomposition_batches, BatchClaim, BatchTotals, PersistOutcome,
+};
 
 #[cfg(feature = "db")]
 mod db_writes {
@@ -230,6 +232,92 @@ mod db_writes {
             edges_created: edges,
             skipped_singletons: 0,
         })
+    }
+
+    /// One undecomposed compound claim, as [`run_decomposition_batches`] needs
+    /// it. Deliberately not `epigraph_core::Claim` — the runner only needs the
+    /// parent id, the author to inherit, and the text to decompose, and a
+    /// narrow struct lets tests construct input without a full claim.
+    #[derive(Debug, Clone)]
+    pub struct BatchClaim {
+        pub claim_id: Uuid,
+        pub agent_id: Uuid,
+        pub content: String,
+    }
+
+    /// Totals accumulated across every batch of a decomposition run.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub struct BatchTotals {
+        pub atoms: usize,
+        pub edges: usize,
+    }
+
+    /// Chunk `claims` into batches, decompose each batch through `llm`, and
+    /// persist the results.
+    ///
+    /// Extracted verbatim from `decompose_claims`'s `main` so the
+    /// prompt -> model -> parse -> persist chain — in particular the
+    /// `chunk.get(local_idx)` mapping that decides WHICH parent an atom is
+    /// wired to — is reachable from a test. `main` keeps only credential
+    /// resolution and the HTTP submit closure.
+    ///
+    /// `submit_via` receives `(atom_text, generality, parent_agent_id)`; atoms
+    /// inherit their parent compound claim's author, and the parent varies
+    /// across a batch, so the author cannot be captured once by the caller.
+    ///
+    /// A batch whose LLM call fails is logged and skipped (the run continues);
+    /// a persist failure aborts the run.
+    pub async fn run_decomposition_batches<F, Fut>(
+        pool: &PgPool,
+        claims: &[BatchClaim],
+        llm: &dyn epigraph_interfaces::LlmProvider,
+        batch_size: usize,
+        embedder: Option<Arc<dyn epigraph_embeddings::EmbeddingService>>,
+        submit_via: F,
+    ) -> Result<BatchTotals, Box<dyn std::error::Error>>
+    where
+        F: Fn(String, i64, Uuid) -> Fut,
+        Fut: std::future::Future<Output = Result<Uuid, Box<dyn std::error::Error>>>,
+    {
+        let mut totals = BatchTotals::default();
+        for chunk in claims.chunks(batch_size) {
+            let indexed: Vec<(usize, &str)> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.content.as_str()))
+                .collect();
+            let prompt = super::build_batch_prompt(&indexed);
+            // SCAFFOLD BOUNDARY: this network call cannot run in the CI box.
+            let raw = match llm.complete_json(&prompt).await {
+                Ok(v) => v.to_string(),
+                Err(e) => {
+                    eprintln!("  LLM call failed for batch: {e}; skipping");
+                    continue;
+                }
+            };
+            let parsed = super::parse_batch_response(&raw);
+            for (local_idx, decomp) in parsed {
+                let Some(parent) = chunk.get(local_idx) else {
+                    continue;
+                };
+                // Atoms inherit the parent compound claim's author. `agent_id` is a
+                // REQUIRED field of CreateClaimRequest (POST /api/v1/claims) — omitting
+                // it returns 422, which silently dropped every decomposition atom.
+                let parent_agent_id = parent.agent_id;
+                let submit_via = &submit_via;
+                let outcome = persist_decomposition(
+                    pool,
+                    parent.claim_id,
+                    &decomp,
+                    embedder.clone(),
+                    move |atom_text, generality| submit_via(atom_text, generality, parent_agent_id),
+                )
+                .await?;
+                totals.atoms += outcome.atom_claim_ids.len();
+                totals.edges += outcome.edges_created;
+            }
+        }
+        Ok(totals)
     }
 }
 
