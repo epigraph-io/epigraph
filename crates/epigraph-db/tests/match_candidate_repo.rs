@@ -99,6 +99,133 @@ async fn set_status_promotes_and_records_decided_fields(pool: PgPool) {
     assert!(row.decided_at.is_some());
 }
 
+/// A nightly matcher re-scan must NOT revert an operator's ruling.
+///
+/// The matcher re-touches 50-99.7% of pairs per run and always upserts with
+/// `status = "pending"`. Before the `decided_at` guard, the unconditional
+/// `status = EXCLUDED.status` in `ON CONFLICT DO UPDATE` silently un-decided
+/// human rulings — observed on prod as 7 rows with `decided_at IS NOT NULL`
+/// but `status = 'pending'`, clobbered 2, 9 and 17 days after the decision.
+///
+/// The contract has two halves and both are asserted: the *decision*
+/// (status / decided_at / decided_by) freezes, while matcher *telemetry*
+/// (score / features / matcher_run_id) still refreshes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn upsert_does_not_revert_a_decided_candidate(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let repo = MatchCandidateRepo::new(pool.clone());
+
+    // Night 1: matcher stages the pair for human review.
+    let run1 = Uuid::new_v4();
+    let id = repo
+        .upsert(
+            lo,
+            hi,
+            0.70,
+            serde_json::json!({"n": 1}),
+            "pending",
+            Some(run1),
+        )
+        .await
+        .expect("first upsert");
+
+    // Operator rules on it via the Telegram / MCP review queue.
+    repo.set_status(id, "promoted", Some(agent))
+        .await
+        .expect("set_status");
+    let decided = repo.get(id).await.expect("get after decision");
+    let decided_at = decided
+        .decided_at
+        .expect("set_status must stamp decided_at");
+
+    // Night 2: the same pair is re-scanned and upserted as "pending" again.
+    let run2 = Uuid::new_v4();
+    let id2 = repo
+        .upsert(
+            lo,
+            hi,
+            0.85,
+            serde_json::json!({"n": 2}),
+            "pending",
+            Some(run2),
+        )
+        .await
+        .expect("re-scan upsert");
+    assert_eq!(id2, id, "upsert must reuse the row");
+
+    let row = repo.get(id).await.expect("get after re-scan");
+
+    // Half 1 — the decision is frozen.
+    assert_eq!(
+        row.status, "promoted",
+        "a re-scan must not revert an operator decision to pending"
+    );
+    assert_eq!(
+        row.decided_at,
+        Some(decided_at),
+        "decided_at must survive a re-scan unchanged"
+    );
+    assert_eq!(
+        row.decided_by,
+        Some(agent),
+        "decided_by must survive a re-scan unchanged"
+    );
+
+    // Half 2 — matcher telemetry still refreshes.
+    assert!(
+        (row.score - 0.85).abs() < 1e-6,
+        "score is matcher telemetry and must refresh on a decided row; got {}",
+        row.score
+    );
+    assert_eq!(
+        row.features.get("n").and_then(|v| v.as_i64()),
+        Some(2),
+        "features are matcher telemetry and must refresh on a decided row"
+    );
+    assert_eq!(
+        row.matcher_run_id,
+        Some(run2),
+        "matcher_run_id must refresh so the last run that saw the pair is known"
+    );
+}
+
+/// The guard keys on `decided_at`, not on `status != 'pending'`, because
+/// `PolicyAction::Reject` upserts `status = 'rejected'` with `decided_at`
+/// NULL. A status-based guard would freeze matcher-set rejections forever and
+/// break re-scoring; this test pins that an undecided row stays mutable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn upsert_still_overwrites_an_undecided_row(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let repo = MatchCandidateRepo::new(pool.clone());
+
+    // Matcher rejected it on its own — no operator involved, decided_at NULL.
+    let id = repo
+        .upsert(lo, hi, 0.30, serde_json::json!({}), "rejected", None)
+        .await
+        .expect("first upsert");
+    assert!(
+        repo.get(id).await.expect("get").decided_at.is_none(),
+        "a matcher-set status must not stamp decided_at"
+    );
+
+    // Re-scoring the pair upward must be able to move it back into review.
+    repo.upsert(lo, hi, 0.95, serde_json::json!({}), "pending", None)
+        .await
+        .expect("re-scan upsert");
+
+    let row = repo.get(id).await.expect("get after re-scan");
+    assert_eq!(
+        row.status, "pending",
+        "an undecided row must remain freely overwritable by the matcher"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_pending_orders_by_score_desc(pool: PgPool) {
     let agent = insert_agent(&pool).await;
