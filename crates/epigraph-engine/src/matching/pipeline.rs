@@ -32,6 +32,10 @@ pub struct RunReport {
     pub staged: usize,
     pub mid_band: usize,
     pub rejected: usize,
+    /// Verdict writes the `decided_at` gate refused because a human had
+    /// already ruled on the pair. Nonzero means the verifier is re-scoring
+    /// decided candidates — see [`Policy::verdict_writes_suppressed`].
+    pub verdict_writes_suppressed: usize,
 }
 
 pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<RunReport> {
@@ -147,5 +151,6 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         staged,
         mid_band,
         rejected,
+        verdict_writes_suppressed: policy.verdict_writes_suppressed(),
     })
 }

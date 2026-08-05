@@ -13,6 +13,7 @@ use crate::matching::verifier::{
 use epigraph_db::repos::match_candidate::MatchCandidateRepo;
 use epigraph_db::EdgeRepository;
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy)]
@@ -27,6 +28,9 @@ pub struct Policy {
     repo: MatchCandidateRepo,
     run_id: Uuid,
     auto_promote: bool,
+    /// Count of verdict writes the `decided_at` gate refused. See
+    /// [`Policy::verdict_writes_suppressed`].
+    suppressed: AtomicUsize,
 }
 
 impl Policy {
@@ -36,7 +40,62 @@ impl Policy {
             repo,
             run_id,
             auto_promote,
+            suppressed: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times this run tried to rewrite the verdict of an
+    /// already-decided candidate and was refused.
+    ///
+    /// This is deliberately surfaced rather than silently dropped. Before the
+    /// gate, every such overwrite left a trace in `verifier_rationale` — which
+    /// is how the 123 corrupted prod rows were found at all. Gating the
+    /// rationale destroys that detector, so this counter is its replacement,
+    /// not a nicety: a nonzero value means the verifier is re-scoring pairs a
+    /// human has already ruled on.
+    pub fn verdict_writes_suppressed(&self) -> usize {
+        self.suppressed.load(Ordering::Relaxed)
+    }
+
+    /// Upsert the candidate row, recording a suppressed verdict write.
+    async fn upsert_candidate(
+        &self,
+        lo: Uuid,
+        hi: Uuid,
+        f: &MatchFeatures,
+        features_json: serde_json::Value,
+        status: &str,
+        verdict: Option<&Verdict>,
+    ) -> anyhow::Result<Uuid> {
+        // Persist the matcher-level vocabulary (`same|paraphrase|overlapping|
+        // contradicts|distinct`) per spec §5, NOT the raw reranker relationship
+        // string. The raw string is preserved in edge properties for debug.
+        let column_verdict =
+            verdict.map(|v| map_relationship(&v.relationship, v.strength).as_column_str());
+        let outcome = self
+            .repo
+            .upsert(
+                lo,
+                hi,
+                f.score,
+                features_json,
+                status,
+                Some(self.run_id),
+                column_verdict,
+                verdict.map(|v| v.rationale.as_str()),
+            )
+            .await?;
+        if outcome.verdict_write_suppressed(column_verdict) {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                candidate_id = %outcome.id,
+                run_id = %self.run_id,
+                attempted = column_verdict.unwrap_or("-"),
+                retained = outcome.verifier_verdict.as_deref().unwrap_or("-"),
+                "verdict write suppressed: candidate already decided",
+            );
+        }
+        Ok(outcome.id)
     }
 
     pub async fn act(
@@ -50,10 +109,13 @@ impl Policy {
         // Canonicalize: match_candidates has a CHECK (claim_a < claim_b).
         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
 
-        // Persist verifier verdict + rationale on the row so we don't re-ask
-        // the LLM (spec §4, "Verdict and rationale stored on the match-
-        // candidate row; never re-asked"). Today MatchCandidateRepo::upsert
-        // doesn't accept these as args yet; we patch them in below.
+        // Verifier verdict + rationale are persisted on the row so we don't
+        // re-ask the LLM (spec §4, "Verdict and rationale stored on the match-
+        // candidate row; never re-asked"). They go through
+        // `MatchCandidateRepo::upsert` in the SAME statement as `status`, so
+        // the `decided_at` guard covers the decision as a whole. Do not
+        // reintroduce a follow-up UPDATE here: an out-of-band verdict write is
+        // exactly the defect this replaced.
         let features_json = serde_json::to_value(f)?;
 
         // `auto_promote` gates BOTH the edge write (below) AND whether the
@@ -72,19 +134,8 @@ impl Policy {
         match action {
             PolicyAction::AutoPromote => {
                 let id = self
-                    .repo
-                    .upsert(
-                        lo,
-                        hi,
-                        f.score,
-                        features_json,
-                        promote_status,
-                        Some(self.run_id),
-                    )
+                    .upsert_candidate(lo, hi, f, features_json, promote_status, verdict.as_ref())
                     .await?;
-                if let Some(v) = verdict.as_ref() {
-                    self.patch_verdict(id, v).await?;
-                }
                 if self.auto_promote {
                     self.write_edge(a, b, CORROBORATES_RELATIONSHIP, f, id, verdict.as_ref())
                         .await?;
@@ -92,19 +143,8 @@ impl Policy {
             }
             PolicyAction::WriteContradicts => {
                 let id = self
-                    .repo
-                    .upsert(
-                        lo,
-                        hi,
-                        f.score,
-                        features_json,
-                        promote_status,
-                        Some(self.run_id),
-                    )
+                    .upsert_candidate(lo, hi, f, features_json, promote_status, verdict.as_ref())
                     .await?;
-                if let Some(v) = verdict.as_ref() {
-                    self.patch_verdict(id, v).await?;
-                }
                 if self.auto_promote {
                     // Lowercase 'contradicts' — the directional factor graph
                     // maps it to mutual_exclusion with strength 0. Shared with
@@ -117,40 +157,10 @@ impl Policy {
                 }
             }
             PolicyAction::Reject => {
-                let id = self
-                    .repo
-                    .upsert(
-                        lo,
-                        hi,
-                        f.score,
-                        features_json,
-                        "rejected",
-                        Some(self.run_id),
-                    )
+                self.upsert_candidate(lo, hi, f, features_json, "rejected", verdict.as_ref())
                     .await?;
-                if let Some(v) = verdict.as_ref() {
-                    self.patch_verdict(id, v).await?;
-                }
             }
         }
-        Ok(())
-    }
-
-    async fn patch_verdict(&self, id: Uuid, v: &Verdict) -> anyhow::Result<()> {
-        // Persist the matcher-level vocabulary (`same|paraphrase|overlapping|
-        // contradicts|distinct`) per spec §5, NOT the raw reranker relationship
-        // string. The raw string is preserved in edge properties for debug.
-        let column_verdict = map_relationship(&v.relationship, v.strength).as_column_str();
-        sqlx::query(
-            "UPDATE match_candidates
-             SET verifier_verdict = $2, verifier_rationale = $3
-             WHERE id = $1",
-        )
-        .bind(id)
-        .bind(column_verdict)
-        .bind(&v.rationale)
-        .execute(&self.pool)
-        .await?;
         Ok(())
     }
 
