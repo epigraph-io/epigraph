@@ -85,6 +85,50 @@ async fn insert_candidate(pool: &PgPool, a: Uuid, b: Uuid, score: f32, status: &
     id
 }
 
+/// Same as [`insert_candidate`] but sets `verifier_verdict` — the column the
+/// promote path must branch on. `verdict` must be one of the five values
+/// allowed by `match_candidates_verdict_valid` (migration 036).
+async fn insert_candidate_with_verdict(
+    pool: &PgPool,
+    a: Uuid,
+    b: Uuid,
+    score: f32,
+    status: &str,
+    verdict: &str,
+) -> Uuid {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO match_candidates
+             (claim_a, claim_b, score, features, status, verifier_verdict, verifier_rationale)
+         VALUES ($1, $2, $3, $4, $5, $6, 'test rationale') RETURNING id",
+    )
+    .bind(lo)
+    .bind(hi)
+    .bind(score)
+    .bind(Json(serde_json::json!({"embed_cosine": 0.99})))
+    .bind(status)
+    .bind(verdict)
+    .fetch_one(pool)
+    .await
+    .expect("insert candidate with verdict");
+    id
+}
+
+/// Every claim→claim edge relationship between the pair, either direction.
+async fn edge_relationships(pool: &PgPool, a: Uuid, b: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT relationship FROM edges
+         WHERE (source_id = $1 AND target_id = $2)
+            OR (source_id = $2 AND target_id = $1)
+         ORDER BY relationship",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_all(pool)
+    .await
+    .expect("edge relationships")
+}
+
 fn result_text(out: rmcp::model::CallToolResult) -> String {
     let first = out.content.first().cloned().expect("first content");
     match first.raw {
@@ -344,4 +388,121 @@ async fn decide_match_candidate_promote_blocked_when_endpoint_not_current(pool: 
         edge_count.0, 0,
         "no CORROBORATES edge may be written onto a retired claim"
     );
+}
+
+/// Promoting a candidate the verifier judged CONTRADICTORY must record a
+/// `contradicts` edge, not a corroboration.
+///
+/// The promote arm used to write `"CORROBORATES"` unconditionally, treating
+/// `verifier_verdict` as an opaque props key. Approving a contradiction then
+/// asserted the exact inverse of what the verifier found, and the directional
+/// factor graph read it as `evidential_support` 0.85 instead of
+/// `mutual_exclusion` 0.0 — belief propagated the wrong way.
+///
+/// The relationship literal is asserted as lowercase `contradicts` on purpose:
+/// `epigraph_engine::matching::policy`'s `WriteContradicts` arm writes exactly
+/// that string, and `EdgeRepository::create_symmetric_if_absent` dedups on an
+/// exact `relationship =` match. A different casing here would double-write
+/// every pair the auto path had already handled.
+#[sqlx::test(migrations = "../../migrations")]
+async fn decide_match_candidate_promote_contradicts_writes_contradicts_edge(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate_with_verdict(&pool, a, b, 0.88, "pending", "contradicts").await;
+
+    tools::matching::decide_match_candidate(
+        &server,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+    )
+    .await
+    .expect("promoting a contradicts candidate must succeed");
+
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "promoted");
+
+    let rels = edge_relationships(&pool, a, b).await;
+    assert_eq!(
+        rels.len(),
+        1,
+        "promote must write exactly one edge, got {rels:?}"
+    );
+    assert_eq!(
+        rels[0], "contradicts",
+        "a 'contradicts' verdict must record a contradiction, not a corroboration"
+    );
+}
+
+/// `distinct` means the verifier found the pair unrelated: there is no edge
+/// worth writing in either polarity. Promoting must be refused outright rather
+/// than fabricating a relationship, and must leave the row decidable
+/// (`pending`) so the operator can still reject it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn decide_match_candidate_promote_distinct_is_refused_and_writes_no_edge(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate_with_verdict(&pool, a, b, 0.31, "pending", "distinct").await;
+
+    let err = tools::matching::decide_match_candidate(
+        &server,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+    )
+    .await
+    .expect_err("promoting a 'distinct' candidate must be refused");
+    assert!(
+        format!("{err:?}").contains("distinct"),
+        "refusal must name the verdict that blocked it: {err:?}"
+    );
+
+    let rels = edge_relationships(&pool, a, b).await;
+    assert!(rels.is_empty(), "refused promote wrote edges: {rels:?}");
+
+    // The refusal must short-circuit BEFORE set_status, or the row is left
+    // `promoted` with no edge — the half-state the policy layer already fixed.
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        status, "pending",
+        "a refused promote must not mark the row decided"
+    );
+}
+
+/// Corroborating verdicts keep the historical relationship. Pins the
+/// unchanged half of the branch so a future edit can't collapse both arms.
+#[sqlx::test(migrations = "../../migrations")]
+async fn decide_match_candidate_promote_paraphrase_still_writes_corroborates(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate_with_verdict(&pool, a, b, 0.91, "pending", "paraphrase").await;
+
+    tools::matching::decide_match_candidate(
+        &server,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+    )
+    .await
+    .expect("promote");
+
+    let rels = edge_relationships(&pool, a, b).await;
+    assert_eq!(rels, vec!["CORROBORATES".to_string()]);
 }

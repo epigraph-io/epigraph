@@ -7,7 +7,9 @@
 //! state machine stays auditable.
 
 use crate::matching::scorer::MatchFeatures;
-use crate::matching::verifier::{map_relationship, Verdict};
+use crate::matching::verifier::{
+    map_relationship, Verdict, CONTRADICTS_RELATIONSHIP, CORROBORATES_RELATIONSHIP,
+};
 use epigraph_db::repos::match_candidate::MatchCandidateRepo;
 use epigraph_db::EdgeRepository;
 use sqlx::PgPool;
@@ -84,7 +86,7 @@ impl Policy {
                     self.patch_verdict(id, v).await?;
                 }
                 if self.auto_promote {
-                    self.write_edge(a, b, "CORROBORATES", f, id, verdict.as_ref())
+                    self.write_edge(a, b, CORROBORATES_RELATIONSHIP, f, id, verdict.as_ref())
                         .await?;
                 }
             }
@@ -104,10 +106,13 @@ impl Policy {
                     self.patch_verdict(id, v).await?;
                 }
                 if self.auto_promote {
-                    // Use the lowercase 'contradicts' factor mapping (migration
-                    // 090 / 049) — the directional factor graph maps it to
-                    // mutual_exclusion with strength 0.
-                    self.write_edge(a, b, "contradicts", f, id, verdict.as_ref())
+                    // Lowercase 'contradicts' — the directional factor graph
+                    // maps it to mutual_exclusion with strength 0. Shared with
+                    // the human-decide path (`decide_candidate` /
+                    // `decide_match_candidate`) via the constant so the two
+                    // producers of this edge cannot drift on casing; edge dedup
+                    // compares the relationship string exactly.
+                    self.write_edge(a, b, CONTRADICTS_RELATIONSHIP, f, id, verdict.as_ref())
                         .await?;
                 }
             }
