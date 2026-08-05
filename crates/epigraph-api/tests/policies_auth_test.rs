@@ -436,6 +436,182 @@ async fn decide_candidate_already_decided_returns_409() {
     );
 }
 
+/// Seed two fresh claims and a pending candidate carrying `verdict`.
+/// Returns `(claim_a, claim_b, candidate_id)`.
+async fn seed_pending_candidate_with_verdict(
+    pool: &sqlx::PgPool,
+    label: &str,
+    verdict: &str,
+) -> (Uuid, Uuid, Uuid) {
+    let claim_a =
+        common::seed_claim_with_labels(pool, &format!("{label} a {}", Uuid::new_v4()), &[]).await;
+    let claim_b =
+        common::seed_claim_with_labels(pool, &format!("{label} b {}", Uuid::new_v4()), &[]).await;
+    let (lo, hi) = if claim_a < claim_b {
+        (claim_a, claim_b)
+    } else {
+        (claim_b, claim_a)
+    };
+    let candidate_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO match_candidates
+             (claim_a, claim_b, score, features, status, verifier_verdict, verifier_rationale)
+         VALUES ($1, $2, 0.8, '{}'::jsonb, 'pending', $3, 'test rationale') RETURNING id",
+    )
+    .bind(lo)
+    .bind(hi)
+    .bind(verdict)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (claim_a, claim_b, candidate_id)
+}
+
+async fn edge_relationships(pool: &sqlx::PgPool, a: Uuid, b: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT relationship FROM edges
+         WHERE (source_id = $1 AND target_id = $2)
+            OR (source_id = $2 AND target_id = $1)
+         ORDER BY relationship",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// Promoting a pair the verifier judged CONTRADICTORY must record a
+/// `contradicts` edge, not a corroboration.
+///
+/// The promote arm wrote `"CORROBORATES"` unconditionally and carried
+/// `verifier_verdict` along only as an opaque props key, so approving a
+/// contradiction asserted the exact inverse of what the verifier found.
+///
+/// Lowercase `contradicts` is load-bearing:
+/// `epigraph_engine::matching::policy`'s `WriteContradicts` arm writes that
+/// exact string on the automatic path, and
+/// `EdgeRepository::create_symmetric_if_absent` dedups on an exact
+/// `relationship =` comparison — a different casing here would double-write
+/// pairs the automatic path had already handled.
+#[tokio::test(flavor = "multi_thread")]
+async fn decide_candidate_promote_contradicts_writes_contradicts_edge() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (claim_a, claim_b, candidate_id) =
+        seed_pending_candidate_with_verdict(&pool, "decide contradicts", "contradicts").await;
+
+    let token = common::test_bearer_token_with_scopes(&["claims:write"]);
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/v1/match_candidates/{candidate_id}/decide"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "verdict": "promote" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "promoting a contradicts candidate must succeed; body={}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    let rels = edge_relationships(&pool, claim_a, claim_b).await;
+    assert_eq!(
+        rels.len(),
+        1,
+        "promote must write exactly one edge, got {rels:?}"
+    );
+    assert_eq!(
+        rels[0], "contradicts",
+        "a 'contradicts' verdict must record a contradiction, not a corroboration"
+    );
+}
+
+/// `distinct` means the verifier found the pair unrelated — there is no edge
+/// worth writing in either polarity, so promote must be refused (400) with no
+/// edge written and the row left `pending` so it can still be rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn decide_candidate_promote_distinct_returns_400_and_writes_no_edge() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (claim_a, claim_b, candidate_id) =
+        seed_pending_candidate_with_verdict(&pool, "decide distinct", "distinct").await;
+
+    let token = common::test_bearer_token_with_scopes(&["claims:write"]);
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/v1/match_candidates/{candidate_id}/decide"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "verdict": "promote" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "expected a refusal for a 'distinct' pair"
+    );
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("distinct"),
+        "refusal must name the verdict that blocked it: {body}"
+    );
+
+    let rels = edge_relationships(&pool, claim_a, claim_b).await;
+    assert!(rels.is_empty(), "refused promote wrote edges: {rels:?}");
+
+    // The refusal must short-circuit BEFORE set_status, or the row is left
+    // `promoted` with no edge — the half-state the policy layer already fixed.
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(candidate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        status, "pending",
+        "a refused promote must not mark the row decided"
+    );
+}
+
+/// Corroborating verdicts keep the historical relationship — pins the
+/// unchanged half of the branch.
+#[tokio::test(flavor = "multi_thread")]
+async fn decide_candidate_promote_same_still_writes_corroborates() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (claim_a, claim_b, candidate_id) =
+        seed_pending_candidate_with_verdict(&pool, "decide same", "same").await;
+
+    let token = common::test_bearer_token_with_scopes(&["claims:write"]);
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/v1/match_candidates/{candidate_id}/decide"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "verdict": "promote" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "body={}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    let rels = edge_relationships(&pool, claim_a, claim_b).await;
+    assert_eq!(rels, vec!["CORROBORATES".to_string()]);
+}
+
 // ── list_match_candidates ───────────────────────────────────────────────────
 //
 // `list_candidates` reads pending cross-source match candidates *and* the

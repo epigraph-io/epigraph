@@ -7,6 +7,11 @@
 //!   rejected rows are intentionally omitted — the UI surface for those is
 //!   either the CORROBORATES edge itself or admin tooling.
 //!
+//! KNOWN GAP: `corroborates` is the only edge array, so a pair promoted as a
+//! *contradiction* (see `decide_candidate`) leaves `pending` without appearing
+//! anywhere in this response. Surfacing contradictions needs a response-shape
+//! change; tracked separately.
+//!
 //! 404 when the claim doesn't exist. 200 with empty arrays when it exists
 //! but has no matches.
 
@@ -278,6 +283,30 @@ pub async fn decide_candidate(
 
     match req.verdict.as_str() {
         "promote" => {
+            // Resolve the polarity FIRST — before the current-ness guard and
+            // before `set_status`. "promote" is the operator saying "act on
+            // this pair", not "these claims agree": the relationship comes
+            // from the row's own `verifier_verdict`. Writing CORROBORATES
+            // unconditionally recorded the exact inverse of the verifier's
+            // finding for contradicting pairs. Resolving up front also means a
+            // refused promote cannot leave the row `promoted` with no edge.
+            let disposition =
+                epigraph_engine::matching::verifier::promotion_disposition_for_column(
+                    row.verifier_verdict.as_deref(),
+                )
+                .map_err(|e| ApiError::BadRequest {
+                    message: format!("cannot promote candidate {id}: {e}"),
+                })?;
+            let Some(relationship) = disposition.edge_relationship() else {
+                return Err(ApiError::BadRequest {
+                    message: format!(
+                        "cannot promote candidate {id}: verifier_verdict '{}' means the claims \
+                         are unrelated, so there is no edge to record. Reject it instead.",
+                        row.verifier_verdict.as_deref().unwrap_or("distinct")
+                    ),
+                });
+            };
+
             let all_current = epigraph_db::ClaimRepository::are_all_current(
                 &state.db_pool,
                 &[row.claim_a, row.claim_b],
@@ -313,7 +342,7 @@ pub async fn decide_candidate(
                 &state.db_pool,
                 row.claim_a,
                 row.claim_b,
-                "CORROBORATES",
+                relationship,
                 props,
             )
             .await

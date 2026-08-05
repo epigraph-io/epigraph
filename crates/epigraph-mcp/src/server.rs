@@ -1336,7 +1336,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Decide a pending match candidate: 'promote' writes a CORROBORATES edge and marks the row promoted; 'reject' marks it rejected. Honours read-only mode."
+        description = "Decide a pending match candidate: 'promote' marks the row promoted and writes the edge its verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts, and refused for distinct (no truthful edge exists; reject it instead); 'reject' marks it rejected. Honours read-only mode."
     )]
     async fn decide_match_candidate(
         &self,

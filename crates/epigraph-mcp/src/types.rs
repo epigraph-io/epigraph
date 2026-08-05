@@ -2191,7 +2191,9 @@ pub struct ListMatchCandidatesParams {
 pub struct DecideMatchCandidateParams {
     #[schemars(description = "Match-candidate UUID to decide on")]
     pub candidate_id: String,
-    #[schemars(description = "Decision: 'promote' (writes CORROBORATES edge) or 'reject'")]
+    #[schemars(
+        description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct) or 'reject'"
+    )]
     pub verdict: String,
 }
 

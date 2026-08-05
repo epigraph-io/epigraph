@@ -8,8 +8,11 @@
 //!   edges for a claim. Read-only.
 //! - `list_match_candidates`: list the queue, sorted by score desc, optionally
 //!   filtered by status.
-//! - `decide_match_candidate`: promote (write CORROBORATES edge) or reject a row.
-//!   Honours `reject_if_read_only` like other write tools.
+//! - `decide_match_candidate`: promote or reject a row. Promotion writes the
+//!   edge the row's `verifier_verdict` calls for — `CORROBORATES` for
+//!   same/paraphrase/overlapping, `contradicts` for contradicts — and refuses
+//!   outright for `distinct`. Honours `reject_if_read_only` like other write
+//!   tools.
 
 #![allow(clippy::wildcard_imports)]
 
@@ -138,7 +141,29 @@ pub async fn decide_match_candidate(
 
     match decision.as_str() {
         "promote" => {
-            // Guard: a CORROBORATES edge must connect two live claims. If
+            // Resolve the polarity FIRST — before the current-ness guard and
+            // before `set_status`. "promote" is the operator saying "act on
+            // this pair", not "these claims agree": the relationship comes from
+            // the row's own `verifier_verdict`. Writing CORROBORATES
+            // unconditionally recorded the exact inverse of the verifier's
+            // finding for contradicting pairs. Resolving up front also means a
+            // refused promote cannot leave the row `promoted` with no edge.
+            let disposition =
+                epigraph_engine::matching::verifier::promotion_disposition_for_column(
+                    row.verifier_verdict.as_deref(),
+                )
+                .map_err(|e| {
+                    invalid_params(format!("cannot promote candidate {candidate_id}: {e}"))
+                })?;
+            let Some(relationship) = disposition.edge_relationship() else {
+                return Err(invalid_params(format!(
+                    "cannot promote candidate {candidate_id}: verifier_verdict '{}' means the \
+                     claims are unrelated, so there is no edge to record. Reject it instead.",
+                    row.verifier_verdict.as_deref().unwrap_or("distinct")
+                )));
+            };
+
+            // Guard: the edge must connect two live claims. If
             // either endpoint was superseded or marked duplicate (is_current =
             // false) since the candidate was generated, promoting would create
             // a structural inconsistency — an edge incident on a retired claim
@@ -148,8 +173,8 @@ pub async fn decide_match_candidate(
                 .map_err(internal_error)?
             {
                 return Err(invalid_params(format!(
-                    "cannot promote candidate {candidate_id}: a CORROBORATES edge requires both \
-                     claims to be current (is_current=true). One of {} / {} is superseded, a \
+                    "cannot promote candidate {candidate_id}: a '{relationship}' edge requires \
+                     both claims to be current (is_current=true). One of {} / {} is superseded, a \
                      duplicate, or missing.",
                     row.claim_a, row.claim_b
                 )));
@@ -159,7 +184,7 @@ pub async fn decide_match_candidate(
                 .await
                 .map_err(internal_error)?;
 
-            // Write CORROBORATES edge if it doesn't already exist (either
+            // Write the edge if it doesn't already exist (either
             // direction). The unique-triple index was dropped in migrations
             // 017/018, so this explicit existence check — now centralized in
             // `EdgeRepository::create_symmetric_if_absent` — is the only guard
@@ -177,7 +202,7 @@ pub async fn decide_match_candidate(
                 &server.pool,
                 row.claim_a,
                 row.claim_b,
-                "CORROBORATES",
+                relationship,
                 props,
             )
             .await
