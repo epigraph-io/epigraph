@@ -22,6 +22,27 @@ pub struct MatchCandidateRow {
     pub decided_by: Option<Uuid>,
 }
 
+/// Result of [`MatchCandidateRepo::upsert`].
+#[derive(Debug, Clone)]
+pub struct UpsertOutcome {
+    pub id: Uuid,
+    /// The verdict on the row *after* the statement ran. Compare against the
+    /// verdict the caller attempted to write: a mismatch means the row was
+    /// already decided and the gate preserved the decided verdict.
+    pub verifier_verdict: Option<String>,
+}
+
+impl UpsertOutcome {
+    /// True when `attempted` was a real verdict that the gate refused to store.
+    /// `None` (pair not verified this pass) is never a suppression.
+    pub fn verdict_write_suppressed(&self, attempted: Option<&str>) -> bool {
+        match attempted {
+            Some(a) => self.verifier_verdict.as_deref() != Some(a),
+            None => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MatchCandidateRepo {
     pool: PgPool,
@@ -35,17 +56,44 @@ impl MatchCandidateRepo {
     /// Insert or update a candidate. Caller MUST pass `claim_a < claim_b`.
     ///
     /// A row that has already been *decided* (`decided_at IS NOT NULL`) keeps
-    /// its `status`: the nightly matcher re-touches most pairs every run and
-    /// always upserts `pending`, so an unguarded `status = EXCLUDED.status`
-    /// silently reverts operator rulings days after the fact. Matcher
-    /// telemetry (`score`, `features`, `matcher_run_id`) still refreshes —
-    /// those describe the *pair*, not the *decision*.
+    /// its `status` **and its verifier verdict/rationale**: the nightly matcher
+    /// re-touches most pairs every run and always upserts `pending`, so an
+    /// unguarded `status = EXCLUDED.status` silently reverts operator rulings
+    /// days after the fact. Matcher telemetry (`score`, `features`,
+    /// `matcher_run_id`) still refreshes — those describe the *pair*, not the
+    /// *decision*.
     ///
     /// The discriminator is `decided_at`, not `status != 'pending'`, because
     /// [`crate::repos::match_candidate::MatchCandidateRepo::set_status`] is the
     /// only writer of `decided_at`, while the matcher itself writes
     /// `status = 'rejected'` with `decided_at` NULL. Keying on status would
     /// freeze matcher-set rejections forever and defeat re-scoring.
+    ///
+    /// `verifier_verdict` / `verifier_rationale` are written **here**, in the
+    /// same statement and under the same guard, rather than by a follow-up
+    /// `UPDATE` in the engine's policy layer. Two separate statements meant two
+    /// separate guards: the status guard above landed while the verdict write
+    /// stayed unconditional, so a re-scan preserved the operator's ruling but
+    /// destroyed the verdict that ruling was based on. That stopped being
+    /// merely an audit-trail loss once `promotion_disposition_for_column` made
+    /// `verifier_verdict` determine the polarity of the edge a promotion
+    /// writes. Folding them also removes the window *between* the two
+    /// statements, during which a concurrent operator tap could read a verdict
+    /// that was about to be overwritten.
+    ///
+    /// The two verdict columns are gated together on purpose: freezing one
+    /// without the other yields a row whose rationale describes a verdict it no
+    /// longer carries, which is worse than either alone.
+    ///
+    /// `verdict`/`rationale` of `None` mean "this pair was not verified on this
+    /// pass" and leave any existing values intact (hence `COALESCE`) — they do
+    /// not mean "erase what is there".
+    ///
+    /// Returns the row id plus the verdict **as actually persisted**. When that
+    /// differs from the `verdict` argument, the gate suppressed the write;
+    /// callers surface that as telemetry rather than an error, because a
+    /// 1000-candidate sweep must not abort on a routine expected condition.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         &self,
         claim_a: Uuid,
@@ -54,12 +102,15 @@ impl MatchCandidateRepo {
         features: serde_json::Value,
         status: &str,
         run_id: Option<Uuid>,
-    ) -> sqlx::Result<Uuid> {
+        verdict: Option<&str>,
+        rationale: Option<&str>,
+    ) -> sqlx::Result<UpsertOutcome> {
         debug_assert!(claim_a < claim_b, "callers must pass canonical order");
-        let (id,): (Uuid,) = sqlx::query_as(
+        let (id, verifier_verdict): (Uuid, Option<String>) = sqlx::query_as(
             "INSERT INTO match_candidates
-                (claim_a, claim_b, score, features, status, matcher_run_id)
-             VALUES ($1, $2, $3, $4, $5, $6)
+                (claim_a, claim_b, score, features, status, matcher_run_id,
+                 verifier_verdict, verifier_rationale)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (claim_a, claim_b) DO UPDATE SET
                 score = EXCLUDED.score,
                 features = EXCLUDED.features,
@@ -68,11 +119,23 @@ impl MatchCandidateRepo {
                     THEN match_candidates.status
                     ELSE EXCLUDED.status
                 END,
-                matcher_run_id = EXCLUDED.matcher_run_id
+                matcher_run_id = EXCLUDED.matcher_run_id,
+                verifier_verdict = CASE
+                    WHEN match_candidates.decided_at IS NOT NULL
+                    THEN match_candidates.verifier_verdict
+                    ELSE COALESCE(EXCLUDED.verifier_verdict,
+                                  match_candidates.verifier_verdict)
+                END,
+                verifier_rationale = CASE
+                    WHEN match_candidates.decided_at IS NOT NULL
+                    THEN match_candidates.verifier_rationale
+                    ELSE COALESCE(EXCLUDED.verifier_rationale,
+                                  match_candidates.verifier_rationale)
+                END
              -- decided_at / decided_by are deliberately absent from this SET
              -- list: omitted columns are left untouched by ON CONFLICT, which
              -- is exactly the desired behaviour. Do not add them.
-             RETURNING id",
+             RETURNING id, verifier_verdict",
         )
         .bind(claim_a)
         .bind(claim_b)
@@ -80,9 +143,14 @@ impl MatchCandidateRepo {
         .bind(Json(features))
         .bind(status)
         .bind(run_id)
+        .bind(verdict)
+        .bind(rationale)
         .fetch_one(&self.pool)
         .await?;
-        Ok(id)
+        Ok(UpsertOutcome {
+            id,
+            verifier_verdict,
+        })
     }
 
     pub async fn get(&self, id: Uuid) -> sqlx::Result<MatchCandidateRow> {

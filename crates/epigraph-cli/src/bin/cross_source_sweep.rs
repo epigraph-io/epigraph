@@ -148,6 +148,10 @@ async fn main() -> anyhow::Result<()> {
             "promoted":      report.promoted,
             "mid_band":      report.mid_band,
             "rejected":      report.rejected,
+            // Nonzero = the verifier re-scored pairs a human already decided
+            // and the gate refused the rewrite. The nightly wrapper journals
+            // this JSON, so a spike is visible with no extra plumbing.
+            "verdict_writes_suppressed": report.verdict_writes_suppressed,
             "apply":         auto_promote,
             "count_only":    args.count_only,
         })
