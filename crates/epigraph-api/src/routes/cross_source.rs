@@ -267,6 +267,23 @@ pub async fn decide_candidate(
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
+    // Decision provenance: prefer agent_id, fall back to client_id (sub).
+    //
+    // OAuth *service* clients — notably the Telegram approval bridge — are
+    // created with `agent_id = NULL` (see `oauth/register.rs`) and nothing ever
+    // links one, so `auth.agent_id` is `None` for every decision they make.
+    // Writing that through unchanged recorded `decided_by = NULL`, silently
+    // dropping the identity behind a promotion that creates a real CORROBORATES
+    // edge. Falling back to the authenticated client keeps every decision
+    // attributable to *something* without rejecting these callers.
+    //
+    // `agents.id` and `oauth_clients.id` are disjoint UUID spaces, so a reader
+    // can tell which kind of principal a `decided_by` names by looking it up;
+    // `match_candidates.decided_by` has no foreign key, so a client UUID here
+    // violates no constraint. Same `agent_id.or(client_id)` idiom already used
+    // for authenticated identity in `routes/claims.rs`.
+    let decided_by = auth.agent_id.or(Some(auth.client_id));
+
     let repo = epigraph_db::MatchCandidateRepo::new(state.db_pool.clone());
     let row = map_sqlx(repo.get(id).await)?;
 
@@ -295,7 +312,7 @@ pub async fn decide_candidate(
                 });
             }
 
-            repo.set_status(id, "promoted", auth.agent_id)
+            repo.set_status(id, "promoted", decided_by)
                 .await
                 .map_err(|e| ApiError::DatabaseError {
                     message: e.to_string(),
@@ -306,7 +323,7 @@ pub async fn decide_candidate(
                 "score": row.score,
                 "features": row.features,
                 "verifier_verdict": row.verifier_verdict,
-                "decided_by": auth.agent_id,
+                "decided_by": decided_by,
                 "source": "cross_source_matcher",
             });
             epigraph_db::EdgeRepository::create_symmetric_if_absent(
@@ -322,7 +339,7 @@ pub async fn decide_candidate(
             })?;
         }
         "reject" => {
-            repo.set_status(id, "rejected", auth.agent_id)
+            repo.set_status(id, "rejected", decided_by)
                 .await
                 .map_err(|e| ApiError::DatabaseError {
                     message: e.to_string(),
