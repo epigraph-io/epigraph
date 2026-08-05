@@ -33,6 +33,19 @@ impl MatchCandidateRepo {
     }
 
     /// Insert or update a candidate. Caller MUST pass `claim_a < claim_b`.
+    ///
+    /// A row that has already been *decided* (`decided_at IS NOT NULL`) keeps
+    /// its `status`: the nightly matcher re-touches most pairs every run and
+    /// always upserts `pending`, so an unguarded `status = EXCLUDED.status`
+    /// silently reverts operator rulings days after the fact. Matcher
+    /// telemetry (`score`, `features`, `matcher_run_id`) still refreshes —
+    /// those describe the *pair*, not the *decision*.
+    ///
+    /// The discriminator is `decided_at`, not `status != 'pending'`, because
+    /// [`crate::repos::match_candidate::MatchCandidateRepo::set_status`] is the
+    /// only writer of `decided_at`, while the matcher itself writes
+    /// `status = 'rejected'` with `decided_at` NULL. Keying on status would
+    /// freeze matcher-set rejections forever and defeat re-scoring.
     pub async fn upsert(
         &self,
         claim_a: Uuid,
@@ -50,8 +63,15 @@ impl MatchCandidateRepo {
              ON CONFLICT (claim_a, claim_b) DO UPDATE SET
                 score = EXCLUDED.score,
                 features = EXCLUDED.features,
-                status = EXCLUDED.status,
+                status = CASE
+                    WHEN match_candidates.decided_at IS NOT NULL
+                    THEN match_candidates.status
+                    ELSE EXCLUDED.status
+                END,
                 matcher_run_id = EXCLUDED.matcher_run_id
+             -- decided_at / decided_by are deliberately absent from this SET
+             -- list: omitted columns are left untouched by ON CONFLICT, which
+             -- is exactly the desired behaviour. Do not add them.
              RETURNING id",
         )
         .bind(claim_a)
