@@ -13,15 +13,39 @@ struct FakeRerank;
 
 #[async_trait]
 impl VerifierClient for FakeRerank {
-    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Verdict>> {
+    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Option<Verdict>>> {
         Ok(pairs
             .iter()
-            .map(|(a, b)| Verdict {
-                source_id: *a,
-                target_id: *b,
-                relationship: "supports".to_string(),
-                strength: 0.9,
-                rationale: "ok".to_string(),
+            .map(|(a, b)| {
+                Some(Verdict {
+                    source_id: *a,
+                    target_id: *b,
+                    relationship: "supports".to_string(),
+                    strength: 0.9,
+                    rationale: "ok".to_string(),
+                })
+            })
+            .collect())
+    }
+}
+
+/// Answers only every other pair; the rest come back as "no answer".
+struct PartiallySilentRerank;
+
+#[async_trait]
+impl VerifierClient for PartiallySilentRerank {
+    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Option<Verdict>>> {
+        Ok(pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (a, b))| {
+                (i % 2 == 0).then(|| Verdict {
+                    source_id: *a,
+                    target_id: *b,
+                    relationship: "supports".to_string(),
+                    strength: 0.9,
+                    rationale: "ok".to_string(),
+                })
             })
             .collect())
     }
@@ -67,7 +91,32 @@ async fn fake_verifier_preserves_pair_order_and_count() {
     let verdicts = FakeRerank.verify(&pairs).await.unwrap();
     assert_eq!(verdicts.len(), pairs.len());
     for (pair, v) in pairs.iter().zip(verdicts.iter()) {
+        let v = v.as_ref().expect("FakeRerank answers every pair");
         assert_eq!(v.source_id, pair.0);
         assert_eq!(v.target_id, pair.1);
+    }
+}
+
+/// A verifier that has no answer for some pairs still fills every slot, so
+/// `pairs[i]` ↔ `result[i]` alignment survives silence. Returning a shorter
+/// vector instead would make the pipeline attribute verdicts to the wrong
+/// rows — which is why "no answer" is `None` in a slot rather than an omission.
+#[tokio::test]
+async fn silence_occupies_its_slot_so_alignment_survives() {
+    let pairs = vec![
+        (Uuid::new_v4(), Uuid::new_v4()),
+        (Uuid::new_v4(), Uuid::new_v4()),
+        (Uuid::new_v4(), Uuid::new_v4()),
+    ];
+    let verdicts = PartiallySilentRerank.verify(&pairs).await.unwrap();
+    assert_eq!(
+        verdicts.len(),
+        pairs.len(),
+        "unanswered pairs must not shorten the result"
+    );
+    assert!(verdicts[1].is_none(), "pair 1 was unanswered");
+    for i in [0usize, 2] {
+        let v = verdicts[i].as_ref().expect("pair {i} was answered");
+        assert_eq!((v.source_id, v.target_id), pairs[i]);
     }
 }

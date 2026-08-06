@@ -64,15 +64,17 @@ struct AlwaysSameVerifier;
 
 #[async_trait]
 impl VerifierClient for AlwaysSameVerifier {
-    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Verdict>> {
+    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Option<Verdict>>> {
         Ok(pairs
             .iter()
-            .map(|(a, b)| Verdict {
-                source_id: *a,
-                target_id: *b,
-                relationship: "supports".to_string(),
-                strength: 0.9,
-                rationale: "test".to_string(),
+            .map(|(a, b)| {
+                Some(Verdict {
+                    source_id: *a,
+                    target_id: *b,
+                    relationship: "supports".to_string(),
+                    strength: 0.9,
+                    rationale: "test".to_string(),
+                })
             })
             .collect())
     }
@@ -82,15 +84,17 @@ struct AlwaysContradictsVerifier;
 
 #[async_trait]
 impl VerifierClient for AlwaysContradictsVerifier {
-    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Verdict>> {
+    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Option<Verdict>>> {
         Ok(pairs
             .iter()
-            .map(|(a, b)| Verdict {
-                source_id: *a,
-                target_id: *b,
-                relationship: "contradicts".to_string(),
-                strength: 0.85,
-                rationale: "negation".to_string(),
+            .map(|(a, b)| {
+                Some(Verdict {
+                    source_id: *a,
+                    target_id: *b,
+                    relationship: "contradicts".to_string(),
+                    strength: 0.85,
+                    rationale: "negation".to_string(),
+                })
             })
             .collect())
     }
@@ -100,16 +104,20 @@ struct AlwaysDerivesFromVerifier;
 
 #[async_trait]
 impl VerifierClient for AlwaysDerivesFromVerifier {
-    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Verdict>> {
-        // `derives_from` maps to MatchVerdict::Distinct → Reject branch.
+    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Option<Verdict>>> {
+        // `derives_from` maps to MatchVerdict::Distinct → Reject branch. This
+        // is an ANSWER — the model was asked and said "related, not the same" —
+        // as distinct from `NoAnswerVerifier`'s silence below.
         Ok(pairs
             .iter()
-            .map(|(a, b)| Verdict {
-                source_id: *a,
-                target_id: *b,
-                relationship: "derives_from".to_string(),
-                strength: 0.7,
-                rationale: "related not same".to_string(),
+            .map(|(a, b)| {
+                Some(Verdict {
+                    source_id: *a,
+                    target_id: *b,
+                    relationship: "derives_from".to_string(),
+                    strength: 0.7,
+                    rationale: "related not same".to_string(),
+                })
             })
             .collect())
     }
@@ -124,16 +132,18 @@ struct SpyVerifier {
 
 #[async_trait]
 impl VerifierClient for SpyVerifier {
-    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Verdict>> {
+    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Option<Verdict>>> {
         self.called.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(pairs
             .iter()
-            .map(|(a, b)| Verdict {
-                source_id: *a,
-                target_id: *b,
-                relationship: self.relationship.to_string(),
-                strength: 0.9,
-                rationale: "spy".to_string(),
+            .map(|(a, b)| {
+                Some(Verdict {
+                    source_id: *a,
+                    target_id: *b,
+                    relationship: self.relationship.to_string(),
+                    strength: 0.9,
+                    rationale: "spy".to_string(),
+                })
             })
             .collect())
     }
@@ -647,4 +657,191 @@ async fn mid_band_distinct_verdict_records_rejected_row_and_no_edge(pool: PgPool
     .expect("row");
     assert_eq!(status, "rejected");
     assert_eq!(verdict_col.as_deref(), Some("distinct"));
+}
+
+/// A verifier with NO answer for any pair — what
+/// `epigraph_cli::matching_client::align_verdicts` now returns when the
+/// reranker produced no row for a pair (model omitted it from the batch, the
+/// batch's LLM call failed, or the pair was filtered out before it was sent).
+///
+/// This slot used to be filled by a fabricated
+/// `relationship: "derives_from", strength: 0.0` verdict carrying the rationale
+/// `"verifier returned no verdict for this pair"` — the literal borne by all
+/// 123 corrupted `match_candidates` rows measured in prod. That is what this
+/// test watched destroy a stored `same` before the fix.
+struct NoAnswerVerifier;
+
+#[async_trait]
+impl VerifierClient for NoAnswerVerifier {
+    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Option<Verdict>>> {
+        Ok(pairs.iter().map(|_| None).collect())
+    }
+}
+
+/// LOAD-BEARING (Defect B): a pair the verifier did NOT answer on must leave
+/// the stored verdict untouched.
+///
+/// The verifier's silence is not a finding. Today it is laundered into one: the
+/// fabricated `derives_from` placeholder maps to `MatchVerdict::Distinct` →
+/// `PolicyAction::Reject` → `patch_verdict`, which destructively overwrites a
+/// prior `same` with `distinct` — and under the promotion rules from #382 a
+/// `distinct` row is permanently un-promotable, so the real verdict is not just
+/// lost, the pair is retired.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verifier_no_answer_must_not_overwrite_stored_verdict(pool: PgPool) {
+    let agent_x = insert_agent(&pool).await;
+    let agent_y = insert_agent(&pool).await;
+    let v = vec![1.0_f32; 1536];
+    let seed = insert_claim(
+        &pool,
+        agent_x,
+        serde_json::json!({"paper_doi": "10.1/K"}),
+        &v,
+    )
+    .await;
+    let peer = insert_claim(
+        &pool,
+        agent_y,
+        serde_json::json!({"paper_doi": "10.1/L"}),
+        &v,
+    )
+    .await;
+
+    // A prior run already got a real verdict for this pair. `decided_at` stays
+    // NULL so the #380 status guard and the #384 verdict freeze are BOTH out of
+    // the picture — this test isolates the verifier's own write path.
+    let (lo, hi) = if seed < peer {
+        (seed, peer)
+    } else {
+        (peer, seed)
+    };
+    sqlx::query(
+        "INSERT INTO match_candidates
+           (claim_a, claim_b, score, features, status, verifier_verdict, verifier_rationale)
+         VALUES ($1, $2, 0.40, '{}'::jsonb, 'pending', 'same', 'earlier run: same underlying claim')",
+    )
+    .bind(lo)
+    .bind(hi)
+    .execute(&pool)
+    .await
+    .expect("seed prior verdict");
+
+    let inputs = RunInputs {
+        seeds: vec![seed],
+        cfg: mid_band_config(),
+        verifier: Box::new(NoAnswerVerifier),
+        auto_promote: true,
+    };
+    let report = run_pipeline(&pool, inputs).await.expect("pipeline");
+
+    // Anti-vacuity: the skip path never re-writes score/features either, so an
+    // untouched row would ALSO be the result of the pair never reaching the
+    // verifier (blocked out, or scored below `bands.mid`). Pin that it did.
+    assert_eq!(
+        report.skipped_no_verdict, 1,
+        "the pair must actually have reached the verifier and been skipped, \
+         otherwise the assertions below pass for the wrong reason: {report:?}"
+    );
+
+    let (verdict_col, rationale_col, status): (Option<String>, Option<String>, String) =
+        sqlx::query_as(
+            "SELECT verifier_verdict, verifier_rationale, status FROM match_candidates
+             WHERE claim_a = $1 AND claim_b = $2",
+        )
+        .bind(lo)
+        .bind(hi)
+        .fetch_one(&pool)
+        .await
+        .expect("row");
+
+    assert_eq!(
+        verdict_col.as_deref(),
+        Some("same"),
+        "a pair the verifier never answered on must not overwrite the stored \
+         verdict — the verifier's silence is not a finding"
+    );
+    assert_eq!(
+        rationale_col.as_deref(),
+        Some("earlier run: same underlying claim"),
+        "the stored rationale must survive a no-answer too"
+    );
+    assert_eq!(
+        status, "pending",
+        "a no-answer must not reject the candidate"
+    );
+}
+
+/// The same skip on a pair with no history: nothing is written at all, and the
+/// skip is COUNTED rather than folded into `rejected`. Without the separate
+/// counter a verifier outage is indistinguishable from a corpus that stopped
+/// matching — the run log would show `rejected` climbing and look healthy.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verifier_no_answer_writes_nothing_and_is_counted_separately(pool: PgPool) {
+    let agent_x = insert_agent(&pool).await;
+    let agent_y = insert_agent(&pool).await;
+    let v = vec![1.0_f32; 1536];
+    let seed = insert_claim(
+        &pool,
+        agent_x,
+        serde_json::json!({"paper_doi": "10.1/M"}),
+        &v,
+    )
+    .await;
+    let peer = insert_claim(
+        &pool,
+        agent_y,
+        serde_json::json!({"paper_doi": "10.1/N"}),
+        &v,
+    )
+    .await;
+
+    let inputs = RunInputs {
+        seeds: vec![seed],
+        cfg: mid_band_config(),
+        verifier: Box::new(NoAnswerVerifier),
+        auto_promote: true,
+    };
+    let report = run_pipeline(&pool, inputs).await.expect("pipeline");
+
+    assert_eq!(
+        report.mid_band, 1,
+        "the pair WAS routed to the verifier — band telemetry must still see it: {report:?}"
+    );
+    assert_eq!(
+        report.skipped_no_verdict, 1,
+        "a no-answer must be counted so an outage is visible: {report:?}"
+    );
+    assert_eq!(report.rejected, 0, "a skip is not a rejection: {report:?}");
+    assert_eq!(report.promoted, 0, "a skip is not a promotion: {report:?}");
+
+    let (lo, hi) = if seed < peer {
+        (seed, peer)
+    } else {
+        (peer, seed)
+    };
+    let rows: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint FROM match_candidates
+         WHERE claim_a = $1 AND claim_b = $2",
+    )
+    .bind(lo)
+    .bind(hi)
+    .fetch_one(&pool)
+    .await
+    .expect("candidate count");
+    assert_eq!(
+        rows.0, 0,
+        "a pair the verifier never answered on must leave no candidate row — \
+         a 'rejected' row here is a fabricated finding"
+    );
+
+    let edges: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint FROM edges
+         WHERE (source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)",
+    )
+    .bind(seed)
+    .bind(peer)
+    .fetch_one(&pool)
+    .await
+    .expect("edge count");
+    assert_eq!(edges.0, 0, "a skip must not write an edge");
 }
