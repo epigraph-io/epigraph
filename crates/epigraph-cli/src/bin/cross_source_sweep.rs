@@ -18,19 +18,30 @@ use uuid::Uuid;
 /// Stub verifier that returns `derives_from` for every pair — maps to
 /// MatchVerdict::Distinct upstream so all mid-band pairs land as rejected.
 /// Lets `--count-only` report band distribution without spending LLM tokens.
+///
+/// NOTE (deliberately unchanged here): this launders "not asked" into a
+/// `distinct` verdict by the same mechanism as the defect fixed in this commit,
+/// and should arguably return `None` per pair. It is left alone because no
+/// measured corruption is attributed to it — every drifted row observed in prod
+/// carries the `RerankBridgesClient` placeholder rationale, not
+/// `"count-only run; verifier skipped"` — and switching it would stop
+/// `--count-only` writing `rejected` rows at all, an unmeasured behaviour
+/// change to an analysis tool riding along with a correctness fix.
 struct CountOnlyVerifier;
 
 #[async_trait]
 impl VerifierClient for CountOnlyVerifier {
-    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Verdict>> {
+    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Option<Verdict>>> {
         Ok(pairs
             .iter()
-            .map(|(a, b)| Verdict {
-                source_id: *a,
-                target_id: *b,
-                relationship: "derives_from".to_string(),
-                strength: 0.0,
-                rationale: "count-only run; verifier skipped".to_string(),
+            .map(|(a, b)| {
+                Some(Verdict {
+                    source_id: *a,
+                    target_id: *b,
+                    relationship: "derives_from".to_string(),
+                    strength: 0.0,
+                    rationale: "count-only run; verifier skipped".to_string(),
+                })
             })
             .collect())
     }
@@ -148,6 +159,10 @@ async fn main() -> anyhow::Result<()> {
             "promoted":      report.promoted,
             "mid_band":      report.mid_band,
             "rejected":      report.rejected,
+            // Pairs the verifier had no answer for and the pipeline skipped
+            // without touching stored state. A spike is a verifier outage, not
+            // a corpus signal — it has to be visible in the run log.
+            "skipped_no_verdict": report.skipped_no_verdict,
             "apply":         auto_promote,
             "count_only":    args.count_only,
         })
