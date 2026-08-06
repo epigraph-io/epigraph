@@ -159,9 +159,12 @@ gate** for 6b: an empty recall probe is only informative if merge rate and tripl
 non-floor.
 
 ### 6f. Ground-truth strategy
-Stored `match_candidates` verdicts are not reused (negatives are `"count-only run; verifier skipped"`
-placeholders). Ground truth here = the duplicate-paper twins (structural positives) + the LLM verifier
-as labeling oracle for cross-paper pairs and negatives.
+Stored `match_candidates` verdicts are not reused (negatives from a `--count-only` sweep are
+placeholders). **Two eras of that placeholder exist**: rows written before the verifier-rationale
+family landed carry `"count-only run; verifier skipped"`; rows written after carry
+`"verifier: skipped (count-only run)"` (`epigraph_cli::matching_client::RATIONALE_COUNT_ONLY`). Any
+query filtering count-only rows must match both. Ground truth here = the duplicate-paper twins
+(structural positives) + the LLM verifier as labeling oracle for cross-paper pairs and negatives.
 
 ## 7. Data realities & caveats
 

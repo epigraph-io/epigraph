@@ -4,7 +4,9 @@
 //! reused by both the original global-join CLI and the new candidates-table
 //! library entry point.
 
-use crate::rerank::candidates::{CandidatePair, ValidationResult, VALID_RELATIONSHIPS};
+use crate::rerank::candidates::{
+    CandidatePair, DiscardReason, DiscardedEntry, ValidationResult, VALID_RELATIONSHIPS,
+};
 
 /// Build the validation prompt for a batch of candidate pairs.
 pub(crate) fn build_validation_prompt(pairs: &[CandidatePair]) -> String {
@@ -81,25 +83,61 @@ pub(crate) fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Parse and validate the LLM's JSON response into `ValidationResult`s.
+/// What one batch response yielded: the entries that survived, and the ones
+/// that did not — each with the reason it was thrown away.
+///
+/// Before this type the discards were bare `continue`s, visible only on stderr;
+/// downstream every discarded pair was indistinguishable from a pair the model
+/// never mentioned.
+pub(crate) struct ParsedBatch {
+    pub results: Vec<ValidationResult>,
+    pub discards: Vec<DiscardedEntry>,
+}
+
+/// Parse and validate the LLM's JSON response into `ValidationResult`s,
+/// recording why each rejected entry was dropped.
 pub(crate) fn parse_validation_response(
     json: &serde_json::Value,
     batch_size: usize,
-) -> Vec<ValidationResult> {
+) -> ParsedBatch {
     let arr = match json.as_array() {
         Some(a) => a,
         None => {
             eprintln!("  WARNING: LLM response is not a JSON array");
-            return Vec::new();
+            return ParsedBatch {
+                results: Vec::new(),
+                discards: vec![DiscardedEntry {
+                    pair_index: None,
+                    reason: DiscardReason::ResponseNotArray,
+                }],
+            };
         }
     };
 
     let mut results = Vec::new();
+    let mut discards = Vec::new();
     for item in arr {
         let parsed: ValidationResult = match serde_json::from_value(item.clone()) {
             Ok(v) => v,
             Err(e) => {
+                // Read `pair_index` straight off the raw entry: deserialization
+                // usually fails on some *other* field, so the index is normally
+                // still there and the discard stays attributable. Without it we
+                // only know the batch was damaged, not which pair — say exactly
+                // that rather than blaming an arbitrary pair.
+                let pair_index = item
+                    .get("pair_index")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
                 eprintln!("  WARNING: Failed to parse validation item: {e}");
+                discards.push(DiscardedEntry {
+                    pair_index,
+                    reason: if pair_index.is_some() {
+                        DiscardReason::EntrySchemaMismatch
+                    } else {
+                        DiscardReason::UnattributableEntry
+                    },
+                });
                 continue;
             }
         };
@@ -110,6 +148,10 @@ pub(crate) fn parse_validation_response(
                 "  WARNING: pair_index {} out of bounds (batch size {})",
                 parsed.pair_index, batch_size
             );
+            discards.push(DiscardedEntry {
+                pair_index: Some(parsed.pair_index),
+                reason: DiscardReason::PairIndexOutOfBounds,
+            });
             continue;
         }
 
@@ -121,6 +163,10 @@ pub(crate) fn parse_validation_response(
                         "  WARNING: pair {}: invalid relationship '{}', skipping",
                         parsed.pair_index, rel
                     );
+                    discards.push(DiscardedEntry {
+                        pair_index: Some(parsed.pair_index),
+                        reason: DiscardReason::RelationshipOutOfVocabulary,
+                    });
                     continue;
                 }
             }
@@ -130,6 +176,10 @@ pub(crate) fn parse_validation_response(
                         "  WARNING: pair {}: strength {:.2} out of [0.3, 1.0], skipping",
                         parsed.pair_index, strength
                     );
+                    discards.push(DiscardedEntry {
+                        pair_index: Some(parsed.pair_index),
+                        reason: DiscardReason::StrengthOutOfRange,
+                    });
                     continue;
                 }
             }
@@ -138,7 +188,7 @@ pub(crate) fn parse_validation_response(
         results.push(parsed);
     }
 
-    results
+    ParsedBatch { results, discards }
 }
 
 // =============================================================================
@@ -235,7 +285,7 @@ mod tests {
             }
         ]);
 
-        let results = parse_validation_response(&json, 1);
+        let results = parse_validation_response(&json, 1).results;
         assert_eq!(results.len(), 1);
         assert!(results[0].valid);
         assert_eq!(results[0].relationship.as_deref(), Some("supports"));
@@ -254,7 +304,7 @@ mod tests {
             }
         ]);
 
-        let results = parse_validation_response(&json, 1);
+        let results = parse_validation_response(&json, 1).results;
         assert_eq!(results.len(), 1);
         assert!(!results[0].valid);
         assert!(results[0].relationship.is_none());
@@ -280,7 +330,7 @@ mod tests {
             }
         ]);
 
-        let results = parse_validation_response(&json, 2);
+        let results = parse_validation_response(&json, 2).results;
         assert_eq!(results.len(), 2);
         assert!(results[0].valid);
         assert!(!results[1].valid);
@@ -298,7 +348,7 @@ mod tests {
             }
         ]);
 
-        let results = parse_validation_response(&json, 1);
+        let results = parse_validation_response(&json, 1).results;
         assert!(
             results.is_empty(),
             "Invalid relationship type should be rejected"
@@ -317,7 +367,7 @@ mod tests {
             }
         ]);
 
-        let results = parse_validation_response(&json, 1);
+        let results = parse_validation_response(&json, 1).results;
         assert!(results.is_empty(), "Strength < 0.3 should be rejected");
     }
 
@@ -333,7 +383,7 @@ mod tests {
             }
         ]);
 
-        let results = parse_validation_response(&json, 1);
+        let results = parse_validation_response(&json, 1).results;
         assert!(results.is_empty(), "Strength > 1.0 should be rejected");
     }
 
@@ -349,7 +399,7 @@ mod tests {
             }
         ]);
 
-        let results = parse_validation_response(&json, 3);
+        let results = parse_validation_response(&json, 3).results;
         assert!(
             results.is_empty(),
             "pair_index >= batch_size should be rejected"
@@ -359,15 +409,91 @@ mod tests {
     #[test]
     fn test_parse_response_not_array() {
         let json = serde_json::json!({"error": "something"});
-        let results = parse_validation_response(&json, 1);
+        let results = parse_validation_response(&json, 1).results;
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_parse_response_empty_array() {
         let json = serde_json::json!([]);
-        let results = parse_validation_response(&json, 5);
+        let results = parse_validation_response(&json, 5).results;
         assert!(results.is_empty());
+    }
+
+    /// Every drop path must name itself. Each of these used to be a bare
+    /// `continue` whose only trace was a stderr line, so the caller could not
+    /// tell a discarded pair from one the model never mentioned.
+    #[test]
+    fn test_parse_response_records_a_reason_for_every_discard() {
+        // Whole response is not a JSON array — batch-wide, unattributable.
+        let d = parse_validation_response(&serde_json::json!({"error": "x"}), 1).discards;
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].reason, DiscardReason::ResponseNotArray);
+        assert_eq!(d[0].pair_index, None);
+
+        // Entry fails to deserialize but still carries a readable pair_index.
+        let d =
+            parse_validation_response(&serde_json::json!([{"pair_index": 0, "valid": "yes"}]), 1)
+                .discards;
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].reason, DiscardReason::EntrySchemaMismatch);
+        assert_eq!(d[0].pair_index, Some(0));
+
+        // Entry fails to deserialize with no index to recover — we know the
+        // batch is damaged, not which pair.
+        let d = parse_validation_response(&serde_json::json!([{"nonsense": true}]), 1).discards;
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].reason, DiscardReason::UnattributableEntry);
+        assert_eq!(d[0].pair_index, None);
+
+        // pair_index outside the batch (batch misalignment).
+        let d = parse_validation_response(
+            &serde_json::json!([{
+                "pair_index": 5, "valid": true, "relationship": "supports",
+                "strength": 0.5, "rationale": "r"
+            }]),
+            3,
+        )
+        .discards;
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].reason, DiscardReason::PairIndexOutOfBounds);
+
+        // Relationship outside VALID_RELATIONSHIPS — the category this whole
+        // instrument exists to detect.
+        let d = parse_validation_response(
+            &serde_json::json!([{
+                "pair_index": 0, "valid": true, "relationship": "causes",
+                "strength": 0.7, "rationale": "r"
+            }]),
+            1,
+        )
+        .discards;
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].reason, DiscardReason::RelationshipOutOfVocabulary);
+        assert_eq!(d[0].pair_index, Some(0));
+
+        // Strength outside the prompt's [0.3, 1.0].
+        let d = parse_validation_response(
+            &serde_json::json!([{
+                "pair_index": 0, "valid": true, "relationship": "supports",
+                "strength": 1.5, "rationale": "r"
+            }]),
+            1,
+        )
+        .discards;
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].reason, DiscardReason::StrengthOutOfRange);
+
+        // A clean response discards nothing.
+        let parsed = parse_validation_response(
+            &serde_json::json!([{
+                "pair_index": 0, "valid": true, "relationship": "supports",
+                "strength": 0.7, "rationale": "r"
+            }]),
+            1,
+        );
+        assert_eq!(parsed.results.len(), 1);
+        assert!(parsed.discards.is_empty());
     }
 
     #[test]

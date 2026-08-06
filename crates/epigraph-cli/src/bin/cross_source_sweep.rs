@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use clap::Parser;
-use epigraph_cli::matching_client::RerankBridgesClient;
+use epigraph_cli::matching_client::{RerankBridgesClient, RATIONALE_COUNT_ONLY};
 use epigraph_engine::matching::calibration::MatcherConfig;
 use epigraph_engine::matching::pipeline::{run_pipeline, RunInputs};
 use epigraph_engine::matching::verifier::{Verdict, VerifierClient};
@@ -30,7 +30,7 @@ impl VerifierClient for CountOnlyVerifier {
                 target_id: *b,
                 relationship: "derives_from".to_string(),
                 strength: 0.0,
-                rationale: "count-only run; verifier skipped".to_string(),
+                rationale: RATIONALE_COUNT_ONLY.to_string(),
             })
             .collect())
     }
