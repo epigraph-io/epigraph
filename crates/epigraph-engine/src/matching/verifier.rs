@@ -190,11 +190,27 @@ pub fn map_relationship(rel: &str, _strength: f32) -> MatchVerdict {
 /// wiring); tests inject a fake.
 #[async_trait]
 pub trait VerifierClient: Send + Sync {
-    /// Return one verdict per input pair, in the same order. Implementations
+    /// Return one **slot** per input pair, in the same order. Implementations
     /// MUST preserve `pairs[i]` ↔ `result[i]` alignment so the pipeline can
     /// attribute verdicts back to `match_candidates` rows without a second
     /// lookup.
-    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Verdict>>;
+    ///
+    /// `None` means **the verifier has no answer for this pair** — it is not a
+    /// verdict and must never be coerced into one. Reaching that state is
+    /// routine and has several causes that the verifier cannot tell apart from
+    /// the outside: the model answered the batch but omitted the pair, the
+    /// whole batch's LLM call failed, or the pair was dropped before it was
+    /// ever sent (e.g. `epigraph_cli::rerank::core::find_candidates_from_table`
+    /// excludes pairs already carrying an edge). All of them mean the same
+    /// thing operationally — *we learned nothing about this pair* — so they
+    /// share one carrier and the pipeline skips the pair entirely rather than
+    /// writing a fabricated verdict over whatever a previous run established.
+    ///
+    /// Before this became `Option`, the production impl fabricated a
+    /// `derives_from`/`strength: 0.0` placeholder for exactly these cases;
+    /// [`map_relationship`] sent it to [`MatchVerdict::Distinct`] → Reject →
+    /// `patch_verdict('distinct')`, destroying 123 real verdicts in prod.
+    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Option<Verdict>>>;
 }
 
 #[cfg(test)]

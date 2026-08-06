@@ -224,6 +224,16 @@ Notes:
   - `contradicts` → `distinct` (and surfaces a contradiction signal — see §Failure Modes)
   - `derives_from` → `distinct` (related-but-not-same)
 - Verdict and rationale stored on the match-candidate row; never re-asked.
+- **No answer is not a verdict.** `VerifierClient::verify` returns one *slot*
+  per input pair (`Vec<Option<Verdict>>`); `None` means the verifier learned
+  nothing about the pair — the model omitted it from the batch, the batch's LLM
+  call failed, or the pair never reached the model (the reranker's candidate
+  query drops pairs that already carry an edge). The pipeline **skips** those
+  pairs: no `match_candidates` row, no verdict, no rationale, no edge, so
+  whatever a previous run established survives. They are reported separately as
+  `RunReport::skipped_no_verdict`, never folded into `rejected`. Before this,
+  the production client fabricated a `derives_from`/`0.0` placeholder for these
+  cases, which mapped to `distinct` and destroyed 123 real verdicts in prod.
 - Cost-bounded: only invoked for pairs in the mid band.
 
 #### 5. `match_candidates` table (new migration)
