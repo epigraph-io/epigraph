@@ -25,6 +25,43 @@ pub fn admin_auth() -> AuthContext {
     }
 }
 
+/// Names these fixtures may mutate without an explicit opt-in.
+/// Mirrors `db_is_disposable` in
+/// `crates/epigraph-db/tests/claim_repo_helpers.rs` — see that file for the
+/// full rationale.
+pub fn db_is_disposable(name: &str) -> bool {
+    name.starts_with("_sqlx_test") || name.ends_with("_test")
+}
+
+/// Environment opt-in for running these fixtures against a
+/// non-disposable-looking database (set by CI, whose DB is named `epigraph`).
+pub const DESTRUCTIVE_OPT_IN: &str = "EPIGRAPH_TEST_DESTRUCTIVE_DB";
+
+/// Refuse to hand back a pool onto a database these fixtures must not touch.
+///
+/// Guards pool construction, not the individual helpers: `try_test_pool`
+/// itself runs `sqlx::migrate!` against whatever `DATABASE_URL` names, so a
+/// per-helper guard would leave that path unprotected. Panics rather than
+/// skips so a misdirected `DATABASE_URL` cannot masquerade as a green run.
+pub async fn assert_disposable_db(pool: &PgPool) {
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .expect("query current_database()");
+
+    if db_is_disposable(&db) || std::env::var(DESTRUCTIVE_OPT_IN).as_deref() == Ok("1") {
+        return;
+    }
+
+    panic!(
+        "refusing to run destructive claim fixtures against database {db:?}.\n\
+         These tests DROP the uq_claims_content_hash_agent constraint and run a \
+         table-wide dedup DELETE on `claims`.\n\
+         Point DATABASE_URL at a scratch database (e.g. epigraph_db_repo_test), or \
+         set {DESTRUCTIVE_OPT_IN}=1 if {db:?} really is disposable."
+    );
+}
+
 pub async fn try_test_pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = PgPoolOptions::new()
@@ -32,6 +69,7 @@ pub async fn try_test_pool() -> Option<PgPool> {
         .connect(&url)
         .await
         .ok()?;
+    assert_disposable_db(&pool).await;
     sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
     Some(pool)
 }

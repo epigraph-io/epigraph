@@ -29,6 +29,20 @@ jobs:
     env:
       DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
       SQLX_OFFLINE: "true"
+      # The claim fixtures in crates/epigraph-db/tests/claim_repo_helpers.rs and
+      # crates/epigraph-mcp/tests/common/mod.rs DROP uq_claims_content_hash_agent
+      # and run a table-wide dedup DELETE on `claims`. They now refuse to run
+      # unless the target database looks disposable (`_sqlx_test*` / `*_test`) or
+      # this flag is set.
+      #
+      # The postgres service above is named `epigraph` — the same name as the
+      # long-lived deployment — so no name-based rule can tell them apart. This
+      # opt-in is what separates them: the ephemeral service container is torn
+      # down with the job, so dropping a constraint in it is harmless. Anyone
+      # running these tests locally against a real `epigraph` gets a panic
+      # instead, which is how the deployed schema lost the constraint while
+      # _sqlx_migrations still recorded migration 013 as applied.
+      EPIGRAPH_TEST_DESTRUCTIVE_DB: "1"
       # CI resource mitigations — GitHub-hosted ubuntu-latest is 4 vCPU /
       # 16 GB RAM / ~14 GB disk. Default cargo build + lld link saturates
       # that on a workspace this size; symptoms are intermittent SIGBUS in
