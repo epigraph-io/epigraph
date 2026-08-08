@@ -4,6 +4,30 @@ Operational scripts for the live EpiGraph deployment. Not part of the
 build; invoked manually or by maintenance tasks (see `epiclaw-host`'s
 `schedules.toml`).
 
+## audit_claims_content_hash_agent.py
+
+Audits the drifted `uq_claims_content_hash_agent` constraint (migration 013)
+on a live database: reports whether `_sqlx_migrations` claims 013 applied,
+whether the constraint actually exists, and how many rows block each candidate
+constraint shape (full `UNIQUE (content_hash, agent_id)` vs partial
+`... WHERE is_current`).
+
+Read-only by default. **Never deletes claims** — 14 of the FKs referencing
+`claims.id` are `ON DELETE CASCADE` (`evidence`, `reasoning_traces`,
+`mass_functions`, `triples`, …), so choosing a survivor per duplicate group is
+an owner decision, not a mechanical one.
+
+```bash
+python3 scripts/audit_claims_content_hash_agent.py            # report
+python3 scripts/audit_claims_content_hash_agent.py --json     # machine-readable
+
+# Adds the constraint; refuses (exit 1) unless zero rows violate it:
+python3 scripts/audit_claims_content_hash_agent.py --apply-constraint full
+```
+
+This is the **S2 content-hash-keyed** gate referenced below — distinct from
+`fuzzy_dedup_claims.py`'s S3 semantic layer.
+
 ## fuzzy_dedup_claims.py
 
 Cross-agent **semantic** dedup of the `claims` table, driven by a

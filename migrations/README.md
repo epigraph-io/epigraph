@@ -12,6 +12,33 @@ refuse to start.
 
 Add a NEW migration (`NNN+1_fix_typo.sql`) instead of editing an existing one.
 
+## Known schema drift: `uq_claims_content_hash_agent` (013)
+
+`_sqlx_migrations` recording a version as applied does **not** prove the
+objects it created still exist. On the long-lived `epigraph` database,
+migration 013 is recorded `success = true` while its
+`uq_claims_content_hash_agent UNIQUE (content_hash, agent_id)` constraint is
+absent from `claims`.
+
+Cause: integration-test fixtures in
+`crates/epigraph-db/tests/claim_repo_helpers.rs` and
+`crates/epigraph-mcp/tests/common/mod.rs` deliberately drop that constraint to
+exercise the pre-107 code path. Run with `DATABASE_URL` pointing at a live
+database, they dropped it there and left it dropped. Those fixtures now refuse
+to run against non-disposable databases (see `db_is_disposable` /
+`EPIGRAPH_TEST_DESTRUCTIVE_DB`), so the drift cannot recur — but the existing
+drift, and the ~169k duplicate rows that accumulated while `claims` was
+unconstrained, still need reconciling.
+
+**Do not "fix" this with a new migration that re-adds the constraint.** A bare
+`ADD CONSTRAINT` fails on the duplicates, and per the append-only rule above a
+failed migration panics the api binary on restart — turning silent drift into a
+deploy outage. Audit first:
+
+```bash
+python3 scripts/audit_claims_content_hash_agent.py     # read-only
+```
+
 ## Version range coordination with epigraph-internal
 
 The private `epigraph-internal` repo also runs `sqlx::migrate!()` against the
