@@ -264,6 +264,13 @@ def apply_constraint(conn, shape: str, report: dict) -> int:
         if report["constraint_present"]:
             print(f"{CONSTRAINT} already present; nothing to do.")
             return 0
+        # NOTE: a plain ADD CONSTRAINT builds the backing index under an
+        # ACCESS EXCLUSIVE lock on `claims` — every reader and writer blocks
+        # for the duration, and `claims` is ~457k rows on the live graph.
+        # Schedule it, or build the index CONCURRENTLY first and attach it with
+        # ADD CONSTRAINT ... USING INDEX. Kept as the plain form here because
+        # it is what migration 013 declares, and matching 013 exactly is the
+        # point of restoring it.
         ddl = (
             f"ALTER TABLE claims ADD CONSTRAINT {CONSTRAINT} "
             "UNIQUE (content_hash, agent_id)"
