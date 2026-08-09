@@ -16,7 +16,7 @@ use epigraph_engine::matching::verifier::{Verdict, VerifierClient};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::rerank::{rerank_candidates_table, PerPairVerdict, RerankConfig};
+use crate::rerank::{rerank_candidates_table, PerPairVerdict, RerankConfig, RerankSummary};
 
 /// Wraps the Phase 7 reranker as a [`VerifierClient`].
 ///
@@ -57,27 +57,34 @@ impl RerankBridgesClient {
 /// Join the reranker's per-pair output back onto the caller's pair list,
 /// preserving order and the one-slot-per-input-pair contract.
 ///
-/// `None` is returned for any pair the reranker produced **no row** for. That
-/// is the verifier saying *"I have no answer"*, and it must stay distinct from
-/// every verdict value. Three different upstream paths land here and none of
-/// them is a finding about the pair:
+/// `None` is returned for any pair the reranker produced **no row** for, *for
+/// any reason whatsoever*. That is the verifier saying *"I have no answer"*, and
+/// it must stay distinct from every verdict value. The known upstream paths, as
+/// of writing, are these five — and none of them is a finding about the pair:
 ///
-/// - the model answered the batch but omitted this pair
-///   ([`crate::rerank::prompt::parse_validation_response`] drops unattributable
-///   entries),
-/// - the batch's LLM call failed outright — `rerank::core::rerank_inner`'s
-///   `call_llm_with_retry` `Err` arm bumps `summary.errors` and `continue`s, so
-///   every pair in that batch is absent,
-/// - the pair never reached the model at all —
-///   `rerank::core::find_candidates_from_table` filters out pairs already
-///   connected by any edge in either direction (and anything without an
-///   embedding), while the matcher pipeline applies no such filter, so on a
-///   re-run the highest-scoring pairs are systematically absent.
+/// 1. the model answered the batch but omitted this pair,
+/// 2. the batch's LLM call failed outright — `rerank::core::rerank_inner`'s
+///    `call_llm_with_retry` `Err` arm bumps `summary.errors` and `continue`s, so
+///    every pair in that batch is absent,
+/// 3. the pair never reached the model at all —
+///    `rerank::core::find_candidates_from_table` filters out pairs already
+///    connected by any edge in either direction (and anything without an
+///    embedding), while the matcher pipeline applies no such filter, so on a
+///    re-run the highest-scoring pairs are systematically absent,
+/// 4. [`crate::rerank::RerankConfig::limit`] truncated the candidate set before
+///    the batch loop,
+/// 5. [`crate::rerank::prompt::parse_validation_response`] dropped the model's
+///    answer — an unparseable item, a `pair_index` out of bounds, or a
+///    `valid: true` answer whose `relationship` is outside `VALID_RELATIONSHIPS`
+///    or whose `strength` is outside `[0.3, 1.0]`.
 ///
-/// Because a `None` causes the pipeline to write nothing, we do not have to
-/// tell those three apart — which matters, since PR #381 tried to and shipped a
-/// rationale string that asserted "the model returned no entry" for pairs the
-/// model was demonstrably never asked about.
+/// The list is deliberately *not* load-bearing: this function keys on the
+/// absence of a row, so a sixth path added tomorrow lands on `None` too. That
+/// matters, since PR #381 tried to tell such paths apart inside a rationale
+/// string, enumerated only some of them, and shipped a literal that asserted
+/// "the model returned no entry" for pairs the model was demonstrably never
+/// asked about. Because a `None` causes the pipeline to write nothing, no
+/// string asserts anything and none can be false.
 ///
 /// `valid: false` is the opposite case: the model *did* answer and said the
 /// pair is not a real bridge. That keeps the `derives_from` mapping (→
@@ -124,6 +131,37 @@ pub fn align_verdicts(
             })
         })
         .collect()
+}
+
+/// Did this rerank call reach the model for at least one pair and come back
+/// with a usable answer for **none** of them?
+///
+/// That is an outage, not a finding, and it must not be reported as a run of
+/// `None`s. `rerank_inner`'s LLM-failure arm does `continue`, not `return Err`,
+/// so a total provider failure returns `Ok` with an empty `per_pair_verdicts` —
+/// which post-fix means every pair is skipped, nothing is written, the pipeline
+/// returns `Ok`, and `cross_source_sweep` would go on to stamp
+/// `last_match_scan_at` on every seed and exit 0. Seven days of seeds
+/// black-holed by a successful-looking sweep. This has already been observed in
+/// prod as `401 Unauthorized` on every verifier call while the process still
+/// exited 0 with well-formed JSON — `cross-source-sweep-nightly.sh` currently
+/// greps stderr for auth strings to catch it, a heuristic this check replaces
+/// structurally.
+///
+/// `candidates_evaluated` is the count that survived
+/// `find_candidates_from_table`, so pairs dropped **before** the model — already
+/// edged (the routine, high-volume case on a re-run), no embedding, or
+/// `limit`-truncated — are not counted here. A fully already-linked corpus
+/// therefore yields `candidates_evaluated == 0` and is *not* flagged: the sweep
+/// legitimately had nothing to ask, and must still stamp its seeds or it would
+/// re-scan the same window forever. The predicate fires only when the model was
+/// genuinely asked and genuinely said nothing usable.
+///
+/// A *partial* failure is deliberately not flagged: some real answers came back,
+/// those are findings, and the unanswered remainder is reported through
+/// `RunReport::skipped_no_verdict`.
+pub fn is_total_verifier_outage(summary: &RerankSummary) -> bool {
+    summary.candidates_evaluated > 0 && summary.per_pair_verdicts.is_empty()
 }
 
 #[async_trait]
@@ -183,6 +221,21 @@ impl VerifierClient for RerankBridgesClient {
 
         let summary = result?;
 
+        // Fail loudly BEFORE handing the pipeline a vector of `None`s it would
+        // (correctly) skip and the sweep would (incorrectly) read as "the
+        // corpus stopped matching". See `is_total_verifier_outage`.
+        if is_total_verifier_outage(&summary) {
+            anyhow::bail!(
+                "verifier outage: the reranker sent {} candidate pair(s) to the model \
+                 and got a usable answer for none of them ({} error(s) recorded). \
+                 Refusing to report this as \"no matches\" — a run of no-answers here \
+                 would skip every pair, write nothing, and still stamp every seed as \
+                 scanned.",
+                summary.candidates_evaluated,
+                summary.errors
+            );
+        }
+
         Ok(align_verdicts(pairs, summary.per_pair_verdicts))
     }
 }
@@ -231,6 +284,64 @@ mod tests {
             .expect("valid:false is an answer, not silence");
         assert_eq!(v.relationship, "derives_from");
         assert_eq!(v.rationale, "model spoke");
+    }
+
+    /// A total LLM failure must NOT be laundered into "the corpus stopped
+    /// matching". `rerank_inner`'s failure arm `continue`s, so the summary comes
+    /// back `Ok` with pairs sent and zero verdicts; post-fix that would skip
+    /// every pair, write nothing, and let the sweep stamp every seed as scanned
+    /// while exiting 0.
+    #[test]
+    fn pairs_sent_to_the_model_with_zero_answers_is_an_outage() {
+        let summary = RerankSummary {
+            candidates_evaluated: 10,
+            errors: 10,
+            per_pair_verdicts: Vec::new(),
+            ..Default::default()
+        };
+        assert!(
+            is_total_verifier_outage(&summary),
+            "10 pairs asked, 0 answered is an outage, not a corpus signal"
+        );
+    }
+
+    /// The routine case this must NOT fire on: every pair was filtered out
+    /// before the model (already edged / no embedding / `limit`), so nothing was
+    /// asked and nothing could be answered. Flagging it would fail the sweep
+    /// every night on an already-linked corpus AND wedge it re-scanning the same
+    /// seed window forever, because the `last_match_scan_at` stamp is downstream
+    /// of the error.
+    #[test]
+    fn a_corpus_with_nothing_left_to_ask_is_not_an_outage() {
+        let summary = RerankSummary {
+            candidates_evaluated: 0,
+            errors: 0,
+            per_pair_verdicts: Vec::new(),
+            ..Default::default()
+        };
+        assert!(
+            !is_total_verifier_outage(&summary),
+            "no pair reached the model, so there is no verifier failure to report"
+        );
+    }
+
+    /// A partial failure is a real result plus a shortfall, not an outage: the
+    /// answers that did arrive are findings and must be acted on. The
+    /// unanswered remainder is reported via `RunReport::skipped_no_verdict`.
+    #[test]
+    fn a_partial_batch_failure_is_not_an_outage() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let summary = RerankSummary {
+            candidates_evaluated: 10,
+            errors: 9,
+            per_pair_verdicts: vec![per_pair(a, b, true)],
+            ..Default::default()
+        };
+        assert!(
+            !is_total_verifier_outage(&summary),
+            "one real answer means the model was reachable; do not fail the run"
+        );
     }
 
     /// Alignment is by canonical pair, so a verdict reported in the opposite

@@ -38,10 +38,19 @@ pub struct RunReport {
     pub verdict_writes_suppressed: usize,
     /// Pairs the verifier had **no answer** for (`verify` returned `None`).
     /// These are skipped outright — no candidate row, no verdict, no edge — so
-    /// they are neither promoted, staged, nor rejected. Reported separately
-    /// because a spike here means the verifier is failing, not that the corpus
-    /// suddenly stopped matching, and the two are indistinguishable from the
-    /// other counters alone.
+    /// they are neither promoted, staged, nor rejected, and the other counters
+    /// alone cannot account for them.
+    ///
+    /// **This is not an outage alarm.** A large, routine baseline is expected:
+    /// the production verifier's pre-LLM candidate query filters out every pair
+    /// already connected by an edge in either direction, while this pipeline
+    /// applies no such filter, so on any re-run over an edge-dense corpus the
+    /// structural `decomposes_to` / `section_follows` pairs land here as a
+    /// matter of course. A rise here means "fewer pairs got a fresh answer",
+    /// which is consistent with both a verifier problem and an already-linked
+    /// corpus; this counter cannot tell them apart. Total verifier silence is
+    /// alarmed at the seam that *can* tell them apart — see
+    /// `epigraph_cli::matching_client::is_total_verifier_outage`.
     pub skipped_no_verdict: usize,
 }
 
