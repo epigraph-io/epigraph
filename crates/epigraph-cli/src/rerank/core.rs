@@ -12,7 +12,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::enrichment::llm_client::{create_llm_client, LlmError, LlmProvider};
-use crate::rerank::candidates::{CandidatePair, ValidationResult};
+use crate::rerank::candidates::{CandidatePair, DiscardReason, ValidationResult};
 use crate::rerank::errors::RerankError;
 use crate::rerank::prompt::{build_validation_prompt, parse_validation_response};
 
@@ -69,6 +69,43 @@ pub struct RerankSummary {
     /// cross-source matcher's verifier wrapper) attribute verdicts back to
     /// their pairs without re-parsing. Populated regardless of `dry_run`.
     pub per_pair_verdicts: Vec<PerPairVerdict>,
+    /// Pairs that were batched but got no usable verdict, each with the reason.
+    /// Disjoint from `per_pair_verdicts`. A batched pair in neither list is one
+    /// the model answered about and simply omitted — that distinction is the
+    /// point of this field.
+    ///
+    /// `errors` counts these; this says *why*. Note the complement is not
+    /// visible here: a pair the caller asked about that never survived
+    /// `find_candidates_from_table` appears in neither list and in no counter,
+    /// because the reranker never saw it.
+    pub per_pair_discards: Vec<PerPairDiscard>,
+}
+
+impl RerankSummary {
+    /// Counts of `per_pair_discards` by reason, keyed on the
+    /// [`DiscardReason::as_str`] text.
+    ///
+    /// **The values are pair counts, not event counts.** A batch-scoped reason
+    /// is recorded against every unexplained pair in its batch, so a single
+    /// malformed entry in a batch of 50 silent pairs reports as `50`. Read an
+    /// entry as "50 pairs got no verdict, and this is why", never as "50 things
+    /// went wrong".
+    ///
+    /// This is the operational readout the old `errors` counter could not give:
+    /// `errors: 300` is the same number whether one LLM call failed on a
+    /// 300-pair run, the model answered and omitted 300 pairs, or 300 entries
+    /// named relationships outside the vocabulary. Those call for completely
+    /// different responses.
+    ///
+    /// Consumed today only by `rerank_inner`'s end-of-run `eprintln!`. It is
+    /// deliberately not written anywhere persistent — see [`DiscardReason`].
+    pub fn discard_breakdown(&self) -> std::collections::BTreeMap<&'static str, usize> {
+        let mut out = std::collections::BTreeMap::new();
+        for d in &self.per_pair_discards {
+            *out.entry(d.reason.as_str()).or_insert(0) += 1;
+        }
+        out
+    }
 }
 
 /// Per-pair verdict surfaced alongside aggregate counts. Mirrors the
@@ -82,6 +119,137 @@ pub struct PerPairVerdict {
     pub relationship: Option<String>,
     pub strength: Option<f64>,
     pub rationale: String,
+}
+
+/// A pair that was assigned to a batch but got no usable verdict out of it,
+/// keyed to the candidate's UUIDs so callers can align it without re-parsing.
+#[derive(Debug, Clone)]
+pub struct PerPairDiscard {
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub reason: DiscardReason,
+}
+
+/// Everything one LLM batch yields, in one value.
+///
+/// Extracted from [`rerank_inner`] so the parse → attribute step is reachable
+/// without a database or a live LLM. The tests at the bottom of this module
+/// drive it directly, which is the point: they exercise the same code the batch
+/// loop runs, rather than a re-implementation of it.
+pub(crate) struct BatchInterpretation {
+    /// Entries that survived parsing and validation, in response order.
+    pub results: Vec<ValidationResult>,
+    /// One per surviving entry, keyed to the batch's claim UUIDs.
+    pub verdicts: Vec<PerPairVerdict>,
+    /// Unanswered pairs whose silence is explained by a discard.
+    pub discards: Vec<PerPairDiscard>,
+    /// Batch indices with no surviving entry — the model was silent about
+    /// them, or their entry was discarded. Counted as errors by the caller.
+    pub unanswered: Vec<usize>,
+}
+
+/// No response ever came back for this batch: the LLM call itself failed
+/// (after the one rate-limit retry), so nothing was parsed.
+///
+/// Every pair is unanswered and every one carries
+/// [`DiscardReason::BatchCallFailed`]. Without this, a failed call left all
+/// `batch_size` pairs looking exactly like pairs the model *answered about and
+/// omitted* — the same conflation this module exists to remove, one layer up.
+pub(crate) fn interpret_failed_batch(batch: &[CandidatePair]) -> BatchInterpretation {
+    BatchInterpretation {
+        results: Vec::new(),
+        verdicts: Vec::new(),
+        discards: batch
+            .iter()
+            .map(|pair| PerPairDiscard {
+                source_id: pair.source_id,
+                target_id: pair.target_id,
+                reason: DiscardReason::BatchCallFailed,
+            })
+            .collect(),
+        unanswered: (0..batch.len()).collect(),
+    }
+}
+
+/// Parse one batch response and attribute every entry back to its pair.
+///
+/// Pure: no I/O. `batch` is the slice of candidates the prompt described, so
+/// `batch.len()` is the bound `pair_index` is checked against.
+///
+/// Attribution rule, and the reason it is shaped this way: a reason is
+/// recorded *against a pair*, so it has to be true of that pair. A discard
+/// naming an in-range `pair_index` is pair-scoped and belongs to that pair.
+/// Everything else — a non-array response, an entry too broken to read an
+/// index from, an index outside the batch — is batch-scoped: it is reported
+/// against every otherwise-unexplained unanswered pair, but worded as a
+/// statement about the batch (see [`DiscardReason::as_str`]), never as a claim
+/// that *this* pair's entry was the broken one. Batch-scoped damage therefore
+/// suppresses the "the model was silent about this pair" reading without
+/// fabricating attribution — an instrument that guesses is worse than one that
+/// admits what it does not know.
+pub(crate) fn interpret_batch_response(
+    batch: &[CandidatePair],
+    json: &serde_json::Value,
+) -> BatchInterpretation {
+    let parsed = parse_validation_response(json, batch.len());
+    let results = parsed.results;
+
+    let mut attributed: std::collections::HashMap<usize, DiscardReason> =
+        std::collections::HashMap::new();
+    let mut batch_wide: Option<DiscardReason> = None;
+    for discard in &parsed.discards {
+        match discard.pair_index {
+            Some(i) if i < batch.len() && discard.reason.is_pair_scoped() => {
+                attributed.entry(i).or_insert(discard.reason);
+            }
+            // Batch-scoped: keep the first one seen. Reporting several
+            // batch-level faults per pair would not tell a reader anything the
+            // first one doesn't, and would make the strings ungroupable.
+            _ => {
+                batch_wide.get_or_insert(discard.reason);
+            }
+        }
+    }
+
+    let verdicts: Vec<PerPairVerdict> = results
+        .iter()
+        .map(|result| {
+            let pair = &batch[result.pair_index];
+            PerPairVerdict {
+                source_id: pair.source_id,
+                target_id: pair.target_id,
+                valid: result.valid,
+                relationship: result.relationship.clone(),
+                strength: result.strength,
+                rationale: result.rationale.clone(),
+            }
+        })
+        .collect();
+
+    let responded: std::collections::HashSet<usize> =
+        results.iter().map(|r| r.pair_index).collect();
+    let unanswered: Vec<usize> = (0..batch.len())
+        .filter(|i| !responded.contains(i))
+        .collect();
+
+    let discards: Vec<PerPairDiscard> = unanswered
+        .iter()
+        .filter_map(|&i| {
+            let reason = attributed.get(&i).copied().or(batch_wide)?;
+            Some(PerPairDiscard {
+                source_id: batch[i].source_id,
+                target_id: batch[i].target_id,
+                reason,
+            })
+        })
+        .collect();
+
+    BatchInterpretation {
+        results,
+        verdicts,
+        discards,
+        unanswered,
+    }
 }
 
 // =============================================================================
@@ -342,25 +510,28 @@ async fn rerank_inner(
             Err(e) => {
                 eprintln!("  ERROR calling LLM: {e}");
                 summary.errors += batch.len();
+                // Record WHY these pairs have no verdict. Bumping `errors` and
+                // moving on used to leave every pair in the batch
+                // indistinguishable from one the model answered about and
+                // omitted.
+                summary
+                    .per_pair_discards
+                    .extend(interpret_failed_batch(batch).discards);
                 continue;
             }
         };
 
-        let results = parse_validation_response(&json, batch.len());
+        let BatchInterpretation {
+            results,
+            verdicts,
+            discards,
+            unanswered,
+        } = interpret_batch_response(batch, &json);
 
         // Capture per-pair verdicts before mutating `summary` further. Output
         // preserves input order across batches.
-        for result in &results {
-            let pair = &batch[result.pair_index];
-            summary.per_pair_verdicts.push(PerPairVerdict {
-                source_id: pair.source_id,
-                target_id: pair.target_id,
-                valid: result.valid,
-                relationship: result.relationship.clone(),
-                strength: result.strength,
-                rationale: result.rationale.clone(),
-            });
-        }
+        summary.per_pair_verdicts.extend(verdicts);
+        summary.per_pair_discards.extend(discards);
 
         for result in &results {
             let pair = &batch[result.pair_index];
@@ -430,15 +601,33 @@ async fn rerank_inner(
             }
         }
 
-        // Count pairs the LLM didn't return results for
-        let responded_indices: std::collections::HashSet<usize> =
-            results.iter().map(|r| r.pair_index).collect();
-        for i in 0..batch.len() {
-            if !responded_indices.contains(&i) {
-                eprintln!("  WARNING: LLM did not return a result for pair {i}");
-                summary.errors += 1;
-            }
+        // Count pairs the LLM didn't return usable results for.
+        for i in unanswered {
+            eprintln!("  WARNING: LLM did not return a result for pair {i}");
+            summary.errors += 1;
         }
+    }
+
+    // One line naming *what kind* of failure the `errors` count is made of.
+    // Unconditional (not `verbose`-gated) because the library callers — the
+    // cross-source sweep in particular — run with `verbose: false` and are
+    // exactly the ones whose operators have no other trace.
+    //
+    // The header says "pairs" because that is what the numbers count: one
+    // batch-scoped fault is reported against every unexplained pair in its
+    // batch, so `50 × the LLM call for this batch failed` is fifty affected
+    // pairs, not fifty failed calls. Leaving that ambiguous would make the
+    // instrument's own output misreadable.
+    let breakdown = summary.discard_breakdown();
+    if !breakdown.is_empty() {
+        let rendered: Vec<String> = breakdown
+            .iter()
+            .map(|(reason, n)| format!("{n} × {reason}"))
+            .collect();
+        eprintln!(
+            "  no-verdict breakdown (pairs, by reason): {}",
+            rendered.join("; ")
+        );
     }
 
     summary.duration_ms = started.elapsed().as_millis();
@@ -525,6 +714,211 @@ async fn call_llm_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate() -> CandidatePair {
+        CandidatePair {
+            source_id: Uuid::new_v4(),
+            target_id: Uuid::new_v4(),
+            source_content: "src".to_string(),
+            target_content: "tgt".to_string(),
+            source_doi: None,
+            target_doi: None,
+            similarity: 0.5,
+        }
+    }
+
+    /// `summary.errors` counts every batch index without a surviving result —
+    /// discarded entries included. Extracting the loop into
+    /// `interpret_batch_response` must not quietly change that count.
+    #[test]
+    fn interpret_counts_discarded_and_silent_pairs_alike_as_unanswered() {
+        let batch = vec![candidate(), candidate(), candidate()];
+        let json = serde_json::json!([
+            // pair 0 omitted (silent); pair 1 discarded (bad relationship)
+            {"pair_index": 1, "valid": true, "relationship": "causes",
+             "strength": 0.7, "rationale": "r"},
+            {"pair_index": 2, "valid": true, "relationship": "supports",
+             "strength": 0.7, "rationale": "r"},
+        ]);
+
+        let interpretation = interpret_batch_response(&batch, &json);
+
+        assert_eq!(interpretation.unanswered, vec![0, 1]);
+        assert_eq!(interpretation.results.len(), 1);
+        assert_eq!(interpretation.verdicts.len(), 1);
+        // Only the discarded pair gets a reason; the silent one gets none, and
+        // that absence is the signal.
+        assert_eq!(interpretation.discards.len(), 1);
+        assert_eq!(interpretation.discards[0].source_id, batch[1].source_id);
+        assert_eq!(
+            interpretation.discards[0].reason,
+            DiscardReason::RelationshipOutOfVocabulary
+        );
+    }
+
+    /// A `pair_index` outside the batch names no real pair, so it must be
+    /// treated as batch damage — reported against every unanswered pair, never
+    /// pinned to a pair we merely guessed at.
+    #[test]
+    fn out_of_bounds_index_is_batch_scoped_not_pinned_to_a_pair() {
+        let batch = vec![candidate(), candidate()];
+        let json = serde_json::json!([
+            {"pair_index": 7, "valid": true, "relationship": "supports",
+             "strength": 0.7, "rationale": "r"}
+        ]);
+
+        let interpretation = interpret_batch_response(&batch, &json);
+
+        assert_eq!(interpretation.unanswered, vec![0, 1]);
+        assert_eq!(interpretation.discards.len(), 2);
+        for d in &interpretation.discards {
+            assert_eq!(d.reason, DiscardReason::PairIndexOutOfBounds);
+        }
+    }
+
+    /// A batch whose LLM call never returned yields no verdicts, every pair
+    /// unanswered, and a `BatchCallFailed` reason for each — so downstream can
+    /// say "we never got an answer" instead of "the model omitted this pair".
+    #[test]
+    fn failed_batch_marks_every_pair_as_call_failed() {
+        let batch = vec![candidate(), candidate(), candidate()];
+
+        let interpretation = interpret_failed_batch(&batch);
+
+        assert!(interpretation.results.is_empty());
+        assert!(interpretation.verdicts.is_empty());
+        assert_eq!(interpretation.unanswered, vec![0, 1, 2]);
+        assert_eq!(interpretation.discards.len(), 3);
+        for (d, pair) in interpretation.discards.iter().zip(&batch) {
+            assert_eq!(d.reason, DiscardReason::BatchCallFailed);
+            assert_eq!(d.source_id, pair.source_id);
+        }
+    }
+
+    /// Scope classification is what keeps the emitted strings true: only
+    /// reasons carrying an in-range `pair_index` may be attributed to a pair.
+    #[test]
+    fn only_entry_level_reasons_are_pair_scoped() {
+        for r in [
+            DiscardReason::EntrySchemaMismatch,
+            DiscardReason::RelationshipOutOfVocabulary,
+            DiscardReason::StrengthOutOfRange,
+        ] {
+            assert!(r.is_pair_scoped(), "{r:?} should be pair-scoped");
+        }
+        for r in [
+            DiscardReason::BatchCallFailed,
+            DiscardReason::ResponseNotArray,
+            DiscardReason::UnattributableEntry,
+            DiscardReason::PairIndexOutOfBounds,
+        ] {
+            assert!(!r.is_pair_scoped(), "{r:?} should be batch-scoped");
+            assert!(
+                r.as_str().contains("batch"),
+                "batch-scoped reason {r:?} must say so: {:?}",
+                r.as_str()
+            );
+        }
+    }
+
+    /// Accumulate batches into a `RerankSummary` the way `rerank_inner` does,
+    /// so the tests below read the same struct a production caller reads.
+    fn summarize(batches: Vec<BatchInterpretation>) -> RerankSummary {
+        let mut s = RerankSummary::default();
+        for b in batches {
+            s.errors += b.unanswered.len();
+            s.per_pair_verdicts.extend(b.verdicts);
+            s.per_pair_discards.extend(b.discards);
+        }
+        s
+    }
+
+    /// The headline defect, at the level where it is actually observable.
+    ///
+    /// A batch whose LLM call failed outright and a pair the model answered
+    /// about and omitted are completely different events — one means the
+    /// verifier never ran, the other means it ran and had nothing to say — and
+    /// they call for opposite operator responses. Before this change both
+    /// showed up as nothing but `+1 errors`, so a run reporting `errors: 300`
+    /// could be one dead API key or three hundred genuinely-silent pairs and
+    /// there was no way to tell.
+    #[test]
+    fn failed_llm_call_and_model_silence_are_distinguishable_in_the_summary() {
+        let call_failed = candidate();
+        let silent = candidate();
+
+        let s = summarize(vec![
+            interpret_failed_batch(std::slice::from_ref(&call_failed)),
+            // Well-formed empty array: the model answered and named nobody.
+            interpret_batch_response(std::slice::from_ref(&silent), &serde_json::json!([])),
+        ]);
+
+        assert_eq!(s.errors, 2, "both pairs are still counted as errors");
+        assert_eq!(
+            s.discard_breakdown(),
+            [("the LLM call for this batch failed", 1)]
+                .into_iter()
+                .collect(),
+            "a failed call must be named, and model silence must NOT be — the \
+             absence of a reason is what marks genuine silence"
+        );
+    }
+
+    /// The other bypass the reverted PR #381 got wrong. An out-of-vocabulary
+    /// relationship is a real model answer we threw away; silence is not. Both
+    /// used to be a bare `continue` plus `+1 errors`.
+    #[test]
+    fn discarded_entry_and_model_silence_are_distinguishable_in_the_summary() {
+        let silent = candidate();
+        let oov = candidate();
+        let batch = vec![silent, oov.clone()];
+        let json = serde_json::json!([
+            {"pair_index": 1, "valid": true, "relationship": "causes",
+             "strength": 0.7, "rationale": "A causes B"}
+        ]);
+
+        let s = summarize(vec![interpret_batch_response(&batch, &json)]);
+
+        assert_eq!(s.errors, 2);
+        assert_eq!(s.per_pair_discards.len(), 1, "only the discarded pair");
+        assert_eq!(s.per_pair_discards[0].source_id, oov.source_id);
+        assert_eq!(
+            s.discard_breakdown(),
+            [(
+                "this pair's relationship was outside the accepted vocabulary",
+                1
+            )]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    /// `discard_breakdown`'s values count *pairs*, not faults. One damaged
+    /// entry in a batch of three silent pairs reports as `3`, which is why the
+    /// rendered line says "(pairs, by reason)" — a reader who takes the number
+    /// as an event count would conclude three separate things went wrong.
+    #[test]
+    fn breakdown_values_count_affected_pairs_not_faults() {
+        let batch = vec![candidate(), candidate(), candidate()];
+        // A single out-of-range entry: one fault, three unexplained pairs.
+        let json = serde_json::json!([
+            {"pair_index": 9, "valid": true, "relationship": "supports",
+             "strength": 0.7, "rationale": "r"}
+        ]);
+
+        let s = summarize(vec![interpret_batch_response(&batch, &json)]);
+
+        assert_eq!(
+            s.discard_breakdown(),
+            [(
+                "the batch response contained an entry naming a pair_index outside the batch",
+                3
+            )]
+            .into_iter()
+            .collect(),
+            "one fault, three pairs — the count is of pairs"
+        );
+    }
 
     #[test]
     fn test_is_safe_identifier_accepts_alphanumeric_underscore() {
