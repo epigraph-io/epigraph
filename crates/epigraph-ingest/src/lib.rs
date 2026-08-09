@@ -345,6 +345,100 @@ mod tests {
         );
     }
 
+    /// Drift guard for `PlannedClaim::id_is_document_scoped`.
+    ///
+    /// Write paths route on that predicate to decide whether to preserve the
+    /// planner's id (document-scoped) or let content-hash convergence pick the
+    /// row (content-addressed). The predicate is `level < 3`, which is only
+    /// sound while every level-3 claim is minted by `atom_id` and every
+    /// level-0/1/2 claim by `compound_claim_id`. Re-derive both namespaces from
+    /// a built plan and fail if a builder ever stops honouring that.
+    ///
+    /// Runs over BOTH builders, since both feed the same predicate.
+    #[test]
+    fn planned_id_namespace_matches_declared_scope() {
+        use crate::common::ids::{atom_id, content_hash};
+
+        let doc_json = r#"{
+            "source": {"title": "Namespace Guard Paper", "source_type": "Paper", "authors": []},
+            "thesis": "Thesis statement",
+            "sections": [{
+                "title": "Intro",
+                "paragraphs": [{
+                    "text": "A paragraph.",
+                    "atoms": ["An atomic assertion."],
+                    "generality": [1],
+                    "confidence": 0.8
+                }]
+            }],
+            "relationships": []
+        }"#;
+        let doc: DocumentExtraction = serde_json::from_str(doc_json).unwrap();
+        let doc_plan = crate::document::build_ingest_plan(&doc);
+
+        let wf_json = r#"{
+            "source": {"canonical_name": "namespace-guard-wf", "goal": "G", "generation": 0, "authors": []},
+            "thesis": "Workflow thesis",
+            "phases": [{
+                "title": "Phase", "summary": "Phase summary",
+                "steps": [{
+                    "compound": "Step compound",
+                    "operations": ["An operation."],
+                    "generality": [1], "confidence": 0.9
+                }]
+            }]
+        }"#;
+        let wf: crate::workflow::WorkflowExtraction = serde_json::from_str(wf_json).unwrap();
+        let wf_plan = crate::workflow::build_ingest_plan(&wf);
+
+        for (label, plan) in [("document", &doc_plan), ("workflow", &wf_plan)] {
+            assert!(
+                plan.claims.iter().any(|c| c.level == 3),
+                "{label} plan must contain at least one atom for this guard to mean anything"
+            );
+            for c in &plan.claims {
+                let global_id = atom_id(&content_hash(&c.content));
+                if c.id_is_document_scoped() {
+                    assert_ne!(
+                        c.id, global_id,
+                        "{label} level-{} claim {:?} is declared document-scoped but its id is \
+                         the global ATOM_NAMESPACE id — a write path preserving it would create \
+                         a per-document node where convergence was intended",
+                        c.level, c.content
+                    );
+                } else {
+                    assert_eq!(
+                        c.id, global_id,
+                        "{label} level-{} claim {:?} is declared content-addressed but its id is \
+                         NOT uuid_v5(ATOM_NAMESPACE, blake3(content)) — a write path would send \
+                         it down the convergence branch and resolve to the wrong row",
+                        c.level, c.content
+                    );
+                }
+            }
+        }
+
+        // Document builder only: compound rows carry a SEED-SCOPED storage hash
+        // so `uq_claims_content_hash_agent` cannot collapse two documents'
+        // structural rows; atoms keep the plain content hash.
+        for c in &doc_plan.claims {
+            let plain = content_hash(&c.content);
+            if c.id_is_document_scoped() {
+                assert_ne!(
+                    c.content_hash, plain,
+                    "document level-{} claim {:?} must store a seed-scoped content_hash",
+                    c.level, c.content
+                );
+            } else {
+                assert_eq!(
+                    c.content_hash, plain,
+                    "document atom {:?} must store the plain content hash so it converges",
+                    c.content
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_normalize_claim_path() {
         use crate::builder::normalize_claim_path;

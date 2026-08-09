@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::common::edges::{decomposes_edge, thesis_derivation_str};
-use crate::common::ids::{atom_id, compound_claim_id, content_hash};
+use crate::common::ids::{atom_id, compound_claim_id, compound_content_hash, content_hash};
 use crate::common::paths::normalize_claim_path;
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
 use crate::document::schema::{DocumentExtraction, Paragraph, SourceType};
@@ -57,7 +57,11 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
     #[allow(clippy::option_if_let_else)]
     let thesis_id = if let Some(ref thesis_text) = extraction.thesis {
         let hash = content_hash(thesis_text);
-        let id = compound_claim_id(&hash, &format!("{doc_title}\u{1f}thesis"));
+        let seed = format!("{doc_title}\u{1f}thesis");
+        let id = compound_claim_id(&hash, &seed);
+        // Stored hash is scoped too, so `uq_claims_content_hash_agent` cannot
+        // collapse two documents' structural rows. See `ids::compound_content_hash`.
+        let stored_hash = compound_content_hash(&hash, &seed);
         path_index.insert("thesis".to_string(), id);
 
         claims.push(PlannedClaim {
@@ -69,7 +73,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 "source_type": source_type,
                 "thesis_derivation": thesis_derivation_str(&extraction.thesis_derivation),
             }),
-            content_hash: hash,
+            content_hash: stored_hash,
             confidence: 1.0,
             methodology: None,
             evidence_type: None,
@@ -87,8 +91,9 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
     for (si, section) in extraction.sections.iter().enumerate() {
         let section_path = format!("sections[{si}]");
         let section_hash = content_hash(&section.title);
-        let section_id =
-            compound_claim_id(&section_hash, &format!("{doc_title}\u{1f}{section_path}"));
+        let section_seed = format!("{doc_title}\u{1f}{section_path}");
+        let section_id = compound_claim_id(&section_hash, &section_seed);
+        let section_stored_hash = compound_content_hash(&section_hash, &section_seed);
         section_ids.push(section_id);
         path_index.insert(section_path.clone(), section_id);
 
@@ -102,7 +107,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 "section": section.title,
                 "spine_text_kind": spine_text_kind(extraction),
             }),
-            content_hash: section_hash,
+            content_hash: section_stored_hash,
             confidence: 1.0,
             methodology: None,
             evidence_type: None,
@@ -122,7 +127,9 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
         for (pi, paragraph) in section.paragraphs.iter().enumerate() {
             let para_path = format!("{section_path}.paragraphs[{pi}]");
             let para_hash = content_hash(&paragraph.text);
-            let para_id = compound_claim_id(&para_hash, &format!("{doc_title}\u{1f}{para_path}"));
+            let para_seed = format!("{doc_title}\u{1f}{para_path}");
+            let para_id = compound_claim_id(&para_hash, &para_seed);
+            let para_stored_hash = compound_content_hash(&para_hash, &para_seed);
             para_ids.push(para_id);
             path_index.insert(para_path.clone(), para_id);
 
@@ -164,7 +171,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                     "section": section.title,
                     "spine_text_kind": spine_text_kind(extraction),
                 }),
-                content_hash: para_hash,
+                content_hash: para_stored_hash,
                 confidence: paragraph.confidence,
                 methodology: paragraph.methodology.clone(),
                 evidence_type: para_evidence_type.clone(),

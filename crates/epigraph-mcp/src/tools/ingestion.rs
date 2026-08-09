@@ -338,8 +338,10 @@ pub async fn check_already_ingested(
 /// Phase 1 of the two-phase ingest flow. Writes thesis + sections +
 /// paragraphs (levels 0–2) and returns which paragraph paths are NEW so the
 /// caller atomizes only those before submitting atoms via
-/// `ingest_document_inline`. Skips atoms entirely; the full content-hash dedup
-/// applies at paragraph level so re-ingesting an abstract is safe.
+/// `ingest_document_inline`. Skips atoms entirely. Structural nodes are keyed
+/// on (document title, structural path, text), so re-ingesting the SAME
+/// document reuses them; a DIFFERENT document that happens to share a heading
+/// or a boilerplate paragraph gets its own nodes.
 pub async fn ingest_document_spine(
     server: &EpiGraphMcpFull,
     params: IngestDocumentSpineParams,
@@ -384,8 +386,9 @@ pub async fn do_ingest_document(
     let paper_label = format!("doi:{doi}");
 
     // ── 1. Get-or-create paper node ──
-    // (Pipeline-version gate removed: node-level content-hash dedup handles
-    //  idempotency so re-ingesting an abstract then the full paper is safe.
+    // (Pipeline-version gate removed: deterministic node ids handle idempotency
+    //  so re-ingesting an abstract then the full paper is safe — structural nodes
+    //  by document-scoped id, atoms by content hash.
     //  Use ingest_document_spine → ingest_document_inline for the two-phase
     //  flow that avoids redundant LLM atomization.)
     let paper_id = PaperRepository::get_or_create(
@@ -521,31 +524,25 @@ pub async fn do_ingest_document(
         );
         // Override generated id with the planner's deterministic UUID.
         claim.id = ClaimId::from_uuid(planned.id);
-        claim.content_hash = ContentHasher::hash(planned.content.as_bytes());
+        // Bind the PLANNER's hash, not `hash(content)`: for document-scoped
+        // nodes it folds in the artifact seed (see `ids::compound_content_hash`).
+        claim.content_hash = planned.content_hash;
         claim.signature = Some(server.signer.sign(&claim.content_hash));
 
-        // ClaimRepository::create dedupes by content_hash and returns the
-        // existing row when the hash matches. Two dedup paths exist:
-        //   (a) deterministic-id collision: persisted_id != planned.id
-        //       (e.g. content_hash matched some other claim with a different
-        //       UUID — shouldn't happen for atoms or compounds we built,
-        //       but we handle it for safety).
-        //   (b) atom convergence across papers: planned.id is
-        //       uuid_v5(ATOM_NAMESPACE, content_hash), so the existing
-        //       atom has the same id. We detect this via persisted.trace_id
-        //       already being Some (the original ingestion already wrote
-        //       trace + evidence; we must NOT clobber that provenance).
-        let persisted = ClaimRepository::create(pool, &claim)
-            .await
-            .map_err(internal_error)?;
-        let persisted_id: Uuid = persisted.id.into();
-        let already_had_trace = persisted.trace_id.is_some();
+        let (persisted_id, resolved_to_existing) = persist_planned_claim(
+            pool,
+            &claim,
+            planned,
+            agent_id,
+            TruthValue::clamped(raw_truth),
+        )
+        .await?;
         // Idempotent add: also runs on the dedup branch below, so an atom
         // shared across papers (convergence) picks up every paper's label.
         ClaimRepository::update_labels(pool, persisted_id, std::slice::from_ref(&paper_label), &[])
             .await
             .map_err(internal_error)?;
-        if persisted_id != planned.id || already_had_trace {
+        if resolved_to_existing {
             let (_row, _was_created) = EdgeRepository::create_if_not_exists(
                 pool,
                 paper_id,
@@ -678,8 +675,10 @@ pub async fn do_ingest_document(
             .unwrap_or(edge.target_id);
 
         // Filter self-loops introduced by content-hash dedup collapsing
-        // distinct planned UUIDs (e.g. compound paragraph and its sole
-        // atom that share text) onto the same persisted claim. The
+        // distinct planned UUIDs onto the same persisted claim. Since
+        // structural nodes keep their document-scoped ids, the old
+        // paragraph-equals-its-sole-atom collapse no longer happens; this
+        // still guards atom-to-atom collapse within one document. The
         // semantically correct outcome is a no-op decomposition; the DB
         // would otherwise reject this with edges_no_self_loop.
         if src == tgt && src_type == edge.target_type {
@@ -939,6 +938,73 @@ fn find_arxiv_id(s: &str) -> Option<String> {
     None
 }
 
+/// Persist one planned claim, routing on the identity class the PLANNER chose.
+///
+/// Returns `(persisted_id, resolved_to_existing)`. `resolved_to_existing` means
+/// the row was already there with its provenance (trace + evidence) written, so
+/// the caller must only wire the `asserts` edge and must NOT clobber it.
+///
+/// Two classes, per `epigraph_ingest::common::ids`:
+///
+/// * **document-scoped (COMPOUND, levels 0–2)** — thesis / section / paragraph.
+///   `id = uuid_v5(COMPOUND_NAMESPACE, hash(text) ++ "{title}\u{1f}{path}")`, so
+///   two papers with a section titled "Introduction" get two different ids *by
+///   design*. Written with [`ClaimRepository::create_with_id_if_absent`], which
+///   binds the caller's id and hash and resolves on `ON CONFLICT (id)`. This is
+///   the same primitive `workflow_ingest` and `epigraph-ingest-executor`
+///   already use; the document path was the sole holdout.
+///
+///   The legacy [`ClaimRepository::create`] instead re-resolves
+///   `SELECT id FROM claims WHERE content_hash = $1`, discarding the planner's
+///   id — that is what fused 70 papers onto one `Abstract` node and, through
+///   `id_map`, remapped every planned structural edge onto it.
+///
+/// * **content-addressed (ATOM, level 3)** — `id = uuid_v5(ATOM_NAMESPACE,
+///   hash(text))`. Convergence across papers IS the feature (it is how
+///   cross-source corroboration finds agreement), so these stay on the
+///   content-hash path unchanged.
+async fn persist_planned_claim(
+    pool: &sqlx::PgPool,
+    claim: &Claim,
+    planned: &PlannedClaim,
+    agent_id: Uuid,
+    truth: TruthValue,
+) -> Result<(Uuid, bool), McpError> {
+    if planned.id_is_document_scoped() {
+        let was_new = ClaimRepository::create_with_id_if_absent(
+            pool,
+            planned.id,
+            &planned.content,
+            &planned.content_hash,
+            agent_id,
+            truth,
+            &[],
+        )
+        .await
+        .map_err(internal_error)?;
+        // Idempotency is now by id rather than by content hash: re-ingesting
+        // the SAME document re-derives the same seed → the same id → conflict →
+        // `was_new == false`. Narrow window: a run that dies between this insert
+        // and the trace write below leaves the node without trace/evidence, and
+        // the retry takes the reuse branch. The old `already_had_trace` probe
+        // covered that; closing it again would cost a SELECT per claim.
+        return Ok((planned.id, !was_new));
+    }
+
+    // Atom: `create` dedupes on content_hash and returns the existing row.
+    // `persisted_id != planned.id` catches a hash collision against some other
+    // claim; `trace_id.is_some()` catches genuine atom convergence, where the
+    // earlier ingestion already wrote the provenance we must not overwrite.
+    let persisted = ClaimRepository::create(pool, claim)
+        .await
+        .map_err(internal_error)?;
+    let persisted_id: Uuid = persisted.id.into();
+    Ok((
+        persisted_id,
+        persisted_id != planned.id || persisted.trace_id.is_some(),
+    ))
+}
+
 fn methodology_from_planned(planned: &PlannedClaim) -> Methodology {
     match planned.methodology.as_deref() {
         Some("statistical" | "instrumental" | "computational") => Methodology::Instrumental,
@@ -1142,19 +1208,22 @@ pub async fn do_ingest_document_spine(
             TruthValue::clamped(raw_truth),
         );
         claim.id = ClaimId::from_uuid(planned.id);
-        claim.content_hash = ContentHasher::hash(planned.content.as_bytes());
+        claim.content_hash = planned.content_hash;
         claim.signature = Some(server.signer.sign(&claim.content_hash));
 
-        let persisted = ClaimRepository::create(pool, &claim)
-            .await
-            .map_err(internal_error)?;
-        let persisted_id: Uuid = persisted.id.into();
-        let already_had_trace = persisted.trace_id.is_some();
+        let (persisted_id, resolved_to_existing) = persist_planned_claim(
+            pool,
+            &claim,
+            planned,
+            agent_id,
+            TruthValue::clamped(raw_truth),
+        )
+        .await?;
         ClaimRepository::update_labels(pool, persisted_id, std::slice::from_ref(&paper_label), &[])
             .await
             .map_err(internal_error)?;
 
-        if persisted_id != planned.id || already_had_trace {
+        if resolved_to_existing {
             let (_row, _) = EdgeRepository::create_if_not_exists(
                 pool,
                 paper_id,
