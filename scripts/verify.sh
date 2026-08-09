@@ -13,6 +13,14 @@
 # The DB-backed (#[sqlx::test]) tests require a reachable Postgres; they are run
 # only when DATABASE_URL is set (CI provides a postgres service). Without it,
 # the static gates that local dev most often forgets — fmt + clippy — still run.
+#
+# <testdb> must be a DISPOSABLE database — a name matching `_sqlx_test*` or
+# `*_test` (e.g. epigraph_db_repo_test). Some fixtures DROP
+# uq_claims_content_hash_agent and run a table-wide dedup DELETE on `claims`;
+# pointing DATABASE_URL at a long-lived graph is what silently removed that
+# constraint from the deployed schema. Those fixtures now panic rather than
+# mutate an unrecognised database. Override with EPIGRAPH_TEST_DESTRUCTIVE_DB=1
+# only when you are certain the target is throwaway.
 
 set -euo pipefail
 

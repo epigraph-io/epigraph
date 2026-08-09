@@ -9,6 +9,58 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Names this file is allowed to mutate without an explicit opt-in.
+///
+/// `#[sqlx::test]` template/instance databases are `_sqlx_test*`; the
+/// hand-rolled scratch databases this repo documents for integration work
+/// (`epigraph_db_repo_test`, `epigraph_frame_test`, …) all end in `_test`.
+/// Both are disposable by construction.
+///
+/// Deliberately *not* name-based beyond that: CI's postgres service database
+/// is named `epigraph`, exactly like the long-lived deployment, so no
+/// blocklist can separate them. Everything outside the disposable set must
+/// opt in via `EPIGRAPH_TEST_DESTRUCTIVE_DB=1`.
+fn db_is_disposable(name: &str) -> bool {
+    name.starts_with("_sqlx_test") || name.ends_with("_test")
+}
+
+/// Environment opt-in for running these fixtures against a
+/// non-disposable-looking database (set by CI, whose DB is named `epigraph`).
+const DESTRUCTIVE_OPT_IN: &str = "EPIGRAPH_TEST_DESTRUCTIVE_DB";
+
+/// Refuse to hand back a pool onto a database these fixtures must not touch.
+///
+/// This guard sits at pool construction rather than on the individual
+/// destructive helpers because `try_test_pool` *itself* mutates: it runs
+/// `sqlx::migrate!` against whatever `DATABASE_URL` names. Guarding only
+/// `drop_unique_constraint`/`add_unique_constraint` would leave that hole
+/// open.
+///
+/// This is not hypothetical. The deployed `epigraph` database records
+/// migration 013 as applied (`_sqlx_migrations.success = true`) while
+/// `uq_claims_content_hash_agent` is absent from `claims` — the signature of
+/// `drop_unique_constraint` having run against it and never being restored.
+/// Panicking (rather than skipping) is deliberate: a silent skip would let a
+/// misdirected `DATABASE_URL` look like a green test run.
+async fn assert_disposable_db(pool: &PgPool) {
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .expect("query current_database()");
+
+    if db_is_disposable(&db) || std::env::var(DESTRUCTIVE_OPT_IN).as_deref() == Ok("1") {
+        return;
+    }
+
+    panic!(
+        "refusing to run destructive claim fixtures against database {db:?}.\n\
+         These tests DROP the uq_claims_content_hash_agent constraint and run a \
+         table-wide dedup DELETE on `claims`.\n\
+         Point DATABASE_URL at a scratch database (e.g. epigraph_db_repo_test), or \
+         set {DESTRUCTIVE_OPT_IN}=1 if {db:?} really is disposable."
+    );
+}
+
 async fn try_test_pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = PgPoolOptions::new()
@@ -16,8 +68,27 @@ async fn try_test_pool() -> Option<PgPool> {
         .connect(&url)
         .await
         .ok()?;
+    assert_disposable_db(&pool).await;
     sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
     Some(pool)
+}
+
+#[test]
+fn disposable_db_classification() {
+    // #[sqlx::test] template + instance databases.
+    assert!(db_is_disposable("_sqlx_test_7228"));
+    assert!(db_is_disposable("_sqlx_test_pIYMM_s7GsH9D_KCYP1I"));
+    // Documented scratch databases.
+    assert!(db_is_disposable("epigraph_db_repo_test"));
+    assert!(db_is_disposable("epigraph_frame_test"));
+
+    // The long-lived deployments this guard exists to protect.
+    assert!(!db_is_disposable("epigraph"));
+    assert!(!db_is_disposable("epigraph_internal_e2e"));
+    // `_e2e` / `_dev` suffixes are NOT disposable: epigraph_internal_e2e is a
+    // long-lived database despite the test-sounding name.
+    assert!(!db_is_disposable("epigraph_e2e"));
+    assert!(!db_is_disposable("epigraph_demo_dev"));
 }
 
 macro_rules! test_pool_or_skip {
