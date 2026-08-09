@@ -159,7 +159,24 @@ pub fn align_verdicts(
 ///
 /// A *partial* failure is deliberately not flagged: some real answers came back,
 /// those are findings, and the unanswered remainder is reported through
-/// `RunReport::skipped_no_verdict`.
+/// `RunReport::skipped_no_verdict`. An honest batch of `valid: false` answers is
+/// likewise not flagged — `rerank_inner` pushes rejections into
+/// `per_pair_verdicts` too, so "the model said no to everything" is a result,
+/// not an outage.
+///
+/// **Known wedge, accepted deliberately.** A *persistent* malformed-response
+/// mode — every answer dropped by
+/// [`crate::rerank::prompt::parse_validation_response`] because the
+/// `relationship` is out of vocabulary or the `strength` is outside
+/// `[0.3, 1.0]` — also leaves `per_pair_verdicts` empty and so fires this
+/// predicate. That is intended: a model emitting only unusable answers is
+/// malfunctioning. But because the error aborts the run *upstream* of the
+/// `last_match_scan_at` stamp, the sweep will retry the same seed window every
+/// night until an operator intervenes. Loud-and-stuck is the deliberate choice
+/// over silent-and-advancing; the alternative — telling a transport failure
+/// apart from a parse failure — is not derivable from `RerankSummary::errors`
+/// (the whole-batch arm adds `batch.len()` at once, the parse-drop path adds one
+/// per unanswered index) and would need a new field on the summary.
 pub fn is_total_verifier_outage(summary: &RerankSummary) -> bool {
     summary.candidates_evaluated > 0 && summary.per_pair_verdicts.is_empty()
 }
