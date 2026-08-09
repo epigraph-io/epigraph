@@ -15,24 +15,34 @@ use epigraph_engine::matching::verifier::{Verdict, VerifierClient};
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
-/// Stub verifier that returns `derives_from` for every pair — maps to
-/// MatchVerdict::Distinct upstream so all mid-band pairs land as rejected.
-/// Lets `--count-only` report band distribution without spending LLM tokens.
+/// Stub verifier for `--count-only`: **no answer** for every pair, so the band
+/// distribution can be measured without spending LLM tokens and without the
+/// stub's silence being mistaken for a finding.
+///
+/// It used to return `relationship: "derives_from", strength: 0.0`, which
+/// `map_relationship` sends to `MatchVerdict::Distinct` → `PolicyAction::Reject`
+/// → `Policy::patch_verdict("distinct")` — i.e. the *same* fabrication this
+/// binary's real verifier was fixed for, reached by the same mechanism, from a
+/// path where no model was asked anything at all. That wrote 12,006
+/// `status='rejected'` rows carrying the rationale `"count-only run; verifier
+/// skipped"` in prod (MEASURED, read-only, all from one 2026-05-23 run).
+///
+/// Returning `None` loses **no** band-distribution information: `run_pipeline`
+/// increments `mid_band` *before* it inspects the slot, so every pair routed
+/// here is still counted; the ones that used to be labelled `rejected` are now
+/// reported honestly as `skipped_no_verdict`, and `rejected` narrows to the
+/// low-band pairs that really were rejected on score. The only thing dropped is
+/// the `match_candidates` write — and that write is the harm, on a run that
+/// already forces `--dry-run` and already skips the `last_match_scan_at` stamp
+/// because it is an analysis run, not a real sweep.
 struct CountOnlyVerifier;
 
 #[async_trait]
 impl VerifierClient for CountOnlyVerifier {
-    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Verdict>> {
-        Ok(pairs
-            .iter()
-            .map(|(a, b)| Verdict {
-                source_id: *a,
-                target_id: *b,
-                relationship: "derives_from".to_string(),
-                strength: 0.0,
-                rationale: "count-only run; verifier skipped".to_string(),
-            })
-            .collect())
+    async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Option<Verdict>>> {
+        // One slot per input pair (the trait's alignment contract), every one
+        // `None`. Nothing was asked, so there is nothing to report.
+        Ok(pairs.iter().map(|_| None).collect())
     }
 }
 
@@ -60,8 +70,8 @@ struct Args {
     #[arg(long, env = "EPIGRAPH_CALIBRATION_PATH")]
     calibration: Option<std::path::PathBuf>,
 
-    /// Skip the LLM verifier — every mid-band pair gets a `derives_from`
-    /// placeholder verdict (mapped to MatchVerdict::Distinct → Reject).
+    /// Skip the LLM verifier — every mid-band pair is reported as "no answer"
+    /// and skipped (counted in `skipped_no_verdict`, no candidate row written).
     /// Lets you measure band distribution against the calibration without
     /// burning LLM tokens. Forces --dry-run.
     #[arg(long)]
@@ -152,9 +162,55 @@ async fn main() -> anyhow::Result<()> {
             // and the gate refused the rewrite. The nightly wrapper journals
             // this JSON, so a spike is visible with no extra plumbing.
             "verdict_writes_suppressed": report.verdict_writes_suppressed,
+            // Pairs the verifier had no answer for and the pipeline skipped
+            // without touching stored state. NOT an outage alarm: the
+            // reranker's pre-LLM query drops pairs that already carry an edge
+            // while the pipeline does not, so a re-run over an already-linked
+            // corpus lands a large routine baseline here. A total verifier
+            // outage is a hard error instead (see matching_client's
+            // `is_total_verifier_outage`): `run_pipeline` propagates it, so the
+            // run exits nonzero and never reaches the `last_match_scan_at`
+            // stamp above.
+            "skipped_no_verdict": report.skipped_no_verdict,
             "apply":         auto_promote,
             "count_only":    args.count_only,
         })
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Link 1 of 2 for "`--count-only` writes no `match_candidates` row":
+    /// the stub answers **nothing** for every pair it is handed.
+    ///
+    /// Link 2 is `epigraph-engine`'s
+    /// `pipeline_end_to_end::verifier_no_answer_writes_nothing_and_is_counted_separately`,
+    /// which asserts on persisted state that a `None` slot produces zero
+    /// `match_candidates` rows and zero edges, and lands in `skipped_no_verdict`
+    /// rather than `rejected`. Composed, the two pin the whole path without a
+    /// live-DB run of the binary.
+    ///
+    /// The regression this guards: returning
+    /// `Verdict { relationship: "derives_from", strength: 0.0 }` here mapped to
+    /// `MatchVerdict::Distinct` → `Reject` → `patch_verdict("distinct")`, so an
+    /// analysis run that asked no model anything wrote 12,006 `rejected` rows.
+    #[tokio::test]
+    async fn count_only_verifier_answers_nothing_for_every_pair() {
+        let pairs: Vec<(Uuid, Uuid)> = (0..3).map(|_| (Uuid::new_v4(), Uuid::new_v4())).collect();
+        let out = CountOnlyVerifier.verify(&pairs).await.expect("verify");
+
+        assert_eq!(
+            out.len(),
+            pairs.len(),
+            "one slot per input pair — the pipeline bails if alignment breaks"
+        );
+        assert!(
+            out.iter().all(|slot| slot.is_none()),
+            "a run that asks no model anything has no verdict to report; \
+             any Some(..) here is a fabricated finding, got {out:?}"
+        );
+    }
 }

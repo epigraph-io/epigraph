@@ -36,6 +36,22 @@ pub struct RunReport {
     /// already ruled on the pair. Nonzero means the verifier is re-scoring
     /// decided candidates — see [`Policy::verdict_writes_suppressed`].
     pub verdict_writes_suppressed: usize,
+    /// Pairs the verifier had **no answer** for (`verify` returned `None`).
+    /// These are skipped outright — no candidate row, no verdict, no edge — so
+    /// they are neither promoted, staged, nor rejected, and the other counters
+    /// alone cannot account for them.
+    ///
+    /// **This is not an outage alarm.** A large, routine baseline is expected:
+    /// the production verifier's pre-LLM candidate query filters out every pair
+    /// already connected by an edge in either direction, while this pipeline
+    /// applies no such filter, so on any re-run over an edge-dense corpus the
+    /// structural `decomposes_to` / `section_follows` pairs land here as a
+    /// matter of course. A rise here means "fewer pairs got a fresh answer",
+    /// which is consistent with both a verifier problem and an already-linked
+    /// corpus; this counter cannot tell them apart. Total verifier silence is
+    /// alarmed at the seam that *can* tell them apart — see
+    /// `epigraph_cli::matching_client::is_total_verifier_outage`.
+    pub skipped_no_verdict: usize,
 }
 
 pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<RunReport> {
@@ -60,6 +76,7 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
     let mut promoted = 0usize;
     let mut mid_band = 0usize;
     let mut rejected = 0usize;
+    let mut skipped_no_verdict = 0usize;
     let repo = MatchCandidateRepo::new(pool.clone());
     let policy = Policy::new(pool.clone(), repo, run_id, inputs.auto_promote);
 
@@ -96,13 +113,26 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         let verdicts = inputs.verifier.verify(&mid_pairs).await?;
         if verdicts.len() != mid_pairs.len() {
             anyhow::bail!(
-                "verifier returned {} verdicts for {} pairs — alignment violated",
+                "verifier returned {} verdict slots for {} pairs — alignment violated",
                 verdicts.len(),
                 mid_pairs.len()
             );
         }
-        for ((pair, verdict), features) in mid_pairs.into_iter().zip(verdicts).zip(mid_features) {
+        for ((pair, slot), features) in mid_pairs.into_iter().zip(verdicts).zip(mid_features) {
+            // `mid_band` counts pairs ROUTED to the verifier, including the
+            // ones it had no answer for — it is the band-distribution
+            // telemetry and must not move because verification failed.
             mid_band += 1;
+            // No answer is not a verdict. Skip the pair completely: no upsert,
+            // no `patch_verdict`, no edge. Whatever a previous run stored stays
+            // stored. Writing anything here is the defect — the placeholder
+            // that used to arrive in this slot mapped to `Distinct` and
+            // overwrote real verdicts with `distinct`, which #382 then makes
+            // permanently un-promotable.
+            let Some(verdict) = slot else {
+                skipped_no_verdict += 1;
+                continue;
+            };
             let mv = map_relationship(&verdict.relationship, verdict.strength);
             let (a, b) = pair;
             match mv {
@@ -152,5 +182,6 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         mid_band,
         rejected,
         verdict_writes_suppressed: policy.verdict_writes_suppressed(),
+        skipped_no_verdict,
     })
 }
