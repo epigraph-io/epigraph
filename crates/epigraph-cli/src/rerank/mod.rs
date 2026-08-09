@@ -12,7 +12,9 @@ pub mod core;
 pub mod errors;
 mod prompt;
 
+pub use candidates::DiscardReason;
 pub use core::{
-    rerank_candidates_table, rerank_global_join, PerPairVerdict, RerankConfig, RerankSummary,
+    rerank_candidates_table, rerank_global_join, PerPairDiscard, PerPairVerdict, RerankConfig,
+    RerankSummary,
 };
 pub use errors::RerankError;
