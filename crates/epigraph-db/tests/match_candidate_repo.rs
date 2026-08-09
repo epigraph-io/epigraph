@@ -63,13 +63,33 @@ async fn upsert_inserts_then_updates(pool: PgPool) {
     let repo = MatchCandidateRepo::new(pool.clone());
 
     let id1 = repo
-        .upsert(lo, hi, 0.7, serde_json::json!({}), "pending", None)
+        .upsert(
+            lo,
+            hi,
+            0.7,
+            serde_json::json!({}),
+            "pending",
+            None,
+            None,
+            None,
+        )
         .await
-        .expect("first upsert");
+        .expect("first upsert")
+        .id;
     let id2 = repo
-        .upsert(lo, hi, 0.9, serde_json::json!({"x": 1}), "pending", None)
+        .upsert(
+            lo,
+            hi,
+            0.9,
+            serde_json::json!({"x": 1}),
+            "pending",
+            None,
+            None,
+            None,
+        )
         .await
-        .expect("second upsert");
+        .expect("second upsert")
+        .id;
     assert_eq!(id1, id2, "upsert must reuse the row");
 
     let row = repo.get(id1).await.expect("get");
@@ -86,9 +106,19 @@ async fn set_status_promotes_and_records_decided_fields(pool: PgPool) {
     let repo = MatchCandidateRepo::new(pool.clone());
 
     let id = repo
-        .upsert(lo, hi, 0.9, serde_json::json!({}), "pending", None)
+        .upsert(
+            lo,
+            hi,
+            0.9,
+            serde_json::json!({}),
+            "pending",
+            None,
+            None,
+            None,
+        )
         .await
-        .expect("upsert");
+        .expect("upsert")
+        .id;
     repo.set_status(id, "promoted", Some(agent))
         .await
         .expect("set_status");
@@ -107,9 +137,16 @@ async fn set_status_promotes_and_records_decided_fields(pool: PgPool) {
 /// human rulings — observed on prod as 7 rows with `decided_at IS NOT NULL`
 /// but `status = 'pending'`, clobbered 2, 9 and 17 days after the decision.
 ///
-/// The contract has two halves and both are asserted: the *decision*
-/// (status / decided_at / decided_by) freezes, while matcher *telemetry*
-/// (score / features / matcher_run_id) still refreshes.
+/// The contract has three parts and all are asserted: the *decision*
+/// (status / decided_at / decided_by) freezes, the *verdict* the decision was
+/// based on (verifier_verdict / verifier_rationale) freezes with it, while
+/// matcher *telemetry* (score / features / matcher_run_id) still refreshes.
+///
+/// The verdict half was originally unguarded — it was written by a separate
+/// `UPDATE` in the engine's policy layer, outside this statement — so a
+/// re-scan preserved the ruling but destroyed the verdict behind it. That is
+/// how 6 prod `CORROBORATES` edges whose candidate row said `contradicts`
+/// escaped a polarity audit keyed on the column.
 #[sqlx::test(migrations = "../../migrations")]
 async fn upsert_does_not_revert_a_decided_candidate(pool: PgPool) {
     let agent = insert_agent(&pool).await;
@@ -128,9 +165,12 @@ async fn upsert_does_not_revert_a_decided_candidate(pool: PgPool) {
             serde_json::json!({"n": 1}),
             "pending",
             Some(run1),
+            Some("contradicts"),
+            Some("night 1: the claims negate each other"),
         )
         .await
-        .expect("first upsert");
+        .expect("first upsert")
+        .id;
 
     // Operator rules on it via the Telegram / MCP review queue.
     repo.set_status(id, "promoted", Some(agent))
@@ -143,7 +183,7 @@ async fn upsert_does_not_revert_a_decided_candidate(pool: PgPool) {
 
     // Night 2: the same pair is re-scanned and upserted as "pending" again.
     let run2 = Uuid::new_v4();
-    let id2 = repo
+    let outcome = repo
         .upsert(
             lo,
             hi,
@@ -151,10 +191,17 @@ async fn upsert_does_not_revert_a_decided_candidate(pool: PgPool) {
             serde_json::json!({"n": 2}),
             "pending",
             Some(run2),
+            Some("distinct"),
+            Some("night 2: verifier returned no verdict for this pair"),
         )
         .await
         .expect("re-scan upsert");
-    assert_eq!(id2, id, "upsert must reuse the row");
+    assert_eq!(outcome.id, id, "upsert must reuse the row");
+    assert!(
+        outcome.verdict_write_suppressed(Some("distinct")),
+        "the caller must be able to observe that its verdict write was refused — \
+         gating the rationale removes the only trace such an overwrite used to leave"
+    );
 
     let row = repo.get(id).await.expect("get after re-scan");
 
@@ -172,6 +219,19 @@ async fn upsert_does_not_revert_a_decided_candidate(pool: PgPool) {
         row.decided_by,
         Some(agent),
         "decided_by must survive a re-scan unchanged"
+    );
+
+    // Half 1b — the verdict the decision was based on freezes with it.
+    assert_eq!(
+        row.verifier_verdict.as_deref(),
+        Some("contradicts"),
+        "the verdict a human ruled on must survive a re-scan — \
+         `promotion_disposition_for_column` reads this column to pick edge polarity"
+    );
+    assert_eq!(
+        row.verifier_rationale.as_deref(),
+        Some("night 1: the claims negate each other"),
+        "verdict and rationale must freeze together"
     );
 
     // Half 2 — matcher telemetry still refreshes.
@@ -206,23 +266,162 @@ async fn upsert_still_overwrites_an_undecided_row(pool: PgPool) {
 
     // Matcher rejected it on its own — no operator involved, decided_at NULL.
     let id = repo
-        .upsert(lo, hi, 0.30, serde_json::json!({}), "rejected", None)
+        .upsert(
+            lo,
+            hi,
+            0.30,
+            serde_json::json!({}),
+            "rejected",
+            None,
+            None,
+            None,
+        )
         .await
-        .expect("first upsert");
+        .expect("first upsert")
+        .id;
     assert!(
         repo.get(id).await.expect("get").decided_at.is_none(),
         "a matcher-set status must not stamp decided_at"
     );
 
     // Re-scoring the pair upward must be able to move it back into review.
-    repo.upsert(lo, hi, 0.95, serde_json::json!({}), "pending", None)
-        .await
-        .expect("re-scan upsert");
+    repo.upsert(
+        lo,
+        hi,
+        0.95,
+        serde_json::json!({}),
+        "pending",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("re-scan upsert");
 
     let row = repo.get(id).await.expect("get after re-scan");
     assert_eq!(
         row.status, "pending",
         "an undecided row must remain freely overwritable by the matcher"
+    );
+}
+
+/// A `None` verdict means "this pair was not verified on this pass", not
+/// "erase the verdict on file".
+///
+/// `Policy::act` takes `Option<Verdict>` and the pre-fix code preserved an
+/// existing verdict only by skipping its `UPDATE` entirely. Folding the columns
+/// into one always-executing statement would bind NULL and blank the row, so
+/// the `COALESCE` in the ELSE branch is load-bearing, not defensive style.
+#[sqlx::test(migrations = "../../migrations")]
+async fn upsert_with_no_verdict_preserves_the_stored_one(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let repo = MatchCandidateRepo::new(pool.clone());
+
+    let id = repo
+        .upsert(
+            lo,
+            hi,
+            0.70,
+            serde_json::json!({}),
+            "pending",
+            None,
+            Some("same"),
+            Some("identical finding"),
+        )
+        .await
+        .expect("verdict upsert")
+        .id;
+
+    // Re-touch with no verdict — the pair never reached the verifier.
+    let outcome = repo
+        .upsert(
+            lo,
+            hi,
+            0.72,
+            serde_json::json!({}),
+            "pending",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("no-verdict upsert");
+
+    let row = repo.get(id).await.expect("get");
+    assert_eq!(
+        row.verifier_verdict.as_deref(),
+        Some("same"),
+        "an unverified re-touch must not erase a stored verdict"
+    );
+    assert_eq!(
+        row.verifier_rationale.as_deref(),
+        Some("identical finding"),
+        "an unverified re-touch must not erase a stored rationale"
+    );
+    assert!(
+        !outcome.verdict_write_suppressed(None),
+        "not attempting a verdict is not a suppression — counting it would \
+         make the telemetry fire on every unverified pair"
+    );
+}
+
+/// The verdict gate keys on `decided_at`, so an *undecided* row stays freely
+/// re-verdictable — `PolicyAction::Reject` writes `status='rejected'` with
+/// `decided_at` NULL, and re-scoring such a pair must be able to correct both
+/// its status and its verdict.
+#[sqlx::test(migrations = "../../migrations")]
+async fn upsert_still_overwrites_the_verdict_of_an_undecided_row(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let repo = MatchCandidateRepo::new(pool.clone());
+
+    let id = repo
+        .upsert(
+            lo,
+            hi,
+            0.30,
+            serde_json::json!({}),
+            "rejected",
+            None,
+            Some("distinct"),
+            Some("unrelated"),
+        )
+        .await
+        .expect("first upsert")
+        .id;
+
+    let outcome = repo
+        .upsert(
+            lo,
+            hi,
+            0.95,
+            serde_json::json!({}),
+            "pending",
+            None,
+            Some("same"),
+            Some("re-scored: identical finding"),
+        )
+        .await
+        .expect("re-scan upsert");
+
+    let row = repo.get(id).await.expect("get");
+    assert_eq!(
+        row.verifier_verdict.as_deref(),
+        Some("same"),
+        "an undecided row must remain freely re-verdictable"
+    );
+    assert_eq!(
+        row.verifier_rationale.as_deref(),
+        Some("re-scored: identical finding")
+    );
+    assert!(
+        !outcome.verdict_write_suppressed(Some("same")),
+        "no suppression should be reported when the write actually landed"
     );
 }
 
@@ -248,9 +447,18 @@ async fn list_pending_orders_by_score_desc(pool: PgPool) {
                 (b, a)
             }
         };
-        repo.upsert(lo, hi, scores[i], serde_json::json!({}), "pending", None)
-            .await
-            .expect("upsert");
+        repo.upsert(
+            lo,
+            hi,
+            scores[i],
+            serde_json::json!({}),
+            "pending",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("upsert");
     }
     let rows = repo.list_pending(10).await.expect("list");
     let our: Vec<f32> = rows
