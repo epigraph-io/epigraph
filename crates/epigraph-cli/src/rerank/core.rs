@@ -205,8 +205,22 @@ pub(crate) fn interpret_batch_response(
             // Batch-scoped: keep the first one seen. Reporting several
             // batch-level faults per pair would not tell a reader anything the
             // first one doesn't, and would make the strings ungroupable.
+            //
+            // The classification is total on purpose: anything that lands here
+            // is about to be smeared over every unexplained pair in the batch,
+            // so a reason worded as a claim about one identified pair would
+            // become false for all the others. `parse_validation_response`
+            // already bounds-checks the index it recovers, which should make
+            // this branch unreachable for a pair-scoped reason — the downgrade
+            // makes the invariant structural rather than a promise about the
+            // caller's care, so a future reason cannot reopen it.
             _ => {
-                batch_wide.get_or_insert(discard.reason);
+                let reason = if discard.reason.is_pair_scoped() {
+                    DiscardReason::UnattributableEntry
+                } else {
+                    discard.reason
+                };
+                batch_wide.get_or_insert(reason);
             }
         }
     }
@@ -817,6 +831,41 @@ mod tests {
                 r.as_str().contains("batch"),
                 "batch-scoped reason {r:?} must say so: {:?}",
                 r.as_str()
+            );
+        }
+    }
+
+    /// The invariant behind every emitted string, asserted as a property rather
+    /// than pinned by one fixture: nothing that ends up smeared across a whole
+    /// batch may be worded as a claim about one identified pair.
+    ///
+    /// The entry below is malformed (`valid` is a plain `bool`, so `"yes"`
+    /// fails deserialization) *and* names an index outside the batch. Before
+    /// the bounds check in `parse_validation_response`, the index was recovered
+    /// and the discard came back pair-scoped as `EntrySchemaMismatch`; the
+    /// `i < batch.len()` guard in `interpret_batch_response` then rejected it,
+    /// dropping a pair-scoped reason into the batch-wide slot, from where
+    /// "this pair's entry did not match the verdict schema" was reported
+    /// against pairs that never had an entry at all.
+    #[test]
+    fn a_batch_wide_reason_is_never_worded_as_a_claim_about_one_pair() {
+        let batch = vec![candidate(), candidate()];
+        let json = serde_json::json!([{"pair_index": 7, "valid": "yes"}]);
+
+        let interpretation = interpret_batch_response(&batch, &json);
+
+        assert_eq!(
+            interpretation.discards.len(),
+            2,
+            "both silent pairs must be explained, or this test proves nothing"
+        );
+        for d in &interpretation.discards {
+            assert!(
+                !d.reason.is_pair_scoped(),
+                "{:?} smeared batch-wide but is worded as a claim about one \
+                 pair: {:?}",
+                d.reason,
+                d.reason.as_str()
             );
         }
     }

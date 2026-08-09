@@ -125,10 +125,19 @@ pub(crate) fn parse_validation_response(
                 // still there and the discard stays attributable. Without it we
                 // only know the batch was damaged, not which pair — say exactly
                 // that rather than blaming an arbitrary pair.
+                //
+                // The `filter` is the bounds check the well-formed path already
+                // gets below, and it has to be here too: an out-of-range index
+                // names no real pair, so recovering it would let the pair-scoped
+                // `EntrySchemaMismatch` ("this pair's entry did not match the
+                // verdict schema") be recorded against a pair that never had an
+                // entry. Out of range ⇒ `None` ⇒ the truthful, batch-scoped
+                // `UnattributableEntry`.
                 let pair_index = item
                     .get("pair_index")
                     .and_then(|v| v.as_u64())
-                    .map(|v| v as usize);
+                    .map(|v| v as usize)
+                    .filter(|i| *i < batch_size);
                 eprintln!("  WARNING: Failed to parse validation item: {e}");
                 discards.push(DiscardedEntry {
                     pair_index,
@@ -494,6 +503,31 @@ mod tests {
         );
         assert_eq!(parsed.results.len(), 1);
         assert!(parsed.discards.is_empty());
+    }
+
+    /// An entry that is BOTH malformed and out of range must not keep its
+    /// index. `EntrySchemaMismatch` is pair-scoped — its text says "this
+    /// pair's entry" — so recovering an index that names no pair in the batch
+    /// would hand a pair-scoped reason to `interpret_batch_response` with
+    /// nowhere truthful to put it, and it would smear over every silent pair
+    /// as a claim about an entry that never existed.
+    #[test]
+    fn a_malformed_entry_naming_an_out_of_range_index_is_unattributable() {
+        let d = parse_validation_response(
+            // `valid` is a plain bool, so "yes" fails deserialization; index 7
+            // is outside a batch of 2.
+            &serde_json::json!([{"pair_index": 7, "valid": "yes"}]),
+            2,
+        )
+        .discards;
+
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].pair_index, None, "an out-of-range index is no index");
+        assert_eq!(d[0].reason, DiscardReason::UnattributableEntry);
+        assert!(
+            !d[0].reason.is_pair_scoped(),
+            "a reason that cannot name its pair must not be pair-scoped"
+        );
     }
 
     #[test]

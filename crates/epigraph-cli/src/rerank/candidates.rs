@@ -105,6 +105,18 @@ impl DiscardReason {
     ///
     /// Batch-scoped variants say "this batch"; they must never read as a claim
     /// about the individual pair they are counted against.
+    ///
+    /// # Interlock before persisting any of this
+    ///
+    /// If a future caller does wire these into a persisted column, two
+    /// structural guarantees have to still hold, because the wording assumes
+    /// them: `rerank::prompt::parse_validation_response` must keep discarding a
+    /// recovered `pair_index` that is out of range (otherwise
+    /// [`Self::EntrySchemaMismatch`] can be attached to a pair whose entry
+    /// never existed), and `rerank::core::interpret_batch_response` must keep
+    /// downgrading any pair-scoped reason it cannot attribute to
+    /// [`Self::UnattributableEntry`]. Without both, a pair-scoped string smears
+    /// batch-wide and becomes false for every pair that had no entry at all.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BatchCallFailed => "the LLM call for this batch failed",
