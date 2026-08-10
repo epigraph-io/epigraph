@@ -46,6 +46,28 @@ pub fn compound_claim_id(content_hash: &[u8; 32], artifact_seed: &str) -> Uuid {
     Uuid::new_v5(&COMPOUND_NAMESPACE, &material)
 }
 
+/// Storage content hash for a compound (document-scoped) claim.
+///
+/// A compound node's identity is `(artifact seed, text)`, not text alone —
+/// that is exactly what [`compound_claim_id`] encodes. `claims.content_hash`
+/// must agree with that identity, because migration 013 puts
+/// `UNIQUE (content_hash, agent_id)` on `claims` and every structural node of
+/// every document is written by the same server agent. Hashing text alone
+/// would make paper A's "Introduction" and paper B's "Introduction"
+/// indistinguishable to that constraint, so the second insert would fail even
+/// though the two rows carry different (correct) ids.
+///
+/// Derived over the same material as [`compound_claim_id`], so the row's
+/// uniqueness key and its primary key are functions of the same inputs.
+/// Atoms keep the plain [`content_hash`] — global convergence is their point.
+#[must_use]
+pub fn compound_content_hash(content_hash: &[u8; 32], artifact_seed: &str) -> [u8; 32] {
+    let mut material = Vec::with_capacity(32 + artifact_seed.len());
+    material.extend_from_slice(content_hash);
+    material.extend_from_slice(artifact_seed.as_bytes());
+    *blake3::hash(&material).as_bytes()
+}
+
 /// Generate a deterministic UUID for an atomic claim (level 3) from its
 /// content hash. Globally unique to the text — converges across artifacts.
 #[must_use]
