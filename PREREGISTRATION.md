@@ -765,3 +765,310 @@ Do these and the gates fall out:
   radius: widening it means `cargo sqlx prepare` **against a throwaway DB** and a
   committed `.sqlx/` delta.
 - Never touch the `epigraph` database on `epigraph-postgres`.
+
+---
+
+## Adjudication
+
+**Written AFTER implementation and after three independent adversarial reviews.**
+Recorded per gate: PASS or REFUTE, with the evidence that decided it. Gates that
+did not pass are recorded as REFUTE and not renegotiated.
+
+| | |
+|---|---|
+| Adjudicated | 2026-08-17 |
+| Branch HEAD at adjudication | `feat/recall-temporal-since` |
+| Base | `origin/main` @ `7cd5eeef` |
+| Test DB | `postgres://epigraph:epigraph@localhost/epigraph_db_repo_test` (throwaway; the prod `epigraph` DB on `epigraph-postgres` was never contacted) |
+| Toolchain | `cargo 1.96.0` / `clippy 0.1.96` (no `rust-toolchain.toml` in the repo) |
+
+### Summary
+
+| Gate | Verdict |
+|---|---|
+| G1 — `since` optional, default behaviour unchanged | **PASS** |
+| G2 — engine entry point keeps its five-argument call | **PASS** |
+| G3 — `created_at` is creation time, never fabricated | **PASS** (test strengthened during adjudication) |
+| G4 — a test that is red on `origin/main` | **PASS** |
+| G5 — window pushed down before the candidate `LIMIT` | **PASS** |
+| G6 — no leak on any of the seven surfaces | **PASS**, with one documented completeness limitation |
+| G7 — context enrichment exempt, exemption written down | **PASS** |
+| G8.1 — scope held | **PASS** |
+| G8.2 — `since` in the audit `params` of BOTH tools | **PASS** (was **REFUTE** at review time; fixed) |
+| G8.3 — full CI gate + sqlx offline | **REFUTE** — see below. `fmt`, `cargo check --workspace` and the test suites are green; workspace-wide `clippy --all-targets -- -D warnings` fails on **pre-existing** lints in files this branch does not touch, reproduced on an `origin/main` worktree. The criterion as written ("or `clippy -D warnings` reports anything") is therefore not met. |
+
+---
+
+### G1 — `since` is optional and default behaviour is unchanged — **PASS**
+
+- (a) `types.rs::RecallParams::since` and `tools/recall.rs::RecallWithContextParams::since`
+  are both `Option<chrono::DateTime<chrono::Utc>>` carrying `#[serde(default)]`.
+- (b) `recall_temporal.rs::since_absent_is_baseline_behaviour` passes on the branch.
+  The pinned baseline is **verified against base, not asserted from memory**: when the
+  whole file was copied into an `origin/main` worktree, this test's
+  `assert_eq!(ids, vec![a, b, c], …)` did **not** fire — the run panicked later, at
+  `created_at_of` (the `created_at`-presence block), proving the id list AND order
+  assertion is satisfied by `origin/main` behaviour.
+- (c) `git diff origin/main -- crates/epigraph-mcp/tests/ | grep -E '^-\s+assert'` → empty.
+  No pre-existing recall assertion was removed or weakened.
+- Adjudication addition: the test now also asserts every unwindowed hit carries its real
+  `created_at`. Mutation proof this is live — `memory.rs`
+  `created_at: Some(claim.created_at)` → `params.since.map(|_| claim.created_at)` turns
+  `since_absent_is_baseline_behaviour` **FAILED**. Before the addition that mutant survived.
+
+### G2 — out-of-workspace callers keep their five-argument call — **PASS**
+
+```
+$ grep -n "pub async fn recall(" -A 8 crates/epigraph-engine/src/recall.rs
+78:pub async fn recall(pool, embedder, query, limit, min_truth) -> Result<Vec<RecallResult>, RecallError>
+$ git diff --stat origin/main -- crates/epigraph-engine/tests/recall_audit_test.rs   # empty
+$ cargo test -p epigraph-engine    # all targets green (see G8.3)
+```
+No sixth positional parameter. BCH-J05's CT-1 tripwire was not tripped.
+
+### G3 — `created_at` is the creation time, and is never fabricated — **PASS**
+
+- (a) `created_at_is_creation_not_update` part (a): after
+  `batch_update_truth_values` moves `updated_at` to `NOW()`, the recalled `created_at`
+  is still `epoch_old()`.
+- (b) **This half was repaired during adjudication.** As written, part (b) used
+  `since = Utc::now() + 1s`, which is past BOTH `created_at` and `updated_at`, so it
+  could not tell the two columns apart — mutating both hybrid CTE predicates to
+  `c.updated_at >= $8` left it **green**. It now uses the discriminating fixture
+  `created_at < since <= updated_at` (`created_at` = 2024-01-15, `updated_at` ≈ now,
+  `since` = `epoch_cut()` = 2025-06-01), with the ordering asserted as an explicit
+  precondition. Mutation proof:
+
+  ```
+  # both CTE predicates -> c.updated_at >= $8
+  test created_at_is_creation_not_update ... FAILED
+    "a claim whose updated_at is inside the window but whose created_at is not must be
+     excluded; filtering on updated_at returns [00000000-…-0301]"
+  ```
+- Boundary semantics are now pinned too. `since` is documented as "at or after this
+  instant"; a claim seeded at exactly `epoch_cut()` is asserted to be RETURNED.
+  Mutation proof: `created_at >= $8` → `created_at > $8` (both CTEs) turns
+  `since_excludes_older_claims_and_reports_created_at` **FAILED**. Before this fixture
+  that mutant survived all 11 tests.
+- (b′) Workflow-origin hits carry the genuine `workflows.created_at`
+  (`workflow.rs::search_by_goal_embedding_since` selects it). No `Utc::now()` /
+  `unwrap_or_default` was added on any `created_at` path — the only new occurrence of
+  the string `Utc::now()` in the diff is inside a comment explaining why it is wrong.
+
+### G4 — at least one criterion is decided by a test that FAILS on current code — **PASS**
+
+The complete `recall_temporal.rs` (including every assertion added during adjudication)
+was copied into a detached `origin/main` worktree and run:
+
+```
+$ cargo test -p epigraph-mcp --test recall_temporal        # in the origin/main worktree
+running 11 tests
+test result: FAILED. 0 passed; 11 failed; 0 ignored
+  since_excludes_older_claims_and_reports_created_at:
+    "the pre-window claim must be excluded; got [..0100, ..0101, ..0102]"
+  since_survives_candidate_pool_saturation:
+    "the only in-window claim was not returned … the window was applied AFTER the LIMIT"
+```
+
+It **compiled** and failed on assertions, not on compilation — which is what the
+criterion requires. On the branch: `11 passed; 0 failed`. The base worktree was removed
+with `git worktree remove`.
+
+*Constraint this imposed on the adjudication:* the branch-only symbol
+`graph_expand_seeds_since` must NOT be named in `recall_temporal.rs`, or the file stops
+compiling on base and G4's own check dies. The graph-expansion regression test was
+therefore placed in `crates/epigraph-db/tests/graph_expand_seeds_window.rs`.
+
+### G5 — `since` is pushed down into the candidate pool — **PASS**
+
+`claim.rs::search_hybrid_scoped_since` carries
+`AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)` inside **both** the
+`dense` and the `lex` CTE, above their `LIMIT $3`; `search_by_embedding_since` and
+`search_lexical_scoped_since` likewise. `since_survives_candidate_pool_saturation`
+passes on the branch and fails on base with exactly the empty-set inversion BCH-J01
+predicts. The review-prompt grep for a Rust-side post-filter
+(`retain(|…)` / `.filter(… created_at)`) over the returned vectors finds nothing.
+
+### G6 — no leak on any of the seven surfaces — **PASS**, with one documented limitation
+
+All six `no_leak_s*` tests pass, and each is a live discriminator: an earlier review
+neutered each surface's predicate in turn and each time exactly its own test went red
+(`workflow.rs` → `no_leak_s4_workflows`; `claim_theme.rs` → `no_leak_s6_diverse_themes`;
+`graph_expand_seeds` destination filter → `no_leak_s7_graph_expansion`).
+
+**Defect found and fixed during adjudication (S7).** `graph_expand_seeds` walked the
+graph, inserted **every** reachable claim into the discovery map, stopped at
+`MAX_EXPANSION_NODES` (200), and only then applied the window. Out-of-window claims
+therefore consumed the emission budget, so a windowed expansion could return `[]` while
+in-window reachable destinations existed — BCH-J01's "empty reads as nothing changed"
+inversion, reproduced on the graph surface. The doc comment asserted the opposite
+("nothing in-window was displaced … the way it would be under a `LIMIT`").
+
+Fix: two budgets. `MAX_EXPANSION_NODES` (200) now caps only what is **emitted**;
+`MAX_EXPANSION_VISITS` (1 000) caps what is **walked**, and applies only when a window
+is set. Membership is resolved per BFS level in one batched query, filtering `level_new`
+in its own order so truncation stays deterministic. Unwindowed the emission cap is the
+only bound that can bind, so behaviour is unchanged. The walk is still not pruned — an
+out-of-window claim remains a legitimate bridge.
+
+Regression test `crates/epigraph-db/tests/graph_expand_seeds_window.rs`:
+
+```
+$ cargo test -p epigraph-db --test graph_expand_seeds_window
+test an_out_of_window_claim_still_bridges_to_an_in_window_one ... ok
+test in_window_destination_survives_a_pre_window_fanout ... ok
+
+# with the two budgets collapsed back into one (the pre-fix shape):
+test in_window_destination_survives_a_pre_window_fanout ... FAILED
+  "the in-window destination … was starved by the expansion budget: 250 pre-window
+   neighbours consumed it and the call returned []"
+```
+
+The unwindowed control (`graph_expand_seeds(&pool, &[seed], 2).len() == 200`) is asserted
+in the same test, so the fix cannot silently change the pre-existing truncation.
+
+**Documented limitation (completeness, not a leak).**
+`diverse_retrieval::run_diverse_pipeline` selects its `max_themes` themes by centroid
+similarity **before** `since` is consulted (`find_similar_themes_at_dim` takes no
+window). A theme holding only pre-window claims still consumes a slot, so a windowed
+`diverse=true` page can be SHORT. No pre-window row can reach the caller — the window
+still binds on `claims_in_themes_at_dim_since` — so this is a shortfall, not the silent
+scope bypass G6 forbids. S6's pre-registered surface inventory named
+`claims_in_themes_at_dim` only; windowing theme selection needs a new `claim_themes`
+query outside that inventory and is deliberately deferred rather than half-done. It is
+now written down at both doc sites — `DiverseRetrievalConfig::since` and the
+caller-facing `RecallWithContextParams::since` schemars text, which previously
+overstated the guarantee for the pipeline as a whole.
+
+**Gating branch hardened.** The `Outcome::Gated` arm of `assert_window_honoured` is dead
+in every current run (the implementation filters rather than gates, which is the branch
+the pre-registration preferred). Its acceptance bar was `msg.contains("since")`, which an
+unrelated internal error could satisfy. It now also requires the incompatible option
+name and an `invalid_params` code. This is intent-hardening for a future implementation;
+**no runtime evidence supports it, because the branch is never taken.**
+
+### G7 — context enrichment is exempt, and the exemption is written down — **PASS**
+
+`context_is_exempt_from_since` passes. `fetch_batched_context` gained `created_at` in its
+`SELECT` and **no** `since` predicate — the only occurrence of "since" inside that
+function is the comment explaining the omission. The hits-vs-context boundary is stated
+explicitly on `RecallWithContextParams::since`.
+
+### G8.1 — scope held — **PASS**
+
+```
+$ git diff --stat origin/main -- crates/epigraph-mcp/src/scope_map.rs \
+    crates/epigraph-mcp/src/server.rs crates/epigraph-mcp/src/embed.rs \
+    crates/epigraph-mcp/src/tools/workflows.rs crates/epigraph-api/src/routes/search.rs
+(empty)
+```
+`ClaimRepository::search_by_embedding_scoped` (5 args) and `search_by_embedding_current`
+(3 args) are unchanged. No new MCP tool; claim `24caecaa` stays out.
+
+**BCH-J05 compatibility decision, recorded rather than left implicit.** Five symbols were
+given `_since` siblings with the original arity retained as a delegating wrapper. Two more
+were fixed during adjudication for consistency at the widest published boundary:
+`ClaimRepository::graph_expand_seeds` (3 args) and
+`WorkflowRepository::search_by_goal_embedding` (3 args) are now wrappers over
+`…_since`. Two remaining breaks are **struct fields**, for which no wrapper form exists;
+both are judged acceptable and the judgement is written into the code:
+
+- `WorkflowGoalEmbeddingHit.created_at` — a `sqlx::FromRow` result row, never constructed
+  by hand (`grep -rn "WorkflowGoalEmbeddingHit {"` finds only the definition).
+- `DiverseRetrievalConfig.since` — deliberately **not** given `#[derive(Default)]`: a
+  defaulted `centroid_dim: 0` is rejected at runtime by `centroid_columns_for_dim`, so
+  deriving `Default` would trade a compile error for a runtime `InvalidData`.
+
+### G8.2 — retrieval auditable for BOTH tools — **PASS** (was REFUTE at review time)
+
+At review time this was **REFUTE**: `recall_audit_wiring.rs::since_is_recorded_in_recall_audit_params`
+queries `WHERE tool = 'recall'`, so deleting **both** `"since": params.since` literals from
+`tools/recall.rs::recall_with_context_post_embed` left the entire suite green (verified by
+a reviewer, and re-verified here).
+
+Two sibling tests now cover the other half:
+`since_is_recorded_in_recall_with_context_audit_params` (main path, with a
+non-empty-page precondition) and
+`since_is_recorded_on_the_empty_recall_with_context_audit_row` (the empty-result early
+return, driven by a claim that only the window excludes, asserting `empty: true`
+alongside the window). Mutation proof:
+
+```
+# both `"since": params.since,` literals removed from tools/recall.rs
+test since_is_recorded_in_recall_with_context_audit_params ... FAILED
+test since_is_recorded_on_the_empty_recall_with_context_audit_row ... FAILED
+test result: FAILED. 3 passed; 2 failed
+```
+
+### G8.3 — full CI gate + sqlx — **REFUTE**
+
+Three of the four sub-conditions hold; the clippy one does not, for reasons entirely
+outside this branch. Recorded as REFUTE because the criterion's refute condition is
+literal ("or `clippy -D warnings` reports anything").
+
+```
+$ SQLX_OFFLINE=true cargo fmt --all -- --check
+(clean)
+
+$ SQLX_OFFLINE=true cargo check --workspace
+Finished `dev` profile … in 56.22s          # .sqlx/ is current; the fetch_batched_context
+                                            # delta was regenerated against the throwaway DB
+
+$ DATABASE_URL=$TESTDB SQLX_OFFLINE=true cargo test -p epigraph-db      # 41 targets, 0 failed
+$ DATABASE_URL=$TESTDB SQLX_OFFLINE=true cargo test -p epigraph-engine  # 40 targets, 0 failed
+$ DATABASE_URL=$TESTDB SQLX_OFFLINE=true cargo test -p epigraph-mcp     # 73 test targets
+                                                                        # + lib (134) + bins (11),
+                                                                        # run in three batches, 0 failed
+
+$ SQLX_OFFLINE=true cargo clippy --all-targets -- -D warnings
+error: could not compile `epigraph-tools` (example "table_graph") due to 5 previous errors
+```
+
+Every `-D warnings` diagnostic is in a file this branch does not touch:
+
+```
+crates/epigraph-tools/examples/table_graph/{discover,dossier,ingest,llm,types}.rs
+crates/epigraph-engine/tests/{blocker_compound_nbhd,perspectival_demo_t2}.rs
+crates/epigraph-db/tests/{match_candidate_repo,last_match_scan_column}.rs
+crates/epigraph-db/src/repos/claim.rs::max_agent_claims_constant_is_positive  (pre-existing test fn)
+```
+
+Reproduced on base, so it is not caused by this change:
+
+```
+$ git worktree add --detach /home/jeremy/pre-j-base origin/main
+$ cd /home/jeremy/pre-j-base && SQLX_OFFLINE=true cargo clippy -p epigraph-tools --all-targets -- -D warnings
+error: function `scan_crates` is never used
+… EXIT=101
+```
+
+**Environment note (recorded because it is a deviation from a plain `cargo test`).**
+The host filesystem was at 100% during adjudication. The test suites above were run
+with `CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0` so the ~40 MB test binaries
+fit; debug info does not affect test outcomes. `epigraph-mcp`'s 73 test targets were run
+in three batches to stay inside the shell timeout. One intermediate batch reported
+`recall_temporal: 8 passed; 3 failed` — that run coincided with the disk filling
+completely, and PostgreSQL's data directory is on the same volume; re-run with 7 GB free
+the same target reports `11 passed; 0 failed`, as does the whole recall family
+(`graph_expand_seeds_window` 2, `perspective_lens_reads` 10, `recall_audit_wiring` 5,
+`recall_dispute_awareness` 3, `recall_graph_expansion` 3, `recall_hybrid` 1,
+`recall_temporal` 11, `recall_with_context` 16, `recall_workflows` 2 — 53 tests, 0 failed).
+The transient failure is recorded rather than omitted, with the evidence that it was the
+environment and not the change.
+
+`epigraph-tools` depends only on `epigraph-core`, which this branch does not modify, so
+the failure is also structurally independent of it. The branch's own blast radius is
+clippy-clean, but the gate as pre-registered is workspace-wide and it does not pass.
+**Recorded as REFUTE, not renegotiated.** Remediation belongs in a separate change that
+fixes the pre-existing lints (or pins the toolchain CI uses).
+
+### BCH challenge outcomes
+
+| Challenge | Outcome |
+|---|---|
+| BCH-J01 (post-filter empties a saturated pool) | Avoided on the ANN legs from the start; **hit on the graph surface** (S7) and fixed during adjudication, with a red-then-green regression test. |
+| BCH-J02 (`updated_at` is not a creation time) | Implementation correct throughout; the *test* did not discriminate the two columns and now does. |
+| BCH-J03 (graph expansion smuggles pre-window claims) | Destination filter present from the start; the budget-starvation variant was the residual and is fixed. |
+| BCH-J04 (fabricated `created_at` for workflow hits) | Avoided — real `workflows.created_at`, `Option` + `skip_serializing_if`. |
+| BCH-J05 (sixth positional parameter) | Avoided on the engine entry point; two further arity breaks closed during adjudication, two struct-field breaks recorded as explicit decisions. |
+| BCH-J06 (a default window) | Avoided — no default window, no recency re-rank. |
