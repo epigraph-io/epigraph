@@ -478,6 +478,31 @@ impl ClaimRepository {
         ))
     }
 
+    /// The authoring agent of a claim, or `None` when no such claim exists.
+    ///
+    /// Narrow read for callers that need attribution without paying for a full
+    /// [`Claim`] hydration — notably
+    /// `epigraph_engine::retraction_cascade::invalidate_and_rewire`, which
+    /// re-derives an edge-factor BBA and must attribute it the way the
+    /// edge-write path does ("A's author asserts A SUPPORTS B"), i.e. to the
+    /// **source** claim's author rather than to whoever triggered the
+    /// retraction.
+    ///
+    /// Exists as a repo function rather than an inline query at the call site
+    /// because `CLAUDE.md` keeps all SQL in `crates/epigraph-db/src/repos/`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_agent_id(pool: &PgPool, id: Uuid) -> Result<Option<Uuid>, DbError> {
+        let agent_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        Ok(agent_id)
+    }
+
     /// Get a claim by ID
     ///
     /// # Errors

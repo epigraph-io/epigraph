@@ -406,24 +406,43 @@ impl MassFunctionRepository {
     /// a vacuous 0.5 could not be distinguished from a genuine maximally
     /// uncertain combine result.
     ///
+    /// # Only clears a cache that exists
+    /// The `WHERE` clause requires at least one derived column to be non-NULL,
+    /// and the row count is returned so the caller can tell "cleared" from
+    /// "there was nothing to clear". Without the guard this is **not** a no-op
+    /// on a claim that never had a BBA: `claims.mass_on_empty` and
+    /// `claims.mass_on_missing` are `DEFAULT 0.0` (migration
+    /// `001_initial_schema.sql`) and `ClaimRepository::create` omits them, so
+    /// an unconditional clear flips a real `0.0` to NULL and bumps
+    /// `updated_at` on a claim the retraction never touched — visible through
+    /// `GET /api/v1/claims/{id}/belief` as `mass_on_conflict: 0.0 → null`.
+    /// `mark_duplicate` puts BOTH endpoints in
+    /// [`crate::DedupRepair::stale_claims`] unconditionally, so every dedup of
+    /// two BBA-free claims (the common case in a bulk
+    /// `sweep_semantic_duplicates` run) would hit exactly that.
+    ///
+    /// Returns the number of rows cleared: 0 or 1.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
-    pub async fn clear_claim_belief(pool: &PgPool, claim_id: Uuid) -> Result<(), DbError> {
-        sqlx::query(
+    pub async fn clear_claim_belief(pool: &PgPool, claim_id: Uuid) -> Result<u64, DbError> {
+        let result = sqlx::query(
             r#"
             UPDATE claims
             SET belief = NULL, plausibility = NULL, mass_on_empty = NULL,
                 pignistic_prob = NULL, mass_on_missing = NULL,
                 classification = NULL, updated_at = NOW()
             WHERE id = $1
+              AND (belief IS NOT NULL OR plausibility IS NOT NULL
+                   OR pignistic_prob IS NOT NULL OR classification IS NOT NULL)
             "#,
         )
         .bind(claim_id)
         .execute(pool)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected())
     }
 
     /// Update a claim's belief, plausibility, and pignistic probability columns
