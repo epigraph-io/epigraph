@@ -927,7 +927,7 @@ beside).
 |---|---|---|
 | C1 — backward compatibility + the observability resource | **PASS** | signatures and params byte-identical; every listed test file unmodified and green; `belief_cascade` added on all four responses |
 | C2 — ANCHOR: downstream cache stops reflecting the retracted supporter | **PASS** | `downstream_cache_drops_retracted_supporter` |
-| C3 — CONTROL: the cascade is surgical | **PASS** (with D9, and strengthened) | `cascade_does_not_touch_unrelated_bbas_or_claims`; dedup-path hole found in review and closed — `bba_free_dedup_leaves_the_survivors_derived_columns_alone` |
+| C3 — CONTROL: the cascade is surgical | **PASS (as-substituted, D9)** — and strengthened | `cascade_does_not_touch_unrelated_bbas_or_claims`; dedup-path hole found in review and closed — `bba_free_dedup_leaves_the_survivors_derived_columns_alone` |
 | C4 — enumeration survives the in-transaction edge migration | **PASS** | `supersede_reports_the_downstream_target_it_repaired`; `target_is_current` → 0 hits |
 | C5 — MemTX I2: no orphaned **or** stranded derived record | **PASS** | `diamond_and_migration_leave_no_orphaned_or_stranded_bba`, plus two new phase-2 fixtures |
 | C6 — empty surviving BBA set has decided semantics | **PASS** | `sole_supporter_retraction_does_not_leave_frozen_belief` + `…_is_reported_as_unbacked_not_as_nothing_to_do` |
@@ -970,7 +970,7 @@ green. No `recompute_beliefs` call anywhere in the test body. Both clauses asser
 BetP moved by more than `1e-9`, and it equals `preview_claim_belief_on_frame` on the post-cascade
 `mass_functions` set to within `1e-12`.
 
-### C3 — PASS, with D9, and a hole closed
+### C3 — PASS as-substituted (D9), with a hole closed
 
 `cascade_does_not_touch_unrelated_bbas_or_claims`: green — the surviving `C→B` BBA row's
 `(masses, source_strength, evidence_type, locality_tag, perspective_id)` are byte-identical, and
@@ -1052,6 +1052,11 @@ $ git diff origin/main -U0 -- crates/epigraph-db/src/repos/claim.rs | grep '^@@'
 $ SQLX_OFFLINE=true cargo fmt --all -- --check                       → 0
 $ SQLX_OFFLINE=true cargo check --workspace                          → 0
 $ SQLX_OFFLINE=true cargo clippy --all-targets -- -D warnings        → 101   ← REFUTE
+# C8's literal combined invocation, run first (see D15):
+$ DATABASE_URL=… cargo test -p epigraph-db -p epigraph-mcp           → 124  killed by the harness's
+                                                                       600s per-call ceiling at
+                                                                       642 passed / 0 failed / 11 ignored
+# ...so it was split per crate, each run to completion (642 → 660, same set):
 $ DATABASE_URL=… cargo test -p epigraph-db                           → 0   264 passed, 0 failed, 10 ignored
 $ DATABASE_URL=… cargo test -p epigraph-mcp                          → 0   396 passed, 0 failed,  1 ignored
 $ DATABASE_URL=… cargo test -p epigraph-engine                       → 0   547 passed, 0 failed, 12 ignored
@@ -1061,6 +1066,12 @@ $ DATABASE_URL=… cargo test -p epigraph-api --features db \
       --test dedup_admin_scope_test --test alternative_of_symmetric_dedup
                                                                      → 0    14 passed, 0 failed
 ```
+
+**Build-profile note.** The four `cargo test` runs above were invoked with
+`CARGO_PROFILE_DEV_DEBUG=0` prepended. That is a build-configuration workaround for a disk-full
+event on the shared `/home/jeremy/.cargo-target` (see D15), not part of the criterion; it changes
+only debuginfo emission, no test semantics. An auditor re-running the bare command in the
+criterion gets the same results from a larger build.
 
 **Attribution of the clippy failure.** All 16 error lines are in `crates/epigraph-tools`
 (`examples/table_graph/*`, reached through its test targets) — an untouched crate that no
@@ -1101,7 +1112,7 @@ $ cargo clippy -p epigraph-api --features db --test versioning_belief_cascade_te
 | K02 — `recompute_beliefs` reports success and changes nothing | **PASS** | `downstream_cache_drops_retracted_supporter` (`> 1e-9` move); `resourced_outgoing_edge_bba_is_re_derived_from_canonical` (`masses` differ) |
 | K03 — dedup orphans one side, strands the other | **PASS** | `diamond_and_migration_leave_no_orphaned_or_stranded_bba`; both counts asserted separately |
 | K04 — sole supporter retracted, belief silently freezes | **PASS** | `sole_supporter_retraction_does_not_leave_frozen_belief` + the reported-outcome half |
-| K05 — cycle in the support graph | **PASS by construction + test** | no recursion in the module (D11); `cyclic_support_terminates` and `second_hop_downstream_of_the_retraction_is_not_touched` |
+| K05 — cycle in the support graph | **PASS by construction, tested by the chain fixture** | the bound is structural — no recursion in the module (D11). `second_hop_downstream_of_the_retraction_is_not_touched` is the test that can discriminate it; `cyclic_support_terminates` cannot, and guards the cycle case against a future recursive edit |
 | K06 — "fail loudly" turns a committed write into a reported failure | **PASS** | return type is `CascadeReport`, not `Result`; `cascade_errors_are_reported_not_propagated`, `cascade_failure_does_not_fail_the_write` |
 
 ### Review findings not adopted, and why
@@ -1115,3 +1126,21 @@ $ cargo clippy -p epigraph-api --features db --test versioning_belief_cascade_te
   governance artifact the adjudication was directed at, and relocating it in the same pass would
   break the audit trail from the review to the record. It is a docs/process call, outside the
   build-and-integration scope of this change.
+
+### D15 — C8's combined `cargo test` invocation was split per crate (harness time limit)
+
+C8 names `cargo test -p epigraph-db -p epigraph-mcp` as one command. Run as written at the branch
+tip it was **killed at 580s** by the 600s-per-call ceiling of the harness this adjudication was
+produced under — `EXIT=124`, 642 passed / 0 failed / 11 ignored with binaries still to run. That is
+a property of the runner, not of the code, so the invocation was split into
+`cargo test -p epigraph-db` (264 passed / 0 failed / 10 ignored, exit 0) and
+`cargo test -p epigraph-mcp` (396 passed / 0 failed / 1 ignored, exit 0). `264 + 396 = 660`, i.e.
+the same test set the combined run was 642 of the way through, each half run to completion.
+
+Both halves were additionally invoked with `CARGO_PROFILE_DEV_DEBUG=0`. Mid-adjudication the host
+filled to 100% (`/dev/sda1 150G, 176K available`) and `rustc` began failing with
+`No space left on device`; `cargo clean -p epigraph-mcp -p epigraph-api -p epigraph-engine
+-p epigraph-db` reclaimed 36.8 GiB, and the reduced debuginfo keeps the rebuild from immediately
+re-filling. The root cause is outside this repo: `/home/jeremy/.cargo/config.toml` declares
+`[env]` **twice**, so its `CARGO_PROFILE_DEV_DEBUG = "line-tables-only"` never takes effect and
+every test binary is built with `-C debuginfo=2`.
