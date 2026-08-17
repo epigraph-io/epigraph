@@ -450,3 +450,85 @@ async fn cascade_failure_does_not_fail_the_write(pool: PgPool) {
         "the replacement claim must still exist despite the cascade error"
     );
 }
+
+/// C7.1 / BCH-EG-K05, stated without a cycle: on the chain
+/// `A --supports--> B --supports--> C`, retracting `A` must repair `B` and
+/// stop. `C` is two hops out and must be left completely alone.
+///
+/// This is the assertion `cyclic_support_terminates` cannot make. Its bound is
+/// observed as "the walk did not come back", which a non-terminating
+/// implementation would demonstrate by hanging rather than by failing an
+/// assertion; and the 1-hop bound itself is structural (flat `for` loops over
+/// one query result — there is no recursion in `retraction_cascade` to bound).
+/// A straight chain turns the bound into something a future edit can actually
+/// break: add transitive propagation and this goes red immediately, because
+/// `B`'s BBA set changes and a second hop would invalidate `B --supports--> C`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn second_hop_downstream_of_the_retraction_is_not_touched(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+
+    let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let b = seed_claim(&pool, "one hop out: B", 0.5).await;
+    let c = seed_claim(&pool, "two hops out: C", 0.5).await;
+
+    wire_supports(&pool, &server, a, b).await;
+    // B now carries an interval of its own, so B --supports--> C wires.
+    wire_supports(&pool, &server, b, c).await;
+
+    let hop_two_edge: Uuid =
+        sqlx::query_scalar("SELECT id FROM edges WHERE source_id = $1 AND target_id = $2")
+            .bind(b)
+            .bind(c)
+            .fetch_one(&pool)
+            .await
+            .expect("read B->C edge id");
+    let hop_two_masses_before: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT masses FROM mass_functions WHERE perspective_id = $1")
+            .bind(hop_two_edge)
+            .fetch_optional(&pool)
+            .await
+            .expect("read B->C BBA");
+    assert!(
+        hop_two_masses_before.is_some(),
+        "fixture: the second hop must carry a BBA, else there is nothing to \
+         observe being left alone"
+    );
+    let c_before = read_scalars(&pool, c).await;
+    let c_updated_before: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM claims WHERE id = $1")
+            .bind(c)
+            .fetch_one(&pool)
+            .await
+            .expect("read C updated_at");
+
+    supersede(&server, a)
+        .await
+        .expect("supersede_claim succeeds");
+
+    let hop_two_masses_after: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT masses FROM mass_functions WHERE perspective_id = $1")
+            .bind(hop_two_edge)
+            .fetch_optional(&pool)
+            .await
+            .expect("read B->C BBA");
+    assert_eq!(
+        hop_two_masses_before, hop_two_masses_after,
+        "the B->C edge factor is two hops from the retraction; invalidating or \
+         re-deriving it means the walk did not stop at one hop"
+    );
+    assert_eq!(
+        c_before,
+        read_scalars(&pool, c).await,
+        "C's cached scalars must be bit-identical two hops out"
+    );
+    let c_updated_after: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM claims WHERE id = $1")
+            .bind(c)
+            .fetch_one(&pool)
+            .await
+            .expect("read C updated_at");
+    assert_eq!(
+        c_updated_before, c_updated_after,
+        "C must not even be written to"
+    );
+}

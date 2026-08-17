@@ -324,3 +324,134 @@ async fn next_offset_advances_for_resumable_paging(pool: PgPool) {
         "resume point for the next call"
     );
 }
+
+/// The BULK collapse path repairs belief too (backlog 20e9ed83).
+///
+/// `sweep_semantic_duplicates` was rewired from `ClaimRepository::mark_duplicate`
+/// to `retraction_cascade::mark_duplicate_with_cascade`, but every pre-existing
+/// fixture here seeds bare claims with no edges, so the duplicate never carried
+/// an edge-factor BBA and the cascade was always a no-op: the wiring could have
+/// been reverted with the whole suite green. A bulk path that skipped the
+/// repair would reintroduce the orphaned/stranded-BBA defect at scale, which is
+/// exactly where it hurts most.
+#[sqlx::test(migrations = "../../migrations")]
+async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(pool: PgPool) {
+    let a1 = seed_agent(&pool).await;
+    let a2 = seed_agent(&pool).await;
+    let a3 = seed_agent(&pool).await;
+    let strong = seed(&pool, a1, "same words", 0.9, &pgvec(0, 0.0), &[]).await;
+    let weak = seed(&pool, a2, "same words", 0.4, &pgvec(0, 0.001), &[]).await;
+
+    // A supporter with a real interval, far away in embedding space so it is
+    // never itself a sweep candidate.
+    let supporter = seed(
+        &pool,
+        a3,
+        "an independent supporting claim",
+        0.8,
+        &pgvec(50, 0.0),
+        &[],
+    )
+    .await;
+    sqlx::query("UPDATE claims SET belief = 0.7, plausibility = 0.85 WHERE id = $1")
+        .bind(supporter)
+        .execute(&pool)
+        .await
+        .expect("plant supporter interval");
+
+    let server = build_server(pool.clone());
+    let link = epigraph_mcp::tools::link_epistemic::do_link_epistemic(
+        &server,
+        epigraph_mcp::types::LinkEpistemicParams {
+            source_claim_id: supporter.to_string(),
+            target_claim_id: weak.to_string(),
+            relationship: "supports".to_string(),
+            properties: None,
+        },
+    )
+    .await
+    .expect("link_epistemic");
+    assert_eq!(
+        json_of(link)["belief_wired"],
+        serde_json::json!(true),
+        "fixture precondition: the duplicate must carry an edge-factor BBA"
+    );
+    let weak_betp_before: Option<f64> =
+        sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
+            .bind(weak)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(weak_betp_before.is_some(), "fixture: duplicate has a BetP");
+
+    let j = json_of(
+        sweep_semantic_duplicates(&server, params(false))
+            .await
+            .expect("sweep"),
+    );
+    assert_eq!(j["pairs_marked"], serde_json::json!(1));
+    assert!(
+        j["failures"].as_array().unwrap().is_empty(),
+        "no collapse and no cascade failure: {}",
+        j["failures"]
+    );
+
+    // MemTX I2 on the bulk path: no phantom and no invisible supporter.
+    let orphaned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions mf \
+         JOIN perspectives p ON p.id = mf.perspective_id AND p.perspective_type = 'edge' \
+         WHERE NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let stranded: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions mf \
+         JOIN perspectives p ON p.id = mf.perspective_id AND p.perspective_type = 'edge' \
+         JOIN edges e ON e.id = mf.perspective_id \
+         WHERE e.target_type = 'claim' AND e.target_id <> mf.claim_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        orphaned, 0,
+        "no orphaned edge-factor BBA after a bulk collapse"
+    );
+    assert_eq!(stranded, 0, "the migrated BBA moved onto the survivor");
+
+    // The survivor inherited the supporter, and its cache says so.
+    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(&pool)
+        .await
+        .expect("binary frame");
+    let coherent =
+        epigraph_engine::edge_factor::preview_claim_belief_on_frame(&pool, strong, frame_id)
+            .await
+            .expect("preview")
+            .expect("the survivor inherited the duplicate's supporter");
+    let cached: Option<f64> = sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
+        .bind(strong)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let cached = cached.expect("survivor must have a cached BetP");
+    assert!(
+        (cached - coherent.pignistic_prob).abs() < 1e-12,
+        "the survivor's cached BetP ({cached}) must equal the canonical combine \
+         of its post-collapse mass_functions set ({})",
+        coherent.pignistic_prob
+    );
+
+    // ...and the retired duplicate is no longer believed on evidence it lost.
+    let weak_betp_after: Option<f64> =
+        sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
+            .bind(weak)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        weak_betp_after, None,
+        "the duplicate's supporter moved to the survivor; keeping its old \
+         cached BetP is a derived record with nothing behind it"
+    );
+}
