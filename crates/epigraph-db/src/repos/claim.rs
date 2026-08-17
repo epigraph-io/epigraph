@@ -82,6 +82,31 @@ pub struct EvolveStepResult {
     pub edge_id: Uuid,
 }
 
+/// What [`ClaimRepository::mark_duplicate_with_repair`] repaired in-transaction,
+/// and what the caller still has to re-derive outside it.
+///
+/// The repo layer can fix *where* a derived record lives (delete BBAs whose
+/// edge is gone, move BBAs whose edge moved) with pure SQL. It cannot
+/// recompute belief: that needs the Dempster-Shafer combine pipeline, which
+/// lives in `epigraph-engine`. So this struct is the hand-off.
+#[derive(Debug, Clone, Default)]
+pub struct DedupRepair {
+    /// Claims whose cached DS scalars no longer match their surviving BBA set:
+    /// both dedup endpoints, plus every third claim that lost a BBA to the
+    /// collision pre-deletes.
+    pub stale_claims: Vec<Uuid>,
+    /// `(edge_id, target_id, relationship)` for claim→claim edges re-sourced
+    /// from `dup` onto `canonical`. Their BBAs encode `dup`'s interval, frozen
+    /// at wire time; the caller must invalidate and re-wire them from
+    /// `canonical`.
+    pub resourced_edges: Vec<(Uuid, Uuid, String)>,
+    /// BBAs deleted because their edge was deleted (orphan repair).
+    pub deleted_bbas: u64,
+    /// BBAs moved from `dup` to `canonical` because their edge was re-pointed
+    /// (stranding repair).
+    pub moved_bbas: u64,
+}
+
 /// Input for [`ClaimRepository::patch_claim_atomic_conn`].
 #[derive(Debug, Clone, Default)]
 pub struct PatchClaimInput {
@@ -2776,6 +2801,11 @@ impl ClaimRepository {
     /// Sets `supersedes = canonical, is_current = false` on `dup` only.
     /// Refuses if `dup.supersedes` is already set.
     ///
+    /// Thin wrapper over [`ClaimRepository::mark_duplicate_with_repair`],
+    /// discarding the repair report. Existing callers that do not need to run
+    /// a downstream belief cascade keep the exact pre-cascade signature and
+    /// behaviour.
+    ///
     /// # Implementation Notes
     /// The UPDATE that sets `is_current = false` on the duplicate also sets
     /// `embedding = NULL` in the **same statement**, satisfying the CHECK
@@ -2790,6 +2820,52 @@ impl ClaimRepository {
         dup: ClaimId,
         canonical: ClaimId,
     ) -> Result<(), DbError> {
+        Self::mark_duplicate_with_repair(pool, dup, canonical)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`ClaimRepository::mark_duplicate`] plus in-transaction repair of the
+    /// **derived-record layer**, returning what the caller must re-derive.
+    ///
+    /// # Why the edge migration alone corrupts belief
+    /// Edge-factor BBAs are stored on the edge's **target** claim keyed
+    /// `perspective_id = edge_id` (`auto_wire_ds_for_edge` →
+    /// `store_with_perspective(pool, target_id, ...)`). Before this function
+    /// existed, dedup touched only `edges` and `claims`, which left two
+    /// distinct classes of wreckage — both instances of the MemTX I2
+    /// violation "retracting a belief leaves an orphaned derived record":
+    ///
+    /// * **Orphaned.** The three collision pre-deletes below remove edges
+    ///   whose BBA rows survive: `mass_functions_perspective_id_fkey`
+    ///   references `perspectives(id)`, and `perspectives` rows minted by
+    ///   `ensure_edge_perspective` have no FK back to `edges`, so nothing
+    ///   cascades. The phantom supporter keeps being combined forever.
+    /// * **Stranded.** `UPDATE edges SET target_id = canonical` re-points an
+    ///   edge while its BBA stays on `dup`, so `canonical` **under-counts**
+    ///   that supporter permanently — and it can never self-heal, because
+    ///   `MassFunctionRepository::exists_for_perspective` is keyed on
+    ///   `perspective_id` alone and ignores `claim_id`, so
+    ///   `auto_wire_edge_if_epistemic` short-circuits on it forever.
+    ///
+    /// Both repairs run inside the same transaction as the edge mutation, so
+    /// there is no window in which the graph is observably inconsistent.
+    ///
+    /// The returned [`DedupRepair`] carries the claims whose cached scalars
+    /// are now stale and the edges whose BBAs must be re-derived from
+    /// `canonical`'s interval instead of `dup`'s. Recombining those existing
+    /// BBA rows would be a numeric no-op — their `masses` were frozen at wire
+    /// time — so the caller-side cascade
+    /// (`epigraph_engine::retraction_cascade`) invalidates and re-wires them.
+    ///
+    /// # Errors
+    /// Same as [`ClaimRepository::mark_duplicate`].
+    #[instrument(skip(pool))]
+    pub async fn mark_duplicate_with_repair(
+        pool: &PgPool,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<DedupRepair, DbError> {
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         if dup_uuid == canon_uuid {
@@ -2875,7 +2951,12 @@ impl ClaimRepository {
         // `edges e2` (innermost scope in PostgreSQL), making the predicate
         // tautological and causing false-positive deletions of edges that should
         // be migrated.
-        sqlx::query(
+        // `RETURNING id, target_id` (here and on the two pre-deletes below) is
+        // the only addition to these statements: the edge rows are about to be
+        // gone, and their `perspective_id = id` BBAs — which live on
+        // `target_id` — have to be deleted with them, so the ids must be
+        // captured before the DELETE commits.
+        let mut deleted_edges: Vec<(Uuid, Uuid)> = sqlx::query_as(
             "DELETE FROM edges AS e \
              WHERE e.target_id = $2 AND e.target_type = 'claim' \
                AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
@@ -2887,34 +2968,38 @@ impl ClaimRepository {
                      AND e2.target_id = $1 \
                      AND e2.target_type = 'claim' \
                      AND e2.relationship = e.relationship \
-               )",
+               ) \
+             RETURNING e.id, e.target_id",
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
 
         // Drop outgoing dup-edges whose migrated triple already exists on canonical.
         // Same aliasing discipline: `e.target_id`, `e.target_type`, `e.relationship`
         // must refer to the outer (being-deleted) row, not the subquery table.
-        sqlx::query(
-            "DELETE FROM edges AS e \
-             WHERE e.source_id = $2 AND e.source_type = 'claim' \
-               AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
-               AND e.target_type = 'claim' AND e.target_id != $1 \
-               AND EXISTS ( \
-                   SELECT 1 FROM edges e2 \
-                   WHERE e2.source_id = $1 \
-                     AND e2.source_type = 'claim' \
-                     AND e2.target_id = e.target_id \
-                     AND e2.target_type = e.target_type \
-                     AND e2.relationship = e.relationship \
-               )",
-        )
-        .bind(canon_uuid)
-        .bind(dup_uuid)
-        .execute(&mut *tx)
-        .await?;
+        deleted_edges.extend(
+            sqlx::query_as::<_, (Uuid, Uuid)>(
+                "DELETE FROM edges AS e \
+                 WHERE e.source_id = $2 AND e.source_type = 'claim' \
+                   AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
+                   AND e.target_type = 'claim' AND e.target_id != $1 \
+                   AND EXISTS ( \
+                       SELECT 1 FROM edges e2 \
+                       WHERE e2.source_id = $1 \
+                         AND e2.source_type = 'claim' \
+                         AND e2.target_id = e.target_id \
+                         AND e2.target_type = e.target_type \
+                         AND e2.relationship = e.relationship \
+                   ) \
+                 RETURNING e.id, e.target_id",
+            )
+            .bind(canon_uuid)
+            .bind(dup_uuid)
+            .fetch_all(&mut *tx)
+            .await?,
+        );
 
         // Symmetric-collision guard for `alternative_of` (migration 042).
         //
@@ -2934,50 +3019,153 @@ impl ClaimRepository {
         // `canonical` already shares a symmetric `alternative_of` edge with the
         // same third claim.  Edges where `canonical` is itself an endpoint are
         // left for the self-loop guards in the migration UPDATEs below.
-        sqlx::query(
-            "DELETE FROM edges AS e \
-             WHERE e.relationship = 'alternative_of' \
-               AND e.source_type = 'claim' AND e.target_type = 'claim' \
-               AND (e.source_id = $2 OR e.target_id = $2) \
-               AND e.source_id != $1 AND e.target_id != $1 \
-               AND EXISTS ( \
-                   SELECT 1 FROM edges e2 \
-                   WHERE e2.relationship = 'alternative_of' \
-                     AND e2.source_type = 'claim' AND e2.target_type = 'claim' \
-                     AND e2.id <> e.id \
-                     AND LEAST(e2.source_id, e2.target_id) = \
-                         LEAST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
-                     AND GREATEST(e2.source_id, e2.target_id) = \
-                         GREATEST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
-               )",
-        )
-        .bind(canon_uuid)
-        .bind(dup_uuid)
-        .execute(&mut *tx)
-        .await?;
+        deleted_edges.extend(
+            sqlx::query_as::<_, (Uuid, Uuid)>(
+                "DELETE FROM edges AS e \
+                 WHERE e.relationship = 'alternative_of' \
+                   AND e.source_type = 'claim' AND e.target_type = 'claim' \
+                   AND (e.source_id = $2 OR e.target_id = $2) \
+                   AND e.source_id != $1 AND e.target_id != $1 \
+                   AND EXISTS ( \
+                       SELECT 1 FROM edges e2 \
+                       WHERE e2.relationship = 'alternative_of' \
+                         AND e2.source_type = 'claim' AND e2.target_type = 'claim' \
+                         AND e2.id <> e.id \
+                         AND LEAST(e2.source_id, e2.target_id) = \
+                             LEAST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
+                         AND GREATEST(e2.source_id, e2.target_id) = \
+                             GREATEST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
+                   ) \
+                 RETURNING e.id, e.target_id",
+            )
+            .bind(canon_uuid)
+            .bind(dup_uuid)
+            .fetch_all(&mut *tx)
+            .await?,
+        );
 
-        sqlx::query(
+        // ── Derived-record repair, part 1: no ORPHANS ────────────────────────
+        // Every edge the three guards just dropped takes its edge-factor BBA
+        // with it. Without this, the BBA outlives its edge (nothing cascades
+        // from `edges` to `mass_functions`) and keeps being combined into the
+        // target's belief forever.
+        let deleted_edge_ids: Vec<Uuid> = deleted_edges.iter().map(|(id, _)| *id).collect();
+        let deleted_bbas = if deleted_edge_ids.is_empty() {
+            0
+        } else {
+            sqlx::query("DELETE FROM mass_functions WHERE perspective_id = ANY($1)")
+                .bind(&deleted_edge_ids)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+        };
+
+        let retargeted: Vec<(Uuid,)> = sqlx::query_as(
             "UPDATE edges SET target_id = $1 \
              WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
-               AND NOT (source_type = 'claim' AND source_id = $1)",
+               AND NOT (source_type = 'claim' AND source_id = $1) \
+             RETURNING id",
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
 
-        sqlx::query(
+        // ── Derived-record repair, part 2: no STRANDINGS ─────────────────────
+        // Those edges now point at `canonical`, but their BBAs still sit on
+        // `dup`. Move them, so `canonical` counts the supporters its edges say
+        // it has.
+        let retargeted_ids: Vec<Uuid> = retargeted.into_iter().map(|(id,)| id).collect();
+        let mut moved_bbas = 0_u64;
+        if !retargeted_ids.is_empty() {
+            // `canonical` must be assigned to every frame whose BBAs it is
+            // about to inherit, or the frame-scoped read paths
+            // (`claim_frames.hypothesis_index`) would not see them.
+            sqlx::query(
+                "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) \
+                 SELECT $1, cf.frame_id, cf.hypothesis_index FROM claim_frames cf \
+                 WHERE cf.claim_id = $2 \
+                 ON CONFLICT (claim_id, frame_id) DO NOTHING",
+            )
+            .bind(canon_uuid)
+            .bind(dup_uuid)
+            .execute(&mut *tx)
+            .await?;
+
+            // Guard `mass_functions_unique_per_perspective`
+            // (claim_id, frame_id, source_agent_id, perspective_id, NULLS NOT
+            // DISTINCT — migration 034): if `canonical` somehow already holds
+            // a row for an incoming perspective, the move would raise and roll
+            // the whole dedup back, i.e. an existing caller would acquire a
+            // brand-new failure mode. Drop the canonical-side duplicate first;
+            // the row arriving from `dup` is the one whose edge survived.
+            sqlx::query(
+                "DELETE FROM mass_functions mf \
+                 WHERE mf.claim_id = $1 AND mf.perspective_id = ANY($3) \
+                   AND EXISTS ( \
+                       SELECT 1 FROM mass_functions m2 \
+                       WHERE m2.claim_id = $2 \
+                         AND m2.perspective_id = mf.perspective_id \
+                         AND m2.frame_id = mf.frame_id \
+                         AND m2.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id \
+                   )",
+            )
+            .bind(canon_uuid)
+            .bind(dup_uuid)
+            .bind(&retargeted_ids)
+            .execute(&mut *tx)
+            .await?;
+
+            moved_bbas = sqlx::query(
+                "UPDATE mass_functions SET claim_id = $1 \
+                 WHERE claim_id = $2 AND perspective_id = ANY($3)",
+            )
+            .bind(canon_uuid)
+            .bind(dup_uuid)
+            .bind(&retargeted_ids)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+
+        // Outgoing edges are re-sourced at `canonical`. Their BBAs live on the
+        // far end and are unmoved, but their *content* was frozen from `dup`'s
+        // interval at wire time, so they now misattribute. They cannot be
+        // fixed by recombination — the caller re-derives them (see
+        // `DedupRepair::resourced_edges`).
+        let resourced_rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
             "UPDATE edges SET source_id = $1 \
              WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes' \
-               AND NOT (target_type = 'claim' AND target_id = $1)",
+               AND NOT (target_type = 'claim' AND target_id = $1) \
+             RETURNING id, target_id, relationship, target_type",
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
+        let resourced_edges: Vec<(Uuid, Uuid, String)> = resourced_rows
+            .into_iter()
+            .filter(|(_, _, _, target_type)| target_type == "claim")
+            .map(|(id, target_id, relationship, _)| (id, target_id, relationship))
+            .collect();
 
         tx.commit().await?;
-        Ok(())
+
+        // Claims whose cached scalars no longer match their BBA set: the two
+        // dedup endpoints, plus every third claim that lost a BBA above.
+        let mut stale_claims = vec![canon_uuid, dup_uuid];
+        for (_, target) in &deleted_edges {
+            if !stale_claims.contains(target) {
+                stale_claims.push(*target);
+            }
+        }
+
+        Ok(DedupRepair {
+            stale_claims,
+            resourced_edges,
+            deleted_bbas,
+            moved_bbas,
+        })
     }
 
     /// Apply a patch atomically inside the supplied transaction. Returns a diff so

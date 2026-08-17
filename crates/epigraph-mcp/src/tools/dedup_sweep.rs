@@ -200,14 +200,27 @@ pub async fn sweep_semantic_duplicates(
     if !dry_run {
         for (survivor, duplicates, _) in &exact_clusters {
             for dup in duplicates {
-                match ClaimRepository::mark_duplicate(
+                // Same retraction cascade as the single-shot `mark_duplicate`
+                // tool (backlog 20e9ed83): collapsing a cluster orphans and
+                // strands the duplicates' edge-factor BBAs exactly the same
+                // way, so the sweep must repair belief too — a bulk path that
+                // skipped it would reintroduce the defect at scale. Cascade
+                // errors land in `failures` alongside the mark failures; they
+                // do not undo an already-committed collapse, so `pairs_marked`
+                // still counts the pair.
+                match epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
                     &server.pool,
-                    epigraph_core::ClaimId::from_uuid(*dup),
-                    epigraph_core::ClaimId::from_uuid(*survivor),
+                    *dup,
+                    *survivor,
                 )
                 .await
                 {
-                    Ok(()) => pairs_marked += 1,
+                    Ok(cascade) => {
+                        pairs_marked += 1;
+                        for err in cascade.errors {
+                            failures.push(format!("{dup} -> {survivor} (belief cascade): {err}"));
+                        }
+                    }
                     Err(e) => failures.push(format!("{dup} -> {survivor}: {e}")),
                 }
             }

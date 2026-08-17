@@ -344,6 +344,54 @@ impl EdgeRepository {
             .collect())
     }
 
+    /// List the claim→claim edges leaving `source_id` that can carry an
+    /// edge-factor BBA on their target, restricted to targets that are still
+    /// `is_current`.
+    ///
+    /// Returns `(edge_id, target_id, relationship)` per edge.
+    ///
+    /// # Why this exists (and why the obvious query is wrong)
+    /// `ClaimRepository::supersede` re-points every non-`supersedes` outgoing
+    /// edge onto the **replacement** claim *inside* its transaction (grep:
+    /// `Migrate outgoing edges: redirect edges FROM old claim`). A cascade
+    /// that enumerates `source_id = <retracted claim>` after the commit
+    /// therefore matches nothing at all — the only edge still touching the old
+    /// uuid is the `supersedes` edge, whose *source* is the new claim. Callers
+    /// must pass the **new** claim id here.
+    ///
+    /// Currency is joined from `claims.is_current`. `edges` carries no
+    /// per-row currency flag for its target — its columns are
+    /// `id, source_id, target_id, source_type, target_type, relationship,
+    /// labels, properties, created_at, prov_type, valid_from, valid_to,
+    /// signature, signer_id, content_hash` — so any query that filters on one
+    /// fails at runtime.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn list_current_claim_targets(
+        pool: &PgPool,
+        source_id: Uuid,
+    ) -> Result<Vec<(Uuid, Uuid, String)>, DbError> {
+        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+            r#"
+            SELECT e.id, e.target_id, e.relationship
+            FROM edges e
+            JOIN claims c ON c.id = e.target_id AND c.is_current = true
+            WHERE e.source_id = $1
+              AND e.source_type = 'claim'
+              AND e.target_type = 'claim'
+              AND e.relationship <> 'supersedes'
+            ORDER BY e.id
+            "#,
+        )
+        .bind(source_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Get edges by target entity
     ///
     /// # Errors
