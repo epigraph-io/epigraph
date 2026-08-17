@@ -609,7 +609,9 @@ pub async fn claim_history(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // No `use super::*` here: the only remaining child module brings its own
+    // (`use super::super::*`), and the unused re-export trips
+    // `clippy -D warnings` in a file this change already touches.
 
     // ---- Handler integration tests (require DB) ----
     // Formerly in-memory tests gated behind #[cfg(not(feature = "db"))].
