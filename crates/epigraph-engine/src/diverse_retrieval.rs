@@ -201,7 +201,26 @@ pub struct DiverseRetrievalConfig {
     /// Optional `claims.created_at >= since` window on the candidate pool.
     /// `None` (the default everywhere it is not explicitly requested) is
     /// today's behaviour exactly. Applied in SQL before the candidate
-    /// `LIMIT`, so a pool saturated by older claims cannot hide a newer one.
+    /// `LIMIT`, so a pool saturated by older claims cannot hide a newer one
+    /// *within the themes that were chosen*.
+    ///
+    /// **Known limitation — theme selection is NOT windowed.**
+    /// [`run_diverse_pipeline`] picks its `max_themes` themes by centroid
+    /// similarity alone, before `since` is consulted, so a theme whose claims
+    /// are all pre-window still consumes one of the slots and the windowed
+    /// page comes back SHORT. This is a shortfall, never a leak: no
+    /// pre-window claim can reach the caller, because the window still binds
+    /// on the within-theme query. Bounded by `max_themes`. Windowing theme
+    /// selection would need a new `claim_themes` query keyed on member
+    /// `created_at`; it is deliberately deferred rather than half-done.
+    ///
+    /// Compatibility note: an additive REQUIRED field on a public struct
+    /// breaks exhaustive struct literals outside this workspace. Judged
+    /// acceptable, and NOT patched with `#[derive(Default)]`, because a
+    /// defaulted `centroid_dim: 0` is rejected at runtime by
+    /// `centroid_columns_for_dim` — deriving `Default` here would trade a
+    /// compile error for a runtime `InvalidData`, which is strictly worse.
+    /// Recorded as a decision, not an oversight.
     pub since: Option<DateTime<Utc>>,
 }
 

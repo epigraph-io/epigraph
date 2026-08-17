@@ -141,7 +141,16 @@ pub struct RecallWithContextParams {
     /// Optional RFC3339 creation-time window. When set, the candidate pool on
     /// EVERY retrieval surface — flat ANN, the diverse/theme pipeline, and
     /// graph expansion — is narrowed to claims with
-    /// `created_at >= since`, in SQL, before each surface's `LIMIT`.
+    /// `created_at >= since`, in SQL, before each surface's `LIMIT`, so no
+    /// hit older than `since` can reach the caller on any path.
+    ///
+    /// **Completeness caveat on `diverse=true`.** The theme *shortlist* is
+    /// chosen by centroid similarity before the window is applied, so a theme
+    /// holding only pre-window claims still consumes one of `max_themes`
+    /// slots and the page can come back SHORT of `limit`. Nothing pre-window
+    /// leaks; the result may just be less complete than an unwindowed diverse
+    /// call would suggest. Set `diverse=false` for a windowed query that must
+    /// be exhaustive.
     ///
     /// **Boundary: the window constrains top-level HITS, not their CONTEXT.**
     /// `atoms`, `siblings`, `corroborates`, `neighbor_paragraphs`, `section`
