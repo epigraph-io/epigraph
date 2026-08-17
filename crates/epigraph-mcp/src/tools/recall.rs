@@ -453,10 +453,12 @@ async fn apply_graph_expansion(
     // results — so it is a candidate-producing surface, not a context
     // surface, and every row it contributes must satisfy the window. The
     // walk itself is not pruned (an old claim may bridge to a new one); only
-    // the emitted destinations are.
-    let expansion = epigraph_db::ClaimRepository::graph_expand_seeds(pool, &seed_ids, depth, since)
-        .await
-        .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
+    // the emitted destinations are, and only in-window destinations consume
+    // the expansion budget.
+    let expansion =
+        epigraph_db::ClaimRepository::graph_expand_seeds_since(pool, &seed_ids, depth, since)
+            .await
+            .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
 
     // Best (highest) decayed score per expanded claim, in case it's
     // reachable from more than one seed at different hop counts / seed
