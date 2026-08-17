@@ -764,15 +764,41 @@ the three collision pre-deletes exist only inside the transaction — after the 
 to tell an orphan this dedup created from one that was already there, and a global orphan sweep would
 violate C3's surgical requirement.
 
-### D7 — Known remaining gap, deliberately NOT fixed (not a criterion; recorded for honesty)
+### D7 — Known remaining gaps, deliberately NOT fixed (not a criterion; recorded for honesty)
 
-`ClaimRepository::supersede` re-points *incoming* edges onto the replacement claim, stranding their
-BBAs on the retired claim — structurally the same defect as C5(b), which this change fixes for
-`mark_duplicate`. It is left alone on purpose: moving those BBAs would give the replacement claim a
-belief interval it never earned (F4: it is inserted with NULL `belief`/`plausibility`), silently
-resurrecting the retracted claim's numbers under a new id, and C3's note explicitly leans on the
-replacement being factorless. It needs its own pre-registration. Documented in the
-`retraction_cascade` module docs under "Known remaining gap".
+Enumerated from every writer of `is_current = false` in the repo layer, so this is the complete
+set of retraction paths the change does **not** cover:
+
+```
+$ grep -n "is_current = false" crates/epigraph-db/src/repos/claim.rs   # (writers only)
+2068  supersede            2808  evolve_step            2937  mark_duplicate_with_repair
+3821  deprecate_claim      4554  consolidate
+```
+
+1. **`ClaimRepository::supersede`** re-points *incoming* edges onto the replacement claim,
+   stranding their BBAs on the retired claim — structurally the same defect as C5(b), which this
+   change fixes for `mark_duplicate`. Left alone on purpose: moving those BBAs would give the
+   replacement claim a belief interval it never earned (F4: it is inserted with NULL
+   `belief`/`plausibility`), silently resurrecting the retracted claim's numbers under a new id,
+   and C3's note explicitly leans on the replacement being factorless.
+
+2. **`ClaimRepository::consolidate`** (live MCP tool `consolidate_claims`, and where
+   `sweep_semantic_duplicates` routes its near-clusters) performs the **identical** three edge
+   operations `mark_duplicate_with_repair` was just taught to repair — a bulk
+   `DELETE FROM edges WHERE id = ANY($1)`, an `UPDATE edges SET source_id`, and an
+   `UPDATE edges SET target_id` — with zero `mass_functions` handling anywhere in its body
+   (`awk 'NR>=4297 && NR<=4600' … | grep -iE "mass_function|perspective_id|bba|belief"` → no
+   output). It is equally broken before and after this change and is untouched by the diff, so it
+   is not a regression; it is named here because omitting it from an enumeration that claims
+   completeness would be. Repairing it needs its own pre-registration: consolidation fuses
+   *several* sources into one synthesis, so "which supporters does the synthesis inherit" is a
+   semantic question, not the mechanical re-pointing dedup does.
+
+3. **`ClaimRepository::deprecate_claim`** and **`ClaimRepository::evolve_step`** retire a claim
+   without moving its edges, so only the frozen-downstream-BBA half applies to them, not the
+   orphan/strand half.
+
+All three are documented in the `retraction_cascade` module docs under "Known remaining gaps".
 
 ### D8 — Surface enumeration: a third call site the criteria never named
 
@@ -782,7 +808,9 @@ found a third: `epigraph-mcp/src/tools/dedup_sweep.rs::sweep_semantic_duplicates
 collapse path. It compiles unchanged (the signature is intact) and would have silently
 reintroduced the defect at scale, so it was wired to the same cascade; its per-pair cascade errors
 are appended to the existing `failures` list rather than aborting the sweep. Complete list of
-retraction call sites after this change:
+**`supersede` / `mark_duplicate` call sites** after this change (NOT of retraction call sites in
+general — `consolidate`, `deprecate_claim` and `evolve_step` also retire claims and are enumerated
+in D7):
 
 | Site | Cascade |
 |---|---|
@@ -792,3 +820,298 @@ retraction call sites after this change:
 | `epigraph-api/src/routes/versioning.rs::supersede_claim` | yes, reported as `belief_cascade` |
 | `epigraph-api/src/routes/versioning.rs::mark_duplicate` | yes, reported as `belief_cascade` |
 | `ClaimRepository::mark_duplicate` (bare repo call) | in-tx BBA repair only, no recompute — by design, the repo layer cannot run the DS pipeline |
+
+### D9 — C3 pins two columns that do not exist on `claims`; read as their real equivalents
+
+C3's pass clause requires `D`'s cached `(belief, plausibility, pignistic_prob, conflict_k,
+missing_mass)` to be bit-identical. `claims` has **neither** `conflict_k` nor `missing_mass`:
+
+```
+$ psql … -tAc "SELECT column_name FROM information_schema.columns
+               WHERE table_name='claims' AND column_name IN ('conflict_k','missing_mass')"
+(0 rows)
+$ psql … -c "\d claims" | grep -iE "belief|plaus|pignistic|mass_on|classification"
+ belief | plausibility | mass_on_empty (DEFAULT 0.0) | pignistic_prob | mass_on_missing (DEFAULT 0.0) | classification
+```
+
+(`conflict_k` exists only on `ds_combined_beliefs` and `mass_functions`.) The test reads
+`mass_on_empty` / `mass_on_missing`, which are the same two quantities under their real column
+names. The substitution is correct; leaving it unlogged is what would have made the
+pre-registration unauditable. `CachedScalars` in `supersede_cascade_recompute.rs` is
+`(belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing)` accordingly.
+
+### D10 — `CascadeReport::targets` reports what was touched, not what was considered
+
+C4's pass condition and `supersede_reports_the_downstream_target_it_repaired` both key on
+`belief_cascade.targets`, so the meaning of that field is fixed here rather than changed silently.
+
+`DedupRepair::stale_claims` always contains **both** dedup endpoints, whether or not the dedup
+changed anything about their evidence. An endpoint that never had a derived cache is therefore not
+a repair the cascade performed, and is now **absent** from `targets`, `recomputed` and `unbacked`.
+`targets` is exactly the union of `recomputed`, `unbacked` and the claims named in `errors`.
+
+This matters beyond bookkeeping: the pre-fix code fed both endpoints to the unbacked path
+unconditionally, and `MassFunctionRepository::clear_claim_belief` NULLs `mass_on_empty` /
+`mass_on_missing`, which are `DEFAULT 0.0` and are omitted by `ClaimRepository::create`. So every
+`mark_duplicate` of two BBA-free claims flipped a real `0.0` to NULL and bumped `updated_at` on
+the **surviving** claim — a C3 surgicality violation on the dedup path, at
+`sweep_semantic_duplicates` scale. `clear_claim_belief` is now guarded on at least one derived
+column being non-NULL and returns its row count. Regression:
+`mark_duplicate_cascade_recompute.rs::bba_free_dedup_leaves_the_survivors_derived_columns_alone`
+(verified red with the guard removed: `mass_on_empty 0.0 → NULL`, `updated_at` moved).
+
+### D11 — BCH-EG-K05's 1-hop bound is satisfied by construction, and separately tested
+
+`retraction_cascade` contains no recursion: `invalidate_and_rewire` is a flat `for` over one
+`EdgeRepository::list_current_claim_targets` result and `repair_targets` is a flat `for` over its
+argument. Neither calls back into a cascade entry point. So the 30s `tokio::time::timeout` in
+`cyclic_support_terminates` cannot fire, and that test alone cannot discriminate a bounded walk
+from an unbounded one — it pins cycle-safety against a *future* recursive edit, not against the
+present code.
+
+Added `supersede_cascade_recompute.rs::second_hop_downstream_of_the_retraction_is_not_touched`:
+on the straight chain `A --supports--> B --supports--> C`, retracting `A` must leave the `B → C`
+edge factor's `masses`, `C`'s cached scalars and `C.updated_at` all byte-identical. That is an
+assertion a transitive implementation fails immediately, without depending on a hang.
+
+### D12 — `sweep_semantic_duplicates::failures` widened its meaning; now documented, not renamed
+
+`failures` previously meant "this pair was not collapsed". It can now also carry
+`"<dup> -> <survivor> (belief cascade): <err>"` on a pair that **was** collapsed and **is** counted
+in `pairs_marked`, so `pairs_marked + failures.len()` no longer partitions the attempted pairs. A
+separate `cascade_failures` key was rejected: it is a second additive response field for a
+condition callers must handle identically (re-run the repair for that pair), and the sweep's other
+consumers already string-match `failures`. The contract is now stated on the field itself
+(`SweepResponse::failures` doc comment). Coverage added:
+`dedup_sweep_tool.rs::execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer` — the
+pre-existing sweep fixtures seed bare claims with no edges, so the cascade was always a no-op and
+the whole wiring could be reverted with the suite green (verified: reverting it turns the new test
+red on "survivor must have a cached BetP").
+
+### D13 — HTTP call sites now have their own tests
+
+`routes/versioning.rs::supersede_claim` and `::mark_duplicate` were covered only by the assumption
+that they call the same engine function as the MCP tools. Added
+`crates/epigraph-api/tests/versioning_belief_cascade_test.rs` (2 tests) driving both routes over
+real HTTP and asserting the `belief_cascade` payload **and** the resulting DB state.
+
+### D14 — `SourceFactorless` after invalidation is a decided outcome, not an error
+
+`invalidate_and_rewire` deletes each stale BBA and then re-derives it. Three of the four
+`EdgeFactorOutcome` values mean "no BBA was written", of which `SourceFactorless` is the *normal*
+post-supersede case (F4: the replacement claim is inserted factorless). Those are **not** reported
+as errors — the target is still recomputed or marked unbacked in the same pass, so the loss of the
+supporter is visible in `recomputed`/`unbacked`. What *is* now reported: `auto_wire_edge_if_epistemic`
+returning `None`, which is a genuine internal failure it otherwise only `warn!`s about, and a
+failure to resolve the source claim's `agent_id` — which now aborts the whole loop rather than
+deleting BBAs it has already established it cannot re-derive.
+
+---
+
+## Adjudication
+
+Recorded after adversarial review of the implementation (three reviewers, 14 findings) and the
+follow-up fix pass. Every line below is the result of running the named command in
+`/home/jeremy/epigraph-wt-K` at the branch tip, not a restatement of intent.
+
+**Environment.** `DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test`,
+`SQLX_OFFLINE=true`. The production `epigraph` database on `epigraph-postgres` was never
+contacted; no migration was run against it. `.sqlx` was not regenerated — no `query!`/`query_as!`
+macro was added or altered (the new `ClaimRepository::get_agent_id` and the guarded
+`clear_claim_belief` are unchecked `sqlx::query`/`query_scalar`, as were the statements they sit
+beside).
+
+### Verdict table
+
+| Gate | Result | One-line basis |
+|---|---|---|
+| C1 — backward compatibility + the observability resource | **PASS** | signatures and params byte-identical; every listed test file unmodified and green; `belief_cascade` added on all four responses |
+| C2 — ANCHOR: downstream cache stops reflecting the retracted supporter | **PASS** | `downstream_cache_drops_retracted_supporter` |
+| C3 — CONTROL: the cascade is surgical | **PASS** (with D9, and strengthened) | `cascade_does_not_touch_unrelated_bbas_or_claims`; dedup-path hole found in review and closed — `bba_free_dedup_leaves_the_survivors_derived_columns_alone` |
+| C4 — enumeration survives the in-transaction edge migration | **PASS** | `supersede_reports_the_downstream_target_it_repaired`; `target_is_current` → 0 hits |
+| C5 — MemTX I2: no orphaned **or** stranded derived record | **PASS** | `diamond_and_migration_leave_no_orphaned_or_stranded_bba`, plus two new phase-2 fixtures |
+| C6 — empty surviving BBA set has decided semantics | **PASS** | `sole_supporter_retraction_does_not_leave_frozen_belief` + `…_is_reported_as_unbacked_not_as_nothing_to_do` |
+| C7 — bounded, cycle-safe, best-effort, orchestrated at the call site | **PASS** (with D2, D11) | four greps + `cyclic_support_terminates`, `second_hop_downstream_of_the_retraction_is_not_touched`, `cascade_errors_are_reported_not_propagated` |
+| C8 — full CI gate green | **PARTIAL — clippy clause REFUTE** | `cargo clippy --all-targets -- -D warnings` exits 101 on **pre-existing** debt in untouched crates; fmt, `check --workspace` and all test suites are green |
+
+No criterion was refuted by the implementation. C8's clippy clause is refuted by the repository,
+and is recorded as REFUTE rather than reinterpreted (see below).
+
+### C1 — PASS
+
+```
+$ git diff origin/main --stat -- crates/epigraph-mcp/src/types.rs
+(no output — no params struct changed)
+
+$ git diff origin/main --name-only -- \
+    crates/epigraph-mcp/tests/supersede_claim_test.rs \
+    crates/epigraph-mcp/tests/mark_duplicate_test.rs \
+    crates/epigraph-db/tests/mark_duplicate_repo.rs \
+    crates/epigraph-db/tests/supersede_nulls_embedding.rs \
+    crates/epigraph-db/tests/supersede_carries_labels_and_filters.rs \
+    crates/epigraph-db/tests/mark_duplicate_nulls_embedding.rs \
+    crates/epigraph-api/tests/supersede_scope_check_test.rs
+(no output — every file C1 names is unmodified)
+```
+
+`ClaimRepository::supersede -> Result<(Uuid, Uuid), DbError>` and
+`ClaimRepository::mark_duplicate -> Result<(), DbError>` are unchanged (D6: the struct-returning
+`mark_duplicate_with_repair` is an additive sibling). All of the above test files pass in the
+suite runs recorded under C8.
+
+*(b)* `belief_cascade` is present on all four responses and asserted by
+`supersede_cascade_reports_targets.rs` (MCP) and the new
+`crates/epigraph-api/tests/versioning_belief_cascade_test.rs` (HTTP, D13).
+
+### C2 — PASS
+
+`epigraph-mcp --test supersede_cascade_recompute -- downstream_cache_drops_retracted_supporter`:
+green. No `recompute_beliefs` call anywhere in the test body. Both clauses asserted: the cached
+BetP moved by more than `1e-9`, and it equals `preview_claim_belief_on_frame` on the post-cascade
+`mass_functions` set to within `1e-12`.
+
+### C3 — PASS, with D9, and a hole closed
+
+`cascade_does_not_touch_unrelated_bbas_or_claims`: green — the surviving `C→B` BBA row's
+`(masses, source_strength, evidence_type, locality_tag, perspective_id)` are byte-identical, and
+`D`'s cached scalars and `updated_at` are untouched. C3's `conflict_k`/`missing_mass` are not
+columns on `claims` and were read as `mass_on_empty`/`mass_on_missing` — logged as **D9**.
+
+Review found C3's property violated on the path its own fixture does not cover: the **dedup**
+endpoints were fed to the unbacked path unconditionally, so a BBA-free `mark_duplicate` rewrote
+the surviving claim's `mass_on_empty`/`mass_on_missing` from `0.0` to NULL and bumped its
+`updated_at`. Fixed (D10) and pinned by
+`bba_free_dedup_leaves_the_survivors_derived_columns_alone`, verified red against the unguarded
+clear.
+
+### C4 — PASS
+
+```
+$ grep -rn "target_is_current" crates migrations | wc -l
+0
+```
+
+`supersede_reports_the_downstream_target_it_repaired` asserts `belief_cascade.targets == [B]`
+**and** separately asserts that the naive `WHERE source_id = <retracted id>` enumeration returns
+0 rows in the same fixture, so the criterion's "the naive query must also fail this" requirement
+is met explicitly rather than by construction.
+
+### C5 — PASS
+
+`diamond_and_migration_leave_no_orphaned_or_stranded_bba`: both SQL invariants from the criterion
+return 0, `canonical` carries both BBAs, and its cached BetP equals
+`preview_claim_belief_on_frame` post-repair.
+
+Review established that the `resourced_edges` half of the dedup cascade (phase 2) was reachable
+by **no** fixture — the whole block could be deleted with all ten tests green. Two fixtures added:
+
+* `resourced_outgoing_edge_bba_is_re_derived_from_canonical` — the duplicate's outgoing edge
+  survives, re-sourced at `canonical`, and its BBA's `masses` must differ from the value frozen
+  from `dup`'s interval. Only phase 2 can produce that.
+* `target_of_both_a_collision_delete_and_a_resourced_edge_is_recomputed_last` — the ordering bug
+  itself. Verified **red** before the fix: `V` was reported under `targets`/`recomputed` while its
+  cached BetP stayed at `0.332` with zero surviving BBAs.
+
+### C6 — PASS
+
+`sole_supporter_retraction_does_not_leave_frozen_belief` (all five scalars **and**
+`classification` NULL) and `sole_supporter_retraction_is_reported_as_unbacked_not_as_nothing_to_do`
+(`unbacked == [B]`, `recomputed` empty). Option **(ii)**, per D4, documented on the module entry
+point. D10 narrows `unbacked` to claims that actually had a cache — the criterion's purpose
+(distinguishing "unbacked" from "believed at 0.79") is strengthened, not weakened, since a claim
+that never had a cache is now also distinguishable from both.
+
+### C7 — PASS
+
+1. **Bounded / 2. cycle-safe.** `cyclic_support_terminates` green inside its 30s timeout;
+   `second_hop_downstream_of_the_retraction_is_not_touched` (new, D11) asserts the bound on a
+   straight 3-chain, which a transitive implementation fails on an assertion rather than a hang.
+3. **Best-effort.** `cascade_after_supersede`/`cascade_after_dedup` return `CascadeReport`, never
+   `Result`. `cascade_errors_are_reported_not_propagated` (the error is reported and names `B`)
+   and `cascade_failure_does_not_fail_the_write` (`A` still retired, replacement still created).
+   The former is where this clause's teeth are; the latter additionally pins the DB end-state.
+4. **Call-site orchestration** (D2 — a shared engine module, not literal inlining):
+
+```
+$ git diff origin/main -- crates/epigraph-mcp/src/tools/supersede.rs \
+      crates/epigraph-api/src/routes/versioning.rs | grep -c '^+.*sqlx::query'
+0
+$ grep -c "tokio::spawn" crates/epigraph-db/src/repos/claim.rs
+0
+$ grep -c "sqlx::query" crates/epigraph-engine/src/retraction_cascade.rs
+0        # was 1 before this fix pass — moved to ClaimRepository::get_agent_id,
+         # per CLAUDE.md "all SQL stays in crates/epigraph-db/src/repos/"
+$ git diff origin/main -U0 -- crates/epigraph-db/src/repos/claim.rs | grep '^@@'
+   # every hunk is at the DedupRepair struct (~L85), get_agent_id (~L481) or
+   # mark_duplicate (~L2829+). `supersede` (~L2000-2100) is untouched.
+```
+
+### C8 — fmt/check/test PASS; the literal clippy clause REFUTE
+
+```
+$ SQLX_OFFLINE=true cargo fmt --all -- --check                       → 0
+$ SQLX_OFFLINE=true cargo check --workspace                          → 0
+$ SQLX_OFFLINE=true cargo clippy --all-targets -- -D warnings        → 101   ← REFUTE
+$ DATABASE_URL=… cargo test -p epigraph-db                           → 0   264 passed, 0 failed, 10 ignored
+$ DATABASE_URL=… cargo test -p epigraph-mcp                          → 0   396 passed, 0 failed,  1 ignored
+$ DATABASE_URL=… cargo test -p epigraph-engine                       → 0   547 passed, 0 failed, 12 ignored
+$ DATABASE_URL=… cargo test -p epigraph-api --features db \
+      --test versioning_belief_cascade_test --test supersede_scope_check_test \
+      --test dedup_endpoint_test --test dedup_negative_test \
+      --test dedup_admin_scope_test --test alternative_of_symmetric_dedup
+                                                                     → 0    14 passed, 0 failed
+```
+
+**Attribution of the clippy failure.** All 16 error lines are in `crates/epigraph-tools`
+(`examples/table_graph/*`, reached through its test targets) — an untouched crate that no
+workspace member depends on. The run aborts there; running clippy **without** `-D warnings` so
+every target compiles yields ~150 diagnostics across 46 files, none of which is in a file this
+branch touches or adds:
+
+```
+$ for f in $(git diff --name-only origin/main; git status --porcelain | awk '{print $2}'); do
+      grep -F "$f:" clippy_all.txt; done
+(no output)
+```
+
+The two diagnostics the reviewers found inside changed files have been handled: the
+`unused import: super::*` in `routes/versioning.rs::mod tests` (blame `5462005b`, 2026-04-15) is
+removed, and `claim.rs::max_agent_claims_constant_is_positive`'s constant assertion (blame
+`74f3f7403`, 2026-06-18) is left alone as a deliberate pre-existing guard test.
+
+**Why this is recorded as REFUTE rather than substituted away.** D5 already disclosed that the
+clause is unsatisfiable at `7cd5eeef`, and that remains true; but "unsatisfiable" is not "passed".
+Cleaning ~150 pre-existing diagnostics across 46 files in `epigraph-tools`, `epigraph-engine`'s
+test/bench targets, `epigraph-api`'s test helpers and `epigraph-db`'s test helpers is a separate
+chore, not part of this decision. The scoped substitute set D5 defines is green:
+
+```
+$ cargo clippy -p epigraph-mcp --all-targets -- -D warnings                       → 0
+$ cargo clippy -p epigraph-db -p epigraph-engine --lib -- -D warnings             → 0
+$ cargo clippy -p epigraph-api --features db --lib -- -D warnings                 → 0
+$ cargo clippy -p epigraph-api --features db --test versioning_belief_cascade_test \
+      -- -D warnings                                                              → 0
+```
+
+### BCH-style challenges
+
+| Challenge | Result | Backing |
+|---|---|---|
+| K01 — post-commit enumeration finds nothing | **PASS** | `supersede_reports_the_downstream_target_it_repaired` asserts both the correct target set and that the naive query returns 0 |
+| K02 — `recompute_beliefs` reports success and changes nothing | **PASS** | `downstream_cache_drops_retracted_supporter` (`> 1e-9` move); `resourced_outgoing_edge_bba_is_re_derived_from_canonical` (`masses` differ) |
+| K03 — dedup orphans one side, strands the other | **PASS** | `diamond_and_migration_leave_no_orphaned_or_stranded_bba`; both counts asserted separately |
+| K04 — sole supporter retracted, belief silently freezes | **PASS** | `sole_supporter_retraction_does_not_leave_frozen_belief` + the reported-outcome half |
+| K05 — cycle in the support graph | **PASS by construction + test** | no recursion in the module (D11); `cyclic_support_terminates` and `second_hop_downstream_of_the_retraction_is_not_touched` |
+| K06 — "fail loudly" turns a committed write into a reported failure | **PASS** | return type is `CascadeReport`, not `Result`; `cascade_errors_are_reported_not_propagated`, `cascade_failure_does_not_fail_the_write` |
+
+### Review findings not adopted, and why
+
+* **"Delete `cascade_failure_does_not_fail_the_write`; it cannot fail and is subsumed."** Kept.
+  It asserts two things `cascade_errors_are_reported_not_propagated` does not — that `A` is still
+  retired and the replacement claim still exists after a cascade error — which is the actual
+  end-state contract of BCH-EG-K06. The observation that C7.3's discriminating power comes from
+  the other test is correct and is recorded above rather than acted on by deletion.
+* **"Move `PREREGISTRATION.md` out of the repo root."** Not done here: this file is the
+  governance artifact the adjudication was directed at, and relocating it in the same pass would
+  break the audit trail from the review to the record. It is a docs/process call, outside the
+  build-and-integration scope of this change.

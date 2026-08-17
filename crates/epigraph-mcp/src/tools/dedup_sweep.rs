@@ -78,7 +78,23 @@ struct SweepResponse {
     /// Near-but-not-identical clusters. Never auto-collapsed: an agent should
     /// synthesize these through `consolidate_claims` so no wording is lost.
     merge_candidates: Vec<ClusterOut>,
+    /// Pairs whose collapse committed.
     pairs_marked: u64,
+    /// Per-pair problems, in two classes that are **not** complementary with
+    /// `pairs_marked`:
+    ///
+    /// * `"<dup> -> <survivor>: <err>"` — the collapse itself failed. The pair
+    ///   is not counted in `pairs_marked`.
+    /// * `"<dup> -> <survivor> (belief cascade): <err>"` — the collapse
+    ///   committed and **is** counted in `pairs_marked`, but the downstream
+    ///   belief repair (backlog 20e9ed83) hit a non-fatal error. Rolling the
+    ///   collapse back is not an option — its transaction is already done —
+    ///   and failing the whole sweep for one stale cache would be worse, so
+    ///   the pair stands and the failure is reported.
+    ///
+    /// So `pairs_marked + failures.len()` no longer equals the number of pairs
+    /// attempted, and a sweep can report failures while having collapsed every
+    /// pair successfully.
     failures: Vec<String>,
     /// Offset to pass on the next call to continue the sweep.
     next_offset: i64,
