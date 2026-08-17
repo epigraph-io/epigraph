@@ -67,6 +67,7 @@ async fn recall_falls_back_to_scope_honoring_lexical_when_embedder_down(pool: Pg
         perspective_id: None,
         include_workflows: false,
         exclude_contested: false,
+        since: None,
     };
     let out = recall(&server, params).await.expect("recall ok");
     let arr = parse_results(out);

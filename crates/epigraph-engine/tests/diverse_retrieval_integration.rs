@@ -161,6 +161,7 @@ async fn run_diverse_pipeline_returns_empty_when_no_themes(pool: PgPool) {
         budget: 10,
         alpha: 0.4,
         paragraph_only: true,
+        since: None,
     };
     let result = run_diverse_pipeline(&pool, &query, config)
         .await
@@ -185,6 +186,7 @@ async fn run_diverse_pipeline_returns_empty_when_themes_have_no_claims(pool: PgP
         budget: 10,
         alpha: 0.4,
         paragraph_only: true,
+        since: None,
     };
     let result = run_diverse_pipeline(&pool, &query, config)
         .await
@@ -319,6 +321,7 @@ async fn diverse_selection_spreads_across_themes_when_flat_would_not(pool: PgPoo
         budget: 5,
         alpha: 0.4,
         paragraph_only: true,
+        since: None,
     };
     let selected = run_diverse_pipeline(&pool, &query, config)
         .await
@@ -394,6 +397,7 @@ async fn candidate_pool_small_value_truncates_sql_input(pool: PgPool) {
         budget: 5,
         alpha: 0.0,
         paragraph_only: true,
+        since: None,
     };
     let selected = run_diverse_pipeline(&pool, &query, config)
         .await
@@ -463,6 +467,7 @@ async fn candidate_pool_large_value_widens_diverse_select_input(pool: PgPool) {
         budget: 5,
         alpha: 1.0,
         paragraph_only: true,
+        since: None,
     };
     let selected = run_diverse_pipeline(&pool, &query, config)
         .await
@@ -506,6 +511,7 @@ async fn paragraph_only_filter_excludes_non_paragraph_claims(pool: PgPool) {
         budget: 10,
         alpha: 0.4,
         paragraph_only: true,
+        since: None,
     };
     let strict = run_diverse_pipeline(&pool, &query, config_strict)
         .await
@@ -528,6 +534,7 @@ async fn paragraph_only_filter_excludes_non_paragraph_claims(pool: PgPool) {
         budget: 10,
         alpha: 0.4,
         paragraph_only: false,
+        since: None,
     };
     let lax = run_diverse_pipeline(&pool, &query, config_lax)
         .await

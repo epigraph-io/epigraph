@@ -5,6 +5,7 @@
 //! whether it logs the ids it really returned. A recall that silently writes
 //! nothing would pass every repo test.
 
+use chrono::TimeZone;
 use epigraph_mcp::tools::memory::recall;
 use epigraph_mcp::types::RecallParams;
 use sqlx::PgPool;
@@ -51,6 +52,7 @@ fn params(query: &str) -> RecallParams {
         perspective_id: None,
         include_workflows: false,
         exclude_contested: false,
+        since: None,
     }
 }
 
@@ -139,5 +141,62 @@ async fn recall_survives_a_failing_audit_write(pool: PgPool) {
     assert!(
         returned.contains(&hit.to_string()),
         "results are served despite the audit failure — best-effort, never blocking"
+    );
+}
+
+/// A windowed retrieval must be RECONSTRUCTABLE from its audit row.
+///
+/// `since` changes which claims a query can return, so an audit row that
+/// records the query but not the window cannot settle "what did this agent
+/// actually see?" — the same `query_text` with and without a window are
+/// different retrievals. This pins the window into `params` for BOTH tools,
+/// including `recall_with_context`'s empty-result early return, which is the
+/// case that matters most: "this window returned nothing at that time" is
+/// precisely the claim an audit exists to support.
+#[sqlx::test(migrations = "../../migrations")]
+async fn since_is_recorded_in_recall_audit_params(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    seed_claim(&pool, agent, "quorbiline audit window fixture").await;
+
+    let since = chrono::Utc
+        .with_ymd_and_hms(2025, 6, 1, 0, 0, 0)
+        .unwrap()
+        .to_rfc3339();
+
+    let server = build_test_server(pool.clone());
+    let mut p = params("quorbiline");
+    p.since = Some(since.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
+    recall(&server, p).await.expect("recall ok");
+
+    // Fire-and-forget write: poll rather than assume.
+    let mut logged: Option<serde_json::Value> = None;
+    for _ in 0..50 {
+        // Runtime query, not the `sqlx::query!` macro: this assertion needs
+        // no compile-time schema check and the macro would add an `.sqlx`
+        // cache entry for a test-only read.
+        if let Some(v) = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT params FROM recall_events WHERE tool = 'recall' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        {
+            logged = Some(v);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let params_json = logged.expect("recall must write an audit row with params");
+    let recorded = params_json["since"]
+        .as_str()
+        .expect("the audit row must record `since`; without it the retrieval is unauditable");
+    assert_eq!(
+        recorded
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("recorded since parses"),
+        since.parse::<chrono::DateTime<chrono::Utc>>().unwrap(),
+        "the audit row must record the window that was actually applied"
     );
 }

@@ -31,6 +31,7 @@
 //! module text-contains no raw SQL primitives — re-introducing them here
 //! will fail that test loudly.
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -90,13 +91,42 @@ pub async fn candidates_in_themes_at_dim(
     centroid_dim: u32,
     paragraph_only: bool,
 ) -> Result<Vec<(Uuid, String, f64)>, sqlx::Error> {
-    ClaimThemeRepository::claims_in_themes_at_dim(
+    candidates_in_themes_at_dim_since(
         pool,
         theme_ids,
         query_pgvec,
         limit,
         centroid_dim,
         paragraph_only,
+        None,
+    )
+    .await
+}
+
+/// [`candidates_in_themes_at_dim`] plus an optional `created_at >= since`
+/// candidate window.
+///
+/// Added as a sibling rather than a seventh parameter on the existing
+/// function so the REST `/api/v1/search/semantic?diverse=true` route keeps
+/// the exact call it has today.
+#[allow(clippy::too_many_arguments)]
+pub async fn candidates_in_themes_at_dim_since(
+    pool: &PgPool,
+    theme_ids: &[Uuid],
+    query_pgvec: &str,
+    limit: i32,
+    centroid_dim: u32,
+    paragraph_only: bool,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<(Uuid, String, f64)>, sqlx::Error> {
+    ClaimThemeRepository::claims_in_themes_at_dim_since(
+        pool,
+        theme_ids,
+        query_pgvec,
+        limit,
+        centroid_dim,
+        paragraph_only,
+        since,
     )
     .await
     .map_err(db_error_to_sqlx)
@@ -168,6 +198,11 @@ pub struct DiverseRetrievalConfig {
     /// MCP `recall_with_context` (paragraph-primary). REST passes
     /// `false` (matches its pre-helper behaviour).
     pub paragraph_only: bool,
+    /// Optional `claims.created_at >= since` window on the candidate pool.
+    /// `None` (the default everywhere it is not explicitly requested) is
+    /// today's behaviour exactly. Applied in SQL before the candidate
+    /// `LIMIT`, so a pool saturated by older claims cannot hide a newer one.
+    pub since: Option<DateTime<Utc>>,
 }
 
 /// Run the diverse-retrieval pipeline against the corpus.
@@ -196,13 +231,14 @@ pub async fn run_diverse_pipeline(
     }
 
     let theme_ids: Vec<Uuid> = themes.iter().map(|(id, _, _)| *id).collect();
-    let candidates = candidates_in_themes_at_dim(
+    let candidates = candidates_in_themes_at_dim_since(
         pool,
         &theme_ids,
         query_pgvec,
         config.candidate_pool,
         config.centroid_dim,
         config.paragraph_only,
+        config.since,
     )
     .await?;
 

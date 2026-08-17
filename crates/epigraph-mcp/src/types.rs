@@ -494,6 +494,20 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub exclude_contested: bool,
+
+    #[schemars(
+        description = "Optional RFC3339 timestamp. When set, the CANDIDATE POOL is narrowed to \
+                       claims (and, with include_workflows, workflows) whose created_at is at or \
+                       after this instant — enabling \"what changed since T?\" semantic queries. \
+                       Filters on creation time, NOT last-update time: a belief recomputation \
+                       bumps updated_at without changing content, so an updated_at window would \
+                       report the whole recomputed corpus as new. Default: no window, byte-\
+                       identical to omitting the parameter. No default window is ever applied — \
+                       every hit carries created_at, so a caller who wants a different temporal \
+                       policy can apply it themselves."
+    )]
+    #[serde(default)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ── Ingestion ──
@@ -1128,6 +1142,23 @@ pub struct RecallResult {
     /// caller can surface the counter-evidence without a second round-trip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contesting_claim_ids: Vec<uuid::Uuid>,
+
+    /// When this result was created — `claims.created_at` for a claim hit,
+    /// `workflows.created_at` for a workflow hit. Never `updated_at`, never
+    /// the request time.
+    ///
+    /// `Option` + `skip_serializing_if` (the same pattern as `result_type` /
+    /// `lensed_belief` above) so a row whose creation time is genuinely
+    /// unknown OMITS the key rather than reporting a fabricated one. A
+    /// caller can then tell "unknown" from a value; `Utc::now()` or the Unix
+    /// epoch would be indistinguishable from a real timestamp while being a
+    /// lie about provenance.
+    ///
+    /// Surfaced on every hit, windowed or not: temporal arbitration between
+    /// a stale and a current memory is the caller's decision, and this is the
+    /// signal it needs to make it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// `skip_serializing_if` helper: keeps an uncontested hit byte-identical to
