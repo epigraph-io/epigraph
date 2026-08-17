@@ -314,13 +314,31 @@ fn created_at_of(hit: &Value, surface: &str) -> DateTime<Utc> {
 }
 
 /// The universal property: EVERY top-level hit satisfies the window.
-fn assert_window_honoured(surface: &str, o: &Outcome, since: DateTime<Utc>) {
+///
+/// `incompatible` is the option name a REFUSAL would have to name alongside
+/// `since` (e.g. `"diverse"`, `"graph_expansion_depth"`). The current
+/// implementation filters rather than gates, so the `Gated` arm never fires in
+/// this suite — it exists so a future implementation that legitimately takes
+/// the pre-registered "documented and gated" branch is still held to a bar.
+/// That bar is deliberately more than `msg.contains("since")`: an unrelated
+/// internal error whose Debug text happens to mention `since` must not pass
+/// for a deliberate refusal, so the message must ALSO name the incompatible
+/// option and carry the `invalid_params` code that distinguishes "you asked
+/// for something I do not support" from "I broke".
+fn assert_window_honoured(surface: &str, o: &Outcome, since: DateTime<Utc>, incompatible: &str) {
     match o {
         Outcome::Gated(msg) => {
             assert!(
-                msg.contains("since"),
+                msg.contains("since") && msg.contains(incompatible),
                 "{surface}: the call was refused, which is allowed ONLY if the \
-                 error names `since` and the incompatible option. Got: {msg}"
+                 error names BOTH `since` and the incompatible option \
+                 `{incompatible}`. Got: {msg}"
+            );
+            assert!(
+                msg.contains("invalid_params") || msg.contains("InvalidParams"),
+                "{surface}: a refusal must be an `invalid_params` error — an \
+                 internal error that merely mentions `since` is a failure, not \
+                 a documented gate. Got: {msg}"
             );
         }
         Outcome::Page(hits) => {
@@ -420,6 +438,21 @@ async fn since_excludes_older_claims_and_reports_created_at(pool: PgPool) {
         epoch_recent(),
     )
     .await;
+    // Sits EXACTLY on the cut. The documented semantic is "at or after this
+    // instant" (`created_at >= since`); without a fixture on the boundary,
+    // flipping the predicate to `>` passes the whole file, so the schemars
+    // description would be the only thing pinning inclusivity. Same cluster
+    // vector and same query terms as the other two, so it matches on both the
+    // dense and the lexical leg and cannot fail for an unrelated reason.
+    let boundary = seed_claim_at(
+        &pool,
+        agent,
+        Uuid::from_u128(0x0102),
+        "grendlewick assay, boundary pass",
+        &cluster_pgvec(0),
+        epoch_cut(),
+    )
+    .await;
 
     let server = build_test_server(pool);
     let out = recall_with_pgvec(
@@ -439,6 +472,12 @@ async fn since_excludes_older_claims_and_reports_created_at(pool: PgPool) {
     assert!(
         !ids.contains(&old.to_string().as_str()),
         "the pre-window claim must be excluded; got {ids:?}"
+    );
+    assert!(
+        ids.contains(&boundary.to_string().as_str()),
+        "`since` is INCLUSIVE — a claim created at exactly since={} must be \
+         returned (`created_at >= since`, \"at or after this instant\"); got {ids:?}",
+        epoch_cut()
     );
 
     let hit = hits
@@ -495,7 +534,8 @@ async fn since_absent_is_baseline_behaviour(pool: PgPool) {
     let out = recall_with_pgvec(&server, recall_params(json!({})), Some(cluster_pgvec(0)))
         .await
         .expect("recall ok");
-    let ids: Vec<String> = results_of(&out)
+    let hits = results_of(&out);
+    let ids: Vec<String> = hits
         .iter()
         .map(|h| h["claim_id"].as_str().unwrap().to_string())
         .collect();
@@ -506,6 +546,21 @@ async fn since_absent_is_baseline_behaviour(pool: PgPool) {
         ids,
         vec![a.to_string(), b.to_string(), c.to_string()],
         "with `since` absent the id list AND order must match origin/main exactly"
+    );
+
+    // `RecallResult::created_at` documents itself as "surfaced on every hit
+    // whether or not `since` was supplied" — the whole point being that a
+    // caller can arbitrate between a stale and a current memory WITHOUT
+    // asking for a window. Asserting it only on windowed pages would let an
+    // implementation tie the field's presence to `since` and stay green.
+    let seen: Vec<DateTime<Utc>> = hits
+        .iter()
+        .map(|h| created_at_of(h, "recall (no since)"))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![epoch_old(), epoch_recent(), epoch_old()],
+        "every unwindowed hit must carry its own real creation instant"
     );
 }
 
@@ -567,23 +622,35 @@ async fn created_at_is_creation_not_update(pool: PgPool) {
         "created_at tracked updated_at — a recomputed belief must not look newly created"
     );
 
-    // (b) The window agrees with the reported timestamp: a `since` after the
-    //     recompute (but after creation too) must NOT resurrect this claim.
-    let after_recompute = Utc::now() + chrono::Duration::seconds(1);
+    // (b) The FILTER column is `created_at`, decided on its own rather than
+    //     by accident. The discriminating fixture is
+    //     `created_at < since <= updated_at`: the claim was created in 2024,
+    //     the recompute above moved `updated_at` to now, and the cut sits at
+    //     2025-06-01 — strictly between them. Under `created_at >= since` the
+    //     claim is excluded; under `updated_at >= since` it is admitted. Any
+    //     `since` at `Utc::now()+1s` would be past BOTH columns and therefore
+    //     could not tell the two predicates apart.
+    let cut = epoch_cut();
+    assert!(
+        created < cut && cut <= updated,
+        "fixture precondition: the cut {cut} must sit strictly between \
+         created_at ({created}) and updated_at ({updated}), or part (b) cannot \
+         discriminate the two columns"
+    );
     let out = recall_with_pgvec(
         &server,
-        recall_params(json!({ "since": after_recompute.to_rfc3339() })),
+        recall_params(json!({ "since": cut.to_rfc3339() })),
         Some(cluster_pgvec(0)),
     )
     .await
     .expect("recall ok");
-    let ids: Vec<&str> = results_of(&out)
+    let ids: Vec<String> = results_of(&out)
         .iter()
         .filter_map(|h| h["claim_id"].as_str())
-        .map(|s| Box::leak(s.to_string().into_boxed_str()) as &str)
+        .map(str::to_owned)
         .collect();
     assert!(
-        !ids.contains(&id.to_string().as_str()),
+        !ids.contains(&id.to_string()),
         "a claim whose updated_at is inside the window but whose created_at is \
          not must be excluded; filtering on updated_at returns {ids:?}"
     );
@@ -704,7 +771,7 @@ async fn no_leak_s1_s2_hybrid_dense_and_lexical(pool: PgPool) {
         .await,
     );
 
-    assert_window_honoured("S1+S2 hybrid", &o, epoch_cut());
+    assert_window_honoured("S1+S2 hybrid", &o, epoch_cut(), "query");
     assert_contains("S1+S2 hybrid", &o, recent, "claim_id");
     assert_excludes("S1+S2 hybrid", &o, old_dense, "claim_id");
     assert_excludes("S1+S2 hybrid", &o, old_lex, "claim_id");
@@ -745,7 +812,7 @@ async fn no_leak_s3_lexical_when_embedder_down(pool: PgPool) {
         .await,
     );
 
-    assert_window_honoured("S3 lexical degrade", &o, epoch_cut());
+    assert_window_honoured("S3 lexical degrade", &o, epoch_cut(), "query");
     assert_contains("S3 lexical degrade", &o, recent, "claim_id");
     assert_excludes("S3 lexical degrade", &o, old, "claim_id");
 }
@@ -784,7 +851,7 @@ async fn no_leak_s4_workflows(pool: PgPool) {
         .await,
     );
 
-    assert_window_honoured("S4 workflows", &o, epoch_cut());
+    assert_window_honoured("S4 workflows", &o, epoch_cut(), "include_workflows");
     assert_contains("S4 workflows", &o, claim, "claim_id");
     assert_excludes("S4 workflows", &o, old_wf, "claim_id");
 
@@ -847,7 +914,7 @@ async fn no_leak_s5_context_flat_ann(pool: PgPool) {
         .await,
     );
 
-    assert_window_honoured("S5 flat ANN", &o, epoch_cut());
+    assert_window_honoured("S5 flat ANN", &o, epoch_cut(), "query");
     assert_contains("S5 flat ANN", &o, recent, "paragraph_id");
     assert_excludes("S5 flat ANN", &o, old, "paragraph_id");
 }
@@ -899,7 +966,7 @@ async fn no_leak_s6_diverse_themes(pool: PgPool) {
         .await,
     );
 
-    assert_window_honoured("S6 diverse", &o, epoch_cut());
+    assert_window_honoured("S6 diverse", &o, epoch_cut(), "diverse");
     assert_contains("S6 diverse", &o, recent, "paragraph_id");
     assert_excludes("S6 diverse", &o, old, "paragraph_id");
 }
@@ -959,6 +1026,27 @@ async fn no_leak_s7_graph_expansion(pool: PgPool) {
         old_neighbour,
         "paragraph_id",
     );
+    // `RecallHit::created_at` claims to be "surfaced on every hit whether or
+    // not `since` was supplied". This is the only unwindowed
+    // `recall_with_context` call in the file, so without this block an
+    // implementation that emitted `created_at` only when `since` is set —
+    // `params.since.map(|_| core.created_at)` — passes the entire suite.
+    // Both hits are checked (the ANN seed and the expansion-reached
+    // neighbour), because they are populated on different code paths.
+    if let Outcome::Page(hits) = &baseline {
+        for (id, expected) in [(seed, epoch_recent()), (old_neighbour, epoch_old())] {
+            let hit = hits
+                .iter()
+                .find(|h| h["paragraph_id"] == id.to_string())
+                .unwrap_or_else(|| panic!("S7 precondition: {id} missing from the page"));
+            assert_eq!(
+                created_at_of(hit, "S7 precondition (no window)"),
+                expected,
+                "an unwindowed recall_with_context hit must still report its \
+                 real creation instant"
+            );
+        }
+    }
 
     let o = outcome(
         recall_with_context_with_pgvec(
@@ -974,7 +1062,12 @@ async fn no_leak_s7_graph_expansion(pool: PgPool) {
         .await,
     );
 
-    assert_window_honoured("S7 graph expansion", &o, epoch_cut());
+    assert_window_honoured(
+        "S7 graph expansion",
+        &o,
+        epoch_cut(),
+        "graph_expansion_depth",
+    );
     assert_contains("S7 graph expansion", &o, seed, "paragraph_id");
     assert_excludes("S7 graph expansion", &o, old_neighbour, "paragraph_id");
 }
