@@ -64,6 +64,14 @@ pub struct WorkflowGoalEmbeddingHit {
     /// claim, so it has no `claims.created_at`, and filling the gap with
     /// `Utc::now()` would make every workflow the newest thing in the corpus
     /// — fabricated provenance in a graph whose purpose is provenance.
+    ///
+    /// Compatibility note: this is an additive REQUIRED field on a public
+    /// struct, which breaks any exhaustive struct literal or pattern match
+    /// outside this workspace. Judged acceptable because the struct is a
+    /// query RESULT row (`sqlx::FromRow`), never constructed by hand —
+    /// `grep -rn "WorkflowGoalEmbeddingHit {"` finds only this definition —
+    /// and there is no wrapper form for a field the way there is for a
+    /// function arity. Recorded as a decision, not an oversight.
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -810,16 +818,32 @@ impl WorkflowRepository {
     /// `min_truth` uniformly across claims + workflows after the merge, same
     /// as it already does for claim hits).
     ///
-    /// `since`, when set, narrows the ANN candidate pool to workflows created
-    /// at or after that instant — in the WHERE clause, above the `LIMIT`, so
-    /// a pool filled with older workflows cannot crowd out a newer one.
+    /// Retained at its original three-argument arity as a delegating wrapper
+    /// over [`Self::search_by_goal_embedding_since`]; `None` = no window =
+    /// today's behaviour.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn search_by_goal_embedding(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        limit: i64,
+    ) -> Result<Vec<WorkflowGoalEmbeddingHit>, sqlx::Error> {
+        Self::search_by_goal_embedding_since(pool, query_embedding_pgvector, limit, None).await
+    }
+
+    /// [`Self::search_by_goal_embedding`] plus an optional
+    /// `created_at >= since` window.
+    ///
+    /// The predicate is in the WHERE clause, above the `LIMIT`, so a pool
+    /// filled with older workflows cannot crowd out a newer one.
     /// `workflows.created_at` is a real column, so this leg honours the
     /// window for real rather than taking the "omit the field and exclude the
     /// row" fallback.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
-    pub async fn search_by_goal_embedding(
+    pub async fn search_by_goal_embedding_since(
         pool: &PgPool,
         query_embedding_pgvector: &str,
         limit: i64,
