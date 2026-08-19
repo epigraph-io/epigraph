@@ -353,6 +353,98 @@ impl MassFunctionRepository {
         Ok(result.rows_affected())
     }
 
+    /// Delete every mass function keyed to a single perspective.
+    ///
+    /// The retraction-repair primitive. Edge-factor BBAs are persisted with
+    /// `perspective_id = edge_id` and their `masses` are **frozen at wire
+    /// time** from the source claim's interval (see
+    /// `epigraph_engine::edge_factor::auto_wire_ds_for_edge`), so re-running
+    /// the combine pipeline over them after the source is retracted is a
+    /// bit-for-bit no-op. Repair therefore requires *invalidation*, not
+    /// recombination — and it must be a delete rather than an overwrite,
+    /// because `auto_wire_edge_if_epistemic` short-circuits on
+    /// [`Self::exists_for_perspective`], so a re-wire that leaves the stale
+    /// row in place is a permanent no-op.
+    ///
+    /// [`Self::delete_for_claim`] is the wrong tool here: it would drop every
+    /// *other* supporter's BBA along with the retracted one.
+    ///
+    /// Returns the number of rows deleted.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn delete_for_perspective(
+        pool: &PgPool,
+        perspective_id: Uuid,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM mass_functions
+            WHERE perspective_id = $1
+            "#,
+        )
+        .bind(perspective_id)
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Mark a claim's cached DS scalars as **unbacked**: NULL out
+    /// `belief`, `plausibility`, `pignistic_prob`, `mass_on_empty`,
+    /// `mass_on_missing` and `classification`.
+    ///
+    /// Needed because the cached scalars on `claims` are a *stale cache*, not
+    /// a derived view: `recompute_claim_belief_on_frame` short-circuits with
+    /// `Ok(false)` and writes nothing when the claim has no BBAs left, so a
+    /// claim whose last supporter was retracted would otherwise keep believing
+    /// its pre-retraction number with no evidence behind it.
+    ///
+    /// NULL is the same state a claim carries before it ever acquires a BBA,
+    /// which lets readers distinguish "unbacked" from "believed at 0.79" —
+    /// a vacuous 0.5 could not be distinguished from a genuine maximally
+    /// uncertain combine result.
+    ///
+    /// # Only clears a cache that exists
+    /// The `WHERE` clause requires at least one derived column to be non-NULL,
+    /// and the row count is returned so the caller can tell "cleared" from
+    /// "there was nothing to clear". Without the guard this is **not** a no-op
+    /// on a claim that never had a BBA: `claims.mass_on_empty` and
+    /// `claims.mass_on_missing` are `DEFAULT 0.0` (migration
+    /// `001_initial_schema.sql`) and `ClaimRepository::create` omits them, so
+    /// an unconditional clear flips a real `0.0` to NULL and bumps
+    /// `updated_at` on a claim the retraction never touched — visible through
+    /// `GET /api/v1/claims/{id}/belief` as `mass_on_conflict: 0.0 → null`.
+    /// `mark_duplicate` puts BOTH endpoints in
+    /// [`crate::DedupRepair::stale_claims`] unconditionally, so every dedup of
+    /// two BBA-free claims (the common case in a bulk
+    /// `sweep_semantic_duplicates` run) would hit exactly that.
+    ///
+    /// Returns the number of rows cleared: 0 or 1.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn clear_claim_belief(pool: &PgPool, claim_id: Uuid) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE claims
+            SET belief = NULL, plausibility = NULL, mass_on_empty = NULL,
+                pignistic_prob = NULL, mass_on_missing = NULL,
+                classification = NULL, updated_at = NOW()
+            WHERE id = $1
+              AND (belief IS NOT NULL OR plausibility IS NOT NULL
+                   OR pignistic_prob IS NOT NULL OR classification IS NOT NULL)
+            "#,
+        )
+        .bind(claim_id)
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
     /// Update a claim's belief, plausibility, and pignistic probability columns
     ///
     /// Called after combining mass functions to persist the computed interval.
