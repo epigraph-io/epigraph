@@ -42,9 +42,11 @@ Two things the earlier version of this file got wrong: `claim_clusters` was neve
 "191,891 rows all under one run" — the March run is 9,110 rows — and the corpus is no
 longer the 500-claim `auto-NN` toy sample.
 
-`centroid_3072` being NULL everywhere is not a hole. `crates/epigraph-api/src/routes/search.rs`
+`centroid_3072` being NULL everywhere breaks nothing today: `crates/epigraph-api/src/routes/search.rs`
 auto-detects centroid dimension from the fraction of themes with `centroid_3072`
 populated (>= 50% selects 3072), so it selects the fully-populated 1536-d `centroid`.
+It does mean the 3072 path is unpopulated — using `centroid_dim=3072` requires an
+`epigraph-cli reembed` first (see the note in `crates/epigraph-api/src/routes/crud.rs`).
 
 The 330,530-vs-330,529 gap is not loss: the run has 210 distinct `cluster_id`s and
 `cluster_id = 0` is a singleton that received no theme row. No cluster row in that run
@@ -207,10 +209,15 @@ should return claims spread across several semantically-named themes. Compare ag
 `diverse: false` — if the two are identical, the `!themes.is_empty()` guard is still
 failing and the projection did not land.
 
-Observed 2026-08-19: same query and limit, flat search returned 8 results from **one**
-theme; `diverse=true` returned 8 from **two** ("Evidence-Grounded Agent Memory Systems",
-4,250 claims, and "Graph integrity maintenance audits", 2,786). Note the failure mode
-this check has: before the size fix, `diverse=true` *also* returned one theme, not
+Observed 2026-08-19: the same query flat search answers out of one theme came back under
+`diverse=true` spread across "Evidence-Grounded Agent Memory Systems" (4,250 claims) and
+"Graph integrity maintenance audits" (2,786) — both theme sizes confirmed against prod.
+The result counts from that check were not re-verified when this file was written: the
+deployed MCP `recall` schema does not expose `diverse`, so re-running it needs a token
+and a direct `POST /api/v1/search/semantic?diverse=true`.
+
+Note the failure mode this check has: before the size fix, `diverse=true` *also*
+returned one theme, not
 because the guard failed but because the whole subject sat inside a single 51,772-claim
 bucket. A one-theme diverse result means either "no themes" or "themes too coarse" —
 check the oversized query in the verify block before blaming the guard.
