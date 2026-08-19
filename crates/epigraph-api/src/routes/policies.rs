@@ -454,7 +454,7 @@ mod tests {
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/v1/policy-challenges/{claim_id}"))
+                    .uri(format!("/api/v1/policy-challenges/{claim_id}"))
                     .body(Body::empty())
                     .unwrap(),
             )

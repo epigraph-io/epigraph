@@ -123,8 +123,7 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
     // Per-test-binary distinct prefix (DD) so we don't collide with other test
     // binaries' agent public_keys (graph_routes_test uses AA, themes BB,
     // neighborhoods CC, mcp query_claims_by_label uses BB-pattern via `bb`).
-    let pk: Vec<u8> = std::iter::repeat(0xDD)
-        .take(16)
+    let pk: Vec<u8> = std::iter::repeat_n(0xDD, 16)
         .chain(id.as_bytes().iter().copied())
         .take(32)
         .collect();
@@ -149,7 +148,7 @@ async fn seed_claim(
         .as_bytes()
         .iter()
         .copied()
-        .chain(std::iter::repeat(0).take(16))
+        .chain(std::iter::repeat_n(0, 16))
         .take(32)
         .collect();
     sqlx::query(

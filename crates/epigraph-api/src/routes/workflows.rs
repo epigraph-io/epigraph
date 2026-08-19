@@ -1743,7 +1743,7 @@ mod tests {
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/v1/workflows/{workflow_id}"))
+                    .uri(format!("/api/v1/workflows/{workflow_id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1766,7 +1766,7 @@ mod tests {
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/v1/workflows/{claim_id}"))
+                    .uri(format!("/api/v1/workflows/{claim_id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1799,7 +1799,7 @@ mod tests {
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/v1/workflows/{wf_id}"))
+                    .uri(format!("/api/v1/workflows/{wf_id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1888,7 +1888,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri(&format!(
+                    .uri(format!(
                         "/api/v1/workflows/hierarchical/{workflow_id}/outcome"
                     ))
                     .method("POST")
@@ -1927,7 +1927,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/v1/workflows/hierarchical/{unknown}/outcome"))
+                    .uri(format!("/api/v1/workflows/hierarchical/{unknown}/outcome"))
                     .method("POST")
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
@@ -1967,7 +1967,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri(&format!(
+                    .uri(format!(
                         "/api/v1/workflows/hierarchical/search?q={canonical}"
                     ))
                     .method("GET")

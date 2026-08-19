@@ -3080,11 +3080,11 @@ mod tests {
             "m_missing=0.20 should trigger frame.incomplete"
         );
         assert!(
-            !(below > threshold),
+            below <= threshold,
             "m_missing=0.10 should NOT trigger frame.incomplete"
         );
         assert!(
-            !(at > threshold),
+            at <= threshold,
             "m_missing=0.15 (boundary) should NOT trigger"
         );
     }

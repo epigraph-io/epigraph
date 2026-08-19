@@ -22,6 +22,11 @@ const DEFAULT_LINEAGE_DEPTH: u32 = 10;
 /// Traversing deeper than this could cause performance issues or timeouts.
 const MAX_LINEAGE_DEPTH: u32 = 100;
 
+/// The default must fit inside the cap, otherwise the `.min(MAX_LINEAGE_DEPTH)`
+/// in `get_lineage` would silently truncate a request that specified nothing.
+/// Enforced at compile time so a bad edit cannot reach a test run.
+const _: () = assert!(DEFAULT_LINEAGE_DEPTH <= MAX_LINEAGE_DEPTH);
+
 // ============================================================================
 // Direction Enum
 // ============================================================================
@@ -731,6 +736,7 @@ mod tests {
     #[test]
     fn test_default_lineage_depth() {
         assert_eq!(DEFAULT_LINEAGE_DEPTH, 10);
-        assert!(DEFAULT_LINEAGE_DEPTH <= MAX_LINEAGE_DEPTH);
+        // `DEFAULT_LINEAGE_DEPTH <= MAX_LINEAGE_DEPTH` is asserted at compile
+        // time next to the constants themselves.
     }
 }
