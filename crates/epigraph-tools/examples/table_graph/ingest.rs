@@ -37,7 +37,7 @@ pub fn run(dry_run: bool, only: Option<&str>) -> Result<()> {
                 continue;
             }
         }
-        let doi = format!("urn:epigraph-table:{}:{}", repo, table);
+        let doi = crate::types::synthetic_doi(repo, table);
         let md_abs = std::fs::canonicalize(&p)?;
         let extraction_json = p.with_extension("extraction.json");
         // Compute the absolute path BEFORE the file exists by canonicalizing the parent
@@ -55,13 +55,10 @@ pub fn run(dry_run: bool, only: Option<&str>) -> Result<()> {
         // current pipeline version. The MCP `ingest_document` tool re-runs this
         // gate, but only AFTER the extract-claims LLM call (~$2.50 per table)
         // has already happened. Doing the check here saves that cost on re-runs.
-        match already_processed(&doi)? {
-            true => {
-                eprintln!("  skip: already processed at pipeline {}", PIPELINE_VERSION);
-                count_ok += 1;
-                continue;
-            }
-            false => {}
+        if already_processed(&doi)? {
+            eprintln!("  skip: already processed at pipeline {}", PIPELINE_VERSION);
+            count_ok += 1;
+            continue;
         }
 
         if dry_run {

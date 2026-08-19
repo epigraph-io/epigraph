@@ -37,6 +37,7 @@ pub fn collect_ddl(migrations_dir: &str, table: &str) -> Result<String> {
 ///   1. introducing commit (--diff-filter=A --follow)
 ///   2. all subsequent commits touching the migration file (--follow)
 ///   3. commits with the table name in the message body (--grep)
+///
 /// Deduped by SHA, sorted by author date ascending.
 pub fn collect_git_context(
     repo: &str,

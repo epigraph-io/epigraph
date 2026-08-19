@@ -9,10 +9,15 @@ pub struct TableRef {
     pub migration: String, // relative path of the migration that created it
 }
 
-impl TableRef {
-    pub fn synthetic_doi(&self) -> String {
-        format!("urn:epigraph-table:{}:{}", self.repo, self.name)
-    }
+/// The synthetic DOI a table's generated paper is filed under.
+///
+/// Downstream filters discriminate table-graph papers by the
+/// `urn:epigraph-table:` prefix, so this is the single definition of the
+/// scheme — `ingest.rs` builds DOIs from bare `repo`/`table` strings parsed
+/// out of a filename stem, which is why this is a free function and not a
+/// `TableRef` method.
+pub fn synthetic_doi(repo: &str, name: &str) -> String {
+    format!("urn:epigraph-table:{repo}:{name}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
