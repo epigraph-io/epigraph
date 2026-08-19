@@ -214,3 +214,39 @@ this check has: before the size fix, `diverse=true` *also* returned one theme, n
 because the guard failed but because the whole subject sat inside a single 51,772-claim
 bucket. A one-theme diverse result means either "no themes" or "themes too coarse" —
 check the oversized query in the verify block before blaming the guard.
+
+## HAZARD — `pgbackrest` must always run as `postgres`
+
+Unrelated to theming, but it bit this run and belongs where an operator will see it.
+
+**Every `pgbackrest` invocation goes through `docker exec -u postgres epigraph-postgres …`.**
+Never as root.
+
+```bash
+# CORRECT
+docker exec -u postgres epigraph-postgres pgbackrest --stanza=main --type=full backup
+
+# WRONG — rewrites archive.info / backup.info as root:root
+docker exec epigraph-postgres pgbackrest --stanza=main --type=full backup
+```
+
+On 2026-08-19 the second form was used. `pgbackrest` rewrote `archive.info` and
+`backup.info` owned by `root:root`; the archiver process runs as `postgres`, so every
+subsequent `archive-push` failed with `[103] Permission denied`. Measured fallout:
+`pg_stat_archiver.failed_count` reached **1,791**, 711 WAL segments stranded, `pg_wal`
+grew from 161 MB to 12 GB, and the follow-up backup died on a WAL-archive timeout.
+
+Recovery, if it happens again:
+
+```bash
+docker exec epigraph-postgres chown -R postgres:postgres /var/lib/postgresql/data
+docker exec -u postgres epigraph-postgres psql -c "CHECKPOINT;"
+docker exec -u postgres epigraph-postgres pgbackrest --stanza=main --type=full backup
+docker exec epigraph-postgres psql -U epigraph -d epigraph \
+  -tAc "SELECT failed_count, last_failed_time, last_archived_time FROM pg_stat_archiver;"
+```
+
+The 2026-08-19 repair touched 25,710 files; the backlog then drained, a checkpoint
+recycled `pg_wal` (257 MB at time of writing), and a correct full backup was taken as
+`postgres`. `failed_count` is cumulative since `stats_reset` — judge health by
+`last_failed_time` versus `last_archived_time`, not by the counter being non-zero.
