@@ -2,31 +2,7 @@
 //!
 //! Verifies that the column exists in `information_schema.columns`.
 
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-
-async fn try_test_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&url)
-        .await
-        .ok()?;
-    sqlx::migrate!("../../migrations").run(&pool).await.expect("test DB migrations failed — likely a description/version mismatch with existing _sqlx_migrations; use a fresh DB");
-    Some(pool)
-}
-
-macro_rules! test_pool_or_skip {
-    () => {{
-        match try_test_pool().await {
-            Some(p) => p,
-            None => {
-                eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                return;
-            }
-        }
-    }};
-}
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn last_match_scan_at_column_exists(pool: PgPool) {

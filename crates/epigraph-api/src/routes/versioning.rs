@@ -582,8 +582,6 @@ pub async fn claim_history(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // ---- Handler integration tests (require DB) ----
     // Formerly in-memory tests gated behind #[cfg(not(feature = "db"))].
     // These need to be rewritten as proper DB integration tests.
