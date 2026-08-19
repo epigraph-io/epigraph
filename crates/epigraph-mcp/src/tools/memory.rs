@@ -283,8 +283,11 @@ async fn recall_post_embed(
     // On embedder failure (pgvec_opt is None), degrade to lexical-only — which,
     // unlike the old ILIKE fallback, still honors tag/agent scope because it
     // filters in SQL.
+    //
+    // `params.since` is threaded into BOTH branches: the window must not
+    // silently widen just because the embedder happened to be down.
     let hits: Vec<HybridHit> = match pgvec_opt.as_deref() {
-        Some(pgvec) => ClaimRepository::search_hybrid_scoped(
+        Some(pgvec) => ClaimRepository::search_hybrid_scoped_since(
             &server.pool,
             pgvec,
             &params.query,
@@ -293,16 +296,18 @@ async fn recall_post_embed(
             limit,
             tags_opt,
             agent_filter,
+            params.since,
         )
         .await
         .map_err(internal_error)?,
-        None => ClaimRepository::search_lexical_scoped(
+        None => ClaimRepository::search_lexical_scoped_since(
             &server.pool,
             &params.query,
             HYBRID_RRF_K,
             limit,
             tags_opt,
             agent_filter,
+            params.since,
         )
         .await
         .map_err(internal_error)?,
@@ -320,10 +325,11 @@ async fn recall_post_embed(
     // legs of one list.
     let workflow_hits: Vec<epigraph_db::WorkflowGoalEmbeddingHit> = if params.include_workflows {
         match pgvec_opt.as_deref() {
-            Some(pgvec) => WorkflowRepository::search_by_goal_embedding(
+            Some(pgvec) => WorkflowRepository::search_by_goal_embedding_since(
                 &server.pool,
                 pgvec,
                 HYBRID_CANDIDATE_POOL,
+                params.since,
             )
             .await
             .map_err(internal_error)?,
@@ -405,6 +411,11 @@ async fn recall_post_embed(
                             dispute_count: 0,
                             is_contested: false,
                             contesting_claim_ids: Vec::new(),
+                            // The claim's real creation instant, straight off
+                            // the row `get_by_id` already fetched — no extra
+                            // round-trip, and specifically NOT `updated_at`,
+                            // which a belief recompute rewrites corpus-wide.
+                            created_at: Some(claim.created_at),
                         });
                     }
                 }
@@ -430,6 +441,14 @@ async fn recall_post_embed(
                         dispute_count: 0,
                         is_contested: false,
                         contesting_claim_ids: Vec::new(),
+                        // The workflow's OWN `workflows.created_at`, selected
+                        // by the ANN leg. Not `Utc::now()`: a workflow row is
+                        // not a claim, and inventing a timestamp to satisfy
+                        // the type would make every workflow the newest thing
+                        // in the corpus and sort it first under any recency
+                        // preference — self-consistent, invisible on
+                        // inspection, and false.
+                        created_at: Some(hit.created_at),
                     });
                 }
             }
@@ -569,6 +588,11 @@ async fn recall_post_embed(
                 "agent_filter": agent_filter,
                 "include_workflows": params.include_workflows,
                 "exclude_contested": params.exclude_contested,
+                // A retrieval whose temporal window cannot be reconstructed
+                // from its audit row is an unauditable retrieval: the same
+                // query with and without a window returns different sets, so
+                // the window is part of what was asked.
+                "since": params.since,
             }),
             returned_claim_ids,
         };

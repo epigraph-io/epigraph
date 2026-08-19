@@ -1,6 +1,7 @@
 //! Claim repository for database operations
 
 use crate::errors::DbError;
+use chrono::{DateTime, Utc};
 use epigraph_core::{AgentId, Claim, ClaimId, TraceId, TruthValue};
 use epigraph_crypto::ContentHasher;
 use sqlx::PgPool;
@@ -586,6 +587,10 @@ impl ClaimRepository {
     /// # Errors
     /// * [`DbError::InvalidData`] if `dim` is neither 1536 nor 3072.
     /// * [`DbError::QueryFailed`] on database errors.
+    ///
+    /// Retained at its original arity as a delegating wrapper over
+    /// [`Self::search_by_embedding_since`]; `None` = no window = today's
+    /// behaviour.
     #[instrument(skip(pool, query_embedding_pgvector))]
     pub async fn search_by_embedding(
         pool: &PgPool,
@@ -593,6 +598,34 @@ impl ClaimRepository {
         dim: u32,
         limit: i64,
         paper_doi_filter: Option<&str>,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        Self::search_by_embedding_since(
+            pool,
+            query_embedding_pgvector,
+            dim,
+            limit,
+            paper_doi_filter,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::search_by_embedding`] plus an optional `created_at >= since`
+    /// window.
+    ///
+    /// The predicate sits in the same WHERE clause as the level/NULL guards,
+    /// i.e. before `ORDER BY … LIMIT`, so the window narrows the candidate
+    /// pool rather than trimming an already-truncated top-K (see
+    /// [`Self::search_hybrid_scoped_since`] for why that distinction decides
+    /// correctness rather than performance).
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn search_by_embedding_since(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        dim: u32,
+        limit: i64,
+        paper_doi_filter: Option<&str>,
+        since: Option<DateTime<Utc>>,
     ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
         let column = match dim {
             1536 => "embedding",
@@ -607,6 +640,11 @@ impl ClaimRepository {
         // Two query shapes — paper-filter vs no-filter — to keep both
         // index-friendly. The shared WHERE predicate matches the partial
         // HNSW index from migration 029 for the 1536d path.
+        //
+        // `since` is bound at a FIXED $3 in BOTH shapes and the conditional
+        // DOI moves to $4. Appending `since` after a conditionally-bound
+        // parameter would leave the no-filter shape with a bind-count
+        // mismatch — a runtime error, not a compile error.
         let sql = if paper_doi_filter.is_some() {
             format!(
                 r#"
@@ -615,12 +653,13 @@ impl ClaimRepository {
                 FROM claims c
                 WHERE (c.properties->>'level')::int = 2
                   AND c.{column} IS NOT NULL
+                  AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                   AND EXISTS (
                       SELECT 1 FROM edges e
                       JOIN papers p ON p.id = e.source_id
                       WHERE e.target_id = c.id
                         AND e.relationship = 'asserts'
-                        AND p.doi = $3
+                        AND p.doi = $4
                   )
                 ORDER BY c.{column} <=> $1::vector
                 LIMIT $2
@@ -634,6 +673,7 @@ impl ClaimRepository {
                 FROM claims c
                 WHERE (c.properties->>'level')::int = 2
                   AND c.{column} IS NOT NULL
+                  AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                 ORDER BY c.{column} <=> $1::vector
                 LIMIT $2
                 "#
@@ -642,7 +682,8 @@ impl ClaimRepository {
 
         let mut q = sqlx::query_as::<_, ClaimEmbeddingHit>(&sql)
             .bind(query_embedding_pgvector)
-            .bind(limit);
+            .bind(limit)
+            .bind(since);
         if let Some(doi) = paper_doi_filter {
             q = q.bind(doi);
         }
@@ -764,6 +805,12 @@ impl ClaimRepository {
     /// one round-trip. Both legs share the `is_current` / `labels @> tags` /
     /// `agent_id` predicates, so the only difference is the relevance signal.
     /// `candidate_pool` caps each leg before fusion; `k_rrf` is the RRF constant.
+    ///
+    /// Retained at its original arity as a delegating wrapper over
+    /// [`Self::search_hybrid_scoped_since`] so existing callers
+    /// (`epigraph-mcp`'s `McpEmbedder::search_hybrid_scoped` novelty path)
+    /// keep the call they already have. `None` = no creation-time window,
+    /// which is the pre-existing behaviour exactly.
     #[allow(clippy::too_many_arguments)]
     pub async fn search_hybrid_scoped(
         pool: &PgPool,
@@ -774,6 +821,47 @@ impl ClaimRepository {
         limit: i64,
         tags: Option<&[String]>,
         agent_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
+        Self::search_hybrid_scoped_since(
+            pool,
+            query_embedding_pgvector,
+            query_text,
+            candidate_pool,
+            k_rrf,
+            limit,
+            tags,
+            agent_id,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::search_hybrid_scoped`] plus an optional creation-time window.
+    ///
+    /// `since` is pushed into the WHERE clause of **both** the `dense` and
+    /// `lex` CTEs, i.e. ABOVE their `LIMIT $3`. This placement is the whole
+    /// point: each leg caps its candidate pool before fusion, so a window
+    /// applied to the fused output would first let `candidate_pool`
+    /// pre-window rows consume the entire pool and then discard them,
+    /// returning `[]` for a query that has a real answer. An empty result
+    /// reads to the caller as "nothing changed" — the exact inverse of the
+    /// truth — so this is a correctness requirement, not an optimisation.
+    ///
+    /// The predicate is `created_at`, never `updated_at`:
+    /// [`Self::batch_update_truth_values`] bumps `updated_at` on every claim a
+    /// belief recomputation touches without changing its content, so an
+    /// `updated_at` window would report the whole recomputed corpus as new.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_scoped_since(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        query_text: &str,
+        candidate_pool: i64,
+        k_rrf: i64,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
@@ -790,6 +878,7 @@ impl ClaimRepository {
                 WHERE c.embedding IS NOT NULL AND c.is_current
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
                   AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
+                  AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
                 ORDER BY c.embedding <=> $1::vector
                 LIMIT $3
             ),
@@ -800,6 +889,7 @@ impl ClaimRepository {
                 WHERE c.content_tsv @@ q AND c.is_current
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
                   AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
+                  AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
                 ORDER BY ts_rank_cd(c.content_tsv, q) DESC
                 LIMIT $3
             )
@@ -821,6 +911,7 @@ impl ClaimRepository {
         .bind(limit) // $5
         .bind(tags_owned) // $6
         .bind(agent_id) // $7
+        .bind(since) // $8
         .fetch_all(pool)
         .await?;
 
@@ -832,6 +923,10 @@ impl ClaimRepository {
     /// `in_lexical = true`; `rrf_score = 1/(k_rrf + rank)` keeps the score scale
     /// consistent with the hybrid path. Used as `recall`'s embedder-down
     /// fallback — unlike an ILIKE scan it honors the tag/agent scope in SQL.
+    ///
+    /// Retained at its original arity as a delegating wrapper over
+    /// [`Self::search_lexical_scoped_since`]; `None` = no window = today's
+    /// behaviour.
     pub async fn search_lexical_scoped(
         pool: &PgPool,
         query_text: &str,
@@ -839,6 +934,26 @@ impl ClaimRepository {
         limit: i64,
         tags: Option<&[String]>,
         agent_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
+        Self::search_lexical_scoped_since(pool, query_text, k_rrf, limit, tags, agent_id, None)
+            .await
+    }
+
+    /// [`Self::search_lexical_scoped`] plus an optional `created_at >= since`
+    /// window, applied in the WHERE clause above `LIMIT` for the same
+    /// pool-saturation reason documented on
+    /// [`Self::search_hybrid_scoped_since`]. This is the surface `recall`
+    /// falls back to when the embedder is down; a window that held on the
+    /// hybrid path but not here would silently widen on embedder failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_lexical_scoped_since(
+        pool: &PgPool,
+        query_text: &str,
+        k_rrf: i64,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
@@ -856,6 +971,7 @@ impl ClaimRepository {
             WHERE c.content_tsv @@ q AND c.is_current
               AND ($4::text[] IS NULL OR c.labels @> $4::text[])
               AND ($5::uuid IS NULL OR c.agent_id = $5::uuid)
+              AND ($6::timestamptz IS NULL OR c.created_at >= $6::timestamptz)
             ORDER BY ts_rank_cd(c.content_tsv, q) DESC
             LIMIT $3
             "#,
@@ -865,6 +981,7 @@ impl ClaimRepository {
         .bind(limit) // $3
         .bind(tags_owned) // $4
         .bind(agent_id) // $5
+        .bind(since) // $6
         .fetch_all(pool)
         .await?;
 
@@ -3073,6 +3190,21 @@ impl ClaimRepository {
     /// to produce it — this cap bounds the work itself.
     const MAX_EXPANSION_NODES: usize = 200;
 
+    /// Hard cap on the number of distinct claims [`Self::graph_expand_seeds`]
+    /// will *visit* when a `since` window is in force — as opposed to
+    /// [`Self::MAX_EXPANSION_NODES`], which caps how many it *emits*.
+    ///
+    /// Two budgets are needed because out-of-window claims are legitimate
+    /// BRIDGES: with one shared budget, 200 pre-window neighbours exhaust the
+    /// cap before the walk ever reaches the in-window claim behind them, and
+    /// the call returns `[]`. Unwindowed, emitted == visited, so
+    /// `MAX_EXPANSION_NODES` binds first and behaviour is bit-identical to
+    /// before this budget existed. Windowed, the walk may cost up to
+    /// `MAX_EXPANSION_VISITS` sequential `get_by_source` round-trips — 5× the
+    /// old worst case, paid only on the path where the old bound produced
+    /// wrong answers rather than slow ones.
+    const MAX_EXPANSION_VISITS: usize = 1_000;
+
     /// Bounded multi-hop BFS from a set of seed claims, following outgoing
     /// edges whose relationship is in [`EXPANSION_RELATIONSHIPS`].
     ///
@@ -3087,11 +3219,15 @@ impl ClaimRepository {
     /// have them as ANN hits); a claim reachable from more than one seed, or
     /// at more than one hop count, is returned once at its shortest hop
     /// count. `max_depth` is clamped to `[1, 4]` to match `traverse`'s depth
-    /// bound; the number of DISTINCT claims discovered is separately capped
-    /// at [`Self::MAX_EXPANSION_NODES`] (mirroring `traverse`'s `node_limit`)
-    /// so a dense graph can't turn one `recall_with_context` call into an
+    /// bound; the number of DISTINCT claims EMITTED is separately capped at
+    /// [`Self::MAX_EXPANSION_NODES`] (mirroring `traverse`'s `node_limit`) so
+    /// a dense graph can't turn one `recall_with_context` call into an
     /// unbounded sequential BFS. When the cap is hit mid-frontier the BFS
     /// stops immediately — same tradeoff `traverse` makes.
+    ///
+    /// Retained at its original three-argument arity as a delegating wrapper
+    /// over [`Self::graph_expand_seeds_since`]; `None` = no window = today's
+    /// behaviour, so out-of-workspace callers keep the call they have.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any underlying edge query fails.
@@ -3101,19 +3237,71 @@ impl ClaimRepository {
         seed_ids: &[Uuid],
         max_depth: u32,
     ) -> Result<Vec<GraphExpansionHit>, DbError> {
+        Self::graph_expand_seeds_since(pool, seed_ids, max_depth, None).await
+    }
+
+    /// [`Self::graph_expand_seeds`] plus an optional `created_at >= since`
+    /// window on the EMITTED destinations.
+    ///
+    /// The reached claims are folded into `recall_with_context`'s top-level
+    /// `results`, so they must satisfy the caller's window like any other
+    /// hit. Two things follow, and they pull in opposite directions:
+    ///
+    /// 1. **The walk is not pruned.** A claim created in 2024 is a perfectly
+    ///    legitimate BRIDGE to a claim created yesterday; stopping at it would
+    ///    sever reachability the unwindowed call would have found. So the BFS
+    ///    traverses through out-of-window nodes and filters only what it
+    ///    emits.
+    /// 2. **Out-of-window nodes therefore must not consume the emission
+    ///    budget.** Membership is resolved per BFS level, in one batched
+    ///    set-membership query, and only in-window destinations count toward
+    ///    [`Self::MAX_EXPANSION_NODES`]; the walk itself is bounded separately
+    ///    by [`Self::MAX_EXPANSION_VISITS`]. A single shared budget would let
+    ///    200 pre-window neighbours exhaust it before the walk reached the one
+    ///    in-window claim behind them, and the caller would read the resulting
+    ///    `[]` as "nothing changed since T" — the same silent inversion that
+    ///    post-filtering a saturated candidate pool produces on the ANN legs.
+    ///
+    /// Truncation is still possible (a windowed walk can exceed
+    /// `MAX_EXPANSION_VISITS` before filling the emission budget), so an empty
+    /// return is "nothing in-window within the traversed neighbourhood", not a
+    /// proof that nothing in-window is reachable. What it is no longer is an
+    /// artefact of out-of-window rows crowding the budget.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any underlying edge query fails.
+    #[instrument(skip(pool, seed_ids))]
+    pub async fn graph_expand_seeds_since(
+        pool: &PgPool,
+        seed_ids: &[Uuid],
+        max_depth: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<GraphExpansionHit>, DbError> {
         let max_depth = max_depth.clamp(1, 4) as i32;
         let seeds: std::collections::HashSet<Uuid> = seed_ids.iter().copied().collect();
+
+        // Unwindowed, every visited node is emitted, so the emission cap is
+        // the only bound that can bind and the walk is byte-identical to the
+        // pre-window implementation. Windowed, the larger visit budget buys
+        // the walk room to get past an out-of-window neighbourhood.
+        let visit_budget = if since.is_some() {
+            Self::MAX_EXPANSION_VISITS
+        } else {
+            Self::MAX_EXPANSION_NODES
+        };
 
         let mut visited: std::collections::HashSet<Uuid> = seeds.clone();
         let mut discovered_at: std::collections::HashMap<Uuid, i32> =
             std::collections::HashMap::new();
         let mut frontier: Vec<Uuid> = seed_ids.to_vec();
         let mut depth = 0;
+        let mut stop = false;
 
-        'bfs: while depth < max_depth && !frontier.is_empty() {
+        while depth < max_depth && !frontier.is_empty() && !stop {
             depth += 1;
             let mut next_frontier = Vec::new();
-            for &node in &frontier {
+            let mut level_new: Vec<Uuid> = Vec::new();
+            'level: for &node in &frontier {
                 let outgoing =
                     crate::repos::edge::EdgeRepository::get_by_source(pool, node, "claim").await?;
                 for e in outgoing {
@@ -3121,14 +3309,48 @@ impl ClaimRepository {
                         continue;
                     }
                     if visited.insert(e.target_id) {
-                        discovered_at.insert(e.target_id, depth);
+                        level_new.push(e.target_id);
                         next_frontier.push(e.target_id);
-                        if discovered_at.len() >= Self::MAX_EXPANSION_NODES {
-                            break 'bfs;
+                        if visited.len() - seeds.len() >= visit_budget {
+                            stop = true;
+                            break 'level;
                         }
                     }
                 }
             }
+
+            // One batched membership round-trip per level (≤ 4 total), not one
+            // per node and not a Rust-side filter over an already-truncated
+            // page. Iterating `level_new` rather than the SQL row order keeps
+            // emission deterministic when the budget truncates mid-level.
+            let admitted: Vec<Uuid> = match since {
+                None => level_new,
+                Some(_) if level_new.is_empty() => level_new,
+                Some(since) => {
+                    let in_window: std::collections::HashSet<Uuid> = sqlx::query_scalar::<_, Uuid>(
+                        "SELECT id FROM claims WHERE id = ANY($1) AND created_at >= $2",
+                    )
+                    .bind(&level_new)
+                    .bind(since)
+                    .fetch_all(pool)
+                    .await?
+                    .into_iter()
+                    .collect();
+                    level_new
+                        .into_iter()
+                        .filter(|id| in_window.contains(id))
+                        .collect()
+                }
+            };
+
+            for id in admitted {
+                discovered_at.entry(id).or_insert(depth);
+                if discovered_at.len() >= Self::MAX_EXPANSION_NODES {
+                    stop = true;
+                    break;
+                }
+            }
+
             frontier = next_frontier;
         }
 

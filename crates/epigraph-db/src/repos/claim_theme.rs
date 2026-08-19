@@ -251,6 +251,12 @@ impl ClaimThemeRepository {
     /// hierarchical-paragraph level), used by MCP `recall_with_context`
     /// where the downstream batched-context fetch assumes paragraphs.
     /// REST passes `false` to match its historical behaviour.
+    ///
+    /// Retained at its original arity as a delegating wrapper over
+    /// [`Self::claims_in_themes_at_dim_since`], so the REST
+    /// `/api/v1/search/semantic?diverse=true` route (which reaches this
+    /// through `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`)
+    /// keeps the call it already has.
     pub async fn claims_in_themes_at_dim(
         pool: &PgPool,
         theme_ids: &[Uuid],
@@ -258,6 +264,37 @@ impl ClaimThemeRepository {
         limit: i32,
         centroid_dim: u32,
         paragraph_only: bool,
+    ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
+        Self::claims_in_themes_at_dim_since(
+            pool,
+            theme_ids,
+            query_vec,
+            limit,
+            centroid_dim,
+            paragraph_only,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::claims_in_themes_at_dim`] plus an optional
+    /// `created_at >= since` window.
+    ///
+    /// This is the diverse-retrieval candidate source, and it bypasses
+    /// `ClaimRepository::search_by_embedding` entirely — so a `since` wired
+    /// only into the flat ANN would be silently ignored whenever
+    /// `diverse=true`. That is precisely the bug class the existing
+    /// `paper_doi_filter` `TODO(diverse-recall)` already exhibits on this
+    /// path; the window must not become the second instance of it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claims_in_themes_at_dim_since(
+        pool: &PgPool,
+        theme_ids: &[Uuid],
+        query_vec: &str,
+        limit: i32,
+        centroid_dim: u32,
+        paragraph_only: bool,
+        since: Option<DateTime<Utc>>,
     ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
         let (_, claim_col) =
             centroid_columns_for_dim(centroid_dim).ok_or_else(|| DbError::InvalidData {
@@ -274,7 +311,8 @@ impl ClaimThemeRepository {
             "SELECT c.id, c.content, (1 - (c.{claim_col} <=> $2::vector))::float8 AS similarity \
              FROM claims c \
              WHERE c.theme_id = ANY($1) \
-               AND c.{claim_col} IS NOT NULL\
+               AND c.{claim_col} IS NOT NULL \
+               AND ($4::timestamptz IS NULL OR c.created_at >= $4::timestamptz)\
                {level_clause} \
              ORDER BY c.{claim_col} <=> $2::vector \
              LIMIT $3"
@@ -284,6 +322,7 @@ impl ClaimThemeRepository {
             .bind(theme_ids)
             .bind(query_vec)
             .bind(limit)
+            .bind(since)
             .fetch_all(pool)
             .await
             .map_err(DbError::from)?;

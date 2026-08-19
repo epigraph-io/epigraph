@@ -138,6 +138,34 @@ pub struct RecallWithContextParams {
     /// annotated with `dispute_count` / `is_contested` / `contesting_claim_ids`.
     #[serde(default)]
     pub exclude_contested: bool,
+    /// Optional RFC3339 creation-time window. When set, the candidate pool on
+    /// EVERY retrieval surface — flat ANN, the diverse/theme pipeline, and
+    /// graph expansion — is narrowed to claims with
+    /// `created_at >= since`, in SQL, before each surface's `LIMIT`, so no
+    /// hit older than `since` can reach the caller on any path.
+    ///
+    /// **Completeness caveat on `diverse=true`.** The theme *shortlist* is
+    /// chosen by centroid similarity before the window is applied, so a theme
+    /// holding only pre-window claims still consumes one of `max_themes`
+    /// slots and the page can come back SHORT of `limit`. Nothing pre-window
+    /// leaks; the result may just be less complete than an unwindowed diverse
+    /// call would suggest. Set `diverse=false` for a windowed query that must
+    /// be exhaustive.
+    ///
+    /// **Boundary: the window constrains top-level HITS, not their CONTEXT.**
+    /// `atoms`, `siblings`, `corroborates`, `neighbor_paragraphs`, `section`
+    /// and `paper` are deliberately NOT filtered. A two-year-old supporting
+    /// paragraph is legitimate evidence for a claim created yesterday;
+    /// dropping it would remove the caller's ability to see *why* a recent
+    /// hit is believed, which is the opposite of what this parameter is for.
+    /// "What changed since T" is a question about hits; the reasons a hit is
+    /// believed are older than the change by construction.
+    ///
+    /// Filters on creation time, never `updated_at` — belief recomputation
+    /// rewrites `updated_at` without changing content. Default: no window,
+    /// and no window is ever applied implicitly.
+    #[serde(default)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Spawn the fire-and-forget recall audit write (backlog 8cbffa0e).
@@ -232,6 +260,16 @@ pub struct RecallHit {
     /// The three strongest contesters (by their own `truth_value`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub contesting_claim_ids: Vec<Uuid>,
+    /// `claims.created_at` for this paragraph — its creation instant, not
+    /// `updated_at` and not the request time. `Option` +
+    /// `skip_serializing_if` so an unresolvable row omits the key instead of
+    /// reporting a fabricated timestamp.
+    ///
+    /// Surfaced on every hit whether or not `since` was supplied: the caller
+    /// needs the signal to arbitrate between a stale and a current memory
+    /// even when it did not ask for a window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -414,14 +452,22 @@ async fn apply_graph_expansion(
     pool: &sqlx::PgPool,
     seeds: Vec<epigraph_db::ClaimEmbeddingHit>,
     depth: u32,
+    since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<Vec<epigraph_db::ClaimEmbeddingHit>, McpError> {
     let seed_ids: Vec<Uuid> = seeds.iter().map(|h| h.claim_id).collect();
     let seed_similarity: std::collections::HashMap<Uuid, f64> =
         seeds.iter().map(|h| (h.claim_id, h.similarity)).collect();
 
-    let expansion = epigraph_db::ClaimRepository::graph_expand_seeds(pool, &seed_ids, depth)
-        .await
-        .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
+    // Expansion output is folded into `raw_hits`, i.e. into the TOP-LEVEL
+    // results — so it is a candidate-producing surface, not a context
+    // surface, and every row it contributes must satisfy the window. The
+    // walk itself is not pruned (an old claim may bridge to a new one); only
+    // the emitted destinations are, and only in-window destinations consume
+    // the expansion budget.
+    let expansion =
+        epigraph_db::ClaimRepository::graph_expand_seeds_since(pool, &seed_ids, depth, since)
+            .await
+            .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
 
     // Best (highest) decayed score per expanded claim, in case it's
     // reachable from more than one seed at different hop counts / seed
@@ -550,6 +596,10 @@ async fn recall_with_context_post_embed(
             // to level=2 so the downstream batched-context fetch (which
             // assumes paragraphs) has nothing to drop.
             paragraph_only: true,
+            // The diverse pipeline bypasses `search_by_embedding` entirely,
+            // so the window has to reach it here or `diverse=true` would
+            // silently ignore `since`.
+            since: params.since,
         };
         let selected =
             epigraph_engine::diverse_retrieval::run_diverse_pipeline(&server.pool, pgvec, config)
@@ -560,12 +610,13 @@ async fn recall_with_context_post_embed(
             // No themes (or no candidates in themes) — fall back to flat ANN
             // so callers still get results in a freshly-clustered or
             // unclustered corpus. Matches the REST diverse-mode fallback.
-            epigraph_db::ClaimRepository::search_by_embedding(
+            epigraph_db::ClaimRepository::search_by_embedding_since(
                 &server.pool,
                 pgvec,
                 centroid_dim,
                 flat_limit,
                 params.paper_doi_filter.as_deref(),
+                params.since,
             )
             .await
             .map_err(|e| internal_error(format!("kNN fallback: {e}")))?
@@ -582,12 +633,13 @@ async fn recall_with_context_post_embed(
         }
     } else {
         // Flat paragraph-primary kNN (level=2 only, optional paper_doi pre-filter).
-        epigraph_db::ClaimRepository::search_by_embedding(
+        epigraph_db::ClaimRepository::search_by_embedding_since(
             &server.pool,
             pgvec,
             centroid_dim,
             flat_limit,
             params.paper_doi_filter.as_deref(),
+            params.since,
         )
         .await
         .map_err(|e| internal_error(format!("kNN: {e}")))?
@@ -605,7 +657,16 @@ async fn recall_with_context_post_embed(
             server.agent_id().await.ok(),
             &params.query,
             pgvec,
-            serde_json::json!({"limit": limit, "min_truth": min_truth, "empty": true}),
+            // `since` is recorded on the EMPTY path too: "this window
+            // returned nothing at that time" is exactly the claim an audit
+            // has to be able to settle, and it is unsettleable without the
+            // window that produced it.
+            serde_json::json!({
+                "limit": limit,
+                "min_truth": min_truth,
+                "empty": true,
+                "since": params.since,
+            }),
             vec![],
         );
         return success_json(&RecallWithContextResponse {
@@ -629,7 +690,7 @@ async fn recall_with_context_post_embed(
     // ANN seeds — matching "expand seeds, then rank" rather than "rank seeds,
     // then expand the winners".
     if let Some(depth) = params.graph_expansion_depth {
-        raw_hits = apply_graph_expansion(&server.pool, raw_hits, depth).await?;
+        raw_hits = apply_graph_expansion(&server.pool, raw_hits, depth, params.since).await?;
     }
 
     // Stage 4.5: cross-encoder rerank + optional groundedness gate over the
@@ -833,6 +894,7 @@ async fn recall_with_context_post_embed(
             dispute_count: 0,
             is_contested: false,
             contesting_claim_ids: Vec::new(),
+            created_at: Some(core.created_at),
         });
     }
 
@@ -958,6 +1020,9 @@ async fn recall_with_context_post_embed(
             "rerank": params.rerank,
             "graph_expansion_depth": params.graph_expansion_depth,
             "exclude_contested": params.exclude_contested,
+            // See the empty-path literal above: the window is part of the
+            // question, so it has to survive into the audit row.
+            "since": params.since,
         }),
         results.iter().map(|h| h.paragraph_id).collect(),
     );
@@ -973,6 +1038,10 @@ async fn recall_with_context_post_embed(
 pub struct ParagraphCore {
     pub content: String,
     pub truth_value: f64,
+    /// `claims.created_at`, carried through the batched context fetch so the
+    /// hit can report a real creation instant without a second round-trip.
+    /// Context enrichment does NOT window on it — see `RecallHit::created_at`.
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 pub struct BatchedContext {
@@ -1400,10 +1469,17 @@ pub async fn fetch_batched_context(
     all_paragraph_ids.sort();
     all_paragraph_ids.dedup();
 
-    // 1. Paragraphs themselves (content + truth_value) — extended to cover neighbor IDs.
+    // 1. Paragraphs themselves (content + truth_value + created_at) — extended
+    //    to cover neighbor IDs.
+    //
+    //    Note what is NOT here: a `since` predicate. This fetch populates both
+    //    the hits' own metadata AND their context (siblings, neighbours,
+    //    atom parents), and the window is deliberately a hits-only concept —
+    //    windowing here would blank the context of a legitimately-returned
+    //    recent hit. The filtering happens on the candidate surfaces upstream.
     {
         let rows = sqlx::query!(
-            "SELECT id, content, truth_value FROM claims WHERE id = ANY($1)",
+            "SELECT id, content, truth_value, created_at FROM claims WHERE id = ANY($1)",
             &all_paragraph_ids
         )
         .fetch_all(pool)
@@ -1414,6 +1490,7 @@ pub async fn fetch_batched_context(
                 ParagraphCore {
                     content: r.content,
                     truth_value: r.truth_value,
+                    created_at: r.created_at,
                 },
             );
         }
