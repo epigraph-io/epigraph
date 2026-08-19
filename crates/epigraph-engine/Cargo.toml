@@ -30,6 +30,10 @@ linfa = { workspace = true }
 linfa-clustering = { workspace = true }
 ndarray = { workspace = true }
 sqlx = { workspace = true }
+# Creation-time (`since`) windows on the diverse-retrieval candidate pool.
+# Was dev-only until temporal recall put a `DateTime<Utc>` in a public
+# signature (`DiverseRetrievalConfig::since`).
+chrono = { workspace = true }
 
 [features]
 # Enables the live HTTP cross-encoder rerank client (Cohere/Voyage/Jina-style).

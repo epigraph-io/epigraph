@@ -32,11 +32,27 @@ pub async fn supersede_claim(
     )
     .await
     .map_err(internal_error)?;
+
+    // Retraction cascade (backlog 20e9ed83): the supporters this claim was
+    // feeding hold BBAs frozen from ITS interval at wire time, so without an
+    // explicit invalidation pass they keep believing a retracted claim
+    // forever. Best-effort by construction — the supersede transaction has
+    // already committed, and failing the call here would hand the caller an
+    // error for a write that succeeded (the retry then hits "already been
+    // superseded"). Enumerated from the REPLACEMENT id: supersede re-points
+    // outgoing edges onto it inside the transaction.
+    //
+    // Reported rather than silent so a caller reading a downstream claim
+    // straight after this call can see exactly what was repaired.
+    let cascade =
+        epigraph_engine::retraction_cascade::cascade_after_supersede(&server.pool, new_id).await;
+
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "new_claim_id": new_id,
             "superseded_claim_id": old_id,
             "reason": params.reason,
+            "belief_cascade": cascade,
         }))
         .map_err(internal_error)?,
     )]))
@@ -60,14 +76,24 @@ pub async fn mark_duplicate(
     crate::tools::claims::require_owner_or_admin(server, auth, dup_claim.agent_id.as_uuid())
         .await?;
 
-    ClaimRepository::mark_duplicate(&server.pool, dup_claim_id, ClaimId::from_uuid(canon))
-        .await
-        .map_err(internal_error)?;
+    // Dedup repairs the derived-record layer inside its own transaction
+    // (orphaned + stranded edge-factor BBAs) and hands back what still has to
+    // be re-derived through the DS pipeline. Same best-effort contract as
+    // supersede: the dedup's own failure is an error, the cascade's is not.
+    let cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
+        &server.pool,
+        dup_claim_id.into(),
+        canon,
+    )
+    .await
+    .map_err(internal_error)?;
+
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "duplicate_id": dup,
             "canonical_id": canon,
             "mode": "mark_duplicate",
+            "belief_cascade": cascade,
         }))
         .map_err(internal_error)?,
     )]))

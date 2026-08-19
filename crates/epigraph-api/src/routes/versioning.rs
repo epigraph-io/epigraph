@@ -41,6 +41,11 @@ pub struct DedupResponse {
     pub duplicate_id: Uuid,
     pub canonical_id: Uuid,
     pub mode: &'static str,
+    /// What the downstream belief cascade repaired (backlog 20e9ed83).
+    /// Additive and best-effort: an empty report means there was nothing
+    /// downstream, never that the dedup failed.
+    #[schema(value_type = Object)]
+    pub belief_cascade: epigraph_engine::retraction_cascade::CascadeReport,
 }
 
 // =============================================================================
@@ -83,6 +88,12 @@ pub struct SupersessionResponse {
     pub version: u32,
     /// When the new claim was created
     pub created_at: DateTime<Utc>,
+    /// What the downstream belief cascade repaired (backlog 20e9ed83).
+    /// Additive and best-effort: `#[serde(default)]` so payloads written
+    /// before this field existed still deserialize.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub belief_cascade: epigraph_engine::retraction_cascade::CascadeReport,
 }
 
 /// A single version entry in a claim's history
@@ -309,6 +320,17 @@ pub async fn supersede_claim(
         })
         .await;
 
+    // 9b. Retraction cascade (backlog 20e9ed83): the downstream claims this
+    // one was supporting hold edge-factor BBAs frozen from ITS interval at
+    // wire time, so nothing re-derives them on its own. Enumerated from the
+    // REPLACEMENT id, because supersede re-points outgoing edges onto it
+    // inside the transaction. Best-effort: the transaction has already
+    // committed, so a cascade failure must not turn a successful write into a
+    // reported error (the retry would hit "already been superseded").
+    let belief_cascade =
+        epigraph_engine::retraction_cascade::cascade_after_supersede(&state.db_pool, new_uuid)
+            .await;
+
     // 10. Trigger belief propagation for downstream factors (fire-and-forget).
     //
     // Supersession creates stale downstream beliefs: any factor that referenced
@@ -358,6 +380,7 @@ pub async fn supersede_claim(
             new_truth_value: request.truth_value,
             version: 0, // version counting now handled by DB chain walk
             created_at: now,
+            belief_cascade,
         }),
     ))
 }
@@ -420,10 +443,13 @@ pub async fn mark_duplicate(
         });
     }
 
-    epigraph_db::ClaimRepository::mark_duplicate(
+    // Dedup repairs the orphaned/stranded edge-factor BBAs inside its own
+    // transaction and then rebuilds the affected beliefs (backlog 20e9ed83).
+    // Only the dedup's own failure is an error; the cascade's is reported.
+    let belief_cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
         &state.db_pool,
-        epigraph_core::ClaimId::from_uuid(dup_id),
-        epigraph_core::ClaimId::from_uuid(req.canonical_id),
+        dup_id,
+        req.canonical_id,
     )
     .await
     .map_err(|e| match e {
@@ -468,6 +494,7 @@ pub async fn mark_duplicate(
         duplicate_id: dup_id,
         canonical_id: req.canonical_id,
         mode: "mark_duplicate",
+        belief_cascade,
     }))
 }
 
@@ -582,6 +609,10 @@ pub async fn claim_history(
 
 #[cfg(test)]
 mod tests {
+    // No `use super::*` here: the only remaining child module brings its own
+    // (`use super::super::*`), and the unused re-export trips
+    // `clippy -D warnings` in a file this change already touches.
+
     // ---- Handler integration tests (require DB) ----
     // Formerly in-memory tests gated behind #[cfg(not(feature = "db"))].
     // These need to be rewritten as proper DB integration tests.

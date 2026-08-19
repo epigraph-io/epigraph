@@ -77,6 +77,7 @@ fn params(query: &str, exclude_contested: bool) -> RecallParams {
         perspective_id: None,
         include_workflows: false,
         exclude_contested,
+        since: None,
     }
 }
 

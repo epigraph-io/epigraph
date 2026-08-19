@@ -101,6 +101,7 @@ async fn recall_include_workflows_true_returns_matching_workflow(pool: PgPool) {
         perspective_id: None,
         include_workflows: true,
         exclude_contested: false,
+        since: None,
     };
 
     let out = recall_with_pgvec(&server, params, Some(pgvec))
@@ -156,6 +157,7 @@ async fn recall_include_workflows_false_excludes_workflow_only_match(pool: PgPoo
         perspective_id: None,
         include_workflows: false,
         exclude_contested: false,
+        since: None,
     };
 
     // include_workflows defaults false: the workflows leg must not even be

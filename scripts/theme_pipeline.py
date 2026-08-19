@@ -36,23 +36,79 @@ def cluster_stats(conn, run_id):
         ]
 
 
-def select_clusters_to_split(stats, min_size=2000, p95_threshold=0.5, boundary_threshold=0.5):
-    """High-variance, large-enough clusters worth splitting."""
+# A cluster at or above this size is split regardless of how tight it looks.
+#
+# The variance thresholds below cannot be relied on to catch large clusters,
+# because `centroid_distance` and `boundary_ratio` are measured in UMAP-32
+# NORMALIZED space, not raw embedding space. UMAP(min_dist=0.0) deliberately
+# collapses each cluster, so a perfectly coherent 50k-member cluster reports a
+# p95 distance around 0.03 — two orders of magnitude under `p95_threshold=0.5`,
+# which is therefore unreachable for exactly the clusters most in need of
+# splitting. Meanwhile small clusters wedged between neighbours report high
+# boundary ratios (0.77, 0.83), so the variance tests preferentially split the
+# crumbs. That inversion produced the 2026-08-17 run: six themes holding 81.7%
+# of the corpus, alongside 67 themes under 2000 claims.
+#
+# The fix is an absolute ceiling rather than a retuned threshold. A retuned
+# threshold silently rots the moment the UMAP parameters change, because its
+# correct value is implied by a distance scale nothing states; a claim count is
+# scale-free and means the same thing in any embedding space. A theme this
+# large is a navigation failure on its own terms — `recall(diverse=true)` picks
+# `max_themes` themes and samples within them, so a theme spanning an entire
+# subject returns the same undifferentiated pool the flat search would.
+DEFAULT_MAX_SIZE = 8000
+
+
+def select_clusters_to_split(stats, min_size=2000, p95_threshold=0.5,
+                             boundary_threshold=0.5, max_size=DEFAULT_MAX_SIZE):
+    """Clusters worth splitting: oversized ones, plus high-variance ones.
+
+    Two independent triggers, deliberately OR-ed:
+
+    - size >= max_size — too big to be a useful theme, whatever its variance.
+    - size >= min_size AND (p95 or boundary above threshold) — the original
+      variance test, kept because it catches genuinely incoherent clusters
+      that are not yet oversized.
+
+    `min_size` still floors both: splitting a 300-claim cluster produces
+    fragments too small to navigate by.
+    """
     return sorted(
         s["cluster_id"] for s in stats
         if s["size"] >= min_size
-        and (s["p95_dist"] >= p95_threshold or s["mean_boundary"] >= boundary_threshold)
+        and (
+            s["size"] >= max_size
+            or s["p95_dist"] >= p95_threshold
+            or s["mean_boundary"] >= boundary_threshold
+        )
     )
 
 
-def stop_reason(current_k, target_k, iterations, max_iter, n_selected):
-    """Return a stop string, or None to continue."""
-    if current_k >= target_k:
-        return "target_k reached"
-    if n_selected == 0:
-        return "no split candidates"
+def count_oversized(stats, max_size=DEFAULT_MAX_SIZE):
+    """How many clusters are over the absolute size ceiling."""
+    return sum(1 for s in stats if s["size"] >= max_size)
+
+
+def stop_reason(current_k, target_k, iterations, max_iter, n_selected, n_oversized=0):
+    """Return a stop string, or None to continue.
+
+    `max_iter` is checked first so an oversized cluster that refuses to shrink
+    — a genuinely indivisible blob — terminates the loop instead of spinning.
+
+    `target_k` is a granularity FLOOR, not a licence to stop while a theme
+    still holds a large fraction of the corpus. In the 2026-08-17 run k reached
+    76 against target_k=72 purely by splitting small clusters, so the loop
+    reported success with six untouched giants. Holding the loop open while
+    `n_oversized > 0` is what makes the size trigger above actually reachable:
+    without this, the trigger fires on candidates the loop has already decided
+    it will never process.
+    """
     if iterations >= max_iter:
         return "max_iter reached"
+    if n_selected == 0:
+        return "no split candidates"
+    if current_k >= target_k and n_oversized == 0:
+        return "target_k reached"
     return None
 
 
@@ -79,11 +135,14 @@ def grow(conn, args):
     iterations = 0
     while True:
         stats = cluster_stats(conn, run_id)
-        selected = select_clusters_to_split(stats, min_size=args.min_size)
+        selected = select_clusters_to_split(stats, min_size=args.min_size,
+                                            max_size=args.max_size)
+        oversized = count_oversized(stats, max_size=args.max_size)
         reason = stop_reason(current_k(conn, run_id), args.target_k, iterations,
-                             args.max_iter, len(selected))
+                             args.max_iter, len(selected), oversized)
+        biggest = max((s["size"] for s in stats), default=0)
         print(f"  iter {iterations}: k={current_k(conn, run_id)} candidates={len(selected)} "
-              f"stop={reason}", file=sys.stderr)
+              f"oversized={oversized} biggest={biggest} stop={reason}", file=sys.stderr)
         if reason:
             print(f"  grow stopped: {reason}", file=sys.stderr)
             break
@@ -112,6 +171,11 @@ def main():
     p.add_argument("--all-claims", action="store_true")
     p.add_argument("--target-k", type=int, default=72)
     p.add_argument("--min-size", type=int, default=2000)
+    p.add_argument("--max-size", type=int, default=DEFAULT_MAX_SIZE,
+                   help="absolute claim-count ceiling; a cluster at or above this is "
+                        "split regardless of variance, and the grow loop will not stop "
+                        "on target_k while any cluster exceeds it "
+                        f"(default {DEFAULT_MAX_SIZE})")
     p.add_argument("--max-iter", type=int, default=8)
     p.add_argument("--run-id", default=None)
     p.add_argument("--from-run-id", default=None,
@@ -126,9 +190,14 @@ def main():
         print(json.dumps(grow(conn, args)))
     elif args.command == "discover":
         run_id = args.run_id or project_to_themes.latest_run_id(conn)
-        print(json.dumps({"run_id": run_id,
-                          "candidates": select_clusters_to_split(cluster_stats(conn, run_id),
-                                                                 min_size=args.min_size)}))
+        stats = cluster_stats(conn, run_id)
+        print(json.dumps({
+            "run_id": run_id,
+            "candidates": select_clusters_to_split(stats, min_size=args.min_size,
+                                                   max_size=args.max_size),
+            "oversized": count_oversized(stats, max_size=args.max_size),
+            "biggest": max((s["size"] for s in stats), default=0),
+        }))
     elif args.command == "project":
         run_id = args.run_id or project_to_themes.latest_run_id(conn)
         print(json.dumps({"status": "projected", "run_id": run_id,

@@ -1,6 +1,7 @@
 //! Claim repository for database operations
 
 use crate::errors::DbError;
+use chrono::{DateTime, Utc};
 use epigraph_core::{AgentId, Claim, ClaimId, TraceId, TruthValue};
 use epigraph_crypto::ContentHasher;
 use sqlx::PgPool;
@@ -85,6 +86,31 @@ pub struct EvolveStepResult {
     pub step_lineage_id: Uuid,
     pub edge_type: String,
     pub edge_id: Uuid,
+}
+
+/// What [`ClaimRepository::mark_duplicate_with_repair`] repaired in-transaction,
+/// and what the caller still has to re-derive outside it.
+///
+/// The repo layer can fix *where* a derived record lives (delete BBAs whose
+/// edge is gone, move BBAs whose edge moved) with pure SQL. It cannot
+/// recompute belief: that needs the Dempster-Shafer combine pipeline, which
+/// lives in `epigraph-engine`. So this struct is the hand-off.
+#[derive(Debug, Clone, Default)]
+pub struct DedupRepair {
+    /// Claims whose cached DS scalars no longer match their surviving BBA set:
+    /// both dedup endpoints, plus every third claim that lost a BBA to the
+    /// collision pre-deletes.
+    pub stale_claims: Vec<Uuid>,
+    /// `(edge_id, target_id, relationship)` for claim→claim edges re-sourced
+    /// from `dup` onto `canonical`. Their BBAs encode `dup`'s interval, frozen
+    /// at wire time; the caller must invalidate and re-wire them from
+    /// `canonical`.
+    pub resourced_edges: Vec<(Uuid, Uuid, String)>,
+    /// BBAs deleted because their edge was deleted (orphan repair).
+    pub deleted_bbas: u64,
+    /// BBAs moved from `dup` to `canonical` because their edge was re-pointed
+    /// (stranding repair).
+    pub moved_bbas: u64,
 }
 
 /// Input for [`ClaimRepository::patch_claim_atomic_conn`].
@@ -458,6 +484,31 @@ impl ClaimRepository {
         ))
     }
 
+    /// The authoring agent of a claim, or `None` when no such claim exists.
+    ///
+    /// Narrow read for callers that need attribution without paying for a full
+    /// [`Claim`] hydration — notably
+    /// `epigraph_engine::retraction_cascade::invalidate_and_rewire`, which
+    /// re-derives an edge-factor BBA and must attribute it the way the
+    /// edge-write path does ("A's author asserts A SUPPORTS B"), i.e. to the
+    /// **source** claim's author rather than to whoever triggered the
+    /// retraction.
+    ///
+    /// Exists as a repo function rather than an inline query at the call site
+    /// because `CLAUDE.md` keeps all SQL in `crates/epigraph-db/src/repos/`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_agent_id(pool: &PgPool, id: Uuid) -> Result<Option<Uuid>, DbError> {
+        let agent_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        Ok(agent_id)
+    }
+
     /// Get a claim by ID
     ///
     /// # Errors
@@ -591,6 +642,10 @@ impl ClaimRepository {
     /// # Errors
     /// * [`DbError::InvalidData`] if `dim` is neither 1536 nor 3072.
     /// * [`DbError::QueryFailed`] on database errors.
+    ///
+    /// Retained at its original arity as a delegating wrapper over
+    /// [`Self::search_by_embedding_since`]; `None` = no window = today's
+    /// behaviour.
     #[instrument(skip(pool, query_embedding_pgvector))]
     pub async fn search_by_embedding(
         pool: &PgPool,
@@ -598,6 +653,34 @@ impl ClaimRepository {
         dim: u32,
         limit: i64,
         paper_doi_filter: Option<&str>,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        Self::search_by_embedding_since(
+            pool,
+            query_embedding_pgvector,
+            dim,
+            limit,
+            paper_doi_filter,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::search_by_embedding`] plus an optional `created_at >= since`
+    /// window.
+    ///
+    /// The predicate sits in the same WHERE clause as the level/NULL guards,
+    /// i.e. before `ORDER BY … LIMIT`, so the window narrows the candidate
+    /// pool rather than trimming an already-truncated top-K (see
+    /// [`Self::search_hybrid_scoped_since`] for why that distinction decides
+    /// correctness rather than performance).
+    #[instrument(skip(pool, query_embedding_pgvector))]
+    pub async fn search_by_embedding_since(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        dim: u32,
+        limit: i64,
+        paper_doi_filter: Option<&str>,
+        since: Option<DateTime<Utc>>,
     ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
         let column = match dim {
             1536 => "embedding",
@@ -612,6 +695,11 @@ impl ClaimRepository {
         // Two query shapes — paper-filter vs no-filter — to keep both
         // index-friendly. The shared WHERE predicate matches the partial
         // HNSW index from migration 029 for the 1536d path.
+        //
+        // `since` is bound at a FIXED $3 in BOTH shapes and the conditional
+        // DOI moves to $4. Appending `since` after a conditionally-bound
+        // parameter would leave the no-filter shape with a bind-count
+        // mismatch — a runtime error, not a compile error.
         let sql = if paper_doi_filter.is_some() {
             format!(
                 r#"
@@ -620,12 +708,13 @@ impl ClaimRepository {
                 FROM claims c
                 WHERE (c.properties->>'level')::int = 2
                   AND c.{column} IS NOT NULL
+                  AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                   AND EXISTS (
                       SELECT 1 FROM edges e
                       JOIN papers p ON p.id = e.source_id
                       WHERE e.target_id = c.id
                         AND e.relationship = 'asserts'
-                        AND p.doi = $3
+                        AND p.doi = $4
                   )
                 ORDER BY c.{column} <=> $1::vector
                 LIMIT $2
@@ -639,6 +728,7 @@ impl ClaimRepository {
                 FROM claims c
                 WHERE (c.properties->>'level')::int = 2
                   AND c.{column} IS NOT NULL
+                  AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                 ORDER BY c.{column} <=> $1::vector
                 LIMIT $2
                 "#
@@ -647,7 +737,8 @@ impl ClaimRepository {
 
         let mut q = sqlx::query_as::<_, ClaimEmbeddingHit>(&sql)
             .bind(query_embedding_pgvector)
-            .bind(limit);
+            .bind(limit)
+            .bind(since);
         if let Some(doi) = paper_doi_filter {
             q = q.bind(doi);
         }
@@ -769,6 +860,12 @@ impl ClaimRepository {
     /// one round-trip. Both legs share the `is_current` / `labels @> tags` /
     /// `agent_id` predicates, so the only difference is the relevance signal.
     /// `candidate_pool` caps each leg before fusion; `k_rrf` is the RRF constant.
+    ///
+    /// Retained at its original arity as a delegating wrapper over
+    /// [`Self::search_hybrid_scoped_since`] so existing callers
+    /// (`epigraph-mcp`'s `McpEmbedder::search_hybrid_scoped` novelty path)
+    /// keep the call they already have. `None` = no creation-time window,
+    /// which is the pre-existing behaviour exactly.
     #[allow(clippy::too_many_arguments)]
     pub async fn search_hybrid_scoped(
         pool: &PgPool,
@@ -779,6 +876,47 @@ impl ClaimRepository {
         limit: i64,
         tags: Option<&[String]>,
         agent_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
+        Self::search_hybrid_scoped_since(
+            pool,
+            query_embedding_pgvector,
+            query_text,
+            candidate_pool,
+            k_rrf,
+            limit,
+            tags,
+            agent_id,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::search_hybrid_scoped`] plus an optional creation-time window.
+    ///
+    /// `since` is pushed into the WHERE clause of **both** the `dense` and
+    /// `lex` CTEs, i.e. ABOVE their `LIMIT $3`. This placement is the whole
+    /// point: each leg caps its candidate pool before fusion, so a window
+    /// applied to the fused output would first let `candidate_pool`
+    /// pre-window rows consume the entire pool and then discard them,
+    /// returning `[]` for a query that has a real answer. An empty result
+    /// reads to the caller as "nothing changed" — the exact inverse of the
+    /// truth — so this is a correctness requirement, not an optimisation.
+    ///
+    /// The predicate is `created_at`, never `updated_at`:
+    /// [`Self::batch_update_truth_values`] bumps `updated_at` on every claim a
+    /// belief recomputation touches without changing its content, so an
+    /// `updated_at` window would report the whole recomputed corpus as new.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_scoped_since(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        query_text: &str,
+        candidate_pool: i64,
+        k_rrf: i64,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
@@ -795,6 +933,7 @@ impl ClaimRepository {
                 WHERE c.embedding IS NOT NULL AND c.is_current
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
                   AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
+                  AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
                 ORDER BY c.embedding <=> $1::vector
                 LIMIT $3
             ),
@@ -805,6 +944,7 @@ impl ClaimRepository {
                 WHERE c.content_tsv @@ q AND c.is_current
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
                   AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
+                  AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
                 ORDER BY ts_rank_cd(c.content_tsv, q) DESC
                 LIMIT $3
             )
@@ -826,6 +966,7 @@ impl ClaimRepository {
         .bind(limit) // $5
         .bind(tags_owned) // $6
         .bind(agent_id) // $7
+        .bind(since) // $8
         .fetch_all(pool)
         .await?;
 
@@ -837,6 +978,10 @@ impl ClaimRepository {
     /// `in_lexical = true`; `rrf_score = 1/(k_rrf + rank)` keeps the score scale
     /// consistent with the hybrid path. Used as `recall`'s embedder-down
     /// fallback — unlike an ILIKE scan it honors the tag/agent scope in SQL.
+    ///
+    /// Retained at its original arity as a delegating wrapper over
+    /// [`Self::search_lexical_scoped_since`]; `None` = no window = today's
+    /// behaviour.
     pub async fn search_lexical_scoped(
         pool: &PgPool,
         query_text: &str,
@@ -844,6 +989,26 @@ impl ClaimRepository {
         limit: i64,
         tags: Option<&[String]>,
         agent_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
+        Self::search_lexical_scoped_since(pool, query_text, k_rrf, limit, tags, agent_id, None)
+            .await
+    }
+
+    /// [`Self::search_lexical_scoped`] plus an optional `created_at >= since`
+    /// window, applied in the WHERE clause above `LIMIT` for the same
+    /// pool-saturation reason documented on
+    /// [`Self::search_hybrid_scoped_since`]. This is the surface `recall`
+    /// falls back to when the embedder is down; a window that held on the
+    /// hybrid path but not here would silently widen on embedder failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_lexical_scoped_since(
+        pool: &PgPool,
+        query_text: &str,
+        k_rrf: i64,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
@@ -861,6 +1026,7 @@ impl ClaimRepository {
             WHERE c.content_tsv @@ q AND c.is_current
               AND ($4::text[] IS NULL OR c.labels @> $4::text[])
               AND ($5::uuid IS NULL OR c.agent_id = $5::uuid)
+              AND ($6::timestamptz IS NULL OR c.created_at >= $6::timestamptz)
             ORDER BY ts_rank_cd(c.content_tsv, q) DESC
             LIMIT $3
             "#,
@@ -870,6 +1036,7 @@ impl ClaimRepository {
         .bind(limit) // $3
         .bind(tags_owned) // $4
         .bind(agent_id) // $5
+        .bind(since) // $6
         .fetch_all(pool)
         .await?;
 
@@ -2781,6 +2948,11 @@ impl ClaimRepository {
     /// Sets `supersedes = canonical, is_current = false` on `dup` only.
     /// Refuses if `dup.supersedes` is already set.
     ///
+    /// Thin wrapper over [`ClaimRepository::mark_duplicate_with_repair`],
+    /// discarding the repair report. Existing callers that do not need to run
+    /// a downstream belief cascade keep the exact pre-cascade signature and
+    /// behaviour.
+    ///
     /// # Implementation Notes
     /// The UPDATE that sets `is_current = false` on the duplicate also sets
     /// `embedding = NULL` in the **same statement**, satisfying the CHECK
@@ -2795,6 +2967,52 @@ impl ClaimRepository {
         dup: ClaimId,
         canonical: ClaimId,
     ) -> Result<(), DbError> {
+        Self::mark_duplicate_with_repair(pool, dup, canonical)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`ClaimRepository::mark_duplicate`] plus in-transaction repair of the
+    /// **derived-record layer**, returning what the caller must re-derive.
+    ///
+    /// # Why the edge migration alone corrupts belief
+    /// Edge-factor BBAs are stored on the edge's **target** claim keyed
+    /// `perspective_id = edge_id` (`auto_wire_ds_for_edge` →
+    /// `store_with_perspective(pool, target_id, ...)`). Before this function
+    /// existed, dedup touched only `edges` and `claims`, which left two
+    /// distinct classes of wreckage — both instances of the MemTX I2
+    /// violation "retracting a belief leaves an orphaned derived record":
+    ///
+    /// * **Orphaned.** The three collision pre-deletes below remove edges
+    ///   whose BBA rows survive: `mass_functions_perspective_id_fkey`
+    ///   references `perspectives(id)`, and `perspectives` rows minted by
+    ///   `ensure_edge_perspective` have no FK back to `edges`, so nothing
+    ///   cascades. The phantom supporter keeps being combined forever.
+    /// * **Stranded.** `UPDATE edges SET target_id = canonical` re-points an
+    ///   edge while its BBA stays on `dup`, so `canonical` **under-counts**
+    ///   that supporter permanently — and it can never self-heal, because
+    ///   `MassFunctionRepository::exists_for_perspective` is keyed on
+    ///   `perspective_id` alone and ignores `claim_id`, so
+    ///   `auto_wire_edge_if_epistemic` short-circuits on it forever.
+    ///
+    /// Both repairs run inside the same transaction as the edge mutation, so
+    /// there is no window in which the graph is observably inconsistent.
+    ///
+    /// The returned [`DedupRepair`] carries the claims whose cached scalars
+    /// are now stale and the edges whose BBAs must be re-derived from
+    /// `canonical`'s interval instead of `dup`'s. Recombining those existing
+    /// BBA rows would be a numeric no-op — their `masses` were frozen at wire
+    /// time — so the caller-side cascade
+    /// (`epigraph_engine::retraction_cascade`) invalidates and re-wires them.
+    ///
+    /// # Errors
+    /// Same as [`ClaimRepository::mark_duplicate`].
+    #[instrument(skip(pool))]
+    pub async fn mark_duplicate_with_repair(
+        pool: &PgPool,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<DedupRepair, DbError> {
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         if dup_uuid == canon_uuid {
@@ -2880,7 +3098,12 @@ impl ClaimRepository {
         // `edges e2` (innermost scope in PostgreSQL), making the predicate
         // tautological and causing false-positive deletions of edges that should
         // be migrated.
-        sqlx::query(
+        // `RETURNING id, target_id` (here and on the two pre-deletes below) is
+        // the only addition to these statements: the edge rows are about to be
+        // gone, and their `perspective_id = id` BBAs — which live on
+        // `target_id` — have to be deleted with them, so the ids must be
+        // captured before the DELETE commits.
+        let mut deleted_edges: Vec<(Uuid, Uuid)> = sqlx::query_as(
             "DELETE FROM edges AS e \
              WHERE e.target_id = $2 AND e.target_type = 'claim' \
                AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
@@ -2892,34 +3115,38 @@ impl ClaimRepository {
                      AND e2.target_id = $1 \
                      AND e2.target_type = 'claim' \
                      AND e2.relationship = e.relationship \
-               )",
+               ) \
+             RETURNING e.id, e.target_id",
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
 
         // Drop outgoing dup-edges whose migrated triple already exists on canonical.
         // Same aliasing discipline: `e.target_id`, `e.target_type`, `e.relationship`
         // must refer to the outer (being-deleted) row, not the subquery table.
-        sqlx::query(
-            "DELETE FROM edges AS e \
-             WHERE e.source_id = $2 AND e.source_type = 'claim' \
-               AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
-               AND e.target_type = 'claim' AND e.target_id != $1 \
-               AND EXISTS ( \
-                   SELECT 1 FROM edges e2 \
-                   WHERE e2.source_id = $1 \
-                     AND e2.source_type = 'claim' \
-                     AND e2.target_id = e.target_id \
-                     AND e2.target_type = e.target_type \
-                     AND e2.relationship = e.relationship \
-               )",
-        )
-        .bind(canon_uuid)
-        .bind(dup_uuid)
-        .execute(&mut *tx)
-        .await?;
+        deleted_edges.extend(
+            sqlx::query_as::<_, (Uuid, Uuid)>(
+                "DELETE FROM edges AS e \
+                 WHERE e.source_id = $2 AND e.source_type = 'claim' \
+                   AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
+                   AND e.target_type = 'claim' AND e.target_id != $1 \
+                   AND EXISTS ( \
+                       SELECT 1 FROM edges e2 \
+                       WHERE e2.source_id = $1 \
+                         AND e2.source_type = 'claim' \
+                         AND e2.target_id = e.target_id \
+                         AND e2.target_type = e.target_type \
+                         AND e2.relationship = e.relationship \
+                   ) \
+                 RETURNING e.id, e.target_id",
+            )
+            .bind(canon_uuid)
+            .bind(dup_uuid)
+            .fetch_all(&mut *tx)
+            .await?,
+        );
 
         // Symmetric-collision guard for `alternative_of` (migration 042).
         //
@@ -2939,50 +3166,153 @@ impl ClaimRepository {
         // `canonical` already shares a symmetric `alternative_of` edge with the
         // same third claim.  Edges where `canonical` is itself an endpoint are
         // left for the self-loop guards in the migration UPDATEs below.
-        sqlx::query(
-            "DELETE FROM edges AS e \
-             WHERE e.relationship = 'alternative_of' \
-               AND e.source_type = 'claim' AND e.target_type = 'claim' \
-               AND (e.source_id = $2 OR e.target_id = $2) \
-               AND e.source_id != $1 AND e.target_id != $1 \
-               AND EXISTS ( \
-                   SELECT 1 FROM edges e2 \
-                   WHERE e2.relationship = 'alternative_of' \
-                     AND e2.source_type = 'claim' AND e2.target_type = 'claim' \
-                     AND e2.id <> e.id \
-                     AND LEAST(e2.source_id, e2.target_id) = \
-                         LEAST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
-                     AND GREATEST(e2.source_id, e2.target_id) = \
-                         GREATEST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
-               )",
-        )
-        .bind(canon_uuid)
-        .bind(dup_uuid)
-        .execute(&mut *tx)
-        .await?;
+        deleted_edges.extend(
+            sqlx::query_as::<_, (Uuid, Uuid)>(
+                "DELETE FROM edges AS e \
+                 WHERE e.relationship = 'alternative_of' \
+                   AND e.source_type = 'claim' AND e.target_type = 'claim' \
+                   AND (e.source_id = $2 OR e.target_id = $2) \
+                   AND e.source_id != $1 AND e.target_id != $1 \
+                   AND EXISTS ( \
+                       SELECT 1 FROM edges e2 \
+                       WHERE e2.relationship = 'alternative_of' \
+                         AND e2.source_type = 'claim' AND e2.target_type = 'claim' \
+                         AND e2.id <> e.id \
+                         AND LEAST(e2.source_id, e2.target_id) = \
+                             LEAST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
+                         AND GREATEST(e2.source_id, e2.target_id) = \
+                             GREATEST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
+                   ) \
+                 RETURNING e.id, e.target_id",
+            )
+            .bind(canon_uuid)
+            .bind(dup_uuid)
+            .fetch_all(&mut *tx)
+            .await?,
+        );
 
-        sqlx::query(
+        // ── Derived-record repair, part 1: no ORPHANS ────────────────────────
+        // Every edge the three guards just dropped takes its edge-factor BBA
+        // with it. Without this, the BBA outlives its edge (nothing cascades
+        // from `edges` to `mass_functions`) and keeps being combined into the
+        // target's belief forever.
+        let deleted_edge_ids: Vec<Uuid> = deleted_edges.iter().map(|(id, _)| *id).collect();
+        let deleted_bbas = if deleted_edge_ids.is_empty() {
+            0
+        } else {
+            sqlx::query("DELETE FROM mass_functions WHERE perspective_id = ANY($1)")
+                .bind(&deleted_edge_ids)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+        };
+
+        let retargeted: Vec<(Uuid,)> = sqlx::query_as(
             "UPDATE edges SET target_id = $1 \
              WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
-               AND NOT (source_type = 'claim' AND source_id = $1)",
+               AND NOT (source_type = 'claim' AND source_id = $1) \
+             RETURNING id",
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
 
-        sqlx::query(
+        // ── Derived-record repair, part 2: no STRANDINGS ─────────────────────
+        // Those edges now point at `canonical`, but their BBAs still sit on
+        // `dup`. Move them, so `canonical` counts the supporters its edges say
+        // it has.
+        let retargeted_ids: Vec<Uuid> = retargeted.into_iter().map(|(id,)| id).collect();
+        let mut moved_bbas = 0_u64;
+        if !retargeted_ids.is_empty() {
+            // `canonical` must be assigned to every frame whose BBAs it is
+            // about to inherit, or the frame-scoped read paths
+            // (`claim_frames.hypothesis_index`) would not see them.
+            sqlx::query(
+                "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) \
+                 SELECT $1, cf.frame_id, cf.hypothesis_index FROM claim_frames cf \
+                 WHERE cf.claim_id = $2 \
+                 ON CONFLICT (claim_id, frame_id) DO NOTHING",
+            )
+            .bind(canon_uuid)
+            .bind(dup_uuid)
+            .execute(&mut *tx)
+            .await?;
+
+            // Guard `mass_functions_unique_per_perspective`
+            // (claim_id, frame_id, source_agent_id, perspective_id, NULLS NOT
+            // DISTINCT — migration 034): if `canonical` somehow already holds
+            // a row for an incoming perspective, the move would raise and roll
+            // the whole dedup back, i.e. an existing caller would acquire a
+            // brand-new failure mode. Drop the canonical-side duplicate first;
+            // the row arriving from `dup` is the one whose edge survived.
+            sqlx::query(
+                "DELETE FROM mass_functions mf \
+                 WHERE mf.claim_id = $1 AND mf.perspective_id = ANY($3) \
+                   AND EXISTS ( \
+                       SELECT 1 FROM mass_functions m2 \
+                       WHERE m2.claim_id = $2 \
+                         AND m2.perspective_id = mf.perspective_id \
+                         AND m2.frame_id = mf.frame_id \
+                         AND m2.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id \
+                   )",
+            )
+            .bind(canon_uuid)
+            .bind(dup_uuid)
+            .bind(&retargeted_ids)
+            .execute(&mut *tx)
+            .await?;
+
+            moved_bbas = sqlx::query(
+                "UPDATE mass_functions SET claim_id = $1 \
+                 WHERE claim_id = $2 AND perspective_id = ANY($3)",
+            )
+            .bind(canon_uuid)
+            .bind(dup_uuid)
+            .bind(&retargeted_ids)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+
+        // Outgoing edges are re-sourced at `canonical`. Their BBAs live on the
+        // far end and are unmoved, but their *content* was frozen from `dup`'s
+        // interval at wire time, so they now misattribute. They cannot be
+        // fixed by recombination — the caller re-derives them (see
+        // `DedupRepair::resourced_edges`).
+        let resourced_rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
             "UPDATE edges SET source_id = $1 \
              WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes' \
-               AND NOT (target_type = 'claim' AND target_id = $1)",
+               AND NOT (target_type = 'claim' AND target_id = $1) \
+             RETURNING id, target_id, relationship, target_type",
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
+        let resourced_edges: Vec<(Uuid, Uuid, String)> = resourced_rows
+            .into_iter()
+            .filter(|(_, _, _, target_type)| target_type == "claim")
+            .map(|(id, target_id, relationship, _)| (id, target_id, relationship))
+            .collect();
 
         tx.commit().await?;
-        Ok(())
+
+        // Claims whose cached scalars no longer match their BBA set: the two
+        // dedup endpoints, plus every third claim that lost a BBA above.
+        let mut stale_claims = vec![canon_uuid, dup_uuid];
+        for (_, target) in &deleted_edges {
+            if !stale_claims.contains(target) {
+                stale_claims.push(*target);
+            }
+        }
+
+        Ok(DedupRepair {
+            stale_claims,
+            resourced_edges,
+            deleted_bbas,
+            moved_bbas,
+        })
     }
 
     /// Apply a patch atomically inside the supplied transaction. Returns a diff so
@@ -3078,6 +3408,21 @@ impl ClaimRepository {
     /// to produce it — this cap bounds the work itself.
     const MAX_EXPANSION_NODES: usize = 200;
 
+    /// Hard cap on the number of distinct claims [`Self::graph_expand_seeds`]
+    /// will *visit* when a `since` window is in force — as opposed to
+    /// [`Self::MAX_EXPANSION_NODES`], which caps how many it *emits*.
+    ///
+    /// Two budgets are needed because out-of-window claims are legitimate
+    /// BRIDGES: with one shared budget, 200 pre-window neighbours exhaust the
+    /// cap before the walk ever reaches the in-window claim behind them, and
+    /// the call returns `[]`. Unwindowed, emitted == visited, so
+    /// `MAX_EXPANSION_NODES` binds first and behaviour is bit-identical to
+    /// before this budget existed. Windowed, the walk may cost up to
+    /// `MAX_EXPANSION_VISITS` sequential `get_by_source` round-trips — 5× the
+    /// old worst case, paid only on the path where the old bound produced
+    /// wrong answers rather than slow ones.
+    const MAX_EXPANSION_VISITS: usize = 1_000;
+
     /// Bounded multi-hop BFS from a set of seed claims, following outgoing
     /// edges whose relationship is in [`EXPANSION_RELATIONSHIPS`].
     ///
@@ -3092,11 +3437,15 @@ impl ClaimRepository {
     /// have them as ANN hits); a claim reachable from more than one seed, or
     /// at more than one hop count, is returned once at its shortest hop
     /// count. `max_depth` is clamped to `[1, 4]` to match `traverse`'s depth
-    /// bound; the number of DISTINCT claims discovered is separately capped
-    /// at [`Self::MAX_EXPANSION_NODES`] (mirroring `traverse`'s `node_limit`)
-    /// so a dense graph can't turn one `recall_with_context` call into an
+    /// bound; the number of DISTINCT claims EMITTED is separately capped at
+    /// [`Self::MAX_EXPANSION_NODES`] (mirroring `traverse`'s `node_limit`) so
+    /// a dense graph can't turn one `recall_with_context` call into an
     /// unbounded sequential BFS. When the cap is hit mid-frontier the BFS
     /// stops immediately — same tradeoff `traverse` makes.
+    ///
+    /// Retained at its original three-argument arity as a delegating wrapper
+    /// over [`Self::graph_expand_seeds_since`]; `None` = no window = today's
+    /// behaviour, so out-of-workspace callers keep the call they have.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any underlying edge query fails.
@@ -3106,19 +3455,71 @@ impl ClaimRepository {
         seed_ids: &[Uuid],
         max_depth: u32,
     ) -> Result<Vec<GraphExpansionHit>, DbError> {
+        Self::graph_expand_seeds_since(pool, seed_ids, max_depth, None).await
+    }
+
+    /// [`Self::graph_expand_seeds`] plus an optional `created_at >= since`
+    /// window on the EMITTED destinations.
+    ///
+    /// The reached claims are folded into `recall_with_context`'s top-level
+    /// `results`, so they must satisfy the caller's window like any other
+    /// hit. Two things follow, and they pull in opposite directions:
+    ///
+    /// 1. **The walk is not pruned.** A claim created in 2024 is a perfectly
+    ///    legitimate BRIDGE to a claim created yesterday; stopping at it would
+    ///    sever reachability the unwindowed call would have found. So the BFS
+    ///    traverses through out-of-window nodes and filters only what it
+    ///    emits.
+    /// 2. **Out-of-window nodes therefore must not consume the emission
+    ///    budget.** Membership is resolved per BFS level, in one batched
+    ///    set-membership query, and only in-window destinations count toward
+    ///    [`Self::MAX_EXPANSION_NODES`]; the walk itself is bounded separately
+    ///    by [`Self::MAX_EXPANSION_VISITS`]. A single shared budget would let
+    ///    200 pre-window neighbours exhaust it before the walk reached the one
+    ///    in-window claim behind them, and the caller would read the resulting
+    ///    `[]` as "nothing changed since T" — the same silent inversion that
+    ///    post-filtering a saturated candidate pool produces on the ANN legs.
+    ///
+    /// Truncation is still possible (a windowed walk can exceed
+    /// `MAX_EXPANSION_VISITS` before filling the emission budget), so an empty
+    /// return is "nothing in-window within the traversed neighbourhood", not a
+    /// proof that nothing in-window is reachable. What it is no longer is an
+    /// artefact of out-of-window rows crowding the budget.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any underlying edge query fails.
+    #[instrument(skip(pool, seed_ids))]
+    pub async fn graph_expand_seeds_since(
+        pool: &PgPool,
+        seed_ids: &[Uuid],
+        max_depth: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<GraphExpansionHit>, DbError> {
         let max_depth = max_depth.clamp(1, 4) as i32;
         let seeds: std::collections::HashSet<Uuid> = seed_ids.iter().copied().collect();
+
+        // Unwindowed, every visited node is emitted, so the emission cap is
+        // the only bound that can bind and the walk is byte-identical to the
+        // pre-window implementation. Windowed, the larger visit budget buys
+        // the walk room to get past an out-of-window neighbourhood.
+        let visit_budget = if since.is_some() {
+            Self::MAX_EXPANSION_VISITS
+        } else {
+            Self::MAX_EXPANSION_NODES
+        };
 
         let mut visited: std::collections::HashSet<Uuid> = seeds.clone();
         let mut discovered_at: std::collections::HashMap<Uuid, i32> =
             std::collections::HashMap::new();
         let mut frontier: Vec<Uuid> = seed_ids.to_vec();
         let mut depth = 0;
+        let mut stop = false;
 
-        'bfs: while depth < max_depth && !frontier.is_empty() {
+        while depth < max_depth && !frontier.is_empty() && !stop {
             depth += 1;
             let mut next_frontier = Vec::new();
-            for &node in &frontier {
+            let mut level_new: Vec<Uuid> = Vec::new();
+            'level: for &node in &frontier {
                 let outgoing =
                     crate::repos::edge::EdgeRepository::get_by_source(pool, node, "claim").await?;
                 for e in outgoing {
@@ -3126,14 +3527,48 @@ impl ClaimRepository {
                         continue;
                     }
                     if visited.insert(e.target_id) {
-                        discovered_at.insert(e.target_id, depth);
+                        level_new.push(e.target_id);
                         next_frontier.push(e.target_id);
-                        if discovered_at.len() >= Self::MAX_EXPANSION_NODES {
-                            break 'bfs;
+                        if visited.len() - seeds.len() >= visit_budget {
+                            stop = true;
+                            break 'level;
                         }
                     }
                 }
             }
+
+            // One batched membership round-trip per level (≤ 4 total), not one
+            // per node and not a Rust-side filter over an already-truncated
+            // page. Iterating `level_new` rather than the SQL row order keeps
+            // emission deterministic when the budget truncates mid-level.
+            let admitted: Vec<Uuid> = match since {
+                None => level_new,
+                Some(_) if level_new.is_empty() => level_new,
+                Some(since) => {
+                    let in_window: std::collections::HashSet<Uuid> = sqlx::query_scalar::<_, Uuid>(
+                        "SELECT id FROM claims WHERE id = ANY($1) AND created_at >= $2",
+                    )
+                    .bind(&level_new)
+                    .bind(since)
+                    .fetch_all(pool)
+                    .await?
+                    .into_iter()
+                    .collect();
+                    level_new
+                        .into_iter()
+                        .filter(|id| in_window.contains(id))
+                        .collect()
+                }
+            };
+
+            for id in admitted {
+                discovered_at.entry(id).or_insert(depth);
+                if discovered_at.len() >= Self::MAX_EXPANSION_NODES {
+                    stop = true;
+                    break;
+                }
+            }
+
             frontier = next_frontier;
         }
 

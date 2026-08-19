@@ -266,6 +266,7 @@ fn rwc_params(
         perspective_id: perspective_id.map(|p| p.to_string()),
         graph_expansion_depth: None,
         exclude_contested: false,
+        since: None,
     }
 }
 
@@ -644,6 +645,7 @@ async fn plain_recall_lens_attaches_diverging_belief(pool: PgPool) {
                 perspective_id: perspective.map(|p| p.to_string()),
                 include_workflows: false,
                 exclude_contested: false,
+                since: None,
             },
         )
     };
@@ -770,6 +772,7 @@ async fn plain_recall_lens_degrades_one_bad_claim_without_failing_page(pool: PgP
             perspective_id: Some(persp.id.to_string()),
             include_workflows: false,
             exclude_contested: false,
+            since: None,
         },
     )
     .await
