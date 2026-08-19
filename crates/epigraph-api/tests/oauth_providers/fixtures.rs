@@ -13,9 +13,17 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 pub const TEST_KID: &str = "test-key-1";
 
 pub struct ProviderFixture {
-    #[allow(dead_code)] // shared across test binaries; not all use the mock_server handle.
+    #[allow(
+        dead_code,
+        reason = "shared oauth-provider fixture: compiled into every oauth integration-test \
+                  binary, and not all of them touch the mock_server handle"
+    )]
     pub mock_server: MockServer,
     pub jwks_url: String,
+    #[allow(
+        dead_code,
+        reason = "read only by `sign`, which some oauth integration-test binaries never call"
+    )]
     private_key: RsaPrivateKey,
 }
 
@@ -57,6 +65,11 @@ impl ProviderFixture {
     }
 
     /// Sign arbitrary JSON claims with the fixture key, matching the JWKS kid.
+    #[allow(
+        dead_code,
+        reason = "shared oauth-provider fixture: only the test binaries that exercise a \
+                  signed-assertion flow call this"
+    )]
     pub fn sign<C: Serialize>(&self, claims: &C) -> String {
         let pem = self
             .private_key

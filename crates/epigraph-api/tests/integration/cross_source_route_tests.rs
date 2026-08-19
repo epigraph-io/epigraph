@@ -195,19 +195,6 @@ async fn returns_corroborates_edges_and_pending_candidates(pool: PgPool) {
     let _ = (&cand.id, &cand.status, &cand.features);
 }
 
-#[derive(Debug, Deserialize)]
-struct ListedCandidate {
-    id: String,
-    claim_a: String,
-    claim_a_excerpt: String,
-    claim_b: String,
-    claim_b_excerpt: String,
-    score: f32,
-    verifier_verdict: Option<String>,
-    verifier_rationale: Option<String>,
-    created_at: String,
-}
-
 // ---------------------------------------------------------------------------
 // POST /api/v1/match_candidates/:id/decide — decision provenance.
 //
@@ -370,6 +357,15 @@ async fn decide_prefers_agent_id_over_client_id(pool: PgPool) {
 // NOTE: this route is registered in routes/mod.rs (Task 3 of the
 // 2026-07-11 xsm-telegram-approval plan) — this test only passes once
 // that registration lands.
+//
+// TODO: despite its name, this test only asserts the auth gate (401 without a
+// bearer token) — it never deserializes a response body, so the seeded
+// `verifier_verdict` / `verifier_rationale` and the excerpt projection are
+// NOT covered. It still needs an authenticated case that reads the body and
+// asserts `claim_a_excerpt` / `claim_b_excerpt` / `verifier_verdict` /
+// `verifier_rationale`. A `ListedCandidate` response struct naming exactly
+// those fields used to sit below this test unused; it was removed as dead
+// code (clippy `-D warnings`), so this comment is the surviving marker.
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_candidates_returns_pending_with_excerpts(pool: PgPool) {
     let agent = insert_agent(&pool).await;
