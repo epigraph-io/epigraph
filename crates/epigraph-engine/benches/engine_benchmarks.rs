@@ -10,6 +10,13 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use epigraph_core::{AgentId, Claim, TruthValue};
 use epigraph_engine::reputation::{ClaimOutcome, ReputationCalculator};
+#[expect(
+    deprecated,
+    reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+              probability but still on the live path (epigraph-api `submission.rs`, \
+              engine `service.rs`); the invariant must keep being covered until those \
+              callers migrate"
+)]
 use epigraph_engine::{
     BayesianUpdater, DagValidator, EvidenceType, EvidenceWeighter, PropagationOrchestrator,
 };
@@ -34,6 +41,13 @@ fn make_claim(truth: f64) -> Claim {
 // Bayesian update benchmarks
 // ---------------------------------------------------------------------------
 
+#[expect(
+    deprecated,
+    reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+              probability but still on the live path (epigraph-api `submission.rs`, \
+              engine `service.rs`); the invariant must keep being covered until those \
+              callers migrate"
+)]
 fn bench_bayesian_single_update(c: &mut Criterion) {
     let updater = BayesianUpdater::new();
     let prior = TruthValue::new(0.5).unwrap();
@@ -47,6 +61,13 @@ fn bench_bayesian_single_update(c: &mut Criterion) {
     });
 }
 
+#[expect(
+    deprecated,
+    reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+              probability but still on the live path (epigraph-api `submission.rs`, \
+              engine `service.rs`); the invariant must keep being covered until those \
+              callers migrate"
+)]
 fn bench_bayesian_sequential_updates(c: &mut Criterion) {
     let updater = BayesianUpdater::new();
 
@@ -63,6 +84,13 @@ fn bench_bayesian_sequential_updates(c: &mut Criterion) {
     });
 }
 
+#[expect(
+    deprecated,
+    reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+              probability but still on the live path (epigraph-api `submission.rs`, \
+              engine `service.rs`); the invariant must keep being covered until those \
+              callers migrate"
+)]
 fn bench_bayesian_initial_truth(c: &mut Criterion) {
     c.bench_function("bayesian_calculate_initial_truth", |b| {
         b.iter(|| BayesianUpdater::calculate_initial_truth(black_box(0.6), black_box(3)));

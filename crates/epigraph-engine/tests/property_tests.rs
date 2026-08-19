@@ -12,6 +12,13 @@
 //! 5. Reputation NEVER influences initial truth calculation
 
 use epigraph_core::TruthValue;
+#[expect(
+    deprecated,
+    reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+              probability but still on the live path (epigraph-api `submission.rs`, \
+              engine `service.rs`); the invariant must keep being covered until those \
+              callers migrate"
+)]
 use epigraph_engine::{BayesianUpdater, DagValidator, EvidenceWeighter};
 use proptest::prelude::*;
 use uuid::Uuid;
@@ -27,6 +34,13 @@ proptest! {
     /// This prevents "certainty lock-in" where a truth value reaches
     /// 0.0 or 1.0 and can never be updated again.
     #[test]
+    #[allow(
+        deprecated,
+        reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+                  probability but still on the live path (epigraph-api `submission.rs`, \
+                  engine `service.rs`); the invariant must keep being covered until those \
+                  callers migrate"
+    )]
     fn bayesian_update_preserves_bounds(
         prior_val in 0.0..=1.0_f64,
         likelihood_true in 0.0..=1.0_f64,
@@ -54,6 +68,13 @@ proptest! {
 
     /// Bayesian update with support always produces posteriors in [0.01, 0.99]
     #[test]
+    #[allow(
+        deprecated,
+        reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+                  probability but still on the live path (epigraph-api `submission.rs`, \
+                  engine `service.rs`); the invariant must keep being covered until those \
+                  callers migrate"
+    )]
     fn bayesian_update_with_support_preserves_bounds(
         prior_val in 0.0..=1.0_f64,
         strength in 0.0..=1.0_f64,
@@ -74,6 +95,13 @@ proptest! {
 
     /// Bayesian update with refutation always produces posteriors in [0.01, 0.99]
     #[test]
+    #[allow(
+        deprecated,
+        reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+                  probability but still on the live path (epigraph-api `submission.rs`, \
+                  engine `service.rs`); the invariant must keep being covered until those \
+                  callers migrate"
+    )]
     fn bayesian_update_with_refutation_preserves_bounds(
         prior_val in 0.0..=1.0_f64,
         strength in 0.0..=1.0_f64,
@@ -94,6 +122,13 @@ proptest! {
 
     /// Bayesian update rejects likelihoods outside [0, 1]
     #[test]
+    #[allow(
+        deprecated,
+        reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+                  probability but still on the live path (epigraph-api `submission.rs`, \
+                  engine `service.rs`); the invariant must keep being covered until those \
+                  callers migrate"
+    )]
     fn bayesian_update_rejects_invalid_likelihoods(
         prior_val in 0.0..=1.0_f64,
         bad_likelihood in prop::strategy::Union::new(vec![
@@ -365,6 +400,13 @@ proptest! {
     /// This test verifies the invariant by showing that the function's output
     /// depends ONLY on evidence parameters.
     #[test]
+    #[allow(
+        deprecated,
+        reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+                  probability but still on the live path (epigraph-api `submission.rs`, \
+                  engine `service.rs`); the invariant must keep being covered until those \
+                  callers migrate"
+    )]
     fn reputation_never_influences_initial_truth(
         evidence_weight in 0.0..=1.0_f64,
         evidence_count in 0..=20_usize,
@@ -399,6 +441,13 @@ proptest! {
     /// Initial truth is capped at 0.85 regardless of evidence parameters.
     /// No new claim should ever start with near-certain truth.
     #[test]
+    #[allow(
+        deprecated,
+        reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+                  probability but still on the live path (epigraph-api `submission.rs`, \
+                  engine `service.rs`); the invariant must keep being covered until those \
+                  callers migrate"
+    )]
     fn initial_truth_never_exceeds_cap(
         evidence_weight in 0.0..=1.0_f64,
         evidence_count in 0..=100_usize,
@@ -415,6 +464,13 @@ proptest! {
     /// With zero evidence (weight=0, count=0), initial truth is exactly 0.5
     /// (maximum uncertainty). This is the baseline.
     #[test]
+    #[allow(
+        deprecated,
+        reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+                  probability but still on the live path (epigraph-api `submission.rs`, \
+                  engine `service.rs`); the invariant must keep being covered until those \
+                  callers migrate"
+    )]
     fn zero_evidence_produces_maximum_uncertainty(
         _any_reputation in 0.0..=1.0_f64,
     ) {

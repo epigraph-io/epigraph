@@ -27,6 +27,13 @@
 //! - P(E) = P(E|H)*P(H) + P(E|~H)*P(~H)
 
 use epigraph_core::{AgentId, Claim, ClaimId, TruthValue};
+#[expect(
+    deprecated,
+    reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+              probability but still on the live path (epigraph-api `submission.rs`, \
+              engine `service.rs`); the invariant must keep being covered until those \
+              callers migrate"
+)]
 use epigraph_engine::{BayesianUpdater, DagValidator, EngineError, EvidenceWeighter};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -72,6 +79,13 @@ struct PropagationAuditRecord {
 /// 3. Recursively propagates to their dependents
 /// 4. Records an audit trail of all updates
 /// 5. Prevents cycles and infinite loops
+#[expect(
+    deprecated,
+    reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+              probability but still on the live path (epigraph-api `submission.rs`, \
+              engine `service.rs`); the invariant must keep being covered until those \
+              callers migrate"
+)]
 struct PropagationOrchestrator {
     /// Bayesian updater for truth calculations
     bayesian: BayesianUpdater,
@@ -92,6 +106,13 @@ struct PropagationOrchestrator {
     agent_reputations: HashMap<AgentId, f64>,
 }
 
+#[expect(
+    deprecated,
+    reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+              probability but still on the live path (epigraph-api `submission.rs`, \
+              engine `service.rs`); the invariant must keep being covered until those \
+              callers migrate"
+)]
 impl PropagationOrchestrator {
     /// Create a new propagation orchestrator
     fn new() -> Self {

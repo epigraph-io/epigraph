@@ -56,6 +56,13 @@ async fn insert_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
 
 /// Store a BBA: mass on the focal singleton {idx}, remainder on Θ, tagged with
 /// `evidence_type`, cross-source locality (locality factor 1.0), no perspective.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test fixture seeder: the 8 parameters are the 8 independent dimensions a \
+              stored BBA varies over (claim, frame row, frame, agent, evidence class, \
+              focal singleton, mass). Bundling them into a struct would only move the \
+              same 8 values to the 9 call sites."
+)]
 async fn store(
     pool: &PgPool,
     claim: Uuid,
