@@ -145,7 +145,13 @@ jobs:
         # on _sqlx_migrations whenever a new migration is added.
         run: cargo test -p epigraph-embeddings --locked -- --test-threads=1
       - name: Clippy
-        run: cargo clippy --workspace --locked -- -D warnings
+        # --all-targets is load-bearing, not cosmetic. Without it cargo lints
+        # only lib+bin targets, so `tests/`, `examples/` and `benches/` are
+        # never compiled by this gate — `touch`ing an example or an integration
+        # test and re-running produced "Finished ... 0.14s" with nothing
+        # rebuilt. That blind spot is how a backlog of clippy failures
+        # accumulated in the test/example targets unnoticed.
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Format check
         run: cargo fmt --check
 
