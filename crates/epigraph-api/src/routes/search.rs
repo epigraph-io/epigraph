@@ -1111,7 +1111,6 @@ mod tests {
 mod db_integration_tests {
     use super::*;
     use crate::state::{ApiConfig, AppState};
-    use sqlx::Row;
 
     async fn try_test_pool() -> Option<sqlx::PgPool> {
         let url = std::env::var("DATABASE_URL").ok()?;

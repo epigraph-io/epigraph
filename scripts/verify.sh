@@ -31,8 +31,11 @@ step() { printf '\n==> %s\n' "$*"; }
 step "cargo fmt --check"
 cargo fmt --check
 
-step "cargo clippy --workspace --locked -- -D warnings"
-cargo clippy --workspace --locked -- -D warnings
+# --all-targets is load-bearing: without it cargo lints only lib+bin targets,
+# leaving tests/, examples/ and benches/ completely unlinted. Keep in sync with
+# the Clippy step in ci.yml.
+step "cargo clippy --workspace --all-targets --locked -- -D warnings"
+cargo clippy --workspace --all-targets --locked -- -D warnings
 
 step "cargo build --workspace --locked"
 cargo build --workspace --locked

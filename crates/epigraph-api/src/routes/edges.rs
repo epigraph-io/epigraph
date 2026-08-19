@@ -2965,7 +2965,7 @@ mod db_tests {
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri(&format!(
+                    .uri(format!(
                         "/api/v1/edges?source_id={a}&target_id={b}&relationship=SUPPORTS"
                     ))
                     .body(Body::empty())
@@ -3008,7 +3008,7 @@ mod db_tests {
             .oneshot(
                 Request::builder()
                     .method("PATCH")
-                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .uri(format!("/api/v1/edges/{edge_id}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
@@ -3065,7 +3065,7 @@ mod db_tests {
             .oneshot(
                 Request::builder()
                     .method("PATCH")
-                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .uri(format!("/api/v1/edges/{edge_id}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
@@ -3121,7 +3121,7 @@ mod db_tests {
             .oneshot(
                 Request::builder()
                     .method("PATCH")
-                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .uri(format!("/api/v1/edges/{edge_id}"))
                     .header("content-type", "application/json")
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -3373,7 +3373,7 @@ mod db_tests {
             .oneshot(
                 Request::builder()
                     .method("PATCH")
-                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .uri(format!("/api/v1/edges/{edge_id}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
@@ -3440,7 +3440,7 @@ mod db_tests {
             .oneshot(
                 Request::builder()
                     .method("PATCH")
-                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .uri(format!("/api/v1/edges/{edge_id}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
@@ -3459,7 +3459,7 @@ mod db_tests {
             .oneshot(
                 Request::builder()
                     .method("PATCH")
-                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .uri(format!("/api/v1/edges/{edge_id}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
@@ -3545,7 +3545,7 @@ mod db_tests {
             .oneshot(
                 Request::builder()
                     .method("PATCH")
-                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .uri(format!("/api/v1/edges/{edge_id}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
@@ -3623,7 +3623,7 @@ mod db_tests {
             .oneshot(
                 Request::builder()
                     .method("PATCH")
-                    .uri(&format!("/api/v1/edges/{edge_id}"))
+                    .uri(format!("/api/v1/edges/{edge_id}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({

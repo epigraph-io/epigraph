@@ -74,7 +74,7 @@ pub fn build_prompt(d: &Dossier) -> String {
     for t in &d.fk_targets {
         p.push_str(&format!("- {}\n", t));
     }
-    p.push_str("\n");
+    p.push('\n');
     p.push_str(MD_INSTRUCTIONS);
     p
 }

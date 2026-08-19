@@ -1676,34 +1676,3 @@ pub async fn create_theme_with_centroid(
         service: "Create theme requires database".to_string(),
     })
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
-
-#[cfg(all(test, feature = "db"))]
-mod tests {
-    use super::*;
-    use crate::state::{ApiConfig, AppState};
-
-    async fn try_test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(3)
-            .connect(&url)
-            .await
-            .ok()?;
-        sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
-        Some(pool)
-    }
-
-    macro_rules! test_pool_or_skip {
-        () => {{
-            match try_test_pool().await {
-                Some(p) => p,
-                None => {
-                    eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                    return;
-                }
-            }
-        }};
-    }
-}

@@ -3,6 +3,10 @@ use std::net::SocketAddr;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn spawn_app(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) {
     let app = epigraph_api::build_app_for_tests(database_url)
         .await
@@ -29,6 +33,10 @@ pub async fn spawn_app(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) 
 ///
 /// Use this for tests of routes like `POST /api/v1/embeddings/neighborhood-density`
 /// whose handler returns 500 when no embedding service is configured.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn spawn_app_with_mock_embedding(
     database_url: &str,
 ) -> (SocketAddr, oneshot::Sender<()>) {
@@ -61,6 +69,10 @@ pub async fn spawn_app_with_mock_embedding(
 
 /// Returns a real signed JWT that the production bearer_auth_middleware will accept.
 /// Uses the same secret-fallback logic as `AppState::default_jwt_config`.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub fn test_bearer_token() -> String {
     let secret = std::env::var("EPIGRAPH_JWT_SECRET")
         .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
@@ -78,6 +90,10 @@ pub fn test_bearer_token() -> String {
     token
 }
 
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn seed_one_cluster(pool: &PgPool, size: usize) -> uuid::Uuid {
     sqlx::query("DELETE FROM graph_cluster_runs")
         .execute(pool)
@@ -152,6 +168,10 @@ pub async fn seed_one_cluster(pool: &PgPool, size: usize) -> uuid::Uuid {
 
 /// Issue a JWT with caller-specified scopes. evolve_step / dedup / patch_claim
 /// require `claims:write`; the existing test_bearer_token() issues only graph:read.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub fn test_bearer_token_with_scopes(scopes: &[&str]) -> String {
     let secret = std::env::var("EPIGRAPH_JWT_SECRET")
         .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
@@ -170,6 +190,10 @@ pub fn test_bearer_token_with_scopes(scopes: &[&str]) -> String {
 }
 
 /// Insert a system agent with a unique 32-byte public_key.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn seed_system_agent(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     let pk: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
@@ -185,21 +209,14 @@ pub async fn seed_system_agent(pool: &PgPool) -> Uuid {
     id
 }
 
-/// Connect to the configured test database. Tests that need just a pool
-/// (no spawned HTTP app) use this helper to centralize the connection.
-pub async fn test_pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .expect("connect to test db")
-}
-
 /// Insert an edge directly via SQL. Returns the generated edge id.
 /// Used by tests that need to seed edge fixtures without going through
 /// the HTTP edges route (e.g., tests of unique indexes, view closures,
 /// or relationships not yet exposed by the public API).
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn insert_edge(
     pool: &PgPool,
     source_id: Uuid,
@@ -224,6 +241,10 @@ pub async fn insert_edge(
 }
 
 /// Insert a minimal claim with per-call unique content_hash.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn seed_claim(pool: &PgPool, content: &str) -> Uuid {
     let agent = seed_system_agent(pool).await;
     let id = Uuid::new_v4();
@@ -244,6 +265,10 @@ pub async fn seed_claim(pool: &PgPool, content: &str) -> Uuid {
 
 /// Insert a claim whose `agent_id` is the given UUID.
 /// Also inserts an `agents` row for that UUID so the FK is satisfied.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn seed_claim_with_agent(pool: &PgPool, content: &str, agent_id: Uuid) -> Uuid {
     // Ensure the agent row exists (may already exist from a previous call).
     let pk: Vec<u8> = agent_id
@@ -280,6 +305,10 @@ pub async fn seed_claim_with_agent(pool: &PgPool, content: &str, agent_id: Uuid)
 }
 
 /// Insert a claim with explicit labels.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn seed_claim_with_labels(pool: &PgPool, content: &str, labels: &[&str]) -> Uuid {
     let id = seed_claim(pool, content).await;
     let labels_owned: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
@@ -295,6 +324,10 @@ pub async fn seed_claim_with_labels(pool: &PgPool, content: &str, labels: &[&str
 /// Seed an oauth_clients row matching client_id (provenance_log.submitted_by FK).
 /// Real schema: id, client_id varchar(64), client_secret_hash bytea (nullable),
 /// client_name, client_type, allowed_scopes text[], granted_scopes text[], status.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn seed_oauth_client(pool: &PgPool, client_id: Uuid) {
     sqlx::query(
         "INSERT INTO oauth_clients (id, client_id, client_name, client_type, legal_entity_name, legal_contact_email, allowed_scopes, granted_scopes, status) \
@@ -310,6 +343,10 @@ pub async fn seed_oauth_client(pool: &PgPool, client_id: Uuid) {
 
 /// Issue a JWT bound to a real seeded oauth_clients row so provenance writes
 /// don't violate the FK. Returns (token, client_id).
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn test_bearer_token_with_seeded_client(
     pool: &PgPool,
     scopes: &[&str],
@@ -346,6 +383,10 @@ pub async fn test_bearer_token_with_seeded_client(
 /// rows for an unencrypted test claim instead of erroring. The A3 tests never
 /// INSERT here, so no FKs/CHECKs are needed; `IF NOT EXISTS` makes it a no-op
 /// when the table is already present (e.g. a prod-shaped DB).
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn ensure_claim_encryption_table(pool: &PgPool) {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS claim_encryption ( \
@@ -371,6 +412,10 @@ pub async fn ensure_claim_encryption_table(pool: &PgPool) {
 /// the requester from `auth_ctx.agent_id` (falling back to `client_id`), NOT
 /// the query-string `agent_id`, so this token — and only this token — drives
 /// the OWNER (Full) vs STRANGER (Redacted) distinction.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub fn mint_token_with_agent(scopes: &[&str], agent_id: Uuid) -> String {
     let secret = std::env::var("EPIGRAPH_JWT_SECRET")
         .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
@@ -398,6 +443,10 @@ pub fn mint_token_with_agent(scopes: &[&str], agent_id: Uuid) -> String {
 /// turning the A3 `frame_claims_sorted` regression guard RED. Mirrors
 /// `ensure_claim_encryption_table`: `IF NOT EXISTS` makes it a no-op on a DB
 /// where 044 has already run.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn ensure_frame_properties_column(pool: &PgPool) {
     sqlx::query(
         "ALTER TABLE frames ADD COLUMN IF NOT EXISTS properties JSONB NOT NULL DEFAULT '{}'::jsonb",
@@ -414,6 +463,10 @@ pub async fn ensure_frame_properties_column(pool: &PgPool) {
 /// claim must be in the frame for it to appear in the page at all. Scoping the
 /// query to a fresh per-test frame also makes the seeded claim the only row,
 /// avoiding paging flakiness on the shared test DB.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn seed_frame_with_claim(pool: &PgPool, claim_id: Uuid) -> Uuid {
     let frame_id = Uuid::new_v4();
     sqlx::query(
@@ -441,6 +494,10 @@ pub async fn seed_frame_with_claim(pool: &PgPool, claim_id: Uuid) -> Uuid {
 /// CHECK constraint, so it must be 'claim'. Create the claim first with
 /// `seed_claim_with_agent(pool, content, owner_id)` so the owner agent row
 /// exists.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
 pub async fn seed_private_ownership(pool: &PgPool, node_id: Uuid, owner_id: Uuid) {
     sqlx::query(
         "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \

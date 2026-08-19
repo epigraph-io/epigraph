@@ -45,7 +45,6 @@ fn read(path: &str) -> Value {
 fn arr<'a>(v: &'a Value, key: &str) -> &'a Vec<Value> {
     v.get(key)
         .and_then(|x| x.as_array())
-        .map(|a| a)
         .unwrap_or_else(|| panic!("missing array {key}"))
 }
 fn s(v: &Value, key: &str) -> String {
@@ -118,7 +117,7 @@ fn ow_bba_json(frame: &FrameOfDiscernment, hyps: &[String], masses: &Map<String,
 
 /// Match a (possibly latin-suffixed) evidence treatment_key back onto a clean
 /// treatment key. COPIED from the converter's inline fuzzy-match logic.
-fn match_treatment<'a>(pkg: &'a Value, raw_tk: &str) -> (String, String) {
+fn match_treatment(pkg: &Value, raw_tk: &str) -> (String, String) {
     let matched = arr(pkg, "treatments").iter().find(|t| {
         let k = s(t, "key");
         !k.is_empty()
@@ -264,15 +263,15 @@ async fn merge_interview_and_recompute() {
     // STAGE A: build the discovery cluster exactly as the converter
     // ============================================================
     let mut metas: Vec<ClaimMeta> = Vec::new();
-    let mut push_claim = |metas: &mut Vec<ClaimMeta>,
-                          key: String,
-                          kind: &str,
-                          frame_key: &str,
-                          content: String,
-                          treatment: Option<String>,
-                          symptom: Option<String>,
-                          dimension: Option<String>,
-                          evidence: Vec<Value>| {
+    let push_claim = |metas: &mut Vec<ClaimMeta>,
+                      key: String,
+                      kind: &str,
+                      frame_key: &str,
+                      content: String,
+                      treatment: Option<String>,
+                      symptom: Option<String>,
+                      dimension: Option<String>,
+                      evidence: Vec<Value>| {
         let (fu, hyps) = frame_of.get(frame_key).expect("frame").clone();
         metas.push(ClaimMeta {
             key,
@@ -339,7 +338,7 @@ async fn merge_interview_and_recompute() {
         for eff in tev
             .get("efficacy")
             .and_then(|x| x.as_array())
-            .map(|a| a.clone())
+            .cloned()
             .unwrap_or_default()
         {
             let sk = s(&eff, "symptom_key");
@@ -477,7 +476,7 @@ async fn merge_interview_and_recompute() {
         for eff in tev
             .get("efficacy")
             .and_then(|x| x.as_array())
-            .map(|a| a.clone())
+            .cloned()
             .unwrap_or_default()
         {
             let sk = s(&eff, "symptom_key");

@@ -50,7 +50,7 @@ fn singleton_nodes_each_get_own_community() {
         resolution: 1.0,
     };
     let result = louvain(&input).expect("louvain runs on edge-free graph");
-    let mut comms: Vec<u32> = result.assignments.iter().copied().collect();
+    let mut comms: Vec<u32> = result.assignments.to_vec();
     comms.sort();
     comms.dedup();
     assert_eq!(comms.len(), 3, "three isolated nodes -> three communities");
@@ -68,7 +68,7 @@ fn star_graph_is_one_community() {
         resolution: 1.0,
     };
     let result = louvain(&input).expect("louvain runs");
-    let mut uniq: Vec<u32> = result.assignments.iter().copied().collect();
+    let mut uniq: Vec<u32> = result.assignments.to_vec();
     uniq.sort();
     uniq.dedup();
     assert_eq!(uniq.len(), 1, "star graph should be one community");

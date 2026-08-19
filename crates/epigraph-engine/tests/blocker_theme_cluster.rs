@@ -1,31 +1,8 @@
 //! Integration test for ThemeClusterBlocker.
 
 use epigraph_engine::matching::blocker::{theme_cluster::ThemeClusterBlocker, Blocker};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-async fn try_test_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&url)
-        .await
-        .ok()?;
-    sqlx::migrate!("../../migrations").run(&pool).await.expect("test DB migrations failed — likely a description/version mismatch with existing _sqlx_migrations; use a fresh DB");
-    Some(pool)
-}
-macro_rules! test_pool_or_skip {
-    () => {
-        match try_test_pool().await {
-            Some(p) => p,
-            None => {
-                eprintln!("Skipping DB test: DATABASE_URL not set");
-                return;
-            }
-        }
-    };
-}
 
 async fn insert_agent(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();

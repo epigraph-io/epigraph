@@ -21,7 +21,6 @@ use std::collections::{BTreeSet, HashMap};
 use epigraph_ds::{FrameOfDiscernment, MassFunction};
 use epigraph_engine::bp::FactorPotential;
 use epigraph_engine::cdst_bp::{run_cdst_bp, CdstBpConfig};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -127,28 +126,6 @@ fn higher_corroborates_strength_yields_higher_betp_rise() {
 }
 
 // ── DB trigger wiring (migration 037) ──────────────────────────────────────
-
-async fn try_test_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&url)
-        .await
-        .ok()?;
-    sqlx::migrate!("../../migrations").run(&pool).await.expect("test DB migrations failed — likely a description/version mismatch with existing _sqlx_migrations; use a fresh DB");
-    Some(pool)
-}
-macro_rules! test_pool_or_skip {
-    () => {
-        match try_test_pool().await {
-            Some(p) => p,
-            None => {
-                eprintln!("Skipping DB test: DATABASE_URL not set");
-                return;
-            }
-        }
-    };
-}
 
 async fn insert_agent(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();

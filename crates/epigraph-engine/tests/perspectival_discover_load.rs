@@ -27,7 +27,6 @@ fn read(path: &str) -> Value {
 fn arr<'a>(v: &'a Value, key: &str) -> &'a Vec<Value> {
     v.get(key)
         .and_then(|x| x.as_array())
-        .map(|a| a)
         .unwrap_or_else(|| panic!("missing array {key}"))
 }
 fn s(v: &Value, key: &str) -> String {
@@ -204,15 +203,15 @@ async fn discover_to_snapshot() {
     }
 
     let mut metas: Vec<ClaimMeta> = Vec::new();
-    let mut push_claim = |metas: &mut Vec<ClaimMeta>,
-                          key: String,
-                          kind: &str,
-                          frame_key: &str,
-                          content: String,
-                          treatment: Option<String>,
-                          symptom: Option<String>,
-                          dimension: Option<String>,
-                          evidence: Vec<Value>| {
+    let push_claim = |metas: &mut Vec<ClaimMeta>,
+                      key: String,
+                      kind: &str,
+                      frame_key: &str,
+                      content: String,
+                      treatment: Option<String>,
+                      symptom: Option<String>,
+                      dimension: Option<String>,
+                      evidence: Vec<Value>| {
         let (fu, hyps) = frame_of.get(frame_key).expect("frame").clone();
         metas.push(ClaimMeta {
             key,
@@ -290,7 +289,7 @@ async fn discover_to_snapshot() {
         for eff in tev
             .get("efficacy")
             .and_then(|x| x.as_array())
-            .map(|a| a.clone())
+            .cloned()
             .unwrap_or_default()
         {
             let sk = s(&eff, "symptom_key");

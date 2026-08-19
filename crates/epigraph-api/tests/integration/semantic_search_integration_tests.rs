@@ -1524,10 +1524,6 @@ async fn test_query_is_embedded_before_comparison(pool: PgPool) {
         "Cooking query should return results - query must be embedded for vector comparison"
     );
 
-    // Top results should be semantically relevant to each query
-    let ml_top = &ml_response.results[0];
-    let cooking_top = &cooking_response.results[0];
-
     // Note: With mock embeddings (byte-hash-based), we cannot guarantee that
     // semantically different queries produce different top results or that
     // results are semantically relevant. The key structural assertion is that

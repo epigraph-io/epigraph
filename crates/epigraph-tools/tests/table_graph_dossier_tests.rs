@@ -1,5 +1,26 @@
+// These modules are the *example*'s source, pulled in by `#[path]` so the tests
+// exercise the real code rather than a copy. Only the items this test binary
+// calls are reachable from its crate root, so `dead_code` fires on the rest —
+// items that are live in the `table_graph` example target. That target is
+// itself linted strictly (no dead_code allow) by the `--all-targets` clippy
+// gate in ci.yml / scripts/verify.sh, so genuinely dead code in these files is
+// still caught there; this allow only silences the test-binary view.
+#[allow(
+    dead_code,
+    reason = "example source #[path]-included into this test crate; the items this binary \
+              does not call are still live in the `table_graph` example target, which \
+              `cargo clippy --workspace --all-targets -- -D warnings` (ci.yml, verify.sh) \
+              lints strictly with no dead_code allow of its own"
+)]
 #[path = "../examples/table_graph/dossier.rs"]
 mod dossier;
+#[allow(
+    dead_code,
+    reason = "example source #[path]-included into this test crate; the items this binary \
+              does not call are still live in the `table_graph` example target, which \
+              `cargo clippy --workspace --all-targets -- -D warnings` (ci.yml, verify.sh) \
+              lints strictly with no dead_code allow of its own"
+)]
 #[path = "../examples/table_graph/types.rs"]
 mod types;
 
@@ -70,6 +91,13 @@ fn fk_targets_dedup() {
     assert_eq!(targets, vec!["claims".to_string()]);
 }
 
+#[allow(
+    dead_code,
+    reason = "example source #[path]-included into this test crate; the items this binary \
+              does not call are still live in the `table_graph` example target, which \
+              `cargo clippy --workspace --all-targets -- -D warnings` (ci.yml, verify.sh) \
+              lints strictly with no dead_code allow of its own"
+)]
 #[path = "../examples/table_graph/llm.rs"]
 mod llm;
 

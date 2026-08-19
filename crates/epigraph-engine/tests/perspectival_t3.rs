@@ -54,6 +54,19 @@ async fn insert_claim(pool: &PgPool, author: Uuid, content: &str) -> Uuid {
     id
 }
 
+/// One v2 agent-gathered BBA case, as the agent reported it:
+/// `(label, frame, prove (m0, m1, theta), refute (m0, m1, theta), agent_K,
+/// agent_consolidated, agent_BetP_target)`.
+type AgentBbaCase<'a> = (
+    &'a str,
+    &'a FrameOfDiscernment,
+    (f64, f64, f64),
+    (f64, f64, f64),
+    f64,
+    bool,
+    f64,
+);
+
 #[tokio::test]
 #[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
 async fn t3_engine_adjudicates_agent_bbas() {
@@ -65,17 +78,8 @@ async fn t3_engine_adjudicates_agent_bbas() {
     let saf =
         FrameOfDiscernment::new("treatment_safety", vec!["safe".into(), "harmful".into()]).unwrap();
 
-    // v2 agent-gathered BBAs (label, frame, prove (m0,m1,theta), refute (m0,m1,theta),
-    //                         agent_K, agent_consolidated, agent_BetP_target)
-    let cases: Vec<(
-        &str,
-        &FrameOfDiscernment,
-        (f64, f64, f64),
-        (f64, f64, f64),
-        f64,
-        bool,
-        f64,
-    )> = vec![
+    // v2 agent-gathered BBAs
+    let cases: Vec<AgentBbaCase<'_>> = vec![
         (
             "clinical/efficacy",
             &eff,
@@ -164,8 +168,8 @@ async fn t3_engine_adjudicates_agent_bbas() {
     let th = ClassifierThresholds::default();
     println!("\nT3 — ENGINE adjudication of agent-gathered BBAs (calibrated classify, conflict_threshold=0.05):");
     println!(
-        "  {:<20} {:>8} {:>10} {:>11} {:>9}  {:<13} {}",
-        "axis", "engineK", "BetP_tgt", "open-world", "(agentK)", "ENGINE", "(agent said)"
+        "  {:<20} {:>8} {:>10} {:>11} {:>9}  {:<13} (agent said)",
+        "axis", "engineK", "BetP_tgt", "open-world", "(agentK)", "ENGINE"
     );
     let mut safety_verdicts = vec![];
     for (label, frame, p, r, ak, ac, ab) in &cases {

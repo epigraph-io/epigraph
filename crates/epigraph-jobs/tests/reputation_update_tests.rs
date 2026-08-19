@@ -361,8 +361,18 @@ fn calculate_initial_truth(evidence_weight: f64, evidence_count: usize) -> f64 {
     // Start from uncertainty (0.5) and adjust
     let truth = 0.5 + base + diversity_bonus;
 
-    // Clamp to never exceed 0.85 for initial truth
-    truth.min(0.85).max(0.0)
+    // Clamp to never exceed 0.85 for initial truth.
+    //
+    // This replaced `truth.min(0.85).max(0.0)` (clippy::manual_clamp). The two
+    // are NOT equivalent on NaN: `f64::min`/`f64::max` return the non-NaN
+    // operand, so the old form silently mapped NaN to 0.85, whereas `clamp`
+    // propagates NaN. That is the better behaviour — a NaN `evidence_weight`
+    // is a bug in the caller and should surface as a failed assertion, not be
+    // laundered into a plausible-looking 0.85. `clamp` only panics when
+    // min > max, and both bounds here are literals with 0.0 < 0.85, so it
+    // cannot panic. Every call site in this file passes a finite value, so no
+    // existing test observes the difference.
+    truth.clamp(0.0, 0.85)
 }
 
 // ============================================================================

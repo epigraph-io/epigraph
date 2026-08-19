@@ -5,32 +5,8 @@
 //! - The `match_candidates_canonical_order` CHECK constraint (claim_a < claim_b)
 //!   rejects rows where claim_a > claim_b.
 
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-async fn try_test_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&url)
-        .await
-        .ok()?;
-    sqlx::migrate!("../../migrations").run(&pool).await.expect("test DB migrations failed — likely a description/version mismatch with existing _sqlx_migrations; use a fresh DB");
-    Some(pool)
-}
-
-macro_rules! test_pool_or_skip {
-    () => {{
-        match try_test_pool().await {
-            Some(p) => p,
-            None => {
-                eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                return;
-            }
-        }
-    }};
-}
 
 /// Insert a minimal agent row, returning its UUID.
 async fn insert_agent(pool: &PgPool) -> Uuid {

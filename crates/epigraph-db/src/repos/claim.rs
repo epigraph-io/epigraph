@@ -11,6 +11,11 @@ use uuid::Uuid;
 /// Repository for Claim operations
 pub struct ClaimRepository;
 
+/// `MAX_AGENT_CLAIMS` is bound as a `LIMIT` in `get_by_agent`; a zero or
+/// negative value would turn that query into a silent "return nothing" (or a
+/// Postgres error) rather than a cap. Enforced at compile time.
+const _: () = assert!(ClaimRepository::MAX_AGENT_CLAIMS > 0);
+
 /// Cached Dempster–Shafer belief columns for a claim, as read by
 /// [`ClaimRepository::get_belief_columns`].
 ///
@@ -4434,11 +4439,6 @@ mod label_tests {
             err_msg.contains("MAX_PAIRWISE_IDS"),
             "error message should mention MAX_PAIRWISE_IDS; got: {err_msg}"
         );
-    }
-
-    #[test]
-    fn max_agent_claims_constant_is_positive() {
-        assert!(ClaimRepository::MAX_AGENT_CLAIMS > 0);
     }
 }
 

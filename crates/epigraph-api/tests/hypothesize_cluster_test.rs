@@ -58,12 +58,12 @@ async fn hypothesize_returns_clusters_when_cluster_count_set() {
         let mut v = base.clone();
         let nudge = 0.05f32 * ((i % 10) as f32 + 1.0) / 10.0;
         if cluster_a {
-            for j in 0..8 {
-                v[j] += nudge;
+            for slot in &mut v[0..8] {
+                *slot += nudge;
             }
         } else {
-            for j in 1500..1508 {
-                v[j] += nudge;
+            for slot in &mut v[1500..1508] {
+                *slot += nudge;
             }
         }
         let vstr = format!(

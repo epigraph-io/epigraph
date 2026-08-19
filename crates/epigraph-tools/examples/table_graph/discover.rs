@@ -62,7 +62,7 @@ pub fn scan_crates(repo_dirs: &[(&str, &str)]) -> Result<Vec<CrateRef>> {
             });
         }
     }
-    out.sort_by(|a, b| (a.repo.clone(), a.name.clone()).cmp(&(b.repo.clone(), b.name.clone())));
+    out.sort_by(|a, b| (&a.repo, &a.name).cmp(&(&b.repo, &b.name)));
     Ok(out)
 }
 

@@ -1895,9 +1895,9 @@ mod tests {
     }
 
     /// Parametric sweep: adding a pure-support BBA to any mix of pure-support
-    /// BBAs never lowers BetP(TRUE).  This tests the math layer (combine_multiple
-    /// + discount) in isolation, independent of the monotonicity clamp in
-    /// auto_wire_ds_update.
+    /// BBAs never lowers BetP(TRUE).  This tests the math layer
+    /// (`combine_multiple` + `discount`) in isolation, independent of the
+    /// monotonicity clamp in `auto_wire_ds_update`.
     ///
     /// If this test fails, the combination algebra itself is broken.  If it
     /// passes but the integration test fails, the issue is in the higher-level

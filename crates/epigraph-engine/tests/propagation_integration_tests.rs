@@ -1333,6 +1333,13 @@ fn bad_actor_test_no_authority_cascade_through_dag() {
 }
 
 #[test]
+#[expect(
+    deprecated,
+    reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
+              probability but still on the live path (epigraph-api `submission.rs`, \
+              engine `service.rs`); the invariant must keep being covered until those \
+              callers migrate"
+)]
 fn bad_actor_test_claim_without_evidence_gets_low_truth() {
     // This test validates the core principle: NO NAKED ASSERTIONS
     // Even from high-reputation agents, claims without evidence get low truth.
