@@ -1,3 +1,26 @@
+// The `db`-less build variant of this crate is UNSUPPORTED and is deliberately
+// a hard compile error rather than a silently-rotting build.
+//
+// Nothing builds `epigraph-api` without `db`: CI (`.github/workflows/ci.yml`)
+// and `scripts/verify.sh` pass no `--features` at all, the production image
+// runs `cargo build --release -p epigraph-api` (epiclaw-host
+// `src/host/container.rs`), README §Quickstart does the same, and the only
+// workspace dependent (`epigraph-cli`) takes it with default features on. The
+// crate's own `[dev-dependencies]` list `epigraph-db` and `sqlx` as
+// non-optional, so even `cargo test --no-default-features` links Postgres —
+// the variant is structurally untestable, not merely untested.
+//
+// See `docs/architecture/no-db-build-variant-unsupported.md` for the
+// measurement and the full decision record.
+#[cfg(not(feature = "db"))]
+compile_error!(
+    "epigraph-api requires the `db` feature. The no-db build variant is unsupported: \
+     nothing in CI, scripts/verify.sh, the production image, the README quickstart, or \
+     any workspace dependent builds it, and the crate's non-optional dev-dependencies \
+     on epigraph-db/sqlx make it untestable. Build with default features (or an explicit \
+     `--features db`). See docs/architecture/no-db-build-variant-unsupported.md."
+);
+
 pub mod access_control;
 pub mod errors;
 pub mod extractors;

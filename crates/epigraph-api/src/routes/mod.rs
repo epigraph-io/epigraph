@@ -1,8 +1,16 @@
-// NOTE: There are 124 `#[cfg(not(feature = "db"))]` stubs across 29 route
-// files. These provide compile-time fallback handlers that return 501 Not
-// Implemented when the `db` feature is disabled, allowing the API crate to
-// build (and run lightweight/mock modes) without a PostgreSQL dependency.
-// Audited 2026-03-28.
+// NOTE: There are 171 `#[cfg(not(feature = "db"))]` stubs across 42 files in
+// this crate (the 2026-03-28 audit counted 124 across 29 route files). They
+// were intended as compile-time fallback handlers returning 501 Not
+// Implemented so the API crate could build without a PostgreSQL dependency.
+//
+// That variant is now UNREACHABLE: `lib.rs` raises a `compile_error!` on
+// `cfg(not(feature = "db"))`, because the no-db build had been broken since
+// 2026-05-08 with no consumer to notice. These stubs are dead code kept in
+// place only to avoid an unreviewable deletion diff; reaping them is a
+// separate logical decision tracked as a follow-up backlog item.
+//
+// Do NOT add new `cfg(not(feature = "db"))` stubs — they can never compile.
+// See `docs/architecture/no-db-build-variant-unsupported.md`.
 
 pub mod activities;
 pub mod admin;
