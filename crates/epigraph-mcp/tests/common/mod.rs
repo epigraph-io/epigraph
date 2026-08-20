@@ -151,10 +151,29 @@ use epigraph_mcp::EpiGraphMcpFull;
 use rmcp::model::CallToolResult;
 use serde_json::Value;
 
+/// A server whose signer identity is DECLARED — the fixed key stands in for
+/// `--agent-key`, which is what `main::select_signer` rung 3 produces. This is
+/// the strict-ownership configuration; `EpiGraphMcpFull::new` defaults
+/// `signer_identity_declared` to `true`.
 pub fn build_test_server(pool: PgPool) -> EpiGraphMcpFull {
     let signer = AgentSigner::from_bytes(&[0xA7u8; 32]).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None);
     EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
+}
+
+/// A server in `main::select_signer`'s rung-4 configuration: neither
+/// `--agent-key` nor `--agent-model` was supplied, so the signer is a fresh
+/// random keypair belonging to this process alone. Both halves matter — the
+/// random signer reproduces the throwaway agent UUID, and
+/// `with_generated_signer_identity` is the bit `main` sets on that rung.
+///
+/// This is what epiclaw agent containers run: the agent-runner spawns
+/// `epigraph-mcp --database-url <url>` over stdio with no key.
+pub fn build_test_server_generated_signer(pool: PgPool) -> EpiGraphMcpFull {
+    let signer = AgentSigner::generate();
+    let embedder = McpEmbedder::new(pool.clone(), None);
+    EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
+        .with_generated_signer_identity()
 }
 
 pub async fn seed_agent(pool: &PgPool) -> Uuid {
