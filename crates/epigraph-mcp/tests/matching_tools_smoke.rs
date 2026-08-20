@@ -506,3 +506,108 @@ async fn decide_match_candidate_promote_paraphrase_still_writes_corroborates(poo
     let rels = edge_relationships(&pool, a, b).await;
     assert_eq!(rels, vec!["CORROBORATES".to_string()]);
 }
+
+/// The reported gap: no MCP surface could retract a promotion, so an agent
+/// that promoted a bad pair had to escalate to a human running the
+/// `retire_match_candidates` binary on the host. `retire` closes that, and it
+/// must take the derived `factors` row with the edge — an orphan factor keeps
+/// corroborating in the belief graph with no edge to explain it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn decide_match_candidate_retire_removes_edge_and_derived_factor(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+
+    tools::matching::decide_match_candidate(
+        &server,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+    )
+    .await
+    .expect("promote");
+
+    let factors_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM factors f
+         JOIN edges e ON e.id::text = f.properties->>'source_edge_id'
+         WHERE e.properties->>'source' = 'cross_source_matcher'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        factors_before, 1,
+        "the edges_auto_factor trigger must have derived a factor — without \
+         one this test cannot prove the factor is cleaned up"
+    );
+
+    let out = tools::matching::decide_match_candidate(
+        &server,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "retire".into(),
+        },
+    )
+    .await
+    .expect("retire");
+    let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
+    assert_eq!(body["candidate"]["status"], "stale");
+    assert_eq!(body["retirement"]["previous_status"], "promoted");
+    assert_eq!(body["retirement"]["edges_retired"], 1);
+    assert_eq!(body["retirement"]["factors_deleted"], 1);
+
+    assert!(
+        edge_relationships(&pool, a, b).await.is_empty(),
+        "retire must delete the matcher edge"
+    );
+    let factors_after: i64 = sqlx::query_scalar("SELECT count(*) FROM factors")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        factors_after, 0,
+        "retire must delete the factor derived from the edge, not just the edge"
+    );
+}
+
+/// `retire` is a write, so it must sit behind the same read-only gate as
+/// `promote`/`reject` — a read-only server must not be able to delete edges.
+#[sqlx::test(migrations = "../../migrations")]
+async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+
+    // Promote with a writable server, then attempt the retire read-only.
+    let writable = build_server(pool.clone(), false).await;
+    tools::matching::decide_match_candidate(
+        &writable,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+    )
+    .await
+    .expect("promote");
+
+    let read_only = build_server(pool.clone(), true).await;
+    tools::matching::decide_match_candidate(
+        &read_only,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "retire".into(),
+        },
+    )
+    .await
+    .expect_err("retire must be refused in read-only mode");
+
+    assert_eq!(
+        edge_relationships(&pool, a, b).await,
+        vec!["CORROBORATES".to_string()],
+        "a refused retire must leave the edge in place"
+    );
+}

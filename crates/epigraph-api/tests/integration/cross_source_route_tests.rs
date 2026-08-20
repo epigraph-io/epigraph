@@ -354,6 +354,217 @@ async fn decide_prefers_agent_id_over_client_id(pool: PgPool) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `retire`: undo a promotion over HTTP.
+//
+// Before this arm existed, the *only* way to retract a promoted candidate was
+// the `retire_match_candidates` operator binary on the host: every HTTP verdict
+// was refused by the `status != "pending"` gate. The tests below pin both the
+// happy path and the transition rules the gate used to enforce for free.
+// ---------------------------------------------------------------------------
+
+/// Count the rows a retirement must remove for one claim pair: the matcher
+/// edge, the `factors` row the `edges_auto_factor` trigger derives from it, and
+/// that factor's `bp_messages`.
+async fn matcher_edge_footprint(pool: &PgPool, a: Uuid, b: Uuid) -> (i64, i64, i64) {
+    let edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges
+         WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))
+           AND properties->>'source' = 'cross_source_matcher'",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let factors: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM factors f
+         JOIN edges e ON e.id::text = f.properties->>'source_edge_id'
+         WHERE ((e.source_id = $1 AND e.target_id = $2)
+             OR (e.source_id = $2 AND e.target_id = $1))
+           AND e.properties->>'source' = 'cross_source_matcher'",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let bp: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM bp_messages m
+         JOIN factors f ON f.id = m.factor_id
+         JOIN edges e ON e.id::text = f.properties->>'source_edge_id'
+         WHERE ((e.source_id = $1 AND e.target_id = $2)
+             OR (e.source_id = $2 AND e.target_id = $1))
+           AND e.properties->>'source' = 'cross_source_matcher'",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (edges, factors, bp)
+}
+
+async fn status_of(pool: &PgPool, candidate: Uuid) -> String {
+    sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(candidate)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The reported defect: a promoted candidate cannot be retracted over HTTP.
+/// `retire` must flip it to `stale` and take the matcher edge — plus the
+/// derived `factors` / `bp_messages` the `edges_auto_factor` trigger hung off
+/// it — with it. Deleting the edge alone is the failure mode migration
+/// `012_cull_low_similarity_corroborates` was written to avoid: an orphan
+/// factor keeps corroborating in the belief graph forever.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_undoes_a_promotion_including_its_derived_factors(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let candidate = insert_pending_candidate(&pool, a, b).await;
+
+    let client_id = Uuid::new_v4();
+    let token = decide_bearer_token(client_id, Some(agent), "agent");
+
+    let resp = post_decide(pool.clone(), candidate, &token, "promote").await;
+    assert_eq!(resp.status(), StatusCode::OK, "promote must succeed");
+
+    let (edges, factors, _) = matcher_edge_footprint(&pool, a, b).await;
+    assert_eq!(edges, 1, "promote must have written one matcher edge");
+    assert_eq!(
+        factors, 1,
+        "the edges_auto_factor trigger must have derived a factor from it — \
+         without one this test cannot prove the factor is cleaned up"
+    );
+
+    let resp = post_decide(pool.clone(), candidate, &token, "retire").await;
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "retire must succeed on a promoted candidate (body: {})",
+        String::from_utf8_lossy(&body)
+    );
+
+    assert_eq!(
+        status_of(&pool, candidate).await,
+        "stale",
+        "a retired candidate must land in 'stale', matching the CLI"
+    );
+    assert_eq!(
+        matcher_edge_footprint(&pool, a, b).await,
+        (0, 0, 0),
+        "retire must remove the matcher edge AND its derived factor/bp_messages"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["edges_retired"].as_i64(),
+        Some(1),
+        "the response must account for the deleted edge"
+    );
+
+    // The undo record. The delete is irreversible, so the response has to
+    // carry enough to reconstruct the edge — the operator binary writes the
+    // same thing to its `--dump` file, and the online path must not be the
+    // lossier of the two.
+    let dumped = json["deleted_edges"]
+        .as_array()
+        .expect("response must carry the deleted edges");
+    assert_eq!(dumped.len(), 1);
+    assert_eq!(
+        dumped[0]["properties"]["candidate_id"],
+        serde_json::json!(candidate),
+        "the undo record must preserve the edge properties, not just its id"
+    );
+    assert_eq!(dumped[0]["relationship"], "CORROBORATES");
+    assert!(
+        dumped[0]["created_at"].is_string(),
+        "the undo record must preserve created_at: {:?}",
+        dumped[0]
+    );
+}
+
+/// Scope guard: retirement is keyed on the matcher's provenance marker, not on
+/// the claim pair. An unrelated hand-authored edge between the same two claims
+/// must survive — otherwise `retire` is a pair-wide edge nuke wearing a
+/// narrower name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_leaves_non_matcher_edges_between_the_same_pair_alone(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let candidate = insert_pending_candidate(&pool, a, b).await;
+
+    let client_id = Uuid::new_v4();
+    let token = decide_bearer_token(client_id, Some(agent), "agent");
+    let resp = post_decide(pool.clone(), candidate, &token, "promote").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let manual_edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type,
+                            relationship, properties)
+         VALUES ($1, 'claim', $2, 'claim', 'CORROBORATES', '{\"source\": \"human\"}'::jsonb)
+         RETURNING id",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let resp = post_decide(pool.clone(), candidate, &token, "retire").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let survives: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE id = $1")
+        .bind(manual_edge)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        survives, 1,
+        "retire must scope on properties->>'source' = 'cross_source_matcher', \
+         not on the claim pair"
+    );
+}
+
+/// Regression guard on the gate that `retire` relaxes: relaxing it wholesale
+/// would let a decided candidate be re-decided, overwriting `decided_by` and
+/// (for promote) re-creating the edge a retirement just removed. `promote` and
+/// `reject` must still 409 on an already-decided row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn promote_and_reject_still_refuse_an_already_decided_candidate(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let candidate = insert_pending_candidate(&pool, a, b).await;
+
+    let client_id = Uuid::new_v4();
+    let token = decide_bearer_token(client_id, Some(agent), "agent");
+
+    let resp = post_decide(pool.clone(), candidate, &token, "reject").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    for verdict in ["promote", "reject"] {
+        let resp = post_decide(pool.clone(), candidate, &token, verdict).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "{verdict} must still 409 on a decided candidate"
+        );
+    }
+
+    // …and the retire arm must not resurrect it as promotable either: a
+    // retired row stays 'stale'.
+    let resp = post_decide(pool.clone(), candidate, &token, "retire").await;
+    assert_eq!(resp.status(), StatusCode::OK, "retire tolerates any status");
+    assert_eq!(status_of(&pool, candidate).await, "stale");
+}
+
 // NOTE: this route is registered in routes/mod.rs (Task 3 of the
 // 2026-07-11 xsm-telegram-approval plan) — this test only passes once
 // that registration lands.

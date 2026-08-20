@@ -96,7 +96,7 @@ pub use gap::{GapAnalysisResult, GapRecord, GapRepository};
 pub use learning_event::{LearningEventRepository, LearningEventRow};
 pub use lineage::LineageRepository;
 pub use mass_function::MassFunctionRepository;
-pub use match_candidate::{MatchCandidateRepo, MatchCandidateRow};
+pub use match_candidate::{MatchCandidateRepo, MatchCandidateRow, RetiredEdge, RetirementOutcome};
 pub use method::{
     MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,

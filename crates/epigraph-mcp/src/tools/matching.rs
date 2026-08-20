@@ -8,11 +8,13 @@
 //!   edges for a claim. Read-only.
 //! - `list_match_candidates`: list the queue, sorted by score desc, optionally
 //!   filtered by status.
-//! - `decide_match_candidate`: promote or reject a row. Promotion writes the
-//!   edge the row's `verifier_verdict` calls for — `CORROBORATES` for
-//!   same/paraphrase/overlapping, `contradicts` for contradicts — and refuses
-//!   outright for `distinct`. Honours `reject_if_read_only` like other write
-//!   tools.
+//! - `decide_match_candidate`: promote, reject, or retire a row. Promotion
+//!   writes the edge the row's `verifier_verdict` calls for — `CORROBORATES`
+//!   for same/paraphrase/overlapping, `contradicts` for contradicts — and
+//!   refuses outright for `distinct`. Retirement is the undo of a promotion:
+//!   it deletes the matcher edge together with the `factors` / `bp_messages`
+//!   the `edges_auto_factor` trigger derived from it and flips the row to
+//!   `stale`. Honours `reject_if_read_only` like other write tools.
 
 #![allow(clippy::wildcard_imports)]
 
@@ -213,9 +215,30 @@ pub async fn decide_match_candidate(
                 .await
                 .map_err(internal_error)?;
         }
+        "retire" => {
+            // Undo of a promotion. Before this arm existed an agent had no way
+            // to retract one at all: the HTTP route refused every verdict on a
+            // decided row, and the only working path was the
+            // `retire_match_candidates` operator binary on the host, which no
+            // MCP tool wrapped.
+            //
+            // The retraction is a single `epigraph-db` transaction shared with
+            // the HTTP route — deleting the edge without the `factors` /
+            // `bp_messages` the `edges_auto_factor` trigger derived from it
+            // would leave an orphan factor corroborating forever.
+            let outcome = repo
+                .retire(candidate_id, Some(acting_agent))
+                .await
+                .map_err(internal_error)?;
+            let updated = repo.get(candidate_id).await.map_err(internal_error)?;
+            return success_json(&serde_json::json!({
+                "candidate": row_to_out(updated),
+                "retirement": outcome,
+            }));
+        }
         other => {
             return Err(invalid_params(format!(
-                "verdict must be 'promote' or 'reject', got {other}"
+                "verdict must be 'promote', 'reject' or 'retire', got {other}"
             )));
         }
     }

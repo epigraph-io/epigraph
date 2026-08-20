@@ -7,6 +7,10 @@
 //!   rejected rows are intentionally omitted — the UI surface for those is
 //!   either the CORROBORATES edge itself or admin tooling.
 //!
+//! POST /api/v1/match_candidates/:id/decide takes `promote`, `reject` and
+//! `retire`. `retire` is the undo of a promotion — the only verdict that
+//! accepts an already-decided row (see `decide_candidate`).
+//!
 //! KNOWN GAP: `corroborates` is the only edge array, so a pair promoted as a
 //! *contradiction* (see `decide_candidate`) leaves `pending` without appearing
 //! anywhere in this response. Surfacing contradictions needs a response-shape
@@ -292,14 +296,69 @@ pub async fn decide_candidate(
     let repo = epigraph_db::MatchCandidateRepo::new(state.db_pool.clone());
     let row = map_sqlx(repo.get(id).await)?;
 
-    if row.status != "pending" {
-        return Err(ApiError::Conflict {
+    // Undecided-only guard. This lives *inside* the `promote` / `reject` arms
+    // rather than above the match, because those two are the verdicts that
+    // must not be replayed: a second `promote` overwrites `decided_by` and
+    // re-creates an edge a retirement just removed, and a re-`reject` rewrites
+    // the provenance of a ruling already made.
+    //
+    // `retire` is the deliberate exception — it is the *undo* of a decision,
+    // so a decided row is precisely its input. Hoisting the guard above the
+    // match (its original position) is what made a promoted candidate
+    // unretractable over HTTP at all, leaving the `retire_match_candidates`
+    // operator binary on the host as the only route.
+    let reject_if_decided = || -> Result<(), ApiError> {
+        if row.status == "pending" {
+            return Ok(());
+        }
+        Err(ApiError::Conflict {
             reason: format!("candidate {id} already decided (status={})", row.status),
-        });
-    }
+        })
+    };
 
     match req.verdict.as_str() {
+        "retire" => {
+            let outcome =
+                repo.retire(id, decided_by)
+                    .await
+                    .map_err(|e| ApiError::DatabaseError {
+                        message: e.to_string(),
+                    })?;
+
+            // Deliberately NOT followed by `recompute_claim_belief_binary`.
+            // That entry point recombines `mass_functions`, and a matcher
+            // promotion writes none (it calls
+            // `EdgeRepository::create_symmetric_if_absent`, never
+            // `auto_wire_edge_if_epistemic`), so it would provably return
+            // bit-identical scalars. What a retirement invalidates is the
+            // factor graph, whose consumer —
+            // `routes/computation.rs::propagate_beliefs`, i.e.
+            // `POST /api/v1/bp/propagate` with `apply_updates: true` — reloads
+            // `factors` from the database on every run and is the only writer
+            // of the `claims.pignistic_prob` a deleted factor could have
+            // biased. The affected endpoints are returned so a caller that
+            // cares can drive that pass itself.
+            return Ok(Json(serde_json::json!({
+                "id": id.to_string(),
+                "status": "stale",
+                "previous_status": outcome.previous_status,
+                "edges_retired": outcome.edges_retired,
+                "factors_deleted": outcome.factors_deleted,
+                "bp_messages_deleted": outcome.bp_messages_deleted,
+                "bbas_invalidated": outcome.bbas_invalidated,
+                "affected_claims": outcome.affected_claims
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                // The undo record. The delete is irreversible and the edge
+                // properties carry the promotion's whole provenance, so the
+                // online path returns what the `retire_match_candidates`
+                // binary writes to its `--dump` file.
+                "deleted_edges": outcome.deleted_edges,
+            })));
+        }
         "promote" => {
+            reject_if_decided()?;
             // Resolve the polarity FIRST — before the current-ness guard and
             // before `set_status`. "promote" is the operator saying "act on
             // this pair", not "these claims agree": the relationship comes
@@ -368,6 +427,7 @@ pub async fn decide_candidate(
             })?;
         }
         "reject" => {
+            reject_if_decided()?;
             repo.set_status(id, "rejected", decided_by)
                 .await
                 .map_err(|e| ApiError::DatabaseError {
@@ -376,7 +436,7 @@ pub async fn decide_candidate(
         }
         other => {
             return Err(ApiError::BadRequest {
-                message: format!("verdict must be 'promote' or 'reject', got {other}"),
+                message: format!("verdict must be 'promote', 'reject' or 'retire', got {other}"),
             });
         }
     }

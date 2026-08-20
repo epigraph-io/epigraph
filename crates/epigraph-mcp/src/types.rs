@@ -2223,7 +2223,7 @@ pub struct DecideMatchCandidateParams {
     #[schemars(description = "Match-candidate UUID to decide on")]
     pub candidate_id: String,
     #[schemars(
-        description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct) or 'reject'"
+        description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct), 'reject', or 'retire' (undo a promotion: deletes the matcher edge plus the factors/bp_messages derived from it and flips the row to stale)"
     )]
     pub verdict: String,
 }
