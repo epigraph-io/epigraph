@@ -56,20 +56,21 @@ pub struct RetirementOutcome {
     pub previous_status: String,
     /// Both endpoints of the retired pair, for the caller's follow-up.
     pub affected_claims: Vec<Uuid>,
-    pub edges_retired: u64,
+    pub edges_retracted: u64,
     pub factors_deleted: u64,
     pub bp_messages_deleted: u64,
     /// Edge-keyed BBAs removed. Structurally 0 on today's promote path — see
     /// [`MatchCandidateRepo::retire`] for why the statement runs anyway.
     pub bbas_invalidated: u64,
-    /// The deleted edges, captured before the DELETE. This is the **undo
-    /// record**, and it is why the outcome is not just counts: the edge's
-    /// `properties` carry the promotion's whole provenance (`candidate_id`,
-    /// `score`, `features`, `verifier_verdict`, `decided_by`) and the delete is
-    /// irreversible. The `retire_match_candidates` operator binary writes the
-    /// same thing to its `--dump` file for exactly this reason; without it the
-    /// online path would silently be the lossier of the two.
-    pub deleted_edges: Vec<RetiredEdge>,
+    /// The retracted edges, captured before `valid_to` was closed.
+    ///
+    /// Retained as a convenience snapshot, NOT as an undo record — retraction is
+    /// reversible and the rows survive, so the authoritative record is now the
+    /// `edges` table itself (`SELECT ... WHERE valid_to IS NOT NULL`). Before the
+    /// switch from DELETE this field was load-bearing, because the promotion's
+    /// provenance (`candidate_id`, `score`, `features`, `verifier_verdict`,
+    /// `decided_by`) existed nowhere else afterwards.
+    pub retracted_edges: Vec<RetiredEdge>,
 }
 
 /// One matcher edge as it existed immediately before
@@ -294,8 +295,8 @@ impl MatchCandidateRepo {
         .await?;
 
         // Capture the full rows, not just their ids: this SELECT is the undo
-        // record (see `RetirementOutcome::deleted_edges`).
-        let deleted_edges: Vec<RetiredEdge> = sqlx::query_as(
+        // snapshot (see `RetirementOutcome::retracted_edges`).
+        let retracted_edges: Vec<RetiredEdge> = sqlx::query_as(
             "SELECT id AS edge_id, source_id, target_id, relationship, properties, created_at
              FROM edges
              WHERE ((source_id = $1 AND target_id = $2)
@@ -307,7 +308,7 @@ impl MatchCandidateRepo {
         .fetch_all(&mut *tx)
         .await?;
 
-        let edge_ids: Vec<Uuid> = deleted_edges.iter().map(|e| e.edge_id).collect();
+        let edge_ids: Vec<Uuid> = retracted_edges.iter().map(|e| e.edge_id).collect();
 
         // `factors.properties->>'source_edge_id'` is text (the trigger builds
         // it with `jsonb_build_object('source_edge_id', NEW.id)`), so compare
@@ -337,11 +338,30 @@ impl MatchCandidateRepo {
                 .await?
                 .rows_affected();
 
-        let edges_retired = sqlx::query("DELETE FROM edges WHERE id = ANY($1)")
-            .bind(&edge_ids)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        // RETRACT, do not DELETE. The edge is a primary epistemic record — the
+        // assertion "the matcher claimed these two claims match, and someone
+        // promoted it" — carrying `properties.decided_by`, the signature and the
+        // content hash. A DELETE here destroys who made the original promotion,
+        // because `match_candidates.decided_by` is overwritten with the RETIRER
+        // twenty lines below; nothing persisted would record the promoter.
+        //
+        // Closing `valid_to` removes the edge from every reader that honours
+        // `EDGE_IN_FORCE` (the derivation selector and the auto-wire guard) while
+        // keeping the row queryable and the retirement reversible. The derived rows
+        // above — bp_messages, factors, mass_functions — are still deleted: those
+        // are materializations (factors come from the `edges_auto_factor` trigger,
+        // BBAs are keyed `perspective_id = edge_id`), so removing them is cache
+        // invalidation and they regenerate from live edges.
+        //
+        // `AND valid_to IS NULL` makes this idempotent: retiring twice does not
+        // advance an existing retraction's timestamp.
+        let edges_retracted = sqlx::query(
+            "UPDATE edges SET valid_to = now() WHERE id = ANY($1) AND valid_to IS NULL",
+        )
+        .bind(&edge_ids)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
 
         sqlx::query(
             "UPDATE match_candidates
@@ -358,11 +378,11 @@ impl MatchCandidateRepo {
         Ok(RetirementOutcome {
             previous_status,
             affected_claims: vec![claim_a, claim_b],
-            edges_retired,
+            edges_retracted,
             factors_deleted,
             bp_messages_deleted,
             bbas_invalidated,
-            deleted_edges,
+            retracted_edges,
         })
     }
 

@@ -115,11 +115,18 @@ async fn insert_candidate_with_verdict(
 }
 
 /// Every claim→claim edge relationship between the pair, either direction.
+/// Relationships of the edges between `a` and `b` that are currently IN FORCE.
+///
+/// The `valid_to IS NULL` filter matters since retirement switched from DELETE to
+/// retraction: the row survives a retire, so an unfiltered count can no longer
+/// distinguish "retired" from "never created". Creation-path tests are unaffected —
+/// a freshly written edge has `valid_to` NULL.
 async fn edge_relationships(pool: &PgPool, a: Uuid, b: Uuid) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT relationship FROM edges
-         WHERE (source_id = $1 AND target_id = $2)
-            OR (source_id = $2 AND target_id = $1)
+         WHERE ((source_id = $1 AND target_id = $2)
+             OR (source_id = $2 AND target_id = $1))
+           AND valid_to IS NULL
          ORDER BY relationship",
     )
     .bind(a)
@@ -513,7 +520,7 @@ async fn decide_match_candidate_promote_paraphrase_still_writes_corroborates(poo
 /// must take the derived `factors` row with the edge — an orphan factor keeps
 /// corroborating in the belief graph with no edge to explain it.
 #[sqlx::test(migrations = "../../migrations")]
-async fn decide_match_candidate_retire_removes_edge_and_derived_factor(pool: PgPool) {
+async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(pool: PgPool) {
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
@@ -556,13 +563,29 @@ async fn decide_match_candidate_retire_removes_edge_and_derived_factor(pool: PgP
     let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
     assert_eq!(body["candidate"]["status"], "stale");
     assert_eq!(body["retirement"]["previous_status"], "promoted");
-    assert_eq!(body["retirement"]["edges_retired"], 1);
+    assert_eq!(body["retirement"]["edges_retracted"], 1);
     assert_eq!(body["retirement"]["factors_deleted"], 1);
 
     assert!(
         edge_relationships(&pool, a, b).await.is_empty(),
-        "retire must delete the matcher edge"
+        "retire must take the matcher edge OUT OF FORCE"
     );
+    // ...but the row itself must survive, carrying the promotion's provenance.
+    // Under the previous DELETE this could not hold: `properties.decided_by`
+    // vanished with the row, and `match_candidates.decided_by` is overwritten
+    // with the retirer, so nothing persisted recorded the original promoter.
+    let (present, closed): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE valid_to IS NOT NULL)
+         FROM edges
+         WHERE (source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(present, 1, "the edge row must survive retraction");
+    assert_eq!(closed, 1, "the surviving row must carry valid_to");
     let factors_after: i64 = sqlx::query_scalar("SELECT count(*) FROM factors")
         .fetch_one(&pool)
         .await
@@ -574,7 +597,7 @@ async fn decide_match_candidate_retire_removes_edge_and_derived_factor(pool: PgP
 }
 
 /// `retire` is a write, so it must sit behind the same read-only gate as
-/// `promote`/`reject` — a read-only server must not be able to delete edges.
+/// `promote`/`reject` — a read-only server must not be able to retract edges.
 #[sqlx::test(migrations = "../../migrations")]
 async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) {
     let agent = insert_agent(&pool).await;

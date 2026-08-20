@@ -367,10 +367,15 @@ async fn decide_prefers_agent_id_over_client_id(pool: PgPool) {
 /// edge, the `factors` row the `edges_auto_factor` trigger derives from it, and
 /// that factor's `bp_messages`.
 async fn matcher_edge_footprint(pool: &PgPool, a: Uuid, b: Uuid) -> (i64, i64, i64) {
+    // Counts edges IN FORCE, not edges present. Under retraction semantics the
+    // row survives with `valid_to` set, so a bare `count(*)` could no longer
+    // distinguish "retired" from "never happened" — which is the whole point of
+    // the change and must stay visible to this test.
     let edges: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges
          WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))
-           AND properties->>'source' = 'cross_source_matcher'",
+           AND properties->>'source' = 'cross_source_matcher'
+           AND valid_to IS NULL",
     )
     .bind(a)
     .bind(b)
@@ -463,29 +468,50 @@ async fn retire_undoes_a_promotion_including_its_derived_factors(pool: PgPool) {
 
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
-        json["edges_retired"].as_i64(),
+        json["edges_retracted"].as_i64(),
         Some(1),
-        "the response must account for the deleted edge"
+        "the response must account for the retracted edge"
     );
 
-    // The undo record. The delete is irreversible, so the response has to
-    // carry enough to reconstruct the edge — the operator binary writes the
-    // same thing to its `--dump` file, and the online path must not be the
-    // lossier of the two.
-    let dumped = json["deleted_edges"]
+    let dumped = json["retracted_edges"]
         .as_array()
-        .expect("response must carry the deleted edges");
+        .expect("response must carry the retracted edges");
     assert_eq!(dumped.len(), 1);
     assert_eq!(
         dumped[0]["properties"]["candidate_id"],
         serde_json::json!(candidate),
-        "the undo record must preserve the edge properties, not just its id"
+        "the snapshot must preserve the edge properties, not just its id"
     );
     assert_eq!(dumped[0]["relationship"], "CORROBORATES");
+
+    // THE POINT OF RETRACTION. Under the old DELETE these three assertions were
+    // impossible: the row was gone, so `decided_by` — who made the original
+    // promotion — survived only in this response body, which nothing stores.
+    // `match_candidates.decided_by` is overwritten with the RETIRER, so a hard
+    // delete left no persisted record of the promoter anywhere.
+    let (still_present, closed_at, promoter): (
+        i64,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT count(*), max(valid_to), max(properties->>'decided_by')
+             FROM edges
+             WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))
+               AND properties->>'source' = 'cross_source_matcher'",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(still_present, 1, "the edge row must SURVIVE retraction");
     assert!(
-        dumped[0]["created_at"].is_string(),
-        "the undo record must preserve created_at: {:?}",
-        dumped[0]
+        closed_at.is_some(),
+        "the surviving row must be out of force (valid_to set)"
+    );
+    assert!(
+        promoter.is_some(),
+        "properties.decided_by must survive so the original promoter stays recoverable"
     );
 }
 

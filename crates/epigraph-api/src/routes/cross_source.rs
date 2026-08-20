@@ -342,7 +342,7 @@ pub async fn decide_candidate(
                 "id": id.to_string(),
                 "status": "stale",
                 "previous_status": outcome.previous_status,
-                "edges_retired": outcome.edges_retired,
+                "edges_retracted": outcome.edges_retracted,
                 "factors_deleted": outcome.factors_deleted,
                 "bp_messages_deleted": outcome.bp_messages_deleted,
                 "bbas_invalidated": outcome.bbas_invalidated,
@@ -354,7 +354,7 @@ pub async fn decide_candidate(
                 // properties carry the promotion's whole provenance, so the
                 // online path returns what the `retire_match_candidates`
                 // binary writes to its `--dump` file.
-                "deleted_edges": outcome.deleted_edges,
+                "retracted_edges": outcome.retracted_edges,
             })));
         }
         "promote" => {
