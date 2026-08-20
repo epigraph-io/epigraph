@@ -26,6 +26,22 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
     "refutes",
 ];
 
+/// SQL predicate selecting edges that are currently in force.
+///
+/// `edges` is bitemporal via `valid_from` / `valid_to` (migration 001), but until
+/// this predicate existed the column was decorative: exactly ONE query in the
+/// workspace filtered on it (`get_current_edges`), and 6 of 987,857 production
+/// rows carried a value. Every belief-bearing read saw retracted edges as live.
+///
+/// That absence is why `MatchCandidateRepo::retire` hard-DELETEs edges rather
+/// than retracting them — a soft retraction that nothing honours retracts
+/// nothing. Enforcing the predicate on the derivation path is the precondition
+/// for making retirement non-destructive.
+///
+/// `valid_to IS NULL` means "ongoing or atemporal" and is the overwhelmingly
+/// common case, so the predicate is written NULL-first to short-circuit.
+pub const EDGE_IN_FORCE: &str = "(e.valid_to IS NULL OR e.valid_to > now())";
+
 /// A row from the edges table
 #[derive(Debug, Clone)]
 pub struct EdgeRow {
@@ -359,12 +375,18 @@ impl EdgeRepository {
     /// uuid is the `supersedes` edge, whose *source* is the new claim. Callers
     /// must pass the **new** claim id here.
     ///
-    /// Currency is joined from `claims.is_current`. `edges` carries no
-    /// per-row currency flag for its target — its columns are
-    /// `id, source_id, target_id, source_type, target_type, relationship,
-    /// labels, properties, created_at, prov_type, valid_from, valid_to,
-    /// signature, signer_id, content_hash` — so any query that filters on one
-    /// fails at runtime.
+    /// Currency has two independent parts and BOTH are enforced here:
+    /// - the TARGET claim's currency, joined from `claims.is_current`;
+    /// - the EDGE's own currency, via [`EDGE_IN_FORCE`] over `valid_to`.
+    ///
+    /// A previous version of this comment claimed `edges` "carries no per-row
+    /// currency flag ... so any query that filters on one fails at runtime",
+    /// while simultaneously listing `valid_to` among the columns. That was
+    /// self-contradictory: the intended point was that edges have no
+    /// `is_current` column, but as written it discouraged filtering on the
+    /// bitemporal column that does exist. Corrected, because this function is
+    /// the retraction cascade's edge selector and is exactly where a retracted
+    /// edge must stop contributing.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -373,7 +395,7 @@ impl EdgeRepository {
         pool: &PgPool,
         source_id: Uuid,
     ) -> Result<Vec<(Uuid, Uuid, String)>, DbError> {
-        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(&format!(
             r#"
             SELECT e.id, e.target_id, e.relationship
             FROM edges e
@@ -382,14 +404,73 @@ impl EdgeRepository {
               AND e.source_type = 'claim'
               AND e.target_type = 'claim'
               AND e.relationship <> 'supersedes'
+              AND {EDGE_IN_FORCE}
             ORDER BY e.id
-            "#,
-        )
+            "#
+        ))
         .bind(source_id)
         .fetch_all(pool)
         .await?;
 
         Ok(rows)
+    }
+
+    /// Retract edges by closing their validity interval instead of deleting them.
+    ///
+    /// This is the non-destructive counterpart to `DELETE FROM edges`. The row —
+    /// and with it `properties.decided_by`, the signature, the content hash and
+    /// the full provenance of who asserted what and when — survives and stays
+    /// queryable; it simply stops being in force for every reader that honours
+    /// [`EDGE_IN_FORCE`].
+    ///
+    /// Idempotent: an already-retracted edge keeps its original `valid_to`, so
+    /// re-retracting does not rewrite history to a later timestamp. Returns the
+    /// ids actually closed by THIS call, which is what an undo record wants.
+    ///
+    /// Derived artifacts (`factors`, `bp_messages`, `mass_functions`) are NOT
+    /// touched here and should still be deleted by the caller: they are
+    /// materializations — `factors` are built by the `edges_auto_factor` trigger,
+    /// BBAs are keyed `perspective_id = edge_id` — so removing them is cache
+    /// invalidation, not data loss, and they regenerate from live edges.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn retract(pool: &PgPool, edge_ids: &[Uuid]) -> Result<Vec<Uuid>, DbError> {
+        if edge_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let closed: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            UPDATE edges
+               SET valid_to = now()
+             WHERE id = ANY($1)
+               AND valid_to IS NULL
+            RETURNING id
+            "#,
+        )
+        .bind(edge_ids)
+        .fetch_all(pool)
+        .await?;
+        Ok(closed)
+    }
+
+    /// True when the edge exists and is currently in force.
+    ///
+    /// Used as a re-derivation guard: a retracted edge must not be woken back up
+    /// into a BBA by a later recompute.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn is_in_force(pool: &PgPool, edge_id: Uuid) -> Result<bool, DbError> {
+        let found: Option<bool> = sqlx::query_scalar(&format!(
+            "SELECT true FROM edges e WHERE e.id = $1 AND {EDGE_IN_FORCE}"
+        ))
+        .bind(edge_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(found.unwrap_or(false))
     }
 
     /// Get edges by target entity
@@ -884,5 +965,25 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_edge_crud(_pool: sqlx::PgPool) {
         // Placeholder: full CRUD coverage is in tests/edge_tests.rs
+    }
+}
+
+#[cfg(test)]
+mod valid_to_enforcement_tests {
+    //! These pin the ONE property that makes soft retraction worth having:
+    //! a retracted edge must disappear from the derivation selector. Before
+    //! `EDGE_IN_FORCE`, setting `valid_to` changed nothing observable, which is
+    //! precisely why retirement resorted to DELETE.
+
+    #[test]
+    fn predicate_is_null_first_and_time_bounded() {
+        // Guards against a rewrite to a bare `valid_to IS NULL`, which would
+        // treat a future-dated retraction as already retracted, and against a
+        // bare `valid_to > now()`, which would treat every ordinary atemporal
+        // edge (valid_to NULL — 987,851 of 987,857 rows) as retracted and
+        // silently blank the graph.
+        assert!(super::EDGE_IN_FORCE.contains("valid_to IS NULL"));
+        assert!(super::EDGE_IN_FORCE.contains("valid_to > now()"));
+        assert!(super::EDGE_IN_FORCE.contains(" OR "));
     }
 }
