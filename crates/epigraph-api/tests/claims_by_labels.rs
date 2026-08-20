@@ -118,6 +118,110 @@ async fn by_labels_returns_filtered_claims() {
     );
 }
 
+/// The truncation contract (remediation R2). Before this, `GET
+/// /api/v1/claims/by-labels` silently clamped `limit` to `MAX_PAGE_LIMIT`
+/// (100) and returned a bare array, so a caller asking for 200 got exactly 100
+/// rows with no way to tell that apart from "there were exactly 100 matches" —
+/// which is how epiclaw-host's backlog router came to believe its
+/// `ROUTER_QUERY_LIMIT = 200` was honoured.
+///
+/// Asserts the three properties a caller needs to detect truncation:
+/// 1. `x-page-limit` reports the *effective* limit, so an over-max request is
+///    self-diagnosing (ask 500, get told 100).
+/// 2. `x-has-more` distinguishes a full page from an exhausted one, and
+///    `x-next-offset` says where to resume.
+/// 3. The body is never longer than the effective limit — the `limit + 1`
+///    probe row must not leak, or `page_claims`-style "short page means done"
+///    loops in the Python reconcilers would never terminate.
+#[tokio::test(flavor = "multi_thread")]
+async fn by_labels_signals_truncation_and_next_page_in_headers() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    // Unique label so the counts below are exact regardless of what else is in
+    // the shared test database.
+    let label = format!("r2-cap-{}", Uuid::new_v4().simple());
+    let agent = seed_agent(&pool).await;
+    for _ in 0..5 {
+        seed_claim(&pool, agent, &[&label], true, None).await;
+    }
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let client = reqwest::Client::new();
+
+    let page = |limit: i64, offset: i64| {
+        let client = client.clone();
+        let label = label.clone();
+        async move {
+            let resp = client
+                .get(format!(
+                    "http://{addr}/api/v1/claims/by-labels?labels={label}&limit={limit}&offset={offset}"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+            };
+            let (page_limit, has_more, next_offset) = (
+                header("x-page-limit"),
+                header("x-has-more"),
+                header("x-next-offset"),
+            );
+            let body: Value = resp.json().await.unwrap();
+            let len = body.as_array().expect("response is JSON array").len();
+            (len, page_limit, has_more, next_offset)
+        }
+    };
+
+    // Mid-stream page: 2 of 5 → more to come, resume at offset 2.
+    let (len, page_limit, has_more, next_offset) = page(2, 0).await;
+    assert_eq!(
+        len, 2,
+        "limit=2 must return exactly 2 rows, not the probe row"
+    );
+    assert_eq!(page_limit.as_deref(), Some("2"));
+    assert_eq!(has_more.as_deref(), Some("true"));
+    assert_eq!(next_offset.as_deref(), Some("2"));
+
+    // Exact-fit page: 4 rows consumed, 1 left → still more.
+    let (len, _, has_more, next_offset) = page(2, 2).await;
+    assert_eq!(len, 2);
+    assert_eq!(
+        has_more.as_deref(),
+        Some("true"),
+        "a FULL page with rows behind it must report has_more=true — this is the \
+         'exactly N' vs 'at least N' distinction the bare array could not express"
+    );
+    assert_eq!(next_offset.as_deref(), Some("4"));
+
+    // Final page: exhausted, no next offset.
+    let (len, _, has_more, next_offset) = page(2, 4).await;
+    assert_eq!(len, 1);
+    assert_eq!(has_more.as_deref(), Some("false"));
+    assert_eq!(
+        next_offset, None,
+        "x-next-offset must be absent once the result set is exhausted"
+    );
+
+    // Over-max request: the clamp is now discoverable instead of silent.
+    let (len, page_limit, has_more, _) = page(500, 0).await;
+    assert_eq!(
+        page_limit.as_deref(),
+        Some("100"),
+        "limit=500 must report the effective clamped limit (MAX_PAGE_LIMIT=100)"
+    );
+    assert_eq!(len, 5, "all 5 seeded rows fit inside the clamped page");
+    assert_eq!(has_more.as_deref(), Some("false"));
+}
+
 async fn seed_agent(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     // Per-test-binary distinct prefix (DD) so we don't collide with other test
