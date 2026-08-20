@@ -2223,9 +2223,23 @@ pub struct DecideMatchCandidateParams {
     #[schemars(description = "Match-candidate UUID to decide on")]
     pub candidate_id: String,
     #[schemars(
-        description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct), 'reject', or 'retire' (undo a promotion: deletes the matcher edge plus the factors/bp_messages derived from it and flips the row to stale)"
+        description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct) or 'reject'. To undo a promotion use the separate `retire_match_candidate` tool — it requires claims:admin because it withdraws another principal's assertion."
     )]
     pub verdict: String,
+}
+
+/// Params for `retire_match_candidate`.
+///
+/// Deliberately a SEPARATE tool from `decide_match_candidate` rather than a third
+/// verdict on it. `SCOPE_MAP` is one scope per tool, and retirement is a different
+/// class of act from promote/reject: those are additive (`claims:write`, the scope
+/// that files a challenge), whereas retirement withdraws an assertion another
+/// principal made (`claims:admin`, the scope that supersedes). Folding it back into
+/// `decide_match_candidate` would force one of the two to hold the wrong scope.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RetireMatchCandidateParams {
+    #[schemars(description = "Match-candidate UUID to retire")]
+    pub candidate_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

@@ -210,12 +210,42 @@ async fn returns_corroborates_edges_and_pending_candidates(pool: PgPool) {
 /// `default_jwt_config()` in state.rs when `EPIGRAPH_JWT_SECRET` is unset).
 /// Same pattern as `integration/embed_on_create_claim.rs::test_bearer_token`.
 fn decide_bearer_token(client_id: Uuid, agent_id: Option<Uuid>, client_type: &str) -> String {
+    decide_bearer_token_with_scopes(
+        client_id,
+        agent_id,
+        client_type,
+        vec!["claims:read".to_string(), "claims:write".to_string()],
+    )
+}
+
+/// `retire` requires `claims:admin` — promote/reject only need `claims:write`.
+/// The two helpers exist so a test cannot accidentally exercise retirement with
+/// a writer token and conclude the gate is open.
+fn admin_bearer_token(client_id: Uuid, agent_id: Option<Uuid>, client_type: &str) -> String {
+    decide_bearer_token_with_scopes(
+        client_id,
+        agent_id,
+        client_type,
+        vec![
+            "claims:read".to_string(),
+            "claims:write".to_string(),
+            "claims:admin".to_string(),
+        ],
+    )
+}
+
+fn decide_bearer_token_with_scopes(
+    client_id: Uuid,
+    agent_id: Option<Uuid>,
+    client_type: &str,
+    scopes: Vec<String>,
+) -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
     let (token, _) = jwt_config
         .issue_access_token(
             client_id,
-            vec!["claims:read".to_string(), "claims:write".to_string()],
+            scopes,
             client_type,
             None, // owner_id — service clients created by the bridge have none
             agent_id,
@@ -445,6 +475,9 @@ async fn retire_undoes_a_promotion_including_its_derived_factors(pool: PgPool) {
          without one this test cannot prove the factor is cleaned up"
     );
 
+    // retire needs claims:admin; promote/reject above ran on claims:write,
+    // which is exactly the split this route enforces.
+    let token = admin_bearer_token(client_id, Some(agent), "agent");
     let resp = post_decide(pool.clone(), candidate, &token, "retire").await;
     let status = resp.status();
     let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -543,6 +576,9 @@ async fn retire_leaves_non_matcher_edges_between_the_same_pair_alone(pool: PgPoo
     .await
     .unwrap();
 
+    // retire needs claims:admin; promote/reject above ran on claims:write,
+    // which is exactly the split this route enforces.
+    let token = admin_bearer_token(client_id, Some(agent), "agent");
     let resp = post_decide(pool.clone(), candidate, &token, "retire").await;
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -586,6 +622,9 @@ async fn promote_and_reject_still_refuse_an_already_decided_candidate(pool: PgPo
 
     // …and the retire arm must not resurrect it as promotable either: a
     // retired row stays 'stale'.
+    // retire needs claims:admin; promote/reject above ran on claims:write,
+    // which is exactly the split this route enforces.
+    let token = admin_bearer_token(client_id, Some(agent), "agent");
     let resp = post_decide(pool.clone(), candidate, &token, "retire").await;
     assert_eq!(resp.status(), StatusCode::OK, "retire tolerates any status");
     assert_eq!(status_of(&pool, candidate).await, "stale");
@@ -626,5 +665,47 @@ async fn list_candidates_returns_pending_with_excerpts(pool: PgPool) {
         resp.status(),
         StatusCode::UNAUTHORIZED,
         "list requires a bearer token"
+    );
+}
+
+/// The scope split, pinned from the refusing side.
+///
+/// Making the retire tests pass by handing them an admin token only proves admin
+/// WORKS; it cannot catch the gate being widened back to `claims:write`. This is
+/// the test that fails if someone does. It matters because retirement withdraws
+/// an assertion another principal made — the same class of act as supersession —
+/// and 50 of 825 production oauth_clients hold `claims:write`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_is_refused_to_a_claims_write_caller(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let candidate = insert_pending_candidate(&pool, a, b).await;
+    let client_id = Uuid::new_v4();
+
+    // Same writer token that promote/reject accept.
+    let writer = decide_bearer_token(client_id, Some(agent), "agent");
+
+    let promote = post_decide(pool.clone(), candidate, &writer, "promote").await;
+    assert_eq!(
+        promote.status(),
+        StatusCode::OK,
+        "precondition: claims:write must still be enough to PROMOTE, otherwise this \
+         test would pass even if the whole route were locked to admin"
+    );
+
+    let retire = post_decide(pool.clone(), candidate, &writer, "retire").await;
+    assert_eq!(
+        retire.status(),
+        StatusCode::FORBIDDEN,
+        "claims:write must NOT be able to retire — that scope files challenges; \
+         withdrawing another principal's assertion takes claims:admin"
+    );
+
+    // And the refusal must be a real refusal: nothing retracted.
+    let (edges, _, _) = matcher_edge_footprint(&pool, a, b).await;
+    assert_eq!(
+        edges, 1,
+        "the promoted edge must still be in force after the refused retire"
     );
 }

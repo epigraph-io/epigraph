@@ -7,6 +7,7 @@ use epigraph_crypto::AgentSigner;
 use epigraph_mcp::tools;
 use epigraph_mcp::types::{
     DecideMatchCandidateParams, FindCrossSourceMatchesParams, ListMatchCandidatesParams,
+    RetireMatchCandidateParams,
 };
 use epigraph_mcp::{embed::McpEmbedder, EpiGraphMcpFull};
 use rmcp::model::RawContent;
@@ -551,11 +552,10 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
          one this test cannot prove the factor is cleaned up"
     );
 
-    let out = tools::matching::decide_match_candidate(
+    let out = tools::matching::retire_match_candidate(
         &server,
-        DecideMatchCandidateParams {
+        RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
-            verdict: "retire".into(),
         },
     )
     .await
@@ -618,11 +618,10 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
     .expect("promote");
 
     let read_only = build_server(pool.clone(), true).await;
-    tools::matching::decide_match_candidate(
+    tools::matching::retire_match_candidate(
         &read_only,
-        DecideMatchCandidateParams {
+        RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
-            verdict: "retire".into(),
         },
     )
     .await

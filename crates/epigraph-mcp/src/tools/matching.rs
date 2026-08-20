@@ -215,27 +215,6 @@ pub async fn decide_match_candidate(
                 .await
                 .map_err(internal_error)?;
         }
-        "retire" => {
-            // Undo of a promotion. Before this arm existed an agent had no way
-            // to retract one at all: the HTTP route refused every verdict on a
-            // decided row, and the only working path was the
-            // `retire_match_candidates` operator binary on the host, which no
-            // MCP tool wrapped.
-            //
-            // The retraction is a single `epigraph-db` transaction shared with
-            // the HTTP route — deleting the edge without the `factors` /
-            // `bp_messages` the `edges_auto_factor` trigger derived from it
-            // would leave an orphan factor corroborating forever.
-            let outcome = repo
-                .retire(candidate_id, Some(acting_agent))
-                .await
-                .map_err(internal_error)?;
-            let updated = repo.get(candidate_id).await.map_err(internal_error)?;
-            return success_json(&serde_json::json!({
-                "candidate": row_to_out(updated),
-                "retirement": outcome,
-            }));
-        }
         other => {
             return Err(invalid_params(format!(
                 "verdict must be 'promote', 'reject' or 'retire', got {other}"
@@ -245,4 +224,39 @@ pub async fn decide_match_candidate(
 
     let updated = repo.get(candidate_id).await.map_err(internal_error)?;
     success_json(&row_to_out(updated))
+}
+
+/// Retire a promoted match candidate: retract its matcher edge and delete the
+/// derived factors, bp_messages and BBAs, flipping the row to `stale`.
+///
+/// A SEPARATE tool from [`decide_match_candidate`] on purpose. `SCOPE_MAP` holds
+/// one scope per tool, and this is not the same kind of act as promote/reject:
+/// those are additive and take `claims:write` (the scope that files a challenge),
+/// while this withdraws an assertion another principal made and takes
+/// `claims:admin` (the scope that supersedes). Keeping them in one tool would
+/// force one of the two to carry the wrong scope, and 50 of 825 production
+/// oauth_clients hold `claims:write`.
+///
+/// The edge is RETRACTED (`valid_to` closed), not deleted, so the promotion's
+/// provenance — `properties.decided_by` in particular — survives; see
+/// `MatchCandidateRepo::retire`. The derived rows ARE deleted, because they are
+/// materializations that regenerate from live edges.
+pub async fn retire_match_candidate(
+    server: &EpiGraphMcpFull,
+    params: RetireMatchCandidateParams,
+) -> Result<CallToolResult, McpError> {
+    server.reject_if_read_only()?;
+    let candidate_id = parse_uuid(&params.candidate_id)?;
+    let repo = MatchCandidateRepo::new(server.pool.clone());
+    let acting_agent = server.agent_id().await?;
+
+    let outcome = repo
+        .retire(candidate_id, Some(acting_agent))
+        .await
+        .map_err(internal_error)?;
+    let updated = repo.get(candidate_id).await.map_err(internal_error)?;
+    success_json(&serde_json::json!({
+        "candidate": row_to_out(updated),
+        "retirement": outcome,
+    }))
 }

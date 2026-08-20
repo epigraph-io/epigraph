@@ -105,6 +105,10 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("update_with_evidence", "claims:write"),
     ("verify_claim", "claims:write"),
     // ─── claims:admin ──────────────────────────────────────────────────
+    // Retirement withdraws an assertion another principal made — same class
+    // of act as supersession, hence admin rather than the claims:write that
+    // covers promote/reject on `decide_match_candidate`.
+    ("retire_match_candidate", "claims:admin"),
     ("mark_duplicate", "claims:admin"),
     ("supersede_claim", "claims:admin"),
     ("update_partition", "claims:admin"),
@@ -169,6 +173,11 @@ mod tests {
     /// gated on `claims:admin`.
     #[test]
     fn issue_122_admin_tools_are_admin_gated() {
+        assert_eq!(
+            required_scope("retire_match_candidate"),
+            Some("claims:admin"),
+            "retirement is destructive+authoritative; claims:write must not reach it"
+        );
         assert_eq!(required_scope("mark_duplicate"), Some("claims:admin"));
         assert_eq!(required_scope("supersede_claim"), Some("claims:admin"));
         assert_eq!(required_scope("update_partition"), Some("claims:admin"));

@@ -274,7 +274,27 @@ pub async fn decide_candidate(
             reason: "decide_candidate requires authentication".into(),
         })?
         .0;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+    // Scope is per-VERDICT, not per-route, because this one entry point covers
+    // two different kinds of act:
+    //   promote / reject  — ADDITIVE. They record a decision and, for promote,
+    //                       create an edge. `claims:write`, same as filing a
+    //                       challenge.
+    //   retire            — AUTHORITATIVE. It withdraws an assertion someone
+    //                       else made: it retracts the edge and deletes the
+    //                       derived factors, bp_messages and BBAs. That is the
+    //                       same class of act as supersession, so it takes
+    //                       `claims:admin`, matching the peer routes
+    //                       (crud::promote_staged_edges, versioning::
+    //                       mark_duplicate, conflicts, policies).
+    // A single route-wide `claims:write` would let any writer withdraw another
+    // principal's assertion, and 50 of 825 production oauth_clients hold
+    // `claims:write`.
+    let required: &[&str] = if req.verdict.eq_ignore_ascii_case("retire") {
+        &["claims:admin"]
+    } else {
+        &["claims:write"]
+    };
+    crate::middleware::scopes::check_scopes(&auth, required)?;
 
     // Decision provenance: prefer agent_id, fall back to client_id (sub).
     //
