@@ -42,6 +42,13 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
 /// common case, so the predicate is written NULL-first to short-circuit.
 pub const EDGE_IN_FORCE: &str = "(e.valid_to IS NULL OR e.valid_to > now())";
 
+/// [`EDGE_IN_FORCE`] for queries that select from `edges` without an alias.
+///
+/// Kept as a separate constant rather than a format arg so both spellings are
+/// greppable and a reviewer can see every enforcement site by searching for
+/// `EDGE_IN_FORCE`.
+pub const EDGE_IN_FORCE_UNALIASED: &str = "(valid_to IS NULL OR valid_to > now())";
+
 /// A row from the edges table
 #[derive(Debug, Clone)]
 pub struct EdgeRow {
