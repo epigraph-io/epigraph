@@ -755,6 +755,28 @@ impl EpiGraphMcpFull {
         tools::link_epistemic::link_epistemic(self, params).await
     }
 
+    #[tool(
+        description = "Update an existing edge in place: retire it by closing its lifecycle window (valid_to) and/or shallow-merge a JSON object into its properties. MCP-native wrapper for PATCH /api/v1/edges/:id — before this tool the only way to act on a mislabeled edge from MCP was raw OAuth + curl. At least one of valid_to / properties is required; properties must be a JSON object (a non-object would silently convert the JSONB column to an array via Postgres `||`). valid_to accepts an RFC3339 timestamp or the literal \"now\" (resolved server-side, since an MCP client has no wall clock). Retiring is the NON-DESTRUCTIVE correction: the row and its audit history survive. Emits edge.updated, plus edge.retired when valid_to is set. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retired edge."
+    )]
+    async fn patch_edge(
+        &self,
+        Parameters(params): Parameters<crate::types::PatchEdgeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::edge_mutation::patch_edge(self, params).await
+    }
+
+    #[tool(
+        description = "Hard-delete an edge by id. MCP-native wrapper for DELETE /api/v1/edges/:id. IRREVERSIBLE and audit-destroying — use patch_edge with valid_to to retire an edge that merely stopped holding; delete is for edges that should never have existed (e.g. a mislabeled contradicts edge). Errors if the edge id does not exist. Emits edge.deleted. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the deleted edge."
+    )]
+    async fn delete_edge(
+        &self,
+        Parameters(params): Parameters<crate::types::DeleteEdgeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::edge_mutation::delete_edge(self, params).await
+    }
+
     // ── Paper Queries (3 tools) ──
 
     #[tool(description = "Look up a paper by its DOI, returning title, authors, and claims.")]

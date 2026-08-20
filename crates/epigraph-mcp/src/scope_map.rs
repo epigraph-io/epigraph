@@ -88,6 +88,11 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("link_hierarchical", "claims:write"),
     ("memorize", "claims:write"),
     ("patch_claim", "claims:write"),
+    // Non-destructive edge correction: closes the lifecycle window and/or
+    // merges properties, leaving the row and its audit trail intact. Same
+    // tier as `patch_claim`. Its destructive sibling `delete_edge` is
+    // admin-gated below.
+    ("patch_edge", "claims:write"),
     ("refresh_workflow_promotion", "claims:write"),
     ("publish_event", "claims:write"),
     ("recompute_beliefs", "claims:write"),
@@ -105,6 +110,13 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("update_with_evidence", "claims:write"),
     ("verify_claim", "claims:write"),
     // ─── claims:admin ──────────────────────────────────────────────────
+    // Hard-deletes the edge row: irreversible and audit-destroying, so it
+    // sits with the other irreversible graph mutations rather than with
+    // `patch_edge`. Note this is STRICTER than the HTTP route it wraps
+    // (DELETE /api/v1/edges/:id only requires `edges:write`); the MCP scope
+    // vocabulary has no `edges:*` tier, and the conservative mapping is the
+    // right default for a tool handed to autonomous agents.
+    ("delete_edge", "claims:admin"),
     ("mark_duplicate", "claims:admin"),
     ("supersede_claim", "claims:admin"),
     ("update_partition", "claims:admin"),
