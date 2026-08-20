@@ -7,6 +7,7 @@ pub mod consolidate;
 pub mod dedup_sweep;
 pub mod ds;
 pub mod ds_auto;
+pub mod edge_mutation;
 pub mod embeddings;
 pub mod events;
 pub mod evolve_step;

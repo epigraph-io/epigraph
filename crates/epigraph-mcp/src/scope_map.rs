@@ -88,6 +88,11 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("link_hierarchical", "claims:write"),
     ("memorize", "claims:write"),
     ("patch_claim", "claims:write"),
+    // Non-destructive edge correction: closes the lifecycle window and/or
+    // merges properties, leaving the row and its audit trail intact. Same
+    // tier as `patch_claim`. Its destructive sibling `delete_edge` is
+    // admin-gated below.
+    ("patch_edge", "claims:write"),
     ("refresh_workflow_promotion", "claims:write"),
     ("publish_event", "claims:write"),
     ("recompute_beliefs", "claims:write"),
@@ -109,6 +114,19 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // of act as supersession, hence admin rather than the claims:write that
     // covers promote/reject on `decide_match_candidate`.
     ("retire_match_candidate", "claims:admin"),
+    // Hard-deletes the edge row: irreversible and audit-destroying, so it
+    // sits with the other irreversible graph mutations rather than with
+    // `patch_edge`. Note this is STRICTER than the HTTP route it wraps
+    // (DELETE /api/v1/edges/:id only requires `edges:write`); the MCP scope
+    // vocabulary has no `edges:*` tier, and the conservative mapping is the
+    // right default for a tool handed to autonomous agents.
+    //
+    // INTEGRATION NOTE: `delete_edge` still hard-deletes, while
+    // `retire_match_candidate` above now RETRACTS (closes `valid_to`, keeping the
+    // row and its provenance). Both being admin is right, but the two paths now
+    // disagree about whether removing an edge should destroy it. Reconciling them
+    // is follow-on work, deliberately not done inside a merge resolution.
+    ("delete_edge", "claims:admin"),
     ("mark_duplicate", "claims:admin"),
     ("supersede_claim", "claims:admin"),
     ("update_partition", "claims:admin"),
