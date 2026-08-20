@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     Json,
 };
 #[cfg(feature = "db")]
@@ -1644,15 +1644,34 @@ pub struct ClaimsByLabelsQuery {
     /// Minimum truth_value (default 0.0).
     #[serde(default)]
     pub min_truth: Option<f64>,
-    /// Max claims to return (clamped to [`MIN_PAGE_LIMIT`, `MAX_PAGE_LIMIT`]).
+    /// Max claims to return. Silently clamped to [`MIN_PAGE_LIMIT`,
+    /// [`MAX_PAGE_LIMIT`]] — a request for more than [`MAX_PAGE_LIMIT`] rows
+    /// yields at most [`MAX_PAGE_LIMIT`]. Read the [`HDR_PAGE_LIMIT`] response
+    /// header for the limit actually applied, and [`HDR_HAS_MORE`] to tell a
+    /// full page from a truncated result set.
     #[serde(default)]
     pub limit: Option<i64>,
     /// Skip the first N matching claims (default 0; negative values clamped to 0).
     /// Combine with `limit` to page through large result sets — claims are
-    /// ordered by `created_at DESC`.
+    /// ordered by `created_at DESC`. [`HDR_NEXT_OFFSET`] carries the offset to
+    /// use for the next page whenever one exists.
     #[serde(default)]
     pub offset: Option<i64>,
 }
+
+/// Effective per-page limit actually applied, after clamping to
+/// [`MAX_PAGE_LIMIT`]. Always present on a 200.
+pub const HDR_PAGE_LIMIT: &str = "x-page-limit";
+
+/// `"true"` when more matching claims exist beyond this page, `"false"` when
+/// the result set is exhausted. This is what makes truncation *detectable*:
+/// without it a caller cannot distinguish "exactly `limit` results" from "at
+/// least `limit` results". Always present on a 200.
+pub const HDR_HAS_MORE: &str = "x-has-more";
+
+/// Offset to pass on the next request to continue paging. Present only when
+/// [`HDR_HAS_MORE`] is `"true"`.
+pub const HDR_NEXT_OFFSET: &str = "x-next-offset";
 
 /// Response row for `GET /api/v1/claims/by-labels`.
 ///
@@ -1677,11 +1696,27 @@ pub struct ClaimByLabelsResponse {
 /// backlog cleanup + reconciler Python scripts can read without direct DB
 /// access. Public (no auth) — these are read-only queries over public claim
 /// metadata, same as `GET /api/v1/claims` and `GET /api/v1/claims/by-belief`.
+///
+/// # Pagination contract
+///
+/// The body stays a bare JSON array (four downstream consumers deserialize it
+/// as one), so the page metadata rides on response headers:
+///
+/// - [`HDR_PAGE_LIMIT`] — the limit actually applied, after clamping to
+///   [`MAX_PAGE_LIMIT`]. A caller that asked for 200 sees `100` here.
+/// - [`HDR_HAS_MORE`] — `"true"`/`"false"`; computed by asking the repo for
+///   `limit + 1` rows and truncating the body back to `limit`, so it costs no
+///   extra `COUNT(*)`.
+/// - [`HDR_NEXT_OFFSET`] — next page's `offset`, present only when there is one.
+///
+/// Without these a caller cannot distinguish "exactly `limit` results" from
+/// "at least `limit` results", which is precisely how the epiclaw-host backlog
+/// router came to believe its `limit=200` was honoured.
 #[cfg(feature = "db")]
 pub async fn list_by_labels(
     State(state): State<AppState>,
     Query(q): Query<ClaimsByLabelsQuery>,
-) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
+) -> Result<(HeaderMap, Json<Vec<ClaimByLabelsResponse>>), ApiError> {
     let labels: Vec<String> = q
         .labels
         .split(',')
@@ -1710,13 +1745,15 @@ pub async fn list_by_labels(
         .clamp(MIN_PAGE_LIMIT, MAX_PAGE_LIMIT);
     let offset = q.offset.unwrap_or(0).max(0);
 
-    let rows = ClaimRepository::list_by_labels(
+    // Probe one row past the page so `has_more` is exact without a COUNT(*).
+    // The repo layer clamps to 1000, so `limit + 1` (max 101) is always honoured.
+    let mut rows = ClaimRepository::list_by_labels(
         &state.db_pool,
         &labels,
         &exclude_labels,
         current_only,
         min_truth,
-        limit,
+        limit + 1,
         offset,
     )
     .await
@@ -1724,29 +1761,58 @@ pub async fn list_by_labels(
         message: e.to_string(),
     })?;
 
-    Ok(Json(
-        rows.into_iter()
-            .map(|(c, claim_labels)| ClaimByLabelsResponse {
-                id: c.id.as_uuid(),
-                content: c.content,
-                truth_value: c.truth_value.value(),
-                agent_id: c.agent_id.as_uuid(),
-                created_at: c.created_at.to_rfc3339(),
-                labels: claim_labels,
-                is_current: c.is_current,
-                supersedes: c.supersedes.map(|s| s.as_uuid()),
-            })
-            .collect(),
+    let has_more = rows.len() as i64 > limit;
+    // The probe row must never reach the body: `scripts/reconcile_backlog_labels.py`
+    // pages until `len(page) < page_size`, so a `limit + 1` page would loop forever.
+    rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(HDR_PAGE_LIMIT, limit.into());
+    headers.insert(
+        HDR_HAS_MORE,
+        if has_more {
+            HeaderValue::from_static("true")
+        } else {
+            HeaderValue::from_static("false")
+        },
+    );
+    if has_more {
+        headers.insert(HDR_NEXT_OFFSET, (offset + limit).into());
+    }
+
+    Ok((
+        headers,
+        Json(
+            rows.into_iter()
+                .map(|(c, claim_labels)| ClaimByLabelsResponse {
+                    id: c.id.as_uuid(),
+                    content: c.content,
+                    truth_value: c.truth_value.value(),
+                    agent_id: c.agent_id.as_uuid(),
+                    created_at: c.created_at.to_rfc3339(),
+                    labels: claim_labels,
+                    is_current: c.is_current,
+                    supersedes: c.supersedes.map(|s| s.as_uuid()),
+                })
+                .collect(),
+        ),
     ))
 }
 
-/// Stub for non-db builds — returns an empty list.
+/// Stub for non-db builds — returns an empty list with an exhausted-page header set.
 #[cfg(not(feature = "db"))]
 pub async fn list_by_labels(
     State(_state): State<AppState>,
-    Query(_q): Query<ClaimsByLabelsQuery>,
-) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
-    Ok(Json(vec![]))
+    Query(q): Query<ClaimsByLabelsQuery>,
+) -> Result<(HeaderMap, Json<Vec<ClaimByLabelsResponse>>), ApiError> {
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .clamp(MIN_PAGE_LIMIT, MAX_PAGE_LIMIT);
+    let mut headers = HeaderMap::new();
+    headers.insert(HDR_PAGE_LIMIT, limit.into());
+    headers.insert(HDR_HAS_MORE, HeaderValue::from_static("false"));
+    Ok((headers, Json(vec![])))
 }
 
 /// Phase 1: Propose deletion of a claim. Requires `claims:delete` scope.
