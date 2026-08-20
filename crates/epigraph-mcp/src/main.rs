@@ -148,6 +148,18 @@ struct Cli {
 struct SelectedSigner {
     signer: AgentSigner,
     llm_identity: Option<(String, String)>,
+    /// `true` when the operator DECLARED this identity (`--agent-model` or
+    /// `--agent-key`, rungs 1-3); `false` for the rung-4 `generate()` fallback.
+    ///
+    /// Distinct from `llm_identity.is_some()`, which is `None` for BOTH rung 3
+    /// and rung 4. The distinction matters to
+    /// `epigraph_mcp::tools::claims::require_owner_or_admin`: its no-`AuthContext`
+    /// fallback compares a claim's author against this server's signer agent,
+    /// which is only a policy when the identity is stable across process
+    /// restarts. Under rung 4 the signer is a fresh random keypair per process,
+    /// so that comparison can never match a pre-existing claim — see
+    /// [`EpiGraphMcpFull::with_generated_signer_identity`].
+    identity_declared: bool,
 }
 
 /// Select the agent signer from CLI/env inputs, returning the signer paired with
@@ -179,6 +191,7 @@ fn select_signer(
             return Ok(SelectedSigner {
                 signer,
                 llm_identity: Some((model.trim().to_string(), hash.to_string())),
+                identity_declared: true,
             });
         }
         // (2) model + raw prompt (or empty) -> raw path, which hashes the
@@ -196,6 +209,7 @@ fn select_signer(
         return Ok(SelectedSigner {
             signer,
             llm_identity: Some((model.trim().to_string(), hash)),
+            identity_declared: true,
         });
     }
 
@@ -213,6 +227,7 @@ fn select_signer(
         return Ok(SelectedSigner {
             signer,
             llm_identity: None,
+            identity_declared: true,
         });
     }
 
@@ -220,6 +235,7 @@ fn select_signer(
     Ok(SelectedSigner {
         signer: AgentSigner::generate(),
         llm_identity: None,
+        identity_declared: false,
     })
 }
 
@@ -319,16 +335,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create or restore agent signer. Precedence lives in `select_signer`
     // (unit-tested); here we only handle the side effects (secret-key print for
     // the generate() fallback, and NEVER logging the raw prompt).
-    let is_generate_fallback = cli.agent_model.is_none() && cli.agent_key.is_none();
     let SelectedSigner {
         signer,
         llm_identity,
+        identity_declared,
     } = select_signer(
         cli.agent_model.as_deref(),
         cli.agent_system_prompt.as_deref(),
         cli.agent_system_prompt_hash.as_deref(),
         cli.agent_key.as_deref(),
     )?;
+    // Read the rung off `select_signer`'s own return value rather than
+    // re-deriving `agent_model.is_none() && agent_key.is_none()` here: the
+    // precedence table is documented as living in one place, and a second copy
+    // of the rung-4 predicate is free to drift from it.
+    let is_generate_fallback = !identity_declared;
 
     if is_generate_fallback {
         eprintln!("Generated new agent keypair");
@@ -339,6 +360,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         eprintln!("  Public key: {}", hex::encode(signer.public_key()));
         eprintln!("  Secret key (save this!): {hex_str}");
+        // Surfaced at boot, not only at the first refused call: with a random
+        // per-process signer the owner-equality fallback in
+        // `require_owner_or_admin` has nothing stable to compare against, so
+        // ownership-gated tools stop enforcing ownership on transports that
+        // carry no AuthContext.
+        tracing::warn!(
+            "No declared signer identity (--agent-key / --agent-model absent): a fresh keypair \
+             was generated for this process. Ownership-gated tools (supersede_claim, \
+             mark_duplicate, resolve_backlog_item) will therefore NOT enforce owner-equality on \
+             transports without an AuthContext (stdio). Pass --agent-key for strict enforcement."
+        );
     }
 
     // Log the derived LLM identity (model + prompt HASH only — the raw prompt is
@@ -423,14 +455,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let service = StreamableHttpService::new(
             move || {
-                Ok(EpiGraphMcpFull::new_shared_with_federation(
+                let srv = EpiGraphMcpFull::new_shared_with_federation(
                     pool.clone(),
                     signer.clone(),
                     embedder.clone(),
                     read_only,
                     federation.clone(),
                     llm_identity.clone(),
-                ))
+                );
+                Ok(if identity_declared {
+                    srv
+                } else {
+                    srv.with_generated_signer_identity()
+                })
             },
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default(),
@@ -509,6 +546,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             federation,
             llm_identity,
         );
+        // Rung-4 signer: the owner-equality fallback in
+        // `require_owner_or_admin` has no stable identity to compare against.
+        // See `EpiGraphMcpFull::with_generated_signer_identity`.
+        let server = if identity_declared {
+            server
+        } else {
+            server.with_generated_signer_identity()
+        };
         let service = server.serve(rmcp::transport::stdio()).await.map_err(|e| {
             tracing::error!("MCP serve error: {e}");
             e
@@ -622,6 +667,7 @@ mod signer_selection_tests {
         let SelectedSigner {
             signer,
             llm_identity,
+            ..
         } = select_signer(Some(model), Some(raw_prompt), Some(hash), Some(KEY_HEX)).unwrap();
 
         // Key is the verbatim-hash derivation, proving the prehashed rung ran
@@ -651,6 +697,7 @@ mod signer_selection_tests {
         let SelectedSigner {
             signer,
             llm_identity,
+            ..
         } = select_signer(Some(model), Some(prompt), None, None).unwrap();
 
         let expected_signer = epigraph_crypto::keypair_from_llm_agent(model, prompt);
@@ -676,6 +723,7 @@ mod signer_selection_tests {
         let SelectedSigner {
             signer,
             llm_identity,
+            ..
         } = select_signer(Some(model), None, None, None).unwrap();
 
         let expected = epigraph_crypto::keypair_from_llm_agent(model, "");
@@ -691,6 +739,7 @@ mod signer_selection_tests {
         let SelectedSigner {
             signer,
             llm_identity,
+            ..
         } = select_signer(None, None, None, Some(KEY_HEX)).unwrap();
 
         let key: [u8; 32] = [0x01; 32];
@@ -714,6 +763,42 @@ mod signer_selection_tests {
             a.signer.public_key(),
             b.signer.public_key(),
             "generate() must be random per call, not a fixed seed"
+        );
+    }
+
+    /// `identity_declared` must track the RUNG, not `llm_identity`. Rungs 1-3
+    /// are declarations by the operator; only rung 4 is not. Rung 3 is the
+    /// discriminating case: it reports `llm_identity: None` exactly like rung
+    /// 4, so a consumer that tried to infer declaredness from `llm_identity`
+    /// would classify an explicit `--agent-key` as undeclared and silently
+    /// disable owner-equality enforcement for it.
+    #[test]
+    fn identity_declared_tracks_the_rung_not_the_llm_identity() {
+        // Rung 1: model + hash.
+        assert!(
+            select_signer(Some("m"), None, Some("abc123"), None)
+                .unwrap()
+                .identity_declared
+        );
+        // Rung 2: model + raw prompt.
+        assert!(
+            select_signer(Some("m"), Some("prompt"), None, None)
+                .unwrap()
+                .identity_declared
+        );
+        // Rung 3: agent-key alone — `llm_identity` is None, yet DECLARED.
+        let rung3 = select_signer(None, None, None, Some(KEY_HEX)).unwrap();
+        assert!(rung3.llm_identity.is_none());
+        assert!(
+            rung3.identity_declared,
+            "--agent-key is an explicit identity declaration even though it carries no \
+             llm_identity; conflating the two would disable ownership enforcement for it"
+        );
+        // Rung 4: nothing supplied.
+        assert!(
+            !select_signer(None, None, None, None)
+                .unwrap()
+                .identity_declared
         );
     }
 

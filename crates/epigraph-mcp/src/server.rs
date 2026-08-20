@@ -43,6 +43,22 @@ pub struct EpiGraphMcpFull {
     /// `None` (the default for every unconfigured process) preserves the legacy
     /// behavior exactly — no properties are written.
     pub(crate) llm_identity: Option<(String, String)>,
+    /// Whether this server's signer identity was DECLARED by the operator
+    /// (`--agent-key` / `--agent-model`) rather than freshly generated per
+    /// process (`main::select_signer` rung 4).
+    ///
+    /// Read only by [`crate::tools::claims::require_owner_or_admin`], whose
+    /// no-`AuthContext` fallback compares a claim's author against
+    /// [`Self::agent_id`]. That comparison is a meaningful ownership policy
+    /// only when the signer is stable across restarts. With a per-process
+    /// random keypair the server's agent UUID is a throwaway that authored
+    /// nothing, so the comparison is undecidable rather than failed.
+    ///
+    /// Defaults to `true` (the strict, pre-existing behavior) in every
+    /// constructor; `main` opts out via
+    /// [`Self::with_generated_signer_identity`] on rung 4. Defaulting strict
+    /// means no embedding caller can widen the gate by omission.
+    pub(crate) signer_identity_declared: bool,
     /// Per-session memoization of auth-lineage principals already linked via an
     /// `OPERATED_BY` edge, so `call_tool` writes that edge at most once per
     /// distinct `auth.agent_id` per session (a fast in-memory short-circuit; the
@@ -347,6 +363,7 @@ impl EpiGraphMcpFull {
             read_only,
             federation,
             llm_identity,
+            signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -394,8 +411,31 @@ impl EpiGraphMcpFull {
             read_only,
             federation,
             llm_identity,
+            signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Mark this server's signer identity as GENERATED — i.e. the operator
+    /// declared neither `--agent-key` nor `--agent-model`, so
+    /// `main::select_signer` fell through to `AgentSigner::generate()` and the
+    /// signer is a fresh random keypair that exists only for this process.
+    ///
+    /// The single consumer is
+    /// [`crate::tools::claims::require_owner_or_admin`]. Its no-`AuthContext`
+    /// fallback (stdio) asks "is this claim authored by *this server's* agent?"
+    /// — a question whose answer is structurally `no` for every pre-existing
+    /// claim once the signer is random per process. Flagging the condition lets
+    /// that fallback distinguish "not the owner" (a real denial) from "there is
+    /// no stable owner to compare against" (undecidable).
+    ///
+    /// Consumed-self builder rather than a constructor parameter: both
+    /// `new_*_with_federation` signatures already carry six arguments and every
+    /// caller except `main` wants the strict default.
+    #[must_use]
+    pub fn with_generated_signer_identity(mut self) -> Self {
+        self.signer_identity_declared = false;
+        self
     }
 
     // ── Claims (11 tools) ──
