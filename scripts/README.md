@@ -157,3 +157,86 @@ find-or-create / idempotency path). Until then, run the reconciler
 **only with `--dry-run`**. Enabling the live cron against a server that
 predates Plan 2.5 risks duplicate or malformed claim writes.
 
+
+## test_generality_direction.py
+
+Falsification test: **does the geometry of the claim embedding space predict
+the direction of `decomposes_to` edges?**
+
+The motivating problem is a mismatch of symmetry. A Riemannian metric is
+symmetric (`d(a,b) = d(b,a)`); an ontology is not (`is-a` and `decomposes-to`
+have direction). So no learned metric can induce hierarchy unless some
+*asymmetric* quantity in the geometry tracks generality. In the full method
+that quantity is the volume element `sqrt(det G(z))`, which costs weeks to
+train. This script asks the cheap prerequisite: does a **flat-space** proxy,
+in the 1536-d space we already have, beat chance at calling which endpoint is
+the parent? If it cannot, a learned metric has no signal to sharpen.
+
+A negative result is a successful outcome. The script is built to kill the
+idea, not to support it.
+
+Proxies (fitted against a background sample of `is_current` claims):
+neighbourhood count at cosine radii 0.20/0.30/0.40, mean k-NN similarity,
+proximity to the corpus centroid, and — the headline — the **participation
+ratio** `(sum L)^2 / sum L^2` of the local k-NN covariance spectrum, which is
+the flat-space analogue of the volume element and so the proxy that actually
+forecasts whether the learned-metric version can work. It is reported
+separately even when another proxy scores higher.
+
+Read-only: the connection is pinned `default_transaction_read_only = on`, so a
+stray write aborts rather than commits.
+
+```bash
+DATABASE_URL=postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph \
+    python3 scripts/test_generality_direction.py --verbose
+
+# Smoke test on a slice:
+python3 scripts/test_generality_direction.py --limit 500 --background 5000
+
+# Full report as JSON, plus the paired parent/child distribution plot:
+python3 scripts/test_generality_direction.py --json out.json --plot out.png
+
+# Validate the harness with no database at all:
+python3 scripts/test_generality_direction.py --self-test
+```
+
+**Pre-registered decision rule** (fixed before any result was seen; do not
+adjust after):
+
+| verdict | condition |
+|---------|-----------|
+| `PROCEED` | best proxy >= 0.70 **and** >= 10 points over the length baseline **and** the margin survives the within-agent restriction |
+| `INCONCLUSIVE` | 0.55 – 0.70, or margin over length < 10 points |
+| `DEAD` | <= 0.55, or not separable from the length baseline |
+
+Four confounds are handled, because a naive version of this test returns a
+confident wrong answer:
+
+1. **Length.** `len(content)` is scored as a first-class competitor beside
+   every proxy, and each proxy is rescored inside length-matched strata.
+2. **Agent.** The parent/child `agent_id` contingency is reported, plus
+   accuracy restricted to same-agent edges (a proxy may be reading writing
+   style, not geometry).
+3. **Non-independence.** A parent with 30 children is 30 correlated trials.
+   The headline uses a one-child-per-parent subsample (Wilson CI); the
+   all-edges figure carries a parent-clustered bootstrap CI.
+4. **Temporal / id leakage.** `created_at`, `id` and insertion order are never
+   read as features — `created_at` is not even selected. Hierarchical ingest
+   creates parents before children, so any time-derived feature would score
+   near-perfectly and mean nothing.
+
+Two further guards: a **shuffled-direction control**, which must return ~0.50
+or the harness is broken and every other number is suspect; and a **lexical
+sanity check** (bag-of-words and length-only pairwise logistic regressions).
+If the lexical models match the geometric proxies, a positive result is a
+lexical axis in the ambient space — a classifier could recover hierarchy, but
+it would say nothing about manifold curvature.
+
+Orientation ("higher = parent" vs "lower = parent") is fitted on a fit split
+and scored only on a disjoint test split, with parents split as whole groups.
+
+Offline regression tests (no DB, no network):
+
+```bash
+python3 -m unittest scripts.tests.test_generality_direction
+```
