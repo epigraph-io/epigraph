@@ -200,6 +200,37 @@ pub struct CorroboratesEdge {
     pub paper_doi: Option<String>,
 }
 
+/// Epistemic relationship types carried through structural context assembly
+/// (in addition to the corroborates edges handled separately above).
+#[allow(dead_code)]
+const EPISTEMIC_EDGE_RELATIONSHIPS: &[&str] = &[
+    "supports",
+    "refutes",
+    "contradicts",
+    "specializes",
+    "elaborates",
+    "cites",
+];
+
+/// Whether a returned epistemic-edge hit is the source or the target of the
+/// edge. This matters because e.g. "refutes" read backwards means "is
+/// refuted by".
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeDirection {
+    Outgoing,
+    Incoming,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EpistemicEdgeNeighbor {
+    pub claim_id: Uuid,
+    pub content: String,
+    pub relationship: String,
+    pub direction: EdgeDirection,
+    pub truth_value: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NeighborParagraph {
     pub paragraph_id: Uuid,
@@ -690,6 +721,8 @@ pub struct BatchedContext {
     pub siblings_total_by_paragraph: std::collections::HashMap<Uuid, usize>,
     pub corroborates_by_paragraph: std::collections::HashMap<Uuid, Vec<CorroboratesEdge>>,
     pub corroborates_total_by_paragraph: std::collections::HashMap<Uuid, usize>,
+    pub epistemic_edges_by_paragraph: std::collections::HashMap<Uuid, Vec<EpistemicEdgeNeighbor>>,
+    pub epistemic_edges_total_by_paragraph: std::collections::HashMap<Uuid, usize>,
     /// continues_argument neighbors of each input paragraph (bidirectional).
     pub continues_argument_by_paragraph: std::collections::HashMap<Uuid, Vec<Uuid>>,
     /// atom_a -> [(atom_b, relationship)] where atom_a is one of "our" atoms
@@ -722,6 +755,10 @@ pub async fn fetch_batched_context(
         Default::default();
     let mut corroborates_total_by_paragraph: std::collections::HashMap<Uuid, usize> =
         Default::default();
+    let epistemic_edges_by_paragraph: std::collections::HashMap<Uuid, Vec<EpistemicEdgeNeighbor>> =
+        Default::default();
+    let epistemic_edges_total_by_paragraph: std::collections::HashMap<Uuid, usize> =
+        Default::default();
     let mut continues_argument_by_paragraph: std::collections::HashMap<Uuid, Vec<Uuid>> =
         Default::default();
     let mut atom_atom_links_by_atom: std::collections::HashMap<Uuid, Vec<(Uuid, String)>> =
@@ -740,6 +777,8 @@ pub async fn fetch_batched_context(
             siblings_total_by_paragraph,
             corroborates_by_paragraph,
             corroborates_total_by_paragraph,
+            epistemic_edges_by_paragraph,
+            epistemic_edges_total_by_paragraph,
             continues_argument_by_paragraph,
             atom_atom_links_by_atom,
             paragraphs_by_atom,
@@ -1165,6 +1204,8 @@ pub async fn fetch_batched_context(
         siblings_total_by_paragraph,
         corroborates_by_paragraph,
         corroborates_total_by_paragraph,
+        epistemic_edges_by_paragraph,
+        epistemic_edges_total_by_paragraph,
         continues_argument_by_paragraph,
         atom_atom_links_by_atom,
         paragraphs_by_atom,
