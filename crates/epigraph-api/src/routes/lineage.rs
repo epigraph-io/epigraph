@@ -292,7 +292,7 @@ async fn get_ancestor_lineage(
 ) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32), ApiError> {
     // Use LineageRepository for ancestor traversal
     let lineage_result =
-        LineageRepository::get_lineage(&state.db_pool, claim_id, Some(max_depth)).await?;
+        LineageRepository::get_lineage(&state.db_pool, claim_id, Some(max_depth), None).await?;
 
     // If no claims found (empty result), return just the root claim
     if lineage_result.claims.is_empty() {
