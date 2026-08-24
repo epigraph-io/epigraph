@@ -87,7 +87,7 @@ pub enum SignatureError {
 
 impl IntoResponse for SignatureError {
     fn into_response(self) -> Response {
-        let error_name = format!("{:?}", &self);
+        let error_name = format!("{:?}", self);
 
         let (status, message) = match self {
             SignatureError::MissingHeader(h) => {
