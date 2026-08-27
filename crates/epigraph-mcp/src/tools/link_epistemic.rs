@@ -23,9 +23,27 @@
 //!   design — belief-wiring already no-ops on Neutral, so accepting them
 //!   here just lets citation/provenance edges be created MCP-natively
 //!   without a doomed detour through the raw HTTP edges route.
-//! - idempotent on `(source, target, relationship)`: a re-hit returns the
-//!   existing edge with `was_created=false` and never re-creates the durable
-//!   edge row or re-emits `edge.added`. Belief wiring, however, is NOT gated
+//! - idempotent on `(source, target, relationship)` for the five ORDERED
+//!   relations (`supports`, `elaborates`, `generalizes`, `specializes`,
+//!   `refutes`) and on the UNORDERED pair for the two symmetric ones
+//!   (`contradicts`, `corroborates` — see [`SYMMETRIC_RELATIONSHIPS`]). For a
+//!   symmetric relation, re-asserting the REVERSE direction returns the
+//!   EXISTING edge id — whose stored `source_id`/`target_id` are the opposite
+//!   of the caller's params — with `was_created=false`.
+//!
+//!   Belief consequence of that (a genuine behavior change, not obvious from
+//!   the write branch): `MassFunctionRepository::exists_for_perspective` keys
+//!   solely on `perspective_id = edge_id`, so one edge id per pair means at
+//!   most ONE edge-factor BBA can ever exist for that pair. A reverse
+//!   re-assertion therefore short-circuits inside
+//!   `auto_wire_edge_if_epistemic` and reports `belief_wired=false`; no BBA is
+//!   wired onto the other endpoint. That is the correct reading for a relation
+//!   whose truth is unordered, but it differs from the pre-`SYMMETRIC_RELATIONSHIPS`
+//!   behavior, where `A contradicts B` then `B contradicts A` moved BOTH
+//!   endpoints' belief via two edges and two BBAs.
+//!
+//!   A re-hit never re-creates the durable edge row or re-emits `edge.added`.
+//!   Belief wiring, however, is NOT gated
 //!   on `was_created` alone: a re-hit still attempts the wire, and
 //!   `belief_wired=true` on that re-hit exactly when no BBA has ever been
 //!   materialized for this edge_id AND the source now has a belief interval
@@ -93,6 +111,35 @@ pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &["cites"];
 
 fn is_structural_relationship(s: &str) -> bool {
     STRUCTURAL_RELATIONSHIPS.contains(&s)
+}
+
+/// Epistemic relations whose truth is UNORDERED: `A contradicts B` and
+/// `B contradicts A` assert the same fact about the pair, so the graph must
+/// hold ONE edge for them, not two.
+///
+/// Members route through `EdgeRepository::create_symmetric_if_absent_returning`
+/// (bidirectional `WHERE NOT EXISTS`) instead of
+/// `EdgeRepository::create_if_not_exists`, whose predicate
+/// (`source_id = $1 AND target_id = $2 AND relationship = $3`) is directional.
+/// This aligns `link_epistemic` with the cross-source matcher, which already
+/// writes the SAME lowercase `contradicts` byte string through the symmetric
+/// writer (`epigraph_engine::matching::verifier::CONTRADICTS_RELATIONSHIP` +
+/// `matching::policy::write_edge`) — before this, the two writers disagreed
+/// about whether a reversed pair was the same edge, so a matcher-written A→B
+/// and an MCP-written B→A coexisted as duplicates. (`corroborates` unifies
+/// only MCP-vs-MCP writes: the matcher emits UPPERCASE `CORROBORATES` and
+/// dedup compares the relationship string byte-for-byte.)
+///
+/// Everything else in [`EPISTEMIC_RELATIONSHIPS`] is genuinely ordered
+/// (`A supports B` != `B supports A`) and keeps the directional writer. The
+/// row still stores the CALLER's `source -> target` ordering — we do NOT
+/// canonicalize — so `restriction_kind_with_profile` and every existing read
+/// query (`dispute_batch`, `in_epistemic_degree_batch`, which remain
+/// directional) see exactly what they see today.
+pub const SYMMETRIC_RELATIONSHIPS: &[&str] = &["contradicts", "corroborates"];
+
+fn is_symmetric_relationship(s: &str) -> bool {
+    SYMMETRIC_RELATIONSHIPS.contains(&s)
 }
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
@@ -163,19 +210,41 @@ pub async fn do_link_epistemic(
         )));
     }
 
-    let (edge_row, was_created) = EdgeRepository::create_if_not_exists(
-        pool,
-        source_id,
-        "claim",
-        target_id,
-        "claim",
-        &params.relationship,
-        params.properties.clone(),
-        None,
-        None,
-    )
-    .await
-    .map_err(internal_error)?;
+    // Symmetric relations dedup in BOTH directions (see SYMMETRIC_RELATIONSHIPS);
+    // ordered relations keep the (source, target, relationship) triple.
+    // The two writers differ in their `properties` shape: `create_if_not_exists`
+    // takes `Option<Value>` and defaults internally, the symmetric one takes a
+    // bare `Value`. Neither takes valid_from/valid_to — link_epistemic passes
+    // `None, None` on the directional path anyway, so nothing is lost.
+    let (edge_id, was_created) = if is_symmetric_relationship(&params.relationship) {
+        EdgeRepository::create_symmetric_if_absent_returning(
+            pool,
+            source_id,
+            target_id,
+            &params.relationship,
+            params
+                .properties
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({})),
+        )
+        .await
+        .map_err(internal_error)?
+    } else {
+        let (row, created) = EdgeRepository::create_if_not_exists(
+            pool,
+            source_id,
+            "claim",
+            target_id,
+            "claim",
+            &params.relationship,
+            params.properties.clone(),
+            None,
+            None,
+        )
+        .await
+        .map_err(internal_error)?;
+        (row.id, created)
+    };
 
     // Belief wiring fires whenever no BBA has ever been materialized for this
     // edge yet — NOT simply on first creation. An edge can be written durably
@@ -205,10 +274,17 @@ pub async fn do_link_epistemic(
         // a BBA and recomputed the target (`Wired`). The other outcomes
         // (SourceFactorless / Vacuous / NonEpistemic / already-wired / None-on-error)
         // move no belief, so we honestly report `belief_wired=false`.
+        // Direction caveat for SYMMETRIC relations in the factorless wake-up
+        // case: the dedup may have returned the edge id of the OPPOSITE-
+        // direction row, so a BBA materialized here under
+        // `perspective_id = edge_id` can be derived from an interval on the
+        // stored row's target rather than its source. Defensible for a relation
+        // whose truth is unordered; recovering the stored direction would mean
+        // widening `create_symmetric_if_absent_returning`'s return type.
         let outcome = auto_wire_edge_if_epistemic(
             pool,
             was_created,
-            edge_row.id,
+            edge_id,
             source_id,
             "claim",
             target_id,
@@ -232,7 +308,7 @@ pub async fn do_link_epistemic(
             "edge.added",
             actor_id,
             &serde_json::json!({
-                "edge_id": edge_row.id,
+                "edge_id": edge_id,
                 "source_type": "claim",
                 "source_id": source_id,
                 "target_type": "claim",
@@ -273,7 +349,7 @@ pub async fn do_link_epistemic(
         };
 
     success_json(&LinkEpistemicResponse {
-        edge_id: edge_row.id.to_string(),
+        edge_id: edge_id.to_string(),
         was_created,
         relationship: params.relationship,
         belief_wired,
@@ -401,6 +477,118 @@ mod tests {
         assert!(
             !is_epistemic_relationship("SUPPORTS"),
             "matcher is case-sensitive on the lowercase canonical form"
+        );
+    }
+
+    /// The symmetric subset is exactly `{contradicts, corroborates}` — the two
+    /// relations whose truth is unordered. Everything else stays on the
+    /// directional writer, so widening this set silently changes dedup shape.
+    #[test]
+    fn symmetric_set_is_exactly_contradicts_and_corroborates() {
+        assert_eq!(
+            SYMMETRIC_RELATIONSHIPS.len(),
+            2,
+            "SYMMETRIC_RELATIONSHIPS must be exactly {{contradicts, corroborates}}"
+        );
+        assert!(is_symmetric_relationship("contradicts"));
+        assert!(is_symmetric_relationship("corroborates"));
+        for ordered in [
+            "supports",
+            "refutes",
+            "elaborates",
+            "generalizes",
+            "specializes",
+            "cites",
+            "supersedes",
+            "",
+        ] {
+            assert!(
+                !is_symmetric_relationship(ordered),
+                "'{ordered}' is ordered (or not epistemic) and must keep the directional writer"
+            );
+        }
+        assert!(
+            !is_symmetric_relationship("CONTRADICTS"),
+            "both dedup predicates compare the relationship string byte-for-byte, so casing is \
+             identity: the UPPERCASE DS variant is a DIFFERENT relationship. Mirrors the \
+             lowercase-on-purpose note on `verifier::CONTRADICTS_RELATIONSHIP`."
+        );
+    }
+
+    /// The symmetric branch cannot widen the accepted surface: every member
+    /// must already clear the epistemic allow-list gate in `do_link_epistemic`
+    /// (and must not be a structural relation, which is Neutral by design).
+    #[test]
+    fn symmetric_relationships_are_a_subset_of_the_epistemic_set() {
+        for rel in SYMMETRIC_RELATIONSHIPS {
+            assert!(
+                is_epistemic_relationship(rel),
+                "'{rel}' routes through the symmetric writer but is not in \
+                 EPISTEMIC_RELATIONSHIPS — it could never reach the write branch"
+            );
+            assert!(
+                !is_structural_relationship(rel),
+                "'{rel}' must not also be structural (structural relations are Neutral)"
+            );
+        }
+    }
+
+    /// Routing a relation through a different edge WRITER must not change the
+    /// belief polarity the engine assigns it. Catches a future "fix" that tries
+    /// to make symmetry work by remapping the relation instead.
+    #[test]
+    fn symmetric_relationships_keep_their_engine_polarity() {
+        let profile = RestrictionProfile::scientific();
+        assert!(
+            matches!(
+                restriction_kind_with_profile("contradicts", &profile),
+                RestrictionKind::Negative(_)
+            ),
+            "'contradicts' must stay Negative after the symmetric-writer switch"
+        );
+        assert!(
+            matches!(
+                restriction_kind_with_profile("corroborates", &profile),
+                RestrictionKind::Positive(_)
+            ),
+            "'corroborates' must stay Positive after the symmetric-writer switch"
+        );
+    }
+
+    /// Drift guard: the symmetric and ordered subsets PARTITION the seven
+    /// epistemic relations. Adding an eighth relationship without deciding its
+    /// symmetry fails here rather than silently defaulting to directional.
+    #[test]
+    fn directional_relationships_partition_the_epistemic_set() {
+        const ORDERED: &[&str] = &[
+            "supports",
+            "elaborates",
+            "generalizes",
+            "specializes",
+            "refutes",
+        ];
+
+        for rel in ORDERED {
+            assert!(
+                is_epistemic_relationship(rel),
+                "ordered relation '{rel}' must be in EPISTEMIC_RELATIONSHIPS"
+            );
+            assert!(
+                !is_symmetric_relationship(rel),
+                "ordered relation '{rel}' must not also be symmetric (subsets must be disjoint)"
+            );
+        }
+        for rel in EPISTEMIC_RELATIONSHIPS {
+            assert!(
+                is_symmetric_relationship(rel) || ORDERED.contains(rel),
+                "'{rel}' is in EPISTEMIC_RELATIONSHIPS but is neither symmetric nor listed as \
+                 ordered — decide its dedup shape before exposing it"
+            );
+        }
+        assert_eq!(
+            SYMMETRIC_RELATIONSHIPS.len() + ORDERED.len(),
+            EPISTEMIC_RELATIONSHIPS.len(),
+            "the two subsets must exactly cover the epistemic set with no overlap"
         );
     }
 }

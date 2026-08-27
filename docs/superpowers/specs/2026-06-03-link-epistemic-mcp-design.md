@@ -37,6 +37,18 @@ the wrong template; `create_edge` is the right one).
 - New MCP tool `link_epistemic(source_claim_id, target_claim_id, relationship, properties?)`.
 - Accept the engine's non-neutral epistemic relationships (below) and wire belief on creation.
 - Idempotent on `(source, target, relationship)`, matching the HTTP route and `link_hierarchical`.
+
+  **Amendment (backlog 9a0bd3e2):** this holds for the five ORDERED relations only.
+  `contradicts` and `corroborates` assert an unordered fact about the pair, so they now
+  dedup on the UNORDERED pair via `EdgeRepository::create_symmetric_if_absent_returning`
+  (the same writer the cross-source matcher already uses for the identical lowercase
+  `contradicts` string). Asserting the reverse direction returns the existing `edge_id`
+  with `was_created=false`; since `MassFunctionRepository::exists_for_perspective` keys on
+  `perspective_id = edge_id`, that reverse call also reports `belief_wired=false` and moves
+  no belief on the other endpoint. The READ side is unchanged and remains DIRECTIONAL
+  (`ClaimRepository::dispute_batch` and `in_epistemic_degree_batch` both group by
+  `target_id`), so only the first-asserted target is reported contested. Legacy pairs that
+  already have both rows are not repaired — this is a write-path fix.
 - Honor the repo convention: routes and MCP both call the shared repo/engine layer; no duplicated logic.
 
 **Non-goals (explicitly out of scope for v1)**

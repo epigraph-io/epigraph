@@ -250,10 +250,22 @@ impl EdgeRepository {
     /// (`(a,b)` and `(b,a)` with the same `relationship` are one edge), but
     /// returns `(edge_id, was_created)` so a caller can echo the id back:
     /// `was_created = true` with the freshly-inserted id, or `false` with the
-    /// id of the pre-existing symmetric edge. Purpose-built for the
-    /// `link_alternative` MCP tool over `alternative_of` (migration 042's
-    /// `edges_alternative_of_symmetric_uniq`). Runtime `sqlx::query*` — no
+    /// id of the pre-existing symmetric edge. Runtime `sqlx::query*` — no
     /// `.sqlx/` prepared-cache entry.
+    ///
+    /// Callers:
+    /// - the `link_alternative` MCP tool over `alternative_of` (migration 042's
+    ///   `edges_alternative_of_symmetric_uniq` makes at most one row possible
+    ///   there),
+    /// - the `link_epistemic` MCP tool over the lowercase `contradicts` /
+    ///   `corroborates` relations, whose truth is unordered (backlog 9a0bd3e2).
+    ///
+    /// The dedup readback is `ORDER BY created_at, id` rather than a bare
+    /// `LIMIT 1`: `link_epistemic` has legacy pairs written through the
+    /// DIRECTIONAL `create_if_not_exists`, so both `(a,b)` and `(b,a)` rows can
+    /// already exist for one pair. Without the ordering the returned id would be
+    /// arbitrary and potentially unstable call-to-call. It is behavior-neutral
+    /// for `alternative_of`, where the unique index admits only one row.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -294,6 +306,7 @@ impl EdgeRepository {
              WHERE ((source_id = $1 AND target_id = $2)
                  OR (source_id = $2 AND target_id = $1))
                AND relationship = $3
+             ORDER BY created_at, id
              LIMIT 1",
         )
         .bind(a)
