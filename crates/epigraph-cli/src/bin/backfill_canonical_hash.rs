@@ -39,11 +39,28 @@
 //! self-consuming — a skipped row stays NULL and would otherwise be re-read
 //! forever. Termination is on END OF SCAN, never on "this chunk wrote
 //! nothing", so a chunk made entirely of skipped rows cannot cut the run
-//! short. No state file is needed: kill it at any point and re-invoke, and the
-//! `IS NULL` predicate makes the re-scan of already-filled rows cheap. A
-//! completed run writes nothing. Safe to run repeatedly, and worth running on
-//! a timer while writers outside `ClaimRepository` (the raw `INSERT INTO
-//! claims` in several API routes) still leave the column NULL.
+//! short.
+//!
+//! An UNBUDGETED run (`--max-chunks 0`, the default) needs no state: it always
+//! runs to end of scan, so kill it at any point and re-invoke from scratch —
+//! the `IS NULL` predicate makes the re-scan of already-filled rows cheap and
+//! a completed run writes nothing.
+//!
+//! A BUDGETED run (`--max-chunks N`) must carry its cursor forward. It stops
+//! mid-table, and the ineligible rows it already scanned stay NULL, so a fresh
+//! `--max-chunks N` invocation re-reads that same prefix. Once the ineligible
+//! rows behind the cursor number `N * chunk_size` or more, the whole budget is
+//! spent re-skipping them and no eligible row is ever reached again. The run
+//! therefore prints its resume point, and the next invocation must pass it:
+//!
+//! ```text
+//! backfill_canonical_hash --chunk-size 5000 --max-chunks 20
+//! # -> resume the next window with: --after 0190f3c2-...-8a41
+//! backfill_canonical_hash --chunk-size 5000 --max-chunks 20 --after 0190f3c2-...-8a41
+//! ```
+//!
+//! Worth running on a timer while writers outside `ClaimRepository` (the raw
+//! `INSERT INTO claims` in several API routes) still leave the column NULL.
 //!
 //! # Until it runs
 //!
@@ -57,6 +74,7 @@
 
 use anyhow::Context;
 use clap::Parser;
+use epigraph_cli::backfill_canonical_hash::drain;
 use epigraph_db::ClaimRepository;
 
 #[derive(Parser, Debug)]
@@ -75,9 +93,20 @@ struct Cli {
     chunk_size: i64,
 
     /// Stop after this many chunks (0 = run to completion). Useful for
-    /// draining a large table across several maintenance windows.
+    /// draining a large table across several maintenance windows. A run
+    /// stopped by this budget prints an `--after` cursor that the NEXT window
+    /// must be given.
     #[arg(long, default_value_t = 0)]
     max_chunks: u64,
+
+    /// Resume the keyset scan strictly after this claim id, as printed by a
+    /// previous `--max-chunks` run.
+    ///
+    /// Required to make windowed draining progress: rows this tool skips stay
+    /// NULL by design, so a fresh scan re-reads them every time and a budget
+    /// smaller than the accumulated skip prefix never reaches a new row.
+    #[arg(long)]
+    after: Option<uuid::Uuid>,
 
     /// Report how many rows WOULD be backfilled without writing anything.
     #[arg(long)]
@@ -102,66 +131,64 @@ async fn main() -> anyhow::Result<()> {
         .context("count rows missing canonical_hash")?;
 
     if cli.dry_run {
+        // `remaining` is an UPPER BOUND, not the work: rows with a namespaced
+        // or client-overridden `content_hash` are counted by this query (SQL
+        // cannot express the eligibility rule — BLAKE3 has no Postgres
+        // function) but are deliberately never filled. Reporting it as the
+        // figure a real run would achieve would promise a `backfilled N` line
+        // that can never arrive.
         tracing::info!(rows_missing = remaining, "dry run; nothing written");
-        println!("dry-run: {remaining} claims would have canonical_hash computed");
+        println!("dry-run: {remaining} claims have canonical_hash IS NULL.");
+        println!(
+            "  That is an UPPER BOUND, not the work: rows with a namespaced or \
+             client-overridden content_hash are counted here but are never \
+             filled, so a real run's `backfilled N` will be lower."
+        );
         return Ok(());
     }
 
-    let mut total: u64 = 0;
-    let mut skipped: u64 = 0;
-    let mut chunks: u64 = 0;
-    let mut after: Option<uuid::Uuid> = None;
-
-    loop {
-        let chunk = ClaimRepository::backfill_canonical_hash_chunk(&pool, cli.chunk_size, after)
-            .await
-            .context("backfill chunk")?;
-
-        // Terminate on END OF SCAN, never on "this chunk wrote nothing": a
-        // chunk made entirely of ineligible rows (namespaced or overridden
-        // `content_hash`) writes zero and must not stop the run.
-        let Some(next) = chunk.next_after else {
-            break;
-        };
-        after = Some(next);
-
-        total += chunk.updated;
-        skipped += chunk.skipped_foreign_digest;
-        chunks += 1;
-        tracing::info!(
-            chunk = chunks,
-            scanned = chunk.scanned,
-            rows = chunk.updated,
-            skipped = chunk.skipped_foreign_digest,
-            total,
-            "chunk committed"
-        );
-
-        if cli.max_chunks > 0 && chunks >= cli.max_chunks {
-            tracing::info!(
-                max_chunks = cli.max_chunks,
-                resume_after = %next,
-                "chunk budget reached; stopping"
-            );
-            break;
-        }
-    }
+    let pass = drain(&pool, cli.chunk_size, cli.max_chunks, cli.after)
+        .await
+        .context("drain canonical_hash backfill")?;
 
     let left = ClaimRepository::count_missing_canonical_hash(&pool)
         .await
         .context("re-count rows missing canonical_hash")?;
 
+    let (total, skipped, chunks) = (pass.backfilled, pass.skipped_foreign_digest, pass.chunks);
     tracing::info!(
         backfilled = total,
         skipped_foreign_digest = skipped,
         chunks,
         still_null = left,
+        complete = pass.is_complete(),
         "backfill pass complete"
     );
-    println!(
-        "backfilled {total} claims in {chunks} chunks; \
-         skipped {skipped} with a namespaced/overridden content_hash; \
-         {left} rows still NULL (skipped rows stay NULL by design)"
-    );
+
+    match pass.resume_after {
+        // Budget cut the scan short. The cursor is the only thing that lets
+        // the next window make progress, so it goes to stdout — not just to
+        // the log — and `left` is NOT attributed to skips, since most of it is
+        // simply unscanned.
+        Some(next) => {
+            tracing::info!(
+                max_chunks = cli.max_chunks,
+                resume_after = %next,
+                "chunk budget reached; stopping"
+            );
+            println!(
+                "backfilled {total} claims in {chunks} chunks; \
+                 skipped {skipped} with a namespaced/overridden content_hash; \
+                 {left} rows still NULL. Chunk budget reached before end of \
+                 table — resume the next window with: --after {next}"
+            );
+        }
+        None => println!(
+            "backfilled {total} claims in {chunks} chunks; \
+             skipped {skipped} with a namespaced/overridden content_hash; \
+             scan reached end of table; \
+             {left} rows still NULL (skipped rows stay NULL by design)"
+        ),
+    }
     Ok(())
 }

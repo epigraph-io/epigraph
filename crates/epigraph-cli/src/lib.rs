@@ -1,4 +1,6 @@
 #[cfg(feature = "db")]
+pub mod backfill_canonical_hash;
+#[cfg(feature = "db")]
 pub mod bootstrap;
 #[cfg(feature = "db")]
 pub mod bridge;

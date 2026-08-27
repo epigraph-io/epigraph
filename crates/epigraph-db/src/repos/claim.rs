@@ -2718,9 +2718,16 @@ impl ClaimRepository {
     /// terminating on "wrote nothing" would stop with eligible rows still
     /// unfilled. Keyset-paging on `id` fixes both — the scan advances past
     /// skipped rows and terminates on an empty read, not an empty write.
-    /// Resumption is still stateless in practice: re-invoking from `None`
-    /// re-scans cheaply (already-filled rows fail the `IS NULL` predicate) and
-    /// a completed run writes nothing.
+    ///
+    /// A caller that always drives the loop to `next_after == None` may stay
+    /// stateless: re-invoking from `None` re-scans cheaply (already-filled
+    /// rows fail the `IS NULL` predicate) and a completed run writes nothing.
+    /// A caller that stops EARLY may not. Because skipped rows stay NULL, a
+    /// restart from `None` re-reads them, and a caller with a fixed per-run
+    /// chunk budget will spend that whole budget re-skipping the same prefix
+    /// once the prefix grows past it — never reaching an eligible row again.
+    /// Such a caller must persist `next_after` and pass it back as `after`;
+    /// see `epigraph_cli::backfill_canonical_hash::drain`.
     ///
     /// The whole chunk lands in one `UPDATE ... FROM (SELECT UNNEST(...))`, so
     /// a chunk is atomic: it either sets every eligible row it read or none.

@@ -126,6 +126,11 @@ path = "tests/cross_source_sweep_smoke.rs"
 required-features = ["genai"]
 
 [[test]]
+name = "backfill_canonical_hash_drain"
+path = "tests/backfill_canonical_hash_drain.rs"
+required-features = ["db"]
+
+[[test]]
 name = "recompute_betp_cohort"
 path = "tests/recompute_betp_cohort.rs"
 required-features = ["db"]
