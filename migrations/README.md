@@ -54,11 +54,46 @@ Current reservation:
   same files in-tree to `036–038` (cross-source matching port); prod
   `_sqlx_migrations` rows must be renumbered +1 on next public deploy.
 - **038**: public `corroborates_factor_strength_from_score` (PR #173)
-- **039+**: public next
+- **039–059**: public
+- **060–085**: RESERVED — public multi-user tenancy series (epigraph-io/epigraph
+  `feat/multi-user-tenancy`). 060–080 are the 21 migrations named in the tenancy
+  plan §3.1; 081–085 is headroom for the webhook-persistence migration and
+  follow-ups. `epigraph-internal` MUST NOT allocate in this range.
+- **086+**: public next
 
-Next public migration must be `039` or later. Picking a colliding version
-(checksum mismatch on a `_sqlx_migrations` row that's already applied) will
-panic the api binary on restart.
+Next public migration **outside the reserved tenancy range** must be `086` or
+later; numbers inside 060–085 are allocated by §3.1 of the tenancy plan and are
+claimed one PR at a time on `feat/multi-user-tenancy`. Picking a colliding
+version (checksum mismatch on a `_sqlx_migrations` row that's already applied)
+will panic the api binary on restart.
+
+## Tombstones
+
+Tables that exist in the field but have no owning code. Scheduled for an
+explicit `DROP TABLE IF EXISTS` inside the reserved 060–085 range — not dropped
+opportunistically, because on the databases where they exist they hold key
+material.
+
+- **`embedding_shares`**, **`re_encryption_keys`** — created by
+  `epigraph-enterprise/migrations/001_initial_schema.sql`, never created by any
+  public migration (060 deliberately skips both). Their repositories
+  (`EmbeddingShareRepository`, `ReEncryptionKeyRepository`) and the MPC/PRE code
+  paths that used them were deleted in PR-01 of the tenancy series. On an
+  enterprise-lineage database both survive with `ON DELETE CASCADE` FKs to
+  `groups` and zero readers; PR-21's corpus-wide seal verification must not
+  mistake the MPC share material for live ciphertext.
+
+## Provisioning lineage
+
+Migration `060_group_tenancy_tables.sql` opens with a **drift guard**: it
+`RAISE`s if any of seven group-tenancy tables already exists in a shape it did
+not create (`pattern_templates`, the eighth, is identical in both lineages and
+carries no sentinel). This is deliberate. Seven of its eight tables also exist in the
+`epigraph-enterprise` schema with different columns, CHECK constraints and
+`ON DELETE` actions, and `CREATE TABLE IF NOT EXISTS` is silent about that — the
+migration would report success while applying none of its guarantees. If you hit
+that error, reconcile the tables to the 060 shape by hand and re-run; do not
+hand-insert a `_sqlx_migrations` row.
 
 ## Migration Order
 

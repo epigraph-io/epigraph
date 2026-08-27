@@ -17,9 +17,8 @@ use axum::{
     Json,
 };
 use epigraph_db::{GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository};
-// rotate_group_key (from epigraph-privacy) is an enterprise extension.
-// The rotate_key handler lives in the epigraph-enterprise repo.
-// To add it here: add epigraph-privacy as a dep, enable the enterprise feature,
+// rotate_group_key (from epigraph-privacy) and the rotate_key handler live in
+// the epigraph-enterprise repo. To add it here: add epigraph-privacy as a dep
 // and re-implement the handler calling rotate_group_key from that crate.
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -56,13 +55,20 @@ pub struct AddMemberRequest {
     pub agent_id: Uuid,
     /// Member's wrapped key share (hex-encoded encrypted payload)
     pub wrapped_key_share: String,
-    /// Role: "admin", "member", or "reader"
+    /// Role: "admin", "writer", or "reader".
+    ///
+    /// BREAKING (PR-01): "member" is no longer accepted. It was never storable
+    /// — `group_memberships_role_check` (migration 060) admits only
+    /// admin|writer|reader — so a request that omitted `role`, or sent
+    /// "member", passed route validation and then raised 23514, which
+    /// `add_member` maps to HTTP 500. The default is now the least-privileged
+    /// role, matching the column DEFAULT.
     #[serde(default = "default_role")]
     pub role: String,
 }
 
 fn default_role() -> String {
-    "member".to_string()
+    "reader".to_string()
 }
 
 /// Response after adding a member
@@ -208,8 +214,10 @@ pub async fn add_member(
             id: group_id.to_string(),
         })?;
 
-    // Validate role
-    let valid_roles = ["admin", "member", "reader"];
+    // Validate role. MUST stay in lockstep with group_memberships_role_check
+    // (migrations/060_group_tenancy_tables.sql); anything this list admits and
+    // the CHECK rejects becomes a 23514 -> HTTP 500 instead of a 400.
+    let valid_roles = ["admin", "writer", "reader"];
     if !valid_roles.contains(&req.role.as_str()) {
         return Err(ApiError::BadRequest {
             message: format!(

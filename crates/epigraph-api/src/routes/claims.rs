@@ -20,9 +20,9 @@ use uuid::Uuid;
 #[cfg(feature = "db")]
 use crate::access_control::{check_content_access, ContentAccess};
 use crate::{errors::ApiError, state::AppState};
-// set_group_context (from epigraph-privacy) is an enterprise extension.
-// Add epigraph-privacy as a dep (epigraph-enterprise repo) and enable the enterprise
-// feature to restore RLS group context scoping.
+// set_group_context (from epigraph-privacy) lives in the epigraph-enterprise
+// repo. Add epigraph-privacy as a dep there to restore RLS group context
+// scoping; kernel RLS arrives with migrations 073-075.
 
 // =============================================================================
 // PAGINATION CONSTANTS
@@ -58,7 +58,12 @@ pub struct CreateClaimRequest {
     pub properties: Option<serde_json::Value>,
     /// Optional evidence ID — if provided, creates a DERIVED_FROM edge (claim→evidence)
     pub evidence_id: Option<Uuid>,
-    /// Privacy tier: "public" (default), "encrypted_content", or "fully_private"
+    /// Privacy tier: "public" (default) or "fully_private".
+    ///
+    /// The former `encrypted_content` tier is rejected: it stored the plaintext
+    /// in `claims.content` alongside the ciphertext, feeding `content_tsv` and
+    /// the BLAKE3 `content_hash`. Migration 060 enforces this with
+    /// `claim_encryption_privacy_tier_check`.
     #[serde(default)]
     pub privacy_tier: Option<String>,
     /// Group ID — required when privacy_tier is not "public"
@@ -219,12 +224,16 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
     let tier = req.privacy_tier.as_deref().unwrap_or("public");
 
     match tier {
-        "public" | "encrypted_content" | "fully_private" => {}
+        // Narrowed to match migration 060's
+        // `claim_encryption_privacy_tier_check CHECK (privacy_tier = 'fully_private')`.
+        // Accepting `encrypted_content` here would bind straight through to
+        // `ClaimEncryptionRepository::insert_conn` and surface as a 23514 → 500.
+        "public" | "fully_private" => {}
         other => {
             return Err(ApiError::ValidationError {
                 field: "privacy_tier".to_string(),
                 reason: format!(
-                    "Unknown privacy tier '{}'. Must be: public, encrypted_content, fully_private",
+                    "Unknown privacy tier '{}'. Must be: public, fully_private",
                     other
                 ),
             });
@@ -284,7 +293,7 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
 /// - Valid trace_id (existing reasoning trace)
 /// - Optional initial_truth in [0.0, 1.0] (defaults to 0.5)
 ///
-/// For encrypted claims (privacy_tier != "public"):
+/// For encrypted claims (privacy_tier == "fully_private"):
 /// - group_id, encrypted_content, and encryption_epoch are required
 /// - Agent must be a member of the specified group
 /// - encryption_epoch must match the group's active epoch
@@ -827,9 +836,10 @@ pub async fn get_claim(
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to begin transaction: {e}"),
         })?;
-    // enterprise: set_group_context(&mut *tx, params.group_id) — add epigraph-privacy dep to enable
+    // epigraph-enterprise: set_group_context(&mut *tx, params.group_id) — add the
+    // epigraph-privacy dep to enable
 
-    // Query claim on the same transaction (RLS applied when enterprise feature is active)
+    // Query claim on the same transaction (RLS arrives with migrations 073-075)
     let claim = ClaimRepository::get_by_id_conn(&mut tx, claim_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
@@ -959,9 +969,10 @@ pub async fn list_claims(
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to begin transaction: {e}"),
         })?;
-    // enterprise: set_group_context(&mut *tx, params.group_id) — add epigraph-privacy dep to enable
+    // epigraph-enterprise: set_group_context(&mut *tx, params.group_id) — add the
+    // epigraph-privacy dep to enable
 
-    // Fetch on the same transaction (RLS applied when enterprise feature is active)
+    // Fetch on the same transaction (RLS arrives with migrations 073-075)
     let claims = ClaimRepository::list_conn(
         &mut tx,
         pagination.limit,

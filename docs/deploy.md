@@ -2,15 +2,26 @@
 
 ## Database migrations
 
-Applied automatically by the API binary on startup. The first deploy after
-2026-05-05 also requires a one-shot reconcile of `_sqlx_migrations`:
+Applied by the `epigraph-migrate` binary, run explicitly — as an
+`ExecStartPre=` on `epigraph-api.service` or by hand — **before** the API
+starts. The API binary does *not* migrate at boot unless
+`EPIGRAPH_MIGRATE_ON_BOOT=1` (also accepts `true`/`yes`, case-insensitively and
+ignoring surrounding whitespace) is set in its environment; migrations
+071/072/080 are designed to `RAISE` when their tenancy preconditions do not
+hold, and the server call site `.expect()`s, so an unattended boot-time apply
+turns a precondition failure into a crash loop. Any other value — including
+`0`, `false` and the empty string — skips.
+
+The first deploy after 2026-05-05 also requires a one-shot reconcile of
+`_sqlx_migrations`:
 
 1. `pg_dump -Fc $DATABASE_URL > epigraph_pre_reconcile_$(date -I).dump`
 2. `psql $DATABASE_URL -f ops/reconcile_2026_05_05.sql`
 3. `cargo run -p epigraph-api --bin epigraph-migrate`  (applies 015–026)
 4. Restart `epigraph-api.service`.
 
-Subsequent deploys: just restart; `sqlx::migrate!()` runs at boot.
+Subsequent deploys: run `cargo run -p epigraph-api --bin epigraph-migrate`
+(or let `ExecStartPre=` do it), then restart `epigraph-api.service`.
 
 ### Cross-worktree binary caching (foot-gun)
 
@@ -22,9 +33,11 @@ crate being compiled. If a different worktree previously built `server` or
 artifact and you end up installing a binary whose embedded migration list
 predates the worktree you think you're building from.
 
-Symptoms on deploy:
+Symptoms on deploy — watch the `epigraph-migrate` run, not the server; since
+the API stopped migrating at boot it emits `EPIGRAPH_MIGRATE_ON_BOOT unset —
+skipping migrations` and says nothing at all about migration state:
 
-* `systemctl restart epigraph-api` succeeds and reports `Migrations up to date`.
+* `epigraph-migrate` exits 0 and applies nothing.
 * `_sqlx_migrations` is missing the migration version your branch added.
 * `information_schema.columns` confirms the new column doesn't exist.
 * Health check passes (the binary doesn't crash — it just doesn't know about

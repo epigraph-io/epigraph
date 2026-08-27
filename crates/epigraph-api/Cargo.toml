@@ -13,9 +13,6 @@ genai = ["db", "dep:epigraph-cli"]  # LLM-dependent workflows; requires ANTHROPI
 integration = []
 tls = ["axum-server"]  # TLS/HTTPS via axum-server + rustls (Caddy terminates TLS in production)
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
-# Enterprise features: encrypted subgraphs, MPC, key rotation.
-# Enable only when epigraph-privacy is added as a dep (epigraph-enterprise repo).
-enterprise = []
 # Episcience features: structural isomorphism detection.
 # Enable only when epigraph-isomorphism is added as a dep (epigraph-io/episcience repo).
 episcience = []
@@ -47,9 +44,8 @@ epigraph-mcp = { workspace = true, optional = true }
 epigraph-ds = { workspace = true }  # Dempster-Shafer math for belief endpoints
 epigraph-events = { workspace = true }  # Event bus for pub/sub messaging
 epigraph-cli = { workspace = true, optional = true }  # LlmClient trait + AnthropicClient (genai feature)
-# Enterprise and episcience deps are optional and not bundled in the kernel.
+# The episcience dep is optional and not bundled in the kernel.
 # To enable, add the git dep and uncomment:
-# epigraph-privacy    = { git = "...", optional = true }
 # epigraph-isomorphism = { git = "...", optional = true }
 hmac = "0.12"  # HMAC signing for webhook payloads
 sha2 = "0.10"  # SHA-256 for webhook HMAC signatures

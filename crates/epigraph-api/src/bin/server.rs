@@ -210,10 +210,24 @@ async fn main() {
             .expect("Failed to connect to PostgreSQL");
         tracing::info!("PostgreSQL connected");
 
-        epigraph_api::run_migrations(&pool)
-            .await
-            .expect("Failed to apply pending migrations");
-        tracing::info!("Migrations up to date");
+        // Migrations 071/072/080 are DESIGNED to RAISE when their tenancy
+        // preconditions do not hold, and this call site .expect()s — so an
+        // environment that ships them without an operator in the loop gets an
+        // api binary that panics on EVERY boot. Migrations now run only when
+        // explicitly asked for; `epigraph-migrate` (ExecStartPre=) is the
+        // supported path and is unchanged.
+        if epigraph_api::should_migrate_on_boot(
+            std::env::var("EPIGRAPH_MIGRATE_ON_BOOT").ok().as_deref(),
+        ) {
+            epigraph_api::run_migrations(&pool)
+                .await
+                .expect("Failed to apply pending migrations");
+            tracing::info!("Migrations up to date");
+        } else {
+            tracing::info!(
+                "EPIGRAPH_MIGRATE_ON_BOOT unset — skipping migrations; run `epigraph-migrate`"
+            );
+        }
 
         // Dedicated pool for background jobs with a per-connection
         // `statement_timeout`, so a runaway clustering query — or a backend

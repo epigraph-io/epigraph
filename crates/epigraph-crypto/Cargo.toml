@@ -20,9 +20,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
-[features]
-recrypt = []  # Placeholder for future true PRE backend
-
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }

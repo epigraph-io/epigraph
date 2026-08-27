@@ -66,8 +66,6 @@ pub mod lineage;
 pub mod mcp_tools;
 #[cfg(feature = "db")]
 pub mod methods;
-#[cfg(feature = "enterprise")]
-pub mod mpc;
 #[cfg(test)]
 mod negative_tests;
 pub mod ownership;
@@ -412,9 +410,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/groups/:id/members/:agent_id",
             delete(groups::remove_member),
         )
-        // /api/v1/groups/:id/rotate-key — enterprise feature (key rotation via epigraph-privacy)
+        // /api/v1/groups/:id/rotate-key lives in the epigraph-enterprise repo.
         // Isomorphism pattern detection (episcience feature)
-        // MPC joint recall (enterprise feature)
         // Admin OAuth client management
         .route(
             "/api/v1/admin/clients/:id/approve",
@@ -1005,7 +1002,6 @@ pub fn create_router(state: AppState) -> Router {
             post(political::create_technique),
         )
         .route("/api/v1/coalitions", post(political::create_coalition));
-    // /api/v1/mpc/joint-recall is an enterprise route; register via enterprise feature
 
     // Auth middleware: bearer first, then signature fallback (same as db variant)
     let protected = if state.config.require_signatures {

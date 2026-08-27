@@ -20,11 +20,29 @@ async fn pool_and_app() -> (
         .connect(&url)
         .await
         .unwrap();
-    // get_claim unconditionally queries `claim_encryption` (an out-of-tree
-    // table no migration creates). Without it the handler 500s before reaching
-    // the redaction branch, silently turning this regression guard RED on the
-    // standard epigraph_db_repo_test DB. Provision it so the suite is runnable.
-    common::ensure_claim_encryption_table(&pool).await;
+    // This file connects to the shared $DATABASE_URL and does NOT migrate:
+    // neither `pool_and_app` nor `build_app_for_tests` calls `run_migrations`,
+    // and calling it here is not an option — the local dev database is
+    // provisioned with psql and carries no `_sqlx_migrations` row at all, so a
+    // migrator run would restart from 001 and die.
+    //
+    // The claim_encryption stand-in that `common::ensure_claim_encryption_table`
+    // used to create is deleted in this PR (migration 060 creates the real
+    // table), which removes the self-healing that hid an unmigrated database.
+    // Fail LOUDLY on the precondition instead: without 060 every case below
+    // fails as an unexplained 500 from get_claim's unconditional
+    // ClaimEncryptionRepository::get_by_claim_id_conn.
+    let has_060: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('public.claim_encryption')::text")
+            .fetch_one(&pool)
+            .await
+            .expect("regclass lookup");
+    assert!(
+        has_060.is_some(),
+        "DATABASE_URL points at a database without migration 060 \
+         (public.claim_encryption is missing). Apply migrations first: \
+         `cargo run -p epigraph-api --bin epigraph-migrate`."
+    );
     // frame_claims_sorted's frame-existence check (FrameRepository::get_by_id)
     // SELECTs frames.properties (migration 044). The shared test DB may predate
     // it; provision the column so that handler reaches its redaction branch
