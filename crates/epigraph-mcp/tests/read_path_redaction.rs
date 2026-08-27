@@ -177,6 +177,7 @@ async fn query_claims_redacts_only_unauthorized_rows(pool: PgPool) {
         QueryClaimsParams {
             min_truth: Some(0.0),
             max_truth: Some(1.0),
+            current_only: false,
             limit: Some(50),
         },
         Some(stranger),

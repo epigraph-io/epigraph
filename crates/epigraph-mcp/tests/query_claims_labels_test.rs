@@ -11,6 +11,13 @@
 //! re-drop labels for the superseded claim — the same bug class, narrowed. This
 //! test locks in the no-filter decision by asserting BOTH claims surface their
 //! labels through the `query_claims` tool entry point.
+//!
+//! Extended for backlog `a85ee585`, which added the opt-in `current_only` flag.
+//! The default (`false`) case above is UNCHANGED on purpose — the returned-rows
+//! contract this file exists to protect survived that fix intact, and only the
+//! per-row `is_current` / `supersedes` reporting changed. The second half below
+//! pins the other side: `current_only: true` must actually drop the superseded
+//! row, so the flag cannot regress into a no-op that quietly returns everything.
 
 use epigraph_mcp::tools::claims::query_claims;
 use epigraph_mcp::types::QueryClaimsParams;
@@ -39,6 +46,7 @@ async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) 
         QueryClaimsParams {
             min_truth: Some(0.0),
             max_truth: Some(1.0),
+            current_only: false,
             limit: Some(50),
         },
         None,
@@ -61,6 +69,50 @@ async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) 
         superseded_labels.contains(&"archived".to_string()),
         "SUPERSEDED claim must ALSO surface its labels — the batch helper must \
          NOT filter on is_current, matching get_claim's label source. got {superseded_labels:?}"
+    );
+
+    // And each row must describe its OWN retirement state (a85ee585). Before
+    // that fix both rows serialised as `"is_current": true` with `supersedes`
+    // omitted, so this default-filter page could not be read safely.
+    assert_eq!(
+        current_claim["is_current"].as_bool(),
+        Some(true),
+        "live claim must report is_current=true"
+    );
+    assert_eq!(
+        superseded_claim["is_current"].as_bool(),
+        Some(false),
+        "superseded claim must report is_current=false, not the hardcoded `true`"
+    );
+    assert_eq!(
+        superseded_claim["supersedes"].as_str(),
+        Some(current.to_string().as_str()),
+        "superseded claim must carry its supersedes link so a consumer can walk \
+         the retirement chain from a query page"
+    );
+
+    // The other side of the contract: current_only=true DROPS the retired row.
+    let filtered = query_claims(
+        &server,
+        QueryClaimsParams {
+            min_truth: Some(0.0),
+            max_truth: Some(1.0),
+            current_only: true,
+            limit: Some(50),
+        },
+        None,
+    )
+    .await
+    .expect("query_claims current_only");
+    let filtered = parse_claims(&filtered);
+
+    find_claim(&filtered, current);
+    let superseded_id = superseded.to_string();
+    assert!(
+        !filtered
+            .iter()
+            .any(|c| c["id"].as_str() == Some(superseded_id.as_str())),
+        "current_only=true must drop the superseded claim {superseded_id}, got {filtered:?}"
     );
 }
 

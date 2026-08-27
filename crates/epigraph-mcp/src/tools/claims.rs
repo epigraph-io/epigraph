@@ -628,9 +628,16 @@ pub async fn query_claims(
 
     // Filter by truth range in SQL (before LIMIT) so matching claims outside
     // the most-recent `limit` rows are still reachable (bug 5a55a48e).
-    let claims = ClaimRepository::list_by_truth_range(&server.pool, min, max, limit, 0)
-        .await
-        .map_err(internal_error)?;
+    //
+    // `current_only` defaults to false, preserving the historical page contents
+    // (superseded rows ARE returned — locked in by query_claims_labels_test).
+    // That default is safe now that each row reports its own `is_current` /
+    // `supersedes`: a caller who wants live-only asks for it, and the sibling
+    // `query_claims_by_label` defaults the same way (bug a85ee585).
+    let claims =
+        ClaimRepository::list_by_truth_range(&server.pool, min, max, params.current_only, limit, 0)
+            .await
+            .map_err(internal_error)?;
 
     // Redact PRIVATE content the requester cannot read (A3 §7.5). Build a
     // per-id access map and look each claim's decision up BY ITS OWN ID rather
@@ -673,8 +680,13 @@ pub async fn query_claims(
                 content_hash,
                 created_at: c.created_at.to_rfc3339(),
                 labels: labels_map.get(&id).cloned().unwrap_or_default(),
-                is_current: true,
-                supersedes: None,
+                // Forward the row's REAL retirement state. These were hardcoded
+                // `true` / `None`, so a superseded claim serialised identically
+                // to a live one while `get_claim` on the same id reported the
+                // truth — the two tools contradicted each other (bug a85ee585).
+                // Matches query_claims_by_label's forwarding exactly.
+                is_current: c.is_current,
+                supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
             }
         })
         .collect();

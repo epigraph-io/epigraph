@@ -165,6 +165,12 @@ pub struct QueryClaimsParams {
     #[schemars(description = "Maximum balanced truth value (0.0-1.0)")]
     pub max_truth: Option<f64>,
 
+    #[schemars(
+        description = "When true, returns only claims with is_current = true (drops superseded/retired claims). Default: false."
+    )]
+    #[serde(default)]
+    pub current_only: bool,
+
     #[schemars(description = "Maximum number of results (default 20)")]
     pub limit: Option<i64>,
 }

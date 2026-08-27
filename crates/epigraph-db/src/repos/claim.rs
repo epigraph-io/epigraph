@@ -1522,24 +1522,59 @@ impl ClaimRepository {
     /// outside that window is silently invisible (backlog bug `5a55a48e`:
     /// `query_claims(max_truth=0.75)` returned empty while matching claims
     /// existed).
+    ///
+    /// `current_only = false` (the historical behaviour) returns superseded and
+    /// duplicate-marked rows alongside live ones; `true` restricts the page to
+    /// `is_current = true`. Mirrors [`Self::list_by_labels`]'s flag so the two
+    /// sibling read paths agree.
+    ///
+    /// # Returns
+    /// The returned `Claim` is post-fixed with the row's `is_current` and
+    /// `supersedes` values. Before backlog bug `a85ee585` this `SELECT` asked
+    /// for neither column, so every row inherited `claim_from_row` →
+    /// [`Claim::with_id`]'s hardcoded `is_current: true, supersedes: None` and a
+    /// retired claim was indistinguishable from a live one — while `get_by_id`
+    /// on the same row reported the truth.
+    ///
+    /// The inline `Row` struct keeps the global [`ClaimRow`] (used by other
+    /// queries that don't need these columns) untouched, and we don't widen
+    /// `claim_from_row`'s signature — its other ~20 callers don't care about
+    /// retirement state.
     pub async fn list_by_truth_range(
         pool: &PgPool,
         min_truth: f64,
         max_truth: f64,
+        current_only: bool,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Claim>, DbError> {
-        let rows = sqlx::query_as::<_, ClaimRow>(
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+        }
+
+        let rows = sqlx::query_as::<_, Row>(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
+                   is_current, supersedes
             FROM claims
             WHERE truth_value >= $1 AND truth_value <= $2
+              AND ($3 = false OR COALESCE(is_current, true) = true)
             ORDER BY created_at DESC
-            LIMIT $3 OFFSET $4
+            LIMIT $4 OFFSET $5
             "#,
         )
         .bind(min_truth)
         .bind(max_truth)
+        .bind(current_only)
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
@@ -1548,7 +1583,7 @@ impl ClaimRepository {
         let mut claims = Vec::with_capacity(rows.len());
         for row in rows {
             let truth_value = TruthValue::new(row.truth_value)?;
-            claims.push(claim_from_row(
+            let mut claim = claim_from_row(
                 row.id,
                 row.content,
                 row.agent_id,
@@ -1556,7 +1591,10 @@ impl ClaimRepository {
                 truth_value,
                 row.created_at,
                 row.updated_at,
-            ));
+            );
+            claim.is_current = row.is_current;
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            claims.push(claim);
         }
         Ok(claims)
     }

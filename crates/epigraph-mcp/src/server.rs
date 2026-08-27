@@ -412,7 +412,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Query epistemic claims by truth value threshold. Returns claims with their truth values and epistemic status."
+        description = "Query epistemic claims by truth value threshold. Returns claims with their truth values and epistemic status (`is_current`, and `supersedes` when the claim replaced an earlier one). Superseded claims ARE included by default — pass current_only=true to restrict the page to live claims."
     )]
     async fn query_claims(
         &self,

@@ -63,7 +63,7 @@ async fn truth_range_filter_finds_matches_outside_recent_window(pool: PgPool) {
     // is the *oldest* row, so a fetch-recent-then-filter strategy never sees it.
     seed_claim(&pool, agent, 0.50, "2026-01-01T00:00:00Z").await;
 
-    let results = ClaimRepository::list_by_truth_range(&pool, 0.0, 0.75, 20, 0)
+    let results = ClaimRepository::list_by_truth_range(&pool, 0.0, 0.75, false, 20, 0)
         .await
         .unwrap();
 
@@ -81,7 +81,7 @@ async fn truth_range_filter_finds_matches_outside_recent_window(pool: PgPool) {
     );
 
     // And a high-truth query still excludes it.
-    let high = ClaimRepository::list_by_truth_range(&pool, 0.9, 1.0, 20, 0)
+    let high = ClaimRepository::list_by_truth_range(&pool, 0.9, 1.0, false, 20, 0)
         .await
         .unwrap();
     assert!(
