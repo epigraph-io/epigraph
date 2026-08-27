@@ -41,7 +41,7 @@ pub fn _test_event_store() -> std::sync::Arc<crate::routes::events::EventStore> 
 ///
 /// `bin/epigraph-migrate.rs` is the supported deploy path and calls this
 /// unconditionally. `bin/server.rs` calls it only when `EPIGRAPH_MIGRATE_ON_BOOT`
-/// is `1`/`true`/`yes`, because migrations 071/072/080 are designed to `RAISE`
+/// is `1`/`true`/`yes`, because migrations 074/075/084 are designed to `RAISE`
 /// when their tenancy preconditions do not hold and the server call site
 /// `.expect()`s — an unattended boot-time apply turns a precondition failure
 /// into a crash loop. See `docs/deploy.md`.

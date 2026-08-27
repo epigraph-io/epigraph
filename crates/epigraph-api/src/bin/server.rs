@@ -257,12 +257,56 @@ async fn main() {
         let database_url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL must be set when running with db feature");
         tracing::info!("Connecting to PostgreSQL...");
-        let pool = epigraph_db::PgPool::connect(&database_url)
+
+        // Constructed through ScopedPool, not `PgPool::connect`, and that is
+        // load-bearing rather than stylistic: `PgPoolOptions::after_release` —
+        // the hook that scrubs a released connection's tenancy GUCs, and the
+        // single mechanism standing between a recycled connection and a
+        // cross-tenant read — can only be installed at pool BUILD time, and
+        // `PgPool` exposes no setter for it. A pool built any other way cannot
+        // have the scrub retrofitted, so the control would exist only under
+        // test.
+        let guc_mode = epigraph_db::SessionGucMode::from_env(
+            std::env::var("EPIGRAPH_SESSION_GUC_MODE")
+                .unwrap_or_default()
+                .as_str(),
+        );
+        let scoped = epigraph_db::ScopedPool::connect(&database_url, guc_mode)
             .await
             .expect("Failed to connect to PostgreSQL");
+        // `AppState::with_db` keeps taking the inner `PgPool`, so nothing else
+        // changes shape in this PR; PR-06/PR-07 migrate call sites onto
+        // `ScopedPool::acquire_as` incrementally.
+        let pool = scoped.inner().clone();
         tracing::info!("PostgreSQL connected");
 
-        // Migrations 071/072/080 are DESIGNED to RAISE when their tenancy
+        // Plan §0.5 boot probe. Session-scoped `set_config` is the whole
+        // mechanism by which a request's group set reaches the RLS policies; if
+        // the deployment sits behind a transaction-mode pooler the GUCs silently
+        // vanish between statements and every policy collapses to
+        // `visibility = 'public'`. That is a fail-CLOSED data-loss shape, not an
+        // error, so it must be caught at boot rather than in production traffic.
+        //
+        // It lives on ScopedPool rather than on AppState because
+        // `AppState::with_db` is sync and receives a possibly-lazy pool — the
+        // same wall `load_entity_type_cache` exists to work around.
+        if guc_mode == epigraph_db::SessionGucMode::Transaction {
+            tracing::warn!(
+                "EPIGRAPH_SESSION_GUC_MODE=transaction — skipping the session-GUC probe. \
+                 Every scoped read will run inside begin_as, at a cost of two extra round \
+                 trips. Unset this variable on a session-mode endpoint."
+            );
+        } else {
+            scoped.probe_session_gucs().await.expect(
+                "FATAL: session GUCs do not survive between statements on one pooled connection. \
+                 This deployment is behind a transaction-mode pooler. Set \
+                 EPIGRAPH_SESSION_GUC_MODE=transaction to switch every read to begin_as, \
+                 or point DATABASE_URL at a session-mode endpoint.",
+            );
+            tracing::info!("Session-GUC probe passed");
+        }
+
+        // Migrations 074/075/084 are DESIGNED to RAISE when their tenancy
         // preconditions do not hold, and this call site .expect()s — so an
         // environment that ships them without an operator in the loop gets an
         // api binary that panics on EVERY boot. Migrations now run only when
@@ -286,6 +330,17 @@ async fn main() {
         // orphaned by a hard restart — self-aborts instead of grinding for
         // hours and saturating Postgres (incident 2026-05-29). Kept separate
         // from the API pool so the cap never affects request handling.
+        //
+        // NOT a `ScopedPool`, and therefore WITHOUT the `after_release` scrub
+        // the comment above calls "the single mechanism standing between a
+        // recycled connection and a cross-tenant read". That is safe today and
+        // only today: nothing stamps a job connection, because every background
+        // writer runs under a bypass viewer. **PR-15 OBLIGATION** — alongside
+        // repointing `ScopedPool::unscoped_for_maintenance` at
+        // `MAINTENANCE_DATABASE_URL`, this pool must be routed through
+        // `ScopedPool` (keeping the `after_connect` statement_timeout hook)
+        // before PR-17 turns RLS on. A job pool that can be stamped but never
+        // scrubbed is the same defect the API pool was rebuilt to close.
         let job_statement_timeout = std::time::Duration::from_millis(
             std::env::var("EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS")
                 .ok()

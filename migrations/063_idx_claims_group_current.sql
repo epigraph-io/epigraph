@@ -1,0 +1,67 @@
+-- no-transaction
+--
+-- FIRST `-- no-transaction` MIGRATION IN THIS REPO'S HISTORY (ops F8).
+-- sqlx-core 0.8.6 honours a leading `-- no-transaction` line
+-- (src/migrate/source.rs:127) and sqlx-macros-core 0.8.6 propagates no_tx into
+-- the migrate!() literal (src/migrate.rs:73), so CREATE INDEX CONCURRENTLY is
+-- legal inside a migration. This supersedes the DBA-pre-step workaround at
+-- migrations/013_code_review_hardening.sql:8-10 and
+-- migrations/030_atom_embedding_partial_index.sql:11.
+--
+-- ONE STATEMENT PER FILE, AND THAT IS NOT STYLE. sqlx-postgres 0.8.6's
+-- execute_migration does `conn.execute(&*migration.sql)` (src/migrate.rs:280),
+-- which is the SIMPLE query protocol over the whole file. PostgreSQL wraps a
+-- multi-statement simple query in an IMPLICIT transaction block, and
+-- CREATE INDEX CONCURRENTLY then fails with 25001. Verified against this
+-- cluster: two CIC statements in one file -> "CREATE INDEX CONCURRENTLY cannot
+-- run inside a transaction block"; interleaving COMMIT; does not help.
+-- DO NOT merge these index migrations back into one file.
+--
+-- WARNING: because there is no transaction, a failure here leaves an INVALID
+-- index behind. Re-running is safe (IF NOT EXISTS) but an operator must DROP
+-- INDEX the leftover first. Detect with:
+--   SELECT relname FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid
+--    WHERE NOT i.indisvalid;
+--
+-- DELETED FROM THE PLAN: idx_claims_embedding_hnsw_public. Under D3 the
+-- anonymous caller cannot exist, and the index is UNREACHABLE: after D3 the
+-- only app-emitted qual on claims is
+--   embedding IS NOT NULL AND is_current AND (visibility='public' OR owner_group_id = ANY($V))
+-- and `A OR B` does not imply `A`. The existing idx_claims_embedding_hnsw
+-- (migration 001:2375) remains the sole ANN index on claims.
+--
+-- MERGED WITH THE PLAN'S idx_claims_owner_group, NOT SUBSUMED BY IT. The plan
+-- named two indexes on claims: this one, and idx_claims_owner_group ON claims
+-- (owner_group_id) WHERE visibility <> 'public'. An earlier draft of this file
+-- deleted the second as "strictly subsumed" because claims_visibility_check
+-- restricts visibility to ('public','group') and the two predicates therefore
+-- match the same ROWS. That argument is wrong, twice over:
+--   (a) claims_visibility_check ships NOT VALID, and plancat.c skips
+--       unvalidated constraints entirely; and
+--   (b) even validated, check_index_predicates never consults table CHECK
+--       constraints. Predicate implication is proved syntactically, per query.
+-- Measured on this cluster (200k rows, ANALYZEd, one index at a time):
+--   index WHERE visibility =  'group' , qual visibility =  'group'  -> Index Scan
+--   index WHERE visibility =  'group' , qual visibility <> 'public' -> Seq Scan
+--   index WHERE visibility <> 'public', qual visibility <> 'public' -> Index Scan
+--   index WHERE visibility <> 'public', qual visibility =  'group'  -> Index Scan
+-- So `<> 'public'` is the DOMINANT spelling -- `= 'group'` implies it through
+-- the btree opfamily prover, but not conversely. This index therefore takes
+-- that predicate (keeping the plan's leading column and adding is_current),
+-- and 064/065 spell it identically. ONE canonical spelling across claims,
+-- evidence and edges; a uniformly generated qual cannot index-scan two of them
+-- and seq-scan the third.
+--
+-- WHAT QUERY SHAPE THIS SERVES, stated so a later predicate reshuffle cannot
+-- silently orphan it: an EXPLICIT visibility qual -- the D4 admin/privatization
+-- surface (PR-18's plan preview and restrict-mode apply) and group-scoped
+-- listings. It does NOT serve the ordinary D3 read predicate
+-- `(visibility = 'public' OR owner_group_id = ANY($V))`, for the same reason
+-- the HNSW index above was deleted: `A OR B` implies neither disjunct, and the
+-- planner confirms a Seq Scan for that qual. Pinned by
+-- tenancy_migration_shape.rs::the_partial_tenancy_indexes_serve_an_explicit_visibility_qual.
+--
+-- DELETED FROM THE PLAN, second entry: nothing. Both plan indexes on claims are
+-- present -- one is this file, the other is 066.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_claims_group_current
+    ON public.claims (owner_group_id, is_current) WHERE visibility <> 'public';

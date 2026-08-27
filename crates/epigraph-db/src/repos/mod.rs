@@ -61,7 +61,9 @@ pub mod workflow_execution;
 
 // Re-export all repositories for convenience
 pub use activity::ActivityRepository;
-pub use agent::{AgentCapabilitiesRow, AgentIdentityRow, AgentRepository, CapabilityFilter};
+pub use agent::{
+    AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, CapabilityFilter,
+};
 pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};

@@ -37,6 +37,12 @@ use sqlx::{PgPool, Row};
 /// The migration file itself, embedded so replay tests cannot drift from it.
 const MIGRATION_060: &str = include_str!("../../../migrations/060_group_tenancy_tables.sql");
 const MIGRATION_061: &str = include_str!("../../../migrations/061_agents_key_kind.sql");
+/// PR-04. The four `-- no-transaction` index migrations (063-066) are
+/// deliberately NOT embedded for replay: `CREATE INDEX CONCURRENTLY` raises
+/// 25001 inside the transaction these replay tests use. Their idempotence is
+/// asserted as `pg_index.indisvalid` in `tenancy_migration_shape.rs` instead.
+const MIGRATION_062: &str = include_str!("../../../migrations/062_tenancy_columns.sql");
+const MIGRATION_067: &str = include_str!("../../../migrations/067_session_functions.sql");
 
 /// `(column_name, data_type, is_nullable)` triples for one table, sorted by
 /// column name — the exact shape `information_schema.columns` reports.
@@ -381,7 +387,8 @@ async fn agents_key_kind_discriminator_is_intact(pool: PgPool) {
     // The CHECK is what makes the two-valued vocabulary enforceable.
     let check: Option<(String,)> = sqlx::query_as(
         "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
-         WHERE conname = 'agents_key_kind_check'",
+         WHERE conrelid = 'public.agents'::regclass \
+           AND conname = 'agents_key_kind_check'",
     )
     .fetch_optional(&pool)
     .await
@@ -488,6 +495,329 @@ async fn migration_061_refuses_a_nullable_key_kind(pool: PgPool) {
     let msg = err.to_string();
     assert!(
         msg.contains("already exists in a shape 061 did not create"),
+        "unexpected error text: {msg}"
+    );
+
+    tx.rollback().await.expect("rollback");
+}
+
+// =============================================================================
+// PR-04 — tenancy columns, indexes and session functions (migrations 062-067)
+// =============================================================================
+
+/// The three bookkeeping tables 062 creates. Every reader of these is a runtime
+/// `sqlx::query`, so `SQLX_OFFLINE=true cargo check` sees none of them and a
+/// later rename surfaces as a 42703 at request time. Same reason as the eight
+/// tables above.
+const TENANCY_BACKFILL_PROGRESS: ColumnContract = &[
+    ("complete", "boolean", "NO"),
+    ("entity", "text", "NO"),
+    ("last_id", "uuid", "YES"),
+    ("rows_done", "bigint", "NO"),
+    ("updated_at", "timestamp with time zone", "NO"),
+];
+
+const TENANCY_UNDECLARED_WRITES: ColumnContract = &[
+    ("day", "date", "NO"),
+    ("last_seen", "timestamp with time zone", "NO"),
+    ("n", "bigint", "NO"),
+    ("table_name", "text", "NO"),
+];
+
+const TENANCY_TRANSCRIPTION_LOG: ColumnContract = &[
+    ("from_partition", "text", "NO"),
+    ("node_id", "uuid", "NO"),
+    ("node_type", "text", "NO"),
+    ("to_group_id", "uuid", "NO"),
+    ("to_visibility", "text", "NO"),
+    ("transcribed_at", "timestamp with time zone", "NO"),
+];
+
+const PR04_CONTRACTS: &[(&str, ColumnContract)] = &[
+    ("tenancy_backfill_progress", TENANCY_BACKFILL_PROGRESS),
+    ("tenancy_undeclared_writes", TENANCY_UNDECLARED_WRITES),
+    ("tenancy_transcription_log", TENANCY_TRANSCRIPTION_LOG),
+];
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn schema_contract_tenancy_bookkeeping_tables(pool: PgPool) {
+    for (table, expected) in PR04_CONTRACTS {
+        let observed = observed_columns(&pool, table).await;
+        assert!(
+            !observed.is_empty(),
+            "table `{table}` does not exist — migration 062 did not apply"
+        );
+        let observed_refs: Vec<(&str, &str, &str)> = observed
+            .iter()
+            .map(|(c, t, n)| (c.as_str(), t.as_str(), n.as_str()))
+            .collect();
+        assert_eq!(
+            observed_refs, *expected,
+            "column contract drift on `{table}` (migration 062)"
+        );
+    }
+}
+
+/// The three columns 062 adds to `agents`, pinned individually for the same
+/// reason `agents_key_kind_discriminator_is_intact` pins `key_kind`: `agents` is
+/// created by migration 001 and a full `ColumnContract` here would make this file
+/// the contract for a table PR-01 does not own.
+///
+/// `profile_visibility` gates the Tier-B projection in
+/// `AgentRepository::get_public_profile`. If it were dropped, widened or made
+/// nullable, that projection would return `properties` — `full_name`, `email`,
+/// `affiliations` — to every viewer, and because the query is a runtime
+/// `sqlx::query_as`, nothing at compile time would notice.
+#[sqlx::test(migrations = "../../migrations")]
+async fn agents_tenancy_columns_are_intact(pool: PgPool) {
+    let expected: &[(&str, &str, &str)] = &[
+        ("default_group_id", "uuid", "YES"),
+        ("key_kind", "character varying", "NO"),
+        ("profile_visibility", "character varying", "NO"),
+    ];
+
+    for (name, data_type, nullable) in expected {
+        let row = sqlx::query(
+            "SELECT data_type, is_nullable, column_default \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'agents' AND column_name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&pool)
+        .await
+        .expect("information_schema lookup")
+        .unwrap_or_else(|| panic!("agents.{name} must exist (migrations 061/062)"));
+
+        assert_eq!(
+            &row.get::<String, _>("data_type"),
+            data_type,
+            "agents.{name}"
+        );
+        assert_eq!(
+            &row.get::<String, _>("is_nullable"),
+            nullable,
+            "agents.{name}"
+        );
+    }
+
+    // `profile_visibility` defaults to 'public': `agents` is Tier-B, deliberately
+    // readable so authorship renders on a public claim. A default of 'group'
+    // would make every existing author's name vanish from every existing claim.
+    let default: Option<String> = sqlx::query_scalar(
+        "SELECT column_default FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'agents' \
+           AND column_name = 'profile_visibility'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("column_default lookup");
+    assert!(
+        default.as_deref().unwrap_or("").contains("'public'"),
+        "agents.profile_visibility must default to 'public'; got {default:?}"
+    );
+
+    // The CHECK is what makes the two-valued vocabulary enforceable. It ships
+    // NOT VALID (no scan of `agents` at migration time) but still applies to
+    // every new row, which is the half that matters.
+    let check: Option<(String,)> = sqlx::query_as(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conrelid = 'public.agents'::regclass \
+           AND conname = 'agents_profile_visibility_check'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_constraint lookup");
+    let check = check.expect("agents_profile_visibility_check must exist").0;
+    for value in ["public", "group"] {
+        assert!(
+            check.contains(value),
+            "CHECK must admit {value}; got {check}"
+        );
+    }
+
+    // Prove EXCLUSION, not just inclusion: a CHECK widened to admit a third
+    // value satisfies `contains` and is exactly the regression this catches.
+    let err = sqlx::query(
+        "INSERT INTO agents (public_key, display_name, profile_visibility) \
+         VALUES (decode(repeat('cd', 32), 'hex'), 'widened-profile-probe', 'secret')",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("agents_profile_visibility_check must reject a third value");
+    let code = err
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or_default();
+    assert_eq!(
+        code, "23514",
+        "expected a CHECK violation (23514), got {err}"
+    );
+
+    // And `default_group_id` really references `groups`, not merely a uuid.
+    let fk: Option<(String,)> = sqlx::query_as(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conrelid = 'public.agents'::regclass \
+           AND conname = 'agents_default_group_fkey'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_constraint lookup");
+    let fk = fk.expect("agents_default_group_fkey must exist").0;
+    assert!(
+        fk.contains("REFERENCES groups(id)") && fk.contains("ON DELETE SET NULL"),
+        "unexpected FK definition: {fk}"
+    );
+}
+
+/// The five functions migration 067 creates.
+///
+/// `ScopedPool` writes the GUCs these read, and migration 077's policies call
+/// them. Nothing in Rust references them by name at compile time, so a rename in
+/// a later migration would be invisible until RLS silently stopped filtering.
+///
+/// `provolatile = 's'` (STABLE) is load-bearing, not decoration: a VOLATILE
+/// function cannot be hoisted into an InitPlan, so the policy would re-parse the
+/// GUC once per row — a seq scan over 1e6 claims would parse it 1e6 times.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_five_session_functions_exist(pool: PgPool) {
+    let expected: &[(&str, &str)] = &[
+        ("epigraph_session_groups", "_uuid"),
+        ("epigraph_writable_groups", "_uuid"),
+        ("epigraph_principal_id", "uuid"),
+        ("epigraph_bypass", "bool"),
+        ("epigraph_definer_bypass", "bool"),
+    ];
+
+    for (name, rettype) in expected {
+        let row = sqlx::query(
+            "SELECT p.provolatile::text AS volatility, \
+                    t.typname          AS rettype, \
+                    p.proparallel::text AS parallel, \
+                    p.proacl::text     AS acl \
+               FROM pg_proc p \
+               JOIN pg_type t ON t.oid = p.prorettype \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+              WHERE n.nspname = 'public' AND p.proname = $1",
+        )
+        .bind(name)
+        .fetch_optional(&pool)
+        .await
+        .expect("pg_proc lookup")
+        .unwrap_or_else(|| panic!("public.{name}() must exist (migration 067)"));
+
+        assert_eq!(
+            row.get::<String, _>("rettype"),
+            *rettype,
+            "{name} returns the wrong type"
+        );
+        assert_eq!(
+            row.get::<String, _>("volatility"),
+            "s",
+            "{name} must be STABLE: a VOLATILE function cannot be hoisted into \
+             an InitPlan, so the RLS policy would re-parse the GUC once per row"
+        );
+        assert_eq!(
+            row.get::<String, _>("parallel"),
+            "s",
+            "{name} must be PARALLEL SAFE, or every policy-bearing scan loses \
+             parallelism"
+        );
+    }
+
+    // `epigraph_definer_bypass` is the `current_user` variant (sec F10), used
+    // only inside trigger bodies that run as the function owner. It must NOT be
+    // executable by PUBLIC.
+    //
+    // Asked as `has_function_privilege('public', …)` rather than by scanning
+    // `proacl` text. A text scan for `=X/` is wrong: the owner's own grant
+    // renders as `postgres=X/postgres` and matches it, so the assertion would
+    // fail on a correctly REVOKEd function. The PUBLIC grant is the aclitem with
+    // an EMPTY grantee (`=X/owner`), and asking the privilege system directly is
+    // both shorter and immune to that class of mistake.
+    let (public_can_execute,): (bool,) = sqlx::query_as(
+        "SELECT has_function_privilege('public', 'public.epigraph_definer_bypass()', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("has_function_privilege lookup");
+    assert!(
+        !public_can_execute,
+        "epigraph_definer_bypass is EXECUTE-able by PUBLIC. It resolves \
+         `current_user`, which inside a SECURITY DEFINER frame is the FUNCTION \
+         OWNER — exactly the escalation the security review flagged. Migration \
+         067's `REVOKE EXECUTE … FROM PUBLIC` is what keeps it unreachable from \
+         app-emitted SQL."
+    );
+    let acl: Option<String> = sqlx::query_scalar(
+        "SELECT proacl::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_definer_bypass'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("proacl lookup");
+    assert!(
+        acl.is_some(),
+        "epigraph_definer_bypass must carry an explicit ACL — a NULL proacl means \
+         the default grant, which includes EXECUTE to PUBLIC"
+    );
+
+    // And the counterpart: `epigraph_bypass` IS callable by PUBLIC, since every
+    // RLS policy in migration 077 calls it on the app role's behalf. Revoking
+    // this one would make every policy-bearing query fail with 42501.
+    let (public_can_bypass,): (bool,) = sqlx::query_as(
+        "SELECT has_function_privilege('public', 'public.epigraph_bypass()', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("has_function_privilege lookup");
+    assert!(
+        public_can_bypass,
+        "epigraph_bypass() must stay EXECUTE-able by PUBLIC: every RLS policy \
+         calls it, and a revoked grant turns every read into a 42501"
+    );
+    let (_ok,): (bool,) = sqlx::query_as("SELECT epigraph_bypass()")
+        .fetch_one(&pool)
+        .await
+        .expect("epigraph_bypass() must be callable");
+}
+
+/// 067 must be re-runnable by hand, for the same reason 060 and 061 must.
+/// Everything in it is `CREATE OR REPLACE` plus one idempotent `REVOKE`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_067_is_idempotent(pool: PgPool) {
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::raw_sql(MIGRATION_067)
+        .execute(&mut *tx)
+        .await
+        .expect("re-applying migration 067 must succeed");
+    tx.commit().await.expect("commit");
+}
+
+/// 062's drift guard, the counterpart to 060's and 061's.
+///
+/// 062 widens 25 tables with `ADD COLUMN IF NOT EXISTS`, which is silent about a
+/// column that already exists in a DIFFERENT shape. A pre-existing NULLABLE
+/// `claims.visibility` would survive the file untouched, and every later
+/// predicate — `visibility = 'public' OR owner_group_id = ANY($V)` — evaluates to
+/// NULL, not true, for those rows. They would vanish from every scoped read,
+/// permanently and silently.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_062_refuses_a_nullable_visibility(pool: PgPool) {
+    let mut tx = pool.begin().await.expect("begin");
+
+    sqlx::query("ALTER TABLE public.claims ALTER COLUMN visibility DROP NOT NULL")
+        .execute(&mut *tx)
+        .await
+        .expect("make claims.visibility nullable");
+
+    let err = sqlx::raw_sql(MIGRATION_062)
+        .execute(&mut *tx)
+        .await
+        .expect_err("062 must refuse a nullable claims.visibility");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("already exists in a shape 062 did not create") && msg.contains("visibility"),
         "unexpected error text: {msg}"
     );
 

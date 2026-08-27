@@ -66,6 +66,34 @@ pub struct CapabilityFilter {
     pub privileged_access: Option<bool>,
 }
 
+/// A Tier-B projection of one `agents` row, narrowed to what a given
+/// [`crate::visibility::Viewer`] may see.
+///
+/// See [`AgentRepository::get_public_profile`] for the rule. The four
+/// always-present fields are the ones authorship rendering needs; the three
+/// `Option` fields below are `None` when the viewer is not entitled to the
+/// agent's PII, which is **indistinguishable from the agent simply not having
+/// set them** — deliberately, so the projection is not itself an oracle for
+/// "this agent has a private profile".
+#[derive(Debug, Clone)]
+pub struct AgentPublicProfile {
+    pub id: Uuid,
+    pub display_name: Option<String>,
+    pub public_key: Vec<u8>,
+    /// `ed25519` or `derived` (migration 061). Always returned: a caller that
+    /// cannot tell a real verifier from the BLAKE3 placeholder will feed the
+    /// placeholder to a signature check.
+    pub key_kind: String,
+    /// `public` or `group` (migration 062). Always returned so a caller can say
+    /// *why* the detail fields are empty without a second query.
+    pub profile_visibility: String,
+    /// `agents.properties` — `full_name`, `affiliations`, `email`. `None` when
+    /// the viewer is not entitled to it.
+    pub properties: Option<JsonValue>,
+    pub orcid: Option<String>,
+    pub ror_id: Option<String>,
+}
+
 /// Repository for Agent operations
 pub struct AgentRepository;
 
@@ -1227,6 +1255,107 @@ impl AgentRepository {
         .await?;
 
         Ok(group_id)
+    }
+
+    /// Tier-B projection of one agent, filtered by what `viewer` may see.
+    ///
+    /// `agents` is deliberately **not** a tenancy-partitioned table: authorship
+    /// must render on a public claim, so the row itself stays readable and
+    /// migration 077's policy on it is `USING (true)` with an explicit
+    /// `-- VISIBILITY-EXEMPT:` marker. What is *not* universally readable is the
+    /// PII the row carries — `agents.properties` holds `full_name`, `orcid`,
+    /// `affiliations` and `email` (migration 001).
+    ///
+    /// PostgreSQL has no column-level RLS, so the narrowing is a **repo-layer
+    /// projection**: `id`, `display_name`, `public_key` and `key_kind` are
+    /// always returned; [`AgentPublicProfile::properties`], `orcid` and `ror_id`
+    /// are `None` unless one of three things holds —
+    ///
+    /// 1. `profile_visibility = 'public'` (migration 062's default), or
+    /// 2. the viewer **is** this agent, or
+    /// 3. the viewer shares a live group with it.
+    ///
+    /// A bypass viewer sees everything, as everywhere else.
+    ///
+    /// The decision is made in SQL, in the same round trip as the row, so there
+    /// is no window in which the caller holds the PII and has not yet decided
+    /// whether it may show it.
+    ///
+    /// Runtime `sqlx::query_as`, like every other query in this file, so no
+    /// `.sqlx/` cache entry is needed. `schema_contract.rs` is what pins the
+    /// columns it names.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(pool, viewer))]
+    pub async fn get_public_profile(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<AgentPublicProfile>, DbError> {
+        type Row = (
+            Uuid,
+            Option<String>,
+            Vec<u8>,
+            String,
+            String,
+            bool,
+            JsonValue,
+            Option<String>,
+            Option<String>,
+        );
+
+        let row: Option<Row> = sqlx::query_as(
+            r#"
+            SELECT a.id,
+                   a.display_name,
+                   a.public_key,
+                   a.key_kind,
+                   a.profile_visibility,
+                   (   $4::bool
+                    OR a.profile_visibility = 'public'
+                    OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
+                    OR EXISTS (SELECT 1 FROM group_memberships gm
+                                WHERE gm.agent_id = a.id
+                                  AND gm.revoked_at IS NULL
+                                  AND gm.group_id = ANY($3::uuid[]))
+                   ) AS may_see_details,
+                   a.properties,
+                   a.orcid,
+                   a.ror_id
+            FROM agents a
+            WHERE a.id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(viewer.principal())
+        .bind(viewer.group_bind().unwrap_or(&[]))
+        .bind(viewer.is_bypass())
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row.map(
+            |(
+                id,
+                display_name,
+                public_key,
+                key_kind,
+                profile_visibility,
+                may_see_details,
+                properties,
+                orcid,
+                ror_id,
+            )| AgentPublicProfile {
+                id,
+                display_name,
+                public_key,
+                key_kind,
+                profile_visibility,
+                properties: may_see_details.then_some(properties),
+                orcid: if may_see_details { orcid } else { None },
+                ror_id: if may_see_details { ror_id } else { None },
+            },
+        ))
     }
 
     /// The agent's public key, but **only** when it is a real Ed25519 verifier.

@@ -29,11 +29,15 @@
 //!
 //! # What is deliberately NOT here yet
 //!
-//! `predicate_fragment` / `edge_predicate_fragment` — the SQL a `Viewer` emits —
-//! land in PR-04 alongside the tenancy columns they reference
-//! (`claims.visibility`, `claims.owner_group_id`). Emitting a predicate against
-//! columns that do not exist yet would be a compile-time-clean, runtime-fatal
-//! change.
+//! [`Viewer::predicate_fragment`] landed in PR-04, alongside the tenancy columns
+//! it references (`claims.visibility`, `claims.owner_group_id`, migration 062).
+//!
+//! `edge_predicate_fragment` — the `edges` variant that carries the co-ownership
+//! INTERSECTION — is still deferred, now to **PR-13**. Plan §4.3 defines it in
+//! terms of `edges.co_owner_group_id`, a column PR-13's migration creates. A
+//! fragment naming a column that does not exist is compile-time-clean and
+//! runtime-fatal, which is exactly the shape this note exists to prevent, so
+//! `edges` reads use [`Viewer::predicate_fragment`] until PR-13 widens them.
 
 use crate::errors::DbError;
 use crate::repos::GroupMembershipRepository;
@@ -62,14 +66,24 @@ enum ViewerShape {
     /// *correct* answer, not an error.
     ///
     /// Plan §4.3 requires that it ALWAYS contain the principal's personal
-    /// group. It does not yet, because personal groups do not exist until
-    /// PR-04 adds `ensure_personal_group`. That obligation is parked as a
-    /// failing `#[ignore]`d test —
+    /// group. As of PR-04 it does, for every principal minted through
+    /// `epigraph-api`'s `oauth/token.rs`: `AgentRepository::ensure_personal_group`
+    /// (shipped in PR-02, `repos/agent.rs`) writes the principal its own
+    /// `kind = 'personal'` group plus a live `role = 'admin'` membership in it,
+    /// and `resolve` reads that membership like any other. No special-casing is
+    /// needed here, and none should be added: the union is a *provisioning*
+    /// property, not a query property.
+    ///
+    /// The invariant is silent when it fails, which is why
     /// `no_anonymous_viewer.rs::resolve_unions_in_the_principals_personal_group`
-    /// — rather than as prose here, because the failure mode is silent: a PR-04
-    /// that lands the groups without the union produces `Scoped` viewers that
-    /// read only `visibility = 'public'` forever, and the symptom looks like
-    /// "the corpus is empty for new users", not like a bug in `resolve`.
+    /// pins it: a principal provisioned without a personal group produces a
+    /// `Scoped` viewer that reads only `visibility = 'public'` forever, and the
+    /// symptom looks like "the corpus is empty for new users" rather than like a
+    /// bug in `resolve`.
+    ///
+    /// An agent inserted straight into `agents` by a fixture or a CLI bin has no
+    /// personal group and therefore no membership — that is a correct, empty
+    /// `Scoped` viewer, not an error.
     ///
     /// `writable` is the subset whose role is `admin` or `writer`.
     Scoped {
@@ -166,10 +180,9 @@ impl SystemReason {
 pub struct MaintenanceLease(pub(crate) ());
 
 impl MaintenanceLease {
-    /// Mint a lease. Crate-private: PR-04's `ScopedPool` is the only intended
-    /// caller, and it mints one only after handing out a connection on the
-    /// maintenance role.
-    #[allow(dead_code)] // the ScopedPool that calls this lands in PR-04
+    /// Mint a lease. Crate-private: [`crate::pool::ScopedPool::unscoped_for_maintenance`]
+    /// is the only caller, and it mints one only after handing out a connection
+    /// on the maintenance role.
     pub(crate) const fn new() -> Self {
         MaintenanceLease(())
     }
@@ -281,6 +294,53 @@ impl Viewer {
         }
     }
 
+    /// The writable group set, in the same `Option` shape as [`Self::group_bind`].
+    ///
+    /// `None` for `Bypass`, so the two binds a scoped statement needs are read
+    /// through symmetric accessors and a `Bypass` viewer cannot be mistaken for
+    /// one with an empty writable set.
+    #[must_use]
+    pub fn writable_bind(&self) -> Option<&[Uuid]> {
+        match &self.shape {
+            ViewerShape::Scoped { writable, .. } => Some(writable),
+            ViewerShape::Bypass { .. } => None,
+        }
+    }
+
+    /// The SQL this viewer contributes to a tenancy-aware read.
+    ///
+    /// **Exactly two distinct strings**, one per shape. `{alias}` is substituted
+    /// by the caller with the table alias the predicate applies to; `$V` is the
+    /// single optional bind, supplied from [`Self::group_bind`] — from the
+    /// *same* `Viewer` value, which is what makes qual/GUC coherence (plan §4.5)
+    /// checkable rather than merely intended.
+    ///
+    /// Three properties are load-bearing and are pinned by unit tests:
+    ///
+    /// * **It is written inline.** No `epigraph_visible()` call: a SQL function
+    ///   here would rest on an inlining assumption the planner is free to break,
+    ///   and would add one more `SECURITY DEFINER`-adjacent surface to `REVOKE`.
+    /// * **`visibility = 'public'` comes FIRST.** Cheap-first for the executor,
+    ///   and it syntactically matches the leading disjunct of the RLS `USING`
+    ///   clause in migration 077 — the property that lets RLS never reject a row
+    ///   the app-emitted qual already returned.
+    /// * **`Bypass` emits a single space, not an empty string.** The fragment is
+    ///   spliced between other SQL tokens; an empty string would join them.
+    ///
+    /// The `edges` variant carrying the co-ownership INTERSECTION
+    /// (`edges.co_owner_group_id`) is deferred to PR-13, which creates that
+    /// column. See the module docs.
+    #[must_use]
+    pub const fn predicate_fragment(&self) -> &'static str {
+        match self.shape {
+            ViewerShape::Scoped { .. } => {
+                " AND ({alias}.visibility = 'public' \
+                   OR {alias}.owner_group_id = ANY($V::uuid[])) "
+            }
+            ViewerShape::Bypass { .. } => " ",
+        }
+    }
+
     /// `true` when this viewer emits no visibility predicate at all.
     #[must_use]
     pub const fn is_bypass(&self) -> bool {
@@ -330,12 +390,20 @@ mod tests {
     fn all_lists_every_variant_exactly_once() {
         // The exhaustive `match` that pairs with this lives in
         // tests/no_anonymous_viewer.rs, where it is compiled against the public
-        // enum. Here we only check ALL has no duplicates and no gaps in count.
+        // enum. Here we only check ALL has no duplicates.
+        //
+        // The COUNT deliberately is not asserted here. It is a
+        // monotone-decreasing ratchet in tests/viewer_ratchet.rs, and PR-04
+        // removed the `assert_eq!(…, 10)` from this file and from
+        // no_anonymous_viewer.rs so the number lives in exactly one place. Three
+        // equality assertions on one count is three files to edit the first time
+        // a bypass is legitimately removed — which is how a ratchet quietly
+        // stops ratcheting.
         let mut seen = std::collections::HashSet::new();
         for r in SystemReason::ALL {
             assert!(seen.insert(*r), "duplicate in SystemReason::ALL: {r:?}");
         }
-        assert_eq!(SystemReason::ALL.len(), 10);
+        assert!(!SystemReason::ALL.is_empty());
     }
 
     #[test]
@@ -370,8 +438,105 @@ mod tests {
 
         assert_eq!(v.principal(), None);
         assert_eq!(v.group_bind(), None);
+        assert_eq!(v.writable_bind(), None);
         assert!(v.writable_groups().is_empty());
         assert!(v.is_bypass());
         assert_eq!(v.bypass_reason(), Some(SystemReason::EmbeddingBackfill));
+    }
+
+    /// Every shape, and every bypass reason, must map onto EXACTLY TWO distinct
+    /// fragments. A third string would mean the predicate had grown a case, and
+    /// a case is where a leak lives: the qual would no longer be a syntactic
+    /// match for migration 077's `USING` clause on every path.
+    #[test]
+    fn predicate_fragment_has_exactly_two_distinct_values() {
+        let lease = MaintenanceLease::new();
+
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(Viewer::test_scoped(Uuid::new_v4(), vec![]).predicate_fragment());
+        seen.insert(
+            Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4(), Uuid::new_v4()])
+                .predicate_fragment(),
+        );
+        for reason in SystemReason::ALL {
+            seen.insert(Viewer::system(&lease, *reason).predicate_fragment());
+        }
+
+        assert_eq!(
+            seen.len(),
+            2,
+            "predicate_fragment must return exactly two distinct strings \
+             (one per shape); got {seen:?}"
+        );
+    }
+
+    #[test]
+    fn bypass_fragment_is_a_separator_not_an_empty_string() {
+        let lease = MaintenanceLease::new();
+        let frag = Viewer::system(&lease, SystemReason::DedupSweep).predicate_fragment();
+        assert_eq!(frag, " ");
+        assert!(
+            !frag.is_empty(),
+            "an empty fragment would concatenate the tokens it is spliced between"
+        );
+    }
+
+    /// The shape of the `Scoped` fragment, asserted rather than described.
+    #[test]
+    fn scoped_fragment_is_inline_ordered_and_single_bind() {
+        let frag = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]).predicate_fragment();
+
+        // No helper-function call: an `epigraph_visible(...)` here would rest on
+        // an inlining assumption and add a surface to REVOKE.
+        assert!(
+            !frag.contains("epigraph_"),
+            "the Scoped fragment must be written inline, not as a function call: {frag}"
+        );
+
+        // `{alias}` is substituted by the caller, once per disjunct.
+        assert_eq!(
+            frag.matches("{alias}").count(),
+            2,
+            "both disjuncts must be alias-qualified: {frag}"
+        );
+
+        // One bind, not two: `$V` is the single optional parameter.
+        assert_eq!(
+            frag.matches("$V").count(),
+            1,
+            "the Scoped fragment takes exactly one bind: {frag}"
+        );
+
+        // ORDERING. `visibility = 'public'` must lead — cheap-first for the
+        // executor, and it is the leading disjunct of migration 077's USING.
+        let public_at = frag
+            .find("visibility = 'public'")
+            .expect("the public disjunct must be present verbatim");
+        let group_at = frag
+            .find("owner_group_id")
+            .expect("the group disjunct must be present");
+        assert!(
+            public_at < group_at,
+            "`visibility = 'public'` must come first: {frag}"
+        );
+
+        // It is spliceable: leading ` AND `, and it does not close a paren it
+        // did not open.
+        assert!(frag.starts_with(" AND ("), "fragment shape changed: {frag}");
+        assert_eq!(
+            frag.matches('(').count(),
+            frag.matches(')').count(),
+            "unbalanced parentheses: {frag}"
+        );
+    }
+
+    #[test]
+    fn writable_bind_mirrors_group_bind_for_a_scoped_viewer() {
+        let principal = Uuid::new_v4();
+        let g = Uuid::new_v4();
+        let v = Viewer::test_scoped(principal, vec![g]);
+
+        assert_eq!(v.group_bind(), Some(&[g][..]));
+        assert_eq!(v.writable_bind(), Some(&[g][..]));
     }
 }

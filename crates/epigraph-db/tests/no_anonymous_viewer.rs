@@ -1,6 +1,10 @@
 //! Source lint: the `Viewer` has exactly two shapes and no way to conjure one.
 //!
-//! Plan §4.13. This is the seed of PR-04's `viewer_ratchet.rs`.
+//! Plan §4.13. The seed of `viewer_ratchet.rs`, which PR-04 split out: the
+//! **count** of `SystemReason` variants is a monotone-decreasing ratchet and
+//! lives there; the compile-time exhaustiveness check and the source lint stay
+//! here. An equality assertion on the count and a `<=` ratchet cannot both
+//! survive the first removal of a bypass reason.
 //!
 //! Two halves, deliberately different in kind:
 //!
@@ -12,12 +16,17 @@
 //!    there is no type to assert against when the whole point is that the impl
 //!    must not exist.
 //!
-//! 2. A **compiled** assertion over `SystemReason`. `ALL.len() == 10` alone is
-//!    weak — someone could add a variant and bump the number. The exhaustive
-//!    `match` below is the real check: adding a variant without also handling it
-//!    here fails to *compile*, which forces the author past a review boundary.
+//! 2. A **compiled** assertion over `SystemReason`. A count alone is weak —
+//!    someone could add a variant and bump the number. The exhaustive `match`
+//!    below is the real check: adding a variant without also handling it here
+//!    fails to *compile*, which forces the author past a review boundary.
+//!
+//! 3. Since PR-04, one live database test: plan §4.3's personal-group invariant,
+//!    whose failure mode is silent and therefore cannot be left as prose.
 
-use epigraph_db::SystemReason;
+use epigraph_db::{repos::AgentRepository, SystemReason, Viewer};
+use sqlx::PgPool;
+use uuid::Uuid;
 
 /// Constructs that must never appear in `visibility.rs`.
 ///
@@ -110,7 +119,7 @@ fn maintenance_lease_has_no_public_constructor() {
 }
 
 #[test]
-fn system_reason_all_is_exhaustive_and_ten_long() {
+fn system_reason_all_is_exhaustive() {
     // The `match` is the load-bearing half: a new variant that is not handled
     // here fails to compile. Bumping the count without touching the match is
     // therefore impossible.
@@ -139,41 +148,93 @@ fn system_reason_all_is_exhaustive_and_ten_long() {
         };
     }
 
-    assert_eq!(
-        SystemReason::ALL.len(),
-        10,
-        "SystemReason::ALL changed length. This is the bypass ratchet (plan \
-         §4.13): it is expected to be monotone *decreasing* from here. Growing \
-         it means a new code path reads the corpus unfiltered."
-    );
+    // The COUNT assertion deliberately does not live here. It is a
+    // monotone-decreasing ratchet in `viewer_ratchet.rs`
+    // (`bypass_count_is_monotone_decreasing_from_the_pr04_baseline`). An
+    // `assert_eq!(…, 10)` here and a `<= PR04_BASELINE` there cannot both
+    // survive the first legitimate REMOVAL of a bypass reason, and whoever hit
+    // that would have to edit one of the two to keep the other green — which is
+    // how a ratchet quietly stops ratcheting. This file keeps the half the
+    // compiler enforces; that file keeps the number.
 }
 
-/// PR-04 obligation, parked here as a tripwire rather than as prose.
+/// Plan §4.3's personal-group invariant, as a live tripwire.
 ///
-/// Plan §4.3 specifies that a `Scoped` viewer's `group_ids` **always contains
-/// the principal's personal group**, and that `Viewer::resolve` "always unions
-/// in the principal's personal group". The shipped `resolve` does not, and
-/// cannot: personal groups do not exist until PR-04 adds `ensure_personal_group`
-/// and the world/seed groups. `visibility.rs` records the deferral in the
-/// `ViewerShape::Scoped` doc.
+/// A `Scoped` viewer's `group_ids` must **always** contain the principal's own
+/// personal group. As of PR-02 that holds by provisioning rather than by
+/// special-casing: `AgentRepository::ensure_personal_group` writes the agent a
+/// `kind = 'personal'` group and a live `role = 'admin'` membership in it, and
+/// `Viewer::resolve` reads that membership like any other. PR-03 parked this
+/// test `#[ignore]`d with a `panic!` body on the belief that personal groups
+/// arrived in PR-04; they had already arrived. PR-04 gives it a body.
 ///
-/// The failure mode this guards is silent. If PR-04 lands the groups but not
-/// the union, nothing errors — every `Scoped` viewer over a fresh principal
-/// simply reads `visibility = 'public'` and nothing else, forever, and the
-/// symptom looks like "the corpus is empty for new users" rather than like a
-/// bug in `resolve`.
+/// **The failure mode is silent, which is the whole reason this exists.** If a
+/// principal is provisioned without a personal group, nothing errors: the viewer
+/// reads `visibility = 'public'` and nothing else, forever, and the symptom
+/// presents as "the corpus is empty for new users" rather than as a bug in
+/// `resolve`. Do not delete this test — deleting it is how the invariant
+/// silently stops holding.
 ///
-/// **PR-04: un-ignore this test and give it a body.** It should seed an agent,
-/// call whatever provisions the personal group, and assert
-/// `Viewer::resolve(...).group_bind()` contains it.
-#[test]
-#[ignore = "PR-04 obligation: un-ignore when ensure_personal_group lands"]
-fn resolve_unions_in_the_principals_personal_group() {
-    panic!(
-        "Plan §4.3's personal-group invariant is not established yet. This test \
-         is the ratchet on it: PR-04 must replace this panic with a real \
-         assertion that Viewer::resolve's group_bind() contains the \
-         principal's personal group, and remove the #[ignore]. Do not delete \
-         the test — deleting it is how the invariant silently never holds."
+/// The GUC-side counterpart (the personal group actually reaching
+/// `epigraph.group_ids`) is
+/// `qual_guc_coherence.rs::the_personal_group_reaches_the_session_gucs`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn resolve_unions_in_the_principals_personal_group(pool: PgPool) {
+    // An agent inserted directly, as `oauth/token.rs` does before it calls
+    // `ensure_for_client`.
+    let agent = Uuid::new_v4();
+    let pk: Vec<u8> = agent.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(agent)
+        .bind(&pk)
+        .execute(&pool)
+        .await
+        .expect("seed agent");
+
+    // Before provisioning: no groups at all. This is what the invariant is
+    // protecting against becoming permanent.
+    let before = Viewer::resolve(&pool, agent).await.expect("resolve");
+    assert_eq!(
+        before.group_bind(),
+        Some(&[][..]),
+        "precondition: an unprovisioned agent has no memberships"
+    );
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let personal = AgentRepository::ensure_personal_group(&mut conn, agent)
+        .await
+        .expect("ensure_personal_group");
+    drop(conn);
+
+    let viewer = Viewer::resolve(&pool, agent).await.expect("resolve");
+
+    assert!(
+        viewer
+            .group_bind()
+            .expect("a scoped viewer binds its groups")
+            .contains(&personal),
+        "Viewer::resolve must union in the principal's personal group"
+    );
+    assert!(
+        viewer.writable_groups().contains(&personal),
+        "the personal-group membership is role='admin', so the principal's own \
+         group must also be WRITABLE — otherwise a new user can read their own \
+         group and never write to it"
+    );
+
+    // Idempotent: a second provisioning call must not create a second group or
+    // a duplicate membership.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let again = AgentRepository::ensure_personal_group(&mut conn, agent)
+        .await
+        .expect("ensure_personal_group is idempotent");
+    drop(conn);
+    assert_eq!(again, personal);
+
+    let after = Viewer::resolve(&pool, agent).await.expect("resolve");
+    assert_eq!(
+        after.group_bind(),
+        Some(&[personal][..]),
+        "exactly one group, exactly once"
     );
 }

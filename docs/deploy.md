@@ -7,7 +7,7 @@ Applied by the `epigraph-migrate` binary, run explicitly — as an
 starts. The API binary does *not* migrate at boot unless
 `EPIGRAPH_MIGRATE_ON_BOOT=1` (also accepts `true`/`yes`, case-insensitively and
 ignoring surrounding whitespace) is set in its environment; migrations
-071/072/080 are designed to `RAISE` when their tenancy preconditions do not
+074/075/084 are designed to `RAISE` when their tenancy preconditions do not
 hold, and the server call site `.expect()`s, so an unattended boot-time apply
 turns a precondition failure into a crash loop. Any other value — including
 `0`, `false` and the empty string — skips.
@@ -334,3 +334,206 @@ that response needs updating.
 `security(...)` annotations are per-operation and the 105 moved read operations
 carry none, so the schema advertises them as requiring nothing. The document
 itself is still anonymous, which is correct. Annotating them is a follow-up.
+
+---
+
+## PR-04 (tenancy columns, ScopedPool) — new env var, and the repo's first `-- no-transaction` migrations
+
+Migrations `062`–`067`. Nothing in PR-04 changes an HTTP response: it widens 25
+tables with two columns that need no table rewrite, creates the world and seed
+groups, adds **five** partial indexes — four built `CONCURRENTLY` in `063`–`066`
+plus `idx_agents_default_group`, an ordinary `CREATE INDEX` inside `062` — and
+creates the five session/bypass SQL functions the RLS policies will read from
+PR-17 onward. RLS is **not** enabled by this PR.
+
+### 1. New: `EPIGRAPH_SESSION_GUC_MODE`
+
+| Value | Meaning |
+|---|---|
+| *unset* (default), or anything other than `transaction` | `session` — the fast path |
+| `transaction` | every scoped read runs inside a transaction |
+
+Tenancy context reaches the database as three session GUCs —
+`epigraph.group_ids`, `epigraph.writable_group_ids`, `epigraph.principal_id` —
+stamped once at connection checkout by `ScopedPool::acquire_as`, in one extra
+statement and no transaction.
+
+**Behind a transaction-mode pooler that mechanism silently does not work.** A
+`set_config(..., is_local = false)` on one statement is not visible to the next,
+so from PR-17 on every RLS policy would collapse to `visibility = 'public'` and
+`epigraph_principal_id()` would be NULL. That is a *fail-closed* failure: no
+errors, no 500s, just permanently empty result sets that look like data loss.
+
+**The boot probe.** `bin/server.rs` therefore runs
+`ScopedPool::probe_session_gucs()` immediately after the pool connects, before
+anything else. It:
+
+1. acquires a connection and stamps a sentinel UUID into all three tenancy GUCs
+   — through the *same* `set_config` triple the request path uses, not a scratch
+   GUC;
+2. reads all three back **as a second statement on the same handle** — they must
+   still carry the sentinel;
+3. releases the connection, acquires again, and asserts all three are now empty
+   — which proves the `after_release` scrub is running, because step 1 is what
+   put values there.
+
+Step 3 is written that way on purpose. An earlier draft stamped a scratch
+`epigraph.probe` GUC in step 1 and then checked the *tenancy* GUCs in step 3;
+since nothing had ever set those, they read empty whether or not the scrub was
+installed, and the check could not fail. Stamping the real three is what makes
+the boot control non-vacuous.
+
+If step 2 fails the process **refuses to serve**, with:
+
+```
+FATAL: session GUCs do not survive between statements on one pooled connection.
+This deployment is behind a transaction-mode pooler. Set
+EPIGRAPH_SESSION_GUC_MODE=transaction to switch every read to begin_as, or
+point DATABASE_URL at a session-mode endpoint.
+```
+
+**When to set `transaction`.** pgbouncer with `pool_mode = transaction`, or RDS
+Proxy without session pinning, in front of `DATABASE_URL`. Setting it skips the
+probe (a `WARN` is logged saying so) and every scoped read runs inside
+`ScopedPool::begin_as`. **Measured cost: two extra round trips per read**
+(`BEGIN` and `COMMIT`). Prefer pointing `DATABASE_URL` at a session-mode
+endpoint if one exists; the fallback is supported, not recommended.
+
+A typo (`EPIGRAPH_SESSION_GUC_MODE=tranaction`) selects `session` and the probe
+then proves whether that was right. Failing over to the slow mode on a typo
+would hide the misconfiguration behind a permanent latency cost nobody
+attributes.
+
+**Not exercised in this repo's CI:** the *refusal* half. There is no
+pgbouncer-in-transaction-mode fixture available here, so the pooler's behaviour
+is reasoned about but not measured. Verify it against staging before relying on
+it in production. What *is* covered: the verdict itself is a pure function
+(`pool.rs::probe_verdict`) with unit tests pinning that a lost stamp is
+diagnosed as a pooler and names `EPIGRAPH_SESSION_GUC_MODE=transaction`, that a
+carried-over stamp is diagnosed as a dead scrub, and that an all-empty
+observation is reported as the former rather than the latter.
+
+### 1b. The release scrub costs one extra round trip on **every** connection
+
+`after_release` runs the `set_config` triple on every release from the API pool,
+including the ~100 % of requests that stamp nothing until PR-06 lands. Measured
+on this loopback cluster (3000 sequential statements through `psql`):
+`SELECT 1` 0.15–0.19 s, the scrub triple 0.19–0.20 s — i.e. **≈55 µs per
+release**, of which the triple itself is ~13 µs and the rest is the round trip.
+Over a real network hop the round trip dominates, so budget one extra p50 RTT
+per released connection. It is not made conditional: a scrub that only runs when
+someone remembered to set a flag is not a security control.
+
+### 1c. Obligations this PR hands to PR-15 and PR-16
+
+* **PR-15** — `ScopedPool::unscoped_for_maintenance` currently draws from the
+  *application* pool. Harmless until RLS is enabled, unsound after: a bypass
+  viewer emits no predicate but the policy still filters, so it reads zero rows.
+  Repoint it at `MAINTENANCE_DATABASE_URL` **before PR-17**.
+* **PR-15** — the background `job_pool` (`bin/server.rs`) is a second pool on the
+  same database built with bare `PgPoolOptions`, so it has **no scrub**. Route it
+  through `ScopedPool` (keeping its `after_connect` `statement_timeout` hook)
+  before anything can stamp a job connection.
+* **PR-16** — after the backfill, `REINDEX INDEX CONCURRENTLY
+  idx_claims_world_owned;`. That index is corpus-sized when `066` builds it
+  (`owner_group_id` defaults to the world group, so the partial predicate
+  matches every row) and the backfill empties it without reclaiming the pages.
+
+### 1d. Deleting a group is a maintenance-window operation
+
+Migration `062` adds 25 `owner_group_id → groups(id)` foreign keys, all
+`ON DELETE RESTRICT`, and **none of them is indexed**. The partial indexes in
+`063`–`065` lead on `owner_group_id` but predicate on `visibility`, and the RI
+check for a RESTRICT parent delete is an unqualified `owner_group_id = $1`
+lookup, so none of them can serve it.
+
+`DELETE FROM groups` is blocked outright by migration `060`'s trigger. Its
+documented escape hatch —
+
+```sql
+SET LOCAL epigraph.allow_group_delete = 'yes';
+```
+
+— therefore costs **25 sequential scans, one of them on `claims`**, inside the
+deleting transaction with row locks held throughout. Take it in a maintenance
+window. An online deprovisioning path must first add plain `(owner_group_id)`
+indexes on the tables it touches.
+
+### 2. Migrations 063–066 are the repo's first `-- no-transaction` migrations
+
+They run `CREATE INDEX CONCURRENTLY`. Consequences an operator must know:
+
+* **They hold no `ACCESS EXCLUSIVE` lock** — that is why they are concurrent.
+  Writes to `claims`, `evidence` and `edges` continue throughout.
+* **sqlx cannot roll them back.** There is no enclosing transaction, and the
+  `_sqlx_migrations` bookkeeping is not atomic with the DDL. A failure leaves an
+  **INVALID index** behind and no migration row.
+* **One statement per file, deliberately.** sqlx sends a whole migration file as
+  one simple query; PostgreSQL wraps a multi-statement simple query in an
+  implicit transaction block; `CREATE INDEX CONCURRENTLY` inside one fails with
+  SQLSTATE 25001. Do not merge 063–066 back into one file — a test fails if you
+  do. Full explanation in `migrations/README.md`.
+
+**Detection:**
+
+```sql
+SELECT c.relname FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+ WHERE NOT i.indisvalid;
+```
+
+**Recovery** — drop the leftover, then re-run the migration (`IF NOT EXISTS`
+means re-running is safe, but it will *not* rebuild an index that already exists
+in an invalid state):
+
+```sql
+DROP INDEX CONCURRENTLY <name>;
+```
+
+**Window.** `CREATE INDEX CONCURRENTLY` waits for every transaction older than
+itself in the same database. The background job pool's `statement_timeout`
+defaults to **45 minutes** (`EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS`), so one long
+clustering job can stall these migrations for that long. `SET LOCAL
+lock_timeout` in a `-- no-transaction` file is *legal* but useless — outside a
+transaction block it is a silent no-op with a `WARNING`, and it would not bound
+this wait even if it took effect. Run them during a quiet window, or check
+first:
+
+```sql
+SELECT max(now() - xact_start) FROM pg_stat_activity
+ WHERE state <> 'idle' AND datname = current_database();
+```
+
+### 3. Migration 062 rewrites no table, but it locks 25 of them
+
+`ADD COLUMN ... NOT NULL DEFAULT ...` is metadata-only on PostgreSQL 11+, so
+widening `claims` does not rewrite the table. Measured against a 5,000,000-row /
+1028 MB clone of `claims` on PostgreSQL 16.2: the two-column `ADD COLUMN` took
+**3.5 ms** and the `NOT VALID` CHECK **3.6 ms**, with `pg_relation_size`
+identical before and after. Every constraint it adds is `NOT VALID`: new rows
+are checked, existing rows are not scanned. Validation is migration 075's job,
+after the backfill.
+
+**That is duration, not locks.** Each `ALTER TABLE` still takes `ACCESS
+EXCLUSIVE`, and sqlx runs the whole file in one transaction, so a lock is held
+until `COMMIT` — by the last table this migration holds `ACCESS EXCLUSIVE` on
+**25 tables simultaneously**, `claims` among them. `SET LOCAL lock_timeout =
+'3s'` bounds how long each `ALTER TABLE` *waits*, not how long the transaction
+*holds*; and while one is queued behind a long-running reader it blocks every
+new query on that table for up to 3 s. Worst case on a busy cluster is a series
+of rolling 3-second stalls ending in a rollback and a restart from table 1. Run
+it in a quiet window, expect to retry, and pre-check with the `pg_stat_activity`
+query above.
+
+The `DEFAULT 'public'` and `DEFAULT <world group>` are **transition artifacts**
+and are dropped by migration 074. Do not build anything that relies on them.
+
+If 062 aborts on its `lock_timeout`, sqlx records no row and the fix is simply
+to re-run it: the whole file is `IF NOT EXISTS` / catalog-guarded and applies
+cleanly a second time.
+
+### 4. `epigraph-migrate` is still the supported migration path
+
+Unchanged from PR-01. The api binary runs migrations only when
+`EPIGRAPH_MIGRATE_ON_BOOT` is set; `ExecStartPre=` running `epigraph-migrate` is
+the supported path, and it honours `-- no-transaction` (the flag is propagated
+into the compile-time `migrate!()` literal).

@@ -32,28 +32,54 @@ async fn run_migrations_applies_all_from_empty(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("count query should succeed");
-    // The floor is the migration-file count at the time of writing (59 files,
-    // 001..060 with one gap). The old floor of 26 could not notice 34
+    // The floor is the migration-file count at the time of writing (66 files,
+    // 001..067 with one gap). The old floor of 26 could not notice 34
     // migrations silently failing to resolve — which is precisely the
     // cross-worktree stale-binary failure mode docs/deploy.md documents.
     assert!(
-        applied >= 59,
-        "expected >= 59 migrations applied, got {}",
+        applied >= 66,
+        "expected >= 66 migrations applied, got {}",
         applied
     );
 
     // Version-precise: the newest migration in the tree must have applied, not
     // merely "enough of them". A stale embedded migration list passes a count
     // floor and fails this.
+    //
+    // BUMP THIS WITH EVERY MIGRATION. PR-02 shipped 061 and left this at 60, so
+    // for one PR the comment above claimed a guarantee the assertion no longer
+    // gave. PR-04 ships 062-067; 067 is the head.
+    //
+    // 063-066 are `-- no-transaction` migrations, and their bookkeeping is NOT
+    // atomic with their DDL (sqlx-postgres 0.8.6 src/migrate.rs:214). Asserting
+    // the head is 067 therefore also asserts that all four of them recorded a
+    // row rather than dying half-applied.
+    const MIGRATION_HEAD: i64 = 67;
     let head_ok: Option<bool> =
-        sqlx::query_scalar("SELECT success FROM _sqlx_migrations WHERE version = 60")
+        sqlx::query_scalar("SELECT success FROM _sqlx_migrations WHERE version = $1")
+            .bind(MIGRATION_HEAD)
             .fetch_optional(&pool)
             .await
             .expect("migration-head lookup should succeed");
     assert_eq!(
         head_ok,
         Some(true),
-        "migration 060 must be applied and successful"
+        "migration {MIGRATION_HEAD:03} must be applied and successful"
+    );
+
+    // And every migration between 060 and the head, so a gap cannot hide behind
+    // the head being present.
+    let tenancy_applied: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM _sqlx_migrations WHERE success AND version BETWEEN 60 AND $1",
+    )
+    .bind(MIGRATION_HEAD)
+    .fetch_one(&pool)
+    .await
+    .expect("tenancy-range count should succeed");
+    assert_eq!(
+        tenancy_applied,
+        MIGRATION_HEAD - 60 + 1,
+        "every tenancy migration 060..={MIGRATION_HEAD} must have applied"
     );
 
     // Spot-check a known table from a recent migration.

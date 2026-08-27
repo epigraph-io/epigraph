@@ -61,14 +61,17 @@ pub use access_control::{
     batch_check_content_access, check_content_access, ContentAccess, COARSE_EDGE_TYPES,
 };
 pub use errors::DbError;
-pub use pool::{create_pool, create_pool_from_options, create_pool_with_options};
+pub use pool::{
+    create_pool, create_pool_from_options, create_pool_with_options, MaintenanceConn, ScopedConn,
+    ScopedPool, ScopedTx, SessionGucMode,
+};
 pub use repos::{
-    ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentRepository, AnalysisRecord,
-    AnalysisRepository, BehavioralExecutionRepository, BehavioralExecutionRow, ChallengeRepository,
-    ChallengeRow, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository,
-    ClaimEncryptionRow, ClaimNeighbor, ClaimNeighborBetpRow, ClaimRepository, ClaimSummary,
-    ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository, ClaimVersionRow,
-    CommunityRepository, ConsolidateMode, ConsolidateResult, ContextRepository,
+    ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentPublicProfile, AgentRepository,
+    AnalysisRecord, AnalysisRepository, BehavioralExecutionRepository, BehavioralExecutionRow,
+    ChallengeRepository, ChallengeRow, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
+    ClaimEncryptionRepository, ClaimEncryptionRow, ClaimNeighbor, ClaimNeighborBetpRow,
+    ClaimRepository, ClaimSummary, ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository,
+    ClaimVersionRow, CommunityRepository, ConsolidateMode, ConsolidateResult, ContextRepository,
     CounterfactualRepository, CounterfactualRow, DedupRepair, DivergenceRepository,
     EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository, EntityRepository, EntityRow,
     EntityTypeEntry, EntityTypeRepository, EpistemicEdgePairRow, EventRepository, EventRow,
