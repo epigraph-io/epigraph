@@ -28,15 +28,24 @@ pub async fn get_neighborhood(
     let mut edges = Vec::new();
 
     if direction == "outgoing" || direction == "both" {
-        let outgoing = EdgeRepository::get_by_source(&server.pool, node_id, "claim")
-            .await
-            .map_err(internal_error)?;
+        // `list_filtered` NULL-guards every predicate, so passing `None` for
+        // both entity-type columns matches edges incident to a node of ANY
+        // type. `get_by_source(.., "claim")` constrained `source_type`, which
+        // is the type of the node being looked up — so a `paper --asserts-->
+        // claim` edge (what every ingestion path writes) matched zero rows and
+        // the tool silently reported `edge_count: 0`.
+        let outgoing = EdgeRepository::list_filtered(
+            &server.pool,
+            Some(node_id),
+            None,
+            params.relationship.as_deref(),
+            None,
+            None,
+            limit,
+        )
+        .await
+        .map_err(internal_error)?;
         for e in outgoing {
-            if let Some(ref rel_filter) = params.relationship {
-                if e.relationship != *rel_filter {
-                    continue;
-                }
-            }
             edges.push(NeighborhoodEdge {
                 edge_id: e.id.to_string(),
                 source_id: e.source_id.to_string(),
@@ -49,15 +58,22 @@ pub async fn get_neighborhood(
     }
 
     if direction == "incoming" || direction == "both" {
-        let incoming = EdgeRepository::get_by_target(&server.pool, node_id, "claim")
-            .await
-            .map_err(internal_error)?;
+        // This half bound the TARGET's type, so it already resolved
+        // `paper --asserts--> claim` when the *claim* was the node. Dropping
+        // the constraint widens it to non-claim nodes (`agent --authored-->
+        // paper`) without regressing that claim-side path.
+        let incoming = EdgeRepository::list_filtered(
+            &server.pool,
+            None,
+            Some(node_id),
+            params.relationship.as_deref(),
+            None,
+            None,
+            limit,
+        )
+        .await
+        .map_err(internal_error)?;
         for e in incoming {
-            if let Some(ref rel_filter) = params.relationship {
-                if e.relationship != *rel_filter {
-                    continue;
-                }
-            }
             edges.push(NeighborhoodEdge {
                 edge_id: e.id.to_string(),
                 source_id: e.source_id.to_string(),
@@ -132,18 +148,22 @@ pub async fn traverse(
         });
 
         if depth < max_depth {
-            // Get outgoing edges
-            let outgoing = EdgeRepository::get_by_source(&server.pool, current_id, "claim")
-                .await
-                .unwrap_or_default();
+            // Get outgoing edges. Unconstrained on entity type for the same
+            // reason as `get_neighborhood`: BFS from a paper terminated at
+            // depth 0 while `source_type = 'claim'` was hardcoded.
+            let outgoing = EdgeRepository::list_filtered(
+                &server.pool,
+                Some(current_id),
+                None,
+                params.relationship.as_deref(),
+                None,
+                None,
+                node_limit as i64,
+            )
+            .await
+            .unwrap_or_default();
 
             for e in outgoing {
-                if let Some(ref rel_filter) = params.relationship {
-                    if e.relationship != *rel_filter {
-                        continue;
-                    }
-                }
-
                 edges.push(TraverseEdge {
                     source_id: e.source_id.to_string(),
                     target_id: e.target_id.to_string(),
