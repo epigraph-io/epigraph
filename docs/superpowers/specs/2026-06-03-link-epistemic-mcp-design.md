@@ -45,10 +45,14 @@ the wrong template; `create_edge` is the right one).
   `contradicts` string). Asserting the reverse direction returns the existing `edge_id`
   with `was_created=false`; since `MassFunctionRepository::exists_for_perspective` keys on
   `perspective_id = edge_id`, that reverse call also reports `belief_wired=false` and moves
-  no belief on the other endpoint. The READ side is unchanged and remains DIRECTIONAL
-  (`ClaimRepository::dispute_batch` and `in_epistemic_degree_batch` both group by
-  `target_id`), so only the first-asserted target is reported contested. Legacy pairs that
-  already have both rows are not repaired — this is a write-path fix.
+  no belief on the other endpoint. The READ side matches: `in_epistemic_degree_batch`
+  counts edges incident to EITHER endpoint for the symmetric relations, and
+  `dispute_batch` mirrors the `contradicts` leg, so both endpoints of a contradiction
+  report contested no matter which direction was asserted first. `refutes` is NOT
+  mirrored — it is ordered, and only its target is contested. Both readers dedup on
+  `(claim, other, relationship)` via `UNION`, so a legacy pair that already carries both
+  `A->B` and `B->A` rows is read as the single fact it represents rather than counted
+  twice; the duplicate rows themselves are left in place.
 - Honor the repo convention: routes and MCP both call the shared repo/engine layer; no duplicated logic.
 
 **Non-goals (explicitly out of scope for v1)**

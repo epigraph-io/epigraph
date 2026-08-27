@@ -154,7 +154,13 @@ async fn exclude_contested_drops_hit_without_backfilling(pool: PgPool) {
     let contested = seed_claim(&pool, agent, "zarnthex primary finding", 0.9).await;
     let clean = seed_claim(&pool, agent, "zarnthex secondary finding", 0.8).await;
 
-    let contester = seed_claim(&pool, agent, "zarnthex rebuttal", 0.7).await;
+    // The contester must share NO token with the query, so it never enters the
+    // page itself. `contradicts` is symmetric on the read side too, so a
+    // contester that DID match "zarnthex finding" would come back flagged
+    // contested and be dropped as well — making the delta 2 and turning this
+    // into an accidental test of read-side directionality instead of the
+    // no-back-fill property it is written to pin.
+    let contester = seed_claim(&pool, agent, "qorvath standalone objection", 0.7).await;
     seed_edge(&pool, contester, contested, "contradicts").await;
 
     let server = build_test_server(pool);

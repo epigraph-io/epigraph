@@ -193,3 +193,134 @@ async fn empty_input_returns_empty_map(pool: PgPool) {
         .expect("dispute_batch on empty input");
     assert!(map.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Symmetry of `contradicts` on the READ side (backlog 9a0bd3e2).
+//
+// `link_epistemic` routes `contradicts` through the SYMMETRIC writer, so one
+// unordered pair yields exactly ONE row in whichever direction the caller
+// asserted it. A read that keys only on `target_id` therefore reports the
+// reverse asserter's own claim as uncontested. These pin the fix, and pin the
+// two things a blanket symmetrization would get wrong.
+// ---------------------------------------------------------------------------
+
+/// The regression itself: `A contradicts B` must mark BOTH A and B disputed.
+/// Pre-fix A is absent from the map entirely, because A is never a `target_id`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_direction_contradicts_marks_the_source_contested(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let a = seed_claim(&pool, agent, 0.8, true).await;
+    let b = seed_claim(&pool, agent, 0.7, true).await;
+
+    seed_edge(&pool, a, b, "contradicts").await;
+
+    let map = ClaimRepository::dispute_batch(&pool, &[a, b])
+        .await
+        .expect("dispute_batch");
+
+    let row_b = map.get(&b).expect("the asserted target is contested");
+    assert_eq!(row_b.dispute_count, 1);
+    assert_eq!(row_b.contesting_claim_ids, vec![a]);
+
+    let row_a = map
+        .get(&a)
+        .expect("the ASSERTER is contested too — `contradicts` is unordered");
+    assert_eq!(row_a.dispute_count, 1);
+    assert_eq!(row_a.contesting_claim_ids, vec![b]);
+}
+
+/// `refutes` is ORDERED — it stays on the directional writer, and `A refutes B`
+/// is a claim about B, not a mutual standoff. Mirroring the whole
+/// `contradicts`/`refutes` pair would report every refuter as itself disputed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_direction_refutes_does_not_mark_the_source_contested(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let a = seed_claim(&pool, agent, 0.8, true).await;
+    let b = seed_claim(&pool, agent, 0.7, true).await;
+
+    seed_edge(&pool, a, b, "refutes").await;
+
+    let map = ClaimRepository::dispute_batch(&pool, &[a, b])
+        .await
+        .expect("dispute_batch");
+
+    assert!(map.contains_key(&b), "the refuted claim is contested");
+    assert!(
+        !map.contains_key(&a),
+        "the refuter must NOT be reported contested — `refutes` is ordered"
+    );
+}
+
+/// A pair written BEFORE the symmetric writer landed carries both `A->B` and
+/// `B->A` rows for one unordered fact. The `UNION` collapses them; `UNION ALL`
+/// would score each endpoint 2 and list its single contester twice.
+#[sqlx::test(migrations = "../../migrations")]
+async fn legacy_duplicate_contradicts_pair_counts_once(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let a = seed_claim(&pool, agent, 0.8, true).await;
+    let b = seed_claim(&pool, agent, 0.7, true).await;
+
+    seed_edge(&pool, a, b, "contradicts").await;
+    seed_edge(&pool, b, a, "contradicts").await;
+
+    let map = ClaimRepository::dispute_batch(&pool, &[a, b])
+        .await
+        .expect("dispute_batch");
+
+    let row_a = map.get(&a).expect("a contested");
+    let row_b = map.get(&b).expect("b contested");
+    assert_eq!(
+        row_a.dispute_count, 1,
+        "one unordered fact, one contester — not one per legacy row"
+    );
+    assert_eq!(row_b.dispute_count, 1);
+    assert_eq!(row_a.contesting_claim_ids, vec![b]);
+    assert_eq!(row_b.contesting_claim_ids, vec![a]);
+}
+
+/// `corroborates` is symmetric but is NOT a dispute relation. Mirroring the
+/// whole `SYMMETRIC_RELATIONSHIPS` set into this query instead of the
+/// `contradicts` leg alone would turn agreement into dispute.
+#[sqlx::test(migrations = "../../migrations")]
+async fn corroborates_never_counts_as_dispute_in_either_direction(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let a = seed_claim(&pool, agent, 0.8, true).await;
+    let b = seed_claim(&pool, agent, 0.7, true).await;
+
+    seed_edge(&pool, a, b, "corroborates").await;
+
+    let map = ClaimRepository::dispute_batch(&pool, &[a, b])
+        .await
+        .expect("dispute_batch");
+    assert!(
+        map.is_empty(),
+        "corroboration is not dispute, in either direction"
+    );
+}
+
+/// `in_epistemic_degree_batch` gains the same symmetric leg — and only for the
+/// symmetric relations. An ordered `C supports D` must still score D only.
+#[sqlx::test(migrations = "../../migrations")]
+async fn symmetric_contradicts_lifts_degree_on_both_endpoints(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let a = seed_claim(&pool, agent, 0.8, true).await;
+    let b = seed_claim(&pool, agent, 0.7, true).await;
+    let c = seed_claim(&pool, agent, 0.8, true).await;
+    let d = seed_claim(&pool, agent, 0.7, true).await;
+
+    seed_edge(&pool, a, b, "contradicts").await;
+    seed_edge(&pool, c, d, "supports").await;
+
+    let map = ClaimRepository::in_epistemic_degree_batch(&pool, &[a, b, c, d])
+        .await
+        .expect("in_epistemic_degree_batch");
+
+    assert_eq!(map.get(&a), Some(&1), "symmetric edge counts on the source");
+    assert_eq!(map.get(&b), Some(&1), "and on the target");
+    assert_eq!(map.get(&d), Some(&1), "ordered edge counts on the target");
+    assert_eq!(
+        map.get(&c),
+        None,
+        "an ordered relation must NOT gain a source-side leg"
+    );
+}

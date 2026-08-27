@@ -26,6 +26,24 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
     "refutes",
 ];
 
+/// The subset of [`EPISTEMIC_RELATIONSHIPS`] whose truth is UNORDERED:
+/// `A contradicts B` and `B contradicts A` assert the same fact about the
+/// pair. The write path holds ONE row for such a pair
+/// ([`EdgeRepository::create_symmetric_if_absent_returning`]) and stores the
+/// caller's `source -> target` ordering without canonicalizing, so every read
+/// that asks "what is incident to this claim?" must consider BOTH endpoints
+/// for these relations or the reverse asserter's claim silently reads as
+/// unrelated.
+///
+/// Kept here (the lower `epigraph-db` layer), next to
+/// [`EPISTEMIC_RELATIONSHIPS`] and for the same reason: the DB-layer batch
+/// queries [`crate::repos::claim::ClaimRepository::in_epistemic_degree_batch`]
+/// and [`crate::repos::claim::ClaimRepository::dispute_batch`] need the list
+/// and must not depend upward on `epigraph-mcp`. `link_epistemic` re-exports
+/// this const rather than redeclaring it, so the writer and the readers can
+/// never disagree about which relations are symmetric.
+pub const SYMMETRIC_RELATIONSHIPS: &[&str] = &["contradicts", "corroborates"];
+
 /// A row from the edges table
 #[derive(Debug, Clone)]
 pub struct EdgeRow {

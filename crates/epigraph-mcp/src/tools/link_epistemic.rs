@@ -133,10 +133,18 @@ fn is_structural_relationship(s: &str) -> bool {
 /// Everything else in [`EPISTEMIC_RELATIONSHIPS`] is genuinely ordered
 /// (`A supports B` != `B supports A`) and keeps the directional writer. The
 /// row still stores the CALLER's `source -> target` ordering — we do NOT
-/// canonicalize — so `restriction_kind_with_profile` and every existing read
-/// query (`dispute_batch`, `in_epistemic_degree_batch`, which remain
-/// directional) see exactly what they see today.
-pub const SYMMETRIC_RELATIONSHIPS: &[&str] = &["contradicts", "corroborates"];
+/// canonicalize — so the read side must meet the writer halfway:
+/// `ClaimRepository::in_epistemic_degree_batch` counts edges on BOTH endpoints
+/// for these relations, and `ClaimRepository::dispute_batch` mirrors the
+/// `contradicts` leg (only that one — `refutes` is ordered and stays
+/// target-only). Without that, asserting the reverse direction of a
+/// contradiction would return the existing edge and then read back as no
+/// dispute signal at all on the asserter's own endpoint.
+///
+/// Defined once in `epigraph-db` alongside the batch readers that consume it
+/// and re-exported here, so the writer's notion of "symmetric" and the
+/// readers' cannot drift apart.
+pub use epigraph_db::SYMMETRIC_RELATIONSHIPS;
 
 fn is_symmetric_relationship(s: &str) -> bool {
     SYMMETRIC_RELATIONSHIPS.contains(&s)
@@ -482,7 +490,11 @@ mod tests {
 
     /// The symmetric subset is exactly `{contradicts, corroborates}` — the two
     /// relations whose truth is unordered. Everything else stays on the
-    /// directional writer, so widening this set silently changes dedup shape.
+    /// directional writer, so widening this set silently changes dedup shape
+    /// on the write path AND which endpoints the read path counts. A pure
+    /// const-vs-const drift guard: it pins the shared definition, it does not
+    /// exercise either path (that coverage is DB-backed, in
+    /// `epigraph-db/tests/dispute_batch_test.rs`).
     #[test]
     fn symmetric_set_is_exactly_contradicts_and_corroborates() {
         assert_eq!(
@@ -515,49 +527,16 @@ mod tests {
         );
     }
 
-    /// The symmetric branch cannot widen the accepted surface: every member
-    /// must already clear the epistemic allow-list gate in `do_link_epistemic`
-    /// (and must not be a structural relation, which is Neutral by design).
-    #[test]
-    fn symmetric_relationships_are_a_subset_of_the_epistemic_set() {
-        for rel in SYMMETRIC_RELATIONSHIPS {
-            assert!(
-                is_epistemic_relationship(rel),
-                "'{rel}' routes through the symmetric writer but is not in \
-                 EPISTEMIC_RELATIONSHIPS — it could never reach the write branch"
-            );
-            assert!(
-                !is_structural_relationship(rel),
-                "'{rel}' must not also be structural (structural relations are Neutral)"
-            );
-        }
-    }
-
-    /// Routing a relation through a different edge WRITER must not change the
-    /// belief polarity the engine assigns it. Catches a future "fix" that tries
-    /// to make symmetry work by remapping the relation instead.
-    #[test]
-    fn symmetric_relationships_keep_their_engine_polarity() {
-        let profile = RestrictionProfile::scientific();
-        assert!(
-            matches!(
-                restriction_kind_with_profile("contradicts", &profile),
-                RestrictionKind::Negative(_)
-            ),
-            "'contradicts' must stay Negative after the symmetric-writer switch"
-        );
-        assert!(
-            matches!(
-                restriction_kind_with_profile("corroborates", &profile),
-                RestrictionKind::Positive(_)
-            ),
-            "'corroborates' must stay Positive after the symmetric-writer switch"
-        );
-    }
-
     /// Drift guard: the symmetric and ordered subsets PARTITION the seven
     /// epistemic relations. Adding an eighth relationship without deciding its
-    /// symmetry fails here rather than silently defaulting to directional.
+    /// symmetry fails here rather than silently defaulting to directional —
+    /// which now also decides whether the READ side counts it on one endpoint
+    /// or both (`ClaimRepository::in_epistemic_degree_batch`).
+    ///
+    /// Subsumes the subset property too: every symmetric member must clear the
+    /// epistemic allow-list gate in `do_link_epistemic` (and must not be a
+    /// structural relation, which is Neutral by design), or it could never
+    /// reach the write branch at all.
     #[test]
     fn directional_relationships_partition_the_epistemic_set() {
         const ORDERED: &[&str] = &[
@@ -583,6 +562,17 @@ mod tests {
                 is_symmetric_relationship(rel) || ORDERED.contains(rel),
                 "'{rel}' is in EPISTEMIC_RELATIONSHIPS but is neither symmetric nor listed as \
                  ordered — decide its dedup shape before exposing it"
+            );
+        }
+        for rel in SYMMETRIC_RELATIONSHIPS {
+            assert!(
+                is_epistemic_relationship(rel),
+                "'{rel}' routes through the symmetric writer but is not in \
+                 EPISTEMIC_RELATIONSHIPS — it could never reach the write branch"
+            );
+            assert!(
+                !is_structural_relationship(rel),
+                "'{rel}' must not also be structural (structural relations are Neutral)"
             );
         }
         assert_eq!(

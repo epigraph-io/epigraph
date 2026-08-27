@@ -3661,17 +3661,35 @@ impl ClaimRepository {
             .collect())
     }
 
-    /// In-degree of epistemic-relationship edges (the full `link_epistemic`
-    /// allowlist: supports/corroborates/elaborates/generalizes/specializes/
-    /// contradicts/refutes) targeting each of `claim_ids`, batched in one
-    /// round-trip. Claims with no such incoming edges are simply absent from
-    /// the returned map (degree 0) rather than present with a zero — callers
-    /// should treat a missing key as 0.
+    /// INCIDENT epistemic degree — the number of distinct epistemic facts
+    /// (the full `link_epistemic` allowlist: supports/corroborates/elaborates/
+    /// generalizes/specializes/contradicts/refutes) touching each of
+    /// `claim_ids`, batched in one round-trip. Claims with no such edges are
+    /// simply absent from the returned map (degree 0) rather than present with
+    /// a zero — callers should treat a missing key as 0.
+    ///
+    /// "Incident", not "in-degree": for the five ORDERED relations this counts
+    /// only edges pointing AT the claim (`A supports B` says nothing about
+    /// `B supports A`), but for [`crate::SYMMETRIC_RELATIONSHIPS`] it counts
+    /// edges on EITHER endpoint. The symmetric writer stores exactly one row
+    /// per unordered pair in the caller's own direction, so keying on
+    /// `target_id` alone would report degree 0 for whichever endpoint happened
+    /// not to be named the target first.
+    ///
+    /// The `UNION` dedups on `(claim_id, other, relationship)` rather than on
+    /// `edges.id`. That is load-bearing: a legacy pair written before the
+    /// symmetric writer landed has BOTH `A->B` and `B->A` rows for one
+    /// unordered fact, and keying on `edges.id` would score it 2. It is a
+    /// no-op for the ordered relations, which `create_if_not_exists` already
+    /// dedups on `(source, target, relationship)`.
     ///
     /// One `GROUP BY` query for the whole batch, not one query per claim: the
     /// N+1 shape would be the naive approach given `recall_with_context`
     /// calls this once per page over its (already small, ≤200) candidate
     /// pool, not once per claim.
+    ///
+    /// Runtime `query_as` rather than the `sqlx::query!` macro: see the note
+    /// on [`Self::dispute_batch`].
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
@@ -3685,24 +3703,43 @@ impl ClaimRepository {
         }
         let relationships: Vec<String> = crate::repos::edge::EPISTEMIC_RELATIONSHIPS
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| (*s).to_string())
             .collect();
-        let rows = sqlx::query!(
+        let symmetric: Vec<String> = crate::repos::edge::SYMMETRIC_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let rows = sqlx::query_as::<_, (Uuid, i64)>(
             r#"
-            SELECT target_id, COUNT(*) AS "degree!"
-            FROM edges
-            WHERE target_id = ANY($1)
-              AND source_type = 'claim' AND target_type = 'claim'
-              AND relationship = ANY($2)
-            GROUP BY target_id
+            WITH incident AS (
+                -- Ordered leg: edges pointing AT the claim. All seven relations.
+                SELECT e.target_id AS claim_id, e.source_id AS other, e.relationship
+                FROM edges e
+                WHERE e.target_id = ANY($1)
+                  AND e.source_type = 'claim' AND e.target_type = 'claim'
+                  AND e.relationship = ANY($2)
+                UNION
+                -- Symmetric leg: edges leaving the claim, for the unordered
+                -- relations only. UNION (not UNION ALL) collapses a legacy
+                -- both-directions pair back into the one fact it represents.
+                SELECT e.source_id AS claim_id, e.target_id AS other, e.relationship
+                FROM edges e
+                WHERE e.source_id = ANY($1)
+                  AND e.source_type = 'claim' AND e.target_type = 'claim'
+                  AND e.relationship = ANY($3)
+            )
+            SELECT claim_id, COUNT(*) AS degree
+            FROM incident
+            GROUP BY claim_id
             "#,
-            claim_ids,
-            &relationships[..],
         )
+        .bind(claim_ids.to_vec())
+        .bind(relationships)
+        .bind(symmetric)
         .fetch_all(pool)
         .await?;
 
-        Ok(rows.into_iter().map(|r| (r.target_id, r.degree)).collect())
+        Ok(rows.into_iter().collect())
     }
 
     /// Live-dispute signal for each of `claim_ids`, batched in one round-trip
@@ -3723,11 +3760,30 @@ impl ClaimRepository {
     /// `contesting_claim_ids` is capped at the three strongest contesters
     /// (by contesting `truth_value` DESC) so a heavily-disputed claim cannot
     /// bloat a recall page; `dispute_count` is the UNCAPPED total, so callers
-    /// can tell "3 contesters" from "30".
+    /// can tell "3 contesters" from "30". `dispute_count` counts distinct live
+    /// CONTESTERS, not dispute edges: one claim holding both a `contradicts`
+    /// and a `refutes` edge against the target is one contester.
+    ///
+    /// `contradicts` is symmetric (see [`crate::SYMMETRIC_RELATIONSHIPS`]) —
+    /// the write path stores ONE row per unordered pair in whichever direction
+    /// the caller asserted it, so both endpoints are read as disputed.
+    /// `refutes` is deliberately NOT mirrored: it is an ORDERED relation
+    /// (`A refutes B` is a claim about B, not a symmetric standoff) and stays
+    /// on the directional writer, so only its target is contested. Blanket
+    /// symmetrization here would report every refuter as itself disputed.
+    /// `corroborates` is symmetric but is not a dispute relation at all, so it
+    /// never enters this query — this stays the narrower sibling of
+    /// [`Self::in_epistemic_degree_batch`].
     ///
     /// This is a post-fix batch query over ids already returned by retrieval —
     /// deliberately NOT a join inside the ANN/RRF SQL, which would put the
     /// HNSW plan at risk for a signal that does not affect ranking.
+    ///
+    /// Runtime `query_as` rather than the `sqlx::query!` macro: the two-legged
+    /// `UNION` is plain SQL with nothing the macro's compile-time checking
+    /// would catch that the tuple type does not, and `query_as` is already the
+    /// established form for this kind of query in this crate (see
+    /// `repos::factor`).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
@@ -3739,32 +3795,48 @@ impl ClaimRepository {
         if claim_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let rows = sqlx::query!(
+        let rows = sqlx::query_as::<_, (Uuid, i64, Option<Vec<Uuid>>)>(
             r#"
-            SELECT e.target_id,
-                   COUNT(*) AS "dispute_count!",
-                   (array_agg(e.source_id ORDER BY src.truth_value DESC, src.id))[1:3]
-                       AS "contesting_claim_ids!"
-            FROM edges e
-            JOIN claims src ON src.id = e.source_id AND src.is_current
-            WHERE e.target_id = ANY($1)
-              AND e.source_type = 'claim' AND e.target_type = 'claim'
-              AND e.relationship IN ('contradicts', 'refutes')
-            GROUP BY e.target_id
+            WITH dispute AS (
+                -- Ordered leg: dispute asserted AT this claim. Both relations.
+                SELECT e.target_id AS claim_id, e.source_id AS contester
+                FROM edges e
+                WHERE e.target_id = ANY($1)
+                  AND e.source_type = 'claim' AND e.target_type = 'claim'
+                  AND e.relationship IN ('contradicts', 'refutes')
+                UNION
+                -- Symmetric leg: `contradicts` ONLY. `A contradicts B` is the
+                -- same fact as `B contradicts A`, so A is disputed too.
+                -- `refutes` is ORDERED and is deliberately absent here.
+                -- UNION (not UNION ALL) collapses a legacy both-directions
+                -- pair, and a contester holding both relations, to one row.
+                SELECT e.source_id AS claim_id, e.target_id AS contester
+                FROM edges e
+                WHERE e.source_id = ANY($1)
+                  AND e.source_type = 'claim' AND e.target_type = 'claim'
+                  AND e.relationship = 'contradicts'
+            )
+            SELECT d.claim_id,
+                   COUNT(*) AS dispute_count,
+                   (array_agg(d.contester ORDER BY src.truth_value DESC, src.id))[1:3]
+                       AS contesting_claim_ids
+            FROM dispute d
+            JOIN claims src ON src.id = d.contester AND src.is_current
+            GROUP BY d.claim_id
             "#,
-            claim_ids,
         )
+        .bind(claim_ids.to_vec())
         .fetch_all(pool)
         .await?;
 
         Ok(rows
             .into_iter()
-            .map(|r| {
+            .map(|(claim_id, dispute_count, contesting_claim_ids)| {
                 (
-                    r.target_id,
+                    claim_id,
                     ClaimDispute {
-                        dispute_count: r.dispute_count,
-                        contesting_claim_ids: r.contesting_claim_ids,
+                        dispute_count,
+                        contesting_claim_ids: contesting_claim_ids.unwrap_or_default(),
                     },
                 )
             })
@@ -3776,8 +3848,9 @@ impl ClaimRepository {
 /// [`ClaimRepository::dispute_batch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimDispute {
-    /// Total number of `is_current` claims contesting this one via
-    /// `contradicts`/`refutes`. Uncapped.
+    /// Total number of DISTINCT `is_current` claims contesting this one via
+    /// `contradicts` (either direction — it is symmetric) or an incoming
+    /// `refutes`. Uncapped, and counted per contester rather than per edge.
     pub dispute_count: i64,
     /// The three strongest contesters (by their own `truth_value` DESC).
     pub contesting_claim_ids: Vec<Uuid>,
