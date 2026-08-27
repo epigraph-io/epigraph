@@ -96,10 +96,11 @@ pub mod webhooks;
 #[cfg(feature = "db")]
 pub mod workflows;
 
-use crate::metrics;
+// `crate::metrics` is deliberately NOT imported here. `/metrics` was removed
+// from both router variants in PR-03 and is served only by the internal
+// listener that `bin/server.rs` binds (`EPIGRAPH_METRICS_ADDR`).
 use crate::middleware::{
     bearer_auth_middleware, optional_bearer_auth_middleware, rate_limit_middleware,
-    require_signature,
 };
 use crate::state::AppState;
 use axum::{
@@ -109,47 +110,57 @@ use axum::{
     Router,
 };
 
-/// Create the main application router with all routes
+/// Create the main application router with all routes.
 ///
-/// # Route Structure
+/// # Route structure — authenticated by default
 ///
-/// Routes are organized into two categories:
+/// Three routers are merged, and the split between them is the security
+/// boundary:
 ///
-/// ## Protected Routes (require Ed25519 signature)
+/// ## `protected` — requires an OAuth2 Bearer token
 ///
-/// Write operations that modify system state:
-/// - `POST /claims` - Create a new claim
-/// - `POST /agents` - Register a new agent
-/// - `POST /api/v1/submit/packet` - Submit an epistemic packet
+/// Everything that reads or writes claim content, claim-derived structure,
+/// ACLs, embeddings or aggregates. `bearer_auth_middleware` rejects a request
+/// with no `Authorization` header, or with a revoked / malformed / expired
+/// token, with 401 and an RFC 6750 `WWW-Authenticate: Bearer …,
+/// error="invalid_token"` challenge.
 ///
-/// ## Public Routes (no authentication required)
+/// ## `public` — the anonymous ALLOWLIST, two routes
 ///
-/// Read-only operations for transparency:
-/// - `GET /health` - Health check endpoint
-/// - `GET /claims` - List claims
-/// - `GET /claims/:id` - Get a specific claim
-/// - `GET /agents` - List agents
-/// - `GET /agents/:id` - Get a specific agent
-/// - `GET /lineage/:claim_id` - Get claim lineage
-/// - `POST /api/v1/search/semantic` - Semantic search (read operation)
-/// - `GET /api/v1/query/rag` - RAG context retrieval (high-truth claims)
+/// - `GET /health` — static, stateless
+/// - `GET /api/v1/openapi.json` — static schema document
 ///
-/// # Security
+/// Enforced by `crates/epigraph-api/tests/public_router_allowlist.rs`, which
+/// fails if a third route appears here.
 ///
-/// Protected routes use the `require_signature` middleware which:
-/// 1. Verifies Ed25519 signatures on requests
-/// 2. Validates request timestamps (prevents replay attacks)
-/// 3. Confirms agent is registered in the system
-/// 4. Injects `VerifiedAgent` into request extensions for handlers
+/// ## `oauth` — anonymous by construction
 ///
-/// # Rate Limiting
+/// The 11 `/oauth/*` and `/.well-known/*` endpoints. Discovery and token
+/// issuance must precede authentication, so they cannot sit behind it.
 ///
-/// All routes (except health endpoints) are subject to rate limiting when
-/// a rate limiter is configured in AppState. Rate limits apply per-agent
-/// for authenticated requests and per-IP for unauthenticated requests.
+/// # What changed in PR-03
+///
+/// Before PR-03 the `public` router held 108 registrations, including
+/// `GET /claims`, `GET /claims/:id`, `GET /agents`, `GET /lineage/:claim_id`,
+/// `POST /api/v1/search/semantic` and `GET /api/v1/query/rag`, all reachable
+/// with no credential. 105 of them moved to `protected`, `/metrics` moved to a
+/// separate internal listener, and the remaining two are the allowlist above.
+/// **The RAG and evidence-search public-access guarantees are revoked.**
+///
+/// The `require_signature` (Ed25519 request-signing) middleware was deleted
+/// rather than moved: it was unreachable through this router. Payload-level
+/// packet signatures are unaffected — see `ApiConfig::require_packet_signatures`
+/// and `routes/submit.rs`.
+///
+/// # Rate limiting
+///
+/// All routes (except health endpoints) are subject to rate limiting when a
+/// rate limiter is configured in `AppState`.
 #[cfg(feature = "db")]
 pub fn create_router(state: AppState) -> Router {
-    // Protected write operations - require signature verification
+    // Write operations. Read operations are appended below by the PR-03
+    // inversion; the two halves are separate only because of the order the
+    // chain was written in, not because they differ in authority.
     let protected = Router::new()
         .route("/claims", post(claims::create_claim))
         .route("/api/v1/claims", post(claims::create_claim))
@@ -490,34 +501,28 @@ pub fn create_router(state: AppState) -> Router {
             post(cross_source::decide_candidate),
         );
 
-    // Auth middleware stack (outermost runs first):
-    // 1. bearer_auth_middleware: if Bearer token present, validate JWT + inject AuthContext
-    //    If no Bearer but X-Signature present, falls through to next layer.
-    // 2. require_signature: Ed25519 signature verification (legacy)
+    // ------------------------------------------------------------------
+    // PR-03: THE INVERSION.
     //
-    // Axum layers are applied inner-to-outer, so we apply signature first, then bearer.
-    let protected = if state.config.require_signatures {
-        protected
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                require_signature,
-            ))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                bearer_auth_middleware,
-            ))
-    } else {
-        // Even without signature requirement, accept bearer tokens when present
-        protected.layer(middleware::from_fn_with_state(
-            state.clone(),
-            bearer_auth_middleware,
-        ))
-    };
-
-    // Public read operations - no authentication required
-    let public = Router::new()
-        .route("/health", get(health::health_check))
-        .route("/metrics", get(metrics::metrics_handler))
+    // Everything from here to the end of this chain used to live in a
+    // separate `public` Router layered with `optional_bearer_auth_middleware`,
+    // which passes a request with no Authorization header straight through
+    // with no `AuthContext` ("anonymous pass-through", bearer.rs). That made
+    // every route below — verbatim claim text via `/api/v1/search/semantic`
+    // and `/api/v1/query/rag`, the ownership ACL itself via
+    // `/api/v1/ownership/:node_id`, up to 5000 raw 1536-d embeddings via
+    // `/api/v1/themes/:id/embeddings` — readable by anyone who could reach the
+    // port.
+    //
+    // The rule is not "audit N handlers" — it is invert the split. `public` is
+    // now an ALLOWLIST of two routes (built below); every other registration is
+    // appended to `protected` and inherits `bearer_auth_middleware`.
+    //
+    // Axum permits repeated `.route()` calls on the same path with different
+    // methods, so the GET arms folded in here merge with the PUT/DELETE arms
+    // already registered above (`/api/v1/claims/:id` is the clearest case).
+    // ------------------------------------------------------------------
+    let protected = protected
         .route("/claims", get(claims::list_claims))
         .route("/claims/:id", get(claims::get_claim))
         .route("/agents", get(agents::list_agents))
@@ -586,10 +591,6 @@ pub fn create_router(state: AppState) -> Router {
             get(crud::get_theme_embeddings),
         )
         .route("/api/v1/reasoning/analyze", post(reasoning::analyze))
-        .route(
-            "/api/v1/openapi.json",
-            get(|| async { axum::Json(crate::openapi::openapi_spec()) }),
-        )
         .route("/api/v1/events", get(events::list_events))
         .route(
             "/api/v1/graph/snapshot/:version",
@@ -777,25 +778,60 @@ pub fn create_router(state: AppState) -> Router {
         // Task management — read endpoints
         .route("/api/v1/tasks", get(tasks::list_tasks))
         .route("/api/v1/tasks/:id", get(tasks::get_task))
-        // MCP tool discovery — no auth required
+        // MCP tool discovery. Moved behind auth: the same catalog is
+        // available to an authenticated caller over MCP `list_tools`, so an
+        // anonymous copy only gave a scanner a free capability map.
         .route("/api/v1/mcp/tools", get(mcp_tools::list_mcp_tools));
 
-    // Inject authenticated identity on public reads (no 401 when absent;
-    // 401 on a present-but-invalid token). This makes auth_ctx AVAILABLE to
-    // every public read handler so partition-aware redaction
-    // (check_content_access) can trust it instead of the spoofable ?agent_id
-    // wire param. (A3, spec §7.2)
+    // Authentication for `protected`: OAuth2 Bearer, unconditionally.
     //
-    // NOTE: availability != adoption. As of A3 Tasks 4-7 the following read
-    // handlers now consume auth_ctx (deriving the requester from the
-    // authenticated agent_id, client_id fallback) instead of trusting the
-    // spoofable params.agent_id:
-    //   - claims::{get_claim,list_claims}                     (A3 Tasks 4-5)
-    //   - belief::{claims_by_belief,frame_claims_sorted}      (A3 Task 6)
-    //   - edges.rs read handlers + evidence_by_relationship   (A3 Task 7)
-    // The one remaining read handler still passing the spoofable
-    // params.agent_id (a live bypass until migrated) is:
-    //   - graph_query::execute_graph_query                    -> A3 Task 8
+    // This used to branch on `ApiConfig::require_signatures`, adding a
+    // `require_signature` (Ed25519 request-signing) layer when set. That
+    // middleware short-circuited on any request carrying an `AuthContext` and
+    // bearer auth ran first, so it was unreachable through this router; it has
+    // been deleted. `require_packet_signatures` survives under its new name and
+    // gates PAYLOAD-level packet signatures inside `routes/submit.rs`, which is
+    // a different mechanism at a different layer.
+    let protected = protected.layer(middleware::from_fn_with_state(
+        state.clone(),
+        bearer_auth_middleware,
+    ));
+
+    // The anonymous allowlist. Adding a route here is a security decision;
+    // `crates/epigraph-api/tests/public_router_allowlist.rs` fails the build
+    // until the allowlist in that test is updated to match, which forces the
+    // addition past a reviewer.
+    //
+    //   /health              — `health::health_check` takes no state and
+    //                          returns a static struct. Load balancers need it.
+    //   /api/v1/openapi.json — a static schema document.
+    //
+    // `/metrics` is NOT here: it moved off the public listener entirely to a
+    // separate internal listener bound by `bin/server.rs`
+    // (`EPIGRAPH_METRICS_ADDR`, default 127.0.0.1:9090). Prometheus exposition
+    // is an operational surface, not a public one.
+    //
+    // The `/oauth/*` and `/.well-known/*` router below is the third anonymous
+    // surface, and is anonymous by construction: discovery and token issuance
+    // must precede authentication.
+    let public = Router::new()
+        .route("/health", get(health::health_check))
+        .route(
+            "/api/v1/openapi.json",
+            get(|| async { axum::Json(crate::openapi::openapi_spec()) }),
+        );
+
+    // Layered on the two-route allowlist: a request with no Authorization
+    // header passes through, a request with a present-but-invalid token still
+    // 401s. Retained rather than dropped so an allowlisted handler can still
+    // see who is calling when a token happens to be supplied.
+    //
+    // The block that used to stand here catalogued which public read handlers
+    // had adopted `auth_ctx` for partition-aware redaction and which still
+    // trusted the spoofable `?agent_id` wire param. It is gone because the
+    // premise is gone: those handlers are no longer reachable without a
+    // credential at all. The remaining work — deriving a `Viewer` on every read
+    // path rather than an `Option<AuthContext>` — is PR-07.
     let public = public.layer(middleware::from_fn_with_state(
         state.clone(),
         optional_bearer_auth_middleware,
@@ -844,22 +880,30 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Create a router without database-dependent routes
-/// Used for testing and when db feature is disabled
+/// Create a router without database-dependent routes.
 ///
-/// # Route Structure
+/// # Status: not built in any supported configuration
 ///
-/// ## Protected Routes (require Ed25519 signature)
-/// - `POST /api/v1/submit/packet` - Submit an epistemic packet
+/// `epigraph-api`'s default feature set is `["db"]` and every CI job builds
+/// with defaults. `cargo check -p epigraph-api --no-default-features` has been
+/// failing for some time (28 pre-existing errors: missing `sqlx`, `db_pool`,
+/// `ClaimId`, …), so **no compiler checks this function**. It is kept in sync
+/// with the `db` variant by hand and by
+/// `crates/epigraph-api/tests/public_router_allowlist.rs`, which is a
+/// source-text lint precisely so that it covers the block nothing else does.
 ///
-/// ## Public Routes (no authentication required)
-/// - `GET /health` - Health check endpoint
-/// - `GET /api/v1/query/rag` - RAG context retrieval (high-truth claims)
+/// # Route structure
 ///
-/// # Rate Limiting
+/// Mirrors the `db` variant: `protected` (Bearer required), a two-route
+/// anonymous `public` allowlist (`GET /health`, `GET /api/v1/openapi.json`),
+/// and an `oauth` router — which here has **9** routes rather than 11, lacking
+/// `/oauth/callback` and `/oauth/authorize/consent`. That divergence is
+/// pre-existing and is asserted, not fixed, by the allowlist test.
 ///
-/// All routes (except health endpoints) are subject to rate limiting when
-/// a rate limiter is configured in AppState.
+/// # Rate limiting
+///
+/// All routes (except health endpoints) are subject to rate limiting when a
+/// rate limiter is configured in `AppState`.
 #[cfg(not(feature = "db"))]
 pub fn create_router(state: AppState) -> Router {
     // Protected write operations
@@ -1007,28 +1051,24 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/coalitions", post(political::create_coalition));
 
-    // Auth middleware: bearer first, then signature fallback (same as db variant)
-    let protected = if state.config.require_signatures {
-        protected
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                require_signature,
-            ))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                bearer_auth_middleware,
-            ))
-    } else {
-        protected.layer(middleware::from_fn_with_state(
-            state.clone(),
-            bearer_auth_middleware,
-        ))
-    };
-
-    // Public read operations
-    let public = Router::new()
-        .route("/health", get(health::health_check))
-        .route("/metrics", get(metrics::metrics_handler))
+    // ------------------------------------------------------------------
+    // PR-03: THE INVERSION.
+    //
+    // Everything from here to the end of this chain used to live in a
+    // separate `public` Router layered with `optional_bearer_auth_middleware`,
+    // which passes a request with no Authorization header straight through
+    // with no `AuthContext` ("anonymous pass-through", bearer.rs). That made
+    // every route below readable by anyone who could reach the port.
+    //
+    // The rule is not "audit N handlers" — it is invert the split. `public` is
+    // now an ALLOWLIST of two routes (built below); every other registration
+    // is appended to `protected` and inherits `bearer_auth_middleware`.
+    //
+    // Axum permits repeated `.route()` calls on the same path with different
+    // methods, so the GET arms folded in here merge with the PUT/DELETE arms
+    // already registered above (`/api/v1/claims/:id` is the clearest case).
+    // ------------------------------------------------------------------
+    let protected = protected
         .route("/api/v1/claims", get(claims_query::list_claims_query))
         .route("/api/v1/query/rag", get(rag::rag_context))
         .route("/api/v1/search/evidence", get(rag::search_evidence))
@@ -1077,10 +1117,6 @@ pub fn create_router(state: AppState) -> Router {
             get(crud::get_theme_embeddings),
         )
         .route("/api/v1/reasoning/analyze", post(reasoning::analyze))
-        .route(
-            "/api/v1/openapi.json",
-            get(|| async { axum::Json(crate::openapi::openapi_spec()) }),
-        )
         .route("/api/v1/events", get(events::list_events))
         .route(
             "/api/v1/graph/snapshot/:version",
@@ -1199,8 +1235,48 @@ pub fn create_router(state: AppState) -> Router {
             get(political::mirror_narratives),
         );
 
-    // Inject authenticated identity on public reads (no 401 when absent;
-    // 401 on a present-but-invalid token). (A3, spec §7.2)
+    // Authentication for `protected`: OAuth2 Bearer, unconditionally.
+    //
+    // This used to branch on `ApiConfig::require_signatures`, adding a
+    // `require_signature` (Ed25519 request-signing) layer when set. That
+    // middleware short-circuited on any request carrying an `AuthContext` and
+    // bearer auth ran first, so it was unreachable through this router; it has
+    // been deleted. `require_packet_signatures` survives under its new name and
+    // gates PAYLOAD-level packet signatures inside `routes/submit.rs`, which is
+    // a different mechanism at a different layer.
+    let protected = protected.layer(middleware::from_fn_with_state(
+        state.clone(),
+        bearer_auth_middleware,
+    ));
+
+    // The anonymous allowlist. Adding a route here is a security decision;
+    // `crates/epigraph-api/tests/public_router_allowlist.rs` fails the build
+    // until the allowlist in that test is updated to match, which forces the
+    // addition past a reviewer.
+    //
+    //   /health             — `health::health_check` takes no state and returns
+    //                         a static struct. Load balancers need it.
+    //   /api/v1/openapi.json — a static schema document.
+    //
+    // `/metrics` is NOT here: it moved off the public listener entirely to a
+    // separate internal listener bound by `bin/server.rs`
+    // (`EPIGRAPH_METRICS_ADDR`, default 127.0.0.1:9090). Prometheus exposition
+    // is an operational surface, not a public one.
+    //
+    // The `/oauth/*` and `/.well-known/*` router below is the third anonymous
+    // surface, and is anonymous by construction: discovery and token issuance
+    // must precede authentication.
+    let public = Router::new()
+        .route("/health", get(health::health_check))
+        .route(
+            "/api/v1/openapi.json",
+            get(|| async { axum::Json(crate::openapi::openapi_spec()) }),
+        );
+
+    // Layered on the two-route allowlist: a request with no Authorization
+    // header passes through, a request with a present-but-invalid token still
+    // 401s. Retained rather than dropped so an allowlisted handler can still
+    // see who is calling when a token happens to be supplied.
     let public = public.layer(middleware::from_fn_with_state(
         state.clone(),
         optional_bearer_auth_middleware,

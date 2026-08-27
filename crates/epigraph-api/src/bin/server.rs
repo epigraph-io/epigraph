@@ -175,13 +175,18 @@ async fn main() {
 
     // Configure API settings.
     //
-    // `require_signatures` enables a packet-signature gate on the write path
-    // (`/api/v1/submit/packet`) that currently fails closed because the
-    // Ed25519 verifier is still TODO in `routes/submit.rs`. Until that lands,
-    // make it env-driven so deployments can opt out and continue recording
-    // provenance via OAuth2 Bearer auth alone. Default off; flip to `1`/`true`
-    // to re-enable the gate once the verifier ships.
-    let require_signatures = std::env::var("EPIGRAPH_REQUIRE_SIGNATURES")
+    // `require_packet_signatures` enables the Ed25519 **payload** signature gate
+    // on `POST /api/v1/submit/packet`. The verifier is implemented
+    // (`routes/submit.rs:689` onwards, keyed on `agents.key_kind = 'ed25519'`),
+    // so turning this on rejects unsigned and badly-signed packets rather than
+    // failing closed on everything.
+    //
+    // The flag gates ONLY payload-level packet signatures. The old
+    // request-signing middleware (`middleware::require_signature`) was deleted;
+    // transport authentication is OAuth2 Bearer, unconditionally.
+    //
+    // The operator-facing env var name is deliberately unchanged.
+    let require_packet_signatures = std::env::var("EPIGRAPH_REQUIRE_SIGNATURES")
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
@@ -208,11 +213,40 @@ async fn main() {
     let allow_all_identities =
         std::env::var("EPIGRAPH_ALLOW_ALL_IDENTITIES").as_deref() == Ok("true");
     let config = ApiConfig {
-        require_signatures,
+        require_packet_signatures,
         max_request_size: 10 * 1024 * 1024, // 10MB — figure evidence carries base64 images
         public_base_url,
         allow_all_identities,
     };
+
+    // RFC 9728 resource-metadata URL, advertised in the `WWW-Authenticate`
+    // challenge on every 401.
+    //
+    // Defaults to the document this deployment already serves at
+    // `/.well-known/oauth-protected-resource`, derived from
+    // `EPIGRAPH_PUBLIC_BASE_URL`, so the URL named in the challenge and the URL
+    // that answers cannot drift. Override only when the metadata document is
+    // fronted by a different host.
+    //
+    // Fail fast rather than degrade: a value that cannot be embedded in a
+    // header (control characters, non-ASCII) would make every 401 silently drop
+    // the challenge, and a newline would let an operator inject a second
+    // header. Same shape as `epigraph-mcp`'s `--resource-metadata-url` check.
+    let resource_metadata_url = std::env::var("EPIGRAPH_RESOURCE_METADATA_URL")
+        .unwrap_or_else(|_| config.resource_metadata_url());
+    if let Err(e) = epigraph_api::errors::validate_resource_metadata_url(&resource_metadata_url) {
+        tracing::error!(
+            url = %resource_metadata_url,
+            error = %e,
+            "EPIGRAPH_RESOURCE_METADATA_URL is unusable; refusing to start"
+        );
+        std::process::exit(1);
+    }
+    epigraph_api::errors::init_resource_metadata_url(Some(resource_metadata_url.clone()));
+    tracing::info!(
+        resource_metadata_url = %resource_metadata_url,
+        "401 responses will advertise this resource-metadata URL"
+    );
 
     // Create embedding service for semantic search
     let embedding_service = create_embedding_service();
@@ -399,7 +433,53 @@ async fn main() {
 
     // Build router with all routes
     let metrics = Arc::new(Metrics::new());
-    let app = create_router(state).layer(axum::Extension(metrics));
+    let app = create_router(state).layer(axum::Extension(metrics.clone()));
+
+    // ---------------------------------------------------------------------
+    // Internal metrics listener (PR-03, §10.3 Q1 option (a)).
+    //
+    // `/metrics` no longer exists on the application router. Prometheus text
+    // exposition is an operational surface: it enumerates counters that
+    // describe corpus activity, and with the application router now
+    // authenticated by default, leaving one unauthenticated route open to the
+    // internet would be the single exception that swallows the rule.
+    //
+    // It binds to 127.0.0.1 by default, so a scraper must be on the host or
+    // inside the network namespace. Set EPIGRAPH_METRICS_ADDR to widen it
+    // deliberately (e.g. "0.0.0.0:9090" inside a private network).
+    //
+    // SPAWNED HERE ON PURPOSE — before the `#[cfg(feature = "tls")]` block
+    // below, which `return`s from `main` when TLS is configured. Spawning after
+    // it would leave every TLS deployment with no metrics at all, and the
+    // failure would be silent.
+    //
+    // A bind failure is a warning, not an abort: losing metrics must not take
+    // the API down with it. It is logged loudly enough to alert on.
+    let metrics_addr =
+        std::env::var("EPIGRAPH_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
+    match tokio::net::TcpListener::bind(&metrics_addr).await {
+        Ok(metrics_listener) => {
+            tracing::info!(
+                addr = %metrics_addr,
+                "Internal metrics listener started — update the Prometheus \
+                 scrape target: /metrics is no longer on the application port"
+            );
+            let metrics_app = epigraph_api::metrics::metrics_router(metrics);
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
+                    tracing::error!(error = %e, "Internal metrics listener stopped");
+                }
+            });
+        }
+        Err(e) => {
+            tracing::error!(
+                addr = %metrics_addr,
+                error = %e,
+                "Failed to bind the internal metrics listener; metrics will not \
+                 be scrapeable. The API continues to serve."
+            );
+        }
+    }
 
     // Bind to address. EPIGRAPH_PORT env var allows side-by-side test runs.
     let port: u16 = std::env::var("EPIGRAPH_PORT")

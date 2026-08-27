@@ -1,6 +1,11 @@
 //! Administrative endpoints for system health and diagnostics
 //!
-//! GET /api/v1/admin/stats - Comprehensive system statistics (public)
+//! GET /api/v1/admin/stats - Comprehensive system statistics
+//!
+//! Requires a Bearer token since PR-03. It was on the anonymous router until
+//! then, which meant the deployment's DAG size, challenge volume, cache
+//! occupancy, webhook count and config were readable by anyone who could reach
+//! the port.
 //!
 //! This endpoint aggregates operational metrics from all major subsystems:
 //! - Event bus (subscriber count, history size)
@@ -97,8 +102,16 @@ pub struct WebhookStats {
 /// Exposes non-sensitive configuration values for diagnostics.
 #[derive(Debug, Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct ConfigSummary {
-    /// Whether Ed25519 signature verification is required for write operations
-    pub require_signatures: bool,
+    /// Whether Ed25519 **packet** signature verification is required on
+    /// `POST /api/v1/submit/packet`.
+    ///
+    /// The Rust field was renamed from `require_signatures` when
+    /// `ApiConfig::require_signatures` became `require_packet_signatures`
+    /// (the old name was ambiguous once the request-signing middleware was
+    /// deleted). The wire name is pinned by `#[serde(rename)]` so neither the
+    /// JSON body of `GET /api/v1/admin/stats` nor the utoipa schema changes.
+    #[serde(rename = "require_signatures")]
+    pub require_packet_signatures: bool,
     /// Maximum request body size in bytes
     pub max_request_size: usize,
 }
@@ -112,8 +125,11 @@ pub struct ConfigSummary {
 /// GET /api/v1/admin/stats
 ///
 /// Returns a JSON snapshot of operational metrics from all major subsystems.
-/// This endpoint is public (no authentication required) to support monitoring
-/// tools and health dashboards.
+///
+/// Registered on the PROTECTED router (PR-03): a monitoring tool or dashboard
+/// must present a Bearer token. Unauthenticated Prometheus scraping is served
+/// instead by the separate internal `/metrics` listener that `bin/server.rs`
+/// binds, which is what a scraper should have been using anyway.
 ///
 /// # Response
 ///
@@ -168,7 +184,7 @@ pub async fn system_stats(State(state): State<AppState>) -> Json<SystemStats> {
 
     // Configuration summary (no lock - ApiConfig is cloned)
     let config = ConfigSummary {
-        require_signatures: state.config.require_signatures,
+        require_packet_signatures: state.config.require_packet_signatures,
         max_request_size: state.config.max_request_size,
     };
 
@@ -574,6 +590,14 @@ mod db_tests {
     }
 }
 
+// NOT COMPILED, NOT RUN. `epigraph-api`'s default features are `["db"]` and
+// the `not(feature = "db")` configuration has 28 pre-existing compile errors
+// (`routes/admin.rs`'s `ApiConfig` literal alone omits `allow_all_identities`),
+// so `cargo test -p epigraph-api --lib -- --list` names none of the tests
+// below. PR-03's `OK -> UNAUTHORIZED` flips in here are DOCUMENTATION of the
+// intended behaviour, not coverage of it. The behaviour is actually asserted
+// by `tests/public_router_allowlist.rs`, which probes every route on the
+// `protected` chain of the buildable variant.
 #[cfg(all(test, not(feature = "db")))]
 mod tests {
     use super::*;
@@ -651,15 +675,15 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
         let stats: SystemStats = parse_body(response).await;
 
-        // Default ApiConfig has require_signatures = false and max_request_size = 10MB
-        assert!(!stats.config.require_signatures);
+        // Default ApiConfig has require_packet_signatures = false and max_request_size = 10MB
+        assert!(!stats.config.require_packet_signatures);
         assert_eq!(stats.config.max_request_size, 10 * 1024 * 1024);
     }
 
     #[tokio::test]
     async fn test_system_stats_custom_config() {
         let state = AppState::new(ApiConfig {
-            require_signatures: true,
+            require_packet_signatures: true,
             max_request_size: 2048,
             public_base_url: "http://localhost:8080".to_string(),
         });
@@ -673,7 +697,7 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
         let stats: SystemStats = parse_body(response).await;
 
-        assert!(stats.config.require_signatures);
+        assert!(stats.config.require_packet_signatures);
         assert_eq!(stats.config.max_request_size, 2048);
     }
 
@@ -848,11 +872,17 @@ mod tests {
         assert!(propagation.get("dag_edge_count").is_some());
     }
 
-    /// Test that admin stats endpoint is accessible through the full application
-    /// router created by `create_router()`, including the rate-limiting and
-    /// middleware layers.
+    /// PR-03 INVERSION. This asserted that `GET /api/v1/admin/stats` was
+    /// reachable "as a public endpoint through the full router". It reports DAG
+    /// node and edge counts, challenge totals, cache sizes, webhook counts and
+    /// the config summary — an operational fingerprint of the whole deployment,
+    /// under a path literally spelled `/admin/`.
+    ///
+    /// The handler's response shape is still asserted by
+    /// `test_system_stats_json_structure` and friends above, which drive
+    /// `test_router()` directly.
     #[tokio::test]
-    async fn test_system_stats_via_full_router() {
+    async fn test_system_stats_via_full_router_is_401() {
         let state = AppState::new(ApiConfig::default());
         let router = crate::routes::create_router(state);
 
@@ -864,14 +894,19 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::OK,
-            "Admin stats should be accessible as a public endpoint through the full router"
+            StatusCode::UNAUTHORIZED,
+            "admin stats is no longer anonymously readable"
         );
-
-        let stats: SystemStats = parse_body(response).await;
-        // Verify the response is structurally valid from the full router path
-        assert_eq!(stats.propagation.dag_node_count, 0);
-        assert_eq!(stats.challenges.total_challenges, 0);
+        let challenge = response
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .expect("401 carries an RFC 6750 challenge")
+            .to_str()
+            .unwrap();
+        assert!(
+            challenge.contains(r#"error="invalid_token""#),
+            "got: {challenge}"
+        );
     }
 
     /// Test that stats reflect correct state after mutations: submitting a claim

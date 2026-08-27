@@ -102,7 +102,7 @@ impl SubmissionService {
         Self::validate_trace_inputs(packet)?;
 
         // 8. Validate signature (if required)
-        if config.require_signatures {
+        if config.require_packet_signatures {
             Self::validate_signature(packet)?;
         }
 

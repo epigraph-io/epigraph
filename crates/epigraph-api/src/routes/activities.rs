@@ -1,8 +1,11 @@
 //! Activity management API for PROV-O provenance tracking
 //!
-//! - `POST /api/v1/activities` — Create a new activity (protected)
-//! - `GET /api/v1/activities/:id` — Get an activity by ID (public)
-//! - `PUT /api/v1/activities/:id/complete` — Mark an activity as completed (protected)
+//! - `POST /api/v1/activities` — Create a new activity
+//! - `GET /api/v1/activities/:id` — Get an activity by ID
+//! - `PUT /api/v1/activities/:id/complete` — Mark an activity as completed
+//!
+//! All three are on the `protected` router and require a Bearer token; the
+//! `GET` was anonymous until PR-03's router inversion.
 
 use crate::errors::ApiError;
 use crate::state::AppState;

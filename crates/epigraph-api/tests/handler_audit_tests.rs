@@ -31,7 +31,7 @@ fn create_test_state() -> AppState {
         std::env::set_var("DATABASE_URL", "postgres://test:test@localhost:5432/test");
     }
     AppState::new(ApiConfig {
-        require_signatures: false,
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()

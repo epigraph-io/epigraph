@@ -301,8 +301,12 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
 #[cfg(feature = "db")]
 pub async fn create_claim(
     State(state): State<AppState>,
+    // Still `Option<Extension<..>>` rather than a required extractor: PR-07
+    // replaces the whole `Option<AuthContext>` idiom with `ViewerExtractor`
+    // across all 39 sites at once. Until then the handler rejects `None`
+    // explicitly below rather than falling open, which is the behavioural half
+    // of that change without the mechanical half.
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
-    verified_agent: Option<axum::Extension<crate::middleware::auth::VerifiedAgent>>,
     Json(request): Json<CreateClaimRequest>,
 ) -> Result<Json<ClaimResponse>, ApiError> {
     // Enforce scope when OAuth2-authenticated
@@ -398,23 +402,49 @@ pub async fn create_claim(
         reason: "Truth value must be between 0.0 and 1.0".to_string(),
     })?;
 
-    // Resolve public key: OAuth2 AuthContext → legacy VerifiedAgent → zero fallback
-    let public_key = if let Some(axum::Extension(ctx)) = &auth_ctx {
-        if let Some(agent_id) = ctx.agent_id {
-            epigraph_db::AgentRepository::get_by_id(&state.db_pool, AgentId::from_uuid(agent_id))
-                .await
-                .ok()
-                .flatten()
-                .map(|a| a.public_key)
-                .unwrap_or([0u8; 32])
-        } else {
-            [0u8; 32]
-        }
-    } else if let Some(axum::Extension(va)) = &verified_agent {
-        va.public_key
-    } else {
-        [0u8; 32]
+    // Resolve the author's public key from the OAuth2 AuthContext. One source,
+    // no fallbacks.
+    //
+    // This chain used to have three more arms, each of which produced a claim
+    // whose recorded author key was a lie:
+    //
+    //   * `verified_agent.public_key` — the legacy Ed25519 request-signing
+    //     path. Its only writer (`middleware::require_signature`) is deleted.
+    //   * `[0u8; 32]` when the token carried no `agent_id`.
+    //   * `[0u8; 32]` when there was no credential at all.
+    //
+    // and a fourth that survived unremarked: `.unwrap_or([0u8; 32])` when the
+    // `agent_id` named no row in `agents`. A zero public key is precisely the
+    // served-with-no-principal shape this PR exists to remove — it is a valid
+    // 32-byte value that no private key can ever sign for, so a claim carrying
+    // one is permanently unverifiable and indistinguishable from every other
+    // such claim.
+    //
+    // Every arm now resolves to 401. That is the right code rather than 403 or
+    // 500 in all three cases: no credential, a credential with no principal,
+    // and a credential naming a principal that does not exist are all "re-mint
+    // your token", which is what RFC 6750 `invalid_token` means.
+    let Some(axum::Extension(ctx)) = &auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required to create a claim".to_string(),
+        });
     };
+    let Some(author_agent_id) = ctx.agent_id else {
+        return Err(ApiError::Unauthorized {
+            reason: "token carries no agent_id; re-authenticate to obtain a \
+                     token bound to a principal"
+                .to_string(),
+        });
+    };
+    let public_key = epigraph_db::AgentRepository::get_by_id(
+        &state.db_pool,
+        AgentId::from_uuid(author_agent_id),
+    )
+    .await?
+    .ok_or_else(|| ApiError::Unauthorized {
+        reason: format!("token names agent {author_agent_id}, which does not exist"),
+    })?
+    .public_key;
 
     // For fully_private tier, override content to "[private]" (spec §5)
     let content_for_db = if privacy_tier == "fully_private" {
@@ -423,6 +453,31 @@ pub async fn create_claim(
         request.content.clone()
     };
 
+    // KNOWN AND DELIBERATELY UNCHANGED HERE: `claims.agent_id` comes from the
+    // request BODY while `claims.public_key` comes from the TOKEN, so a caller
+    // can record `(agent_id = X, public_key = key(Y))` — a pairing that looks
+    // like a well-formed attribution to X but carries Y's key.
+    //
+    // This decoupling is older than PR-03: the pre-existing chain also read the
+    // key from `ctx.agent_id` and the author from `request.agent_id`. PR-03
+    // strictly reduces the number of lying shapes (it deletes the four
+    // `[0u8; 32]` arms); it does not introduce this one and does not close it.
+    //
+    // Closing it is a wire-behaviour change with an in-repo consumer:
+    // `crates/epigraph-cli/src/bin/decompose_claims.rs:243` posts atoms with
+    // `agent_id = parent_agent_id` — the *parent claim's* author, not its own
+    // principal — and it holds an opaque `EPIGRAPH_TOKEN` from which it cannot
+    // learn its own agent id. Rejecting the mismatch here (403) breaks it with
+    // no client-side remedy; silently overriding the field changes what that
+    // tool records without telling it. Either is a decision about delegated
+    // authorship, which is what `ownership` and the `Viewer` write half are
+    // for, and it belongs with them rather than smuggled into a router
+    // inversion.
+    //
+    // Until then: the body's `agent_id` is NOT a credential and never was, and
+    // nothing downstream may treat it as one. What PR-03 does guarantee is that
+    // the *key* is now always a real agent's key, resolved from an
+    // authenticated principal.
     let claim = if let Some(trace_uuid) = request.trace_id {
         Claim::new_with_trace(
             content_for_db,
@@ -1139,9 +1194,18 @@ pub struct NeedingEmbeddingsQuery {
 ///
 /// Returns claims with NULL embeddings for the caller to process
 /// through an embedding service and write back.
+///
+/// # Authorization
+///
+/// Requires `claims:admin`. This is a **maintenance** endpoint: it enumerates
+/// claim ids AND raw content corpus-wide, ordered by an internal invariant
+/// (which rows the embedder has not reached yet), and it sat in the anonymous
+/// router until PR-03. `claims:read` is not enough — the result set is a
+/// worklist for an operator's backfill job, not a query anyone would ask.
 #[cfg(feature = "db")]
 pub async fn find_claims_needing_embeddings(
     State(state): State<AppState>,
+    _admin: crate::middleware::bearer::RequireScopeAdmin,
     Query(params): Query<NeedingEmbeddingsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = params.limit.unwrap_or(100).min(500);
@@ -1162,6 +1226,7 @@ pub async fn find_claims_needing_embeddings(
 #[cfg(not(feature = "db"))]
 pub async fn find_claims_needing_embeddings(
     State(_state): State<AppState>,
+    _admin: crate::middleware::bearer::RequireScopeAdmin,
     Query(_params): Query<NeedingEmbeddingsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(serde_json::json!({
@@ -2301,7 +2366,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2350,7 +2415,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2394,7 +2459,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2461,7 +2526,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2506,7 +2571,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2559,7 +2624,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2603,7 +2668,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2629,7 +2694,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2672,7 +2737,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2703,7 +2768,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2733,7 +2798,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2772,7 +2837,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );

@@ -250,7 +250,7 @@ fn create_multi_evidence_packet(agent_id: Uuid, evidence_count: usize) -> Episte
 /// DB persistence logic without auth ceremony.
 fn create_test_router(pool: PgPool) -> Router {
     let config = ApiConfig {
-        require_signatures: false,
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()

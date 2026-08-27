@@ -73,7 +73,7 @@ async fn agent_create_or_get_is_idempotent_on_public_key(pool: PgPool) {
 /// `submit_persistence_tests::create_test_router`.
 fn create_test_router(pool: PgPool) -> Router {
     let config = ApiConfig {
-        require_signatures: false,
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()
@@ -644,7 +644,7 @@ async fn submit_packet_dedup_onto_null_trace_claim_returns_null_trace(pool: PgPo
 /// vacuously — even unfixed.
 fn create_test_router_with_embedder(pool: PgPool) -> Router {
     let config = ApiConfig {
-        require_signatures: false,
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()

@@ -4,6 +4,22 @@
 //! value must be ignored. Tests go through spawn_app → build_app_for_tests →
 //! create_router (the production middleware layering); a handler-unit test
 //! that hand-passes auth_ctx cannot catch this bug (spec §7.3).
+//!
+//! # PR-03: the anonymous halves became 401 halves, and did NOT just disappear
+//!
+//! Every route this file exercises moved from the anonymous `public` router to
+//! `protected`, so an unauthenticated request now 401s before it reaches a
+//! handler. The `*_no_token_spoofed_owner_*` tests were written to prove that a
+//! caller passing `?agent_id=<owner>` cannot thereby read the owner's private
+//! content — and that property still has to hold, for a caller who IS
+//! authenticated as somebody else.
+//!
+//! So each of those tests was converted rather than deleted: it now asserts
+//! BOTH that the anonymous request is refused (401 + an RFC 6750 challenge) AND
+//! that a STRANGER'S token with the same spoofed `?agent_id` still gets
+//! `[REDACTED]`. Replacing the anonymous request with nothing would have
+//! removed the only coverage of partition redaction on nine routes; replacing
+//! it with an owner token would have inverted the assertion it was making.
 mod common;
 
 use sqlx::postgres::PgPoolOptions;
@@ -52,6 +68,41 @@ async fn pool_and_app() -> (
     (pool, addr, shutdown)
 }
 
+/// Assert a response is the PR-03 refusal: 401 plus the RFC 6750 challenge a
+/// client needs in order to discover where to authenticate.
+async fn assert_401_with_challenge(resp: reqwest::Response, what: &str) {
+    assert_eq!(
+        resp.status(),
+        401,
+        "{what}: this route moved to the protected router in PR-03; an \
+         unauthenticated request must be refused"
+    );
+    let challenge = resp
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .unwrap_or_else(|| panic!("{what}: 401 with no WWW-Authenticate header"))
+        .to_str()
+        .expect("challenge is ASCII")
+        .to_string();
+    assert!(
+        challenge.contains(r#"error="invalid_token""#),
+        "{what}: challenge lacks error=\"invalid_token\": {challenge}"
+    );
+}
+
+/// Anonymous GET of `url` must be refused.
+async fn assert_anonymous_get_401(url: &str) {
+    let resp = reqwest::Client::new().get(url).send().await.unwrap();
+    assert_401_with_challenge(resp, url).await;
+}
+
+/// A token for somebody who is NOT the owner. This is what the
+/// `*_no_token_spoofed_owner_*` tests use now: the spoof they guard against is
+/// still reachable, just by an authenticated stranger rather than by nobody.
+fn stranger_token() -> String {
+    common::mint_token_with_agent(&["claims:read"], Uuid::new_v4())
+}
+
 /// Extract the `content` field from a get_claim JSON response.
 fn content_of(v: &serde_json::Value) -> String {
     v.get("content")
@@ -60,33 +111,18 @@ fn content_of(v: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// DISCRIMINATING REGRESSION: no token + ?agent_id=<owner_uuid> (spoof) must
-/// redact. Pre-fix: handler trusts params.agent_id == owner → returns full
-/// content. Post-fix: requester is None (no auth) → Redacted.
+/// PR-03: the spoof is no longer reachable without a credential at all — the
+/// route left the anonymous router. The spoof-redaction property itself is
+/// still asserted, one test below, against a STRANGER'S token.
 #[tokio::test(flavor = "multi_thread")]
-async fn get_claim_no_token_spoofed_owner_is_redacted() {
+async fn get_claim_anonymous_spoofed_owner_is_401() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
     let claim_id =
         common::seed_claim_with_agent(&pool, "TOP SECRET private claim body", owner).await;
     common::seed_private_ownership(&pool, claim_id, owner).await;
 
-    let resp = reqwest::Client::new()
-        .get(format!("http://{addr}/claims/{claim_id}?agent_id={owner}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "private claim still returns 200, just redacted"
-    );
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(
-        content_of(&body),
-        "[REDACTED]",
-        "no-token spoof of owner agent_id must NOT reveal private content"
-    );
+    assert_anonymous_get_401(&format!("http://{addr}/claims/{claim_id}?agent_id={owner}")).await;
 }
 
 /// Stranger token + spoofed ?agent_id=<owner> → still redacted.
@@ -137,24 +173,26 @@ async fn get_claim_owner_token_ignores_wire_param_and_sees_full() {
     );
 }
 
-/// Non-regression: anonymous GET of a public / ownership-less claim returns
-/// 200 + full content (optional-bearer did not turn public reads into 401s).
+/// PR-03 INVERSION. This test used to assert the opposite: that an anonymous
+/// GET of an ownership-less claim returned 200 with full content, on the
+/// grounds that a claim nobody has claimed is a claim anybody may read.
+///
+/// That reasoning does not survive contact with the corpus. "No `ownership`
+/// row" is the default state of a claim, not a declaration that it is public —
+/// the overwhelming majority of rows are in it by omission, not by intent. An
+/// anonymous reader who could enumerate them had the corpus.
 #[tokio::test(flavor = "multi_thread")]
-async fn get_claim_anonymous_public_claim_is_full() {
+async fn get_claim_anonymous_is_401() {
     let (pool, addr, _shutdown) = pool_and_app().await;
-    let claim_id = common::seed_claim(&pool, "public ownership-less claim body").await;
+    let claim_id = common::seed_claim(&pool, "ownership-less claim body").await;
 
-    let resp = reqwest::Client::new()
-        .get(format!("http://{addr}/claims/{claim_id}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(content_of(&body), "public ownership-less claim body");
+    assert_anonymous_get_401(&format!("http://{addr}/claims/{claim_id}")).await;
 }
 
-/// Invalid Bearer token on a public read → 401 (spec §7.4 default).
+/// Present-but-invalid Bearer token → 401. Unchanged by PR-03:
+/// `bearer_auth_middleware` rejects a malformed token in exactly the same place
+/// `optional_bearer_auth_middleware` did, so this asserts the same thing it
+/// always did — only the reason a credential-less request also 401s has moved.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_claim_invalid_token_is_401() {
     let (pool, addr, _shutdown) = pool_and_app().await;
@@ -166,11 +204,7 @@ async fn get_claim_invalid_token_is_401() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        401,
-        "present-but-invalid Bearer must 401 even on a public read"
-    );
+    assert_eq!(resp.status(), 401, "present-but-invalid Bearer must 401");
 }
 
 /// list_claims (GET /claims) must redact a private claim's content for a
@@ -178,13 +212,24 @@ async fn get_claim_invalid_token_is_401() {
 /// `search` so the freshly-seeded claim is the only match, avoiding paging
 /// flakiness on a shared test DB.
 #[tokio::test(flavor = "multi_thread")]
-async fn list_claims_no_token_spoofed_owner_is_redacted() {
+async fn list_claims_stranger_token_spoofed_owner_is_redacted() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
     let secret = format!("LIST private secret body {}", Uuid::new_v4());
     let claim_id = common::seed_claim_with_agent(&pool, &secret, owner).await;
     common::seed_private_ownership(&pool, claim_id, owner).await;
 
+    // Anonymous: refused outright.
+    let anon = reqwest::Client::new()
+        .get(format!("http://{addr}/claims"))
+        .query(&[("limit", "100"), ("search", secret.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_401_with_challenge(anon, "GET /claims").await;
+
+    // Authenticated stranger spoofing ?agent_id=<owner>: reaches the handler,
+    // and must still be redacted.
     let resp = reqwest::Client::new()
         .get(format!("http://{addr}/claims"))
         .query(&[
@@ -192,6 +237,7 @@ async fn list_claims_no_token_spoofed_owner_is_redacted() {
             ("agent_id", owner.to_string().as_str()),
             ("search", secret.as_str()),
         ])
+        .bearer_auth(stranger_token())
         .send()
         .await
         .unwrap();
@@ -208,7 +254,7 @@ async fn list_claims_no_token_spoofed_owner_is_redacted() {
     assert_eq!(
         content_of(found),
         "[REDACTED]",
-        "no-token spoof must not reveal private content in list_claims"
+        "stranger token spoofing ?agent_id=<owner> must not reveal private content in list_claims"
     );
 }
 
@@ -221,7 +267,7 @@ async fn list_claims_no_token_spoofed_owner_is_redacted() {
 /// <= max) still applies even with frame_id narrowing, and NULL >= 0.0 is
 /// falsy, so we must set belief/plausibility explicitly for the row to return.
 #[tokio::test(flavor = "multi_thread")]
-async fn claims_by_belief_no_token_spoofed_owner_is_redacted() {
+async fn claims_by_belief_stranger_token_spoofed_owner_is_redacted() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
     let claim_id = common::seed_claim_with_agent(&pool, "BELIEF private secret body", owner).await;
@@ -233,10 +279,14 @@ async fn claims_by_belief_no_token_spoofed_owner_is_redacted() {
     let frame_id = common::seed_frame_with_claim(&pool, claim_id).await;
     common::seed_private_ownership(&pool, claim_id, owner).await;
 
+    let url = format!(
+        "http://{addr}/api/v1/claims/by-belief?min_belief=0.0&max_plausibility=1.0&limit=100&frame_id={frame_id}&agent_id={owner}"
+    );
+    assert_anonymous_get_401(&url).await;
+
     let resp = reqwest::Client::new()
-        .get(format!(
-            "http://{addr}/api/v1/claims/by-belief?min_belief=0.0&max_plausibility=1.0&limit=100&frame_id={frame_id}&agent_id={owner}"
-        ))
+        .get(&url)
+        .bearer_auth(stranger_token())
         .send()
         .await
         .unwrap();
@@ -250,7 +300,7 @@ async fn claims_by_belief_no_token_spoofed_owner_is_redacted() {
     assert_eq!(
         content_of(found),
         "[REDACTED]",
-        "no-token spoof of owner agent_id must NOT reveal private content in claims_by_belief"
+        "stranger token spoofing ?agent_id=<owner> must NOT reveal private content in claims_by_belief"
     );
 }
 
@@ -303,17 +353,19 @@ async fn claims_by_belief_owner_token_ignores_wire_param_and_sees_full() {
 /// redacted. Without this guard the exact spoof bypass could be reintroduced in
 /// frame_claims_sorted and nothing would catch it.
 #[tokio::test(flavor = "multi_thread")]
-async fn frame_claims_sorted_no_token_spoofed_owner_is_redacted() {
+async fn frame_claims_sorted_stranger_token_spoofed_owner_is_redacted() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
     let claim_id = common::seed_claim_with_agent(&pool, "FRAME private secret body", owner).await;
     let frame_id = common::seed_frame_with_claim(&pool, claim_id).await;
     common::seed_private_ownership(&pool, claim_id, owner).await;
 
+    let url = format!("http://{addr}/api/v1/frames/{frame_id}/claims?limit=100&agent_id={owner}");
+    assert_anonymous_get_401(&url).await;
+
     let resp = reqwest::Client::new()
-        .get(format!(
-            "http://{addr}/api/v1/frames/{frame_id}/claims?limit=100&agent_id={owner}"
-        ))
+        .get(&url)
+        .bearer_auth(stranger_token())
         .send()
         .await
         .unwrap();
@@ -329,7 +381,7 @@ async fn frame_claims_sorted_no_token_spoofed_owner_is_redacted() {
     assert_eq!(
         content_of(found),
         "[REDACTED]",
-        "no-token spoof of owner agent_id must NOT reveal private content in frame_claims_sorted"
+        "stranger token spoofing ?agent_id=<owner> must NOT reveal private content in frame_claims_sorted"
     );
 }
 
@@ -374,7 +426,7 @@ async fn frame_claims_sorted_owner_token_ignores_wire_param_and_sees_full() {
 /// "[REDACTED]" when the requester lacks access. No-token spoof of the owner
 /// agent_id must still redact.
 #[tokio::test(flavor = "multi_thread")]
-async fn claim_provenance_no_token_spoofed_owner_is_redacted() {
+async fn claim_provenance_stranger_token_spoofed_owner_is_redacted() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
     let claim_id = common::seed_claim_with_agent(&pool, "PROV private secret body", owner).await;
@@ -414,10 +466,12 @@ async fn claim_provenance_no_token_spoofed_owner_is_redacted() {
     )
     .await;
 
+    let url = format!("http://{addr}/api/v1/claims/{claim_id}/provenance?agent_id={owner}");
+    assert_anonymous_get_401(&url).await;
+
     let resp = reqwest::Client::new()
-        .get(format!(
-            "http://{addr}/api/v1/claims/{claim_id}/provenance?agent_id={owner}"
-        ))
+        .get(&url)
+        .bearer_auth(stranger_token())
         .send()
         .await
         .unwrap();
@@ -557,7 +611,7 @@ async fn claim_provenance_owner_token_ignores_wire_param_and_sees_full() {
 /// token (even with a random wire agent_id) must see it. The two halves together
 /// prove the decision is token-driven, not wire-param-driven.
 #[tokio::test(flavor = "multi_thread")]
-async fn list_edges_no_token_spoofed_owner_omits_private_edge() {
+async fn list_edges_stranger_token_spoofed_owner_omits_private_edge() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
     let claim_id = common::seed_claim_with_agent(&pool, "EDGE private secret body", owner).await;
@@ -597,15 +651,24 @@ async fn list_edges_no_token_spoofed_owner_omits_private_edge() {
         "http://{addr}/api/v1/edges?source_id={claim_id}&source_type=claim&agent_id={owner}"
     );
 
-    // No-token spoof of the owner agent_id: source claim is redacted → edge omitted.
-    let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+    // Anonymous: refused before the handler runs.
+    assert_anonymous_get_401(&url).await;
+
+    // Stranger token spoofing the owner agent_id: source claim is redacted →
+    // edge omitted.
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(stranger_token())
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let edges: serde_json::Value = resp.json().await.unwrap();
     let arr = edges.as_array().expect("array of edges");
     assert!(
         !arr.iter()
             .any(|e| e.get("id").and_then(|v| v.as_str()) == Some(edge_id.to_string().as_str())),
-        "no-token spoof of owner agent_id must NOT see an edge whose source claim is private"
+        "stranger token spoofing ?agent_id=<owner> must NOT see an edge whose source claim is private"
     );
 
     // Owner token (with a RANDOM spoofed wire agent_id) → source claim is Full → edge present.
@@ -643,7 +706,7 @@ async fn list_edges_no_token_spoofed_owner_omits_private_edge() {
 /// test's claim->evidence DERIVED_FROM edge — so this seeding is what makes the
 /// query return a row at all.
 #[tokio::test(flavor = "multi_thread")]
-async fn supporting_evidence_no_token_spoofed_owner_sees_empty_owner_sees_evidence() {
+async fn supporting_evidence_stranger_token_spoofed_owner_sees_empty_owner_sees_evidence() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
     let claim_id = common::seed_claim_with_agent(&pool, "SUPEV private secret body", owner).await;
@@ -680,11 +743,14 @@ async fn supporting_evidence_no_token_spoofed_owner_sees_empty_owner_sees_eviden
     )
     .await;
 
-    // No-token spoof of the owner agent_id: claim is redacted → empty list.
+    let url =
+        format!("http://{addr}/api/v1/claims/{claim_id}/supporting-evidence?agent_id={owner}");
+    assert_anonymous_get_401(&url).await;
+
+    // Stranger token spoofing the owner agent_id: claim is redacted → empty list.
     let resp = reqwest::Client::new()
-        .get(format!(
-            "http://{addr}/api/v1/claims/{claim_id}/supporting-evidence?agent_id={owner}"
-        ))
+        .get(&url)
+        .bearer_auth(stranger_token())
         .send()
         .await
         .unwrap();
@@ -693,7 +759,7 @@ async fn supporting_evidence_no_token_spoofed_owner_sees_empty_owner_sees_eviden
     assert_eq!(
         body.get("total").and_then(|t| t.as_u64()),
         Some(0),
-        "no-token spoof of owner agent_id must NOT see evidence for a private claim"
+        "stranger token spoofing ?agent_id=<owner> must NOT see evidence for a private claim"
     );
     let ev = body
         .get("evidence")
@@ -747,7 +813,7 @@ async fn supporting_evidence_no_token_spoofed_owner_sees_empty_owner_sees_eviden
 /// caption/source_url assertions are the ones that fail on pre-fix code (which
 /// emitted them ungated) — the owner half proves they are present to begin with.
 #[tokio::test(flavor = "multi_thread")]
-async fn get_evidence_no_token_spoofed_owner_redacts_content_caption_and_url() {
+async fn get_evidence_stranger_token_spoofed_owner_redacts_content_caption_and_url() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
     let claim_id = common::seed_claim_with_agent(&pool, "GETEV private secret body", owner).await;
@@ -786,12 +852,14 @@ async fn get_evidence_no_token_spoofed_owner_redacts_content_caption_and_url() {
     )
     .await;
 
-    // No-token spoof of the owner agent_id: claim redacted → content, caption,
-    // and source_url all gated.
+    let url = format!("http://{addr}/api/v1/evidence/{evidence_id}?agent_id={owner}");
+    assert_anonymous_get_401(&url).await;
+
+    // Stranger token spoofing the owner agent_id: claim redacted → content,
+    // caption, and source_url all gated.
     let resp = reqwest::Client::new()
-        .get(format!(
-            "http://{addr}/api/v1/evidence/{evidence_id}?agent_id={owner}"
-        ))
+        .get(&url)
+        .bearer_auth(stranger_token())
         .send()
         .await
         .unwrap();
@@ -800,7 +868,7 @@ async fn get_evidence_no_token_spoofed_owner_redacts_content_caption_and_url() {
     assert_eq!(
         body.get("content").and_then(|c| c.as_str()),
         Some("[REDACTED]"),
-        "no-token spoof must not reveal evidence content for a private claim"
+        "stranger token spoofing ?agent_id=<owner> must not reveal evidence content for a private claim"
     );
     assert!(
         body.get("caption").and_then(|c| c.as_str()).is_none(),
@@ -851,7 +919,7 @@ async fn get_evidence_no_token_spoofed_owner_redacts_content_caption_and_url() {
 /// "node is actually present" proof (graph_full pulls nodes from the 2000 most
 /// recent edges, so a freshly-seeded edge guarantees inclusion).
 #[tokio::test(flavor = "multi_thread")]
-async fn graph_full_no_token_spoofed_owner_redacts_node_label() {
+async fn graph_full_stranger_token_spoofed_owner_redacts_node_label() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
     let claim_id =
@@ -875,9 +943,13 @@ async fn graph_full_no_token_spoofed_owner_redacts_node_label() {
             })
     };
 
-    // No-token spoof of the owner agent_id: node label redacted.
+    let url = format!("http://{addr}/api/v1/graph/full?agent_id={owner}");
+    assert_anonymous_get_401(&url).await;
+
+    // Stranger token spoofing the owner agent_id: node label redacted.
     let resp = reqwest::Client::new()
-        .get(format!("http://{addr}/api/v1/graph/full?agent_id={owner}"))
+        .get(&url)
+        .bearer_auth(stranger_token())
         .send()
         .await
         .unwrap();
@@ -888,7 +960,7 @@ async fn graph_full_no_token_spoofed_owner_redacts_node_label() {
     if let Some(label) = find_node(&body) {
         assert_eq!(
             label, "[REDACTED]",
-            "no-token spoof of owner agent_id must redact the private node label in graph_full"
+            "stranger token spoofing ?agent_id=<owner> must redact the private node label in graph_full"
         );
         assert!(
             !label.contains("GRAPHFULL private secret body"),
@@ -922,10 +994,11 @@ async fn graph_full_no_token_spoofed_owner_redacts_node_label() {
 /// proves the redaction is token-driven — not "graph_query always redacts" or
 /// "the body agent_id is still trusted" — and doubles as the presence proof.
 #[tokio::test(flavor = "multi_thread")]
-async fn graph_query_no_token_spoofed_owner_is_redacted() {
+async fn graph_query_stranger_token_spoofed_owner_is_redacted() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
-    let claim_id = common::seed_claim_with_agent(&pool, "GQL private secret body", owner).await;
+    let (claim_id, probe) =
+        common::seed_probe_claim_with_agent(&pool, "GQL private secret body", owner).await;
     common::seed_private_ownership(&pool, claim_id, owner).await;
 
     let find_node_label = |body: &serde_json::Value| -> Option<String> {
@@ -941,31 +1014,47 @@ async fn graph_query_no_token_spoofed_owner_is_redacted() {
             })
     };
 
-    // No-token spoof of the owner agent_id in the body: node label redacted.
-    // MATCH (n:claim) RETURN * with no WHERE returns all claims (capped). The
-    // shared test DB holds >200 claims and the handler default LIMIT is 200
-    // with no ORDER BY, so raise the explicit limit to the handler cap (1000)
-    // to guarantee the freshly-seeded claim is in the result window.
+    // Select EXACTLY the seeded claim, by the unique `properties->>'probe'`
+    // key `seed_probe_claim_with_agent` wrote.
+    //
+    // This used to be `MATCH (n:claim) RETURN * LIMIT 1000` — match everything,
+    // and trust the seeded row to be inside the window. `graph_query.rs` emits
+    // `SELECT id FROM claims <where> LIMIT <n>` with **no ORDER BY**, so which
+    // 1000 rows come back is whatever the plan yields; once the shared test
+    // database passed ~2500 claims the freshly-seeded row started falling
+    // outside it and the test failed with "seeded claim not present", i.e. a
+    // false failure that says nothing about redaction. A one-row match makes
+    // the assertion about redaction and nothing else.
+    let query = format!("MATCH (n:claim) WHERE n.probe = '{probe}' RETURN *");
     let body = serde_json::json!({
-        "query": "MATCH (n:claim) RETURN * LIMIT 1000",
+        "query": query,
         "agent_id": owner.to_string()
     });
+    let anon = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/graph/query"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_401_with_challenge(anon, "POST /api/v1/graph/query").await;
+
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/v1/graph/query"))
+        .bearer_auth(stranger_token())
         .json(&body)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "graph query returns 200");
     let resp_body: serde_json::Value = resp.json().await.unwrap();
-    // graph_query redacts into the node `label` field, not `content`. The cap
-    // (1000) must include our just-seeded claim; absence means the test can't
-    // discriminate, so require presence here too.
+    // graph_query redacts into the node `label` field, not `content`. The
+    // WHERE selects exactly one row, so absence here is a real failure — the
+    // node vanished from the response — not a windowing accident.
     let label = find_node_label(&resp_body)
-        .expect("seeded claim not present in graph query result; widen the match");
+        .expect("the probe-selected claim must be present in the graph query result");
     assert_eq!(
         label, "[REDACTED]",
-        "private claim node label must be redacted under no-token spoof"
+        "private claim node label must be redacted for a stranger token spoofing the owner"
     );
 
     // Owner token with a RANDOM (spoofed) body agent_id: node present AND label
@@ -973,7 +1062,7 @@ async fn graph_query_no_token_spoofed_owner_is_redacted() {
     // agent_id field is no longer trusted for access.
     let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
     let owner_body = serde_json::json!({
-        "query": "MATCH (n:claim) RETURN * LIMIT 1000",
+        "query": query,
         "agent_id": Uuid::new_v4().to_string()
     });
     let resp = reqwest::Client::new()

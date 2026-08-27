@@ -575,7 +575,10 @@ pub struct EvidenceEmbeddingResponse {
 /// `GET /api/v1/search/evidence`
 ///
 /// Returns evidence items ranked by vector similarity to the query.
-/// Public endpoint — no authentication required.
+///
+/// Requires a Bearer token. PR-03 revoked this endpoint's public-access
+/// guarantee: corpus-wide semantic search over evidence is the highest-value
+/// anonymous read the API had.
 #[cfg(feature = "db")]
 pub async fn search_evidence(
     State(state): State<AppState>,
@@ -888,6 +891,12 @@ mod tests {
     // These tests exercise the validation logic in the handler without needing
     // a real database, by using the non-db feature gate path.
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod handler_tests {
         use super::*;
@@ -1094,13 +1103,23 @@ mod tests {
             assert_eq!(resp["embedding_mode"], "mock");
         }
 
-        /// Test RAG endpoint is accessible as a public (unauthenticated) route
-        /// through the full application router, including rate-limiting and
-        /// signature verification middleware layers.
+        /// PR-03 INVERSION. This asserted 200 — that the RAG endpoint was
+        /// reachable with no credential — and the assertion message said so out
+        /// loud. `GET /api/v1/query/rag` returns claim CONTENT for the
+        /// highest-truth claims in the corpus (`rag.rs` `:402`), which makes it
+        /// the single highest-value route on the old anonymous surface.
+        ///
+        /// The public-access guarantee is deliberately revoked. What is asserted
+        /// now is that revoking it produced a usable failure: 401 with the
+        /// RFC 6750 challenge, not a bare status code.
+        ///
+        /// The `min_truth` plumbing this test used to cover moves to
+        /// `test_rag_min_truth` above, which drives the handler through
+        /// `test_router()` and needs no credential.
         #[tokio::test]
-        async fn test_rag_returns_200_via_full_router() {
+        async fn test_rag_is_401_via_full_router() {
             let state = AppState::new(ApiConfig {
-                require_signatures: true,
+                require_packet_signatures: true,
                 ..ApiConfig::default()
             });
             let router = crate::routes::create_router(state);
@@ -1113,26 +1132,26 @@ mod tests {
             let response = router.oneshot(request).await.unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
-                "RAG endpoint should be publicly accessible even with require_signatures enabled"
+                StatusCode::UNAUTHORIZED,
+                "RAG returns claim content and is no longer anonymously readable"
             );
-
-            let body = http_body_util::BodyExt::collect(response.into_body())
-                .await
-                .unwrap()
-                .to_bytes();
-            let resp: RagContextResponse = serde_json::from_slice(&body).unwrap();
-            assert_eq!(resp.count, 0, "No DB means empty results");
+            let challenge = response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .expect("401 carries an RFC 6750 challenge")
+                .to_str()
+                .unwrap();
             assert!(
-                (resp.min_truth_applied - 0.7).abs() < f64::EPSILON,
-                "Default min_truth should be 0.7"
+                challenge.contains(r#"error="invalid_token""#),
+                "got: {challenge}"
             );
         }
 
-        /// Test that the min_truth parameter correctly flows through the full
-        /// router and is reflected in the response.
+        /// PR-03: `min_truth` still flows through the router, but the router
+        /// answers 401 before the handler parses it. The parameter's own
+        /// behaviour is covered by the `test_router()` cases above.
         #[tokio::test]
-        async fn test_rag_min_truth_via_full_router() {
+        async fn test_rag_min_truth_via_full_router_is_401() {
             let state = AppState::new(ApiConfig::default());
             let router = crate::routes::create_router(state);
 
@@ -1142,18 +1161,7 @@ mod tests {
                 .unwrap();
 
             let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let body = http_body_util::BodyExt::collect(response.into_body())
-                .await
-                .unwrap()
-                .to_bytes();
-            let resp: RagContextResponse = serde_json::from_slice(&body).unwrap();
-            assert!(
-                (resp.min_truth_applied - 0.95).abs() < f64::EPSILON,
-                "min_truth=0.95 should be reflected in response, got {}",
-                resp.min_truth_applied
-            );
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
     }
 
@@ -1271,6 +1279,12 @@ mod tests {
 
     // ---- Evidence Search Handler Tests (non-DB) ----
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod evidence_search_handler_tests {
         use super::*;
@@ -1331,8 +1345,11 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
 
+        /// PR-03 INVERSION: the evidence-search public-access guarantee is
+        /// revoked alongside RAG's. Same reasoning — the endpoint searches
+        /// evidence bodies corpus-wide.
         #[tokio::test]
-        async fn test_evidence_search_via_full_router() {
+        async fn test_evidence_search_via_full_router_is_401() {
             let state = AppState::new(ApiConfig::default());
             let router = crate::routes::create_router(state);
 
@@ -1344,14 +1361,20 @@ mod tests {
             let response = router.oneshot(request).await.unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
-                "Evidence search should be publicly accessible"
+                StatusCode::UNAUTHORIZED,
+                "Evidence search is no longer anonymously readable"
             );
         }
     }
 
     // ---- Evidence Embedding Handler Test (non-DB) ----
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod evidence_embedding_handler_tests {
         use super::*;

@@ -215,7 +215,7 @@ fn create_test_app() -> axum::Router {
 
     ensure_database_url_for_lazy_pool();
     let config = ApiConfig {
-        require_signatures: true,
+        require_packet_signatures: true,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()
@@ -230,7 +230,7 @@ fn create_test_app_no_sig() -> axum::Router {
 
     ensure_database_url_for_lazy_pool();
     let config = ApiConfig {
-        require_signatures: false,
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()

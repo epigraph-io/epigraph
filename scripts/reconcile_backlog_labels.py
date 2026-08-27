@@ -18,11 +18,31 @@ from pathlib import Path
 
 import httpx
 
-# Bearer auth for the PATCH route (read route is public). Pass via
-# EPIGRAPH_TOKEN env var. Mint with scripts/mint_epigraph_token.py
-# (EPIGRAPH_SCOPE="claims:read claims:write" or higher).
+# PR-03: the token is MANDATORY now, not just for the PATCH.
+#
+# Every route this script reads — including `/api/v1/claims/by-labels` — moved
+# from the anonymous router to the authenticated one, so degrading to no
+# Authorization header no longer means "read-only mode", it means every request
+# 401s. Failing loudly at startup beats a run that reports zero backlog items
+# because it could not read any.
+#
+# Mint with `scripts/_api_client.py::mint_bearer_token` (there is no
+# `scripts/mint_epigraph_token.py`; it never existed in this repo). The token
+# must carry a non-null `agent_id` claim — set EPIGRAPH_AGENT_ID before minting
+# — because the API resolves the caller's read authority from it and refuses a
+# principal-less token with 401 `invalid_token`.
 TOKEN = os.environ.get("EPIGRAPH_TOKEN")
-AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
+if not TOKEN:
+    sys.exit(
+        "EPIGRAPH_TOKEN is required.\n"
+        "  Mint one with scripts/_api_client.py::mint_bearer_token, e.g.\n"
+        "    EPIGRAPH_AGENT_ID=<agents.id> python3 -c \\\n"
+        "      \"import sys; sys.path.insert(0,'scripts'); from _api_client \\\n"
+        "        import mint_bearer_token; \\\n"
+        "        print(mint_bearer_token(['claims:read','claims:write']))\"\n"
+        "  The token must carry a non-null agent_id claim."
+    )
+AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 
 # Shared with cleanup_backlog_labels.py — same convention.
 KEYWORD_RE = re.compile(
@@ -52,7 +72,13 @@ def page_claims(base_url: str, labels: list[str], exclude: list[str]) -> list[di
         }
         if exclude:
             params["exclude_labels"] = ",".join(exclude)
-        r = httpx.get(f"{base_url}/api/v1/claims/by-labels", params=params, timeout=30)
+        # PR-03: this read moved behind Bearer auth; without AUTH_HEADERS it 401s.
+        r = httpx.get(
+            f"{base_url}/api/v1/claims/by-labels",
+            params=params,
+            headers=AUTH_HEADERS,
+            timeout=30,
+        )
         r.raise_for_status()
         page = r.json()
         out.extend(page)

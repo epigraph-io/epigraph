@@ -145,7 +145,23 @@ pub struct AppState {
     pub config: ApiConfig,
     /// Idempotency store for duplicate request detection
     pub idempotency_store: IdempotencyStore,
-    /// Signature verification state for authenticated routes
+    /// Signature verification state for the Ed25519 request-signing middleware.
+    ///
+    /// **Test-only as of PR-03, and left in place deliberately.** Its sole
+    /// production consumer was `middleware::require_signature`, which was
+    /// unreachable through either `create_router` and has been deleted; the
+    /// remaining constructors (`with_signature_state`,
+    /// `with_db_and_signature_state`) and every reader of this field now live
+    /// under `tests/`. `SecurityEvent::signature_verification` and
+    /// `::auth_attempt` are consequently never written any more — `deploy.md`
+    /// §5 tells operators their dashboards for those two event types will read
+    /// empty.
+    ///
+    /// Not deleted here because removing it means touching `AppState`'s two
+    /// non-db constructors, and the `not(feature = "db")` configuration does
+    /// not compile today (28 pre-existing errors), so the change could not be
+    /// verified. It is dead weight, not a hazard: nothing reads it on a request
+    /// path.
     pub signature_state: SignatureVerificationState,
     /// Thread-safe propagation orchestrator for truth propagation
     ///
@@ -258,7 +274,7 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct ApiConfig {
     /// Whether to require Ed25519 signatures on write operations
-    pub require_signatures: bool,
+    pub require_packet_signatures: bool,
     /// Maximum size of request bodies in bytes
     pub max_request_size: usize,
     /// Public HTTPS base URL this API is reachable at externally (no trailing slash),
@@ -277,6 +293,32 @@ pub struct ApiConfig {
     /// `oauth::providers::build_registry`, which refuses to boot under
     /// `EPIGRAPH_ENV=production` with an empty allowlist and this false.
     pub allow_all_identities: bool,
+}
+
+impl ApiConfig {
+    /// The RFC 9728 protected-resource-metadata document URL for this
+    /// deployment.
+    ///
+    /// A **method**, not a field, on purpose. `ApiConfig` is not
+    /// `#[non_exhaustive]` and ~70 struct literals in this workspace name every
+    /// field explicitly, five of them without a `..Default::default()` spread;
+    /// a new field would break all five and add a value that is derivable from
+    /// one already present.
+    ///
+    /// It derives the same document URL that
+    /// `oauth::metadata::protected_resource_metadata` already serves from
+    /// `public_base_url`, so the URL named in a `WWW-Authenticate` challenge
+    /// and the URL that actually answers cannot drift.
+    ///
+    /// Operators who front the API with a different metadata host override the
+    /// derived value with `EPIGRAPH_RESOURCE_METADATA_URL` in `bin/server.rs`.
+    #[must_use]
+    pub fn resource_metadata_url(&self) -> String {
+        format!(
+            "{}/.well-known/oauth-protected-resource",
+            self.public_base_url.trim_end_matches('/')
+        )
+    }
 }
 
 impl AppState {
@@ -658,7 +700,7 @@ impl AppState {
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
-            require_signatures: false,
+            require_packet_signatures: false,
             max_request_size: 10 * 1024 * 1024, // 10MB
             public_base_url: "http://localhost:8080".to_string(),
             // Fail closed. An operator who wants the old allow-all posture must
@@ -691,7 +733,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ApiConfig::default();
-        assert!(!config.require_signatures);
+        assert!(!config.require_packet_signatures);
         assert_eq!(config.max_request_size, 10 * 1024 * 1024);
         // PR-02 decision Q4: fail closed. Flipping this default silently
         // restores allow-all external provisioning on every deployment.
@@ -704,12 +746,12 @@ mod tests {
     #[test]
     fn test_config_clone() {
         let config = ApiConfig {
-            require_signatures: true,
+            require_packet_signatures: true,
             max_request_size: 2048,
             ..ApiConfig::default()
         };
         let cloned = config.clone();
-        assert!(cloned.require_signatures);
+        assert!(cloned.require_packet_signatures);
         assert_eq!(cloned.max_request_size, 2048);
     }
 

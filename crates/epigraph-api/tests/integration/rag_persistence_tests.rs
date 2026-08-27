@@ -107,10 +107,35 @@ fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
     )
 }
 
-/// Create a router configured for testing with DB pool (bypasses auth)
+/// Mint a Bearer token for the RAG reads below.
+///
+/// PR-03 moved `GET /api/v1/query/rag` from the anonymous router to the
+/// protected one, so these tests — which are about the RAG *query semantics*
+/// (similarity ordering, min_truth, limit, domain filter), not about
+/// authorization — need a credential to reach the handler at all. `agent_id` is
+/// `Some` because a principal-less token is what `ViewerExtractor` will reject
+/// once PR-07 wires it onto this handler.
+fn rag_bearer_token() -> String {
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (token, _jti) = cfg
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:read".to_string()],
+            "service",
+            None,
+            Some(Uuid::new_v4()),
+            chrono::Duration::minutes(60),
+        )
+        .expect("test JWT issued");
+    token
+}
+
+/// Create a router configured for testing with DB pool
 fn create_test_router(pool: PgPool) -> Router {
     let config = ApiConfig {
-        require_signatures: false,
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()
@@ -176,6 +201,10 @@ async fn rag_query(router: &Router, query: &str, params: &str) -> (StatusCode, S
     let request = Request::builder()
         .method(Method::GET)
         .uri(&uri)
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", rag_bearer_token()),
+        )
         .body(Body::empty())
         .expect("Failed to build request");
 

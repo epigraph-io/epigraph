@@ -15,12 +15,21 @@
 //!
 //! - Malformed input tests use **direct routers** (no auth middleware layer) so
 //!   validation logic is exercised without signature verification interference.
-//! - Auth tests use the full `create_router()` which includes the `require_signature`
-//!   middleware layer, proving that unauthenticated requests are properly rejected.
+//! - Auth tests use the full `create_router()`, which layers
+//!   `bearer_auth_middleware` on the protected router, proving that
+//!   unauthenticated requests are properly rejected.
 //! - Concurrency tests clone `AppState` (which is `Arc`-backed) across multiple
 //!   tokio tasks, each creating its own router via `create_router` to avoid
 //!   consuming the router with `oneshot`.
 
+// NOT COMPILED, NOT RUN. `epigraph-api`'s default features are `["db"]` and
+// the `not(feature = "db")` configuration has 28 pre-existing compile errors
+// (`routes/admin.rs`'s `ApiConfig` literal alone omits `allow_all_identities`),
+// so `cargo test -p epigraph-api --lib -- --list` names none of the tests
+// below. PR-03's `OK -> UNAUTHORIZED` flips in here are DOCUMENTATION of the
+// intended behaviour, not coverage of it. The behaviour is actually asserted
+// by `tests/public_router_allowlist.rs`, which probes every route on the
+// `protected` chain of the buildable variant.
 #[cfg(all(test, not(feature = "db")))]
 mod malformed_input_tests {
     use crate::routes::batch::batch_create_claims;
@@ -616,10 +625,10 @@ mod auth_failure_tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    /// Create the full application router with `require_signatures: true`.
+    /// Create the full application router with `require_packet_signatures: true`.
     fn app_with_auth() -> axum::Router {
         let state = AppState::new(ApiConfig {
-            require_signatures: true,
+            require_packet_signatures: true,
             ..ApiConfig::default()
         });
         crate::routes::create_router(state)
@@ -866,7 +875,7 @@ mod auth_failure_tests {
     #[tokio::test]
     async fn test_all_protected_routes_reject_without_auth() {
         // Each protected route is a POST or DELETE that sits behind the
-        // require_signature middleware. Without auth headers, all should 401.
+        // bearer_auth_middleware. Without an Authorization header, all should 401.
         let claim_id = Uuid::new_v4();
         let webhook_id = Uuid::new_v4();
 
@@ -1133,18 +1142,19 @@ mod concurrency_tests {
             })
             .collect();
 
+        // PR-03: RAG left the anonymous router. What this test still proves is
+        // what it was really for — that ten simultaneous requests through ten
+        // independently-built routers over one shared AppState all terminate
+        // cleanly and identically, with no lock contention or interleaving.
+        // The status they agree on is now 401.
         for task in tasks {
             let response = task.await.unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
-                "All concurrent RAG queries should return 200"
+                StatusCode::UNAUTHORIZED,
+                "All concurrent RAG queries should return 401 — the route is no \
+                 longer anonymous"
             );
-
-            let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-            let resp: RagContextResponse = serde_json::from_slice(&body_bytes).unwrap();
-            // Without a DB, results are empty but the response structure is valid
-            assert_eq!(resp.count, 0);
         }
     }
 
@@ -1172,20 +1182,17 @@ mod concurrency_tests {
             })
             .collect();
 
+        // PR-03: as with the RAG case above, the concurrency property survives
+        // and the status changes. Stats-content consistency is asserted by the
+        // `test_router()`-driven tests in `routes/admin.rs`.
         for task in tasks {
             let response = task.await.unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
-                "All concurrent admin stats requests should return 200"
+                StatusCode::UNAUTHORIZED,
+                "All concurrent admin stats requests should return 401 — the \
+                 route is no longer anonymous"
             );
-
-            let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-            let stats: SystemStats = serde_json::from_slice(&body_bytes).unwrap();
-
-            // All stats should be consistent (initial state: everything is zero)
-            assert_eq!(stats.caches.idempotency_store_size, 0);
-            assert!(!stats.config.require_signatures);
         }
     }
 

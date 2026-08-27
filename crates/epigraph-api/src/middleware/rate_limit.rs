@@ -39,8 +39,18 @@ const X_FORWARDED_FOR: &str = "X-Forwarded-For";
 /// Header for real IP (alternative to X-Forwarded-For)
 const X_REAL_IP: &str = "X-Real-IP";
 
-/// Routes that bypass rate limiting
-const BYPASS_ROUTES: &[&str] = &["/health", "/readiness", "/liveness", "/metrics"];
+/// Routes that bypass rate limiting.
+///
+/// `/metrics` was removed from this list in PR-03: Prometheus exposition is no
+/// longer routable on the application listener at all (it moved to the internal
+/// listener `bin/server.rs` binds from `EPIGRAPH_METRICS_ADDR`), so the entry
+/// could only ever have matched a request this router now 404s. It was also the
+/// widest entry here — matching is `path.starts_with`, so `/metrics-anything`
+/// inherited the bypass.
+///
+/// The three that remain are liveness probes: a rate-limited health check turns
+/// a traffic spike into a false unhealthy verdict and then into a restart loop.
+const BYPASS_ROUTES: &[&str] = &["/health", "/readiness", "/liveness"];
 
 // ============================================================================
 // Rate Limit Response
@@ -201,6 +211,16 @@ pub async fn rate_limit_middleware(
 
     // Extract client identifier
     // Priority: VerifiedAgent (if present) > IP address > fallback
+    //
+    // PR-03 note: the `VerifiedAgent` arm is now permanently `None` in
+    // production. `VerifiedAgent` is inserted only by
+    // `middleware::auth::signature_verification_middleware`, whose sole
+    // production caller (`middleware::require_signature`) was deleted with the
+    // router inversion. It is kept rather than collapsed to IP-only because the
+    // middleware integration tests still exercise this precedence, and because
+    // PR-07 will replace it with the `ViewerExtractor` principal — which is a
+    // strictly better rate-limit key than the client IP and restores the
+    // intent of this branch.
     let agent_id = request
         .extensions()
         .get::<crate::middleware::VerifiedAgent>()
@@ -317,7 +337,21 @@ mod tests {
         assert!(should_bypass_rate_limit("/health/ready", &Method::GET));
         assert!(should_bypass_rate_limit("/readiness", &Method::GET));
         assert!(should_bypass_rate_limit("/liveness", &Method::GET));
-        assert!(should_bypass_rate_limit("/metrics", &Method::GET));
+    }
+
+    /// `/metrics` lost its bypass in PR-03 because it lost its route: it is no
+    /// longer registered on either application router (it moved to the internal
+    /// listener `bin/server.rs` binds from `EPIGRAPH_METRICS_ADDR`), so the
+    /// entry could only ever have matched a request the router now 404s.
+    ///
+    /// Asserted rather than deleted so that re-adding `/metrics` to
+    /// `BYPASS_ROUTES` fails here — matching is `path.starts_with`, so the entry
+    /// also handed the bypass to `/metrics-anything`, and it was the widest
+    /// prefix in the list.
+    #[test]
+    fn metrics_no_longer_bypasses_rate_limiting() {
+        assert!(!should_bypass_rate_limit("/metrics", &Method::GET));
+        assert!(!should_bypass_rate_limit("/metrics-not-really", &Method::GET));
     }
 
     #[test]

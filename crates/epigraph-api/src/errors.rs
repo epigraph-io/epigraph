@@ -1,12 +1,155 @@
 use axum::{
-    http::StatusCode,
+    http::{header::WWW_AUTHENTICATE, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 #[cfg(feature = "db")]
 use epigraph_db::DbError;
 use serde::Serialize;
+use std::sync::OnceLock;
 use thiserror::Error;
+
+/// RFC 6750 §3.1 error code. Every 401 this crate emits is `invalid_token`:
+/// the credential is missing, malformed, expired, or structurally deficient
+/// (e.g. a JWT carrying no `agent_id`), and in every one of those cases the
+/// remedy is the same — re-mint the token. `insufficient_scope` belongs on 403
+/// responses, which this crate raises as `ApiError::Forbidden`.
+///
+/// # A deliberate deviation from RFC 6750 §3.1
+///
+/// The RFC says a server *SHOULD NOT* include an `error` code when the request
+/// carried no authentication information at all — a bare `Bearer` (optionally
+/// with `realm`) is the conforming challenge for "you sent nothing". This crate
+/// emits `error="invalid_token"` there too.
+///
+/// That is a choice, not an oversight. The alternative makes the challenge
+/// depend on whether an `Authorization` header was present, and a client
+/// looking at two different challenge strings has to decide which of two code
+/// paths produced it before it can act — while the action is identical in both
+/// cases (obtain a token, retry). PR-03 turned 105 routes into 401s at once;
+/// one challenge shape across all of them is what makes
+/// `public_router_allowlist.rs`'s exhaustive probe a single assertion instead
+/// of a case analysis, and what lets an operator grep one string out of a
+/// client's logs. The parameter is advisory in RFC 6750's own terms
+/// ("SHOULD NOT", not "MUST NOT"), and no interoperability failure follows: a
+/// conforming client treats an unrecognised or unexpected `error` on a 401 the
+/// same way it treats its absence.
+const INVALID_TOKEN: &str = "invalid_token";
+
+/// The RFC 9728 protected-resource-metadata URL advertised in the
+/// `WWW-Authenticate` challenge.
+///
+/// # Why a process-global
+///
+/// `IntoResponse::into_response(self)` takes only `self`. There is no
+/// `AppState`, no `ApiConfig`, and no request in scope, so the URL cannot be
+/// read from configuration at response time. The two alternatives are (a) widen
+/// `ApiError::Unauthorized`, `::InvalidSignature` and `::SignatureError` to
+/// carry the URL at every one of their ~100 construction sites, or (b) attach
+/// the challenge in a response-mapping middleware, which then has to
+/// re-classify status codes it did not produce. A `OnceLock` written once
+/// during boot is the smaller mechanism.
+///
+/// Unset means the challenge degrades to the bare `Bearer error="invalid_token"`
+/// form, which is RFC 6750-valid — just not RFC 9728-discoverable. That is the
+/// shape every integration test sees, because tests build routers through
+/// `build_app_for_tests` / `spawn_app` and never boot `bin/server.rs`.
+static RESOURCE_METADATA_URL: OnceLock<Option<String>> = OnceLock::new();
+
+/// Install the resource-metadata URL advertised on 401s. Called once from
+/// `bin/server.rs`, before the listener binds.
+///
+/// Idempotent-by-ignoring: a second call is a no-op rather than a panic, so a
+/// test binary that initialises it cannot poison a later one. Validate the URL
+/// with [`validate_resource_metadata_url`] first — this function does not.
+pub fn init_resource_metadata_url(url: Option<String>) {
+    let _ = RESOURCE_METADATA_URL.set(url);
+}
+
+/// The configured resource-metadata URL, if any.
+fn resource_metadata_url() -> Option<&'static str> {
+    RESOURCE_METADATA_URL.get().and_then(|opt| opt.as_deref())
+}
+
+/// Build the RFC 9728 `WWW-Authenticate` challenge value.
+///
+/// Ported verbatim from `crates/epigraph-mcp/src/auth.rs:132-140` so the HTTP
+/// API and the MCP server emit byte-identical challenges. It is not *shared*
+/// with that module because `epigraph-mcp` is an optional dependency of this
+/// crate and `challenge_header` there is private; a shared copy belongs in
+/// `epigraph-auth` (a hard dependency of both) if a third caller appears.
+///
+/// Returns `None` when the interpolated URL produces a value `HeaderValue`
+/// rejects (control characters / non-ASCII). This is the single source of the
+/// challenge format, shared by [`IntoResponse`] (per-request) and
+/// [`validate_resource_metadata_url`] (boot-time fail-fast) so the two cannot
+/// drift.
+fn challenge_header(resource_metadata_url: Option<&str>, error: &str) -> Option<HeaderValue> {
+    let challenge = match resource_metadata_url {
+        Some(url) => format!("Bearer resource_metadata=\"{url}\", error=\"{error}\""),
+        None => format!("Bearer error=\"{error}\""),
+    };
+    challenge.parse().ok()
+}
+
+/// Validate an operator-supplied resource-metadata URL at startup.
+///
+/// A URL that cannot be embedded in a header would otherwise make every 401
+/// silently drop the challenge; failing fast at boot surfaces the
+/// misconfiguration before the listener accepts traffic. Mirrors
+/// `epigraph_mcp::auth::validate_resource_metadata_url`.
+///
+/// # Why this is not just a `challenge_header` round trip
+///
+/// It used to be, and the round trip does not check what this function claims
+/// to check. `HeaderValue::from_str`'s predicate (`http` 1.4.0,
+/// `src/header/value.rs`) is `b >= 32 && b != 127 || b == b'\t'` — it rejects
+/// control characters, and **accepts every byte >= 0x80**. So
+/// `https://exämple.test/...` passed, booted, and produced a non-ASCII
+/// `WWW-Authenticate` value that strict clients reject and `.to_str()` cannot
+/// decode: precisely the silent degradation the fail-fast exists to prevent.
+/// An empty string passed too, advertising `resource_metadata=""`, and a bare
+/// TAB passed and produced a malformed challenge.
+///
+/// The four checks below run before the round trip, which is retained as the
+/// backstop for control characters and CR/LF header injection.
+///
+/// # Errors
+/// Returns a human-readable message naming which rule the URL broke.
+pub fn validate_resource_metadata_url(url: &str) -> Result<(), String> {
+    if url.is_empty() {
+        return Err("EPIGRAPH_RESOURCE_METADATA_URL is set but empty; unset it \
+                    to fall back to EPIGRAPH_PUBLIC_BASE_URL, or give it a URL"
+            .to_string());
+    }
+    if !url.is_ascii() {
+        return Err(format!(
+            "EPIGRAPH_RESOURCE_METADATA_URL contains non-ASCII bytes ({url:?}). \
+             HeaderValue accepts them but the resulting WWW-Authenticate value \
+             is not decodable as a str and strict clients reject it; percent-encode \
+             the host and path (IDNA/punycode for the host)"
+        ));
+    }
+    if url.contains('\t') {
+        return Err("EPIGRAPH_RESOURCE_METADATA_URL contains a TAB, which is a \
+                    legal header byte but not a legal URL character"
+            .to_string());
+    }
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(format!(
+            "EPIGRAPH_RESOURCE_METADATA_URL must be an absolute http(s) URL; got {url:?}. \
+             A client reads it out of the challenge and fetches it directly, so a \
+             relative or scheme-less value is unfetchable"
+        ));
+    }
+    challenge_header(Some(url), INVALID_TOKEN)
+        .map(|_| ())
+        .ok_or_else(|| {
+            "EPIGRAPH_RESOURCE_METADATA_URL is not a valid HTTP header value \
+             (control characters, or an embedded CR/LF?)"
+                .to_string()
+        })
+}
 
 /// API error types with HTTP status code mapping
 #[derive(Error, Debug)]
@@ -138,13 +281,45 @@ impl IntoResponse for ApiError {
             ),
         };
 
+        // RFC 6750 §3 REQUIRES a `WWW-Authenticate` challenge on a 401 from a
+        // protected resource. Without it, a client that gets a 401 has no
+        // machine-readable way to learn *which* authorization server to talk to
+        // — the failure is undiscoverable. That was tolerable while almost
+        // nothing returned 401; it is not tolerable now that the router
+        // defaults to authenticated.
+        //
+        // Attached to the three variants that mean "your credential did not
+        // work": Unauthorized, InvalidSignature, SignatureError. Deliberately
+        // NOT attached to Forbidden — a 403 means the credential was accepted
+        // and the answer is still no, and a challenge there tells the client to
+        // retry an authentication that already succeeded.
+        let needs_challenge = matches!(
+            self,
+            ApiError::Unauthorized { .. }
+                | ApiError::InvalidSignature
+                | ApiError::SignatureError { .. }
+        );
+
         let body = ErrorResponse {
             error: error_type.to_string(),
             message: self.to_string(),
             details,
         };
 
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+
+        if needs_challenge {
+            // The `Some` URL is validated at boot
+            // (`validate_resource_metadata_url`) and the `None` branch is a
+            // static valid string, so this is expected to succeed. If it
+            // somehow does not, drop the header rather than panicking on every
+            // request.
+            if let Some(value) = challenge_header(resource_metadata_url(), INVALID_TOKEN) {
+                response.headers_mut().insert(WWW_AUTHENTICATE, value);
+            }
+        }
+
+        response
     }
 }
 
@@ -278,5 +453,130 @@ mod tests {
         };
         let response = error.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ---- RFC 6750 / RFC 9728 challenge -----------------------------------
+    //
+    // These assert on the `error="invalid_token"` parameter only, never on
+    // `resource_metadata=`. RESOURCE_METADATA_URL is a process-global OnceLock:
+    // whether it is set depends on whether some *other* test in this same
+    // binary happened to set it first, which would make any assertion about the
+    // URL order-dependent. The URL's own formatting is covered by
+    // `challenge_header_shapes` below, which calls the pure function directly.
+
+    fn challenge_of(error: ApiError) -> String {
+        let response = error.into_response();
+        response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .unwrap_or_else(|| panic!("401 response carries no WWW-Authenticate header"))
+            .to_str()
+            .expect("challenge is ASCII")
+            .to_string()
+    }
+
+    #[test]
+    fn unauthorized_carries_the_bearer_challenge() {
+        let challenge = challenge_of(ApiError::Unauthorized {
+            reason: "no credential".to_string(),
+        });
+        assert!(challenge.starts_with("Bearer "), "got: {challenge}");
+        assert!(
+            challenge.contains(r#"error="invalid_token""#),
+            "got: {challenge}"
+        );
+    }
+
+    #[test]
+    fn invalid_signature_carries_the_bearer_challenge() {
+        let challenge = challenge_of(ApiError::InvalidSignature);
+        assert!(
+            challenge.contains(r#"error="invalid_token""#),
+            "got: {challenge}"
+        );
+    }
+
+    #[test]
+    fn signature_error_carries_the_bearer_challenge() {
+        let challenge = challenge_of(ApiError::SignatureError {
+            reason: "malformed".to_string(),
+        });
+        assert!(
+            challenge.contains(r#"error="invalid_token""#),
+            "got: {challenge}"
+        );
+    }
+
+    #[test]
+    fn non_401_errors_carry_no_challenge() {
+        // A 403 in particular: the credential was accepted and the answer is
+        // still no. Challenging there tells the client to retry an
+        // authentication that already worked.
+        for error in [
+            ApiError::Forbidden {
+                reason: "scope".to_string(),
+            },
+            ApiError::NotFound {
+                entity: "Claim".to_string(),
+                id: "x".to_string(),
+            },
+            ApiError::BadRequest {
+                message: "nope".to_string(),
+            },
+        ] {
+            let rendered = format!("{error}");
+            let response = error.into_response();
+            assert!(
+                response.headers().get(WWW_AUTHENTICATE).is_none(),
+                "unexpected challenge on non-401: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn challenge_header_shapes() {
+        let with_url = challenge_header(Some("https://api.example/.well-known/x"), INVALID_TOKEN)
+            .expect("valid url builds a header");
+        assert_eq!(
+            with_url.to_str().unwrap(),
+            r#"Bearer resource_metadata="https://api.example/.well-known/x", error="invalid_token""#
+        );
+
+        let without_url = challenge_header(None, INVALID_TOKEN).expect("bare form is always valid");
+        assert_eq!(
+            without_url.to_str().unwrap(),
+            r#"Bearer error="invalid_token""#
+        );
+    }
+
+    #[test]
+    fn validate_resource_metadata_url_rejects_unheaderable_values() {
+        assert!(validate_resource_metadata_url("https://api.example/.well-known/x").is_ok());
+        assert!(validate_resource_metadata_url("http://127.0.0.1:8080/.well-known/x").is_ok());
+        // A newline would let an operator inject a second header.
+        assert!(validate_resource_metadata_url("https://api.example/\r\nX-Evil: 1").is_err());
+        assert!(validate_resource_metadata_url("https://api.example/\u{7f}").is_err());
+    }
+
+    /// The cases `HeaderValue::from_str` alone lets through. Each of these
+    /// booted successfully before the explicit checks were added, and each
+    /// produced a challenge a client cannot use.
+    #[test]
+    fn validate_resource_metadata_url_rejects_what_headervalue_accepts() {
+        // Every byte >= 0x80 satisfies HeaderValue's predicate, so an IDN host
+        // built a header that `.to_str()` cannot decode.
+        assert!(
+            validate_resource_metadata_url("https://exämple.test/.well-known/x").is_err(),
+            "non-ASCII must be refused at boot, not turned into an undecodable header"
+        );
+        // Set-but-empty produced `Bearer resource_metadata="", error="..."`.
+        assert!(validate_resource_metadata_url("").is_err());
+        // TAB is a legal header byte and an illegal URL character.
+        assert!(validate_resource_metadata_url("https://api.example/\tx").is_err());
+        // Scheme-less and relative values are unfetchable by the client that
+        // reads them out of the challenge.
+        assert!(validate_resource_metadata_url("api.example/.well-known/x").is_err());
+        assert!(validate_resource_metadata_url("/.well-known/x").is_err());
+        assert!(validate_resource_metadata_url("ftp://api.example/x").is_err());
     }
 }

@@ -748,6 +748,12 @@ mod tests {
 
     // ---- Handler integration tests (need AppState without DB) ----
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod handler_tests {
         use super::super::*;
@@ -762,7 +768,7 @@ mod tests {
         /// Create a test router with webhook endpoints (no auth middleware for unit tests)
         fn test_router() -> Router {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -888,7 +894,7 @@ mod tests {
         #[tokio::test]
         async fn test_list_webhooks_returns_registered() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
             let router = test_router_with_state(state);
@@ -941,7 +947,7 @@ mod tests {
         #[tokio::test]
         async fn test_get_webhook_by_id() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
             let router = test_router_with_state(state);
@@ -992,7 +998,7 @@ mod tests {
         #[tokio::test]
         async fn test_delete_webhook_removes_it() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
             let router = test_router_with_state(state);
@@ -1052,7 +1058,7 @@ mod tests {
         async fn test_full_crud_lifecycle() {
             // Single end-to-end test: register -> list -> get -> delete -> verify gone
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
             let router = test_router_with_state(state);
@@ -1151,9 +1157,9 @@ mod tests {
 
         #[tokio::test]
         async fn test_register_webhook_without_signature_returns_401() {
-            // Use the full router which applies require_signature middleware
+            // Use the full router, which applies bearer_auth_middleware
             let state = AppState::new(ApiConfig {
-                require_signatures: true,
+                require_packet_signatures: true,
                 ..ApiConfig::default()
             });
             let router = crate::routes::create_router(state);
@@ -1177,7 +1183,7 @@ mod tests {
         #[tokio::test]
         async fn test_list_webhooks_without_signature_returns_401() {
             let state = AppState::new(ApiConfig {
-                require_signatures: true,
+                require_packet_signatures: true,
                 ..ApiConfig::default()
             });
             let router = crate::routes::create_router(state);
@@ -1199,7 +1205,7 @@ mod tests {
         #[tokio::test]
         async fn test_get_webhook_without_signature_returns_401() {
             let state = AppState::new(ApiConfig {
-                require_signatures: true,
+                require_packet_signatures: true,
                 ..ApiConfig::default()
             });
             let router = crate::routes::create_router(state);
@@ -1222,7 +1228,7 @@ mod tests {
         #[tokio::test]
         async fn test_delete_webhook_without_signature_returns_401() {
             let state = AppState::new(ApiConfig {
-                require_signatures: true,
+                require_packet_signatures: true,
                 ..ApiConfig::default()
             });
             let router = crate::routes::create_router(state);
@@ -1299,7 +1305,7 @@ mod tests {
         #[tokio::test]
         async fn test_register_multiple_webhooks_then_list_all() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
             let router = test_router_with_state(state);
@@ -1450,7 +1456,7 @@ mod tests {
         #[tokio::test]
         async fn test_delete_webhook_is_idempotent_returns_404_on_second_delete() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
             let router = test_router_with_state(state);

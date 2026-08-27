@@ -29,12 +29,17 @@ async fn by_labels_returns_filtered_claims() {
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let client = reqwest::Client::new();
+    // PR-03: `/api/v1/claims/by-labels` moved to the protected router. Note the
+    // token must carry a non-null `agent_id` — `mint_token_with_agent` is the
+    // only helper in tests/common that sets one.
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
 
     // No filters: all 3 claims, with labels/is_current/supersedes populated.
     let resp = client
         .get(format!(
             "http://{addr}/api/v1/claims/by-labels?labels=backlog"
         ))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap();
@@ -83,6 +88,7 @@ async fn by_labels_returns_filtered_claims() {
         .get(format!(
             "http://{addr}/api/v1/claims/by-labels?labels=backlog&exclude_labels=resolved&current_only=true"
         ))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap();
@@ -108,6 +114,7 @@ async fn by_labels_returns_filtered_claims() {
     // Missing labels query parameter → 400.
     let resp = client
         .get(format!("http://{addr}/api/v1/claims/by-labels"))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap();

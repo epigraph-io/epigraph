@@ -77,8 +77,22 @@ impl Default for Metrics {
 /// Handler for `GET /metrics`.
 ///
 /// Returns the full Prometheus text exposition in the standard wire format.
-/// No authentication is required — scrapers (Prometheus, Grafana Agent) hit
-/// this endpoint directly.
+///
+/// # Where this is served from
+///
+/// **Not** from the application router. PR-03 removed `/metrics` from both
+/// `create_router` variants: with the router inverted to an anonymous
+/// allowlist, the only two remaining choices for a public `/metrics` were to
+/// leave a corpus-shaped operational surface open to the internet, or to make
+/// scrapers carry an OAuth token. Neither is what a metrics endpoint should be.
+///
+/// It is served instead by a **separate internal listener** bound in
+/// `bin/server.rs` from `EPIGRAPH_METRICS_ADDR` (default `127.0.0.1:9090`),
+/// which carries no application routes, no rate limiter, and no body limit.
+/// Reaching it requires being on the host or inside the network namespace.
+///
+/// Deploy consequence: the Prometheus scrape target must be updated in the same
+/// window as this change, or monitoring goes dark.
 pub async fn metrics_handler(
     axum::extract::Extension(metrics): axum::extract::Extension<Arc<Metrics>>,
 ) -> impl axum::response::IntoResponse {
@@ -91,4 +105,19 @@ pub async fn metrics_handler(
         )],
         buffer,
     )
+}
+
+/// The internal metrics router: exactly one route, `GET /metrics`.
+///
+/// Kept here rather than inline in `bin/server.rs` so that the exposition
+/// surface is described in one place, and so a future change to it (an
+/// additional `/metrics/health`, a scrape token) has an obvious home.
+///
+/// The `Arc<Metrics>` is supplied as an `Extension` because `metrics_handler`
+/// already takes it that way on the application router, where `bin/server.rs`
+/// still layers it. Keeping one handler signature means the two cannot drift.
+pub fn metrics_router(metrics: Arc<Metrics>) -> axum::Router {
+    axum::Router::new()
+        .route("/metrics", axum::routing::get(metrics_handler))
+        .layer(axum::Extension(metrics))
 }

@@ -18,7 +18,7 @@ mod oauth_providers;
 
 fn config() -> ApiConfig {
     ApiConfig {
-        require_signatures: false,
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "https://test.example".to_string(),
         // Empty provider allowlists in this file's fixtures + PR-02's

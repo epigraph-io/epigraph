@@ -60,9 +60,20 @@ pub async fn bearer_auth_middleware(
 /// Middleware: extract Bearer token if present, validate, inject AuthContext.
 ///
 /// Unlike [`bearer_auth_middleware`], a request WITHOUT an Authorization header
-/// is allowed through anonymously (no `AuthContext`, no 401) — this layers on
-/// the PUBLIC router so reads stay anonymously readable. A request WITH a
+/// is allowed through with no `AuthContext` and no 401. A request WITH a
 /// `Bearer` token that is revoked, malformed, or expired is rejected 401.
+///
+/// Since PR-03 this layers on the **anonymous allowlist router only** — the two
+/// routes (`/health`, `/api/v1/openapi.json`) that are legitimately reachable
+/// without a credential, plus the OAuth/discovery router which must precede
+/// authentication by construction. Every route that returns claim content,
+/// claim-derived structure, ACLs, embeddings or aggregates now sits behind
+/// [`bearer_auth_middleware`] instead.
+///
+/// It is still `optional` rather than absent because an allowlisted route may
+/// legitimately want to know *who* is calling when a token happens to be
+/// present, and because a present-but-invalid token should 401 even on an
+/// allowlisted route rather than being silently ignored.
 pub async fn optional_bearer_auth_middleware(
     State(state): State<AppState>,
     mut request: Request<axum::body::Body>,
@@ -158,6 +169,107 @@ require_scope_extractor!(RequireScopeWebhooksWrite, "webhooks:write");
 require_scope_extractor!(RequireScopeGroupsWrite, "groups:write");
 require_scope_extractor!(RequireScopeGroupsAdmin, "groups:admin");
 
+/// The ONLY way an HTTP handler obtains a [`Viewer`](epigraph_db::Viewer).
+///
+/// Handlers take `ViewerExtractor(viewer): ViewerExtractor`, never
+/// `Option<ViewerExtractor>` — an optional viewer reintroduces exactly the
+/// fail-open idiom (`if let Some(auth) = auth_ctx { check() }`) that PR-03
+/// exists to remove.
+///
+/// # When it 401s (RFC 6750 `invalid_token`)
+///
+/// * **No `AuthContext` in extensions** — no credential reached the handler.
+///   On the protected router this should be unreachable, because
+///   [`bearer_auth_middleware`] rejects first; it stays here so that a handler
+///   accidentally registered on the allowlist router still fails closed.
+/// * **`AuthContext.agent_id` is `None`** — a credential with no principal.
+///   `Viewer::resolve` needs an `agents.id`; there is no defensible reading
+///   authority to synthesise without one, and D3 removes the anonymous shape
+///   that would otherwise absorb this case.
+///
+/// The second case is **401, not 403**. A 403 would say "you are known and the
+/// answer is no", inviting the client to retry with different parameters
+/// forever. The token is structurally deficient: the remedy is to re-mint it,
+/// which is precisely what `invalid_token` tells the client. (An OAuth client
+/// registered before PR-02 populated `oauth_clients.agent_id` mints exactly
+/// this token, and re-minting after PR-02 is the fix.)
+///
+/// # Ordering
+///
+/// `FromRequestParts` runs before any `FromRequest` body extractor regardless
+/// of parameter order in the handler signature (see the note on
+/// [`require_scope_extractor`] above), so the 401 lands before body parse —
+/// no 422-instead-of-401.
+///
+/// # Cost
+///
+/// One indexed round trip per request (`Viewer::resolve` →
+/// `GroupMembershipRepository::list_live_for_agent`, served index-only by
+/// `idx_group_memberships_agent_live`). PR-03 defines the extractor but
+/// attaches it to no handler; PR-07 wires it to the read paths.
+#[cfg(feature = "db")]
+pub struct ViewerExtractor(pub epigraph_db::Viewer);
+
+#[cfg(feature = "db")]
+#[axum::async_trait]
+impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // `visibility.viewer.rejected{reason, route}` is emitted as a
+        // structured tracing event rather than a Prometheus counter:
+        // `metrics::Metrics` is a fixed struct of unlabeled counter handles
+        // reached through an `Extension` that only `bin/server.rs` installs, so
+        // a labeled counter family here would be both a new metrics-shape
+        // change and unavailable in every test router.
+        let route = parts.uri.path().to_string();
+
+        let Some(auth) = parts.extensions.get::<AuthContext>().cloned() else {
+            tracing::warn!(
+                target: "visibility.viewer.rejected",
+                reason = "no_auth_context",
+                route = %route,
+                "viewer rejected: request carried no AuthContext"
+            );
+            return Err(ApiError::Unauthorized {
+                reason: "authentication required".into(),
+            });
+        };
+
+        let Some(principal) = auth.agent_id else {
+            tracing::warn!(
+                target: "visibility.viewer.rejected",
+                reason = "no_agent_id",
+                route = %route,
+                client_id = %auth.client_id,
+                "viewer rejected: token carries no agent_id; re-mint the token"
+            );
+            return Err(ApiError::Unauthorized {
+                reason: "token carries no agent_id; re-authenticate to obtain \
+                         a token bound to a principal"
+                    .into(),
+            });
+        };
+
+        let viewer = epigraph_db::Viewer::resolve(&state.db_pool, principal)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    route = %route,
+                    principal = %principal,
+                    error = %e,
+                    "failed to resolve viewer group membership"
+                );
+                ApiError::from(e)
+            })?;
+
+        Ok(Self(viewer))
+    }
+}
+
 #[cfg(test)]
 mod require_scope_tests {
     use super::*;
@@ -218,5 +330,104 @@ mod require_scope_tests {
         let r: Result<RequireScopeWebhooksWrite, _> =
             RequireScopeWebhooksWrite::from_request_parts(&mut parts, &()).await;
         assert!(matches!(r, Err(ApiError::Forbidden { .. })));
+    }
+}
+
+/// `ViewerExtractor`'s two rejection paths.
+///
+/// Both are reached before `Viewer::resolve` is called, so neither test needs a
+/// database. The success path (`agent_id: Some(_)` → a `Scoped` viewer) does
+/// need one and lives in `crates/epigraph-api/tests/` alongside the other
+/// pool-backed tests; asserting it here would mean standing up a pool inside a
+/// `--lib` unit test, which nothing else in this crate does.
+///
+/// These two tests are, in PR-03, the ONLY thing that exercises
+/// `ViewerExtractor` at all — it is defined here and attached to no handler
+/// until PR-07.
+#[cfg(all(test, feature = "db"))]
+mod viewer_extractor_tests {
+    use super::*;
+    use axum::extract::FromRequestParts;
+    use axum::http::Request;
+    use axum::response::IntoResponse;
+    use uuid::Uuid;
+
+    fn parts_with_auth(auth: Option<AuthContext>) -> axum::http::request::Parts {
+        let req = Request::builder()
+            .uri("/api/v1/claims/00000000-0000-0000-0000-000000000000")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        if let Some(auth) = auth {
+            parts.extensions.insert(auth);
+        }
+        parts
+    }
+
+    fn auth_ctx(agent_id: Option<Uuid>) -> AuthContext {
+        AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id,
+            owner_id: None,
+            client_type: ClientType::Service,
+            scopes: vec!["claims:read".to_string()],
+            jti: Uuid::new_v4(),
+        }
+    }
+
+    /// A pool that is never connected to. Both rejection paths return before
+    /// `Viewer::resolve` touches it, so lazy connection is never triggered.
+    fn unconnected_state() -> AppState {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool construction does not connect");
+        AppState::with_db(pool, crate::state::ApiConfig::default())
+    }
+
+    #[tokio::test]
+    async fn missing_auth_context_is_401() {
+        let state = unconnected_state();
+        let mut parts = parts_with_auth(None);
+        let r: Result<ViewerExtractor, _> =
+            ViewerExtractor::from_request_parts(&mut parts, &state).await;
+        assert!(
+            matches!(r, Err(ApiError::Unauthorized { .. })),
+            "no credential must be 401, never a viewer"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_context_without_agent_id_is_401_invalid_token() {
+        let state = unconnected_state();
+        let mut parts = parts_with_auth(Some(auth_ctx(None)));
+        let r: Result<ViewerExtractor, _> =
+            ViewerExtractor::from_request_parts(&mut parts, &state).await;
+
+        let err = match r {
+            Err(e) => e,
+            Ok(_) => panic!("a token with no agent_id must not yield a Viewer"),
+        };
+        assert!(
+            matches!(err, ApiError::Unauthorized { .. }),
+            "a principal-less token is 401 (re-mint), not 403 (you are known \
+             and the answer is no)"
+        );
+
+        // The client has to be able to *tell* that re-minting is the fix, which
+        // is what the RFC 6750 challenge says.
+        let response = err.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let challenge = response
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .expect("401 carries a WWW-Authenticate challenge")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            challenge.contains(r#"error="invalid_token""#),
+            "got: {challenge}"
+        );
     }
 }

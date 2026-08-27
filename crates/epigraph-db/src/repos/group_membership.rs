@@ -290,4 +290,44 @@ impl GroupMembershipRepository {
 
         Ok(row.map(|r| r.0))
     }
+
+    /// Every live `(group_id, role)` pair for one agent.
+    ///
+    /// This is the single query behind `Viewer::resolve`
+    /// (`crates/epigraph-db/src/visibility.rs`) and therefore sits on the hot
+    /// path of every authenticated request once PR-07 attaches the extractor.
+    /// It is served index-only by `idx_group_memberships_agent_live`
+    /// (`migrations/060_group_tenancy_tables.sql:266-268`), whose columns are
+    /// `(agent_id, group_id, role) WHERE revoked_at IS NULL` — exactly this
+    /// predicate and exactly this projection, in that order.
+    ///
+    /// Rows are returned unordered. The partial unique index
+    /// `group_memberships_one_live (group_id, agent_id) WHERE revoked_at IS
+    /// NULL` (`migrations/060_group_tenancy_tables.sql:263-264`) guarantees at
+    /// most one live row per `(group_id, agent_id)`, so a duplicate `group_id`
+    /// is not reachable through the schema; `Viewer::resolve` still sorts and
+    /// dedups defensively, because the bind it produces is fed to a `= ANY($V)`
+    /// whose cost is proportional to the array length and nothing downstream
+    /// should have to trust an index it cannot see.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn list_live_for_agent(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>, DbError> {
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            r#"
+            SELECT group_id, role
+            FROM group_memberships
+            WHERE agent_id = $1 AND revoked_at IS NULL
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
 }

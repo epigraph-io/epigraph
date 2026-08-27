@@ -241,6 +241,14 @@ fn validate_batch_item(item: &BatchClaimItem) -> Result<Claim, String> {
 // TESTS
 // =============================================================================
 
+// NOT COMPILED, NOT RUN. `epigraph-api`'s default features are `["db"]` and
+// the `not(feature = "db")` configuration has 28 pre-existing compile errors
+// (`routes/admin.rs`'s `ApiConfig` literal alone omits `allow_all_identities`),
+// so `cargo test -p epigraph-api --lib -- --list` names none of the tests
+// below. PR-03's `OK -> UNAUTHORIZED` flips in here are DOCUMENTATION of the
+// intended behaviour, not coverage of it. The behaviour is actually asserted
+// by `tests/public_router_allowlist.rs`, which probes every route on the
+// `protected` chain of the buildable variant.
 #[cfg(all(test, not(feature = "db")))]
 mod tests {
     use super::*;
@@ -268,7 +276,7 @@ mod tests {
     /// Create a default test state
     fn test_state() -> AppState {
         AppState::new(ApiConfig {
-            require_signatures: false,
+            require_packet_signatures: false,
             ..ApiConfig::default()
         })
     }
@@ -658,13 +666,13 @@ mod tests {
     /// Test that POST /api/v1/claims/batch without signature headers
     /// returns 401 when routed through the full production middleware stack.
     ///
-    /// The batch endpoint is a protected (write) route. The require_signature
+    /// The batch endpoint is a protected (write) route. `bearer_auth_middleware`
     /// middleware rejects requests that lack the X-Signature, X-Public-Key,
     /// and X-Timestamp headers before the handler is ever invoked.
     #[tokio::test]
     async fn test_batch_without_signature_returns_401() {
         let state = test_state();
-        // Use the full production router (includes require_signature middleware)
+        // Use the full production router (includes bearer_auth_middleware)
         let router = crate::routes::create_router(state);
 
         let body = serde_json::json!({

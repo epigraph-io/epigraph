@@ -686,7 +686,24 @@ async fn validate_packet(
     }
 
     // 7. Validate signature (if required)
-    if state.config.require_signatures {
+    //
+    // DELIBERATE: the six 401s in this block are raw
+    // `(StatusCode::UNAUTHORIZED, Json(ErrorResponse))` tuples and carry NO
+    // `WWW-Authenticate` challenge, unlike every 401 `ApiError` produces.
+    //
+    // PR-03's acceptance asked for "the challenge header on every 401 shape",
+    // and this is the exception, recorded rather than left implicit. An RFC
+    // 6750 challenge means *"your bearer credential is the problem; obtain a
+    // new one and retry"*. Here the bearer credential was already accepted by
+    // `bearer_auth_middleware` several layers out; what failed is the Ed25519
+    // signature over the PAYLOAD, a different mechanism at a different layer
+    // keyed to a different secret. Telling that client to re-mint its OAuth
+    // token would send it round a loop that cannot terminate — the packet
+    // would still be unsigned.
+    //
+    // (RFC 6750 §3 scopes the challenge to requests that fail *bearer* token
+    // authentication, so omitting it here is conformant, not a shortcut.)
+    if state.config.require_packet_signatures {
         // Validate signature format (128 hex chars for Ed25519)
         if packet.signature.len() != 128 {
             return Err((
@@ -718,7 +735,7 @@ async fn validate_packet(
         //
         // When the `db` feature is disabled, we have no public-key store to
         // verify against, so we fail closed: any request on the
-        // require_signatures path is rejected. Builds with `db` enabled
+        // require_packet_signatures path is rejected. Builds with `db` enabled
         // perform the real Ed25519 verification below.
         #[cfg(feature = "db")]
         {
@@ -2021,7 +2038,7 @@ mod event_tests {
     #[tokio::test]
     async fn test_submit_packet_publishes_claim_submitted_event() {
         let state = AppState::new(ApiConfig {
-            require_signatures: false,
+            require_packet_signatures: false,
             ..ApiConfig::default()
         });
 
@@ -2055,7 +2072,7 @@ mod event_tests {
     #[tokio::test]
     async fn test_submit_packet_no_event_on_validation_failure() {
         let state = AppState::new(ApiConfig {
-            require_signatures: false,
+            require_packet_signatures: false,
             ..ApiConfig::default()
         });
 
@@ -2098,8 +2115,8 @@ mod event_tests {
     }
 
     /// Test that submitting a packet without signature headers through the full
-    /// router (which includes the `require_signature` middleware) returns 401
-    /// when `require_signatures` is enabled.
+    /// router (which layers `bearer_auth_middleware` on `protected`) returns 401
+    /// when `require_packet_signatures` is enabled.
     ///
     /// This exercises the complete middleware stack: rate limiter -> signature
     /// verification -> handler, verifying that unauthenticated write requests
@@ -2107,7 +2124,7 @@ mod event_tests {
     #[tokio::test]
     async fn test_submit_without_signature_headers_returns_401_via_full_router() {
         let state = AppState::new(ApiConfig {
-            require_signatures: true,
+            require_packet_signatures: true,
             ..ApiConfig::default()
         });
         let router = crate::routes::create_router(state);
@@ -2191,7 +2208,7 @@ mod event_tests {
     #[tokio::test]
     async fn test_submit_packet_with_figure_evidence() {
         let state = AppState::new(ApiConfig {
-            require_signatures: false,
+            require_packet_signatures: false,
             ..ApiConfig::default()
         });
 
@@ -2258,12 +2275,12 @@ mod signature_verification_tests {
 
     // ── Test scaffolding ──
 
-    /// Build an `AppState` backed by `pool` with `require_signatures` enabled.
+    /// Build an `AppState` backed by `pool` with `require_packet_signatures` enabled.
     fn test_state_with_required_signatures(pool: PgPool) -> AppState {
         AppState::with_db(
             pool,
             ApiConfig {
-                require_signatures: true,
+                require_packet_signatures: true,
                 ..ApiConfig::default()
             },
         )

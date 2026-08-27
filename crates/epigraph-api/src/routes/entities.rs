@@ -1,11 +1,14 @@
 //! Entity and triple REST endpoints for NER/RDF knowledge graph operations
 //!
-//! ## Write endpoints (protected, require auth)
+//! Every endpoint below is on the `protected` router and requires a Bearer
+//! token. The reads were anonymous until PR-03's router inversion.
+//!
+//! ## Write endpoints
 //! - `POST /api/v1/entities` — Upsert a named entity
 //! - `POST /api/v1/entity-mentions/batch` — Batch insert entity mentions
 //! - `POST /api/v1/triples/batch` — Batch insert RDF-style triples
 //!
-//! ## Read endpoints (public)
+//! ## Read endpoints
 //! - `POST /api/v1/triples/query` — Query triples with optional filters
 //! - `GET /api/v1/entities/:id/neighborhood` — Get all triples for an entity
 

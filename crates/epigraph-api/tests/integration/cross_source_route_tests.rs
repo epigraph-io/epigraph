@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 fn create_test_router(pool: PgPool) -> Router {
     let config = ApiConfig {
-        require_signatures: false,
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()
@@ -22,6 +22,21 @@ fn create_test_router(pool: PgPool) -> Router {
     let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
     let state = AppState::with_db_and_signature_state(pool, config, signature_state);
     create_router(state)
+}
+
+/// Deliberately credential-less, for the cases that assert a 401.
+async fn get_anonymous(router: &Router, path: &str) -> axum::http::Response<axum::body::Body> {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
 }
 
 async fn insert_agent(pool: &PgPool) -> Uuid {
@@ -80,13 +95,20 @@ struct Response {
     pending: Vec<PendingCandidate>,
 }
 
+/// PR-03: `GET /api/v1/claims/:id/cross_source_matches` moved to the protected
+/// router, so these reads need a Bearer token. `decide_bearer_token` (defined
+/// below, for the POST cases) already mints exactly the right shape; reuse it
+/// with a linked agent so the token is not the principal-less kind the API
+/// refuses.
 async fn get(router: &Router, path: &str) -> axum::http::Response<axum::body::Body> {
+    let token = decide_bearer_token(Uuid::new_v4(), Some(Uuid::new_v4()), "service");
     router
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
                 .uri(path)
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -385,7 +407,7 @@ async fn list_candidates_returns_pending_with_excerpts(pool: PgPool) {
     .unwrap();
 
     let router = create_test_router(pool);
-    let resp = get(&router, "/api/v1/match_candidates?status=pending&limit=100").await;
+    let resp = get_anonymous(&router, "/api/v1/match_candidates?status=pending&limit=100").await;
     assert_eq!(
         resp.status(),
         StatusCode::UNAUTHORIZED,

@@ -304,6 +304,40 @@ pub async fn seed_claim_with_agent(pool: &PgPool, content: &str, agent_id: Uuid)
     id
 }
 
+/// Like [`seed_claim_with_agent`], but the claim also carries a unique
+/// `properties` key so a Cypher `WHERE` can select exactly this row.
+///
+/// `POST /api/v1/graph/query` compiles an unknown property in a `WHERE` clause
+/// to `properties->>'<name>' = $n` (`routes/graph_query.rs`), and it has no
+/// other way to address one specific claim: `n.id` would compile to
+/// `properties->>'id'`, and the node-selection SQL is
+/// `SELECT id FROM claims <where> LIMIT <n>` with **no `ORDER BY`**. A test that
+/// matches all claims and hopes its seeded row lands inside the window is a
+/// test that fails once the shared database grows past the limit — which is
+/// what happened at 2500+ claims against `LIMIT 1000`.
+///
+/// Returns `(claim_id, probe_value)`; query with
+/// `MATCH (n:claim) WHERE n.probe = '<probe_value>' RETURN *`.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
+pub async fn seed_probe_claim_with_agent(
+    pool: &PgPool,
+    content: &str,
+    agent_id: Uuid,
+) -> (Uuid, String) {
+    let claim_id = seed_claim_with_agent(pool, content, agent_id).await;
+    let probe = Uuid::new_v4().to_string();
+    sqlx::query("UPDATE claims SET properties = jsonb_build_object('probe', $1::text) WHERE id = $2")
+        .bind(&probe)
+        .bind(claim_id)
+        .execute(pool)
+        .await
+        .expect("set probe property");
+    (claim_id, probe)
+}
+
 /// Insert a claim with explicit labels.
 #[allow(
     dead_code,
@@ -363,6 +397,42 @@ pub async fn test_bearer_token_with_seeded_client(
             "service",
             None,
             None,
+            chrono::Duration::minutes(60),
+        )
+        .expect("test JWT issued");
+    (token, client_id)
+}
+
+/// Like [`test_bearer_token_with_seeded_client`], but the JWT also carries a
+/// non-null `agent_id` claim.
+///
+/// PR-03 makes this the shape a write path needs. `POST /api/v1/claims` used to
+/// resolve the author's public key through a fallback chain that ended in
+/// `[0u8; 32]` when the token named no principal; that chain is deleted and a
+/// principal-less token is now 401 `invalid_token`. `agent_id` must name a row
+/// in `agents` — a token naming a nonexistent agent is also 401, deliberately,
+/// rather than the zero key it used to produce.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
+pub async fn test_bearer_token_with_seeded_client_for_agent(
+    pool: &PgPool,
+    scopes: &[&str],
+    agent_id: Uuid,
+) -> (String, Uuid) {
+    let client_id = Uuid::new_v4();
+    seed_oauth_client(pool, client_id).await;
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (token, _jti) = cfg
+        .issue_access_token(
+            client_id,
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+            "service",
+            None,
+            Some(agent_id),
             chrono::Duration::minutes(60),
         )
         .expect("test JWT issued");

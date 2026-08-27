@@ -3,9 +3,16 @@
 //! Provides REST endpoints for creating and querying edges (relationships)
 //! between entities in the epistemic knowledge graph.
 //!
-//! - `POST /api/v1/edges` — Create a new edge (protected, requires signature)
-//! - `GET /api/v1/edges` — Query edges by source, target, or relationship (public)
-//! - `GET /api/v1/claims/:id/neighborhood` — Get 2-hop subgraph around a claim (public)
+//! - `POST /api/v1/edges` — Create a new edge
+//! - `GET /api/v1/edges` — Query edges by source, target, or relationship
+//! - `GET /api/v1/claims/:id/neighborhood` — Get 2-hop subgraph around a claim
+//!
+//! Every route in this module is registered on the `protected` router and
+//! requires an OAuth2 Bearer token (PR-03). The `(public)` annotations that
+//! used to sit on the two reads above were accurate until the router
+//! inversion; they are removed rather than corrected because "protected" is
+//! now the module-wide default and an exception would be the thing worth
+//! annotating.
 
 #[cfg(feature = "db")]
 use crate::access_control::{check_content_access, ContentAccess};
@@ -1451,7 +1458,8 @@ async fn entity_exists(state: &AppState, id: Uuid, entity_type: &str) -> Result<
 
 /// Query edges by source, target, or relationship
 ///
-/// Public route — no authentication required.
+/// Requires a Bearer token: an edge list is claim-derived structure, and PR-03
+/// moved this registration into the `protected` router.
 ///
 /// At least one filter parameter must be provided.
 #[cfg(feature = "db")]
@@ -1514,7 +1522,7 @@ pub async fn list_edges(
 /// Returns all edges where the claim is either source or target (1-hop),
 /// plus edges connected to those neighbors (2-hop).
 ///
-/// Public route — no authentication required.
+/// Requires a Bearer token (PR-03: registered on the `protected` router).
 #[cfg(feature = "db")]
 pub async fn claim_neighborhood(
     State(state): State<AppState>,
@@ -3284,7 +3292,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -3428,7 +3436,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );

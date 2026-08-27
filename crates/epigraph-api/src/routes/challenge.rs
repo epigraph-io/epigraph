@@ -1,7 +1,7 @@
 //! Challenge endpoints for disputing claims
 //!
 //! POST /api/v1/claims/:id/challenge - Submit a challenge (protected)
-//! GET  /api/v1/claims/:id/challenges - List challenges for a claim (public)
+//! GET  /api/v1/claims/:id/challenges - List challenges for a claim
 //!
 //! Challenges allow agents to dispute existing claims with counter-evidence.
 //! This is a core epistemic mechanism: truth must be contestable to be trustworthy.
@@ -273,8 +273,15 @@ pub async fn submit_challenge(
 ///
 /// GET /api/v1/claims/:id/challenges
 ///
-/// This is a public endpoint. Transparency is a core epistemic principle:
-/// anyone can see what challenges have been raised against a claim.
+/// Requires a Bearer token. This doc used to argue the opposite — that
+/// transparency is a core epistemic principle, so anyone may see what
+/// challenges have been raised against a claim — and PR-03 moved the route
+/// onto the `protected` router anyway. The principle survives, its scope
+/// changed: transparency is owed to participants in the corpus, not to the
+/// unauthenticated internet, because `challenges.explanation` quotes the claim
+/// it disputes and so leaks content the reader may not be entitled to.
+/// Filtering the query by the reader's `Viewer` is PR-07 (plan §2.4 / §4.9
+/// #23); until then the token requirement is the whole control.
 ///
 /// # Errors
 ///
@@ -364,6 +371,12 @@ mod tests {
 
     // ---- Handler integration tests (need AppState without DB) ----
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod handler_tests {
         use super::super::*;
@@ -378,7 +391,7 @@ mod tests {
         /// Create a test router with challenge endpoints (no auth middleware for unit tests)
         fn test_router() -> Router {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -539,7 +552,7 @@ mod tests {
         async fn test_list_challenges_after_submission() {
             // Use shared state so both requests see the same ChallengeService
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -580,7 +593,7 @@ mod tests {
         #[tokio::test]
         async fn test_duplicate_challenge_rejected() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -639,7 +652,7 @@ mod tests {
 
             for challenge_type in valid_types {
                 let state = AppState::new(ApiConfig {
-                    require_signatures: false,
+                    require_packet_signatures: false,
                     ..ApiConfig::default()
                 });
 
@@ -688,10 +701,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_submit_challenge_without_signature_returns_401() {
-            // Use create_router which wires up the require_signature middleware.
+            // Use create_router, which layers bearer_auth_middleware on the
+            // protected router.
             // Any POST to a protected route without signature headers must be rejected.
             let state = AppState::new(ApiConfig {
-                require_signatures: false, // even with flag off, middleware still checks headers
+                require_packet_signatures: false, // even with flag off, middleware still checks headers
                 ..ApiConfig::default()
             });
             let router = crate::routes::create_router(state);
@@ -718,10 +732,18 @@ mod tests {
             );
         }
 
+        /// PR-03 INVERSION. This asserted 200, with the comment "The GET
+        /// endpoint is public - no auth required". `GET
+        /// /api/v1/claims/:id/challenges` returns `challenges.explanation`,
+        /// which is free prose about a claim written by whoever disputed it —
+        /// so it leaks the disputed claim's substance for any claim id a caller
+        /// can guess or enumerate.
+        ///
+        /// PR-03 closes the anonymous access. Filtering the query itself by the
+        /// caller's `Viewer` (so that an AUTHENTICATED caller sees no
+        /// explanation for a claim they cannot read) is PR-07.
         #[tokio::test]
-        async fn test_list_challenges_via_full_router_returns_empty_for_nonexistent_claim() {
-            // The GET endpoint is public - no auth required.
-            // A random UUID that has no challenges should return an empty list, not 404.
+        async fn test_list_challenges_via_full_router_is_401() {
             let state = AppState::new(ApiConfig::default());
             let router = crate::routes::create_router(state);
 
@@ -733,11 +755,7 @@ mod tests {
                 .unwrap();
 
             let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let list: ListChallengesResponse = parse_body(response).await;
-            assert_eq!(list.total, 0);
-            assert!(list.challenges.is_empty());
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
 
         #[tokio::test]
@@ -745,7 +763,7 @@ mod tests {
             // Submit multiple challenges from different agents against the same claim,
             // then verify list_challenges returns all of them.
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -806,7 +824,7 @@ mod tests {
         async fn test_list_challenges_different_claims_are_isolated() {
             // Challenges for claim A must not appear in the listing for claim B.
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -864,7 +882,7 @@ mod tests {
             // Verify that submitting two challenges from the same agent against
             // the same claim is rejected as a duplicate, even with different types.
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -901,7 +919,7 @@ mod tests {
         async fn test_duplicate_challenge_different_agent_same_claim_allowed() {
             // Two different agents should be able to challenge the same claim.
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -944,7 +962,7 @@ mod tests {
         async fn test_submit_challenge_response_fields_match_request() {
             // Verify the response body accurately reflects the submitted challenge.
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -979,10 +997,15 @@ mod tests {
             assert_ne!(challenge.id, Uuid::nil());
         }
 
+        /// PR-03: the routing half of this end-to-end check now terminates at
+        /// the auth layer. The handler half — that a challenge submitted
+        /// through the service is returned by `list_challenges` — is covered by
+        /// `test_list_challenges_returns_multiple` above, which calls the
+        /// handler directly.
         #[tokio::test]
-        async fn test_list_challenges_via_full_router_after_direct_submission() {
-            // Submit a challenge via the service, then verify it appears through
-            // the full router's GET endpoint (proving routing + handler work end-to-end).
+        async fn test_list_challenges_via_full_router_after_direct_submission_is_401() {
+            // Submit a challenge via the service, then verify the full router
+            // refuses to hand it to an unauthenticated caller.
             let state = AppState::new(ApiConfig::default());
 
             let claim_id = Uuid::new_v4();
@@ -1005,16 +1028,22 @@ mod tests {
                 .unwrap();
 
             let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let list: ListChallengesResponse = parse_body(response).await;
-            assert_eq!(list.total, 1);
-            assert_eq!(list.challenges[0].claim_id, claim_id);
-            assert_eq!(list.challenges[0].challenger_id, challenger_id);
-            assert_eq!(list.challenges[0].challenge_type, "contradicting_evidence");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "a challenge's explanation is claim-derived content and is not \
+                 anonymously readable"
+            );
+            let _ = (claim_id, challenger_id);
         }
     } // end mod handler_tests
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod event_tests {
         use super::super::*;
@@ -1028,7 +1057,7 @@ mod tests {
         #[tokio::test]
         async fn test_submit_challenge_publishes_claim_challenged_event() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -1067,7 +1096,7 @@ mod tests {
         #[tokio::test]
         async fn test_submit_challenge_no_event_on_validation_failure() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 

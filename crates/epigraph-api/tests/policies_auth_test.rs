@@ -167,7 +167,14 @@ async fn create_challenge_with_claims_write_returns_200() {
     let (addr, _shutdown) = common::spawn_app(&url).await;
 
     let token = common::test_bearer_token_with_scopes(&["claims:write"]);
-    let body = serde_json::json!({ "host": "example.com", "port": 443 });
+    // The host must be UNIQUE PER RUN. The handler files a claim whose content
+    // is derived from (host, port); with a fixed `example.com:443` the second
+    // run against the same database hit `uq_claims_content_hash_agent` and
+    // returned 500, so this test passed exactly once per freshly migrated DB
+    // and failed on every run after — a false failure with nothing to do with
+    // authorization, which is all this file is about.
+    let host = format!("{}.example.com", Uuid::new_v4().simple());
+    let body = serde_json::json!({ "host": host, "port": 443 });
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/v1/policy-challenges"))
         .bearer_auth(&token)

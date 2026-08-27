@@ -1,7 +1,10 @@
 //! Agent activity timeline endpoint
 //!
 //! Merges security events and PROV-O activities for a single agent into a
-//! unified, time-ordered audit view.  Read-only; no authentication required.
+//! unified, time-ordered audit view.  Read-only, and — since PR-03 moved the
+//! registration onto the `protected` router — authenticated: an agent's audit
+//! trail is exactly the kind of activity map an anonymous scanner should not
+//! be able to assemble.
 
 use axum::{
     extract::{Path, State},

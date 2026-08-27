@@ -617,6 +617,12 @@ mod tests {
     // Formerly in-memory tests gated behind #[cfg(not(feature = "db"))].
     // These need to be rewritten as proper DB integration tests.
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod handler_tests_placeholder {
         use super::super::*;
@@ -639,7 +645,7 @@ mod tests {
         /// Helper to create a state with a claim pre-populated in the store
         async fn state_with_claim(claim_id: Uuid) -> (AppState, Uuid) {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -736,7 +742,7 @@ mod tests {
         #[tokio::test]
         async fn test_supersede_nonexistent_claim_returns_404() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
             let router = test_router(state);
@@ -1003,7 +1009,7 @@ mod tests {
         #[tokio::test]
         async fn test_history_nonexistent_claim_returns_404() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
             let router = test_router(state);
@@ -1088,13 +1094,13 @@ mod tests {
         /// when the request goes through the full create_router middleware stack.
         ///
         /// This is a true integration test: it uses the production router
-        /// (including the require_signature middleware layer) rather than a
+        /// (including the bearer_auth_middleware layer) rather than a
         /// bare handler router, proving that unauthenticated writes are rejected.
         #[tokio::test]
         async fn test_supersede_without_signature_returns_401() {
             let claim_id = Uuid::new_v4();
             let state = AppState::new(ApiConfig {
-                require_signatures: false, // irrelevant; middleware always checks headers
+                require_packet_signatures: false, // irrelevant; middleware always checks headers
                 ..ApiConfig::default()
             });
 
@@ -1217,10 +1223,13 @@ mod tests {
             assert!(history.versions[2].is_current);
         }
 
-        /// Test that the GET /history endpoint is publicly accessible
-        /// (no signature headers required) through the full router.
+        /// PR-03 INVERSION. This asserted that `GET /api/v1/claims/:id/history`
+        /// answered 200 with no credential, "because the history endpoint is on
+        /// the public router". It is not on the public router any more: version
+        /// history is claim content over time, which is strictly more than
+        /// `GET /api/v1/claims/:id` exposes.
         #[tokio::test]
-        async fn test_history_accessible_without_signature() {
+        async fn test_history_is_401_without_a_token() {
             let claim_id = Uuid::new_v4();
             let state = AppState::new(ApiConfig::default());
 
@@ -1243,8 +1252,10 @@ mod tests {
             // Use the full production router (with middleware)
             let router = crate::routes::create_router(state);
 
-            // GET without any signature headers -> should succeed (200) because
-            // the history endpoint is on the public router
+            // GET with no Authorization header -> 401 with the RFC 6750
+            // challenge. The handler's own behaviour (that it returns one
+            // version for a freshly-inserted claim) is covered by the
+            // handler-level tests above, which call it directly.
             let request = Request::builder()
                 .method("GET")
                 .uri(format!("/api/v1/claims/{claim_id}/history"))
@@ -1254,15 +1265,28 @@ mod tests {
             let response = router.oneshot(request).await.unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
-                "History endpoint should be publicly accessible without signature"
+                StatusCode::UNAUTHORIZED,
+                "claim version history is no longer anonymously readable"
             );
-
-            let history: VersionHistoryResponse = parse_body(response).await;
-            assert_eq!(history.total_versions, 1);
+            let challenge = response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .expect("401 carries an RFC 6750 challenge")
+                .to_str()
+                .unwrap();
+            assert!(
+                challenge.contains(r#"error="invalid_token""#),
+                "got: {challenge}"
+            );
         }
     } // end mod handler_tests
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod event_tests {
         use super::super::*;
@@ -1285,7 +1309,7 @@ mod tests {
         /// Helper to create a state with a claim pre-populated in the store
         async fn state_with_claim(claim_id: Uuid) -> AppState {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 

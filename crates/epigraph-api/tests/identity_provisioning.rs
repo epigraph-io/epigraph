@@ -320,7 +320,7 @@ async fn a_derived_key_is_refused_by_the_packet_verifier(pool: PgPool) {
     let signing_app = create_router(AppState::with_db(
         pool.clone(),
         ApiConfig {
-            require_signatures: true,
+            require_packet_signatures: true,
             ..ApiConfig::default()
         },
     ));

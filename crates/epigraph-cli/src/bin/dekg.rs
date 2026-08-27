@@ -3,8 +3,13 @@
 //! Wraps the `EpiGraph` REST API with ergonomic CLI commands for frames, beliefs,
 //! divergence, conflict analysis, evidence submission, and entity management.
 //!
+//! Every command below calls a route that requires an OAuth2 Bearer token
+//! (PR-03 moved the whole read surface behind authentication). Supply one with
+//! `--token` or `EPIGRAPH_TOKEN`; the JWT must carry a non-null `agent_id`
+//! claim, or the API answers 401 `invalid_token`.
+//!
 //! Usage:
-//!   `dekg frame list`
+//!   `EPIGRAPH_TOKEN=... dekg frame list`
 //!   `dekg belief show <claim_id>`
 //!   `dekg divergence report --threshold 0.3`
 //!   `dekg evidence submit <content> --frame <id> --mass '{"0": 0.7, "0,1": 0.3}'`
@@ -32,6 +37,15 @@ struct Cli {
         default_value = "http://localhost:3000"
     )]
     api_url: String,
+
+    /// OAuth2 Bearer token (or set `EPIGRAPH_TOKEN`).
+    ///
+    /// Required: every route this CLI calls moved behind authentication in
+    /// PR-03. The JWT must carry a non-null `agent_id` claim — the API resolves
+    /// the caller's read authority from it and refuses a principal-less token
+    /// with 401 `invalid_token`.
+    #[arg(long, env = "EPIGRAPH_TOKEN")]
+    token: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -421,7 +435,35 @@ struct EvidenceSubmissionResponse {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = Client::new();
+
+    // Attach the bearer token once, as a default header, rather than at each of
+    // the ~20 request sites below.
+    //
+    // A missing token is a hard error rather than an anonymous attempt: without
+    // it every command fails with an opaque JSON deserialization error against
+    // a 401 body, which is a materially worse thing to debug than this message.
+    let token = cli
+        .token
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no API token: pass --token or set EPIGRAPH_TOKEN.\n\
+             Every dekg command calls an authenticated route, and the token \
+             must carry a non-null agent_id claim."
+            )
+        })?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {token}")
+            .parse()
+            .context("EPIGRAPH_TOKEN is not a valid HTTP header value")?,
+    );
+    let client = Client::builder()
+        .default_headers(headers)
+        .build()
+        .context("building the HTTP client")?;
     let base = cli.api_url.trim_end_matches('/');
 
     match cli.command {

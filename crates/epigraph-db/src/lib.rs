@@ -54,6 +54,7 @@ pub mod access_control;
 pub mod errors;
 pub mod pool;
 pub mod repos;
+pub mod visibility;
 
 // Re-export primary types
 pub use access_control::{
@@ -91,6 +92,7 @@ pub use repos::{
     WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
     EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
+pub use visibility::{MaintenanceLease, SystemReason, Viewer};
 
 // Re-export sqlx types that users will need
 pub use sqlx::PgPool;

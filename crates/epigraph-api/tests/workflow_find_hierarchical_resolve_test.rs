@@ -28,12 +28,17 @@ async fn find_workflow_hierarchical_resolve_to_latest_includes_resolved_steps() 
     .expect("seed workflow");
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
+    // PR-03: this route moved to the protected router. The token must carry a
+    // non-null `agent_id`; `mint_token_with_agent` is the only tests/common
+    // helper that sets one.
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
 
     // Default: resolve_to_latest=false → no resolved_steps key.
     let resp_default: serde_json::Value = reqwest::Client::new()
         .get(format!(
             "http://{addr}/api/v1/workflows/hierarchical/search?q={unique_goal}"
         ))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap()
@@ -50,6 +55,7 @@ async fn find_workflow_hierarchical_resolve_to_latest_includes_resolved_steps() 
     // resolve_to_latest=true → each workflow has a resolved_steps array.
     let resp_resolved: serde_json::Value = reqwest::Client::new()
         .get(format!("http://{addr}/api/v1/workflows/hierarchical/search?q={unique_goal}&resolve_to_latest=true"))
+        .bearer_auth(&token)
         .send().await.unwrap().json().await.unwrap();
     assert_eq!(resp_resolved["resolve_to_latest"], serde_json::json!(true));
     let workflows = resp_resolved["workflows"].as_array().unwrap();
