@@ -200,7 +200,73 @@ source hunk, observe the failure, restore, observe the pass.
 
 ## 8. Item ledger
 
-*Populated when rounds 3 and 4 complete — see `HANDOFF-LEDGER.md`.*
+**Graph index claim: `0e4b4b96-ffdf-4566-8b6e-ccf163d4c69a`** — the single durable, queryable record
+of what landed where, with commit shas. Read it first.
+
+**New defect found during the sweep: `152d9af6`** (priority-high). `belief_query::get_belief` with no
+`frame_id` never reads the DS cache; it returns `cached_from_truth(truth_value)`, and both the tool
+schema and the doc comment say otherwise. This is distinct from `696d3a1c` and the two mask each
+other — fixing only `696d3a1c` will look like it did not work.
+
+### RETIREMENT IS OUTSTANDING — action required
+
+Nothing was retired. `resolve_backlog_item` failed with:
+
+> claim is owned by agent `427aa492-…`; caller principal `149ea918-…` cannot retire it
+> (requires claims:admin scope or ownership)
+
+The MCP principal changed mid-session. Free-text "Resolves &lt;uuid&gt;" claims were deliberately NOT
+filed as a substitute — per §6 those leave the original open in every backlog query forever. **An
+owning agent or an admin must retire the completed items listed in `0e4b4b96`.**
+
+### Verified SOUND — `fix/backlog-sweep-2026-08-26` (31 commits, 1873 tests, offline-clean)
+
+| Item | What landed | Commit |
+|---|---|---|
+| `696d3a1c` | recompute_beliefs frame-name-ordered clobber | `22c1c7e1` |
+| `cdd8d097` | get_neighborhood/traverse blind to non-claim nodes | `63e4ddd4` |
+| `a85ee585` | query_claims `is_current` fabrication at two layers | `b1dd73e7` |
+| `52eff3ab` | `shifted_to` edge — re-rank only, never moves belief | `eec703be` (mig 060) |
+| `e09986c2` | additive `canonical_hash`, wire contract intact | `7b569f86` (mig 061) |
+| `9a0bd3e2` | symmetric contradicts dedup | round 1 + 2 |
+| `31c10a5a` | get_provenance depth/node caps | round 1 + 2 |
+| `6ed02d04` | write-time contradiction staging | round 1 + 2 |
+| `d4f1e8fa` | closure_basis as justifies edges | round 1 |
+| `0a2ed32d` | `get_step_deviations` | round 1 |
+| `dae795f8` | edge-writer inventory + drift guard | round 1 |
+
+### Verified SOUND — `feat/blob-manifest-anchor` (7 commits, 1783 tests, offline-clean)
+
+| Item | What landed | Migration / tools |
+|---|---|---|
+| — | blob store ported from episcience | `070`, `attach_blob` |
+| `6e2364b8` | Merkle manifests over an immutable per-row subset | `071`, `export_subgraph_manifest`, `verify_manifest` |
+| `94e62824` | mock-first anchoring of manifest roots | `072`, `anchor_manifest`, `verify_anchor` |
+| `4b48ffb5` | obligation MVP — flagged as needing elaboration | `073`, `check_obligation` |
+
+### NOT done
+
+- **`7c909c49` essence binding.** Complete feasible design, skipped by an orchestration bug (the
+  design agent returned track id `essence-binding`; the driver's order array looked up `essence`).
+  Recorded verbatim in `backlog-sweep-2026-08-26-essence-design.md`. Decisions 17 and 18 are stale.
+
+### Landed but NOT trustworthy — review before trusting
+
+- **`1a79c4d9`** shipped **inert** — no caller outside the trait's own default, so every persisted
+  digest still takes the untagged path. It also moves digests *and signature preimages* in
+  `epigraph-harvester`, which is in the Cargo `exclude` list and therefore never compile-checked.
+- **`5e54282f`** shipped **disabled** — gated on an embedder that returns `Err` whenever the API key
+  is absent or `"mock"`, which is how every DB-backed test builds the server.
+
+Both are revert-or-wire-up decisions, not retirements.
+
+### Open non-blocking defects from round 4 verifiers (unfixed by the halt)
+
+- blob: `mime_type` is validated only for emptiness yet echoed into responses — the unguarded twin
+  of the filename bug the same commit fixed.
+- manifest: `ManifestRepository::list_for_row` has zero production callers (dead code).
+- anchor: `service.rs` mislabels `trust_basis` when the process backend differs from the row's.
+- obligation: `declared_total` above `i32::MAX` truncates on store (no verdict is ever wrong).
 
 The authoritative record is the graph itself. Query open items with:
 
