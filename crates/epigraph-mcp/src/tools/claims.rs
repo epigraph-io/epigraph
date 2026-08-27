@@ -829,6 +829,15 @@ pub async fn update_with_evidence(
     server: &EpiGraphMcpFull,
     params: UpdateWithEvidenceParams,
 ) -> Result<CallToolResult, McpError> {
+    // Reject unexpanded shell syntax up front, mirroring `submit_claim`.
+    // `ClaimRepository::update_labels` already guards its `add` slice, but it
+    // runs *after* the evidence row and DS recomputation have been written, and
+    // its `DbError` was mapped through `internal_error` — a 500, which agents
+    // retry. Checking here fails the call before any write, and `map_db_error`
+    // turns `DbError::InvalidData` into `invalid_params` so the caller is told
+    // to fix the label rather than to try again.
+    epigraph_db::reject_shell_expansion(&params.labels).map_err(map_db_error)?;
+
     // Two addressing modes, exactly one required: id-mode (`claim_id`) or
     // name-mode (`canonical_name` + `step_index`), the latter resolved through
     // the same `executes`-edge walk `report_hierarchical_outcome` uses (#352).
