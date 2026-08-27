@@ -84,6 +84,149 @@ pub async fn get_workflow_executions(
     }))
 }
 
+/// One step lineage's deviation profile: how often its runs reported a
+/// deviation, how often those runs failed, and which reasons recur.
+#[derive(Debug, serde::Serialize, PartialEq)]
+pub struct LineageDeviationSummary {
+    pub step_lineage_id: uuid::Uuid,
+    pub observations: usize,
+    pub failure_observations: usize,
+    pub distinct_reasons: usize,
+    pub workflow_ids: Vec<uuid::Uuid>,
+    pub last_seen: chrono::DateTime<chrono::Utc>,
+    pub recurring_reasons: Vec<epigraph_engine::deviation_reasons::RecurringReason>,
+}
+
+/// Group raw deviation rows by step lineage and rank each lineage's recurring
+/// reasons. Pure and DB-free — this is the unit-tested seam for
+/// `get_step_deviations`.
+///
+/// Rows whose reason does not normalise are dropped before anything is
+/// counted, so a lineage that only ever recorded `"..."` yields no summary at
+/// all rather than a summary with zero reasons. `distinct_reasons` counts
+/// canonical forms and is independent of `min_count`/`limit`, so the caller can
+/// tell "one recurring reason out of one" from "one out of twenty".
+pub(crate) fn group_deviations_by_lineage(
+    rows: &[epigraph_db::StepDeviationRow],
+    min_count: usize,
+    limit: usize,
+) -> Vec<LineageDeviationSummary> {
+    use epigraph_engine::deviation_reasons::{normalize_reason, rank_recurring_reasons};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // BTreeMap keeps lineage order deterministic (uuid-ascending), which is
+    // also the tiebreak once the stable sort by observation count runs.
+    let mut by_lineage: BTreeMap<uuid::Uuid, Vec<&epigraph_db::StepDeviationRow>> = BTreeMap::new();
+    for row in rows {
+        if normalize_reason(&row.deviation_reason).is_none() {
+            continue;
+        }
+        by_lineage.entry(row.step_lineage_id).or_default().push(row);
+    }
+
+    let mut summaries: Vec<LineageDeviationSummary> = by_lineage
+        .into_iter()
+        .filter(|(_, kept)| !kept.is_empty())
+        .map(|(step_lineage_id, kept)| {
+            let failure_observations = kept.iter().filter(|r| !r.success).count();
+            let workflow_ids: Vec<uuid::Uuid> = kept
+                .iter()
+                .map(|r| r.workflow_id)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let last_seen = kept
+                .iter()
+                .map(|r| r.created_at)
+                .max()
+                .expect("kept is non-empty");
+            let distinct_reasons = kept
+                .iter()
+                .filter_map(|r| normalize_reason(&r.deviation_reason))
+                .collect::<BTreeSet<_>>()
+                .len();
+            let recurring_reasons = rank_recurring_reasons(
+                kept.iter()
+                    .map(|r| (r.deviation_reason.as_str(), r.success)),
+                min_count,
+                limit,
+            );
+
+            LineageDeviationSummary {
+                step_lineage_id,
+                observations: kept.len(),
+                failure_observations,
+                distinct_reasons,
+                workflow_ids,
+                last_seen,
+                recurring_reasons,
+            }
+        })
+        .collect();
+
+    summaries.sort_by_key(|s| std::cmp::Reverse(s.observations));
+    summaries
+}
+
+/// Summarise recurring step deviation reasons for a workflow's versioned step
+/// lineages — the evidence to read BEFORE calling `evolve_step`, so the new
+/// step content addresses observed failures rather than a guess. Read-only.
+///
+/// Reads only hierarchical outcome rows (`report_hierarchical_outcome` /
+/// `POST /api/v1/workflows/.../outcome`). Flat `report_workflow_outcome` rows
+/// carry `step_claim_id = NULL` and are invisible here, so an empty result
+/// means "no hierarchical deviations recorded", NOT "this step never
+/// deviates". A `truncated = true` response means the row cap was hit and the
+/// counts are biased toward recent runs.
+pub async fn get_step_deviations(
+    server: &EpiGraphMcpFull,
+    params: GetStepDeviationsParams,
+) -> Result<CallToolResult, McpError> {
+    let step_lineage_id = match params.step_lineage_id.as_deref() {
+        Some(s) => Some(parse_uuid(s.trim())?),
+        None => None,
+    };
+    let workflow_id = match params.workflow_id.as_deref() {
+        Some(s) => Some(parse_uuid(s.trim())?),
+        None => None,
+    };
+    if step_lineage_id.is_none() && workflow_id.is_none() {
+        return Err(invalid_params(
+            "provide step_lineage_id and/or workflow_id — an unfiltered scan is not supported",
+        ));
+    }
+
+    let min_count = params.min_count.unwrap_or(2).max(1);
+    let limit = params.limit.unwrap_or(5).clamp(1, 20);
+    let max_rows = params.max_rows.unwrap_or(500).clamp(1, 5000);
+
+    let rows = BehavioralExecutionRepository::step_deviation_reasons(
+        &server.pool,
+        step_lineage_id,
+        workflow_id,
+        max_rows,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    let lineages = group_deviations_by_lineage(&rows, min_count, limit);
+
+    success_json(&serde_json::json!({
+        "step_lineage_id": step_lineage_id,
+        "workflow_id": workflow_id,
+        "rows_scanned": rows.len(),
+        "truncated": rows.len() as i64 == max_rows,
+        "min_count": min_count,
+        "limit": limit,
+        "lineages": lineages,
+        "coverage_note": "Hierarchical outcome reports only. Flat report_workflow_outcome rows \
+                          write step_claim_id = NULL, so they are not counted here — an empty \
+                          result means no hierarchical deviations were recorded, not that the \
+                          step never deviates. Steps whose claims predate step-lineage ids (and \
+                          level 0/1 steps, which get none) are likewise absent.",
+    }))
+}
+
 /// Evaluate whether a workflow variant is statistically ready to be promoted
 /// over its immediate (`variant_of`) parent — the autonomous-statistical-gate
 /// verdict the workflow-evolution maintenance pass consumes. Resolves the
@@ -1410,11 +1553,140 @@ pub mod __test_only {
 #[cfg(test)]
 mod tests {
     use super::{
-        hierarchical_row_to_result, merge_threshold_from_env, merge_workflow_results,
-        resolve_goal_identity, slugify_workflow_goal, source_identity, steps_from_resolved,
-        FindWorkflowResult, GoalIdentity, DEFAULT_GOAL_MERGE_THRESHOLD,
+        group_deviations_by_lineage, hierarchical_row_to_result, merge_threshold_from_env,
+        merge_workflow_results, resolve_goal_identity, slugify_workflow_goal, source_identity,
+        steps_from_resolved, FindWorkflowResult, GoalIdentity, DEFAULT_GOAL_MERGE_THRESHOLD,
     };
-    use epigraph_db::{HierarchicalWorkflowRow, LineageHead, ResolvedStep};
+    use epigraph_db::{HierarchicalWorkflowRow, LineageHead, ResolvedStep, StepDeviationRow};
+
+    /// Deviation-row builder: `secs` is an offset from a fixed epoch so tests
+    /// can order rows without depending on wall-clock time.
+    fn dev_row(
+        lineage: uuid::Uuid,
+        workflow: uuid::Uuid,
+        reason: &str,
+        success: bool,
+        secs: i64,
+    ) -> StepDeviationRow {
+        StepDeviationRow {
+            step_lineage_id: lineage,
+            step_claim_id: uuid::Uuid::new_v4(),
+            workflow_id: workflow,
+            deviation_reason: reason.to_string(),
+            success,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0)
+                .expect("valid timestamp"),
+        }
+    }
+
+    /// Two lineage uuids in known ascending order, so tiebreak assertions are
+    /// not at the mercy of random uuid generation.
+    fn ordered_lineages() -> (uuid::Uuid, uuid::Uuid) {
+        (
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000aa").unwrap(),
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap(),
+        )
+    }
+
+    #[test]
+    fn group_deviations_by_lineage_partitions_rows_per_lineage() {
+        let (a, b) = ordered_lineages();
+        let wf = uuid::Uuid::new_v4();
+        let rows = vec![
+            dev_row(a, wf, "tool timed out", false, 1),
+            dev_row(a, wf, "tool timed out", false, 2),
+            dev_row(b, wf, "schema drift", true, 3),
+        ];
+
+        let summaries = group_deviations_by_lineage(&rows, 1, 5);
+        assert_eq!(summaries.len(), 2);
+
+        let sa = summaries.iter().find(|s| s.step_lineage_id == a).unwrap();
+        assert_eq!(sa.observations, 2);
+        assert_eq!(sa.recurring_reasons.len(), 1);
+        assert_eq!(sa.recurring_reasons[0].reason, "tool timed out");
+
+        let sb = summaries.iter().find(|s| s.step_lineage_id == b).unwrap();
+        assert_eq!(sb.observations, 1);
+        assert_eq!(sb.recurring_reasons[0].reason, "schema drift");
+    }
+
+    #[test]
+    fn group_deviations_by_lineage_orders_lineages_by_observation_count() {
+        let (a, b) = ordered_lineages();
+        let wf = uuid::Uuid::new_v4();
+
+        // b has more observations than a, despite sorting later by uuid.
+        let rows = vec![
+            dev_row(a, wf, "tool timed out", false, 1),
+            dev_row(b, wf, "schema drift", false, 2),
+            dev_row(b, wf, "schema drift", false, 3),
+        ];
+        let ranked = group_deviations_by_lineage(&rows, 1, 5);
+        assert_eq!(ranked[0].step_lineage_id, b);
+        assert_eq!(ranked[1].step_lineage_id, a);
+
+        // Exact tie falls back to lineage uuid ascending.
+        let tied = vec![
+            dev_row(b, wf, "schema drift", false, 1),
+            dev_row(a, wf, "tool timed out", false, 2),
+        ];
+        let ranked = group_deviations_by_lineage(&tied, 1, 5);
+        assert_eq!(ranked[0].step_lineage_id, a);
+        assert_eq!(ranked[1].step_lineage_id, b);
+    }
+
+    #[test]
+    fn group_deviations_by_lineage_collects_distinct_workflow_ids_per_lineage() {
+        let (a, _) = ordered_lineages();
+        let gen1 = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000011").unwrap();
+        let gen2 = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000022").unwrap();
+        let rows = vec![
+            dev_row(a, gen2, "tool timed out", false, 1),
+            dev_row(a, gen1, "tool timed out", false, 2),
+            dev_row(a, gen2, "tool timed out", false, 3),
+        ];
+
+        let summaries = group_deviations_by_lineage(&rows, 1, 5);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].workflow_ids, vec![gen1, gen2]);
+    }
+
+    #[test]
+    fn group_deviations_by_lineage_drops_rows_whose_reason_normalizes_away() {
+        let (a, b) = ordered_lineages();
+        let wf = uuid::Uuid::new_v4();
+        let rows = vec![
+            dev_row(a, wf, "tool timed out", false, 1),
+            dev_row(a, wf, "...", false, 2),
+            // A lineage of nothing but unnormalisable reasons must vanish.
+            dev_row(b, wf, "   ", false, 3),
+        ];
+
+        let summaries = group_deviations_by_lineage(&rows, 1, 5);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].step_lineage_id, a);
+        assert_eq!(summaries[0].observations, 1);
+        assert_eq!(summaries[0].failure_observations, 1);
+        assert_eq!(summaries[0].distinct_reasons, 1);
+    }
+
+    #[test]
+    fn group_deviations_by_lineage_reports_last_seen_as_max_created_at() {
+        let (a, _) = ordered_lineages();
+        let wf = uuid::Uuid::new_v4();
+        let newest = dev_row(a, wf, "tool timed out", false, 900);
+        let expected = newest.created_at;
+        // Deliberately not in timestamp order.
+        let rows = vec![
+            dev_row(a, wf, "tool timed out", false, 10),
+            newest,
+            dev_row(a, wf, "tool timed out", false, 100),
+        ];
+
+        let summaries = group_deviations_by_lineage(&rows, 1, 5);
+        assert_eq!(summaries[0].last_seen, expected);
+    }
 
     /// Row builder so a future field on `HierarchicalWorkflowRow` is a one-line
     /// fix here rather than N broken struct literals.

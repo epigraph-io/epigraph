@@ -89,10 +89,10 @@ pub use repos::{
     ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
     ReEncryptionKeyRepository, ReEncryptionKeyRow, ReasoningTraceRepository, RecallEventRepository,
     RecallEventRow, RefreshTokenRepository, RefreshTokenRow, ResolvedStep, ScopedBeliefRepository,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, SweepCandidate, TaskRepository,
-    TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository, WorkflowExecutionRow,
-    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
-    EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    SecurityEventRepository, SecurityEventRow, SheafRepository, StepDeviationRow, SweepCandidate,
+    TaskRepository, TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository,
+    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 
 // Re-export sqlx types that users will need

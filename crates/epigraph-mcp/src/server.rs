@@ -828,7 +828,7 @@ impl EpiGraphMcpFull {
         tools::cdst_maintenance::recompute_beliefs(self, params).await
     }
 
-    // ── Workflows (8 tools) ──
+    // ── Workflows (9 tools) ──
 
     #[tool(
         description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table; use `report_workflow_outcome` with that returned id to record execution results."
@@ -857,6 +857,16 @@ impl EpiGraphMcpFull {
         Parameters(params): Parameters<GetWorkflowExecutionsParams>,
     ) -> Result<CallToolResult, McpError> {
         tools::workflows::get_workflow_executions(self, params).await
+    }
+
+    #[tool(
+        description = "Summarise recurring step deviation reasons for a workflow's versioned step lineages: groups behavioral_executions.step_beliefs.deviation_reason by claims.step_lineage_id, normalises the free text, and ranks the reasons that recur — the evidence to read BEFORE calling evolve_step on that step. Read-only. Covers hierarchical outcome reports only (flat report_workflow_outcome rows have no step_claim_id)."
+    )]
+    async fn get_step_deviations(
+        &self,
+        Parameters(params): Parameters<GetStepDeviationsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::workflows::get_step_deviations(self, params).await
     }
 
     #[tool(

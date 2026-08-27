@@ -39,6 +39,31 @@ pub struct BehavioralExecutionRow {
     pub run_label: Option<String>,
 }
 
+/// One `(execution, step)` pair that recorded a non-empty `deviation_reason`
+/// AND resolved to a versioned step lineage.
+///
+/// Produced by [`BehavioralExecutionRepository::step_deviation_reasons`], which
+/// joins `behavioral_executions.step_claim_id` (migration 021) to
+/// `claims.step_lineage_id` (migration 031) so deviations can be counted per
+/// step lineage rather than per individual claim version.
+///
+/// **Coverage limitation:** flat outcome reports (`report_workflow_outcome` and
+/// its HTTP twin) write `step_claim_id = NULL` and nest `deviation_reason`
+/// under integer keys (`"0"`, `"1"`, …) inside `step_beliefs`, so those rows
+/// are excluded by the inner join and by the `->>'deviation_reason'` lookup.
+/// Only hierarchical outcome reports are represented here. Likewise, claims
+/// with `step_lineage_id IS NULL` (pre-migration-031 rows, and level 0/1 steps,
+/// for which the executor injects no lineage id) never appear.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct StepDeviationRow {
+    pub step_lineage_id: Uuid,
+    pub step_claim_id: Uuid,
+    pub workflow_id: Uuid,
+    pub deviation_reason: String,
+    pub success: bool,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Repository for `behavioral_executions` table operations.
 ///
 /// All methods are static async and take a `&PgPool`. The goal embedding is
@@ -217,6 +242,66 @@ impl BehavioralExecutionRepository {
         )
         .bind(workflow_id)
         .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Fetch the raw deviation-reason rows for a step lineage and/or a
+    /// workflow, newest first, capped at `max_rows`.
+    ///
+    /// Deliberately returns *rows*, not a SQL aggregate: the free-text reason
+    /// has to be normalised (case, whitespace, trailing punctuation) before it
+    /// can be counted, and that normalisation lives in
+    /// `epigraph_engine::deviation_reasons`. A `GROUP BY` here would count
+    /// `"Tool timed out"` and `"tool  timed out."` as two distinct problems.
+    ///
+    /// At least one of `step_lineage_id` / `workflow_id` should be supplied;
+    /// passing `None` for both scans the newest `max_rows` deviations across
+    /// the whole table, which callers are expected to reject.
+    ///
+    /// See [`StepDeviationRow`] for what this does *not* cover: flat
+    /// `report_workflow_outcome` rows carry `step_claim_id = NULL` and are
+    /// dropped by the inner join, so an empty result means "no hierarchical
+    /// deviations recorded", never "this step never deviates".
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn step_deviation_reasons(
+        pool: &PgPool,
+        step_lineage_id: Option<Uuid>,
+        workflow_id: Option<Uuid>,
+        max_rows: i64,
+    ) -> Result<Vec<StepDeviationRow>, DbError> {
+        // Column aliases must match StepDeviationRow's field names exactly —
+        // sqlx::FromRow resolves by name. The projection's coalesce guarantees
+        // `deviation_reason` never decodes a SQL NULL into `String`, even
+        // though the WHERE clause already excludes blank/absent reasons.
+        let rows = sqlx::query_as::<_, StepDeviationRow>(
+            r#"
+            SELECT c.step_lineage_id                                        AS step_lineage_id,
+                   be.step_claim_id                                         AS step_claim_id,
+                   be.workflow_id                                           AS workflow_id,
+                   coalesce(btrim(be.step_beliefs->>'deviation_reason'),'') AS deviation_reason,
+                   be.success                                               AS success,
+                   be.created_at                                            AS created_at
+            FROM behavioral_executions be
+            JOIN claims c ON c.id = be.step_claim_id
+            WHERE be.step_claim_id IS NOT NULL
+              AND c.step_lineage_id IS NOT NULL
+              AND jsonb_typeof(be.step_beliefs) = 'object'
+              AND btrim(coalesce(be.step_beliefs->>'deviation_reason','')) <> ''
+              AND ($1::uuid IS NULL OR c.step_lineage_id = $1::uuid)
+              AND ($2::uuid IS NULL OR be.workflow_id   = $2::uuid)
+            ORDER BY be.created_at DESC, be.id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(step_lineage_id)
+        .bind(workflow_id)
+        .bind(max_rows)
         .fetch_all(pool)
         .await?;
 

@@ -41,6 +41,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("get_provenance", "claims:read"),
     ("get_provenance_chain", "claims:read"),
     ("get_recall_events", "claims:read"),
+    ("get_step_deviations", "claims:read"),
     ("consolidate_claims", "claims:write"),
     ("sweep_semantic_duplicates", "claims:write"),
     ("get_workflow_executions", "claims:read"),

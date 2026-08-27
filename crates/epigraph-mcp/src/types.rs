@@ -662,6 +662,30 @@ pub struct GetWorkflowExecutionsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetStepDeviationsParams {
+    #[schemars(
+        description = "Step lineage UUID (claims.step_lineage_id) to summarise. Provide this and/or workflow_id; at least one is required."
+    )]
+    pub step_lineage_id: Option<String>,
+
+    #[schemars(
+        description = "Workflow UUID whose step lineages to summarise (groups every lineage executed under it). Provide this and/or step_lineage_id."
+    )]
+    pub workflow_id: Option<String>,
+
+    #[schemars(
+        description = "Minimum occurrences before a reason counts as recurring (default 2, min 1)"
+    )]
+    pub min_count: Option<usize>,
+
+    #[schemars(description = "Max recurring reasons returned per lineage (default 5, max 20)")]
+    pub limit: Option<usize>,
+
+    #[schemars(description = "Max deviation rows scanned, newest first (default 500, max 5000)")]
+    pub max_rows: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvaluateWorkflowPromotionParams {
     #[schemars(
         description = "Workflow variant UUID to evaluate for promotion over its variant_of parent"

@@ -5,6 +5,11 @@
 //! Use `supersedes` for linear refinement (new claim takes over from parent);
 //! use `revises` for a concurrent branch sharing a common ancestor. The new
 //! claim shares the same `step_lineage_id` as the parent.
+//!
+//! Before evolving a step, call `get_step_deviations` for the parent's
+//! `step_lineage_id`: it reports which deviation reasons actually recur across
+//! that lineage's runs, so the new `content` addresses observed failures rather
+//! than a guess.
 
 use rmcp::model::{CallToolResult, Content};
 use serde::{Deserialize, Serialize};
