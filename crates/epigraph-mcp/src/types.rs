@@ -1736,6 +1736,12 @@ pub struct ResolveBacklogItemParams {
         description = "Methodology for the resolution claim (default: 'expert_elicitation'). Use 'inductive_generalization' if the resolution generalizes from an observed pattern."
     )]
     pub methodology: Option<String>,
+
+    #[schemars(
+        description = "Optional claim UUIDs that justify closing this item - the evidence, test result, or commit claim the closure rests on. Each becomes a 'justifies' edge (basis -> resolution claim) and the whole list is stored on the resolution claim's properties as 'closure_basis'. Max 16. Every id must be an existing claim and must not be original_id."
+    )]
+    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
+    pub closure_basis: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2245,6 +2251,29 @@ mod tests {
         let raw = serde_json::json!({ "extraction": inner.to_string() });
         let params: IngestWorkflowParams = serde_json::from_value(raw).expect("should deserialize");
         assert_eq!(params.extraction.source.canonical_name, "test-workflow");
+    }
+
+    #[test]
+    fn resolve_backlog_item_params_accepts_missing_closure_basis() {
+        // Backward-compatibility guard for every caller in the wild: the
+        // field was added after the tool shipped, so `#[serde(default)]` must
+        // keep a two-key payload deserializing.
+        let p: ResolveBacklogItemParams =
+            serde_json::from_str(r#"{"original_id":"a","resolution_content":"x"}"#).unwrap();
+        assert!(p.closure_basis.is_none());
+    }
+
+    #[test]
+    fn resolve_backlog_item_params_accepts_double_encoded_closure_basis() {
+        // Proves `deserialize_opt_string_array` is actually wired to the new
+        // field — some MCP clients stringify array params.
+        let raw = r#"{"original_id":"a","resolution_content":"x",
+                      "closure_basis":"[\"11111111-1111-1111-1111-111111111111\"]"}"#;
+        let p: ResolveBacklogItemParams = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            p.closure_basis.as_deref(),
+            Some(["11111111-1111-1111-1111-111111111111".to_string()].as_slice())
+        );
     }
 }
 

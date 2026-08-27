@@ -16,7 +16,9 @@ use epigraph_db::access_control::{
     batch_check_content_access, check_content_access, ContentAccess,
 };
 use epigraph_db::PatchClaimInput;
-use epigraph_db::{ClaimRepository, EdgeRepository, EvidenceRepository, ReasoningTraceRepository};
+use epigraph_db::{
+    ClaimRepository, DbError, EdgeRepository, EvidenceRepository, ReasoningTraceRepository,
+};
 use uuid::Uuid;
 
 /// Resolve an agent-supplied methodology string to a [`Methodology`].
@@ -986,6 +988,112 @@ pub(crate) async fn require_owner_or_admin(
     })
 }
 
+/// Upper bound on `closure_basis` entries accepted by `resolve_backlog_item`.
+///
+/// Each id costs two sequential round-trips — one `get_by_id` existence check
+/// before any write, plus one `create_if_not_exists` (itself a two-statement
+/// transaction) after. The cap bounds the worst case at ~48 statements on a
+/// verb that already does far more; raise it only with that arithmetic in mind.
+const MAX_CLOSURE_BASIS: usize = 16;
+
+/// Parse and normalize the caller's `closure_basis` strings. Pure — no DB.
+///
+/// Rejects (rather than silently drops) three things, because each one means
+/// the caller believes something false about the closure they are recording:
+/// more than [`MAX_CLOSURE_BASIS`] entries, a malformed UUID, and the item
+/// being resolved appearing as its own justification.
+///
+/// De-duplicates while preserving first-seen order, so the stored
+/// `closure_basis` property and the emitted edges are deterministic for a
+/// given input. Empty input yields an empty vector — the zero-cost path every
+/// pre-existing caller takes.
+fn parse_closure_basis(raw: &[String], original_id: Uuid) -> Result<Vec<Uuid>, McpError> {
+    if raw.len() > MAX_CLOSURE_BASIS {
+        return Err(invalid_params(format!(
+            "closure_basis accepts at most {MAX_CLOSURE_BASIS} entries, got {}",
+            raw.len()
+        )));
+    }
+    let mut out: Vec<Uuid> = Vec::with_capacity(raw.len());
+    for (i, s) in raw.iter().enumerate() {
+        let id = Uuid::parse_str(s.trim())
+            .map_err(|e| invalid_params(format!("closure_basis[{i}] is not a valid UUID: {e}")))?;
+        if id == original_id {
+            return Err(invalid_params(format!(
+                "closure_basis[{i}] is the backlog item being resolved ({original_id}); \
+                 an item is not evidence for its own closure"
+            )));
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Split a validated basis list into the ids that may legally receive an edge
+/// and human-readable warnings for the ids that may not. Pure — no DB.
+///
+/// The one skipped case is the resolution claim itself. That is not
+/// hypothetical: `submit_claim` dedups on content hash, so re-filing an
+/// identical resolution hands back a pre-existing claim id, which a caller may
+/// legitimately also be citing as basis. `edges_no_self_loop`
+/// (`migrations/001_initial_schema.sql:772`) rejects a claim→claim self edge,
+/// so filtering here turns a constraint violation into a reported skip.
+fn closure_basis_edge_targets(basis: &[Uuid], resolution_id: Uuid) -> (Vec<Uuid>, Vec<String>) {
+    let mut targets = Vec::with_capacity(basis.len());
+    let mut warnings = Vec::new();
+    for id in basis {
+        if *id == resolution_id {
+            warnings.push(format!(
+                "closure_basis entry {id} is the resolution claim itself; \
+                 skipped the self-edge (recorded in the closure_basis property only)"
+            ));
+        } else {
+            targets.push(*id);
+        }
+    }
+    (targets, warnings)
+}
+
+/// The `properties` fragment stashed on the resolution claim. Pure — no DB.
+///
+/// Merged with jsonb `||` by `patch_claim_atomic_conn`, so it must set exactly
+/// one top-level key: anything else in the object would clobber unrelated
+/// properties on the claim.
+fn closure_basis_properties(basis: &[Uuid]) -> serde_json::Value {
+    serde_json::json!({
+        "closure_basis": basis.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    })
+}
+
+/// Merge `{"closure_basis": [...]}` into the resolution claim's properties.
+///
+/// Mirrors `patch_claim`'s transaction shape. Note the merge is
+/// last-writer-wins: because `submit_claim` dedups on content hash, calling
+/// `resolve_backlog_item` twice with identical `resolution_content` patches the
+/// *same* claim, and the jsonb `||` replaces the key outright while the edges
+/// from the first call remain. A second call with a shorter basis list
+/// therefore leaves the property narrower than the edges.
+async fn stash_closure_basis(
+    pool: &epigraph_db::PgPool,
+    resolution_id: Uuid,
+    basis: &[Uuid],
+) -> Result<(), DbError> {
+    let mut tx = pool.begin().await?;
+    ClaimRepository::patch_claim_atomic_conn(
+        &mut tx,
+        ClaimId::from_uuid(resolution_id),
+        &PatchClaimInput {
+            properties: Some(closure_basis_properties(basis)),
+            ..PatchClaimInput::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// One-call backlog-item retirement.
 ///
 /// Submits a resolution claim via the canonical `submit_claim` pipeline
@@ -1005,6 +1113,8 @@ pub async fn resolve_backlog_item(
 ) -> Result<CallToolResult, McpError> {
     let original_id = parse_uuid(&params.original_id)?;
     let original_claim_id = ClaimId::from_uuid(original_id);
+    let basis_ids =
+        parse_closure_basis(params.closure_basis.as_deref().unwrap_or(&[]), original_id)?;
 
     // Confirm the target exists; we do NOT require the "backlog" label —
     // a stricter precondition belongs to the call site (HTTP filters /
@@ -1024,6 +1134,25 @@ pub async fn resolve_backlog_item(
     // own signer agent — preserves backward compat for non-HTTP callers.
     let target_agent = original.agent_id.as_uuid();
     require_owner_or_admin(server, auth, target_agent).await?;
+
+    // Existence-check every closure basis id. Ordering is load-bearing twice
+    // over: after the auth check, so an unauthorized caller cannot use this
+    // verb to probe which claim ids exist; and before any write, so a typo'd
+    // basis UUID fails the whole call instead of leaving a resolution claim
+    // behind. (`edges_validate_refs`,
+    // `migrations/001_initial_schema.sql:3263`, would also reject a dangling
+    // ref — but only after the resolution claim and the label patch landed.)
+    for (i, basis) in basis_ids.iter().enumerate() {
+        if ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(*basis))
+            .await
+            .map_err(internal_error)?
+            .is_none()
+        {
+            return Err(invalid_params(format!(
+                "closure_basis[{i}]: claim {basis} not found"
+            )));
+        }
+    }
 
     // 1. Submit the resolution claim via the canonical pipeline.
     let methodology = params
@@ -1084,10 +1213,82 @@ pub async fn resolve_backlog_item(
         }
     };
 
+    // 3. Record WHY the item could be closed. Deliberately AFTER the label
+    //    patch and deliberately best-effort: at this point the item is already
+    //    correctly retired, so a lost provenance edge must not turn a
+    //    successful retirement into an error the caller retries — a retry would
+    //    file a second resolution claim. Same rule CLAUDE.md applies to
+    //    post-commit embedding ("best-effort, warn on failure, never block the
+    //    write") and the same shape as submit_claim's best-effort edges.
+    //    `create_if_not_exists` is idempotent on (source, target,
+    //    relationship), so re-running is safe.
+    let mut warnings: Vec<String> = Vec::new();
+    let mut edges_created = 0usize;
+    if !basis_ids.is_empty() {
+        let resolution_uuid = Uuid::parse_str(&resolution_id).map_err(internal_error)?;
+        if let Err(e) = stash_closure_basis(&server.pool, resolution_uuid, &basis_ids).await {
+            tracing::warn!(
+                resolution_id = %resolution_uuid,
+                "closure_basis property patch failed: {e}"
+            );
+            warnings.push(format!("closure_basis property patch failed: {e}"));
+        }
+        let (targets, mut skipped) = closure_basis_edge_targets(&basis_ids, resolution_uuid);
+        warnings.append(&mut skipped);
+        for basis in &targets {
+            // `source -> target` reads "source RELATIONSHIP target"
+            // (`link_epistemic` module docs), so basis -> resolution says
+            // "basis justifies resolution" — the direction that is true.
+            //
+            // "justifies" is deliberately absent from `edge_to_factor_type`
+            // (migrations/011; trigger last rewritten in migrations/038), so
+            // `auto_create_factor_from_edge` hits `IF ft IS NULL THEN RETURN
+            // NEW` and the edge is belief-inert — correct for an operational
+            // provenance record. It is likewise absent from
+            // `link_epistemic::EPISTEMIC_RELATIONSHIPS`,
+            // `epigraph_db::EPISTEMIC_RELATIONSHIPS` and
+            // `EXPANSION_RELATIONSHIPS`. Do not add it to any of them: giving
+            // "justifies" a factor mapping later would retroactively animate
+            // every historical closure edge.
+            match EdgeRepository::create_if_not_exists(
+                &server.pool,
+                *basis,
+                "claim",
+                resolution_uuid,
+                "claim",
+                "justifies",
+                Some(serde_json::json!({
+                    "written_by": "resolve_backlog_item",
+                    "backlog_item_id": original_id.to_string(),
+                })),
+                None,
+                None,
+            )
+            .await
+            {
+                Ok((_, true)) => edges_created += 1,
+                Ok((_, false)) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        source = %basis,
+                        target = %resolution_uuid,
+                        "justifies edge failed: {e}"
+                    );
+                    warnings.push(format!(
+                        "justifies edge {basis} -> {resolution_uuid} failed: {e}"
+                    ));
+                }
+            }
+        }
+    }
+
     success_json(&serde_json::json!({
         "resolution_claim_id": resolution_id,
         "original_id": original_id.to_string(),
         "original_labels": after_labels,
+        "closure_basis": basis_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "justifies_edges_created": edges_created,
+        "warnings": warnings,
     }))
 }
 
@@ -1216,7 +1417,8 @@ pub async fn query_undecomposed_claims(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_confidence_declaration, parse_methodology, MAX_CONFIDENCE_SCOPE_CHARS,
+        build_confidence_declaration, closure_basis_edge_targets, closure_basis_properties,
+        parse_closure_basis, parse_methodology, MAX_CLOSURE_BASIS, MAX_CONFIDENCE_SCOPE_CHARS,
         MAX_KNOWN_ISSUES, MAX_KNOWN_ISSUE_CHARS,
     };
     use epigraph_core::Methodology;
@@ -1532,5 +1734,115 @@ mod tests {
             .map(|i| format!("issue {i}"))
             .collect();
         assert!(build_confidence_declaration(None, &over_limit).is_err());
+    }
+
+    // ---- closure_basis (resolve_backlog_item) --------------------------
+    //
+    // All pure. The DB-side facts these stand in for — the `justifies` edge
+    // insert, the belief-inert trigger, the jsonb `||` merge — cannot be
+    // exercised here; see the module doc comments for where each is argued
+    // from in `migrations/`.
+
+    /// A `uuid` distinct per `n`, so order assertions below are meaningful.
+    fn test_uuid(n: u8) -> uuid::Uuid {
+        uuid::Uuid::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn closure_basis_defaults_to_empty_when_omitted() {
+        // The zero-cost path every pre-existing caller takes: no basis, no
+        // existence checks, no edges, no property patch.
+        let original = test_uuid(1);
+        assert!(parse_closure_basis(&[], original).unwrap().is_empty());
+    }
+
+    #[test]
+    fn closure_basis_rejects_a_malformed_uuid() {
+        let original = test_uuid(1);
+        let raw = vec![test_uuid(2).to_string(), "not-a-uuid".to_string()];
+        let err = parse_closure_basis(&raw, original).expect_err("malformed uuid must be rejected");
+        // The index is what lets the caller find the offending entry.
+        assert!(
+            err.message.contains("closure_basis[1]"),
+            "message must name the offending index: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn closure_basis_rejects_the_item_being_resolved() {
+        // Hard error, not a silent drop: citing the item as its own
+        // justification means the caller believes something false about the
+        // closure they are recording.
+        let original = test_uuid(1);
+        let raw = vec![test_uuid(2).to_string(), original.to_string()];
+        let err =
+            parse_closure_basis(&raw, original).expect_err("self-justification must be rejected");
+        assert!(
+            err.message.contains("its own closure"),
+            "message must explain the rejection: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn closure_basis_deduplicates_and_preserves_first_seen_order() {
+        // Determinism is load-bearing: the stored property and the emitted
+        // edges must both be a function of the input alone.
+        let original = test_uuid(1);
+        let (a, b) = (test_uuid(2), test_uuid(3));
+        let raw = vec![a.to_string(), b.to_string(), a.to_string()];
+        assert_eq!(parse_closure_basis(&raw, original).unwrap(), vec![a, b]);
+    }
+
+    #[test]
+    fn closure_basis_rejects_more_entries_than_the_cap() {
+        let original = test_uuid(0);
+        let at_limit: Vec<String> = (1..=MAX_CLOSURE_BASIS)
+            .map(|i| test_uuid(u8::try_from(i).unwrap()).to_string())
+            .collect();
+        assert_eq!(
+            parse_closure_basis(&at_limit, original).unwrap().len(),
+            MAX_CLOSURE_BASIS
+        );
+
+        let over_limit: Vec<String> = (1..=MAX_CLOSURE_BASIS + 1)
+            .map(|i| test_uuid(u8::try_from(i).unwrap()).to_string())
+            .collect();
+        assert!(parse_closure_basis(&over_limit, original).is_err());
+    }
+
+    #[test]
+    fn closure_basis_edge_targets_skips_the_resolution_itself() {
+        // Pure-logic stand-in for the `edges_no_self_loop` CHECK
+        // (migrations/001_initial_schema.sql:772), which cannot be exercised
+        // without a database. Reachable in production because `submit_claim`
+        // dedups on content hash.
+        let (a, r) = (test_uuid(2), test_uuid(9));
+        let (targets, warnings) = closure_basis_edge_targets(&[a, r], r);
+        assert_eq!(targets, vec![a]);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains(&r.to_string()),
+            "warning must name the skipped id: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn closure_basis_properties_serializes_uuids_as_strings() {
+        let (a, b) = (test_uuid(2), test_uuid(3));
+        let props = closure_basis_properties(&[a, b]);
+        // Exactly one top-level key: the jsonb `||` merge replaces whole
+        // top-level keys, so a second key here would clobber unrelated
+        // properties on the resolution claim.
+        let obj = props.as_object().expect("object");
+        assert_eq!(obj.len(), 1);
+        assert_eq!(
+            props["closure_basis"],
+            serde_json::json!([a.to_string(), b.to_string()])
+        );
+        // Hyphenated lowercase, the form `Uuid::parse_str` round-trips.
+        assert_eq!(props["closure_basis"][0].as_str().unwrap(), a.to_string());
     }
 }

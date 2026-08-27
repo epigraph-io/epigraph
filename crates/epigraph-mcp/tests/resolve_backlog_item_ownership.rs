@@ -63,6 +63,7 @@ async fn resolve_backlog_item_refuses_foreign_agent_claim(pool: PgPool) {
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "should be rejected".to_string(),
             methodology: None,
+            closure_basis: None,
         },
         None,
     )
@@ -124,6 +125,7 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
             original_id: claim_id.to_string(),
             resolution_content: "retired by own signer".to_string(),
             methodology: None,
+            closure_basis: None,
         },
         None,
     )
@@ -168,6 +170,7 @@ async fn resolve_backlog_item_admin_scope_overrides_foreign_agent(pool: PgPool) 
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "retired by admin token".to_string(),
             methodology: None,
+            closure_basis: None,
         },
         Some(&admin_auth),
     )
@@ -206,6 +209,7 @@ async fn resolve_backlog_item_matching_principal_passes_without_admin(pool: PgPo
             original_id: claim.as_uuid().to_string(),
             resolution_content: "retired by owning principal".to_string(),
             methodology: None,
+            closure_basis: None,
         },
         Some(&auth),
     )
@@ -244,6 +248,7 @@ async fn resolve_backlog_item_foreign_principal_without_admin_denied(pool: PgPoo
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "should be rejected".to_string(),
             methodology: None,
+            closure_basis: None,
         },
         Some(&auth),
     )

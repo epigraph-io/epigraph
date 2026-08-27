@@ -40,6 +40,7 @@ async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPo
             original_id: original.as_uuid().to_string(),
             resolution_content: "Fixed by replacing the index with a GIN BTREE.".to_string(),
             methodology: None,
+            closure_basis: None,
         },
         None,
     )
