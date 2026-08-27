@@ -94,6 +94,34 @@ pub async fn get_neighborhood(
     })
 }
 
+/// Per-node fan-out bound for `traverse`'s BFS edge fetch.
+///
+/// Deliberately NOT the tool's `node_limit`. The two budgets are not
+/// interchangeable, and conflating them silently under-reports:
+///
+/// * `list_filtered` applies its `LIMIT` in SQL, i.e. BEFORE `min_truth` is
+///   evaluated in Rust below.
+/// * A target under `min_truth` hits `continue` WITHOUT being pushed to
+///   `nodes`, so it never consumes node budget — the `nodes.len() >=
+///   node_limit` break cannot fire on its account, and the BFS instead drains
+///   its already-truncated queue.
+///
+/// So sizing the edge fetch off the node budget drops *qualifying*
+/// neighbours: `traverse(min_truth > 0)` on a node whose fan-out exceeds
+/// `limit` loses nodes it would otherwise return. `edges.valid_from` has no
+/// column default (migrations/001_initial_schema.sql:765), so the
+/// `ORDER BY valid_from DESC NULLS LAST, id` degenerates to
+/// `gen_random_uuid()` id order and *which* neighbours vanish is effectively
+/// random. Regression pinned by `tests/graph_traverse_fan_out_bound.rs`.
+///
+/// This constant is a memory guard against a pathological hub, not a semantic
+/// knob: no caller-supplied value can shrink it, and at 10x the largest
+/// accepted `limit` (100) it cannot interact with the node budget. A node with
+/// fan-out above it still has its tail cut — the pre-63e4ddd `get_by_source`
+/// had no `LIMIT` at all — but that trade buys a bounded response and is two
+/// orders of magnitude away from the budgets a caller can actually set.
+const MAX_EDGES_PER_NODE: i64 = 1_000;
+
 pub async fn traverse(
     server: &EpiGraphMcpFull,
     params: TraverseParams,
@@ -151,6 +179,9 @@ pub async fn traverse(
             // Get outgoing edges. Unconstrained on entity type for the same
             // reason as `get_neighborhood`: BFS from a paper terminated at
             // depth 0 while `source_type = 'claim'` was hardcoded.
+            //
+            // Bounded by `MAX_EDGES_PER_NODE`, NOT by `node_limit` — see that
+            // constant for why the node budget is the wrong bound here.
             let outgoing = EdgeRepository::list_filtered(
                 &server.pool,
                 Some(current_id),
@@ -158,7 +189,7 @@ pub async fn traverse(
                 params.relationship.as_deref(),
                 None,
                 None,
-                node_limit as i64,
+                MAX_EDGES_PER_NODE,
             )
             .await
             .unwrap_or_default();
