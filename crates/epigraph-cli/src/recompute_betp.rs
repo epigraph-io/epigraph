@@ -13,6 +13,7 @@
 //! logic — see `crates/epigraph-cli/src/bin/recompute_claim_belief.rs` for
 //! the established per-claim, per-frame pattern this module mirrors.
 
+use epigraph_db::MassFunctionRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -75,32 +76,26 @@ pub async fn select_cohort(pool: &PgPool) -> Result<Vec<Uuid>, sqlx::Error> {
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// Discover every distinct `frame_id` a claim has BBAs on, ordered by the
-/// frame's name. Identical query to
-/// `recompute_claim_belief.rs::recompute_one_claim_all_frames`'s frame
-/// discovery — kept in lock-step so both operator binaries process a
-/// claim's frames in the same deterministic order (matters because
-/// `claims.{belief, pl, betp, ...}` are frame-agnostic scalars — last
-/// writer wins across frames).
+/// Discover every distinct `frame_id` a claim has BBAs on, in the canonical
+/// recompute order (`binary_truth` LAST, frame name as the tiebreak).
+///
+/// Delegates to `MassFunctionRepository::list_frames_for_claim` rather than
+/// inlining the query: `claims.{belief, pl, betp, ...}` are frame-agnostic
+/// scalars, so the frame order decides which frame's local answer survives in
+/// the cache, and a second copy of the ORDER BY is a second place for that
+/// contract to rot (backlog 696d3a1c). The MCP `recompute_beliefs` tool and
+/// `recompute_claim_belief.rs` share the same call.
 async fn claim_frames(pool: &PgPool, claim_id: Uuid) -> Result<Vec<Uuid>, String> {
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT DISTINCT mf.frame_id, f.name \
-           FROM mass_functions mf \
-           JOIN frames f ON f.id = mf.frame_id \
-          WHERE mf.claim_id = $1 \
-          ORDER BY f.name",
-    )
-    .bind(claim_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("list frames for claim: {e}"))?;
+    let rows = MassFunctionRepository::list_frames_for_claim(pool, claim_id)
+        .await
+        .map_err(|e| format!("list frames for claim: {e}"))?;
     Ok(rows.into_iter().map(|(frame_id, _name)| frame_id).collect())
 }
 
 /// Dry-run half: preview the recomputed belief for every frame this claim
 /// has BBAs on, without writing anything. Returns `(frame_id, preview)`
-/// pairs in the same frame-name order `run_claim` would write them, so a
-/// caller can print "last one wins" alongside each candidate.
+/// pairs in the same order `run_claim` would write them (`binary_truth` last),
+/// so a caller can print "last one wins" alongside each candidate.
 ///
 /// # Errors
 /// Propagates any error from the frame-discovery query or from

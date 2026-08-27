@@ -108,7 +108,7 @@ pub use repos::edge::{
 };
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
-pub use repos::mass_function::MassFunctionRow;
+pub use repos::mass_function::{MassFunctionRow, BINARY_FRAME_NAME};
 pub use repos::ownership::OwnershipRow;
 pub use repos::perspective::PerspectiveRow;
 pub use repos::scoped_belief::ScopedBeliefRow;

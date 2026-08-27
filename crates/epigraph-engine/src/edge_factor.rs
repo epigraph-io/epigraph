@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use epigraph_db::{
     FrameRepository, MassFunctionRepository, MassFunctionRow, PerspectiveRepository,
+    BINARY_FRAME_NAME,
 };
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
@@ -30,7 +31,12 @@ use crate::epistemic_interval::{
 };
 use crate::sheaf::{restriction_kind_with_profile, RestrictionKind, RestrictionProfile};
 
-const BINARY_FRAME_NAME: &str = "binary_truth";
+// `BINARY_FRAME_NAME` is imported from `epigraph_db` rather than declared
+// here: `MassFunctionRepository::list_frames_for_claim` orders the recompute
+// cascade's per-frame loop by that exact name (binary frame last, so that the
+// only frame carrying edge-borne belief is the one that wins the
+// frame-agnostic `claims.*` cache). Two independent literals could drift and
+// silently reinstate backlog 696d3a1c.
 const BINARY_HYPOTHESES: [&str; 2] = ["TRUE", "FALSE"];
 
 /// Outcome of an edge-factor auto-wire pass.

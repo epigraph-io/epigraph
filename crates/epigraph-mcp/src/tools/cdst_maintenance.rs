@@ -3,8 +3,9 @@
 //! [`recompute_beliefs`] is the in-server, queryable sibling of the
 //! `epigraph-recompute-belief` operator binary: it refreshes the cached
 //! `claims.{belief, plausibility, pignistic_prob, conflict_k, missing_mass}`
-//! scalars from current `mass_functions` state, per-frame, in deterministic
-//! frame-name order.
+//! scalars from current `mass_functions` state, per-frame, in the canonical
+//! order `MassFunctionRepository::list_frames_for_claim` defines — the
+//! `binary_truth` frame LAST, frame name as the tiebreak among the rest.
 //!
 //! Why it exists: several write paths populate or discount BBAs without
 //! refreshing the cached belief — e.g. initial `ingest_document` writes the
@@ -61,8 +62,14 @@ struct RecomputeBeliefsResult {
 ///
 /// Target precedence: `claim_ids` (explicit) > `labels` (current claims with
 /// all labels) > bulk enumeration of every claim that has a BBA. Each target
-/// claim is recomputed on **every frame it carries BBAs on**, in frame-name
-/// order, so the frame-agnostic cached scalars converge deterministically.
+/// claim is recomputed on **every frame it carries BBAs on**, in the order
+/// `MassFunctionRepository::list_frames_for_claim` returns them: `binary_truth`
+/// last, frame name as the tiebreak. Since `claims.{belief, plausibility,
+/// pignistic_prob, ...}` are frame-agnostic (last write wins), that ordering
+/// both makes the cache converge deterministically AND keeps the binary
+/// frame — the only one edge-factor BBAs land on — authoritative, so a
+/// recompute cannot revert `contradicts` / `refutes` propagation to the
+/// target's intrinsic BBA (backlog 696d3a1c).
 pub async fn recompute_beliefs(
     server: &EpiGraphMcpFull,
     params: RecomputeBeliefsParams,

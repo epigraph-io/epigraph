@@ -8,6 +8,16 @@ use sqlx::{FromRow, PgPool};
 use tracing::instrument;
 use uuid::Uuid;
 
+/// Name of the canonical binary `{TRUE, FALSE}` frame.
+///
+/// Defined here, at the bottom of the dependency graph, because
+/// [`MassFunctionRepository::list_frames_for_claim`] has to order by it and
+/// `epigraph-engine` (which owns the DS semantics) already depends on
+/// `epigraph-db`, not the other way round. `epigraph_engine::edge_factor`
+/// re-uses this constant rather than declaring its own — the recompute
+/// ordering below is only correct while the two agree exactly.
+pub const BINARY_FRAME_NAME: &str = "binary_truth";
+
 /// A row from the mass_functions table
 #[derive(Debug, Clone, FromRow)]
 pub struct MassFunctionRow {
@@ -602,29 +612,59 @@ impl MassFunctionRepository {
     }
 
     /// List every distinct `frame_id` a claim carries BBAs on, paired with the
-    /// frame's name and **ordered by frame name**.
+    /// frame's name, ordered so that the canonical [`BINARY_FRAME_NAME`] frame
+    /// is **always last** and every other frame sorts before it by name.
     ///
-    /// The `claims.{belief, plausibility, pignistic_prob, ...}` columns are
-    /// frame-agnostic scalars (last-writer-wins), so callers that recompute a
-    /// claim across all its frames must process them in a deterministic order
-    /// for two runs to converge to the same cached value. Frame-name order is
-    /// that canonical order — it matches the `epigraph-recompute-belief`
-    /// operator binary.
+    /// The `claims.{belief, plausibility, pignistic_prob, mass_on_empty,
+    /// mass_on_missing}` columns are frame-AGNOSTIC scalars, and the recompute
+    /// cascade writes them once per frame — last writer wins. So this ordering
+    /// is not cosmetic: it decides which frame's local answer ends up in the
+    /// cache. Two rules, in priority order:
+    ///
+    /// 1. **`binary_truth` last.** Edge-factor BBAs land exclusively on the
+    ///    binary frame (`auto_wire_ds_for_edge` hardcodes `ensure_binary_frame`),
+    ///    so it is the only frame that carries `contradicts` / `refutes`
+    ///    propagation. Letting any other frame write after it silently reverts
+    ///    that propagation to the target's intrinsic BBA. Worse, the result is
+    ///    *incoherent* rather than merely stale: `compute_combined_belief` only
+    ///    emits a `classification` on the binary frame, so a trailing
+    ///    non-binary write clobbers belief/Pl/BetP while leaving
+    ///    `classification = 'contradicted'` behind — the fingerprint this bug
+    ///    was found by (backlog 696d3a1c).
+    /// 2. **Frame name as the tiebreak** among the rest, so two runs over the
+    ///    same population still converge on the same cached value.
+    ///
+    /// Skipping the non-binary frames instead is NOT equivalent: a claim whose
+    /// only BBAs live on `textbook_veracity_*` legitimately sources its cache
+    /// from that frame, and skipping would leave it stale or NULL forever.
+    ///
+    /// This is the single implementation of that contract — the MCP
+    /// `recompute_beliefs` tool and both `epigraph-cli` recompute operator
+    /// binaries call it rather than re-deriving the query, so the ordering
+    /// cannot drift between them.
     #[instrument(skip(pool))]
     pub async fn list_frames_for_claim(
         pool: &PgPool,
         claim_id: Uuid,
     ) -> Result<Vec<(Uuid, String)>, DbError> {
+        // GROUP BY, not SELECT DISTINCT: Postgres rejects an ORDER BY
+        // expression that is absent from a DISTINCT select list, and
+        // `(f.name = $2)` is exactly such an expression. GROUP BY over the two
+        // projected columns gives the same de-duplication with no such
+        // restriction. `false` sorts before `true`, so the binary frame lands
+        // last.
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
             r#"
-            SELECT DISTINCT mf.frame_id, f.name
+            SELECT mf.frame_id, f.name
             FROM mass_functions mf
             JOIN frames f ON f.id = mf.frame_id
             WHERE mf.claim_id = $1
-            ORDER BY f.name
+            GROUP BY mf.frame_id, f.name
+            ORDER BY (f.name = $2), f.name
             "#,
         )
         .bind(claim_id)
+        .bind(BINARY_FRAME_NAME)
         .fetch_all(pool)
         .await?;
 
@@ -770,9 +810,11 @@ mod tests {
     }
 
     /// `list_frames_for_claim` must (a) return each frame ONCE even when the
-    /// claim has multiple BBAs on it (DISTINCT), and (b) order by frame NAME,
-    /// not by insertion order / frame id — the ordering the recompute cascade
-    /// relies on for deterministic last-writer convergence.
+    /// claim has multiple BBAs on it (de-duplicated), and (b) fall back to
+    /// frame NAME order — not insertion order / frame id — when no
+    /// `binary_truth` frame is involved. Name order is the TIEBREAK half of the
+    /// contract; `list_frames_for_claim_puts_the_binary_frame_last` pins the
+    /// half that takes priority over it.
     #[sqlx::test(migrations = "../../migrations")]
     async fn list_frames_for_claim_is_distinct_and_name_ordered(pool: sqlx::PgPool) {
         let agent_a = insert_agent(&pool, "frames-for-claim-a").await;
@@ -821,6 +863,67 @@ mod tests {
         assert_eq!(frames.len(), 2, "two distinct frames despite 3 BBAs");
         assert_eq!(frames[0].0, frame_a, "name-ordered: aaa frame first");
         assert_eq!(frames[1].0, frame_z, "name-ordered: zzz frame last");
+    }
+
+    /// REGRESSION, backlog 696d3a1c. The canonical `binary_truth` frame must
+    /// come back LAST regardless of where its name falls alphabetically, and
+    /// the remaining frames must still be name-ordered among themselves.
+    ///
+    /// Why it matters: `claims.{belief, plausibility, pignistic_prob, ...}` are
+    /// frame-agnostic scalars that the recompute cascade rewrites once per
+    /// frame, and edge-factor BBAs (`contradicts` / `refutes` propagation) land
+    /// exclusively on `binary_truth`. Under the old plain `ORDER BY f.name`
+    /// every production frame name — `claim_validity`, `paper_validity_*`,
+    /// `playbook_*`, `textbook_veracity_*` — sorted AFTER `binary_truth` and so
+    /// overwrote the propagated belief with its own local answer.
+    ///
+    /// The fixture deliberately brackets `binary_truth` alphabetically: `aaa-`
+    /// sorts before it and `zzz-` after it, so a name-only ORDER BY puts the
+    /// binary frame in the MIDDLE and fails the final assert.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_frames_for_claim_puts_the_binary_frame_last(pool: sqlx::PgPool) {
+        let agent = insert_agent(&pool, "frames-binary-last").await;
+        let suffix = Uuid::new_v4();
+        // Insert binary_truth FIRST so insertion order also disagrees with the
+        // expected result — this cannot pass by accident.
+        let binary = insert_frame(&pool, BINARY_FRAME_NAME).await;
+        let frame_z = insert_frame(&pool, &format!("zzz-{suffix}")).await;
+        let frame_a = insert_frame(&pool, &format!("aaa-{suffix}")).await;
+        assert!(
+            format!("aaa-{suffix}").as_str() < BINARY_FRAME_NAME
+                && BINARY_FRAME_NAME < format!("zzz-{suffix}").as_str(),
+            "fixture precondition: binary_truth must sort BETWEEN the two decoys"
+        );
+        let claim_id = insert_claim(&pool, agent, &format!("ffc-bin-{suffix}")).await;
+
+        let masses = serde_json::json!({"0": 0.6, "0,1": 0.4});
+        for frame in [binary, frame_z, frame_a] {
+            MassFunctionRepository::store(
+                &pool,
+                claim_id,
+                frame,
+                Some(agent),
+                &masses,
+                None,
+                Some("test"),
+                "unknown",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let frames = MassFunctionRepository::list_frames_for_claim(&pool, claim_id)
+            .await
+            .unwrap();
+        let order: Vec<Uuid> = frames.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            order,
+            vec![frame_a, frame_z, binary],
+            "binary_truth must be written LAST; name order is only the tiebreak \
+             among the rest. got names {:?}",
+            frames.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>()
+        );
     }
 
     /// `list_claim_ids` must return DISTINCT claim ids (a claim with multiple

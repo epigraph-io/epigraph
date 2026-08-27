@@ -18,8 +18,11 @@
 //! `frame_id` in `mass_functions` and recomputes per-frame via
 //! `edge_factor::recompute_claim_belief_on_frame`. `claims.{belief, pl,
 //! pignistic_prob, ...}` are frame-agnostic scalars — last writer wins.
-//! Per-claim frames are processed in lexicographic frame-name order so
-//! two runs against the same population converge to the same cached value.
+//! Per-claim frames are processed in the canonical order defined by
+//! `MassFunctionRepository::list_frames_for_claim`: the `binary_truth` frame
+//! LAST (it is the only frame edge-borne belief lands on, so it must win the
+//! cache), frame name as the tiebreak among the rest so that two runs against
+//! the same population converge to the same cached value.
 //!
 //! Reads claim_ids from a file (one UUID per line) or `--stdin`.
 //!
@@ -34,6 +37,7 @@
 //! workers ≈ 2–3 minutes.
 
 use clap::Parser;
+use epigraph_db::MassFunctionRepository;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -164,27 +168,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Discover every distinct `frame_id` this claim has BBAs on, ordered by
-/// the frame's name, and recompute each. Frame-name ordering gives a
-/// deterministic last-writer for the cached `claims.{belief, pl, betp, ...}`
-/// scalars so that two runs against the same population converge.
+/// Discover every distinct `frame_id` this claim has BBAs on, in the canonical
+/// recompute order (`binary_truth` LAST, frame name as the tiebreak), and
+/// recompute each. That ordering gives a deterministic last-writer for the
+/// frame-agnostic cached `claims.{belief, pl, betp, ...}` scalars AND makes the
+/// binary frame — the only one edge-factor BBAs land on — the winner, so a
+/// recompute cannot revert `contradicts` / `refutes` propagation.
+///
+/// The query is `MassFunctionRepository::list_frames_for_claim`, shared with
+/// the MCP `recompute_beliefs` tool and `recompute_betp`, so the ordering
+/// contract has exactly one implementation (backlog 696d3a1c).
 ///
 /// Returns the number of (claim, frame) pairs that produced a recompute.
 async fn recompute_one_claim_all_frames(
     pool: &sqlx::PgPool,
     claim_id: Uuid,
 ) -> Result<usize, String> {
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT DISTINCT mf.frame_id, f.name \
-           FROM mass_functions mf \
-           JOIN frames f ON f.id = mf.frame_id \
-          WHERE mf.claim_id = $1 \
-          ORDER BY f.name",
-    )
-    .bind(claim_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("list frames for claim: {e}"))?;
+    let rows = MassFunctionRepository::list_frames_for_claim(pool, claim_id)
+        .await
+        .map_err(|e| format!("list frames for claim: {e}"))?;
     let mut written = 0usize;
     for (frame_id, _frame_name) in rows {
         let did =
