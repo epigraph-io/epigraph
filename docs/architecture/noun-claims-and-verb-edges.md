@@ -104,7 +104,13 @@ Writers are responsible for retry/cleanup if the verb-edge call fails after the 
 
 ## Edge signing
 
-Schema supports `signature` / `signer_id` on edges (migration 073). S1 does not require edge signing; the existing `EdgeRepository::create` call passes `None` for signature fields. S3 writer plans specify the signing strategy per writer (host_agent has key material; ingest scripts may not). The "same audit guarantee as claim signatures" claim above is therefore aspirational — schema-supported, S3-realised.
+Schema supports `signature` / `signer_id` on edges. The columns, both CHECK constraints (`edges_signature_length`, `edges_signature_requires_signer`), the `signer_id -> agents(id)` FK and the partial `idx_edges_signer_id` are all in `migrations/001_initial_schema.sql` (lines 767–775, 3551, 2525) — **not** migration 073, which does not exist in this repository's `migrations/` directory.
+
+S1 does not require edge signing; the existing `EdgeRepository::create` call passes `None` for signature fields. S3 writer plans specify the signing strategy per writer (host_agent has key material; ingest scripts may not). The "same audit guarantee as claim signatures" claim above is therefore aspirational — schema-supported, S3-realised.
+
+`docs/architecture/edge-writer-inventory.md` is the ground-truth companion: it enumerates all 41 direct `INSERT INTO edges` statements and all four `EdgeRepository::create*` entry points, and records for each whether a signing key is in scope. Its headline finding sharpens the paragraph above — edge signing coverage is not partial, it is **zero**, and the same is true of `claims`. Read it before scoping any S3 signing work.
+
+> **Migration-number caveat.** This document also cites migrations 106, 107 and 109. `migrations/` here runs `001`–`059`; `042` exists, but `073`, `106`, `107` and `109` do not. Only the 073 attribution is corrected above, because the `edges` signing columns are directly verifiable in `001_initial_schema.sql`. The remaining numbers are flagged, not rewritten: they may refer to a downstream or renumbered series owned by the S2–S4 sequence, and adjudicating them belongs to that owner.
 
 ## Migration sequence
 
