@@ -103,6 +103,8 @@ fn submit_params(
         reasoning: None,
         labels: vec![],
         novelty_threshold,
+        confidence_scope: None,
+        known_issues: Vec::new(),
     }
 }
 

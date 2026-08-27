@@ -45,6 +45,8 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         reasoning: None,
         labels: vec![],
         novelty_threshold: None,
+        confidence_scope: None,
+        known_issues: Vec::new(),
     };
     let params2 = SubmitClaimParams {
         content: content.clone(),
@@ -56,6 +58,8 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         reasoning: None,
         labels: vec![],
         novelty_threshold: None,
+        confidence_scope: None,
+        known_issues: Vec::new(),
     };
 
     tools::claims::submit_claim(&server, params1)

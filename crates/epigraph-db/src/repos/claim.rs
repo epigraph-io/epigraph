@@ -388,6 +388,34 @@ impl ClaimRepository {
         Ok(())
     }
 
+    /// Read the writer-declared confidence scope block
+    /// (`properties->'confidence_declaration'`) for one claim.
+    ///
+    /// `None` when the claim has no declaration, `properties` is SQL NULL, or
+    /// the row does not exist. Runtime query (not `query_scalar!`) so the
+    /// workspace still builds under `SQLX_OFFLINE=true` with no `.sqlx`
+    /// regeneration.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_confidence_declaration(
+        pool: &PgPool,
+        claim_id: ClaimId,
+    ) -> Result<Option<serde_json::Value>, DbError> {
+        let id: Uuid = claim_id.into();
+        // The doubled `Option` steers inference and is not redundant: the outer
+        // layer is "row present" (`fetch_optional`), the inner is "column was
+        // SQL NULL". `.flatten()` collapses both to the same `None`.
+        let value: Option<Option<serde_json::Value>> = sqlx::query_scalar(
+            "SELECT properties -> 'confidence_declaration' FROM claims WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(value.flatten())
+    }
+
     /// Create a new claim within an existing transaction (LEGACY — implicit content-hash dedup)
     ///
     /// Same as `create()` but accepts a `&mut PgConnection` for transactional use.

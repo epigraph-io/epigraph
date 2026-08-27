@@ -140,6 +140,72 @@ fn optional_object_params_stay_optional() {
     }
 }
 
+/// `submit_claim`'s confidence-declaration params must stay optional.
+///
+/// `confidence_scope` and `known_issues` are additive: every agent that calls
+/// `submit_claim` today omits them. `#[serde(default)]` is the single line that
+/// keeps them out of `inputSchema.required` — drop it from `known_issues` (a
+/// `Vec<String>`, not an `Option`) and schemars promotes it to required, at
+/// which point EVERY existing caller starts failing schema validation. That
+/// regression is invisible in a type check, so it is asserted on the wire.
+#[test]
+fn submit_claims_confidence_declaration_params_are_optional_and_typed() {
+    let tools = EpiGraphMcpFull::all_tools_json();
+
+    let entry = tools
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|t| t.get("name").and_then(serde_json::Value::as_str) == Some("submit_claim"))
+        .expect("tool `submit_claim` is not registered");
+
+    let required = entry
+        .get("inputSchema")
+        .and_then(|s| s.get("required"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    for field in ["confidence_scope", "known_issues"] {
+        assert!(
+            !required.iter().any(|r| r.as_str() == Some(field)),
+            "`submit_claim.{field}` is additive and must not appear in `required` — \
+             promoting it breaks every existing caller; required = {required:?}"
+        );
+    }
+
+    // A scope is prose: a client must be told to send a string, not an object.
+    let scope = property_schema(&tools, "submit_claim", "confidence_scope");
+    assert!(
+        declares_type(&scope, "string"),
+        "`submit_claim.confidence_scope` must declare \"type\": \"string\" (bare or in a \
+         union with \"null\"); got {scope}"
+    );
+    assert!(
+        scope
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|d| !d.is_empty()),
+        "`submit_claim.confidence_scope` must keep the prose that tells an agent what \
+         conditions to record; got {scope}"
+    );
+
+    // Issues are a list of strings — `items` must say so, or a client has no
+    // way to know it cannot send a list of objects.
+    let issues = property_schema(&tools, "submit_claim", "known_issues");
+    assert!(
+        declares_type(&issues, "array"),
+        "`submit_claim.known_issues` must declare \"type\": \"array\"; got {issues}"
+    );
+    let items = issues
+        .get("items")
+        .unwrap_or_else(|| panic!("known_issues must constrain its items; got {issues}"));
+    assert!(
+        declares_type(items, "string"),
+        "`submit_claim.known_issues` items must declare \"type\": \"string\"; got {items}"
+    );
+}
+
 /// `masses` values must be advertised as plain numbers. Typing them as `f64`
 /// would also emit `"format": "double"`, and a certain mass of 1.0 arrives as
 /// the JSON integer `1` from any client whose encoder drops the trailing

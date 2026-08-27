@@ -33,6 +33,8 @@ pub async fn batch_submit_claims(
             reasoning: None,
             labels: entry.labels.clone(),
             novelty_threshold: None,
+            confidence_scope: None,
+            known_issues: Vec::new(),
         };
 
         match crate::tools::claims::submit_claim(server, claim_params).await {

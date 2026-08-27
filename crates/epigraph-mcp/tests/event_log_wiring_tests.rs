@@ -81,6 +81,8 @@ async fn submit_claim_emits_claim_created_event() {
         reasoning: None,
         labels: vec![],
         novelty_threshold: None,
+        confidence_scope: None,
+        known_issues: Vec::new(),
     };
 
     let before = chrono::Utc::now();
@@ -169,6 +171,8 @@ async fn resubmit_does_not_emit_duplicate_claim_created() {
         reasoning: None,
         labels: vec![],
         novelty_threshold: None,
+        confidence_scope: None,
+        known_issues: Vec::new(),
     };
 
     // First submit — should create the claim and emit one event.

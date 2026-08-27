@@ -133,6 +133,100 @@ fn parse_evidence_type(s: &str, source_url: Option<&str>) -> Result<EvidenceType
     }
 }
 
+const MAX_CONFIDENCE_SCOPE_CHARS: usize = 2000;
+const MAX_KNOWN_ISSUES: usize = 32;
+const MAX_KNOWN_ISSUE_CHARS: usize = 500;
+
+/// Validate a writer's confidence declaration and render it as a `properties`
+/// patch, or `Ok(None)` when nothing was declared.
+///
+/// A bare `confidence: 0.9` records a number with no conditions of validity: a
+/// reader cannot tell whether it means "n=1 on one laptop" or "n=10000 across
+/// three platforms". `confidence_scope` and `known_issues` are the writer's
+/// answer to that, stored beside the scalar they qualify.
+///
+/// Three load-bearing decisions live here:
+///
+/// 1. **One top-level key.** Everything nests under a single
+///    `confidence_declaration` object. `ClaimRepository::merge_properties` is a
+///    shallow `||`, so a patch with several top-level keys could clobber a
+///    sibling from the documented `properties` vocabulary (`level`, `event`,
+///    `methodology`, `section`, `reasoning_chain`, `asserted_by_authors`,
+///    `source_doi`, `extraction_persona`). With exactly one key it cannot.
+/// 2. **The block is written whole.** A later re-declaration is last-writer-wins
+///    over the entire block, not a per-field merge — re-submitting with only
+///    `confidence_scope` DROPS a previously stored `known_issues`. That is
+///    intended: the declaration is the unit of assertion, and a half-updated
+///    caveat is worse than a replaced one. It is also stated in the schemars
+///    description so a caller is not surprised.
+/// 3. **Bounds count `chars()`, never bytes, and nothing is truncated.** An
+///    over-long declaration is REJECTED, because a silently truncated caveat
+///    reads as a complete one and is worse than no caveat at all. Counting
+///    chars also means no byte-slicing panic on multi-byte input.
+///
+/// The function takes no clock and touches no database, which is what makes it
+/// unit-testable in-crate (see `tests` at the bottom of this file) and what
+/// lets `submit_claim` reject a bad declaration before it writes anything.
+fn build_confidence_declaration(
+    scope: Option<&str>,
+    known_issues: &[String],
+) -> Result<Option<serde_json::Value>, String> {
+    let mut block = serde_json::Map::new();
+
+    if let Some(raw) = scope {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "confidence_scope must not be empty or whitespace-only; omit the field instead"
+                    .to_string(),
+            );
+        }
+        let len = trimmed.chars().count();
+        if len > MAX_CONFIDENCE_SCOPE_CHARS {
+            return Err(format!(
+                "confidence_scope is {len} characters; the maximum is {MAX_CONFIDENCE_SCOPE_CHARS}"
+            ));
+        }
+        block.insert(
+            "scope".to_string(),
+            serde_json::Value::String(trimmed.to_string()),
+        );
+    }
+
+    if !known_issues.is_empty() {
+        if known_issues.len() > MAX_KNOWN_ISSUES {
+            return Err(format!(
+                "known_issues has {} entries; the maximum is {MAX_KNOWN_ISSUES}",
+                known_issues.len()
+            ));
+        }
+        let mut issues = Vec::with_capacity(known_issues.len());
+        for (i, raw) in known_issues.iter().enumerate() {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(format!(
+                    "known_issues[{i}] must not be empty or whitespace-only"
+                ));
+            }
+            let len = trimmed.chars().count();
+            if len > MAX_KNOWN_ISSUE_CHARS {
+                return Err(format!(
+                    "known_issues[{i}] is {len} characters; the maximum is {MAX_KNOWN_ISSUE_CHARS}"
+                ));
+            }
+            issues.push(serde_json::Value::String(trimmed.to_string()));
+        }
+        block.insert("known_issues".to_string(), serde_json::Value::Array(issues));
+    }
+
+    if block.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        serde_json::json!({ "confidence_declaration": serde_json::Value::Object(block) }),
+    ))
+}
+
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
@@ -146,6 +240,14 @@ pub async fn submit_claim(
     let methodology = parse_methodology(&params.methodology).map_err(invalid_params)?;
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
+    // Sits with the other two parse-and-reject calls on purpose: an invalid
+    // declaration must fail with `invalid_params` BEFORE the agent lookup,
+    // before the novelty gate's embedder call, and before any row is inserted.
+    // Building the owned value here also sidesteps the later partial move of
+    // `params.reasoning`.
+    let confidence_declaration =
+        build_confidence_declaration(params.confidence_scope.as_deref(), &params.known_issues)
+            .map_err(invalid_params)?;
 
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
@@ -262,6 +364,29 @@ pub async fn submit_claim(
 
     if !params.labels.is_empty() {
         ClaimRepository::update_labels(&server.pool, claim_uuid, &params.labels, &[])
+            .await
+            .map_err(internal_error)?;
+    }
+
+    // Attach the writer's confidence declaration, if any.
+    //
+    // `merge_properties` is a RUNTIME `sqlx::query`, not a compile-time macro,
+    // so this needs no `.sqlx` regeneration and no database to build.
+    //
+    // The error is PROPAGATED, not warn-swallowed, deliberately matching the
+    // adjacent `update_labels` call: a claim that lands with an un-caveated
+    // confidence is the exact failure this field exists to prevent, so a
+    // best-effort write here would defeat the point.
+    //
+    // Placement is load-bearing. This site is only reachable AFTER
+    // `create_claim_idempotent`, whose `create_or_get` dedups on
+    // `(content_hash, agent_id)` — so `claim.id` is always THIS agent's own
+    // row. The novelty gate's `GateDecision::ReturnExisting` branch above
+    // returns early with an id that can belong to ANOTHER agent (the ANN scan
+    // is corpus-wide, as documented there); a properties write must never
+    // reach that path. Do not hoist this block above that early return.
+    if let Some(declaration) = &confidence_declaration {
+        ClaimRepository::merge_properties(&server.pool, claim.id, declaration)
             .await
             .map_err(internal_error)?;
     }
@@ -557,6 +682,18 @@ pub async fn get_claim(
         None => None,
     };
 
+    // Writer-supplied free-text prose ABOUT the claim — a sibling field of
+    // `content` in exactly the sense redaction.rs warns about (a redacted row
+    // must not leak its content through a neighbouring field). Gate it on the
+    // SAME `access` decision that gates content, and skip the read entirely
+    // when redacted: no round-trip, no oracle.
+    let confidence_declaration = match access {
+        ContentAccess::Full => ClaimRepository::get_confidence_declaration(&server.pool, claim_id)
+            .await
+            .map_err(internal_error)?,
+        ContentAccess::Redacted => None,
+    };
+
     #[derive(serde::Serialize)]
     struct GetClaimResponse {
         #[serde(flatten)]
@@ -564,6 +701,10 @@ pub async fn get_claim(
         classification: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         lensed_belief: Option<LensedBelief>,
+        // Omitted (never `null`) when absent, so a claim with no declaration
+        // serialises byte-identically to before this field existed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        confidence_declaration: Option<serde_json::Value>,
     }
 
     success_json(&GetClaimResponse {
@@ -580,6 +721,7 @@ pub async fn get_claim(
         },
         classification,
         lensed_belief,
+        confidence_declaration,
     })
 }
 
@@ -867,6 +1009,11 @@ pub async fn resolve_backlog_item(
         // epistemic content competing for novelty against the corpus —
         // never suppress or flag them via the semantic gate.
         novelty_threshold: Some(0.0),
+        // Not declared here. The hardcoded `confidence: 0.8` above is itself a
+        // textbook bare scalar and deserves a scope, but dogfooding it is a
+        // separate decision from adding the field — left as its own item.
+        confidence_scope: None,
+        known_issues: Vec::new(),
     };
     let submit_result = submit_claim(server, submit_params).await?;
     let resolution_id = extract_submit_claim_id(&submit_result)?;
@@ -1029,7 +1176,10 @@ pub async fn query_undecomposed_claims(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_methodology;
+    use super::{
+        build_confidence_declaration, parse_methodology, MAX_CONFIDENCE_SCOPE_CHARS,
+        MAX_KNOWN_ISSUES, MAX_KNOWN_ISSUE_CHARS,
+    };
     use epigraph_core::Methodology;
     use epigraph_engine::calibration::CalibrationConfig;
 
@@ -1218,5 +1368,130 @@ mod tests {
     fn an_unknown_methodology_is_still_rejected() {
         assert!(parse_methodology("vibes").is_err());
         assert!(parse_methodology("").is_err());
+    }
+
+    // ── build_confidence_declaration ──
+    //
+    // The function is pure — no clock, no pool — so every case below runs
+    // without a database. All of them assert on the returned patch, which is
+    // exactly the value handed to `merge_properties`.
+
+    /// The default path: a caller who sends neither field produces no patch at
+    /// all, so `submit_claim` performs NO properties write and the stored row
+    /// is byte-identical to one written before this feature existed.
+    #[test]
+    fn no_declaration_leaves_properties_untouched() {
+        assert_eq!(build_confidence_declaration(None, &[]), Ok(None));
+    }
+
+    /// A scope is trimmed, and — the guard that matters — the patch has exactly
+    /// ONE top-level key. `merge_properties` is a shallow `||`, so a second
+    /// top-level key here would be able to clobber `level` / `event` /
+    /// `methodology` on a claim that already carries them.
+    #[test]
+    fn a_declared_scope_is_trimmed_and_nested_under_one_properties_key() {
+        let patch = build_confidence_declaration(Some("  pg15 only "), &[])
+            .expect("a well-formed scope is accepted")
+            .expect("a declared scope produces a patch");
+
+        assert_eq!(
+            patch.pointer("/confidence_declaration/scope"),
+            Some(&serde_json::json!("pg15 only"))
+        );
+
+        let top = patch.as_object().expect("the patch is a JSON object");
+        assert_eq!(
+            top.keys().collect::<Vec<_>>(),
+            vec!["confidence_declaration"],
+            "the patch must carry exactly one top-level key or the shallow `||` \
+             merge can clobber a sibling properties key"
+        );
+    }
+
+    /// Issues stand alone without a scope, keep their submitted order, and do
+    /// not conjure a null `scope` key.
+    #[test]
+    fn known_issues_keep_their_order_and_stand_alone_without_a_scope() {
+        let issues = vec![
+            "single run, n=1".to_string(),
+            "macOS only".to_string(),
+            "no concurrency test".to_string(),
+        ];
+        let patch = build_confidence_declaration(None, &issues)
+            .expect("well-formed issues are accepted")
+            .expect("declared issues produce a patch");
+
+        assert_eq!(
+            patch.pointer("/confidence_declaration/known_issues"),
+            Some(&serde_json::json!([
+                "single run, n=1",
+                "macOS only",
+                "no concurrency test"
+            ]))
+        );
+        assert!(
+            patch.pointer("/confidence_declaration/scope").is_none(),
+            "an undeclared scope must be ABSENT, not null: {patch}"
+        );
+    }
+
+    /// An empty scope is a caller mistake, not a declaration of "no conditions".
+    /// Rejecting it keeps a meaningless `scope: ""` out of the graph.
+    #[test]
+    fn an_empty_or_whitespace_only_scope_is_rejected_rather_than_stored() {
+        for bad in ["", "   ", "\n\t"] {
+            assert!(
+                build_confidence_declaration(Some(bad), &[]).is_err(),
+                "scope {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// A bad entry names its index, so a caller with 20 issues can find the one
+    /// that failed without bisecting.
+    #[test]
+    fn an_empty_known_issue_is_rejected_and_names_its_index() {
+        let issues = vec!["ok".to_string(), "  ".to_string()];
+        let err = build_confidence_declaration(None, &issues)
+            .expect_err("a whitespace-only issue must be rejected");
+        assert!(
+            err.contains("known_issues[1]"),
+            "the error must name the offending index; got {err}"
+        );
+    }
+
+    /// Bounds are counted in `chars()`, never bytes. A 2000-char scope of
+    /// two-byte characters is 4000 bytes and must still be accepted; byte
+    /// counting would reject it, and byte SLICING would panic mid-character.
+    #[test]
+    fn the_character_bounds_are_counted_in_chars_not_bytes() {
+        let at_scope_limit = "é".repeat(MAX_CONFIDENCE_SCOPE_CHARS);
+        assert!(
+            at_scope_limit.len() > MAX_CONFIDENCE_SCOPE_CHARS,
+            "multi-byte"
+        );
+        assert!(build_confidence_declaration(Some(&at_scope_limit), &[]).is_ok());
+
+        let over_scope_limit = "é".repeat(MAX_CONFIDENCE_SCOPE_CHARS + 1);
+        assert!(build_confidence_declaration(Some(&over_scope_limit), &[]).is_err());
+
+        let at_issue_limit = vec!["é".repeat(MAX_KNOWN_ISSUE_CHARS)];
+        assert!(build_confidence_declaration(None, &at_issue_limit).is_ok());
+
+        let over_issue_limit = vec!["é".repeat(MAX_KNOWN_ISSUE_CHARS + 1)];
+        assert!(build_confidence_declaration(None, &over_issue_limit).is_err());
+    }
+
+    #[test]
+    fn more_known_issues_than_the_bound_are_rejected() {
+        let at_limit: Vec<String> = (0..MAX_KNOWN_ISSUES)
+            .map(|i| format!("issue {i}"))
+            .collect();
+        assert!(build_confidence_declaration(None, &at_limit).is_ok());
+
+        let over_limit: Vec<String> = (0..=MAX_KNOWN_ISSUES)
+            .map(|i| format!("issue {i}"))
+            .collect();
+        assert!(build_confidence_declaration(None, &over_limit).is_err());
     }
 }

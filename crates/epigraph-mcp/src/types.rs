@@ -143,6 +143,18 @@ pub struct SubmitClaimParams {
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
+
+    #[schemars(
+        description = "Declared scope of validity for `confidence`: the conditions under which that number holds (environment, version, sample size, population, time window). A bare 0.0-1.0 scalar with no scope is unfalsifiable. Free text, max 2000 characters; omit the field rather than sending an empty string. Stored under properties.confidence_declaration.scope and returned by get_claim."
+    )]
+    #[serde(default)]
+    pub confidence_scope: Option<String>,
+
+    #[schemars(
+        description = "Known limitations the confidence scalar does NOT account for (e.g. 'single run, n=1', 'measured on macOS only, untested on Linux'). Max 32 entries, 500 characters each, no empty entries. Stored under properties.confidence_declaration.known_issues. Re-declaring replaces the whole confidence_declaration block."
+    )]
+    #[serde(default)]
+    pub known_issues: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
