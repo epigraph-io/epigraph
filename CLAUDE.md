@@ -82,6 +82,48 @@ small DB):
 DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo test ...
 ```
 
+## Coverage standards and the obligation layer
+
+When you assert that an answer covers a set, name the standard it is held to.
+Five words, and only two of them are settled by arithmetic:
+
+| standard | means | decided by counting? | always-missing field |
+|---|---|---|---|
+| `exhaustive` | every unit | **yes** — `observed == declared` | — |
+| `native_complete` | every unit the source itself names | **yes**, on cardinality only | `declared_unit_keys` |
+| `material` | every unit that changes the conclusion | no → `indeterminate` | `materiality_criterion` |
+| `representative` | a defensible sample | no → `indeterminate` | `sampling_frame` |
+| `summary` | no completeness owed | n/a → `not_applicable` | — |
+
+A **surplus is a breach**, not a pass: `observed > declared` means the
+denominator was wrong, which is a finding.
+
+**The zero-denominator rule.** `declared_total == 0` under `exhaustive` or
+`native_complete` is `indeterminate` with `population_source` missing — never
+`satisfied`. Counting what you produced cannot settle an assertion that there
+was nothing to produce. (This is the epiclaw-host false `TASK_SILENT`: a
+checker that blessed `0 == 0` would have blessed the bug the layer exists for.)
+
+Refusing to invent a materiality threshold or validate a sampling frame is the
+design, not an omission. Three of five standards return a non-verdict, and the
+module doc, the response payload and `missing_contract_fields` all say so.
+
+**`server_instructions` is the canonical copy.** The agent-facing text lives in
+`EpiGraphMcpFull::server_instructions` (`epigraph-mcp/src/server.rs`), which
+ships in the `initialize` handshake — that is what a fresh install with no repo
+checkout inherits. This section is the repo-local restatement; do not let the
+two drift. `instructions_carry_the_coverage_standard_vocabulary` guards the
+canonical one.
+
+Code: the rule table is a pure function in `epigraph-core/src/obligation.rs`
+(no sqlx, unit-testable with no DB); all SQL is in
+`epigraph-db/src/repos/obligation.rs`. `batch_submit_claims` is the one live
+call site — every call carries an implicit `exhaustive` contract over its own
+entries, with **no config key, env var or feature gate**. Verdicts are
+**advisory**: a breach never fails a call or rolls anything back. Obligations
+are operational records, not claims — they never enter `claims` and the
+embedding invariant below does not apply to them.
+
 ## Workflow
 
 - Feature branches, never land 3+ commits directly on `main`.

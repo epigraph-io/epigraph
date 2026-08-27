@@ -1,0 +1,104 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE obligations\n            SET observed_total          = $2,\n                verdict                 = $3,\n                verdict_reason          = $4,\n                missing_contract_fields = $5,\n                checked_at              = NOW()\n            WHERE id = $1\n            RETURNING id, agent_id, standard, unit, declared_total,\n                      anchors, anchor_kind, observed_total, verdict, verdict_reason,\n                      missing_contract_fields, source_tool, created_at, checked_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "agent_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "standard",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "unit",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "declared_total",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "anchors",
+        "type_info": "UuidArray"
+      },
+      {
+        "ordinal": 6,
+        "name": "anchor_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "observed_total",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "verdict",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "verdict_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "missing_contract_fields",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 11,
+        "name": "source_tool",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "checked_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f37cab5ffb3da025f3b3da39d0590a5e96f522669240e7da47a4b7ed8b283098"
+}

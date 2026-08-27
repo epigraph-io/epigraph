@@ -743,6 +743,27 @@ impl EpiGraphMcpFull {
         tools::anchors::verify_anchor(self, params).await
     }
 
+    // ── Obligations (1 tool) ──
+
+    #[tool(
+        description = "Re-count an obligation's anchors against the live graph and persist the \
+                       fresh verdict. Coverage DECAYS: superseding or marking-duplicate a claim \
+                       flips is_current=false, so a contract that read `satisfied` when it was \
+                       opened can be a `breach` later — this is how you find out. Only \
+                       `exhaustive` and `native_complete` are settled by counting; `material` \
+                       and `representative` return `indeterminate` naming the contract field \
+                       they still lack, and `summary` returns `not_applicable`. Obligation ids \
+                       come back from batch_submit_claims as `obligation_id`."
+    )]
+    async fn check_obligation(
+        &self,
+        Parameters(params): Parameters<CheckObligationParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // A write: recheck stores the recomputed verdict and bumps checked_at.
+        self.reject_if_read_only()?;
+        tools::obligations::check_obligation(self, params).await
+    }
+
     // ── Memory (2 tools) ──
 
     #[tool(
@@ -1157,7 +1178,7 @@ impl EpiGraphMcpFull {
     // ── Batch / Staging / Stats (3 tools) ──
 
     #[tool(
-        description = "Submit multiple claims in a single batch (max 100). Each entry needs content, evidence_data, evidence_type, and optional confidence."
+        description = "Submit multiple claims in a single batch (max 100). Each entry needs content, evidence_data, evidence_type, and optional confidence. Held to an `exhaustive` coverage contract over its own entries by default; the response reports a counted verdict, not a self-report. `submitted` counts entries that returned OK — which includes entries deduplicated onto a pre-existing claim — so read `distinct_claims` and `coverage_verdict` for what was actually anchored. Verdicts are advisory: a breach never fails the call. Pass `coverage` only to weaken or relabel the contract."
     )]
     async fn batch_submit_claims(
         &self,
@@ -1499,6 +1520,14 @@ impl EpiGraphMcpFull {
     /// `tool_count` is derived from the live tool router (`all_tools_json`),
     /// so it can never drift from the registered tool set the way a
     /// hardcoded constant would.
+    ///
+    /// It is also where the coverage-standard vocabulary (backlog 4b48ffb5)
+    /// lives. This string is compiled into the server binary, so a brand-new
+    /// install emits that vocabulary on its first handshake with zero config,
+    /// zero DB rows and zero repo checkout — CLAUDE.md only reaches people who
+    /// clone this repo. Keep the two copies in step; CLAUDE.md's
+    /// "Coverage standards and the obligation layer" section says this one is
+    /// canonical.
     #[must_use]
     pub fn server_instructions(read_only: bool) -> String {
         let mode = if read_only { "read-only" } else { "full" };
@@ -1512,7 +1541,15 @@ impl EpiGraphMcpFull {
              a tool's schema by name before calling it (the edge-writers submit_claim, \
              link_hierarchical, supersede_claim and the graph reads get_neighborhood, traverse, \
              query_claims are all available this way), or call list_mcp_tools to enumerate every \
-             tool with its full schema."
+             tool with its full schema. \
+             Coverage standards — when you assert that an answer covers a set, name the standard \
+             it is held to: exhaustive (every unit), native_complete (every unit the source \
+             itself names), material (every unit that changes the conclusion), representative \
+             (a defensible sample), or summary (no completeness owed). Only exhaustive and \
+             native_complete are settled by counting; material and representative return \
+             indeterminate until their missing contract field is supplied. batch_submit_claims \
+             applies exhaustive to its own entries and returns a counted verdict rather than \
+             trusting the assertion."
         )
     }
 }
@@ -1806,5 +1843,33 @@ mod instructions_tests {
     fn instructions_reflect_mode_label() {
         assert!(EpiGraphMcpFull::server_instructions(true).contains("read-only"));
         assert!(EpiGraphMcpFull::server_instructions(false).contains("full"));
+    }
+
+    /// The coverage vocabulary (backlog 4b48ffb5) ships in the handshake, not
+    /// only in CLAUDE.md. This string is compiled into the binary, so it is
+    /// the ONLY copy a fresh install with no repo checkout inherits — guard it
+    /// against silent deletion.
+    #[test]
+    fn instructions_carry_the_coverage_standard_vocabulary() {
+        let s = EpiGraphMcpFull::server_instructions(false);
+
+        for standard in [
+            "exhaustive",
+            "native_complete",
+            "material",
+            "representative",
+            "summary",
+        ] {
+            assert!(
+                s.contains(standard),
+                "instructions must name the `{standard}` coverage standard; got: {s}"
+            );
+        }
+        // The vocabulary is worthless without the claim that it is SETTLED by
+        // arithmetic rather than by assertion — that framing is the point.
+        assert!(
+            s.contains("counted") || s.contains("counting"),
+            "instructions must say the verdict is counted, not asserted; got: {s}"
+        );
     }
 }

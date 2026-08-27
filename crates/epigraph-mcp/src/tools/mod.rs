@@ -22,6 +22,7 @@ pub mod manifest;
 pub mod matching;
 pub mod memory;
 pub mod novelty_gate;
+pub mod obligations;
 pub mod paper_queries;
 pub mod perspectives;
 pub mod provenance;

@@ -1900,6 +1900,67 @@ pub struct PublishEventParams {
 pub struct BatchSubmitClaimsParams {
     #[schemars(description = "Array of claim objects to submit (max 100)")]
     pub claims: Vec<BatchClaimEntry>,
+
+    #[serde(default)]
+    #[schemars(
+        description = "Optional override of the coverage contract this batch is held to. \
+                       OMIT IT and the batch is held to `exhaustive` over its own entries, \
+                       which is what you almost always want. This field can only WEAKEN or \
+                       relabel the contract — there is no way to switch the counting off."
+    )]
+    pub coverage: Option<CoverageParams>,
+}
+
+/// Caller-supplied coverage contract (backlog 4b48ffb5).
+///
+/// A typed struct rather than a `serde_json::Value`: schemars 1 renders a bare
+/// `Value` as the permissive literal `true`, leaving a client no type
+/// information at all — backlog BL-1, pinned by
+/// `tests/tool_input_schema_types.rs`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CoverageParams {
+    #[schemars(
+        description = "Coverage standard, i.e. what completeness this answer owes. \
+                       `exhaustive` = every unit (settled by counting). \
+                       `native_complete` = every unit the source itself names (settled by \
+                       counting, but the units counted are not proven to be the units \
+                       declared). \
+                       `material` = every unit that changes the conclusion (NOT settled by \
+                       counting — returns indeterminate until a materiality_criterion is \
+                       supplied). \
+                       `representative` = a defensible sample (NOT settled by counting — \
+                       returns indeterminate until a sampling_frame is supplied). \
+                       `summary` = no completeness owed. \
+                       Hyphens are accepted (`native-complete`). An unrecognised value is \
+                       rejected, never defaulted. Default when omitted: `exhaustive`."
+    )]
+    pub standard: Option<String>,
+
+    #[schemars(
+        description = "What is being counted, e.g. 'claim', 'emitter', 'section'. \
+                       Default 'claim'. Purely a label on the arithmetic."
+    )]
+    pub unit: Option<String>,
+
+    #[schemars(
+        description = "Denominator override. Defaults to the number of entries in this \
+                       batch, which checks INTERNAL consistency (did you deliver the N \
+                       distinct things you listed?). Supply an EXTERNAL denominator here \
+                       when the population is known independently of the payload. \
+                       A declared total of 0 under a counting standard is never satisfied: \
+                       it returns indeterminate asking for a population_source, because \
+                       counting what you produced cannot settle a claim that there was \
+                       nothing to produce."
+    )]
+    pub declared_total: Option<u32>,
+}
+
+// ── Obligations ──
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CheckObligationParams {
+    #[schemars(description = "UUID of the obligation to re-count and re-decide")]
+    pub obligation_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

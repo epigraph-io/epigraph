@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO obligations\n                (agent_id, standard, unit, declared_total, anchors, anchor_kind,\n                 observed_total, verdict, verdict_reason, missing_contract_fields,\n                 source_tool)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Int4",
+        "UuidArray",
+        "Text",
+        "Int4",
+        "Text",
+        "Text",
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0005a9e5bf7ab19665e93f6c81e9df508abef2c26803feb884b2f3f6dd539752"
+}

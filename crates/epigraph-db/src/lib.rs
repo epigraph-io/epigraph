@@ -89,17 +89,17 @@ pub use repos::{
     MethodEvidenceStrength, MethodFailureModes, MethodForCapability, MethodRecord,
     MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
     MockChainRepository, MockChainRow, NearestClaimHit, NewAnchor, NewManifest, NewManifestEntry,
-    NewRecallEvent, OAuthClientRepository, OAuthClientRow, OwnershipRepository, PaperRepository,
-    PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository, PatternTemplateRow,
-    PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge,
-    ProvenanceLogRow, ProvenanceNode, ProvenanceRepository, ReEncryptionKeyRepository,
-    ReEncryptionKeyRow, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
-    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, ScopedBeliefRepository,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, StoredBlob, SweepCandidate,
-    TaskRepository, TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository,
-    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
-    WorkflowRepository, EXPANSION_RELATIONSHIPS, MANIFEST_ALGO, PRUNABLE_EVENT_TYPES,
-    ROOT_TYPE_MANIFEST,
+    NewObligation, NewRecallEvent, OAuthClientRepository, OAuthClientRow, ObligationRepository,
+    ObligationRow, OwnershipRepository, PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput,
+    PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository, ProvenanceChain,
+    ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
+    ProvenanceRepository, ReEncryptionKeyRepository, ReEncryptionKeyRow, ReasoningTraceRepository,
+    RecallEventRepository, RecallEventRow, RefreshTokenRepository, RefreshTokenRow, ResolvedStep,
+    ScopedBeliefRepository, SecurityEventRepository, SecurityEventRow, SheafRepository, StoredBlob,
+    SweepCandidate, TaskRepository, TaskRow, TripleRepository, TripleRow,
+    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
+    WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS, MANIFEST_ALGO,
+    PRUNABLE_EVENT_TYPES, ROOT_TYPE_MANIFEST,
 };
 
 // Re-export sqlx types that users will need
@@ -114,6 +114,7 @@ pub use repos::edge::{AttributedClaimRow, EdgeRow, EPISTEMIC_RELATIONSHIPS};
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
 pub use repos::mass_function::MassFunctionRow;
+pub use repos::obligation::ANCHOR_KIND_CLAIM;
 pub use repos::ownership::OwnershipRow;
 pub use repos::perspective::PerspectiveRow;
 pub use repos::scoped_belief::ScopedBeliefRow;

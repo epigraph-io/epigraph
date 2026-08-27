@@ -43,6 +43,7 @@ pub mod mass_function;
 pub mod match_candidate;
 pub mod method;
 pub mod oauth_client;
+pub mod obligation;
 pub mod ownership;
 pub mod paper;
 pub mod pattern_template;
@@ -112,6 +113,7 @@ pub use method::{
     MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
 };
+pub use obligation::{NewObligation, ObligationRepository, ObligationRow, ANCHOR_KIND_CLAIM};
 pub use ownership::OwnershipRepository;
 pub use paper::{AssertedClaimRow, PaperRepository, PaperRow};
 pub use perspective::PerspectiveRepository;

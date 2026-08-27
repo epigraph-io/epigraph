@@ -38,6 +38,7 @@ pub mod graph;
 pub mod ids;
 pub mod labels;
 pub mod node;
+pub mod obligation;
 pub mod properties;
 pub mod prov;
 pub mod traits;
@@ -53,6 +54,10 @@ pub use errors::CoreError;
 pub use ids::{EdgeId, NodeId};
 pub use labels::Label;
 pub use node::Node;
+pub use obligation::{
+    CoverageAssessment, CoverageContract, CoverageStandard, CoverageVerdict,
+    UnknownCoverageStandard,
+};
 pub use properties::{PropertyMap, PropertyValue};
 pub use prov::ProvAgentType;
 pub use traits::{ContentAddressable, Signable, Verifiable};

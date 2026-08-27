@@ -17,25 +17,64 @@
 
 use epigraph_mcp::EpiGraphMcpFull;
 
-/// Locate a tool's declared subschema for one named parameter.
-fn property_schema(tools: &serde_json::Value, tool: &str, field: &str) -> serde_json::Value {
-    let entry = tools
+/// A tool's whole `inputSchema`, needed because a `$ref` resolves against the
+/// `$defs` that sits beside `properties`.
+fn input_schema(tools: &serde_json::Value, tool: &str) -> serde_json::Value {
+    tools
         .as_array()
         .expect("all_tools_json must return an array")
         .iter()
         .find(|t| t.get("name").and_then(serde_json::Value::as_str) == Some(tool))
-        .unwrap_or_else(|| panic!("tool `{tool}` is not registered on the router"));
-
-    entry
+        .unwrap_or_else(|| panic!("tool `{tool}` is not registered on the router"))
         .get("inputSchema")
-        .and_then(|s| s.get("properties"))
+        .unwrap_or_else(|| panic!("tool `{tool}` has no inputSchema"))
+        .clone()
+}
+
+/// Locate a tool's declared subschema for one named parameter.
+fn property_schema(tools: &serde_json::Value, tool: &str, field: &str) -> serde_json::Value {
+    let schema = input_schema(tools, tool);
+    schema
+        .get("properties")
         .and_then(|p| p.get(field))
         .unwrap_or_else(|| {
-            panic!(
-                "tool `{tool}` declares no `{field}` property; inputSchema = {}",
-                entry.get("inputSchema").unwrap_or(&serde_json::Value::Null)
-            )
+            panic!("tool `{tool}` declares no `{field}` property; inputSchema = {schema}")
         })
+        .clone()
+}
+
+/// Follow one level of indirection to the subschema that actually carries the
+/// type.
+///
+/// A named `JsonSchema` struct behind an `Option` renders as
+/// `{"anyOf": [{"$ref": "#/$defs/T"}, {"const": null}]}` — the `$ref` target
+/// in `$defs` holds `"type": "object"` plus every property. That is STRONGER
+/// type information than an inline `"type": "object"`, so it must satisfy the
+/// same assertion; but an unresolvable `$ref`, or a branch with no type at
+/// all, still fails, which is the BL-1 regression being guarded.
+fn resolve<'a>(
+    input_schema: &'a serde_json::Value,
+    schema: &'a serde_json::Value,
+) -> serde_json::Value {
+    let Some(branches) = schema.get("anyOf").and_then(serde_json::Value::as_array) else {
+        return schema.clone();
+    };
+    // Skip the null branch schemars emits for the `Option` wrapper.
+    let non_null = branches
+        .iter()
+        .find(|b| b.get("const") != Some(&serde_json::Value::Null))
+        .unwrap_or_else(|| panic!("anyOf has only a null branch: {schema}"));
+
+    let Some(reference) = non_null.get("$ref").and_then(serde_json::Value::as_str) else {
+        return non_null.clone();
+    };
+    let name = reference.strip_prefix("#/$defs/").unwrap_or_else(|| {
+        panic!("only local $defs references are resolvable here; got {reference}")
+    });
+    input_schema
+        .get("$defs")
+        .and_then(|d| d.get(name))
+        .unwrap_or_else(|| panic!("dangling $ref {reference}: no $defs/{name} in {input_schema}"))
         .clone()
 }
 
@@ -50,8 +89,29 @@ fn declares_type(schema: &serde_json::Value, expected: &str) -> bool {
     }
 }
 
+/// True when the property may be omitted or sent as null: `nullable: true`, a
+/// `"null"` type member, or an `anyOf` branch that is the null constant.
+fn admits_null(schema: &serde_json::Value) -> bool {
+    if schema.get("nullable") == Some(&serde_json::Value::Bool(true))
+        || declares_type(schema, "null")
+    {
+        return true;
+    }
+    schema
+        .get("anyOf")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|branches| {
+            branches.iter().any(|b| {
+                b.get("const") == Some(&serde_json::Value::Null)
+                    || b.get("nullable") == Some(&serde_json::Value::Bool(true))
+                    || declares_type(b, "null")
+            })
+        })
+}
+
 fn assert_declares(tools: &serde_json::Value, tool: &str, field: &str, expected: &str) {
-    let schema = property_schema(tools, tool, field);
+    let declared = property_schema(tools, tool, field);
+    let schema = resolve(&input_schema(tools, tool), &declared);
 
     // The regression being guarded is a schema of the JSON literal `true` (or
     // `{}`): syntactically valid, semantically "anything goes", and useless to
@@ -69,12 +129,15 @@ fn assert_declares(tools: &serde_json::Value, tool: &str, field: &str, expected:
     // Pinning the type must not cost the prose that tells an agent what to put
     // in the field — schemars merges `with` and `description`, and a future
     // bump that stops merging them would silently strip every one of these.
+    // Read it off the DECLARED property: that is where a client looking at
+    // `properties.<field>` finds it, whether or not the type sits behind a
+    // `$ref`.
     assert!(
-        schema
+        declared
             .get("description")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|d| !d.is_empty()),
-        "`{tool}.{field}` lost its description when the type was pinned; got {schema}"
+        "`{tool}.{field}` lost its description when the type was pinned; got {declared}"
     );
     println!("{tool}.{field} => {schema}");
 }
@@ -92,6 +155,11 @@ fn free_form_json_params_declare_a_concrete_type() {
     assert_declares(&tools, "link_hierarchical", "properties", "object");
     assert_declares(&tools, "link_epistemic", "properties", "object");
     assert_declares(&tools, "patch_claim", "properties", "object");
+    // Backlog 4b48ffb5: the coverage contract override. A bare
+    // `serde_json::Value` here would leave a client unable to tell that
+    // `{"standard": "summary"}` is an object, re-introducing BL-1 on the one
+    // tool whose default contract most callers will want to relabel.
+    assert_declares(&tools, "batch_submit_claims", "coverage", "object");
 }
 
 /// The three optional parameters must stay optional. Declaring a type is only
@@ -105,6 +173,7 @@ fn optional_object_params_stay_optional() {
         ("link_hierarchical", "properties"),
         ("link_epistemic", "properties"),
         ("patch_claim", "properties"),
+        ("batch_submit_claims", "coverage"),
     ] {
         let entry = tools
             .as_array()
@@ -127,15 +196,16 @@ fn optional_object_params_stay_optional() {
 
         // Absent from `required` is only half of "optional": the value must
         // also still be allowed to *be* null. rmcp renders that as
-        // `"nullable": true`; a schemars/rmcp bump could switch to the
-        // `"type": ["object","null"]` union instead. Either is fine — silently
-        // losing both is not, and `required` alone would not catch it.
+        // `"nullable": true` for an inline type and as an `anyOf` null branch
+        // for a `$ref`'d one; a schemars/rmcp bump could switch to the
+        // `"type": ["object","null"]` union instead. Any of the three is fine
+        // — silently losing all of them is not, and `required` alone would not
+        // catch it.
         let schema = property_schema(&tools, tool, field);
         assert!(
-            schema.get("nullable") == Some(&serde_json::Value::Bool(true))
-                || declares_type(&schema, "null"),
+            admits_null(&schema),
             "`{tool}.{field}` is Option<_> but its schema no longer admits null \
-             (neither `nullable: true` nor a \"null\" type member); got {schema}"
+             (no `nullable: true`, no \"null\" type member, no null anyOf branch); got {schema}"
         );
     }
 }

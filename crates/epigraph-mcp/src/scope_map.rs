@@ -76,6 +76,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("backfill_embeddings", "claims:write"),
     ("batch_submit_claims", "claims:write"),
     ("challenge_claim", "claims:write"),
+    ("check_obligation", "claims:write"),
     ("create_frame", "claims:write"),
     ("create_perspective", "claims:write"),
     ("decide_match_candidate", "claims:write"),

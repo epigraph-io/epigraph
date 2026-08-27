@@ -23,6 +23,10 @@ async fn batch_submit_claims_attaches_per_entry_labels(pool: PgPool) {
                 confidence: Some(0.8),
                 labels: vec!["capability-registry".into()],
             }],
+            // Backlog 4b48ffb5: the coverage contract has no opt-in. `None`
+            // here is not "off" — it is the implicit default, `exhaustive`
+            // over this batch's own entries. The assertions below prove it.
+            coverage: None,
         },
     )
     .await
@@ -40,6 +44,26 @@ async fn batch_submit_claims_attaches_per_entry_labels(pool: PgPool) {
         summary.get("errors").and_then(|v| v.as_i64()),
         Some(0),
         "expected no batch errors, got {summary}"
+    );
+
+    // Backlog 4b48ffb5: this pre-existing test is also the proof that the
+    // coverage checker runs on the DEFAULT path. No flag was passed, no config
+    // key exists, and the batch still comes back with a counted verdict over a
+    // declared denominator read off its own payload.
+    assert_eq!(
+        summary.get("declared").and_then(|v| v.as_i64()),
+        Some(1),
+        "declared_total must default to the entry count, got {summary}"
+    );
+    assert_eq!(
+        summary.get("coverage_standard").and_then(|v| v.as_str()),
+        Some("exhaustive"),
+        "the default standard must be exhaustive, got {summary}"
+    );
+    assert_eq!(
+        summary.get("coverage_verdict").and_then(|v| v.as_str()),
+        Some("satisfied"),
+        "one distinct claim against a declared 1 must satisfy, got {summary}"
     );
 
     let (labels,): (Vec<String>,) =
