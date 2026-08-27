@@ -1329,10 +1329,10 @@ impl EpiGraphMcpFull {
         tools::rdf::search_triples(self, params).await
     }
 
-    // ── Cross-source matching (3 tools) ──
+    // ── Cross-source matching (4 tools) ──
 
     #[tool(
-        description = "Look up existing cross-source matches for a claim. Returns match_candidates rows (any status) plus any CORROBORATES edges already written. Read-only — to *run* the matcher across new claims, use the `cross_source_sweep` CLI."
+        description = "Look up existing cross-source matches for a claim. Returns match_candidates rows (any status) plus any CORROBORATES edges already written. Read-only — to *stage* new candidates for review, use `stage_cross_source_matches` (blocking + scoring, no verifier); to run the full matcher including LLM verification, use the `cross_source_sweep` CLI."
     )]
     async fn find_cross_source_matches(
         &self,
@@ -1359,6 +1359,16 @@ impl EpiGraphMcpFull {
         Parameters(params): Parameters<DecideMatchCandidateParams>,
     ) -> Result<CallToolResult, McpError> {
         tools::matching::decide_match_candidate(self, params).await
+    }
+
+    #[tool(
+        description = "Run the blocking + scoring stages of the cross-source matcher over seed claims and stage the survivors as status='pending' match_candidates for review. It does NOT run the LLM verifier and spends no tokens, so staged rows carry verifier_verdict = NULL — promoting one records an edge nothing verified. `dry_run` defaults to TRUE: pass dry_run=false to actually write rows. Pairs that already carry a verifier verdict or an operator decision are skipped, never reset to pending. It does not stamp last_match_scan_at, so the nightly `cross_source_sweep` still re-scans and verifies these seeds — staging supplements the sweep, it does not replace it. A nonzero `truncated_pairs` in the response means the scan was PARTIAL (raise `max_pairs` or lower `limit`). Requires claims:write."
+    )]
+    async fn stage_cross_source_matches(
+        &self,
+        Parameters(params): Parameters<StageCrossSourceMatchesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::matching::stage_cross_source_matches(self, params).await
     }
 
     // ── Meta (1 tool) ──

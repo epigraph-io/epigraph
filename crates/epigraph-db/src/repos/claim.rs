@@ -1586,6 +1586,37 @@ impl ClaimRepository {
         Ok(live as usize == distinct.len())
     }
 
+    /// Seed window for the cross-source matcher: current claims never scanned,
+    /// or scanned more than 7 days ago, most-recent first.
+    ///
+    /// Biased toward recent claims so newly-ingested material gets attention
+    /// first — the older-and-unscanned tail can wait for a backfill pass.
+    ///
+    /// Lives here rather than inline in `cross_source_sweep` because that seed
+    /// query now has two consumers (the nightly CLI sweep and the MCP
+    /// `stage_cross_source_matches` tool) and CLAUDE.md forbids duplicating SQL
+    /// outside `crates/epigraph-db/src/repos/`. Two copies of the window
+    /// predicate could drift, and the two paths would then disagree about which
+    /// claims are "due".
+    ///
+    /// Note that neither caller's *use* of the seeds stamps
+    /// `last_match_scan_at` — only `cross_source_sweep` does, after it has
+    /// actually verified.
+    pub async fn select_match_seeds(pool: &PgPool, limit: i64) -> Result<Vec<uuid::Uuid>, DbError> {
+        let seeds = sqlx::query_scalar(
+            "SELECT id FROM claims
+         WHERE COALESCE(is_current, true) = true
+           AND (last_match_scan_at IS NULL
+                OR last_match_scan_at < now() - INTERVAL '7 days')
+         ORDER BY created_at DESC
+         LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        Ok(seeds)
+    }
+
     /// Fetch `(id, content)` for a batch of claim ids, current rows only.
     ///
     /// Lightweight companion to the structural enrichment in

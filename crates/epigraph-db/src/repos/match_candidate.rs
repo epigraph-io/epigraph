@@ -196,6 +196,44 @@ impl MatchCandidateRepo {
         .await
     }
 
+    /// Of the given pairs, which ones already carry a verifier verdict or an
+    /// operator decision. Caller MUST pass canonical (`claim_a < claim_b`)
+    /// pairs — the same contract `union_block`'s output satisfies.
+    ///
+    /// This is the re-stage guard. [`MatchCandidateRepo::upsert`]'s status gate
+    /// keys on `decided_at IS NOT NULL`, which protects operator rulings — but
+    /// the matcher's own verifier-set `status='rejected'` rows have `decided_at`
+    /// NULL (deliberately, see the `upsert` doc above), so an unguarded
+    /// verifier-free re-stage would flip those rows back to `'pending'` while
+    /// `COALESCE` preserved their `distinct` verdict. The result is a row that
+    /// sits in the human review queue and that
+    /// `promotion_disposition_for_column` then refuses to promote: permanent
+    /// junk, and a resurrection of pairs the LLM already ruled distinct.
+    ///
+    /// Verdict-carrying rows are excluded too, not just decided ones: a pair the
+    /// verifier has already answered on does not need a second, weaker,
+    /// unverified opinion.
+    pub async fn verified_or_decided_pairs(
+        &self,
+        pairs: &[(Uuid, Uuid)],
+    ) -> sqlx::Result<std::collections::HashSet<(Uuid, Uuid)>> {
+        if pairs.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let a_side: Vec<Uuid> = pairs.iter().map(|&(a, _)| a).collect();
+        let b_side: Vec<Uuid> = pairs.iter().map(|&(_, b)| b).collect();
+        let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT claim_a, claim_b FROM match_candidates
+             WHERE (claim_a, claim_b) IN (SELECT * FROM UNNEST($1::uuid[], $2::uuid[]))
+               AND (verifier_verdict IS NOT NULL OR decided_at IS NOT NULL)",
+        )
+        .bind(&a_side)
+        .bind(&b_side)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     pub async fn get(&self, id: Uuid) -> sqlx::Result<MatchCandidateRow> {
         sqlx::query_as("SELECT * FROM match_candidates WHERE id = $1")
             .bind(id)

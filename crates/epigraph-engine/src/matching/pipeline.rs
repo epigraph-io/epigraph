@@ -2,11 +2,27 @@
 //!
 //! Wires blocker → scorer → band classification → verifier → policy.
 //! See `docs/superpowers/specs/2026-05-21-cross-source-matching-design.md` §3.
+//!
+//! Two entry points share the blocking and scoring stages:
+//!
+//! - [`run_pipeline`] — the full sweep, driven by the `cross_source_sweep` CLI.
+//!   Every mid-or-above pair goes through the LLM verifier and the resulting
+//!   verdict decides promote / contradicts / reject.
+//! - [`stage_candidates`] — blocking + scoring ONLY. It writes `status='pending'`
+//!   rows with `verifier_verdict IS NULL`, writes NO edges, spends NO LLM
+//!   tokens, and does NOT stamp `claims.last_match_scan_at` (stamping would
+//!   hide unverified seeds from the nightly verifying sweep for 7 days). It
+//!   exists so an agent over MCP can fill the human-review queue
+//!   (`list_match_candidates` / `decide_match_candidate`) without a verifier
+//!   client, which only `epigraph-cli` can construct.
+//!
+//! Both call [`default_blockers`] and [`stage_decision`] so the blocker set and
+//! the mid-band boundary cannot drift between them.
 
 use crate::matching::blocker::{
     compound_nbhd::CompoundNbhdBlocker, content_hash_prefix::ContentHashBlocker,
     embedding_ann::EmbeddingAnnBlocker, shared_triple::SharedTripleBlocker,
-    theme_cluster::ThemeClusterBlocker, union_block, Blocker,
+    theme_cluster::ThemeClusterBlocker, union_block, Blocker, CandidatePair,
 };
 use crate::matching::calibration::MatcherConfig;
 use crate::matching::policy::{Policy, PolicyAction};
@@ -54,16 +70,68 @@ pub struct RunReport {
     pub skipped_no_verdict: usize,
 }
 
-pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<RunReport> {
-    let run_id = Uuid::new_v4();
-    let fan_out = inputs.cfg.fan_out.max_per_claim;
-    let blockers: Vec<Box<dyn Blocker>> = vec![
+/// The blocker set every entry point runs. Factored out so the staging tool
+/// and the nightly sweep cannot drift on which blockers generate candidates —
+/// a divergence there would make the two paths disagree about what a "pair"
+/// even is, silently.
+fn default_blockers(fan_out: usize) -> Vec<Box<dyn Blocker>> {
+    vec![
         Box::new(EmbeddingAnnBlocker::new(fan_out)),
         Box::new(ThemeClusterBlocker::new(fan_out)),
         Box::new(CompoundNbhdBlocker::new(fan_out)),
         Box::new(SharedTripleBlocker::new(fan_out)),
         Box::new(ContentHashBlocker),
-    ];
+    ]
+}
+
+/// What [`stage_candidates`] does with a scored pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageDecision {
+    /// At or above the mid band — write a `pending` candidate row.
+    Stage,
+    /// Below the mid band — dropped entirely, exactly as [`run_pipeline`] drops
+    /// its low band (spec §6 state machine: `[dropped]`).
+    BelowBand,
+}
+
+/// Classify a scored pair against the mid band.
+///
+/// Pinned to the identical `>=` comparison [`run_pipeline`] uses when it routes
+/// pairs to the verifier, so the two entry points classify the boundary the
+/// same way. A NaN score falls to [`StageDecision::BelowBand`] because
+/// `f32::NAN >= mid` is false — a degenerate `renormalized_score` must not
+/// reach the review queue.
+#[must_use]
+pub fn stage_decision(score: f32, mid: f32) -> StageDecision {
+    if score >= mid {
+        StageDecision::Stage
+    } else {
+        StageDecision::BelowBand
+    }
+}
+
+/// Truncate `pairs` to `max_pairs`, returning the kept pairs and how many were
+/// dropped. `max_pairs == 0` means uncapped.
+///
+/// This is a COST GUARD, not a ranking. `union_block` returns pairs in sorted
+/// canonical-uuid order, so truncation drops an ARBITRARY subset — not the
+/// lowest-scoring one; scores do not exist yet at this point. Each surviving
+/// pair costs 5 DB round-trips in `score_pair`, which is the whole reason the
+/// cap exists. The drop count is returned so a partial scan is never silent:
+/// callers must surface it.
+fn cap_pairs(pairs: Vec<CandidatePair>, max_pairs: usize) -> (Vec<CandidatePair>, usize) {
+    if max_pairs == 0 || pairs.len() <= max_pairs {
+        return (pairs, 0);
+    }
+    let dropped = pairs.len() - max_pairs;
+    let mut kept = pairs;
+    kept.truncate(max_pairs);
+    (kept, dropped)
+}
+
+pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<RunReport> {
+    let run_id = Uuid::new_v4();
+    let blockers = default_blockers(inputs.cfg.fan_out.max_per_claim);
     let pairs = union_block(
         pool,
         &blockers,
@@ -97,7 +165,7 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         // otherwise. Cost: high-band pairs now incur one verifier call;
         // acceptable since `auto_promote` defaults off and a future
         // `belief_alignment`-gated fast-path can re-optimize the clear cases.
-        if f.score >= inputs.cfg.bands.mid {
+        if stage_decision(f.score, inputs.cfg.bands.mid) == StageDecision::Stage {
             mid_pairs.push((*a, *b));
             mid_features.push(f);
         } else {
@@ -184,4 +252,176 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         verdict_writes_suppressed: policy.verdict_writes_suppressed(),
         skipped_no_verdict,
     })
+}
+
+/// Inputs for [`stage_candidates`].
+pub struct StageInputs {
+    pub seeds: Vec<Uuid>,
+    pub cfg: MatcherConfig,
+    /// Cap on scored pairs; `0` means uncapped. See [`cap_pairs`] — truncation
+    /// is arbitrary, not by score.
+    pub max_pairs: usize,
+    /// `false` performs the full blocking + scoring pass and reports what it
+    /// *would* stage without writing any row.
+    pub write: bool,
+}
+
+/// Outcome of [`stage_candidates`].
+///
+/// `blocked_pairs` = `truncated_pairs` + `already_decided` + `scanned_pairs`,
+/// and `scanned_pairs` = `staged` + `below_band`.
+#[derive(Debug, Clone)]
+pub struct StageReport {
+    pub run_id: Uuid,
+    /// Pairs `union_block` produced, before the `max_pairs` cap.
+    pub blocked_pairs: usize,
+    /// Pairs actually sent through `score_pair`.
+    pub scanned_pairs: usize,
+    /// Pairs dropped by the `max_pairs` cap. Nonzero means a PARTIAL scan.
+    pub truncated_pairs: usize,
+    pub staged: usize,
+    pub below_band: usize,
+    /// Pairs skipped because they already carry a verifier verdict or an
+    /// operator decision. See
+    /// [`MatchCandidateRepo::verified_or_decided_pairs`].
+    pub already_decided: usize,
+    /// Whether rows were actually written (`StageInputs::write`).
+    pub wrote_rows: bool,
+}
+
+/// Run the blocking + scoring stages over `seeds` and stage the survivors as
+/// `status='pending'` match candidates for human review.
+///
+/// **No verification happens here.** No `VerifierClient` is constructed, no LLM
+/// token is spent, and the rows this writes carry `verifier_verdict IS NULL`
+/// and `verifier_rationale IS NULL`. Never synthesise a `Verdict` or a
+/// rationale string on this path: a rationale written by a path that asked no
+/// model anything is the exact fabrication that produced the 12,006 bogus
+/// `status='rejected'` rows documented at
+/// `epigraph-cli/src/bin/cross_source_sweep.rs`.
+///
+/// It also does NOT stamp `claims.last_match_scan_at`. Staged rows carry no
+/// verdict, so advancing the sweep window would hide unverified seeds from the
+/// nightly verifying sweep for 7 days. Staging is therefore a *supplement* to
+/// `cross_source_sweep`, never a substitute for it.
+///
+/// Pairs that already carry a verdict or an operator decision are skipped
+/// rather than re-staged — see
+/// [`MatchCandidateRepo::verified_or_decided_pairs`] for why an unguarded
+/// re-stage corrupts the review queue.
+pub async fn stage_candidates(pool: &PgPool, inputs: StageInputs) -> anyhow::Result<StageReport> {
+    let run_id = Uuid::new_v4();
+    let blockers = default_blockers(inputs.cfg.fan_out.max_per_claim);
+    let blocked = union_block(
+        pool,
+        &blockers,
+        &inputs.seeds,
+        inputs.cfg.filter,
+        &inputs.cfg.eligibility,
+    )
+    .await?;
+    let blocked_pairs = blocked.len();
+    let (pairs, truncated_pairs) = cap_pairs(blocked, inputs.max_pairs);
+
+    // One batched read for the whole capped list — not per-pair, which would
+    // double this path's query count.
+    let repo = MatchCandidateRepo::new(pool.clone());
+    let decided = repo.verified_or_decided_pairs(&pairs).await?;
+
+    // `auto_promote = false` defensively: `PolicyAction::Stage` ignores the
+    // flag, but a Policy built for a staging run should not be one flipped bit
+    // away from committing edges.
+    let policy = Policy::new(pool.clone(), repo, run_id, false);
+
+    let mut scanned_pairs = 0usize;
+    let mut staged = 0usize;
+    let mut below_band = 0usize;
+    let mut already_decided = 0usize;
+    for (a, b) in pairs {
+        if decided.contains(&(a, b)) {
+            already_decided += 1;
+            continue;
+        }
+        let f = score_pair(pool, a, b, &inputs.cfg.weights).await?;
+        scanned_pairs += 1;
+        match stage_decision(f.score, inputs.cfg.bands.mid) {
+            StageDecision::Stage => {
+                staged += 1;
+                if inputs.write {
+                    // `verdict: None` — nothing was asked, so nothing is
+                    // reported.
+                    policy.act(PolicyAction::Stage, a, b, &f, None).await?;
+                }
+            }
+            StageDecision::BelowBand => below_band += 1,
+        }
+    }
+
+    Ok(StageReport {
+        run_id,
+        blocked_pairs,
+        scanned_pairs,
+        truncated_pairs,
+        staged,
+        below_band,
+        already_decided,
+        wrote_rows: inputs.write,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(n: u128) -> CandidatePair {
+        (Uuid::from_u128(n), Uuid::from_u128(n + 1_000))
+    }
+
+    /// Pins the `>=` boundary `run_pipeline` uses to route the mid band, so the
+    /// staging entry point and the nightly sweep cannot drift on it.
+    #[test]
+    fn stage_decision_is_inclusive_at_the_mid_band() {
+        assert_eq!(stage_decision(0.80, 0.80), StageDecision::Stage);
+    }
+
+    #[test]
+    fn stage_decision_drops_scores_below_the_mid_band() {
+        assert_eq!(stage_decision(0.7999, 0.80), StageDecision::BelowBand);
+    }
+
+    /// A degenerate `renormalized_score` must never reach the review queue.
+    #[test]
+    fn stage_decision_drops_nan_scores() {
+        assert_eq!(stage_decision(f32::NAN, 0.80), StageDecision::BelowBand);
+        assert_eq!(stage_decision(f32::NAN, 0.0), StageDecision::BelowBand);
+    }
+
+    #[test]
+    fn cap_pairs_truncates_and_reports_the_drop_count() {
+        let pairs: Vec<CandidatePair> = (0..10).map(pair).collect();
+        let (kept, dropped) = cap_pairs(pairs, 4);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(dropped, 6);
+    }
+
+    #[test]
+    fn cap_pairs_is_a_noop_at_or_below_the_cap() {
+        let exactly: Vec<CandidatePair> = (0..4).map(pair).collect();
+        let (kept, dropped) = cap_pairs(exactly.clone(), 4);
+        assert_eq!(kept, exactly);
+        assert_eq!(dropped, 0);
+
+        let under: Vec<CandidatePair> = (0..2).map(pair).collect();
+        let (kept, dropped) = cap_pairs(under.clone(), 4);
+        assert_eq!(kept, under);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn cap_pairs_zero_means_uncapped() {
+        let pairs: Vec<CandidatePair> = (0..10).map(pair).collect();
+        let (kept, dropped) = cap_pairs(pairs.clone(), 0);
+        assert_eq!(kept, pairs);
+        assert_eq!(dropped, 0);
+    }
 }

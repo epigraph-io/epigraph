@@ -2320,6 +2320,31 @@ mod tests {
             Some(["11111111-1111-1111-1111-111111111111".to_string()].as_slice())
         );
     }
+
+    /// Every field optional, so an empty payload is valid and the tool's own
+    /// clamping supplies the documented defaults (limit 25, max_pairs 300,
+    /// dry_run true).
+    #[test]
+    fn stage_cross_source_matches_params_default_to_none() {
+        let p: StageCrossSourceMatchesParams = serde_json::from_str("{}").unwrap();
+        assert!(p.claim_ids.is_none());
+        assert!(p.limit.is_none());
+        assert!(p.max_pairs.is_none());
+        assert!(p.dry_run.is_none());
+        assert!(p.calibration_path.is_none());
+    }
+
+    /// Exercises this file's `deserialize_opt_string_array` defence against
+    /// clients that stringify array params.
+    #[test]
+    fn stage_cross_source_matches_params_accept_stringified_claim_ids() {
+        let raw = r#"{"claim_ids":"[\"11111111-1111-1111-1111-111111111111\"]"}"#;
+        let p: StageCrossSourceMatchesParams = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            p.claim_ids.as_deref(),
+            Some(["11111111-1111-1111-1111-111111111111".to_string()].as_slice())
+        );
+    }
 }
 
 // ── Cross-source matching (T19) ──
@@ -2346,6 +2371,53 @@ pub struct DecideMatchCandidateParams {
         description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct) or 'reject'"
     )]
     pub verdict: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StageCrossSourceMatchesParams {
+    #[schemars(
+        description = "Explicit claim UUIDs to use as matcher seeds. When present and non-empty, \
+                       `limit` is ignored. Omit to let the tool pick the same seed window the \
+                       nightly sweep uses (current claims never scanned, or scanned 7+ days ago, \
+                       most-recent first)."
+    )]
+    #[serde(default, deserialize_with = "deserialize_opt_string_array")]
+    pub claim_ids: Option<Vec<String>>,
+
+    #[schemars(
+        description = "How many seed claims to pull when `claim_ids` is absent. Default 25, \
+                       clamped to 1..=200. This is a SEED count, not a candidate count — each \
+                       seed can block out to many pairs."
+    )]
+    #[serde(default)]
+    pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Cap on the number of blocked pairs actually scored. Default 300, clamped \
+                       to 1..=2000. Scoring costs ~5 DB round-trips per pair, so this bounds \
+                       latency. Truncation is by canonical UUID order, NOT by score, so a \
+                       nonzero `truncated_pairs` in the response means the scan was PARTIAL."
+    )]
+    #[serde(default)]
+    pub max_pairs: Option<i64>,
+
+    #[schemars(
+        description = "Default TRUE. When true, the blocking + scoring pass runs and the report \
+                       says what WOULD be staged, but no match_candidates rows are written. Pass \
+                       false to actually stage."
+    )]
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+
+    #[schemars(
+        description = "Path to calibration.toml (weights, bands, source filter, eligibility \
+                       exclude-labels). Overrides EPIGRAPH_CALIBRATION_PATH; defaults to \
+                       'calibration.toml' relative to the server's working directory. There is \
+                       deliberately no built-in fallback config — a wrong eligibility list \
+                       floods the queue with operational self-logs."
+    )]
+    #[serde(default)]
+    pub calibration_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

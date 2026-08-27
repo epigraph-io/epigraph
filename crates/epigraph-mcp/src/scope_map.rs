@@ -98,6 +98,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("resolve_backlog_item", "claims:write"),
     ("set_source_reliability", "claims:write"),
     ("stage_claims", "claims:write"),
+    ("stage_cross_source_matches", "claims:write"),
     ("store_workflow", "claims:write"),
     ("submit_claim", "claims:write"),
     ("submit_ds_evidence", "claims:write"),
@@ -173,5 +174,15 @@ mod tests {
         assert_eq!(required_scope("mark_duplicate"), Some("claims:admin"));
         assert_eq!(required_scope("supersede_claim"), Some("claims:admin"));
         assert_eq!(required_scope("update_partition"), Some("claims:admin"));
+    }
+
+    /// `stage_cross_source_matches` writes `match_candidates` rows, so it must
+    /// never be reachable on a read-only token.
+    #[test]
+    fn stage_cross_source_matches_is_write_gated() {
+        assert_eq!(
+            required_scope("stage_cross_source_matches"),
+            Some("claims:write")
+        );
     }
 }

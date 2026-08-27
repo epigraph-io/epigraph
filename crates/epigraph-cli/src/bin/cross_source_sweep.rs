@@ -104,20 +104,11 @@ async fn main() -> anyhow::Result<()> {
         None => MatcherConfig::load_default()?,
     };
 
-    // Pick seeds: claims never scanned, or scanned more than 7 days ago.
-    // Bias toward recent claims so newly-ingested material gets attention
-    // first — the older-and-unscanned tail can wait for a backfill pass.
-    let seeds: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM claims
-         WHERE COALESCE(is_current, true) = true
-           AND (last_match_scan_at IS NULL
-                OR last_match_scan_at < now() - INTERVAL '7 days')
-         ORDER BY created_at DESC
-         LIMIT $1",
-    )
-    .bind(args.limit)
-    .fetch_all(&pool)
-    .await?;
+    // Pick seeds: claims never scanned, or scanned more than 7 days ago. The
+    // window predicate lives in the repo layer because the MCP staging tool
+    // shares it; see `ClaimRepository::select_match_seeds`.
+    let seeds: Vec<Uuid> =
+        epigraph_db::ClaimRepository::select_match_seeds(&pool, args.limit).await?;
 
     let seed_count = seeds.len();
     let verifier: Box<dyn VerifierClient> = if args.count_only {

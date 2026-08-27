@@ -16,11 +16,66 @@ use sqlx::PgPool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyAction {
     AutoPromote,
     WriteContradicts,
     Reject,
+    /// Record the pair as `pending` for human review; never writes an edge,
+    /// never carries a verdict, and ignores `auto_promote`.
+    ///
+    /// This is the verifier-free entry point
+    /// ([`crate::matching::pipeline::stage_candidates`]): blocking + scoring
+    /// happened, no model was asked anything, so there is nothing to promote
+    /// and nothing to reject. Anything stronger than "queue it for a human"
+    /// would be a finding the pipeline did not make.
+    Stage,
+}
+
+impl PolicyAction {
+    /// The `match_candidates.status` this action writes.
+    ///
+    /// `auto_promote` gates BOTH the edge write ([`Self::edge_relationship`])
+    /// AND whether the candidate is committed (`promoted`) or staged for human
+    /// review (`pending`). Before this, `auto_promote=false` left the row as
+    /// `promoted` with no edge — a half-state — and the `pending` review queue
+    /// (`decide_match_candidate`, `MatchCandidateRepo::list_pending`, the API
+    /// `pending[]` array) had no producer at all, so the whole human-review
+    /// surface was dead in normal operation.
+    ///
+    /// [`PolicyAction::Stage`] ignores the flag: a pair nobody verified is
+    /// never committed, however the run was configured.
+    #[must_use]
+    pub fn candidate_status(self, auto_promote: bool) -> &'static str {
+        match self {
+            PolicyAction::AutoPromote | PolicyAction::WriteContradicts => {
+                if auto_promote {
+                    "promoted"
+                } else {
+                    "pending"
+                }
+            }
+            PolicyAction::Stage => "pending",
+            PolicyAction::Reject => "rejected",
+        }
+    }
+
+    /// The edge relationship this action commits, or `None` when it writes no
+    /// edge at all.
+    ///
+    /// Lowercase `contradicts` — the directional factor graph maps it to
+    /// mutual_exclusion with strength 0. Shared with the human-decide path
+    /// (`decide_candidate` / `decide_match_candidate`) via the constant so the
+    /// two producers of this edge cannot drift on casing; edge dedup compares
+    /// the relationship string exactly.
+    #[must_use]
+    pub fn edge_relationship(self, auto_promote: bool) -> Option<&'static str> {
+        match self {
+            PolicyAction::AutoPromote if auto_promote => Some(CORROBORATES_RELATIONSHIP),
+            PolicyAction::WriteContradicts if auto_promote => Some(CONTRADICTS_RELATIONSHIP),
+            _ => None,
+        }
+    }
 }
 
 pub struct Policy {
@@ -118,48 +173,17 @@ impl Policy {
         // exactly the defect this replaced.
         let features_json = serde_json::to_value(f)?;
 
-        // `auto_promote` gates BOTH the edge write (below) AND whether the
-        // candidate is committed (`promoted`) or staged for human review
-        // (`pending`). Before this, `auto_promote=false` left the row as
-        // `promoted` with no edge — a half-state — and the `pending` review
-        // queue (`decide_match_candidate`, `MatchCandidateRepo::list_pending`,
-        // the API `pending[]` array) had no producer at all, so the whole
-        // human-review surface was dead in normal operation.
-        let promote_status = if self.auto_promote {
-            "promoted"
-        } else {
-            "pending"
-        };
-
-        match action {
-            PolicyAction::AutoPromote => {
-                let id = self
-                    .upsert_candidate(lo, hi, f, features_json, promote_status, verdict.as_ref())
-                    .await?;
-                if self.auto_promote {
-                    self.write_edge(a, b, CORROBORATES_RELATIONSHIP, f, id, verdict.as_ref())
-                        .await?;
-                }
-            }
-            PolicyAction::WriteContradicts => {
-                let id = self
-                    .upsert_candidate(lo, hi, f, features_json, promote_status, verdict.as_ref())
-                    .await?;
-                if self.auto_promote {
-                    // Lowercase 'contradicts' — the directional factor graph
-                    // maps it to mutual_exclusion with strength 0. Shared with
-                    // the human-decide path (`decide_candidate` /
-                    // `decide_match_candidate`) via the constant so the two
-                    // producers of this edge cannot drift on casing; edge dedup
-                    // compares the relationship string exactly.
-                    self.write_edge(a, b, CONTRADICTS_RELATIONSHIP, f, id, verdict.as_ref())
-                        .await?;
-                }
-            }
-            PolicyAction::Reject => {
-                self.upsert_candidate(lo, hi, f, features_json, "rejected", verdict.as_ref())
-                    .await?;
-            }
+        // The row/edge decision is a pure function of (action, auto_promote) —
+        // see [`PolicyAction::candidate_status`] and
+        // [`PolicyAction::edge_relationship`]. Keeping it out of this async
+        // body is what makes "Stage never writes an edge" assertable in a unit
+        // test with no database.
+        let status = action.candidate_status(self.auto_promote);
+        let id = self
+            .upsert_candidate(lo, hi, f, features_json, status, verdict.as_ref())
+            .await?;
+        if let Some(rel) = action.edge_relationship(self.auto_promote) {
+            self.write_edge(a, b, rel, f, id, verdict.as_ref()).await?;
         }
         Ok(())
     }
@@ -190,5 +214,77 @@ impl Policy {
         });
         EdgeRepository::create_symmetric_if_absent(&self.pool, a, b, relationship, props).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole safety claim of `stage_cross_source_matches`, asserted with no
+    /// database: a staged pair is always queued for review and never commits an
+    /// edge, whatever `auto_promote` says.
+    #[test]
+    fn stage_action_always_pends_and_never_writes_an_edge() {
+        for auto_promote in [false, true] {
+            assert_eq!(
+                PolicyAction::Stage.candidate_status(auto_promote),
+                "pending",
+                "Stage must queue for review (auto_promote={auto_promote})"
+            );
+            assert_eq!(
+                PolicyAction::Stage.edge_relationship(auto_promote),
+                None,
+                "Stage must never commit an edge (auto_promote={auto_promote})"
+            );
+        }
+    }
+
+    /// Regression net for the `Policy::act` refactor: this table is exactly the
+    /// matrix the three pre-refactor `match` arms produced. `act` shares the
+    /// nightly sweep's write path, so a mistake here changes what cron writes
+    /// to prod.
+    #[test]
+    fn existing_actions_keep_their_pre_refactor_status_and_edge() {
+        let table: &[(PolicyAction, bool, &str, Option<&str>)] = &[
+            (
+                PolicyAction::AutoPromote,
+                true,
+                "promoted",
+                Some(CORROBORATES_RELATIONSHIP),
+            ),
+            (PolicyAction::AutoPromote, false, "pending", None),
+            (
+                PolicyAction::WriteContradicts,
+                true,
+                "promoted",
+                Some(CONTRADICTS_RELATIONSHIP),
+            ),
+            (PolicyAction::WriteContradicts, false, "pending", None),
+            (PolicyAction::Reject, true, "rejected", None),
+            (PolicyAction::Reject, false, "rejected", None),
+        ];
+        for &(action, auto_promote, status, edge) in table {
+            assert_eq!(
+                action.candidate_status(auto_promote),
+                status,
+                "{action:?} / auto_promote={auto_promote}"
+            );
+            assert_eq!(
+                action.edge_relationship(auto_promote),
+                edge,
+                "{action:?} / auto_promote={auto_promote}"
+            );
+        }
+    }
+
+    /// Casing is identity for edge dedup (see the `CONTRADICTS_RELATIONSHIP`
+    /// doc), so the contradicts edge must stay lowercase — and must never be
+    /// confused with CORROBORATES, which is its exact inverse.
+    #[test]
+    fn contradicts_edge_stays_lowercase_through_the_action_table() {
+        let rel = PolicyAction::WriteContradicts.edge_relationship(true);
+        assert_eq!(rel, Some("contradicts"));
+        assert_ne!(rel, Some(CORROBORATES_RELATIONSHIP));
     }
 }
