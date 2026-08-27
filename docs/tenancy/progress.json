@@ -1,0 +1,65 @@
+{
+  "branch": "feat/multi-user-tenancy",
+  "policy": "accept highest-priority recommendation at each decision point; never apply migrations to any production database",
+  "decisions_taken": {
+    "Q1_metrics": "separate internal listener (plan's 'real engineering' option)",
+    "Q2_epigraph_seed": "keep for rollout, delete in follow-up (plan recommendation)",
+    "Q3_community_acl": "proceed; POST /communities/:id/members performs no authorization today",
+    "Q4_allow_all_identities": "fail closed; allow_all_identities defaults false, explicit opt-in required",
+    "Q5_pad_to": "256 (plan recommendation)"
+  },
+  "blocked_measurements": {
+    "M1": "ownership row census - needs prod DB",
+    "M3": "prod _sqlx_migrations head - needs prod DB",
+    "M4": "row counts for DDL sizing - needs prod DB",
+    "M5": "session-GUC probe on real topology - needs prod cluster",
+    "M6": "OAuth client agent_id coverage - needs prod DB",
+    "M7": "partition split f_group - needs prod data"
+  },
+  "prs": {
+    "total": 22,
+    "done": [
+      {
+        "pr": "PR-01",
+        "sha": "4f32408",
+        "verified_by": "main-agent",
+        "tests": "3453 passed / 0 failed"
+      },
+      {
+        "pr": "PR-02",
+        "sha": "6429097",
+        "verified_by": "main-agent",
+        "tests": "3634 passed / 0 failed / 69 ignored (baseline ignores unchanged)",
+        "notes": "migration 061; DCR agent path -> pending+zero scopes; IdP allowlist fail-closed; group_authz admin-only"
+      },
+      {
+        "pr": "PR-03",
+        "sha": "8c70e5a",
+        "verified_by": "main-agent",
+        "tests": "3669 passed / 0 failed / 69 ignored",
+        "notes": "anonymous surface = /health + /api/v1/openapi.json only, locked by source lint; /metrics -> internal listener EPIGRAPH_METRICS_ADDR 127.0.0.1:9090 (Q1 option a)"
+      },
+      {
+        "pr": "PR-04",
+        "sha": "1e310bc",
+        "verified_by": "main-agent",
+        "tests": "3723 passed / 0 failed / 68 ignored (verified on pgvector 0.6.2 AND 0.8.6)",
+        "notes": "migrations 062-067; ScopedPool + Viewer; discharged PR-03's ignore obligation"
+      }
+    ],
+    "current": null,
+    "failed": [],
+    "halted": "Loop halted after PR-04 by user request 2026-08-27. PR-05 not started. 18 PRs remain."
+  },
+  "env": {
+    "postgres": "16.2 @127.0.0.1:55432",
+    "pg_trgm": "1.6 (real, built from upstream source)",
+    "uuid-ossp": "1.1 SHIM (functions only)",
+    "pgvector": "0.8.6 (upgraded from 0.6.2; matches prod 0.8 series; hnsw.iterative_scan verified)",
+    "migrations": "apply with `sqlx migrate run`, never psql"
+  },
+  "deferred_obligations": [],
+  "resolved_measurements": {
+    "M2": "ANSWERED by user 2026-08-27: production pgvector is 0.8 series. hnsw.iterative_scan IS available in prod; pgvector upgrade is OFF the critical path; plan R1 mitigation (a) is viable. CAVEAT: exact prod patch level unconfirmed - local will be 0.8.6, so do not depend on anything added after 0.8.0 without checking prod's patch version."
+  }
+}

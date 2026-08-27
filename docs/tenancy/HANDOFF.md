@@ -2,6 +2,8 @@
 
 **Branch:** `feat/multi-user-tenancy` · **Base:** `main` @ `3948445`
 **Status as of 2026-08-27.** Nothing pushed. No PRs opened. Everything below is local commits.
+**The implementation loop was HALTED after PR-04 by request.** PR-05 was never started.
+4 of 22 PRs are landed and independently verified; 18 remain.
 
 This document is the durable record for whoever (human or agent) picks this up next.
 It assumes no access to this session's scratchpad, which is ephemeral.
@@ -39,7 +41,7 @@ Group-scoped encryption (`seal`) is last and deliberately optional.
 | PR-01 | create the group tenancy tables (migration 060) | **landed** `4f32408` — 3453 pass / 0 fail |
 | PR-02 | agents.id for every principal; close both registration gates (061) | **landed** `6429097` — 3634 pass / 0 fail |
 | PR-03 | anonymous allowlist, RFC 6750 challenge, unforgeable Viewer (D3) | **landed** `8c70e5a` — 3669 pass / 0 fail |
-| PR-04 | tenancy columns, world/seed groups, ScopedPool, resolvable Viewer | see §9 |
+| PR-04 | tenancy columns, world/seed groups, ScopedPool, resolvable Viewer (062–067) | **landed** `1e310bc` — 3723 pass / 0 fail; discharged PR-03's ignore obligation |
 | PR-05 | project communities onto groups; de-overload `ownership.encryption_key_id` | not started |
 | PR-06 | visibility predicate required on every claim read | not started |
 | PR-07 | derive a Viewer on every HTTP read path | not started |
@@ -156,10 +158,17 @@ cd <repo> && sqlx migrate run --source migrations
 -- --tests` must leave `.sqlx/` with **zero** diff. That passed here, which is the proof
 the local schema matches the one the committed query cache was built against.
 
-pgvector: match production's 0.8 series. Build from source the same way as `pg_trgm`,
-then `ALTER EXTENSION vector UPDATE` on the test database **and on `template1`** —
-`#[sqlx::test]` clones from template and will otherwise keep minting old-version
-databases.
+pgvector: **done — local is 0.8.6**, matching production's 0.8 series. Built from source
+the same way as `pg_trgm`, then `ALTER EXTENSION vector UPDATE` (the 0.6.2 → 0.8.6
+upgrade chain ships with the install, so it is in-place, not a rebuild). `template1`
+never carried the extension here, so `#[sqlx::test]` databases pick up 0.8.6 from the
+migration's own `CREATE EXTENSION` — but check that assumption on any other machine.
+`SET hnsw.iterative_scan = 'relaxed_order'` is verified working locally.
+
+**The bump was verified non-breaking:** the full workspace suite returned identical
+numbers before and after (3723 passed / 0 failed / 68 ignored on both 0.6.2 and 0.8.6).
+Worth re-checking on any future pgvector move, since a major bump touches operator
+classes and index AM behaviour.
 
 ## 7. How the work was being driven
 
@@ -192,11 +201,15 @@ began running) — but only a per-suite diff shows it.
 
 ## 9. Immediate next steps
 
-1. Confirm PR-04's final state — `git log --oneline` and `git status`. If the tree is
-   dirty, PR-04 did not land and must be re-run from clean.
-2. Perform **M3** before anything merges: PR-01's W0 gate requires confirming prod's
-   `_sqlx_migrations` has nothing at 060 or above.
-3. Continue at the first unlanded PR in §2, following its spec in the plan's §7.
-4. `stash@{0}` may hold an earlier, unverified partial PR-04 (migrations 062–068). It
-   was interrupted mid-implement and is **not** trustworthy; prefer re-running from
-   clean. Inspect with `git stash show -p stash@{0}` before dropping.
+1. **Perform M3 before anything merges.** PR-01's W0 gate requires confirming prod's
+   `_sqlx_migrations` has nothing at 060 or above. **Eight migrations (060–067) are already
+   written against that assumption.** If production holds anything at 060+, all eight need
+   renumbering before this branch can merge. This is the single highest-risk open item.
+2. Start at **PR-05** (`feat(db): project communities onto groups, de-overload
+   ownership.encryption_key_id, and classify every entity type`), spec in the plan's §7.
+3. `stash@{0}` holds an abandoned, unverified partial PR-04 from an interrupted run
+   (its own migrations 062–068, numbered differently from what actually landed). It is
+   superseded and **should be dropped**: `git stash drop`. Inspect first with
+   `git stash show -p stash@{0}` if curious.
+4. Local pgvector was upgraded 0.6.2 → **0.8.6** to match production's 0.8 series;
+   `hnsw.iterative_scan` is available locally and verified working.
