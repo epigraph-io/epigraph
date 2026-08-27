@@ -1079,6 +1079,18 @@ pub struct SubmitClaimResponse {
     pub pignistic_prob: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_id: Option<String>,
+    /// Claim ids the write-time contradiction scan flagged as possibly
+    /// conflicting with this submission (backlog `6ed02d04`). Each one also
+    /// staged a `pending` `match_candidates` row for review.
+    ///
+    /// A SUSPICION from a cheap lexical heuristic, never a verdict — nothing
+    /// was adjudicated and no `contradicts` edge was written.
+    ///
+    /// `skip_serializing_if` is load-bearing: a submission that trips no cue
+    /// serializes byte-identically to the pre-feature response, so the blast
+    /// radius is only submissions that actually fire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub possible_contradictions: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1121,6 +1133,18 @@ pub struct MemorizeResponse {
     pub plausibility: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pignistic_prob: Option<f64>,
+    /// Claim ids the write-time contradiction scan flagged as possibly
+    /// conflicting with this submission (backlog `6ed02d04`). Each one also
+    /// staged a `pending` `match_candidates` row for review.
+    ///
+    /// A SUSPICION from a cheap lexical heuristic, never a verdict — nothing
+    /// was adjudicated and no `contradicts` edge was written.
+    ///
+    /// `skip_serializing_if` is load-bearing: a submission that trips no cue
+    /// serializes byte-identically to the pre-feature response, so the blast
+    /// radius is only submissions that actually fire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub possible_contradictions: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

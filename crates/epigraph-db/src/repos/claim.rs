@@ -44,9 +44,18 @@ pub struct ClaimEmbeddingHit {
 /// identical direction. Unlike [`ClaimEmbeddingHit::similarity`] this is NOT
 /// inverted, because the write-side novelty gate (backlog `1bcaed94`)
 /// thresholds directly on distance (`dist < 0.05` / `dist < 0.15`).
+///
+/// `content` rides along on the same round-trip so the write-side gate can run
+/// a lexical polarity check over the neighbours it already fetched (backlog
+/// `6ed02d04`, `epigraph_mcp::tools::contradiction_scan`). It is here rather
+/// than behind a second query because an embedding distance ALONE cannot
+/// express negation — "X is safe" and "X is not safe" sit almost on top of each
+/// other in vector space — and reading the text is the only way to tell those
+/// two apart. Truncated by the query, see [`ClaimRepository::nearest_by_embedding`].
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct NearestClaimHit {
     pub claim_id: Uuid,
+    pub content: String,
     pub distance: f64,
 }
 
@@ -856,6 +865,20 @@ impl ClaimRepository {
     /// `is_current = false` rows (superseded/retired claims must never
     /// suppress a new near-paraphrase insert).
     ///
+    /// Also selects `left(content, 2000)` for the write-time contradiction scan
+    /// (backlog `6ed02d04`). The truncation is deliberate, not incidental: this
+    /// runs on the hottest write path in the system (`submit_claim` /
+    /// `memorize`, once per novel claim), so the extra bytes pulled per call
+    /// must be bounded — `LIMIT 5` × 2000 chars is a worst case of ~10KB
+    /// against an embedding round-trip that already dominates. Nothing is lost
+    /// for the consumer: a polarity cue 2000 characters into a claim is far
+    /// beyond what a surface-lexical detector can act on anyway.
+    ///
+    /// This is a RUNTIME `sqlx::query_as`, not a compile-time macro, so
+    /// changing the SELECT list needs no `cargo sqlx prepare` and no `.sqlx`
+    /// regeneration. `FromRow` binds by column NAME, so the SELECT order is
+    /// free. Do not convert this to `sqlx::query!`.
+    ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
     #[instrument(skip(pool, query_embedding_pgvector))]
@@ -867,6 +890,7 @@ impl ClaimRepository {
         let rows = sqlx::query_as::<_, NearestClaimHit>(
             r#"
             SELECT id AS claim_id,
+                   left(content, 2000) AS content,
                    (embedding <=> $1::vector)::float8 AS distance
             FROM claims
             WHERE embedding IS NOT NULL

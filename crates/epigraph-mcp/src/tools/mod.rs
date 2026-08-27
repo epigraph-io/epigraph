@@ -4,6 +4,7 @@ pub mod cdst_maintenance;
 pub mod challenges;
 pub mod claims;
 pub mod consolidate;
+pub mod contradiction_scan;
 pub mod dedup_sweep;
 pub mod ds;
 pub mod ds_auto;

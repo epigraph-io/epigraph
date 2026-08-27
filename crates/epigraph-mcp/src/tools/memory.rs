@@ -54,11 +54,16 @@ pub async fn memorize(
             .is_some()
     };
     let mut pending_embedding: Option<String> = None;
+    // Write-time contradiction scan (backlog 6ed02d04) — same wiring and same
+    // ordering constraints as submit_claim; see that function for the full
+    // rationale on why staging happens after the claim row exists.
+    let mut contradiction_signals: Vec<crate::tools::contradiction_scan::ContradictionSignal> =
+        Vec::new();
     if !is_exact_resubmit {
         let novelty_threshold = params
             .novelty_threshold
             .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
-        if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
+        if let Some(outcome) = crate::tools::novelty_gate::decide(
             &server.pool,
             server.embedder.as_ref(),
             &params.content,
@@ -66,6 +71,7 @@ pub async fn memorize(
         )
         .await
         {
+            let decision = outcome.decision;
             if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) = decision
             {
                 // See submit_claim's identical branch (claims.rs) for the
@@ -91,9 +97,14 @@ pub async fn memorize(
                     belief: None,
                     plausibility: None,
                     pignistic_prob: None,
+                    // Nothing was inserted, so there is no claim id to pair a
+                    // flagged neighbour against — see submit_claim's identical
+                    // branch.
+                    possible_contradictions: Vec::new(),
                 });
             }
-            pending_embedding = Some(pgvec);
+            pending_embedding = Some(outcome.pgvector);
+            contradiction_signals = outcome.contradictions;
             if matches!(
                 decision,
                 crate::tools::novelty_gate::GateDecision::InsertFlagged
@@ -117,6 +128,10 @@ pub async fn memorize(
             tracing::warn!(claim_id = %claim_uuid, "memorize: update_labels failed: {e}");
         }
     }
+
+    // Neighbour ids reported back to the caller. Populated only on the
+    // first-create branch, matching submit_claim.
+    let mut possible_contradictions: Vec<String> = Vec::new();
 
     let (final_truth, ds, embedded) = if was_created {
         let evidence_text = if tags.is_empty() {
@@ -193,6 +208,21 @@ pub async fn memorize(
                 .await
         };
 
+        // Stage flagged neighbours for review. AFTER the claim row exists
+        // (`match_candidates.claim_a/claim_b` are FKs into `claims(id)`) and
+        // inside `was_created` only. Never fails the write.
+        if !contradiction_signals.is_empty() {
+            possible_contradictions = crate::tools::contradiction_scan::enqueue(
+                &server.pool,
+                claim_uuid,
+                &contradiction_signals,
+            )
+            .await
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
+        }
+
         (raw_truth, ds, embedded)
     } else {
         // Option A: skip Evidence + Trace + update_trace_id + DS + embed.
@@ -208,6 +238,7 @@ pub async fn memorize(
         belief: ds.as_ref().map(|d| d.belief),
         plausibility: ds.as_ref().map(|d| d.plausibility),
         pignistic_prob: ds.as_ref().map(|d| d.pignistic_prob),
+        possible_contradictions,
     })
 }
 

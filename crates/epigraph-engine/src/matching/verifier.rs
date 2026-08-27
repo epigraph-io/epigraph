@@ -108,6 +108,37 @@ pub const CORROBORATES_RELATIONSHIP: &str = "CORROBORATES";
 /// [`EdgeRepository::create_symmetric_if_absent`]: epigraph_db::EdgeRepository::create_symmetric_if_absent
 pub const CONTRADICTS_RELATIONSHIP: &str = "contradicts";
 
+/// `features->>'source'` marker on a `match_candidates` row staged by the
+/// write-time contradiction scan (`epigraph_mcp::tools::contradiction_scan`,
+/// backlog `6ed02d04`).
+///
+/// Lives here, next to [`CONTRADICTS_RELATIONSHIP`], for the same
+/// casing-is-identity reason: the writer (`epigraph-mcp`) and BOTH decide
+/// surfaces (`decide_match_candidate` and its HTTP twin) compare against this
+/// exact byte string, and a re-typed literal in any of the three silently
+/// disables the guard below on that surface only.
+pub const WRITE_TIME_SCAN_SOURCE: &str = "write_time_contradiction_scan";
+
+/// True when a `match_candidates` row was staged by the write-time
+/// contradiction scan and no verifier has scored it yet.
+///
+/// This exists to block one specific inversion. [`promotion_disposition_for_column`]
+/// maps a NULL `verifier_verdict` to [`PromotionDisposition::Corroborate`] ON
+/// PURPOSE, so the matcher's unverified pending rows stay promotable — see
+/// `null_verdict_still_corroborates`. But a contradiction-scan row exists
+/// precisely BECAUSE a detector suspects the two claims CONFLICT, so that
+/// default is exactly backwards for it: promoting one would record CORROBORATES
+/// on a pair the system flagged as contradictory — the same inversion this file
+/// already fixed once for the LLM-verified path.
+///
+/// A real verdict (`Some(_)`) means the verifier has actually scored the pair,
+/// so promotion resolves from that verdict and this predicate steps aside.
+#[must_use]
+pub fn is_unverified_write_time_scan(verdict: Option<&str>, features: &serde_json::Value) -> bool {
+    verdict.is_none()
+        && features.get("source").and_then(serde_json::Value::as_str) == Some(WRITE_TIME_SCAN_SOURCE)
+}
+
 /// What promoting a `match_candidates` row should write to the graph.
 ///
 /// Promotion is an operator saying "yes, act on this pair" — *not* "these two
@@ -293,6 +324,49 @@ mod tests {
             promotion_disposition_for_column(None),
             Ok(PromotionDisposition::Corroborate)
         );
+    }
+
+    /// A write-time contradiction-scan row with no verdict must be flagged, so
+    /// the decide surfaces refuse to promote it. Without this the NULL verdict
+    /// would resolve to `Corroborate` — the inverse of why the row was staged.
+    #[test]
+    fn write_time_scan_row_with_null_verdict_is_flagged_unverified() {
+        let features = serde_json::json!({ "source": WRITE_TIME_SCAN_SOURCE });
+        assert!(is_unverified_write_time_scan(None, &features));
+    }
+
+    /// Once the verifier has actually scored the pair, the row promotes
+    /// normally: the guard is about the NULL default, not about the row's
+    /// origin.
+    #[test]
+    fn write_time_scan_row_with_a_real_verdict_is_not_flagged() {
+        let features = serde_json::json!({ "source": WRITE_TIME_SCAN_SOURCE });
+        assert!(!is_unverified_write_time_scan(Some("contradicts"), &features));
+        assert!(!is_unverified_write_time_scan(Some("same"), &features));
+    }
+
+    /// Matcher rows keep the historical behaviour `null_verdict_still_corroborates`
+    /// pins — an unverified pending matcher row stays promotable.
+    #[test]
+    fn matcher_row_with_null_verdict_is_not_flagged() {
+        let features = serde_json::json!({ "source": "cross_source_matcher" });
+        assert!(!is_unverified_write_time_scan(None, &features));
+    }
+
+    /// Features with no `source` key — and a non-object `features` value —
+    /// must not trip the guard. Fails open toward the historical behaviour,
+    /// because only rows this scan itself wrote can carry the marker.
+    #[test]
+    fn features_without_a_source_key_is_not_flagged() {
+        assert!(!is_unverified_write_time_scan(None, &serde_json::json!({})));
+        assert!(!is_unverified_write_time_scan(
+            None,
+            &serde_json::Value::Null
+        ));
+        assert!(!is_unverified_write_time_scan(
+            None,
+            &serde_json::json!("write_time_contradiction_scan")
+        ));
     }
 
     /// Out-of-vocabulary strings fail closed rather than defaulting to

@@ -21,13 +21,16 @@
 //! so the semantic-duplicate branch never fires and every submission inserts
 //! (still subject to the fixed 0.15 near-duplicate soft-flag).
 
+use crate::tools::contradiction_scan::{self, ContradictionSignal};
 use epigraph_db::{ClaimRepository, NearestClaimHit};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Number of ANN neighbors fetched per the backlog plan's SQL sketch
 /// (`... ORDER BY dist LIMIT 5`). Only the closest is used for the gate
-/// decision; the rest is headroom for future soft-dup review tooling.
+/// decision; the remaining four feed the write-time contradiction scan
+/// (`crate::tools::contradiction_scan`, backlog `6ed02d04`), which previously
+/// had no consumer at all.
 pub const NEAREST_K: i64 = 5;
 
 /// Fixed near-duplicate soft-flag band. NOT the tunable `novelty_threshold`
@@ -53,6 +56,23 @@ pub enum GateDecision {
     Insert,
 }
 
+/// Everything [`decide`] learned from its single ANN round-trip.
+///
+/// `contradictions` is populated from the SAME `nearest` vec the gate
+/// classifies on — no extra embedding call, no extra query. The gate used to
+/// throw four of its five neighbours away.
+#[derive(Debug, Clone)]
+pub struct GateOutcome {
+    pub decision: GateDecision,
+    /// The already-generated, pgvector-formatted embedding — store it directly
+    /// rather than paying for a second embedding call.
+    pub pgvector: String,
+    /// Neighbours a cheap lexical polarity check flagged as possibly
+    /// contradicting. A SUSPICION, never a verdict — see
+    /// [`crate::tools::contradiction_scan`].
+    pub contradictions: Vec<ContradictionSignal>,
+}
+
 /// Pure decision function — no I/O, directly testable.
 ///
 /// `nearest` is the ANN result ordered closest-first (as returned by
@@ -75,7 +95,7 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
 /// policy). Callers that get `None` should fall back to the pre-gate
 /// embed-after-insert behavior (there is no vector to reuse).
 ///
-/// On `Some`, the returned `String` is the ALREADY-GENERATED embedding,
+/// On `Some`, [`GateOutcome::pgvector`] is the ALREADY-GENERATED embedding,
 /// pgvector-formatted, so the caller can store it directly
 /// (`ClaimRepository::store_embedding`) instead of calling `embed_and_store`
 /// again and paying for a second embedding call. (Only the formatted string
@@ -88,12 +108,16 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
 /// — `EpiGraphMcpFull` itself still only ever constructs this with its one
 /// concrete `McpEmbedder` (hardcoded to the OpenAI endpoint); this is not a
 /// server-wide trait-object refactor.
+///
+/// The write-time contradiction scan runs here too, over the SAME `nearest`
+/// vec: it costs one pure function call and no additional I/O, because the ANN
+/// query already returned the neighbours' text (backlog `6ed02d04`).
 pub async fn decide(
     pool: &PgPool,
     embedder: &dyn epigraph_embeddings::EmbeddingService,
     content: &str,
     novelty_threshold: f64,
-) -> Option<(GateDecision, String)> {
+) -> Option<GateOutcome> {
     let vector = embedder.generate(content).await.ok()?;
     let pgvec = crate::embed::format_pgvector(&vector);
     let nearest = match ClaimRepository::nearest_by_embedding(pool, &pgvec, NEAREST_K).await {
@@ -103,18 +127,42 @@ pub async fn decide(
             return None;
         }
     };
-    Some((classify(&nearest, novelty_threshold), pgvec))
+    Some(GateOutcome {
+        decision: classify(&nearest, novelty_threshold),
+        pgvector: pgvec,
+        contradictions: contradiction_scan::scan(content, &nearest),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// `classify` never reads `content`, so the distance-only tests below use
+    /// an empty one. Use [`hit_with`] when the text itself is under test.
     fn hit(distance: f64) -> NearestClaimHit {
+        hit_with(distance, "")
+    }
+
+    fn hit_with(distance: f64, content: &str) -> NearestClaimHit {
         NearestClaimHit {
             claim_id: Uuid::new_v4(),
+            content: content.to_string(),
             distance,
         }
+    }
+
+    /// The neighbour text is inert for the gate decision — `classify` keys on
+    /// distance alone, and the contradiction scan reads the same vec without
+    /// influencing it.
+    #[test]
+    fn neighbor_content_does_not_affect_the_gate_decision() {
+        let with_text = [hit_with(0.10, "the retry loop is not safe")];
+        let without_text = [hit_with(0.10, "")];
+        assert_eq!(
+            classify(&with_text, DEFAULT_NOVELTY_THRESHOLD),
+            classify(&without_text, DEFAULT_NOVELTY_THRESHOLD)
+        );
     }
 
     #[test]
@@ -267,12 +315,12 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(&pool, &embedder, text, DEFAULT_NOVELTY_THRESHOLD)
+        let outcome = decide(&pool, &embedder, text, DEFAULT_NOVELTY_THRESHOLD)
             .await
             .expect("decide must succeed with a working mock embedder");
 
         assert_eq!(
-            decision,
+            outcome.decision,
             GateDecision::ReturnExisting(neighbor_id),
             "identical-text embedding must be classified as a semantic duplicate of the seeded neighbor"
         );
@@ -309,12 +357,12 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(&pool, &embedder, text, 0.0)
+        let outcome = decide(&pool, &embedder, text, 0.0)
             .await
             .expect("decide must succeed with a working mock embedder");
 
         assert_eq!(
-            decision,
+            outcome.decision,
             GateDecision::InsertFlagged,
             "novelty_threshold=0.0 must never suppress an insert, even for an identical-text embedding; \
              the fixed 0.15 near-duplicate band still applies"
@@ -328,7 +376,7 @@ mod tests {
     async fn decide_inserts_unflagged_when_no_neighbors_exist(pool: sqlx::PgPool) {
         let embedder = MockProvider::new(EmbeddingConfig::openai(1536));
 
-        let (decision, _pgvec) = decide(
+        let outcome = decide(
             &pool,
             &embedder,
             "an utterly unrelated claim with no corpus neighbors",
@@ -337,6 +385,10 @@ mod tests {
         .await
         .expect("decide must succeed with a working mock embedder");
 
-        assert_eq!(decision, GateDecision::Insert);
+        assert_eq!(outcome.decision, GateDecision::Insert);
+        assert!(
+            outcome.contradictions.is_empty(),
+            "no neighbours at all means nothing to contradict"
+        );
     }
 }

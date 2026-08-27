@@ -277,11 +277,18 @@ pub async fn submit_claim(
             .is_some()
     };
     let mut pending_embedding: Option<String> = None;
+    // Neighbours the write-time contradiction scan flagged (backlog 6ed02d04).
+    // Computed by the same `decide` call — it scans the ANN neighbours the gate
+    // already fetched — and staged for review AFTER the claim row and its
+    // embedding exist, since `match_candidates.claim_a/claim_b` are FKs into
+    // `claims(id)`.
+    let mut contradiction_signals: Vec<crate::tools::contradiction_scan::ContradictionSignal> =
+        Vec::new();
     if !is_exact_resubmit {
         let novelty_threshold = params
             .novelty_threshold
             .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
-        if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
+        if let Some(outcome) = crate::tools::novelty_gate::decide(
             &server.pool,
             server.embedder.as_ref(),
             &params.content,
@@ -289,6 +296,7 @@ pub async fn submit_claim(
         )
         .await
         {
+            let decision = outcome.decision;
             if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) = decision
             {
                 // Semantic duplicate: suppress the insert entirely and
@@ -338,13 +346,19 @@ pub async fn submit_claim(
                     plausibility: None,
                     pignistic_prob: None,
                     frame_id: None,
+                    // Nothing was inserted, so there is no claim id on this
+                    // side of the pair to stage a `match_candidates` row
+                    // against. Any signals the scan produced are dropped
+                    // with the submission itself.
+                    possible_contradictions: Vec::new(),
                 });
             }
             // Insert / InsertFlagged: stash the already-generated,
             // pgvector-formatted embedding so the was_created branch below
             // can store it directly instead of paying for a second
             // embedding call via embed_and_store.
-            pending_embedding = Some(pgvec);
+            pending_embedding = Some(outcome.pgvector);
+            contradiction_signals = outcome.contradictions;
             if matches!(
                 decision,
                 crate::tools::novelty_gate::GateDecision::InsertFlagged
@@ -467,6 +481,11 @@ pub async fn submit_claim(
     )
     .await;
 
+    // Neighbour ids reported back to the caller (STRINGS, to match the rest of
+    // this response type). Populated only on the first-create branch — see the
+    // enqueue site below for why a resubmit stages nothing.
+    let mut possible_contradictions: Vec<String> = Vec::new();
+
     let (final_truth, ds, embedded) = if was_created {
         // First-create: full lineage. update_trace_id, DS auto-wire, embed.
         ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
@@ -522,6 +541,25 @@ pub async fn submit_claim(
                 .await
         };
 
+        // Stage anything the write-time contradiction scan flagged
+        // (backlog 6ed02d04). Placement is load-bearing on BOTH sides:
+        //   - AFTER `create_claim_idempotent` and the embedding store, because
+        //     `match_candidates.claim_a/claim_b` are FKs into `claims(id)` —
+        //     enqueuing earlier is a constraint violation, not a warning.
+        //   - INSIDE `was_created`, because a resubmit's claim was already
+        //     scanned when it was first written; re-staging would just retry an
+        //     insert that `ON CONFLICT DO NOTHING` will refuse anyway.
+        // Best-effort by construction: `enqueue` never returns an error, so a
+        // review queue that is down cannot fail a submission.
+        if !contradiction_signals.is_empty() {
+            possible_contradictions =
+                crate::tools::contradiction_scan::enqueue(&server.pool, claim_uuid, &contradiction_signals)
+                    .await
+                    .into_iter()
+                    .map(|id| id.to_string())
+                    .collect();
+        }
+
         let final_truth = ds
             .as_ref()
             .map(|d| d.pignistic_prob.clamp(0.01, 0.99))
@@ -545,6 +583,7 @@ pub async fn submit_claim(
         plausibility: ds.as_ref().map(|d| d.plausibility),
         pignistic_prob: ds.as_ref().map(|d| d.pignistic_prob),
         frame_id: ds.as_ref().map(|d| d.frame_id.to_string()),
+        possible_contradictions,
     })
 }
 

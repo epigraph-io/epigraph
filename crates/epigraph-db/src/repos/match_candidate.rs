@@ -153,6 +153,49 @@ impl MatchCandidateRepo {
         })
     }
 
+    /// Stage a candidate pair **only if the pair has no row yet**. Caller MUST
+    /// pass `claim_a < claim_b`. Returns the new row's id, or `None` when a row
+    /// for the pair already existed (in which case nothing was written).
+    ///
+    /// Deliberately NOT [`MatchCandidateRepo::upsert`]. `upsert` unconditionally
+    /// overwrites `score`, `features` and `matcher_run_id` — that is correct for
+    /// the nightly matcher, whose whole job is to re-score pairs, but it is
+    /// destructive for a write-time enqueue: a submission that happens to
+    /// rediscover a pair the matcher already scored would replace the matcher's
+    /// 9-feature blend with a raw cosine and erase the `features` payload an
+    /// operator's ruling was based on. `ON CONFLICT DO NOTHING` makes this write
+    /// path strictly additive — it either creates a fresh pending row or leaves
+    /// the existing row byte-identical.
+    ///
+    /// `matcher_run_id`, `verifier_verdict` and `verifier_rationale` are absent
+    /// from the column list on purpose, so they land NULL: this is not a matcher
+    /// run, and a lexical heuristic is not a verdict. See
+    /// `epigraph_engine::matching::verifier::is_unverified_write_time_scan` for
+    /// the guard that stops a NULL verdict from being read as "corroborates".
+    pub async fn insert_if_absent(
+        &self,
+        claim_a: Uuid,
+        claim_b: Uuid,
+        score: f32,
+        features: serde_json::Value,
+        status: &str,
+    ) -> sqlx::Result<Option<Uuid>> {
+        debug_assert!(claim_a < claim_b, "callers must pass canonical order");
+        sqlx::query_scalar(
+            "INSERT INTO match_candidates (claim_a, claim_b, score, features, status)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (claim_a, claim_b) DO NOTHING
+             RETURNING id",
+        )
+        .bind(claim_a)
+        .bind(claim_b)
+        .bind(score)
+        .bind(Json(features))
+        .bind(status)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     pub async fn get(&self, id: Uuid) -> sqlx::Result<MatchCandidateRow> {
         sqlx::query_as("SELECT * FROM match_candidates WHERE id = $1")
             .bind(id)

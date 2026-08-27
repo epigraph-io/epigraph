@@ -307,6 +307,28 @@ pub async fn decide_candidate(
             // unconditionally recorded the exact inverse of the verifier's
             // finding for contradicting pairs. Resolving up front also means a
             // refused promote cannot leave the row `promoted` with no edge.
+            // Refuse to promote a row the write-time contradiction scan
+            // staged but no verifier has scored (backlog 6ed02d04).
+            // `promotion_disposition_for_column(None)` resolves a NULL verdict
+            // to Corroborate on purpose, so unverified MATCHER rows stay
+            // promotable — but a scan row exists precisely because a detector
+            // suspects the pair CONFLICTS, so that default would record the
+            // exact inverse. Rejecting is deliberately still one call away.
+            if epigraph_engine::matching::verifier::is_unverified_write_time_scan(
+                row.verifier_verdict.as_deref(),
+                &row.features,
+            ) {
+                return Err(ApiError::BadRequest {
+                    message: format!(
+                        "cannot promote candidate {id}: it was staged by the write-time \
+                         contradiction scan and carries no verifier verdict. Promoting a NULL \
+                         verdict records CORROBORATES, which is the inverse of what this row was \
+                         staged for. Run the verifier (cross_source_sweep) to set \
+                         verifier_verdict, or reject it."
+                    ),
+                });
+            }
+
             let disposition =
                 epigraph_engine::matching::verifier::promotion_disposition_for_column(
                     row.verifier_verdict.as_deref(),
