@@ -1558,6 +1558,15 @@ pub struct FindWorkflowResult {
     /// when never evaluated. Advisory — callers may prefer promoted variants.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promotable: Option<bool>,
+    /// Which store `workflow_id` came from: `"claims"` for legacy flat
+    /// workflow claims (label `workflow`), `"workflows"` for hierarchical
+    /// rows written by `store_workflow` / `ingest_workflow`. Both ids
+    /// round-trip through `report_workflow_outcome`, which probes the
+    /// `workflows` table first and only then falls back to the claim path —
+    /// so a caller can always report an outcome without branching. The field
+    /// exists for callers that do something claim-specific with the id (e.g.
+    /// `get_claim`), which only works for `"claims"`.
+    pub store: &'static str,
 }
 
 #[derive(Debug, Serialize)]

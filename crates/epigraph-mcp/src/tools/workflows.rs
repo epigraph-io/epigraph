@@ -614,15 +614,20 @@ pub async fn find_workflow(
     // run (offline embedders shouldn't blank the whole tool). The post-embed
     // pipeline (extracted to mirror recall.rs's recall_with_context split) lets
     // integration tests skip the OpenAI embedder via `__test_only`.
-    let pgvec_opt = match server.embedder.generate(&params.goal).await {
-        Ok(v) => Some(format_pgvector(&v)),
+    // Kept as a raw Vec<f32> as well as a pgvector literal: the claims leg and
+    // behavioral affinity consume the literal, while the hierarchical ANN
+    // helper (`find_hierarchical_by_embedding`) takes `&[f32]` and formats its
+    // own literal.
+    let qvec_opt: Option<Vec<f32>> = match server.embedder.generate(&params.goal).await {
+        Ok(v) => Some(v),
         Err(e) => {
             tracing::warn!("embedder failed in find_workflow; relying on text fallback: {e}");
             None
         }
     };
+    let pgvec_opt = qvec_opt.as_deref().map(format_pgvector);
 
-    find_workflow_post_embed(server, &params, pgvec_opt).await
+    find_workflow_post_embed(server, &params, pgvec_opt, qvec_opt.as_deref()).await
 }
 
 /// Post-embedding pipeline: shared by `find_workflow` and the
@@ -632,10 +637,17 @@ pub async fn find_workflow(
 /// Recomputes `limit`/`min_truth` from `params` internally (rather than taking
 /// them as args) so the public wrapper stays minimal and the two extraction
 /// sites cannot drift, mirroring recall.rs's wrapper pattern.
+///
+/// `pgvec_opt` is the pgvector literal consumed by the claims leg and the
+/// behavioral-affinity lookup; `qvec_opt` is the same embedding in raw form,
+/// needed by the hierarchical ANN helper. `qvec_opt` may be `None` while
+/// `pgvec_opt` is `Some` (the `__test_only` entry point), in which case the
+/// hierarchical leg degrades to its ILIKE path.
 async fn find_workflow_post_embed(
     server: &EpiGraphMcpFull,
     params: &FindWorkflowParams,
     pgvec_opt: Option<String>,
+    qvec_opt: Option<&[f32]>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(5).clamp(1, 20);
     let min_truth = params.min_truth.unwrap_or(0.3);
@@ -710,12 +722,21 @@ async fn find_workflow_post_embed(
         }
     }
 
-    // Fallback: workflows usually have no associated evidence with embeddings,
-    // so the semantic path above frequently returns empty even when a perfectly
-    // good ILIKE match exists. The 144 production workflows live as claims
-    // labeled `workflow` (the legacy `workflows` table has only 3 test rows),
-    // so we search claims directly. When semantic hits came in below half the
-    // requested limit, augment with an ILIKE pass on workflow-labeled claims.
+    // find_workflow reads BOTH workflow stores and merges them below:
+    //   * legacy FLAT workflow claims — a single claim labelled `workflow`
+    //     carrying goal + steps as JSON. That is the leg above and the ILIKE
+    //     fallback immediately below.
+    //   * HIERARCHICAL `workflows` rows — what `store_workflow` /
+    //     `ingest_workflow` write. Their claims are labelled
+    //     ["claim","workflow_thesis"|"workflow_step"], never `workflow`, so
+    //     NOTHING those tools store can ever match a `workflow`-label scope.
+    //     `hierarchical_workflow_results` below is the leg that reads them.
+    //
+    // The ILIKE pass here is the CLAIMS-side fallback only: workflow claims
+    // usually have no associated evidence with embeddings, so the semantic path
+    // above frequently returns empty even when a perfectly good substring match
+    // exists. When semantic hits came in below half the requested limit,
+    // augment with an ILIKE pass on workflow-labeled claims.
     // Resolves claim 903e5120.
     let limit_usize = limit as usize;
     let half = (limit_usize / 2).max(1);
@@ -759,7 +780,19 @@ async fn find_workflow_post_embed(
         }
     }
 
-    success_json(&results)
+    // Second store: hierarchical `workflows` rows. Best-effort throughout — a
+    // broken hierarchical leg must never blank the claim-side results.
+    let hier = hierarchical_workflow_results(
+        &server.pool,
+        &params.goal,
+        qvec_opt,
+        pgvec_opt.as_deref(),
+        min_truth,
+        limit,
+    )
+    .await;
+
+    success_json(&merge_workflow_results(results, hier, limit_usize))
 }
 
 /// Build a `FindWorkflowResult` from a workflow claim, applying the shared
@@ -848,7 +881,212 @@ async fn enrich_workflow_result(
         behavioral_success_rate,
         behavioral_execution_count,
         promotable,
+        store: "claims",
     })
+}
+
+/// Cosine-similarity floor for the hierarchical embedding leg. 0.5 mirrors
+/// `find_workflow_hierarchical` and the `behavioral_affinity_lineage` default
+/// the claims leg above already uses, so both stores admit candidates on the
+/// same terms.
+const HIER_SIMILARITY_THRESHOLD: f64 = 0.5;
+
+/// Search the hierarchical `workflows` table — the store `store_workflow` and
+/// `ingest_workflow` write, whose step/thesis claims are never labelled
+/// `workflow` and so are invisible to the claims leg of `find_workflow`.
+///
+/// Every repo call is best-effort: a failure warns and contributes nothing,
+/// never an error. A broken hierarchical leg must degrade `find_workflow` to
+/// its previous claims-only behaviour rather than blanking it.
+async fn hierarchical_workflow_results(
+    pool: &sqlx::PgPool,
+    goal: &str,
+    qvec_opt: Option<&[f32]>,
+    pgvec_opt: Option<&str>,
+    min_truth: f64,
+    limit: i64,
+) -> Vec<FindWorkflowResult> {
+    // Embedding-first (tolerates paraphrase), ILIKE second — the same shape
+    // `find_workflow_hierarchical` uses.
+    let mut rows = match qvec_opt {
+        Some(qvec) => WorkflowRepository::find_hierarchical_by_embedding(
+            pool,
+            qvec,
+            HIER_SIMILARITY_THRESHOLD,
+            min_truth,
+            limit * 3,
+            false,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("hierarchical embedding search failed in find_workflow: {e}");
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+
+    if rows.is_empty() {
+        rows = WorkflowRepository::search_hierarchical_by_text(
+            pool,
+            goal,
+            limit * 2,
+            min_truth,
+            false,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("hierarchical text search failed in find_workflow: {e}");
+            Vec::new()
+        });
+    }
+
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    // Score the rows. `search_by_goal_embedding` is the only repo fn over
+    // `workflows.goal_embedding` that surfaces `similarity = 1 - cosine
+    // distance`, and it takes the pgvector literal we already formatted — so
+    // scoring needs no new SQL. It applies neither the similarity floor nor
+    // min_truth, so a row found by the ANN pass above can be absent here; it
+    // then scores 0.0 and ranks alongside the text-fallback hits, which is what
+    // 0.0 already means in this function.
+    let scores: std::collections::HashMap<uuid::Uuid, f64> = match pgvec_opt {
+        Some(pgvec) => WorkflowRepository::search_by_goal_embedding(pool, pgvec, limit * 3)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("workflow goal-embedding scoring failed in find_workflow: {e}");
+                Vec::new()
+            })
+            .into_iter()
+            .map(|h| (h.workflow_id, h.similarity))
+            .collect(),
+        None => std::collections::HashMap::new(),
+    };
+
+    // Step text for every hit in 2 round-trips total, not 2 per workflow.
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+    let mut steps_by_wf = WorkflowRepository::resolve_steps_to_heads_batched(pool, &ids)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("resolve_steps_to_heads_batched failed in find_workflow: {e}");
+            std::collections::HashMap::new()
+        });
+
+    rows.iter()
+        .map(|row| {
+            let steps = steps_by_wf
+                .remove(&row.id)
+                .map(|resolved| steps_from_resolved(&resolved))
+                .unwrap_or_default();
+            hierarchical_row_to_result(row, steps, scores.get(&row.id).copied().unwrap_or(0.0))
+        })
+        .collect()
+}
+
+/// Flatten resolved step lineages into the plain `Vec<String>` shape
+/// `FindWorkflowResult.steps` carries.
+///
+/// Takes the FIRST head of each lineage, mirroring
+/// `WorkflowRepository::resolve_step_claim`'s existing `heads.first()`
+/// precedent for a lineage with `pending_resolution`.
+///
+/// A step whose lineage was pruned — or that predates step-level versioning and
+/// so has no `step_lineage_id` — yields an EMPTY string IN POSITION rather than
+/// being dropped. Positions are load-bearing: `report_workflow_outcome` /
+/// `report_hierarchical_outcome` address steps by `step_index`, so closing a
+/// gap would silently misaddress every later step. In practice
+/// `store_workflow`'s steps always get a `step_lineage_id`, and
+/// `latest_in_lineage` returns the claim itself when it is the lineage's only
+/// member, so freshly stored workflows always resolve to real text.
+fn steps_from_resolved(resolved: &[epigraph_db::ResolvedStep]) -> Vec<String> {
+    resolved
+        .iter()
+        .map(|s| {
+            s.heads
+                .first()
+                .map(|h| h.content.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Project a hierarchical `workflows` row into the shared `FindWorkflowResult`
+/// shape. Pure — all I/O is done by the caller.
+///
+/// `use_count` / `success_count` come from `metadata`, which is exactly where
+/// `do_report_hierarchical_outcome_via_pool` writes them.
+///
+/// The three `behavioral_*` fields are always `None`: the affinity map is built
+/// by `BehavioralExecutionRepository::behavioral_affinity_lineage`, whose
+/// `live_roots` CTE joins `claims c ON c.id = r.root_id`, and a `workflows`-table
+/// id has no `claims` row — so the map can never key on a hierarchical
+/// workflow. The metadata counters above carry the same use/success signal.
+///
+/// `promotable` is `None` for the same class of reason:
+/// `ClaimRepository::promotion_flag` reads `claims.properties`, so it would be
+/// `Ok(None)` for every `workflows` id. Skipping the query saves a round-trip
+/// per hit for a value that cannot exist.
+fn hierarchical_row_to_result(
+    row: &epigraph_db::HierarchicalWorkflowRow,
+    steps: Vec<String>,
+    similarity: f64,
+) -> FindWorkflowResult {
+    let use_count = row
+        .metadata
+        .get("use_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let success_count = row
+        .metadata
+        .get("success_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+
+    FindWorkflowResult {
+        workflow_id: row.id.to_string(),
+        goal: row.goal.clone(),
+        steps,
+        truth_value: row.truth_value,
+        similarity,
+        use_count,
+        success_count,
+        generation: i64::from(row.generation),
+        parent_id: row.parent_id.map(|p| p.to_string()),
+        behavioral_affinity: None,
+        behavioral_success_rate: None,
+        behavioral_execution_count: None,
+        promotable: None,
+        store: "workflows",
+    }
+}
+
+/// Merge the two stores' hits into one ranked, deduplicated page.
+///
+/// Claim hits are concatenated FIRST so every tie breaks toward today's output,
+/// then the whole list is STABLY sorted by descending similarity, deduplicated
+/// on `workflow_id` (first occurrence wins), and truncated to `limit`.
+///
+/// The `.max(0.0)` clamp on the sort key matters: cosine similarity is
+/// mathematically in [-1, 1], and an (vanishingly rare) negative ANN score
+/// would otherwise sort BEHIND the 0.0 text-fallback hits, silently reordering
+/// output that today lists ANN hits before ILIKE hits. Clamping makes them tie,
+/// and the stable sort then preserves that existing order exactly — so with an
+/// empty hierarchical side this function is the identity on the claims list.
+fn merge_workflow_results(
+    claim_hits: Vec<FindWorkflowResult>,
+    hierarchical_hits: Vec<FindWorkflowResult>,
+    limit: usize,
+) -> Vec<FindWorkflowResult> {
+    let mut merged: Vec<FindWorkflowResult> = claim_hits;
+    merged.extend(hierarchical_hits);
+
+    merged.sort_by(|a, b| b.similarity.max(0.0).total_cmp(&a.similarity.max(0.0)));
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    merged.retain(|r| seen.insert(r.workflow_id.clone()));
+    merged.truncate(limit);
+    merged
 }
 
 pub async fn report_workflow_outcome(
@@ -1155,22 +1393,28 @@ pub mod __test_only {
     /// so they pre-format a known pgvector literal and dispatch directly
     /// into the post-embed pipeline. This is the same code that
     /// `find_workflow` runs after `embedder.generate`.
+    ///
+    /// The hierarchical leg's EMBEDDING path is skipped here: this entry point
+    /// carries only the pgvector literal, not the raw `Vec<f32>` that
+    /// `find_hierarchical_by_embedding` needs, so it passes `None` and that leg
+    /// falls back to its ILIKE search.
     pub async fn find_workflow_with_pgvec(
         server: &EpiGraphMcpFull,
         params: FindWorkflowParams,
         pgvec: Option<String>,
     ) -> Result<CallToolResult, McpError> {
-        find_workflow_post_embed(server, &params, pgvec).await
+        find_workflow_post_embed(server, &params, pgvec, None).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_threshold_from_env, resolve_goal_identity, slugify_workflow_goal, source_identity,
-        GoalIdentity, DEFAULT_GOAL_MERGE_THRESHOLD,
+        hierarchical_row_to_result, merge_threshold_from_env, merge_workflow_results,
+        resolve_goal_identity, slugify_workflow_goal, source_identity, steps_from_resolved,
+        FindWorkflowResult, GoalIdentity, DEFAULT_GOAL_MERGE_THRESHOLD,
     };
-    use epigraph_db::HierarchicalWorkflowRow;
+    use epigraph_db::{HierarchicalWorkflowRow, LineageHead, ResolvedStep};
 
     /// Row builder so a future field on `HierarchicalWorkflowRow` is a one-line
     /// fix here rather than N broken struct literals.
@@ -1355,6 +1599,248 @@ mod tests {
         assert_ne!(
             slugify_workflow_goal("Deploy the API"),
             slugify_workflow_goal("Deploy API service")
+        );
+    }
+
+    // ── find_workflow's two-store merge ──────────────────────────────────
+
+    /// Result builder so a future field on `FindWorkflowResult` is a one-line
+    /// fix here rather than N broken struct literals.
+    fn hit(id: &str, similarity: f64, store: &'static str) -> FindWorkflowResult {
+        FindWorkflowResult {
+            workflow_id: id.to_string(),
+            goal: format!("goal for {id}"),
+            steps: Vec::new(),
+            truth_value: 1.0,
+            similarity,
+            use_count: 0,
+            success_count: 0,
+            generation: 0,
+            parent_id: None,
+            behavioral_affinity: None,
+            behavioral_success_rate: None,
+            behavioral_execution_count: None,
+            promotable: None,
+            store,
+        }
+    }
+
+    fn head(content: &str) -> LineageHead {
+        LineageHead {
+            id: uuid::Uuid::new_v4(),
+            content: content.to_string(),
+            truth_value: 1.0,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn step(step_index: usize, heads: Vec<LineageHead>) -> ResolvedStep {
+        ResolvedStep {
+            step_index,
+            frozen_claim_id: uuid::Uuid::new_v4(),
+            step_lineage_id: Some(uuid::Uuid::new_v4()),
+            heads,
+            pending_resolution: false,
+        }
+    }
+
+    #[test]
+    fn merge_ranks_hierarchical_hit_above_lower_scored_claim_hit() {
+        // The bug, pinned: before this change the hierarchical hit did not
+        // exist at all, and a merge that merely appended it would still have
+        // buried it beneath a weaker claim hit.
+        let merged = merge_workflow_results(
+            vec![hit("claim-a", 0.40, "claims")],
+            vec![hit("wf-a", 0.90, "workflows")],
+            5,
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].workflow_id, "wf-a");
+        assert_eq!(merged[0].store, "workflows");
+        assert_eq!(merged[1].workflow_id, "claim-a");
+    }
+
+    #[test]
+    fn merge_returns_hierarchical_hits_when_claim_side_is_empty() {
+        let merged = merge_workflow_results(
+            Vec::new(),
+            vec![
+                hit("wf-low", 0.30, "workflows"),
+                hit("wf-high", 0.80, "workflows"),
+            ],
+            5,
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .map(|r| r.workflow_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wf-high", "wf-low"]
+        );
+    }
+
+    #[test]
+    fn merge_dedups_by_workflow_id_keeping_first() {
+        // Equal scores tie, and the stable sort keeps the claim-side copy
+        // first because claim hits are concatenated first.
+        let merged = merge_workflow_results(
+            vec![hit("shared", 0.5, "claims")],
+            vec![hit("shared", 0.5, "workflows")],
+            5,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].store, "claims");
+    }
+
+    #[test]
+    fn merge_truncates_to_limit() {
+        let merged = merge_workflow_results(
+            vec![
+                hit("c1", 0.90, "claims"),
+                hit("c2", 0.20, "claims"),
+                hit("c3", 0.10, "claims"),
+            ],
+            vec![
+                hit("w1", 0.80, "workflows"),
+                hit("w2", 0.70, "workflows"),
+                hit("w3", 0.05, "workflows"),
+            ],
+            4,
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .map(|r| r.workflow_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c1", "w1", "w2", "c2"]
+        );
+    }
+
+    #[test]
+    fn merge_keeps_negative_similarity_ann_hit_ahead_of_zero_scored_text_hit() {
+        // The `.max(0.0)` clamp: without it the negative ANN score would sort
+        // behind the 0.0 ILIKE hit and silently reorder today's output.
+        let merged = merge_workflow_results(
+            vec![hit("ann", -0.10, "claims"), hit("ilike", 0.0, "claims")],
+            Vec::new(),
+            5,
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .map(|r| r.workflow_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ann", "ilike"]
+        );
+    }
+
+    #[test]
+    fn merge_preserves_claims_only_order_when_hierarchical_empty() {
+        // Guards crates/epigraph-mcp/tests/find_workflow_semantic_test.rs,
+        // which asserts on arr[0] of a claims-only result set.
+        let claims = vec![
+            hit("c1", 0.91, "claims"),
+            hit("c2", 0.55, "claims"),
+            hit("c3", 0.0, "claims"),
+        ];
+        let expected: Vec<String> = claims.iter().map(|r| r.workflow_id.clone()).collect();
+        let merged = merge_workflow_results(claims, Vec::new(), 10);
+        assert_eq!(merged.len(), expected.len());
+        assert_eq!(
+            merged
+                .iter()
+                .map(|r| r.workflow_id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn hierarchical_row_to_result_maps_metadata_counters_generation_and_parent() {
+        let parent = uuid::Uuid::new_v4();
+        let row = HierarchicalWorkflowRow {
+            id: uuid::Uuid::new_v4(),
+            canonical_name: "deploy-api".to_string(),
+            generation: 3,
+            goal: "Deploy the API".to_string(),
+            parent_id: Some(parent),
+            metadata: serde_json::json!({ "use_count": 7, "success_count": 5 }),
+            created_at: chrono::Utc::now(),
+            truth_value: 0.82,
+        };
+
+        let result = hierarchical_row_to_result(&row, vec!["build".to_string()], 0.77);
+
+        assert_eq!(result.workflow_id, row.id.to_string());
+        assert_eq!(result.goal, "Deploy the API");
+        assert_eq!(result.steps, vec!["build".to_string()]);
+        assert!((result.truth_value - 0.82).abs() < f64::EPSILON);
+        assert!((result.similarity - 0.77).abs() < f64::EPSILON);
+        assert_eq!(result.generation, 3);
+        assert_eq!(result.parent_id, Some(parent.to_string()));
+        assert_eq!(result.use_count, 7);
+        assert_eq!(result.success_count, 5);
+        assert_eq!(result.store, "workflows");
+        // A workflows-table id has no claims row, so neither the affinity map
+        // nor the promotion flag can ever key on it.
+        assert_eq!(result.behavioral_affinity, None);
+        assert_eq!(result.behavioral_success_rate, None);
+        assert_eq!(result.behavioral_execution_count, None);
+        assert_eq!(result.promotable, None);
+    }
+
+    #[test]
+    fn hierarchical_row_to_result_defaults_missing_metadata_counters_to_zero() {
+        for metadata in [serde_json::json!({}), serde_json::json!(null)] {
+            let row = HierarchicalWorkflowRow {
+                id: uuid::Uuid::new_v4(),
+                canonical_name: "deploy-api".to_string(),
+                generation: 0,
+                goal: "Deploy the API".to_string(),
+                parent_id: None,
+                metadata,
+                created_at: chrono::Utc::now(),
+                truth_value: 1.0,
+            };
+            let result = hierarchical_row_to_result(&row, Vec::new(), 0.0);
+            assert_eq!(result.use_count, 0);
+            assert_eq!(result.success_count, 0);
+            assert_eq!(result.parent_id, None);
+        }
+    }
+
+    #[test]
+    fn steps_from_resolved_uses_first_head_content_in_plan_order() {
+        let resolved = vec![
+            step(0, vec![head("build image")]),
+            // Two heads (an unreconciled lineage): take the first, matching
+            // resolve_step_claim's existing precedent.
+            step(1, vec![head("push"), head("push --force")]),
+            step(2, vec![head("restart")]),
+        ];
+        assert_eq!(
+            steps_from_resolved(&resolved),
+            vec![
+                "build image".to_string(),
+                "push".to_string(),
+                "restart".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn steps_from_resolved_preserves_positions_for_steps_without_heads() {
+        // A pruned or legacy lineage yields "" IN POSITION. Closing the gap
+        // would misaddress every later step for report_workflow_outcome, which
+        // addresses steps by step_index.
+        let resolved = vec![
+            step(0, vec![head("a")]),
+            step(1, Vec::new()),
+            step(2, vec![head("c")]),
+        ];
+        assert_eq!(
+            steps_from_resolved(&resolved),
+            vec!["a".to_string(), String::new(), "c".to_string()]
         );
     }
 }
