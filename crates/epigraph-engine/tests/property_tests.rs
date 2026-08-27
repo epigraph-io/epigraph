@@ -10,8 +10,17 @@
 //! 3. Evidence weights are always non-negative
 //! 4. DAG validator rejects self-references
 //! 5. Reputation NEVER influences initial truth calculation
+//! 6. Sheaf expected-BetP, sections and cohomology are permutation-invariant
+//!    in their neighbour / obstruction order
+//! 7. Sheaf expected BetP stays inside [0, 1]
+//! 8. The `expected` half of an edge inconsistency is a function of the source
+//!    and the relationship only, never of the target
 
 use epigraph_core::TruthValue;
+use epigraph_engine::sheaf::{
+    compute_cohomology, compute_edge_inconsistency, compute_expected_betp, compute_section,
+    restriction_kind, RestrictionKind, SheafObstruction,
+};
 #[expect(
     deprecated,
     reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
@@ -481,5 +490,245 @@ proptest! {
             "Zero evidence should produce exactly 0.5, got {}",
             truth.value()
         );
+    }
+}
+
+// =============================================================================
+// SHEAF ORDER-INDEPENDENCE INVARIANTS
+// =============================================================================
+
+/// Tolerance for the sheaf properties. Tighter than the DS suite's 1e-6 because
+/// these are single means and sums, not iterated combinations.
+const SHEAF_EPSILON: f64 = 1e-9;
+
+fn arb_restriction_kind() -> impl Strategy<Value = RestrictionKind> {
+    prop_oneof![
+        (0.01..=0.99_f64).prop_map(RestrictionKind::Positive),
+        (0.01..=0.99_f64).prop_map(RestrictionKind::Negative),
+        (0.01..=0.99_f64).prop_map(RestrictionKind::FrameEvidence),
+        Just(RestrictionKind::Neutral),
+    ]
+}
+
+/// Strategy: 0-7 neighbours. The zero-length lower bound matters — it is what
+/// exercises the `count == 0 => None` branch of `compute_expected_betp`.
+fn arb_neighbors() -> impl Strategy<Value = Vec<(f64, RestrictionKind)>> {
+    proptest::collection::vec((0.0..=1.0_f64, arb_restriction_kind()), 0..8)
+}
+
+/// Deterministically permute `items` using `seed` as a sort key.
+///
+/// `prop_shuffle()` is deliberately NOT used: it yields an independently
+/// shuffled *sample*, not a permutation of the same vector, so it cannot
+/// express "same multiset, different order".
+fn permute<T: Clone>(items: &[T], seed: &[u32]) -> Vec<T> {
+    let mut idx: Vec<usize> = (0..items.len()).collect();
+    idx.sort_by_key(|&i| (seed.get(i).copied().unwrap_or(0), i));
+    idx.into_iter().map(|i| items[i].clone()).collect()
+}
+
+fn arb_obstruction() -> impl Strategy<Value = SheafObstruction> {
+    (
+        any::<[u8; 16]>(),
+        any::<[u8; 16]>(),
+        0u8..=10,
+        0.0..=1.0_f64,
+        0.0..=1.0_f64,
+    )
+        .prop_map(|(s, t, tenths, sb, tb)| SheafObstruction {
+            source_id: Uuid::from_bytes(s),
+            target_id: Uuid::from_bytes(t),
+            relationship: "supports".into(),
+            source_betp: sb,
+            target_betp: tb,
+            expected_target_betp: 0.5,
+            // Quantised to tenths on purpose: ties are exactly where a stable
+            // sort with no secondary key is fragile, so we force plenty of them.
+            edge_inconsistency: f64::from(tenths) / 10.0,
+        })
+}
+
+proptest! {
+    /// `compute_expected_betp` is a mean over the epistemic neighbours, so the
+    /// order they arrive in must not change the answer.
+    ///
+    /// Tolerance rather than equality: the function is `sum / count` and
+    /// floating-point addition is not associative.
+    #[test]
+    fn sheaf_expected_betp_is_permutation_invariant(
+        neighbors in arb_neighbors(),
+        perm_seed in proptest::collection::vec(any::<u32>(), 0..8),
+    ) {
+        let permuted = permute(&neighbors, &perm_seed);
+        let mut reversed = neighbors.clone();
+        reversed.reverse();
+
+        let base = compute_expected_betp(&neighbors);
+
+        for (label, other) in [("permuted", &permuted), ("reversed", &reversed)] {
+            match (base, compute_expected_betp(other)) {
+                (None, None) => {}
+                (Some(x), Some(y)) => prop_assert!(
+                    (x - y).abs() < SHEAF_EPSILON,
+                    "expected_betp ({label}): {x} vs {y} (diff = {})",
+                    (x - y).abs()
+                ),
+                (a, b) => prop_assert!(
+                    false,
+                    "expected_betp ({label}) disagreed on emptiness: {a:?} vs {b:?}"
+                ),
+            }
+        }
+    }
+
+    /// Every contribution is in [0, 1] — `Positive(f)` contributes
+    /// `betp * f` and `Negative(f)` contributes `(1 - betp) * f`, both with
+    /// `betp, f` in [0, 1] — and the result is their mean, so it stays in [0, 1].
+    #[test]
+    fn sheaf_expected_betp_stays_in_unit_interval(
+        neighbors in arb_neighbors(),
+    ) {
+        if let Some(e) = compute_expected_betp(&neighbors) {
+            prop_assert!(
+                (0.0..=1.0).contains(&e),
+                "expected_betp = {e} escaped [0, 1] for {} neighbours",
+                neighbors.len()
+            );
+        }
+    }
+
+    /// A section summarises its neighbourhood; permuting that neighbourhood
+    /// must not move the summary.
+    ///
+    /// `neighbor_count` is an exact `usize` filter count, so it gets
+    /// `prop_assert_eq!`; the two floats inherit `compute_expected_betp`'s
+    /// `sum / count` and so get a tolerance.
+    #[test]
+    fn sheaf_section_is_permutation_invariant(
+        neighbors in arb_neighbors(),
+        perm_seed in proptest::collection::vec(any::<u32>(), 0..8),
+        local_betp in 0.0..=1.0_f64,
+        local_belief in 0.0..=1.0_f64,
+        local_plausibility in 0.0..=1.0_f64,
+    ) {
+        let permuted = permute(&neighbors, &perm_seed);
+
+        let a = compute_section(
+            Uuid::nil(), local_betp, local_belief, local_plausibility, &neighbors,
+        );
+        let b = compute_section(
+            Uuid::nil(), local_betp, local_belief, local_plausibility, &permuted,
+        );
+
+        prop_assert_eq!(a.neighbor_count, b.neighbor_count);
+        prop_assert!(
+            (a.expected_betp - b.expected_betp).abs() < SHEAF_EPSILON,
+            "expected_betp: {} vs {}", a.expected_betp, b.expected_betp
+        );
+        prop_assert!(
+            (a.consistency_radius - b.consistency_radius).abs() < SHEAF_EPSILON,
+            "consistency_radius: {} vs {}", a.consistency_radius, b.consistency_radius
+        );
+    }
+
+    /// `compute_cohomology`'s scalar outputs do not depend on the order the
+    /// obstructions were collected in, and neither does the *set* that survives
+    /// the threshold.
+    ///
+    /// The surviving obstructions are compared as a MULTISET, not as a `Vec`,
+    /// and that weakening is deliberate: the stronger claim is false. The
+    /// function sorts by `edge_inconsistency` DESC with a stable `sort_by` and
+    /// no secondary key, so obstructions with EQUAL inconsistency come out in
+    /// caller order — the emitted `Vec` order is genuinely permutation-
+    /// dependent. Asserted as a `Vec` this test fails within a few dozen cases
+    /// on a tied pair (falsified during development). Adding a tiebreak to the
+    /// sort would be a behaviour change and belongs in its own item; nothing
+    /// observable depends on the tie order today, as `compute_cohomology` has
+    /// no production caller.
+    ///
+    /// `h0` and `edge_count` are exact counts; `h1` and `h1_normalized` are a
+    /// sum over a re-ordered `Vec` and so need a tolerance.
+    #[test]
+    fn sheaf_cohomology_is_permutation_invariant(
+        obstructions in proptest::collection::vec(arb_obstruction(), 0..10),
+        perm_seed in proptest::collection::vec(any::<u32>(), 0..10),
+        threshold in 0.0..=1.0_f64,
+    ) {
+        // `compute_cohomology` takes `&mut Vec<_>` and both sorts and retains it,
+        // so each call gets its own clone.
+        let mut base_input = obstructions.clone();
+        let mut perm_input = permute(&obstructions, &perm_seed);
+
+        let a = compute_cohomology(&mut base_input, threshold);
+        let b = compute_cohomology(&mut perm_input, threshold);
+
+        prop_assert_eq!(a.h0, b.h0);
+        prop_assert_eq!(a.edge_count, b.edge_count);
+        prop_assert!(
+            (a.h1 - b.h1).abs() < SHEAF_EPSILON,
+            "h1: {} vs {}", a.h1, b.h1
+        );
+        prop_assert!(
+            (a.h1_normalized - b.h1_normalized).abs() < SHEAF_EPSILON,
+            "h1_normalized: {} vs {}", a.h1_normalized, b.h1_normalized
+        );
+
+        // `SheafObstruction` derives only `Debug, Clone` — there is no
+        // `PartialEq` to lean on, so project to a comparable key.
+        let key = |o: &SheafObstruction| {
+            (o.edge_inconsistency.to_bits(), o.source_id, o.target_id)
+        };
+        let mut ka: Vec<_> = a.obstructions.iter().map(key).collect();
+        let mut kb: Vec<_> = b.obstructions.iter().map(key).collect();
+        ka.sort_unstable();
+        kb.sort_unstable();
+        prop_assert_eq!(ka, kb);
+    }
+
+    /// The `expected` half of `compute_edge_inconsistency`'s return is a
+    /// restriction map applied to the SOURCE: for `Positive`/`Negative` it is a
+    /// function of `(source_betp, relationship)` alone and must be identical
+    /// across different targets. For `Neutral`/`FrameEvidence` there is no
+    /// transmission, so it echoes its own target back.
+    ///
+    /// This pins the restriction-map contract that a future refactor could
+    /// quietly break.
+    #[test]
+    fn sheaf_edge_inconsistency_expected_is_independent_of_target(
+        source in 0.0..=1.0_f64,
+        t1 in 0.0..=1.0_f64,
+        t2 in 0.0..=1.0_f64,
+        rel in prop_oneof![
+            Just("supports"),
+            Just("refutes"),
+            Just("contradicts"),
+            Just("elaborates"),
+            Just("generalizes"),
+            Just("informs"),
+            Just("frame_validates"),
+            Just("derived_from"),
+            Just("supersedes"),
+        ],
+    ) {
+        let (inc1, exp1) = compute_edge_inconsistency(source, t1, rel);
+        let (inc2, exp2) = compute_edge_inconsistency(source, t2, rel);
+
+        prop_assert!(inc1 >= 0.0, "inconsistency went negative: {inc1} ({rel})");
+        prop_assert!(inc2 >= 0.0, "inconsistency went negative: {inc2} ({rel})");
+
+        match restriction_kind(rel) {
+            RestrictionKind::Positive(_) | RestrictionKind::Negative(_) => {
+                prop_assert!(
+                    (exp1 - exp2).abs() < SHEAF_EPSILON,
+                    "{rel}: expected target depends on the target ({exp1} vs {exp2})"
+                );
+            }
+            RestrictionKind::Neutral | RestrictionKind::FrameEvidence(_) => {
+                prop_assert!(
+                    (exp1 - t1).abs() < SHEAF_EPSILON && (exp2 - t2).abs() < SHEAF_EPSILON,
+                    "{rel}: non-transmitting edge should echo its target, got {exp1}/{exp2}"
+                );
+            }
+        }
     }
 }

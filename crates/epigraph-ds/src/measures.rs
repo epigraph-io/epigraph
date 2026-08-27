@@ -1285,4 +1285,279 @@ mod proptest_properties {
             }
         }
     }
+
+    /// Compare two mass functions focal-element-wise within `EPSILON`.
+    ///
+    /// Takes the union of both key sets so a focal element present in only one
+    /// side is still checked (`mass_of` returns 0.0 for an absent key).
+    fn assert_same_masses(
+        a: &MassFunction,
+        b: &MassFunction,
+        label: &str,
+    ) -> Result<(), TestCaseError> {
+        let mut keys: BTreeSet<FocalElement> = BTreeSet::new();
+        keys.extend(a.masses().keys().cloned());
+        keys.extend(b.masses().keys().cloned());
+        for fe in &keys {
+            let ma = a.mass_of(fe);
+            let mb = b.mass_of(fe);
+            prop_assert!(
+                (ma - mb).abs() < EPSILON,
+                "{label}: {fe} -> {ma} vs {mb} (diff = {})",
+                (ma - mb).abs()
+            );
+        }
+        Ok(())
+    }
+
+    /// Strategy: generate a frame and 2-4 mass functions on it
+    fn arb_frame_and_masses() -> impl Strategy<Value = (FrameOfDiscernment, Vec<MassFunction>)> {
+        arb_frame().prop_flat_map(|frame| {
+            let f = frame.clone();
+            proptest::collection::vec(arb_mass_function(f), 2..=4)
+                .prop_map(move |ms| (frame.clone(), ms))
+        })
+    }
+
+    // ========================================================================
+    // Property 7: dempster_combine is commutative — and its failure mode is
+    //   symmetric too (TotalConflict depends only on K_c, which is symmetric)
+    // ========================================================================
+
+    proptest! {
+        #[test]
+        fn dempster_combine_is_commutative(
+            (_frame, m1, m2) in arb_frame_and_two_masses()
+        ) {
+            // `arb_mass_function` always injects Theta, so K_c < 1 strictly and
+            // the Err/Err arm is never taken in practice — it is kept because
+            // error symmetry is itself part of the contract.
+            match (
+                combination::dempster_combine(&m1, &m2),
+                combination::dempster_combine(&m2, &m1),
+            ) {
+                (Ok(ab), Ok(ba)) => assert_same_masses(&ab, &ba, "dempster")?,
+                (Err(_), Err(_)) => {}
+                (a, b) => prop_assert!(
+                    false,
+                    "dempster asymmetric: ok={} vs ok={}",
+                    a.is_ok(),
+                    b.is_ok()
+                ),
+            }
+        }
+    }
+
+    // ========================================================================
+    // Property 8: conflict_coefficient is symmetric — K(m1, m2) = K(m2, m1)
+    // ========================================================================
+
+    proptest! {
+        #[test]
+        fn conflict_coefficient_is_symmetric(
+            (_frame, m1, m2) in arb_frame_and_two_masses()
+        ) {
+            let k12 = combination::conflict_coefficient(&m1, &m2).unwrap();
+            let k21 = combination::conflict_coefficient(&m2, &m1).unwrap();
+            // Tolerance, not equality: the two loops accumulate the same set of
+            // products in a different order, so the sums can differ in the last bits.
+            prop_assert!(
+                (k12 - k21).abs() < EPSILON,
+                "K(m1,m2) = {k12} != K(m2,m1) = {k21} (diff = {})",
+                (k12 - k21).abs()
+            );
+        }
+    }
+
+    // ========================================================================
+    // Property 9: cautious_combine is commutative
+    // ========================================================================
+
+    proptest! {
+        #[test]
+        fn cautious_combine_is_commutative(
+            (_frame, m1, m2) in arb_frame_and_two_masses()
+        ) {
+            // Same frame on both sides, so `check_frame_compat` cannot fail.
+            let ab = combination::cautious_combine(&m1, &m2).unwrap();
+            let ba = combination::cautious_combine(&m2, &m1).unwrap();
+            assert_same_masses(&ab, &ba, "cautious")?;
+        }
+    }
+
+    // ========================================================================
+    // Property 10: cautious_combine is idempotent — m ∧ m = m
+    //
+    //   Generalises the single hand-picked case in
+    //   `combination.rs::cautious_is_idempotent` to the whole generated domain,
+    //   exercising the `q(empty) = 1.0` convention and the `m_a > 1e-12` cutoff
+    //   in the Moebius inversion.
+    // ========================================================================
+
+    proptest! {
+        #[test]
+        fn cautious_combine_is_idempotent(
+            (_frame, m) in arb_frame_and_mass()
+        ) {
+            let same = combination::cautious_combine(&m, &m).unwrap();
+            assert_same_masses(&same, &m, "cautious idempotence")?;
+        }
+    }
+
+    // ========================================================================
+    // Property 11: adaptive_combine is commutative — masses AND report.
+    //   Sweeping `conflict_threshold` over [0, 1] exercises both the Dempster
+    //   and the Conjunctive branch of the rule selector.
+    // ========================================================================
+
+    proptest! {
+        #[test]
+        fn adaptive_combine_is_commutative(
+            (_frame, m1, m2) in arb_frame_and_two_masses(),
+            conflict_threshold in 0.0..=1.0_f64,
+        ) {
+            match (
+                combination::adaptive_combine(&m1, &m2, conflict_threshold),
+                combination::adaptive_combine(&m2, &m1, conflict_threshold),
+            ) {
+                (Ok((ab, r_ab)), Ok((ba, r_ba))) => {
+                    assert_same_masses(&ab, &ba, "adaptive")?;
+                    prop_assert_eq!(
+                        r_ab.method_used,
+                        r_ba.method_used,
+                        "adaptive picked different rules for the same pair"
+                    );
+                    prop_assert!(
+                        (r_ab.conflict_k - r_ba.conflict_k).abs() < EPSILON,
+                        "adaptive conflict_k: {} vs {}",
+                        r_ab.conflict_k, r_ba.conflict_k
+                    );
+                    prop_assert!(
+                        (r_ab.mass_on_conflict - r_ba.mass_on_conflict).abs() < EPSILON,
+                        "adaptive mass_on_conflict: {} vs {}",
+                        r_ab.mass_on_conflict, r_ba.mass_on_conflict
+                    );
+                    prop_assert!(
+                        (r_ab.mass_on_missing - r_ba.mass_on_missing).abs() < EPSILON,
+                        "adaptive mass_on_missing: {} vs {}",
+                        r_ab.mass_on_missing, r_ba.mass_on_missing
+                    );
+                }
+                (Err(_), Err(_)) => {}
+                (a, b) => prop_assert!(
+                    false,
+                    "adaptive asymmetric: ok={} vs ok={}",
+                    a.is_ok(),
+                    b.is_ok()
+                ),
+            }
+        }
+    }
+
+    // ========================================================================
+    // Property 12: every redistribution rule is commutative.
+    //
+    //   This is the only path a test can reach the private `yager_open_combine`,
+    //   `yager_closed_combine`, `dubois_prade_combine` and `inagaki_combine` by
+    //   — they have no `pub` re-export. Distinct from
+    //   `redistribute_preserves_total_mass` above, which deliberately skips
+    //   `Dempster`; both mappings are intentional, neither subsumes the other.
+    // ========================================================================
+
+    proptest! {
+        #[test]
+        fn redistribute_is_commutative_for_all_methods(
+            (_frame, m1, m2) in arb_frame_and_two_masses(),
+            method_idx in 0u8..6,
+        ) {
+            let method = match method_idx {
+                0 => combination::CombinationMethod::Conjunctive,
+                1 => combination::CombinationMethod::Dempster,
+                2 => combination::CombinationMethod::YagerOpen,
+                3 => combination::CombinationMethod::YagerClosed,
+                4 => combination::CombinationMethod::DuboisPrade,
+                5 => combination::CombinationMethod::Inagaki,
+                _ => unreachable!(),
+            };
+
+            match (
+                combination::redistribute(&m1, &m2, method, Some(0.5)),
+                combination::redistribute(&m2, &m1, method, Some(0.5)),
+            ) {
+                (Ok(ab), Ok(ba)) => assert_same_masses(&ab, &ba, "redistribute")?,
+                (Err(_), Err(_)) => {}
+                (a, b) => prop_assert!(
+                    false,
+                    "redistribute({:?}) asymmetric: ok={} vs ok={}",
+                    method,
+                    a.is_ok(),
+                    b.is_ok()
+                ),
+            }
+        }
+    }
+
+    // ========================================================================
+    // Property 13: combine_multiple is permutation-invariant.
+    //
+    //   Guards the `canonical_mass_cmp` sort in `combination::combine_multiple`
+    //   (added for backlog cebb0043). Existing coverage is only the three fixed
+    //   masses in `combination.rs::combine_multiple_is_order_independent` and
+    //   `tests/order_independence_smoke.rs`.
+    // ========================================================================
+
+    proptest! {
+        #[test]
+        fn combine_multiple_is_permutation_invariant(
+            (_frame, ms) in arb_frame_and_masses(),
+            rot in 0usize..4,
+        ) {
+            let n = ms.len();
+            let rotated: Vec<MassFunction> =
+                (0..n).map(|i| ms[(i + rot) % n].clone()).collect();
+            let mut reversed = ms.clone();
+            reversed.reverse();
+
+            let base = combination::combine_multiple(&ms, 0.1);
+            let rotres = combination::combine_multiple(&rotated, 0.1);
+            let revres = combination::combine_multiple(&reversed, 0.1);
+
+            if let (Ok((a, _)), Ok((b, _)), Ok((c, _))) = (base, rotres, revres) {
+                assert_same_masses(&a, &b, "combine_multiple rotated")?;
+                assert_same_masses(&a, &c, "combine_multiple reversed")?;
+            }
+        }
+    }
+
+    // ========================================================================
+    // Property 14: combine_multiple's BetP is permutation-invariant.
+    //
+    //   Pins the invariance at the layer downstream callers actually read
+    //   (pignistic probability), not just the raw mass map.
+    // ========================================================================
+
+    proptest! {
+        #[test]
+        fn combine_multiple_betp_is_permutation_invariant(
+            (frame, ms) in arb_frame_and_masses()
+        ) {
+            let mut reversed = ms.clone();
+            reversed.reverse();
+
+            if let (Ok((a, _)), Ok((b, _))) = (
+                combination::combine_multiple(&ms, 0.1),
+                combination::combine_multiple(&reversed, 0.1),
+            ) {
+                for i in 0..frame.hypothesis_count() {
+                    let pa = measures::pignistic_probability(&a, i);
+                    let pb = measures::pignistic_probability(&b, i);
+                    prop_assert!(
+                        (pa - pb).abs() < EPSILON,
+                        "BetP(h{i}) = {pa} vs {pb} under reversal (diff = {})",
+                        (pa - pb).abs()
+                    );
+                }
+            }
+        }
+    }
 }
