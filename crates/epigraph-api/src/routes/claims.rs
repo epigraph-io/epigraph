@@ -329,6 +329,25 @@ pub async fn create_claim(
         });
     }
 
+    // Reject unexpanded shell syntax in caller-supplied labels.
+    //
+    // The label write below is a raw `UPDATE claims SET labels = $1`, so it
+    // never enters `ClaimRepository::update_labels` and the guard wired in
+    // there cannot fire. This route is the most likely real-world producer of
+    // a literal `$VAR` label — a shell script curling this endpoint with an
+    // unset variable — so the guard has to be re-stated here. Pre-insert and
+    // 4xx on purpose: no half-labelled row persists, and the caller is told to
+    // fix the payload rather than retry it.
+    epigraph_db::reject_shell_expansion(&request.labels).map_err(|e| {
+        ApiError::ValidationError {
+            field: "labels".to_string(),
+            reason: match e {
+                epigraph_db::DbError::InvalidData { reason } => reason,
+                other => other.to_string(),
+            },
+        }
+    })?;
+
     // If encrypted, validate group membership and epoch
     if privacy_tier != "public" {
         let group_id = request.group_id.unwrap(); // safe: validated above

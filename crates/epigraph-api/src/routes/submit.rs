@@ -438,6 +438,31 @@ async fn validate_packet(
         }
     }
 
+    // 1d. Reject unexpanded shell syntax in caller-supplied labels.
+    //
+    // The label write further down is a raw `UPDATE claims SET labels = $1`,
+    // so it never enters `ClaimRepository::update_labels` and the guard wired
+    // in there cannot fire. Restated here so a literal `$VAR` label — a shell
+    // script curling this endpoint with an unset variable — fails as a 400
+    // before anything is written, rather than persisting.
+    //
+    // `cfg`-gated on `db` because that is the only build in which labels are
+    // persisted at all, and `epigraph_db` is an optional dependency.
+    #[cfg(feature = "db")]
+    if let Err(e) = epigraph_db::reject_shell_expansion(&packet.claim.labels) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ErrorResponse::with_details(
+                "ValidationError",
+                match e {
+                    epigraph_db::DbError::InvalidData { reason } => reason,
+                    other => other.to_string(),
+                },
+                serde_json::json!({ "field": "claim.labels" }),
+            ),
+        ));
+    }
+
     // 2. Validate evidence count is within bounds (DoS prevention)
     if packet.evidence.len() > MAX_EVIDENCE_PER_PACKET {
         return Err((

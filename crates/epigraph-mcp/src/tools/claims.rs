@@ -250,6 +250,14 @@ pub async fn submit_claim(
     let confidence_declaration =
         build_confidence_declaration(params.confidence_scope.as_deref(), &params.known_issues)
             .map_err(invalid_params)?;
+    // Same reasoning as the two calls above: `update_labels` below already
+    // runs this guard, but it fires AFTER `create_claim_idempotent` has
+    // inserted the row, which would leave a persisted claim with none of the
+    // caller's labels. Validating the caller's labels at fn entry rejects the
+    // submission before anything is written. The one label this function adds
+    // itself ("near-duplicate", pushed by the novelty gate below) is a
+    // constant and always clean, so checking here loses no coverage.
+    epigraph_db::reject_shell_expansion(&params.labels).map_err(map_db_error)?;
 
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
@@ -390,9 +398,15 @@ pub async fn submit_claim(
     let claim_uuid = claim.id.as_uuid();
 
     if !params.labels.is_empty() {
+        // `map_db_error`, not `internal_error`: a rejected label is a caller
+        // mistake and must surface as INVALID_PARAMS, or the agent retries the
+        // same bad payload forever. The fn-entry guard above means this branch
+        // should no longer see a shell-expansion rejection at all, but the
+        // classification is correct for any other `InvalidData` the repo
+        // raises.
         ClaimRepository::update_labels(&server.pool, claim_uuid, &params.labels, &[])
             .await
-            .map_err(internal_error)?;
+            .map_err(map_db_error)?;
     }
 
     // Attach the writer's confidence declaration, if any.

@@ -33,6 +33,14 @@ pub async fn memorize(
     let pub_key = server.signer.public_key();
     let confidence = params.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
     let mut tags = params.tags.unwrap_or_default();
+    // Validate the caller's tags before anything is written. `update_labels`
+    // below runs the same guard, but it fires after the row is inserted AND
+    // its error is warn-swallowed, so one offending tag silently discards the
+    // ENTIRE tag set while the claim persists — with evidence text that still
+    // names the tags. Rejecting up front is the only signal the caller gets.
+    // Deliberately NOT dropping just the offending tag: silently mutating the
+    // caller's tag set is how an unexpanded `$VAR` goes unnoticed.
+    epigraph_db::reject_shell_expansion(&tags).map_err(crate::errors::map_db_error)?;
 
     let raw_truth = (confidence * 0.6).clamp(0.01, 0.99);
     let truth_value = TruthValue::clamped(raw_truth);
@@ -126,6 +134,10 @@ pub async fn memorize(
     // Persist tags as claim labels so `query_claims_by_label` can surface them.
     // Apply on dedup-hit too — labels accumulate non-destructively via the repo's
     // SELECT DISTINCT, so re-memorizing existing content with new tags is additive.
+    // The warn-swallow stays: post-insert this can only be a transient DB
+    // failure, and hard-erroring after the claim is already committed would be
+    // a wider behaviour change. The caller-mistake case it used to hide is now
+    // rejected at fn entry, before the insert.
     if !tags.is_empty() {
         if let Err(e) = ClaimRepository::update_labels(&server.pool, claim_uuid, &tags, &[]).await {
             tracing::warn!(claim_id = %claim_uuid, "memorize: update_labels failed: {e}");

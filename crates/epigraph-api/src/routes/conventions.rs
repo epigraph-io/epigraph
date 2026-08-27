@@ -117,6 +117,20 @@ pub async fn learn_convention(
         });
     }
 
+    // Reject unexpanded shell syntax in caller-supplied tags. They are spliced
+    // into the labels array written below by a raw
+    // `UPDATE claims SET labels = $1`, which never enters
+    // `ClaimRepository::update_labels` and so never reaches the guard wired in
+    // there. Checked here, before the claim row is created, so a bad tag is a
+    // 400 rather than a persisted claim carrying a literal `$VAR` label.
+    epigraph_db::reject_shell_expansion(&request.tags).map_err(|e| ApiError::ValidationError {
+        field: "tags".to_string(),
+        reason: match e {
+            epigraph_db::DbError::InvalidData { reason } => reason,
+            other => other.to_string(),
+        },
+    })?;
+
     let confidence = request.confidence.clamp(0.0, 1.0);
     let pool = &state.db_pool;
 
@@ -420,7 +434,11 @@ pub async fn share_skill(
 
     epigraph_db::ClaimRepository::create(pool, &shared_claim).await?;
 
-    // Set labels
+    // Set labels.
+    //
+    // No `reject_shell_expansion` guard here, unlike the other raw
+    // `UPDATE claims SET labels = $1` sites: all three labels are string
+    // literals with no caller input, so the guard would be dead code.
     let labels = vec![
         "workflow".to_string(),
         "global".to_string(),
