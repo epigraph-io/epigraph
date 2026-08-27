@@ -297,6 +297,128 @@ fn slugify_workflow_goal(s: &str) -> String {
         .join("-")
 }
 
+/// Override for the goal-similarity floor at which `store_workflow` treats a
+/// paraphrased goal as the SAME lineage rather than a new one.
+const GOAL_MERGE_THRESHOLD_ENV: &str = "EPIGRAPH_WORKFLOW_MERGE_THRESHOLD";
+
+/// Default identity-merge floor. Deliberately far stricter than
+/// `find_workflow_hierarchical`'s 0.5 retrieval floor: a loose RETRIEVAL floor
+/// is recoverable (the caller just ignores a bad hit), a loose IDENTITY floor
+/// is not — the workflow id is deterministic in `(canonical_name, generation)`,
+/// so there is no un-merge once two lineages have been welded together.
+const DEFAULT_GOAL_MERGE_THRESHOLD: f64 = 0.92;
+
+/// Parse the merge threshold from its env var, falling back to
+/// [`DEFAULT_GOAL_MERGE_THRESHOLD`] on absent, unparseable, or non-finite input.
+///
+/// Pure so it can be unit-tested without touching the process environment.
+/// Setting a value above 1.0 disables goal merging outright — cosine similarity
+/// never exceeds 1, so no candidate can ever clear the floor and every call
+/// falls back to today's slug-only identity.
+fn merge_threshold_from_env(raw: Option<&str>) -> f64 {
+    raw.and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(DEFAULT_GOAL_MERGE_THRESHOLD)
+}
+
+/// Outcome of resolving a `store_workflow` goal against existing lineages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GoalIdentity {
+    /// No semantic match (or an exact-slug lineage already exists): mint/reuse
+    /// the slug lineage at generation 0, exactly as `store_workflow` always did.
+    NewRoot(String),
+    /// A row in a matched lineage already carries this exact goal text — reuse
+    /// its `(canonical_name, generation)` so repeat calls stay idempotent.
+    Existing {
+        canonical_name: String,
+        generation: u32,
+    },
+    /// The goal is a paraphrase of a matched lineage: add a generation to it
+    /// instead of forking a brand-new root.
+    DriftedInto { canonical_name: String },
+}
+
+/// Decide which lineage a `store_workflow` goal belongs to. Pure — no DB, no
+/// embedder — so the whole decision table is unit-testable offline.
+///
+/// `candidates` MUST already be threshold-filtered and ordered closest-first;
+/// that is exactly `WorkflowRepository::find_hierarchical_by_embedding`'s
+/// contract, so `candidates[0]` is the nearest surviving lineage.
+///
+/// Rules, in order:
+/// 1. An exact-slug lineage wins outright — identity beats semantics, and this
+///    reproduces today's behaviour verbatim for every goal already in the graph.
+/// 2. Otherwise a candidate carrying this exact goal text (case- and
+///    whitespace-insensitive) is reused at its own generation. This is what
+///    keeps the drift path idempotent: calling twice with the same paraphrase
+///    re-attaches instead of stacking a fresh generation each time.
+/// 3. Otherwise the closest candidate's lineage absorbs the goal as drift.
+/// 4. Otherwise mint a new root from the slug.
+pub(crate) fn resolve_goal_identity(
+    goal: &str,
+    slug: &str,
+    slug_lineage_exists: bool,
+    candidates: &[epigraph_db::HierarchicalWorkflowRow],
+) -> GoalIdentity {
+    if slug_lineage_exists {
+        return GoalIdentity::NewRoot(slug.to_string());
+    }
+
+    let needle = goal.trim();
+    for row in candidates {
+        if row.goal.trim().eq_ignore_ascii_case(needle) {
+            // A negative generation is not representable upstream
+            // (`WorkflowSource::generation` is u32); skip such a row rather
+            // than error, and let the drift rule handle the lineage.
+            if let Ok(generation) = u32::try_from(row.generation) {
+                return GoalIdentity::Existing {
+                    canonical_name: row.canonical_name.clone(),
+                    generation,
+                };
+            }
+        }
+    }
+
+    match candidates.first() {
+        Some(row) => GoalIdentity::DriftedInto {
+            canonical_name: row.canonical_name.clone(),
+        },
+        None => GoalIdentity::NewRoot(slug.to_string()),
+    }
+}
+
+/// Project a [`GoalIdentity`] onto the `(canonical_name, generation,
+/// parent_canonical_name)` triple that `WorkflowSource` needs. Pure.
+///
+/// `parent_canonical_name` is only meaningful in concert with `generation`:
+/// `epigraph-ingest-executor/src/workflow.rs` resolves the parent row as
+/// `find_root_by_canonical(parent_canonical_name, generation - 1)`, so a drift
+/// MUST land at `lineage_max_generation + 1` or neither `parent_id` nor the
+/// `variant_of` edge resolves. This mirrors `improve_workflow_hierarchy`
+/// exactly.
+///
+/// The `Existing` arm leaves the parent `None` on purpose: that row already
+/// exists, so the executor's idempotency gate short-circuits. If it is a zombie
+/// row with zero `executes` edges, `insert_root`'s `ON CONFLICT DO NOTHING`
+/// leaves it untouched and the call merely backfills the claims and edges.
+fn source_identity(
+    identity: GoalIdentity,
+    lineage_max_generation: u32,
+) -> (String, u32, Option<String>) {
+    match identity {
+        GoalIdentity::NewRoot(name) => (name, 0, None),
+        GoalIdentity::Existing {
+            canonical_name,
+            generation,
+        } => (canonical_name, generation, None),
+        GoalIdentity::DriftedInto { canonical_name } => (
+            canonical_name.clone(),
+            lineage_max_generation.saturating_add(1),
+            Some(canonical_name),
+        ),
+    }
+}
+
 /// Store a new hierarchical workflow.
 ///
 /// Input shape stays simple (`goal` + `steps[]`); internally builds a
@@ -304,6 +426,13 @@ fn slugify_workflow_goal(s: &str) -> String {
 /// becomes a first-class claim under a single `"Body"` phase. The workflow
 /// itself is a row in the `workflows` table, identified by a deterministic
 /// UUID from `(canonical_name, generation)`. Idempotent on `canonical_name`.
+///
+/// Identity is NOT slug-only. `slugify_workflow_goal` alone forks a fresh
+/// lineage root for every paraphrase ("Deploy the API" vs "Deploy API
+/// service"), so when an embedder is available the goal is matched against
+/// existing lineages at a strict floor and drift is absorbed as a new
+/// generation of the matched lineage. `identity_resolution` /
+/// `merged_into_goal` in the response make that merge visible to the caller.
 pub async fn store_workflow(
     server: &EpiGraphMcpFull,
     params: StoreWorkflowParams,
@@ -312,7 +441,80 @@ pub async fn store_workflow(
     use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
     use epigraph_ingest::workflow::WorkflowExtraction;
 
-    let canonical_name = slugify_workflow_goal(&params.goal);
+    let slug = slugify_workflow_goal(&params.goal);
+
+    // Hoisted from the post-ingest embedding block below so ONE embedding
+    // serves both lineage matching and `workflows.goal_embedding` — this is a
+    // move, not an extra OpenAI call. A mock or disabled embedder returns Err
+    // here, which collapses the whole path back to today's slug-only identity;
+    // no separate `is_mock()` guard is needed.
+    let goal_vec: Option<Vec<f32>> = server
+        .embedder
+        .generate(&params.goal)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "store_workflow: goal embedding unavailable; falling back to slug identity");
+        })
+        .ok();
+
+    // `lineage_max` is only read on the drift arm; every other arm ignores it.
+    let (identity, lineage_max, merged_into_goal) = match goal_vec.as_ref() {
+        // Offline path: byte-for-byte today's behaviour, and zero DB round-trips.
+        None => (GoalIdentity::NewRoot(slug.clone()), 0, None),
+        Some(qvec) => {
+            let slug_lineage_exists =
+                WorkflowRepository::max_generation_by_canonical(&server.pool, &slug)
+                    .await
+                    .map_err(internal_error)?
+                    .is_some();
+
+            // min_truth 0.3 keeps deprecated lineages (deprecate_workflow
+            // writes 0.05) from ever becoming a merge target;
+            // resolve_to_latest breaks equal-distance ties toward the newest
+            // generation. A lookup failure must not fail the tool — it just
+            // means we mint a new lineage, which is the pre-existing behaviour.
+            let candidates = WorkflowRepository::find_hierarchical_by_embedding(
+                &server.pool,
+                qvec,
+                merge_threshold_from_env(std::env::var(GOAL_MERGE_THRESHOLD_ENV).ok().as_deref()),
+                0.3,
+                5,
+                true,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = ?e, "store_workflow: lineage lookup failed; minting a new lineage");
+                Vec::new()
+            });
+
+            let identity =
+                resolve_goal_identity(&params.goal, &slug, slug_lineage_exists, &candidates);
+            let merged_into_goal = match &identity {
+                GoalIdentity::DriftedInto { .. } => candidates.first().map(|row| row.goal.clone()),
+                _ => None,
+            };
+            let lineage_max = match &identity {
+                GoalIdentity::DriftedInto { canonical_name } => u32::try_from(
+                    WorkflowRepository::max_generation_by_canonical(&server.pool, canonical_name)
+                        .await
+                        .map_err(internal_error)?
+                        .unwrap_or(0),
+                )
+                .unwrap_or(0),
+                _ => 0,
+            };
+            (identity, lineage_max, merged_into_goal)
+        }
+    };
+
+    let identity_resolution = match identity {
+        GoalIdentity::NewRoot(_) => "new_root",
+        GoalIdentity::Existing { .. } => "existing_generation",
+        GoalIdentity::DriftedInto { .. } => "goal_drift",
+    };
+    let (canonical_name, generation, parent_canonical_name) =
+        source_identity(identity, lineage_max);
+
     let prereqs = params.prerequisites.unwrap_or_default();
     let tags = params.tags.unwrap_or_default();
 
@@ -347,8 +549,8 @@ pub async fn store_workflow(
         source: WorkflowSource {
             canonical_name: canonical_name.clone(),
             goal: params.goal.clone(),
-            generation: 0,
-            parent_canonical_name: None,
+            generation,
+            parent_canonical_name,
             authors: vec![],
             expected_outcome: params.expected_outcome.clone(),
             tags,
@@ -378,19 +580,15 @@ pub async fn store_workflow(
 
     // Also embed the workflow goal into workflows.goal_embedding for
     // embedding-first find_workflow_hierarchical. Omitted from the original
-    // store_workflow; do_ingest_workflow embeds it correctly.
-    if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
-        match server.embedder.generate(&params.goal).await {
-            Ok(qvec) => {
-                if let Err(e) =
-                    WorkflowRepository::set_goal_embedding(&server.pool, wf_id, &qvec).await
-                {
-                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
-            }
+    // store_workflow; do_ingest_workflow embeds it correctly. Reuses the
+    // vector generated above rather than asking the embedder twice.
+    // Best-effort: a failure here must never fail the tool.
+    if let (Ok(wf_id), Some(qvec)) = (
+        uuid::Uuid::parse_str(&response.workflow_id),
+        goal_vec.as_ref(),
+    ) {
+        if let Err(e) = WorkflowRepository::set_goal_embedding(&server.pool, wf_id, qvec).await {
+            tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
         }
     }
 
@@ -402,6 +600,8 @@ pub async fn store_workflow(
         step_count: params.steps.len(),
         claims_ingested: response.claims_ingested,
         already_ingested: response.already_ingested,
+        identity_resolution,
+        merged_into_goal,
     })
 }
 
@@ -961,5 +1161,200 @@ pub mod __test_only {
         pgvec: Option<String>,
     ) -> Result<CallToolResult, McpError> {
         find_workflow_post_embed(server, &params, pgvec).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        merge_threshold_from_env, resolve_goal_identity, slugify_workflow_goal, source_identity,
+        GoalIdentity, DEFAULT_GOAL_MERGE_THRESHOLD,
+    };
+    use epigraph_db::HierarchicalWorkflowRow;
+
+    /// Row builder so a future field on `HierarchicalWorkflowRow` is a one-line
+    /// fix here rather than N broken struct literals.
+    fn row(canonical: &str, generation: i32, goal: &str) -> HierarchicalWorkflowRow {
+        HierarchicalWorkflowRow {
+            id: uuid::Uuid::nil(),
+            canonical_name: canonical.to_string(),
+            generation,
+            goal: goal.to_string(),
+            parent_id: None,
+            metadata: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            truth_value: 1.0,
+        }
+    }
+
+    #[test]
+    fn resolve_goal_identity_mints_new_root_when_no_candidates() {
+        assert_eq!(
+            resolve_goal_identity("Deploy the API", "deploy-the-api", false, &[]),
+            GoalIdentity::NewRoot("deploy-the-api".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_goal_identity_preserves_exact_slug_lineage_at_generation_zero() {
+        // Identity beats semantics: an existing slug lineage short-circuits
+        // BEFORE any candidate is considered, so today's behaviour is verbatim.
+        let candidates = [row("deploy-api-service", 3, "Deploy API service")];
+        let identity = resolve_goal_identity("Deploy the API", "deploy-the-api", true, &candidates);
+        assert_eq!(
+            identity,
+            GoalIdentity::NewRoot("deploy-the-api".to_string())
+        );
+        assert_eq!(
+            source_identity(identity, 7),
+            ("deploy-the-api".to_string(), 0, None)
+        );
+    }
+
+    #[test]
+    fn resolve_goal_identity_drifts_into_closest_candidate_lineage() {
+        let candidates = [row("deploy-api-service", 2, "Deploy API service")];
+        assert_eq!(
+            resolve_goal_identity("Deploy the API", "deploy-the-api", false, &candidates),
+            GoalIdentity::DriftedInto {
+                canonical_name: "deploy-api-service".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_goal_identity_reuses_existing_generation_for_identical_goal_text() {
+        // The idempotency rule: a repeated drifted goal re-attaches to the
+        // generation already carrying that exact text instead of forking one
+        // more generation on every call.
+        let candidates = [
+            row("deploy-api-service", 2, "Deploy API service"),
+            row("deploy-api-service", 1, "Deploy the API"),
+        ];
+        assert_eq!(
+            resolve_goal_identity("Deploy the API", "deploy-the-api", false, &candidates),
+            GoalIdentity::Existing {
+                canonical_name: "deploy-api-service".to_string(),
+                generation: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_goal_identity_exact_goal_match_ignores_case_and_surrounding_whitespace() {
+        let candidates = [row("deploy-api-service", 4, "  deploy THE api  ")];
+        assert_eq!(
+            resolve_goal_identity("Deploy the API\n", "deploy-the-api", false, &candidates),
+            GoalIdentity::Existing {
+                canonical_name: "deploy-api-service".to_string(),
+                generation: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_goal_identity_prefers_first_candidate_when_several_clear_threshold() {
+        // find_hierarchical_by_embedding returns closest-first, so index 0 is
+        // the nearest lineage — the drift target.
+        let candidates = [
+            row("deploy-api-service", 0, "Deploy API service"),
+            row("ship-the-api", 0, "Ship the API"),
+        ];
+        assert_eq!(
+            resolve_goal_identity("Deploy the API", "deploy-the-api", false, &candidates),
+            GoalIdentity::DriftedInto {
+                canonical_name: "deploy-api-service".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_goal_identity_skips_candidate_with_negative_generation() {
+        // A negative generation cannot be represented in WorkflowSource (u32);
+        // the exact-text rule declines it and the drift rule takes over.
+        let candidates = [row("deploy-api-service", -1, "Deploy the API")];
+        assert_eq!(
+            resolve_goal_identity("Deploy the API", "deploy-the-api", false, &candidates),
+            GoalIdentity::DriftedInto {
+                canonical_name: "deploy-api-service".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn source_identity_new_root_is_generation_zero_with_no_parent() {
+        assert_eq!(
+            source_identity(GoalIdentity::NewRoot("deploy-the-api".to_string()), 9),
+            ("deploy-the-api".to_string(), 0, None)
+        );
+    }
+
+    #[test]
+    fn source_identity_existing_reuses_generation_without_parent() {
+        assert_eq!(
+            source_identity(
+                GoalIdentity::Existing {
+                    canonical_name: "deploy-api-service".to_string(),
+                    generation: 2,
+                },
+                9
+            ),
+            ("deploy-api-service".to_string(), 2, None)
+        );
+    }
+
+    #[test]
+    fn source_identity_drift_sets_generation_above_lineage_max_and_names_parent() {
+        // The executor resolves the parent as
+        // find_root_by_canonical(parent, generation - 1), so generation MUST be
+        // lineage_max + 1 for parent_id and the variant_of edge to resolve.
+        assert_eq!(
+            source_identity(
+                GoalIdentity::DriftedInto {
+                    canonical_name: "deploy-api-service".to_string(),
+                },
+                2
+            ),
+            (
+                "deploy-api-service".to_string(),
+                3,
+                Some("deploy-api-service".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn merge_threshold_from_env_defaults_when_unset_or_unparseable() {
+        for raw in [None, Some(""), Some("high"), Some("NaN"), Some("inf")] {
+            assert_eq!(
+                merge_threshold_from_env(raw),
+                DEFAULT_GOAL_MERGE_THRESHOLD,
+                "raw={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_threshold_from_env_honours_valid_override() {
+        assert!((merge_threshold_from_env(Some("0.97")) - 0.97).abs() < f64::EPSILON);
+        assert!((merge_threshold_from_env(Some(" 0.5 ")) - 0.5).abs() < f64::EPSILON);
+        // > 1.0 is the documented kill switch: cosine similarity never exceeds
+        // 1, so nothing can clear the floor and merging is off.
+        assert!(merge_threshold_from_env(Some("1.5")) > 1.0);
+    }
+
+    #[test]
+    fn slugify_workflow_goal_maps_paraphrases_to_distinct_slugs() {
+        // This is the bug's root cause, pinned: slug identity alone cannot see
+        // that these two goals are the same workflow.
+        assert_eq!(slugify_workflow_goal("Deploy the API"), "deploy-the-api");
+        assert_eq!(
+            slugify_workflow_goal("Deploy API service"),
+            "deploy-api-service"
+        );
+        assert_ne!(
+            slugify_workflow_goal("Deploy the API"),
+            slugify_workflow_goal("Deploy API service")
+        );
     }
 }

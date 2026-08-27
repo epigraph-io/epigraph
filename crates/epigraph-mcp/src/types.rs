@@ -1521,6 +1521,18 @@ pub struct StoreWorkflowResponse {
     /// `true` if a workflow with this `(canonical_name, generation)` was
     /// already present and the call short-circuited.
     pub already_ingested: bool,
+    /// How `canonical_name`/`generation` above were arrived at:
+    /// `"new_root"` (slug lineage, generation 0 — the classic path),
+    /// `"existing_generation"` (a row in a matched lineage already carried
+    /// this exact goal text), or `"goal_drift"` (the goal paraphrases an
+    /// existing lineage and was added to it as a new generation).
+    /// A silent merge is the dangerous failure mode here; this field is what
+    /// makes it visible so a caller can correct course.
+    pub identity_resolution: &'static str,
+    /// The matched lineage's goal text when `identity_resolution` is
+    /// `"goal_drift"` — i.e. the goal this call was merged into.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_into_goal: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
