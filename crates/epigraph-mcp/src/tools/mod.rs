@@ -1,4 +1,5 @@
 pub mod alternative_sets;
+pub mod anchors;
 pub mod batch;
 pub mod blobs;
 pub mod cdst_maintenance;

@@ -501,6 +501,40 @@ pub struct VerifyManifestParams {
     pub prove_edge_id: Option<String>,
 }
 
+// ── External anchors ──
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AnchorManifestParams {
+    #[schemars(
+        description = "UUID of the manifest whose Merkle root to publish externally. Note that                        every sealed manifest is anchored automatically on export, so this tool                        is the RETRY path for a root whose first attempt hit an unconfigured or                        unreachable backend. It is idempotent: an already-anchored root returns                        its existing anchor and publishes nothing."
+    )]
+    pub manifest_id: String,
+}
+
+// There is deliberately no `retry_failed` flag. A failed attempt is excluded
+// from `uq_anchors_live_root`, so calling this tool on a root whose only anchor
+// failed already retries; a flag that changed nothing would be worse than no
+// flag at all.
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VerifyAnchorParams {
+    #[schemars(
+        description = "UUID of the anchored root — a manifest id for the default root_type."
+    )]
+    pub root_id: String,
+
+    #[schemars(
+        description = "Kind of root, defaulting to 'manifest'. 'checkpoint' is reserved by the                        schema for a future tree over many manifest roots and is not implemented;                        passing it is an error, never a silent skip."
+    )]
+    #[serde(default)]
+    pub root_type: Option<String>,
+}
+
+// Nor is there a `backend` override. Which ledger this process talks to is
+// process configuration (`EPIGRAPH_ANCHOR_BACKEND`), and the load-bearing check
+// — reading the commitment back out of the ledger — is impossible against a
+// backend this process is not configured to reach.
+
 // ── Memory ──
 
 #[derive(Debug, Deserialize, JsonSchema)]

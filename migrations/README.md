@@ -62,9 +62,11 @@ Current reservation:
   `entity_types` row that makes `claim -[derived_from]-> blob` edges legal)
 - **071**: public `manifests` + `manifest_entries` (signed Merkle commitment
   over a SET of claim/edge rows; backlog 6e2364b8)
-- **072+**: public next
+- **072**: public `anchors` + `anchor_mock_chain` (external anchoring of
+  manifest Merkle roots to a ledger outside this database; backlog 94e62824)
+- **073+**: public next
 
-Next public migration must be `072` or later. Picking a colliding version
+Next public migration must be `073` or later. Picking a colliding version
 (checksum mismatch on a `_sqlx_migrations` row that's already applied) will
 panic the api binary on restart.
 

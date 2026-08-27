@@ -1,7 +1,7 @@
 //! Extension point traits for the `EpiGraph` kernel.
 //!
-//! This crate defines the four interface boundaries that separate the open
-//! kernel from enterprise / private features:
+//! This crate defines the interface boundaries that separate the open kernel
+//! from enterprise / private features and swappable external services:
 //!
 //! | Trait | Kernel default | Enterprise / private implementation |
 //! |---|---|---|
@@ -9,6 +9,13 @@
 //! | [`PolicyGate`] | [`NoOpPolicyGate`] — allow all | RBAC/ABAC enforcement |
 //! | [`OrchestrationBackend`] | [`NoOpOrchestrationBackend`] — silent drop | Durable task queue |
 //! | [`LlmProvider`] | [`NoOpLlmProvider`] — error on use | Anthropic API, OpenAI, vLLM, private extensions, … |
+//! | [`AnchorBackend`] | `epigraph_db::anchor::MockAnchorBackend` — **no no-op exists** | Cardano metadata, Sigstore/Rekor, signed git tag |
+//!
+//! [`AnchorBackend`] deliberately breaks the house pattern: it ships NO
+//! `NoOpAnchorBackend`. A no-op that reported success while publishing nothing
+//! would be precisely the inert-feature failure external anchoring exists to
+//! remove, so the kernel default is a *mock ledger that does real work* — see
+//! [`anchor`] and `epigraph_db::anchor`.
 //!
 //! The kernel holds each as `Arc<dyn Trait>`, initialised to the no-op at
 //! startup. Enterprise / private deployments replace them at startup with
@@ -31,11 +38,16 @@
 //!   skip expensive metadata writes that would be meaningless without a real
 //!   backend.
 
+pub mod anchor;
 pub mod encryption;
 pub mod llm;
 pub mod orchestration;
 pub mod policy;
 
+pub use anchor::{
+    AnchorBackend, AnchorCommitment, AnchorError, AnchorReceipt, PublishedAnchor,
+    COMMITMENT_VERSION,
+};
 pub use encryption::{EncryptionError, EncryptionProvider, NoOpEncryptionProvider};
 pub use llm::{
     default_llm_provider, llm_provider_by_name, register_llm_provider, registered_llm_providers,

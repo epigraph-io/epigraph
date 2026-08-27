@@ -7,6 +7,7 @@ pub mod activity;
 pub mod agent;
 pub mod agent_key;
 pub mod analysis;
+pub mod anchor;
 pub mod authorization_code;
 pub mod authorize_session;
 pub mod behavioral_execution;
@@ -68,6 +69,9 @@ pub use activity::ActivityRepository;
 pub use agent::{AgentCapabilitiesRow, AgentIdentityRow, AgentRepository, CapabilityFilter};
 pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
+pub use anchor::{
+    AnchorRepository, AnchorRow, MockChainRepository, MockChainRow, NewAnchor, ROOT_TYPE_MANIFEST,
+};
 pub use blob::{BlobRepository, StoredBlob, ATTACH_RELATIONSHIP, BLOB_ENTITY_TYPE};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{

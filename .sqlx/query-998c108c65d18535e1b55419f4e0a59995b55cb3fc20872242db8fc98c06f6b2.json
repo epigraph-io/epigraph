@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE anchors\n            SET status = 'submitted', tx_id = $2, submitted_at = NOW(), failure_reason = NULL\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "998c108c65d18535e1b55419f4e0a59995b55cb3fc20872242db8fc98c06f6b2"
+}

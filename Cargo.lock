@@ -1381,7 +1381,9 @@ dependencies = [
  "epigraph-core",
  "epigraph-crypto",
  "epigraph-ds",
+ "epigraph-interfaces",
  "futures",
+ "hex",
  "serde",
  "serde_json",
  "sqlx",
@@ -1507,6 +1509,8 @@ name = "epigraph-interfaces"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "ciborium",
+ "hex",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

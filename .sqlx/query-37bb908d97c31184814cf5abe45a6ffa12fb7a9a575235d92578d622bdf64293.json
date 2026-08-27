@@ -1,0 +1,49 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO anchor_mock_chain (tx_id, metadata_label, metadata_cbor, block_height)\n            VALUES ($1, $2, $3, $4)\n            RETURNING tx_id, metadata_label, metadata_cbor, block_height, block_time\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tx_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "metadata_label",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "metadata_cbor",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "block_height",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "block_time",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Bytea",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "37bb908d97c31184814cf5abe45a6ffa12fb7a9a575235d92578d622bdf64293"
+}

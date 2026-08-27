@@ -51,6 +51,7 @@
 //! All migrations are in `/migrations/` and should be run with `sqlx migrate run`.
 
 pub mod access_control;
+pub mod anchor;
 pub mod errors;
 pub mod pool;
 pub mod repos;
@@ -59,32 +60,37 @@ pub mod repos;
 pub use access_control::{
     batch_check_content_access, check_content_access, ContentAccess, COARSE_EDGE_TYPES,
 };
+pub use anchor::{
+    anchor_manifest_best_effort, AnchorService, AnchorServiceError, AnchorVerdict,
+    AnchorVerification, MockAnchorBackend,
+};
 pub use errors::DbError;
 pub use pool::{create_pool, create_pool_from_options, create_pool_with_options};
 pub use repos::manifest::{ClaimLeafInput, EdgeLeafInput};
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentRepository, AnalysisRecord,
-    AnalysisRepository, BehavioralExecutionRepository, BehavioralExecutionRow, BlobRepository,
-    ChallengeRepository, ChallengeRow, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
-    ClaimEncryptionRepository, ClaimEncryptionRow, ClaimNeighbor, ClaimNeighborBetpRow,
-    ClaimRepository, ClaimSummary, ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository,
-    ClaimVersionRow, CommunityRepository, ConsolidateMode, ConsolidateResult, ContextRepository,
-    CounterfactualRepository, CounterfactualRow, DedupRepair, DivergenceRepository,
-    EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository, EmbeddingShareRepository,
-    EmbeddingShareRow, EntityRepository, EntityRow, EntityTypeEntry, EntityTypeRepository,
-    EpistemicEdgePairRow, EventRepository, EventRow, EvidenceEncryptionRepository,
-    EvidenceEncryptionRow, EvidenceRepository, EvidenceSearchResult, EvolveStepResult,
-    ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
-    FactorRepository, FrameRepository, GapAnalysisResult, GapChallengeRow, GapRecord,
-    GapRepository, GraphExpansionHit, GroupKeyEpochRepository, GroupMembershipRepository,
-    GroupRepository, GroupRow, HierarchicalWorkflowRow, HybridHit, IndexCounts, KeyEpochRow,
-    LearningEventRepository, LearningEventRow, LineageHead, LineageRepository, ManifestEntryRow,
-    ManifestRepository, ManifestRow, MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow,
-    MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes,
-    MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper,
-    MethodUsageExample, NearestClaimHit, NewManifest, NewManifestEntry, NewRecallEvent,
-    OAuthClientRepository, OAuthClientRow, OwnershipRepository, PaperRepository, PaperRow,
-    PatchClaimDiff, PatchClaimInput, PatternTemplateRepository, PatternTemplateRow,
+    AnalysisRepository, AnchorRepository, AnchorRow, BehavioralExecutionRepository,
+    BehavioralExecutionRow, BlobRepository, ChallengeRepository, ChallengeRow, ClaimBeliefColumns,
+    ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow, ClaimNeighbor,
+    ClaimNeighborBetpRow, ClaimRepository, ClaimSummary, ClaimThemeRepository, ClaimThemeRow,
+    ClaimVersionRepository, ClaimVersionRow, CommunityRepository, ConsolidateMode,
+    ConsolidateResult, ContextRepository, CounterfactualRepository, CounterfactualRow, DedupRepair,
+    DivergenceRepository, EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository,
+    EmbeddingShareRepository, EmbeddingShareRow, EntityRepository, EntityRow, EntityTypeEntry,
+    EntityTypeRepository, EpistemicEdgePairRow, EventRepository, EventRow,
+    EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceRepository, EvidenceSearchResult,
+    EvolveStepResult, ExperimentRepository, ExperimentResultRepository, ExperimentResultRow,
+    ExperimentRow, FactorRepository, FrameRepository, GapAnalysisResult, GapChallengeRow,
+    GapRecord, GapRepository, GraphExpansionHit, GroupKeyEpochRepository,
+    GroupMembershipRepository, GroupRepository, GroupRow, HierarchicalWorkflowRow, HybridHit,
+    IndexCounts, KeyEpochRow, LearningEventRepository, LearningEventRow, LineageHead,
+    LineageRepository, ManifestEntryRow, ManifestRepository, ManifestRow, MassFunctionRepository,
+    MatchCandidateRepo, MatchCandidateRow, MembershipRow, MentionRow, MethodCapability,
+    MethodEvidenceStrength, MethodFailureModes, MethodForCapability, MethodRecord,
+    MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
+    MockChainRepository, MockChainRow, NearestClaimHit, NewAnchor, NewManifest, NewManifestEntry,
+    NewRecallEvent, OAuthClientRepository, OAuthClientRow, OwnershipRepository, PaperRepository,
+    PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository, PatternTemplateRow,
     PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge,
     ProvenanceLogRow, ProvenanceNode, ProvenanceRepository, ReEncryptionKeyRepository,
     ReEncryptionKeyRow, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
@@ -93,6 +99,7 @@ pub use repos::{
     TaskRepository, TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository,
     WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
     WorkflowRepository, EXPANSION_RELATIONSHIPS, MANIFEST_ALGO, PRUNABLE_EVENT_TYPES,
+    ROOT_TYPE_MANIFEST,
 };
 
 // Re-export sqlx types that users will need

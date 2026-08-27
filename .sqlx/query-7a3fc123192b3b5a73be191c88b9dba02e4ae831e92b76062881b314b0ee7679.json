@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT nextval('anchor_mock_chain_height_seq') AS \"height!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "height!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "7a3fc123192b3b5a73be191c88b9dba02e4ae831e92b76062881b314b0ee7679"
+}

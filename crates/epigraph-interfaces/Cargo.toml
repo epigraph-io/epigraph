@@ -11,9 +11,11 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
+ciborium = { workspace = true }  # Deterministic CBOR for AnchorCommitment
 
 [dev-dependencies]
 tokio = { workspace = true }  # For #[tokio::test] in inline unit tests
+hex = { workspace = true }  # Golden vector for the anchor commitment wire format
 
 [lints]
 workspace = true

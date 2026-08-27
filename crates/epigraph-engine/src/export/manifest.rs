@@ -17,6 +17,23 @@
 //! * [`verify_manifest`] — re-read every committed row, recompute its leaf, and
 //!   report seven independent checks (plus an optional inclusion proof).
 //!
+//! # The seal is externally anchored, unconditionally
+//!
+//! Immediately after [`anchor_manifest`]'s transaction commits it calls
+//! `epigraph_db::anchor::anchor_manifest_best_effort`, which publishes the root
+//! as a commitment to a ledger outside this database (backlog 94e62824). The
+//! hook sits HERE rather than at each caller because this is the single write
+//! path that produces a sealed root — the MCP tool and the `export_provenance`
+//! CLI both funnel through it, and a hook per caller would leave whichever one
+//! was forgotten producing un-anchored manifests. There is no
+//! `EPIGRAPH_ANCHOR_ENABLED`: the only knob is which backend, defaulting to the
+//! mock ledger, so the default path is the anchoring path.
+//!
+//! It is BEST-EFFORT and post-commit, matching CLAUDE.md's embedding contract
+//! verbatim — a warning and a `status = 'failed'` anchor row, never a failed or
+//! delayed seal. An unconfigured or unreachable chain must not be able to stop
+//! the graph from recording an export.
+//!
 //! # Why the checks are reported separately
 //!
 //! The failure modes are genuinely different and a boolean would destroy the
@@ -525,6 +542,12 @@ pub async fn anchor_manifest(
         },
     )
     .await?;
+
+    // --- Publish the root outside this database -----------------------------
+    //
+    // Post-commit and best-effort, exactly like the embedding write paths: this
+    // never returns an error and never blocks the seal. See the module docs.
+    epigraph_db::anchor::anchor_manifest_best_effort(pool, manifest_id).await;
 
     let entries = ordered
         .iter()

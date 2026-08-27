@@ -66,9 +66,11 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("suggest_alternative_sets", "claims:read"),
     ("system_stats", "claims:read"),
     ("traverse", "claims:read"),
+    ("verify_anchor", "claims:read"),
     ("verify_manifest", "claims:read"),
     // ─── claims:write ──────────────────────────────────────────────────
     ("add_step", "claims:write"),
+    ("anchor_manifest", "claims:write"),
     ("assign_ownership", "claims:write"),
     ("attach_blob", "claims:write"),
     ("backfill_embeddings", "claims:write"),

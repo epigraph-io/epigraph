@@ -720,6 +720,29 @@ impl EpiGraphMcpFull {
         tools::manifest::verify_manifest(self, params).await
     }
 
+    // ── External anchors (2 tools) ──
+
+    #[tool(
+        description = "Publish a manifest's Merkle root as a commitment held OUTSIDE this                        database, so a later verifier can detect after-the-fact edits without                        trusting the operator. You rarely need to call this: every sealed                        manifest is anchored automatically the moment it is exported, with no                        flag and no configuration. This is the RETRY path for a root whose first                        attempt met an unconfigured or unreachable backend. Idempotent — an                        already-anchored root returns its existing anchor and publishes nothing,                        because two live commitments over one root would let an operator present                        whichever suited them. READ trust_basis in the result: 'operator-held'                        means the default mock ledger, which lives in this same Postgres and                        therefore proves the mechanism and NOT third-party existence-at-a-time."
+    )]
+    async fn anchor_manifest(
+        &self,
+        Parameters(params): Parameters<AnchorManifestParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::anchors::anchor_manifest(self, params).await
+    }
+
+    #[tool(
+        description = "Re-verify an anchored Merkle root against the ledger's own copy of the                        published bytes AND against the live graph. Verdicts, ordered                        cheapest-and-most-damning first: 'missing' (never anchored),                        'commitment_tampered' (the stored payload does not hash to its digest, or                        its decoded contents disagree with the row's columns — this is what                        catches an operator who edits root_hash alone), 'unconfirmed',                        'ledger_missing' (the ledger has no such transaction), 'ledger_mismatch'                        (the two stores disagree — the case anchoring exists for),                        'root_unresolvable', 'drift' (the root re-derives to a DIFFERENT value;                        both hex roots are returned and NOT judged, since benign label churn and                        an edit look the same from here), or 'verified'. Verification never                        trusts anchors.root_hash on its own — it re-derives the root from the                        published bytes. trust_basis says whether the ledger is the operator's                        own ('operator-held') or a third party's."
+    )]
+    async fn verify_anchor(
+        &self,
+        Parameters(params): Parameters<VerifyAnchorParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::anchors::verify_anchor(self, params).await
+    }
+
     // ── Memory (2 tools) ──
 
     #[tool(

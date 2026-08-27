@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE anchors\n            SET status = 'confirmed', tx_id = $2, block_height = $3, block_time = $4,\n                confirmed_at = NOW(), failure_reason = NULL\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "91aedfc1f5fb5d766f26f00d2b8797092695d98579837729a28246eca945b43f"
+}

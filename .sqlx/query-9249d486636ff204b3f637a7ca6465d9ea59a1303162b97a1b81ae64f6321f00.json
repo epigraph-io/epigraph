@@ -1,0 +1,127 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, root_type, root_id, root_hash, commitment_version,\n                   commitment_hash, commitment_bytes, backend, network, status,\n                   tx_id, block_height, block_time, sealed_at, submitted_at,\n                   confirmed_at, failure_reason, created_at\n            FROM anchors\n            WHERE root_type = $1 AND root_id = $2 AND backend = $3 AND network = $4\n              AND status <> 'failed'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "root_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "root_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "root_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 4,
+        "name": "commitment_version",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 5,
+        "name": "commitment_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 6,
+        "name": "commitment_bytes",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 7,
+        "name": "backend",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "network",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "tx_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "block_height",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 12,
+        "name": "block_time",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "sealed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "submitted_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "confirmed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "failure_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 17,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "9249d486636ff204b3f637a7ca6465d9ea59a1303162b97a1b81ae64f6321f00"
+}

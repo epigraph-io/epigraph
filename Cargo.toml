@@ -36,6 +36,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = "3"
 toml = "0.8"
+# Deterministic CBOR for external-anchor commitments (RFC 8949 4.2.1). Already
+# in Cargo.lock transitively via criterion; promoted to a direct dependency so
+# epigraph-interfaces can build the commitment `Value::Map` by hand.
+ciborium = "0.2"
 
 # Identifiers
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
