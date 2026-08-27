@@ -20,13 +20,15 @@ pub mod epoch;
 pub mod errors;
 pub mod hasher;
 pub mod key_exchange;
+pub mod merkle;
 pub mod proxy_re;
 pub mod signer;
 pub mod verifier;
 
 pub use canonical::{to_canonical_bytes, to_canonical_json, Canonical};
 pub use did_key::{
-    did_key_for_llm_agent, keypair_from_llm_agent, keypair_from_llm_agent_prehashed, DidKey,
+    did_key_for_llm_agent, keypair_from_llm_agent, keypair_from_llm_agent_prehashed,
+    keypair_from_service, DidKey,
 };
 pub use encryption::{decrypt, encrypt, EncryptedPayload};
 pub use epoch::derive_epoch_key;
@@ -35,6 +37,10 @@ pub use hasher::ContentHasher;
 pub use key_exchange::{
     ecdh_shared_secret, ed25519_to_x25519_public, ed25519_to_x25519_secret, unwrap_group_key,
     wrap_group_key,
+};
+pub use merkle::{
+    canonical_order, claim_leaf, edge_leaf, inclusion_proof, merkle_root, verify_inclusion,
+    ManifestLeaf, ManifestRowKind, MerkleError, ProofStep, MANIFEST_DOMAIN,
 };
 pub use signer::AgentSigner;
 pub use verifier::SignatureVerifier;

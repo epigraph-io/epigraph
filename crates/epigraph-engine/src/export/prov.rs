@@ -1,6 +1,21 @@
 //! PROV-O export mapping: internal edge relationship names to
 //! `http://www.w3.org/ns/prov#` predicates, applied **only** at
-//! serialization time. Nothing here writes to the database.
+//! serialization time — no `edges.relationship` value is ever rewritten.
+//!
+//! # This module DOES write to the database
+//!
+//! It did not, until manifests landed (backlog 6e2364b8). Every export now
+//! anchors a signed Merkle manifest over exactly the claim ids and edge ids it
+//! emitted, which inserts one `manifests` row and one `manifest_entries` row
+//! per committed row. There is no `--manifest` flag and no
+//! `enable_manifests` setting: a subgraph export whose recipient must simply
+//! trust that nothing was dropped is precisely the failure this exists to
+//! remove, and a feature that ships behind an off-by-default switch is off
+//! everywhere that matters. An anchored export is a RECORDED export.
+//!
+//! The consequence is real and deliberate: `export_provenance_prov_o` is no
+//! longer callable against a read-only connection, and an operator scripting it
+//! in a loop grows the manifest tables.
 //!
 //! # Why PROV-O over RO-Crate
 //!
@@ -38,6 +53,23 @@
 //! Entity-Activity-Agent triples. Adding `reasoning_traces` as `prov:Activity`
 //! nodes (as `get_provenance` already does) is a natural follow-up once
 //! there's a concrete consumer that needs the activity-level detail.
+
+use crate::export::manifest::{anchor_manifest, ManifestError};
+
+/// The result of a PROV-O export: the JSON-LD document (with its `manifest`
+/// block already spliced in) plus the exact id sets the manifest commits to.
+///
+/// The id sets are returned rather than left implicit so a caller can assert
+/// what was committed without re-parsing the document, and so a second anchor
+/// over the same set is reproducible.
+#[derive(Debug, Clone)]
+pub struct ProvExport {
+    pub document: serde_json::Value,
+    /// Claims actually emitted as `prov:Entity` nodes.
+    pub claim_ids: Vec<uuid::Uuid>,
+    /// Edges that actually produced a `prov:Relation` — NOT every edge visited.
+    pub edge_ids: Vec<uuid::Uuid>,
+}
 
 /// Map an internal `edges.relationship` value to its PROV-O predicate,
 /// for use in exported JSON-LD only. Returns `None` for relationship types
@@ -102,11 +134,21 @@ fn prov_relation_endpoints(
 /// supersede a claim already reached via a supersedes edge) are a follow-up;
 /// see the module's PR description.
 ///
-/// This is **read-only**: it issues only `SELECT`s (via
-/// `LineageRepository`, `EdgeRepository`, `ClaimRepository`,
-/// `AgentRepository`) and never writes to `edges` or `claims`. Internal
-/// relationship strings in the DB are left exactly as they are; the PROV-O
-/// predicate only ever appears in the returned JSON value.
+/// Internal relationship strings in the DB are left exactly as they are; the
+/// PROV-O predicate only ever appears in the returned JSON value, and nothing
+/// in `claims` or `edges` is modified.
+///
+/// It is NOT read-only, however: before returning, the emitted set is anchored
+/// as a signed Merkle manifest (see [`crate::export::manifest`]), which inserts
+/// a `manifests` row and its `manifest_entries`. The resulting bundle is
+/// spliced into the returned document under `manifest`, and the committed id
+/// sets come back on [`ProvExport`] so callers do not have to re-derive them.
+///
+/// The committed sets are the EMITTED ones, not the enumerated ones: a claim
+/// whose `get_by_id` returned `None` (deleted mid-export) is skipped and is not
+/// committed to, and only edges that actually produced a relation are
+/// committed. Anchoring a row the document does not contain would be a false
+/// commitment.
 ///
 /// Works for any claim's provenance — there is no filter on evidence type
 /// or claim label. Computational-model claims (marked by
@@ -114,12 +156,18 @@ fn prov_relation_endpoints(
 /// the exporter does not special-case them.
 ///
 /// # Errors
-/// Returns [`epigraph_db::DbError`] if any underlying repository call fails.
+/// Returns [`ManifestError`] if any underlying repository call fails or if the
+/// manifest cannot be anchored — including [`ManifestError::UnknownRow`] when a
+/// committed row was deleted between assembly and anchoring. That last case
+/// converts what used to be a silently partial document into a hard failure,
+/// which is the intended trade.
 pub async fn export_provenance_prov_o(
     pool: &epigraph_db::PgPool,
     root_claim_id: uuid::Uuid,
     max_depth: Option<i32>,
-) -> Result<serde_json::Value, epigraph_db::DbError> {
+    signer: &epigraph_crypto::AgentSigner,
+    signer_agent_id: uuid::Uuid,
+) -> Result<ProvExport, ManifestError> {
     use epigraph_core::domain::ids::{AgentId, ClaimId};
     use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, LineageRepository};
 
@@ -163,12 +211,19 @@ pub async fn export_provenance_prov_o(
     let mut agent_entities = Vec::new();
     let mut relations = Vec::new();
     let mut edges_seen = std::collections::HashSet::new();
+    // The manifest commits to what was EMITTED, not to what was enumerated.
+    // `claim_ids` is the candidate set; a claim whose `get_by_id` returns None
+    // hits the `continue` below and never becomes an entity, so committing to
+    // it would be a false claim about the document's contents.
+    let mut emitted_claim_ids = Vec::new();
+    let mut emitted_edge_ids = Vec::new();
 
     for &claim_id in &claim_ids {
         let Some(claim) = ClaimRepository::get_by_id(pool, ClaimId::from_uuid(claim_id)).await?
         else {
             continue;
         };
+        emitted_claim_ids.push(claim_id);
 
         entities.push(serde_json::json!({
             "@id": format!("claim:{claim_id}"),
@@ -231,16 +286,42 @@ pub async fn export_provenance_prov_o(
                 "predicate": predicate,
                 "source_relationship": edge.relationship,
             }));
+            // Only here — `edges_seen` also holds every edge that hit one of
+            // the three `continue`s above and produced no relation at all.
+            emitted_edge_ids.push(edge.id);
         }
     }
 
-    Ok(serde_json::json!({
+    // --- Pass 3: anchor a signed commitment over exactly what was emitted ---
+
+    let anchored = anchor_manifest(
+        pool,
+        signer,
+        signer_agent_id,
+        serde_json::json!({
+            "kind": "provenance_export",
+            "root_claim_id": root_claim_id,
+            "max_depth": max_depth,
+        }),
+        &emitted_claim_ids,
+        &emitted_edge_ids,
+    )
+    .await?;
+
+    let document = serde_json::json!({
         "@context": "https://www.w3.org/ns/prov#",
         "root_claim": format!("claim:{root_claim_id}"),
         "entities": entities,
         "agents": agent_entities,
         "relations": relations,
-    }))
+        "manifest": anchored.to_json(),
+    });
+
+    Ok(ProvExport {
+        document,
+        claim_ids: emitted_claim_ids,
+        edge_ids: emitted_edge_ids,
+    })
 }
 
 #[cfg(test)]

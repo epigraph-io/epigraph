@@ -182,6 +182,27 @@ pub fn keypair_from_llm_agent_prehashed(model_id: &str, prompt_hash_hex: &str) -
     keypair_from_seed(&seed_input)
 }
 
+/// Derive a deterministic Ed25519 keypair for a **system service** — a
+/// non-human, non-LLM tool that needs a stable signing identity without any
+/// required configuration (an exporter CLI, a scheduled job, a migration
+/// runner).
+///
+/// The seed is `"service:{service_id.trim()}"`, a namespace of its own. Neither
+/// existing derivation fits: [`keypair_from_llm_agent`]'s seed is
+/// `"llm-agent:{model}:{prompt_hash}"` and would falsely attribute a service to
+/// a model, while [`keypair_from_name`] normalizes its input as a *human author
+/// name* (lowercased, non-`[a-z0-9_-]` stripped), silently collapsing
+/// distinct service ids.
+///
+/// Every process that names the same service lands on the same public key, and
+/// therefore on the same `agents` row via
+/// `AgentRepository::get_by_public_key`.
+#[must_use]
+pub fn keypair_from_service(service_id: &str) -> AgentSigner {
+    let service_id = service_id.trim();
+    keypair_from_seed(&format!("service:{service_id}"))
+}
+
 /// Generate a `did:key` for an LLM-driven agent.
 ///
 /// Same `(model_id, system_prompt)` inputs produce the same DID across
@@ -432,6 +453,27 @@ mod tests {
             misused.public_key(),
             "raw prompt fed to _prehashed must NOT collide with the hashed path"
         );
+    }
+
+    #[test]
+    fn service_derivation_is_deterministic_and_namespaced() {
+        let a = keypair_from_service("epigraph-export-provenance");
+        let b = keypair_from_service("  epigraph-export-provenance  ");
+        assert_eq!(
+            a.public_key(),
+            b.public_key(),
+            "service ids are trimmed, so a stray space cannot fork the identity"
+        );
+
+        let other = keypair_from_service("epigraph-something-else");
+        assert_ne!(a.public_key(), other.public_key());
+
+        // The `service:` namespace must not collide with the author-name or
+        // LLM-agent namespaces for the same string.
+        let as_name = keypair_from_name("epigraph-export-provenance");
+        assert_ne!(a.public_key(), as_name.public_key());
+        let as_llm = keypair_from_llm_agent("epigraph-export-provenance", "");
+        assert_ne!(a.public_key(), as_llm.public_key());
     }
 
     #[test]

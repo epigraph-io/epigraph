@@ -1,0 +1,78 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT m.id, m.algo, m.root, m.entry_count, m.subject, m.signed_header,\n                   m.signature, m.signer_id, m.signer_public_key, m.created_at\n            FROM manifests m\n            JOIN manifest_entries e ON e.manifest_id = m.id\n            WHERE e.row_kind = $1 AND e.row_id = $2\n            ORDER BY m.created_at DESC\n            LIMIT $3\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "algo",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "root",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "entry_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "subject",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "signed_header",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 6,
+        "name": "signature",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 7,
+        "name": "signer_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "signer_public_key",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "f71744e43432246c1cc10b1f85bb9abadd358329440f9c82b0d0a3cf0d6bcf59"
+}

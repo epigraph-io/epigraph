@@ -461,6 +461,46 @@ pub struct AttachBlobParams {
     pub properties: serde_json::Value,
 }
 
+// ── Manifests ──
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExportSubgraphManifestParams {
+    #[schemars(
+        description = "Root claim UUID whose provenance subgraph to export. The export walks \
+                       derived_from-family ancestry plus one hop of supersedes predecessors, \
+                       exactly as get_provenance does."
+    )]
+    pub root_claim_id: String,
+
+    #[schemars(
+        description = "Maximum ancestor traversal depth (repository default 100 when omitted). \
+                       Recorded inside the manifest's signed subject, so a narrow export cannot \
+                       later be presented as a broad one."
+    )]
+    #[serde(default)]
+    pub max_depth: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VerifyManifestParams {
+    #[schemars(description = "UUID of the manifest to verify.")]
+    pub manifest_id: String,
+
+    #[schemars(
+        description = "Optional claim UUID to additionally return an RFC 6962 inclusion proof \
+                       for. Mutually exclusive with prove_edge_id."
+    )]
+    #[serde(default)]
+    pub prove_claim_id: Option<String>,
+
+    #[schemars(
+        description = "Optional edge UUID to additionally return an RFC 6962 inclusion proof \
+                       for. Mutually exclusive with prove_claim_id."
+    )]
+    #[serde(default)]
+    pub prove_edge_id: Option<String>,
+}
+
 // ── Memory ──
 
 #[derive(Debug, Deserialize, JsonSchema)]

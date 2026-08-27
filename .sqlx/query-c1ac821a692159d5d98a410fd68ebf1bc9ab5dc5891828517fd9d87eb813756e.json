@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, algo, root, entry_count, subject, signed_header,\n                   signature, signer_id, signer_public_key, created_at\n            FROM manifests\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "algo",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "root",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "entry_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "subject",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "signed_header",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 6,
+        "name": "signature",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 7,
+        "name": "signer_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "signer_public_key",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "c1ac821a692159d5d98a410fd68ebf1bc9ab5dc5891828517fd9d87eb813756e"
+}

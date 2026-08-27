@@ -673,6 +673,53 @@ impl EpiGraphMcpFull {
         tools::blobs::attach_blob(self, params).await
     }
 
+    // ── Manifests (2 tools) ──
+
+    #[tool(
+        description = "Export a claim's provenance subgraph as PROV-O JSON-LD, anchored by an \
+                       Ed25519-signed Merkle manifest over exactly the rows the document \
+                       contains. Per-row signatures prove authorship but say nothing about the \
+                       BOUNDARY of a set — an exporter can drop inconvenient rows and every \
+                       survivor still verifies. The manifest closes that: dropping, adding, or \
+                       substituting any row changes the root, and the returned bundle carries \
+                       every leaf's material, the signed header, and the signature, so a \
+                       recipient with no access to this instance can recompute the root and \
+                       verify it off-platform. LIMIT, stated plainly: an edge leaf binds \
+                       (id, relationship, created_at) and NOT its endpoints, because dedup \
+                       re-sourcing legitimately rewrites source_id/target_id — omission and \
+                       substitution of edges are caught, silent re-pointing of a surviving edge \
+                       is not. Anchoring fails closed: if any emitted row cannot be re-read the \
+                       whole export errors rather than committing to a partial set."
+    )]
+    async fn export_subgraph_manifest(
+        &self,
+        Parameters(params): Parameters<ExportSubgraphManifestParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::manifest::export_subgraph_manifest(self, params).await
+    }
+
+    #[tool(
+        description = "Re-verify a stored Merkle manifest against the live graph. Reports SEVEN \
+                       checks separately rather than one boolean, because the failure modes \
+                       differ: per-entry status (ok | mismatch | missing), stored_root_intact \
+                       (the stored leaves still fold to the root — catches manifest_entries \
+                       tampering), live_root_matches (leaves recomputed from the live rows), \
+                       entry_count_matches (catches a deleted entry row), header_consistent \
+                       (the signed header agrees with the id/root/entry_count/created_at/signer \
+                       columns), signature_valid, and signer_key_current. A legitimately deleted \
+                       claim gives missing + live_root_matches=false while signature_valid stays \
+                       true; a rewritten manifests column gives header_consistent=false. Pass \
+                       prove_claim_id or prove_edge_id for an RFC 6962 inclusion proof of one \
+                       committed row against the root."
+    )]
+    async fn verify_manifest(
+        &self,
+        Parameters(params): Parameters<VerifyManifestParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::manifest::verify_manifest(self, params).await
+    }
+
     // ── Memory (2 tools) ──
 
     #[tool(

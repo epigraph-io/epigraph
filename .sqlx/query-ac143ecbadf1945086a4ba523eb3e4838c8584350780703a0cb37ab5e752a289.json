@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT manifest_id, position, row_kind, row_id, leaf_hash\n            FROM manifest_entries\n            WHERE manifest_id = $1\n            ORDER BY position\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "manifest_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "position",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "row_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "row_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "leaf_hash",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ac143ecbadf1945086a4ba523eb3e4838c8584350780703a0cb37ab5e752a289"
+}

@@ -61,6 +61,7 @@ pub use access_control::{
 };
 pub use errors::DbError;
 pub use pool::{create_pool, create_pool_from_options, create_pool_with_options};
+pub use repos::manifest::{ClaimLeafInput, EdgeLeafInput};
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentRepository, AnalysisRecord,
     AnalysisRepository, BehavioralExecutionRepository, BehavioralExecutionRow, BlobRepository,
@@ -77,20 +78,21 @@ pub use repos::{
     FactorRepository, FrameRepository, GapAnalysisResult, GapChallengeRow, GapRecord,
     GapRepository, GraphExpansionHit, GroupKeyEpochRepository, GroupMembershipRepository,
     GroupRepository, GroupRow, HierarchicalWorkflowRow, HybridHit, IndexCounts, KeyEpochRow,
-    LearningEventRepository, LearningEventRow, LineageHead, LineageRepository,
-    MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow, MembershipRow, MentionRow,
-    MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
-    MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
-    NearestClaimHit, NewRecallEvent, OAuthClientRepository, OAuthClientRow, OwnershipRepository,
-    PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository,
-    PatternTemplateRow, PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository,
-    ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
-    ReEncryptionKeyRepository, ReEncryptionKeyRow, ReasoningTraceRepository, RecallEventRepository,
-    RecallEventRow, RefreshTokenRepository, RefreshTokenRow, ResolvedStep, ScopedBeliefRepository,
+    LearningEventRepository, LearningEventRow, LineageHead, LineageRepository, ManifestEntryRow,
+    ManifestRepository, ManifestRow, MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow,
+    MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes,
+    MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper,
+    MethodUsageExample, NearestClaimHit, NewManifest, NewManifestEntry, NewRecallEvent,
+    OAuthClientRepository, OAuthClientRow, OwnershipRepository, PaperRepository, PaperRow,
+    PatchClaimDiff, PatchClaimInput, PatternTemplateRepository, PatternTemplateRow,
+    PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge,
+    ProvenanceLogRow, ProvenanceNode, ProvenanceRepository, ReEncryptionKeyRepository,
+    ReEncryptionKeyRow, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
+    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, ScopedBeliefRepository,
     SecurityEventRepository, SecurityEventRow, SheafRepository, StoredBlob, SweepCandidate,
     TaskRepository, TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository,
     WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
-    WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    WorkflowRepository, EXPANSION_RELATIONSHIPS, MANIFEST_ALGO, PRUNABLE_EVENT_TYPES,
 };
 
 // Re-export sqlx types that users will need

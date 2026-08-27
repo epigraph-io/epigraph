@@ -60,9 +60,11 @@ Current reservation:
   the same number. Do not backfill them.
 - **070**: public `blobs` (content-addressed blob storage + the `blob`
   `entity_types` row that makes `claim -[derived_from]-> blob` edges legal)
-- **071+**: public next
+- **071**: public `manifests` + `manifest_entries` (signed Merkle commitment
+  over a SET of claim/edge rows; backlog 6e2364b8)
+- **072+**: public next
 
-Next public migration must be `071` or later. Picking a colliding version
+Next public migration must be `072` or later. Picking a colliding version
 (checksum mismatch on a `_sqlx_migrations` row that's already applied) will
 panic the api binary on restart.
 

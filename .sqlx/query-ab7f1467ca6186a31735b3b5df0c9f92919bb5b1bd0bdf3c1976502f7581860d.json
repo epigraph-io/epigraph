@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO manifest_entries (manifest_id, position, row_kind, row_id, leaf_hash)\n            SELECT $1, p, k, r, l\n            FROM UNNEST($2::int[], $3::text[], $4::uuid[], $5::bytea[]) AS t(p, k, r, l)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4Array",
+        "TextArray",
+        "UuidArray",
+        "ByteaArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ab7f1467ca6186a31735b3b5df0c9f92919bb5b1bd0bdf3c1976502f7581860d"
+}

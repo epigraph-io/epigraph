@@ -37,6 +37,7 @@ pub mod group_key_epoch;
 pub mod group_membership;
 pub mod learning_event;
 pub mod lineage;
+pub mod manifest;
 pub mod mass_function;
 pub mod match_candidate;
 pub mod method;
@@ -97,6 +98,10 @@ pub use frame::FrameRepository;
 pub use gap::{GapAnalysisResult, GapRecord, GapRepository};
 pub use learning_event::{LearningEventRepository, LearningEventRow};
 pub use lineage::LineageRepository;
+pub use manifest::{
+    ClaimLeafInput, EdgeLeafInput, ManifestEntryRow, ManifestRepository, ManifestRow, NewManifest,
+    NewManifestEntry, MANIFEST_ALGO,
+};
 pub use mass_function::MassFunctionRepository;
 pub use match_candidate::{MatchCandidateRepo, MatchCandidateRow};
 pub use method::{

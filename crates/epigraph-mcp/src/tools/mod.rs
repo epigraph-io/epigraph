@@ -17,6 +17,7 @@ pub mod lens;
 pub mod link_alternative;
 pub mod link_epistemic;
 pub mod link_hierarchical;
+pub mod manifest;
 pub mod matching;
 pub mod memory;
 pub mod novelty_gate;

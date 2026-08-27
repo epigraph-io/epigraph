@@ -23,6 +23,7 @@
 //! `target_id` bound to the claim being superseded). The fixture mirrors
 //! real data rather than the more "natural"-looking old-to-new direction.
 
+use epigraph_crypto::AgentSigner;
 use epigraph_engine::export::prov::export_provenance_prov_o;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -108,9 +109,14 @@ async fn export_maps_predicates_and_leaves_edges_relationship_column_unchanged()
     // target = superseded claim.
     let supersedes_edge_id = insert_edge(&pool, child_claim, prior_claim, "supersedes").await;
 
-    let document = export_provenance_prov_o(&pool, child_claim, Some(5))
+    // The exporter now takes a signer and ALWAYS anchors — there is no
+    // `--manifest` flag and no `enable_manifests` setting, so this
+    // pre-existing test observes the manifest unconditionally.
+    let signer = AgentSigner::from_bytes(&[0x11; 32]).expect("signer");
+    let export = export_provenance_prov_o(&pool, child_claim, Some(5), &signer, agent)
         .await
         .expect("export should succeed");
+    let document = &export.document;
 
     // All three claims — root (ancestor), child (root of the export), and
     // prior (reached only via the one-hop supersedes expansion) — must be
@@ -182,4 +188,36 @@ async fn export_maps_predicates_and_leaves_edges_relationship_column_unchanged()
         .await
         .expect("fetch supersedes edge");
     assert_eq!(supersedes_row.0, "supersedes");
+
+    // The manifest is not opt-in: every export carries one, over exactly the
+    // rows the document emitted.
+    let root_hex = document["manifest"]["root"]
+        .as_str()
+        .expect("every export carries a manifest root");
+    assert_eq!(root_hex.len(), 64, "BLAKE3 root as hex");
+    assert!(
+        root_hex
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "the root must be LOWERCASE hex, got {root_hex}"
+    );
+    assert_eq!(
+        document["manifest"]["entry_count"].as_u64().unwrap() as usize,
+        export.claim_ids.len() + export.edge_ids.len(),
+        "the manifest commits to exactly the emitted claims and edges"
+    );
+    assert!(export.claim_ids.contains(&child_claim));
+    assert!(export.edge_ids.contains(&derives_edge_id));
+    assert!(export.edge_ids.contains(&supersedes_edge_id));
+
+    let manifest_id = document["manifest"]["manifest_id"].as_str().unwrap();
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE id = $1::uuid")
+        .bind(manifest_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count manifest row");
+    assert_eq!(
+        stored, 1,
+        "the exporter is no longer read-only — it records"
+    );
 }
