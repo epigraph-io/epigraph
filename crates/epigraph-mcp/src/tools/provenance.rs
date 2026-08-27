@@ -61,7 +61,12 @@ struct CappedBundle {
 /// Within each category the sort is total and deterministic — claims by
 /// `(depth, id)` so the root and its nearest ancestors survive the cut, evidence
 /// and traces by `(claim_id, id)` — because `HashMap` iteration order is not.
-fn build_capped_bundle(lineage: &LineageResult, max_nodes: usize) -> CappedBundle {
+///
+/// `max_depth` is the bound the walk itself ran under. It drops no entity here —
+/// `lineage` arrives already cut — but it is needed to report truncation: a
+/// depth-cut walk has `included == total` in every category, so the node-count
+/// comparisons alone would call a partial graph closed.
+fn build_capped_bundle(lineage: &LineageResult, max_nodes: usize, max_depth: i32) -> CappedBundle {
     let mut sorted_claims: Vec<_> = lineage.claims.values().collect();
     sorted_claims.sort_by_key(|c| (c.depth, c.id));
     let kept_claims = &sorted_claims[..max_nodes.min(sorted_claims.len())];
@@ -142,9 +147,13 @@ fn build_capped_bundle(lineage: &LineageResult, max_nodes: usize) -> CappedBundl
         evidence_included: kept_evidence.len(),
         traces_total,
         traces_included: kept_traces.len(),
+        // A walk stopped by the depth bound is also a partial answer, even when
+        // every entity it did reach fits the node budget. Matches
+        // `epigraph-api`'s `routes/lineage.rs` and `provenance_chain.rs`.
         truncated: kept_claims.len() < claims_total
             || kept_evidence.len() < evidence_total
-            || kept_traces.len() < traces_total,
+            || kept_traces.len() < traces_total
+            || lineage.max_depth_reached >= max_depth,
     }
 }
 
@@ -161,7 +170,7 @@ pub async fn get_provenance(
         .map_err(internal_error)?;
 
     // Build W3C PROV-O style JSON-LD, bounded by the node budget.
-    let bundle = build_capped_bundle(&lineage, max_nodes);
+    let bundle = build_capped_bundle(&lineage, max_nodes, max_depth);
 
     let prov_bundle = serde_json::json!({
         "@context": "https://www.w3.org/ns/prov#",
@@ -272,7 +281,7 @@ mod tests {
             vec![trace(id(20), id(1))],
         );
 
-        let bundle = build_capped_bundle(&lr, 500);
+        let bundle = build_capped_bundle(&lr, 500, MAX_MAX_DEPTH);
 
         assert_eq!(bundle.entities.len(), 6);
         assert!(!bundle.truncated);
@@ -289,7 +298,7 @@ mod tests {
             .collect();
         let lr = lineage(claims, vec![], vec![]);
 
-        let bundle = build_capped_bundle(&lr, 3);
+        let bundle = build_capped_bundle(&lr, 3, MAX_MAX_DEPTH);
 
         assert_eq!(bundle.entities.len(), 3);
         assert_eq!(
@@ -313,7 +322,7 @@ mod tests {
             (0..4).map(|n| trace(id(20 + n), id(1))).collect(),
         );
 
-        let bundle = build_capped_bundle(&lr, 3);
+        let bundle = build_capped_bundle(&lr, 3, MAX_MAX_DEPTH);
 
         assert_eq!(bundle.claims_included, 2);
         assert_eq!(bundle.evidence_included, 1);
@@ -337,7 +346,7 @@ mod tests {
         // belt-and-braces half of that invariant; this test pins the invariant
         // itself, so a later refactor that hands leftover budget to evidence
         // cannot start emitting evidence orphaned from its claim.
-        let bundle = build_capped_bundle(&lr, 1);
+        let bundle = build_capped_bundle(&lr, 1, MAX_MAX_DEPTH);
 
         assert_eq!(bundle.claims_included, 1);
         assert_eq!(bundle.evidence_included, 0);
@@ -357,7 +366,7 @@ mod tests {
             .collect();
         let lr = lineage(claims, vec![], vec![]);
 
-        let bundle = build_capped_bundle(&lr, 2);
+        let bundle = build_capped_bundle(&lr, 2, MAX_MAX_DEPTH);
 
         // Retained = depths 0 and 1; repo order is depth-descending, so depth 1 first.
         assert_eq!(
@@ -384,8 +393,8 @@ mod tests {
             lineage(claims, ev, tr)
         };
 
-        let a = build_capped_bundle(&mk(false), 4);
-        let b = build_capped_bundle(&mk(true), 4);
+        let a = build_capped_bundle(&mk(false), 4, MAX_MAX_DEPTH);
+        let b = build_capped_bundle(&mk(true), 4, MAX_MAX_DEPTH);
 
         assert_eq!(a.entities, b.entities);
         assert_eq!(a.topological_order, b.topological_order);
@@ -393,10 +402,59 @@ mod tests {
 
     #[test]
     fn empty_lineage_yields_empty_bundle_untruncated() {
-        let bundle = build_capped_bundle(&LineageResult::default(), 500);
+        let bundle = build_capped_bundle(&LineageResult::default(), 500, MAX_MAX_DEPTH);
 
         assert!(bundle.entities.is_empty());
         assert!(bundle.topological_order.is_empty());
+        assert!(!bundle.truncated);
+    }
+
+    /// The depth bound drops entities *before* `build_capped_bundle` sees them,
+    /// so a depth-cut walk reports `included == total` in every category and
+    /// none of the three node-count disjuncts can fire. Without the fourth
+    /// disjunct the agent is told a graph missing its deeper ancestry is closed.
+    #[test]
+    fn depth_bound_reached_sets_truncated_even_when_no_node_is_dropped() {
+        let claims: Vec<_> = (0..4u32)
+            .map(|d| claim(id(u128::from(d) + 1), i32::try_from(d).unwrap()))
+            .collect();
+        let lr = lineage(claims, vec![], vec![]);
+
+        // Budget far above the node count: only the depth bound bites.
+        let bundle = build_capped_bundle(&lr, 500, 3);
+
+        assert_eq!(bundle.claims_included, bundle.claims_total);
+        assert_eq!(bundle.evidence_included, bundle.evidence_total);
+        assert_eq!(bundle.traces_included, bundle.traces_total);
+        assert!(
+            bundle.truncated,
+            "a walk stopped by the depth bound is a partial answer"
+        );
+    }
+
+    #[test]
+    fn walk_short_of_the_depth_bound_stays_untruncated() {
+        let claims: Vec<_> = (0..3u32)
+            .map(|d| claim(id(u128::from(d) + 1), i32::try_from(d).unwrap()))
+            .collect();
+        let lr = lineage(claims, vec![], vec![]);
+
+        let bundle = build_capped_bundle(&lr, 500, 5);
+
+        assert!(!bundle.truncated);
+    }
+
+    /// `resolve_max_depth` clamps to a minimum of 1 and a root-only walk reports
+    /// `max_depth_reached == 0`, so the smallest possible bound still leaves the
+    /// flag false. This is why the depth term needs no `nodes.len() > 1` guard
+    /// of the sort `epigraph-api`'s `routes/lineage.rs` carries.
+    #[test]
+    fn root_only_lineage_is_not_truncated_by_the_smallest_depth_bound() {
+        let lr = lineage(vec![claim(id(1), 0)], vec![], vec![]);
+
+        let bundle = build_capped_bundle(&lr, 500, resolve_max_depth(Some(0)));
+
+        assert_eq!(bundle.claims_included, 1);
         assert!(!bundle.truncated);
     }
 
