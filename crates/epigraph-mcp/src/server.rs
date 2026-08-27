@@ -541,7 +541,13 @@ impl EpiGraphMcpFull {
     // ── Provenance (1 tool) ──
 
     #[tool(
-        description = "Get the provenance lineage for a claim — all ancestor claims, evidence, and reasoning traces in topological order."
+        description = "Get the provenance lineage for a claim — all ancestor claims, evidence, \
+                       and reasoning traces in topological order. Bounded: max_depth defaults \
+                       to 5 (max 20), max_nodes caps total entities at 500 (max 5000). When a \
+                       bound bites, `truncated` is true and `entity_counts` shows what was \
+                       dropped — and a retained claim's parent_ids/evidence_ids may then name \
+                       entities absent from `entities`, so check `truncated` before assuming \
+                       the returned graph is closed."
     )]
     async fn get_provenance(
         &self,

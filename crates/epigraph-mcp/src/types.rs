@@ -297,6 +297,16 @@ pub struct UpdateWithEvidenceParams {
 pub struct GetProvenanceParams {
     #[schemars(description = "The UUID of the claim to get provenance for")]
     pub claim_id: String,
+    #[schemars(description = "How many ancestor hops to walk. Clamped to 1..=20. \
+                       Default 5 (the previously hardcoded value).")]
+    #[serde(default)]
+    pub max_depth: Option<u32>,
+    #[schemars(description = "Cap on the TOTAL number of PROV entities returned \
+                       (claims + evidence + activities). Clamped to 1..=5000. Default 500. \
+                       When the cap bites, `truncated` is true and `entity_counts` reports \
+                       what was dropped.")]
+    #[serde(default)]
+    pub max_nodes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
