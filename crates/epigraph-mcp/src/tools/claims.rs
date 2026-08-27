@@ -2,7 +2,7 @@
 
 use rmcp::model::*;
 
-use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
+use crate::errors::{internal_error, invalid_params, map_db_error, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto;
 use crate::types::*;
@@ -933,7 +933,7 @@ pub async fn update_labels(
     let id = parse_uuid(&params.claim_id)?;
     let labels = ClaimRepository::update_labels(&server.pool, id, &params.add, &params.remove)
         .await
-        .map_err(internal_error)?;
+        .map_err(map_db_error)?;
     success_json(&serde_json::json!({ "claim_id": id, "labels": labels }))
 }
 
@@ -967,7 +967,7 @@ pub async fn patch_claim(
         },
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(map_db_error)?;
     tx.commit().await.map_err(internal_error)?;
     success_json(&serde_json::json!({
         "claim_id": id,

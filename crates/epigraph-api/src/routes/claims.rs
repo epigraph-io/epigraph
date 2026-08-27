@@ -1419,6 +1419,9 @@ pub async fn patch_claim(
                     entity: "Claim".to_string(),
                     id: eid.to_string(),
                 },
+                epigraph_db::DbError::InvalidData { reason } => {
+                    ApiError::BadRequest { message: reason }
+                }
                 other => ApiError::DatabaseError {
                     message: other.to_string(),
                 },
@@ -1604,6 +1607,9 @@ pub async fn update_labels(
                 entity: "Claim".to_string(),
                 id: id.to_string(),
             },
+            epigraph_db::DbError::InvalidData { reason } => {
+                ApiError::BadRequest { message: reason }
+            }
             other => ApiError::DatabaseError {
                 message: other.to_string(),
             },

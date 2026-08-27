@@ -4060,7 +4060,8 @@ impl ClaimRepository {
     /// removing a nonexistent label is a no-op. Returns the updated labels array.
     ///
     /// # Errors
-    /// Returns `DbError::NotFound` if the claim doesn't exist.
+    /// Returns `DbError::NotFound` if the claim doesn't exist, or
+    /// `DbError::InvalidData` if any label in `add` contains shell-variable syntax.
     #[instrument(skip(pool))]
     pub async fn update_labels(
         pool: &PgPool,
@@ -4068,6 +4069,10 @@ impl ClaimRepository {
         add: &[String],
         remove: &[String],
     ) -> Result<Vec<String>, DbError> {
+        // Reject unexpanded shell syntax on the ADD side only. `remove` stays
+        // unvalidated so a bad label already in the array can still be deleted.
+        crate::label_guard::reject_shell_expansion(add)?;
+
         let row: Option<(Vec<String>,)> = sqlx::query_as(
             r#"
             WITH current AS (
@@ -4106,6 +4111,14 @@ impl ClaimRepository {
     }
 
     /// Update labels using an existing connection (e.g. inside a transaction).
+    ///
+    /// This is the path [`Self::patch_claim_atomic_conn`] delegates to, so the
+    /// guard below also covers MCP `patch_claim` and HTTP
+    /// `PATCH /api/v1/claims/:id`.
+    ///
+    /// # Errors
+    /// Returns `DbError::NotFound` if the claim doesn't exist, or
+    /// `DbError::InvalidData` if any label in `add` contains shell-variable syntax.
     pub async fn update_labels_conn(
         conn: &mut sqlx::PgConnection,
         claim_id: Uuid,
@@ -4113,6 +4126,11 @@ impl ClaimRepository {
         remove: &[String],
     ) -> Result<Vec<String>, DbError> {
         use sqlx::Row;
+
+        // Reject unexpanded shell syntax on the ADD side only. `remove` stays
+        // unvalidated so a bad label already in the array can still be deleted.
+        crate::label_guard::reject_shell_expansion(add)?;
+
         let row: Option<sqlx::postgres::PgRow> = sqlx::query(
             r#"WITH current AS (
                    SELECT id, labels FROM claims WHERE id = $1

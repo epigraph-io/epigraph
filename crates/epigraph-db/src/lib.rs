@@ -52,6 +52,7 @@
 
 pub mod access_control;
 pub mod errors;
+pub mod label_guard;
 pub mod pool;
 pub mod repos;
 
@@ -60,6 +61,7 @@ pub use access_control::{
     batch_check_content_access, check_content_access, ContentAccess, COARSE_EDGE_TYPES,
 };
 pub use errors::DbError;
+pub use label_guard::{reject_shell_expansion, shell_expansion_offense};
 pub use pool::{create_pool, create_pool_from_options, create_pool_with_options};
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentRepository, AnalysisRecord,
