@@ -272,6 +272,8 @@ impl Verifiable for Evidence {
 }
 
 impl ContentAddressable for Evidence {
+    const HASH_DOMAIN_TAG: &'static str = "epigraph.evidence.v1";
+
     fn content_hash(&self) -> &[u8; 32] {
         &self.content_hash
     }
@@ -289,7 +291,7 @@ impl ContentAddressable for Evidence {
             claim_id: self.claim_id,
             created_at: self.created_at,
         };
-        epigraph_crypto::ContentHasher::hash_canonical(&hashable)
+        epigraph_crypto::ContentHasher::hash_canonical_domain(Self::HASH_DOMAIN_TAG, &hashable)
     }
 }
 
@@ -918,5 +920,44 @@ mod tests {
 
         let is_valid = evidence.verify_hash().unwrap();
         assert!(!is_valid, "Tampered content should fail hash verification");
+    }
+
+    #[test]
+    fn evidence_compute_hash_uses_domain_tag() {
+        let evidence = Evidence::new(
+            AgentId::new(),
+            [0u8; 32],
+            [0u8; 32],
+            EvidenceType::Observation {
+                observed_at: Utc::now(),
+                method: "instrumental".to_string(),
+                location: None,
+            },
+            Some("observed content".to_string()),
+            ClaimId::new(),
+        );
+
+        let hashable = EvidenceHashableContent {
+            id: evidence.id,
+            agent_id: evidence.agent_id,
+            evidence_type: evidence.evidence_type.clone(),
+            raw_content: evidence.raw_content.clone(),
+            claim_id: evidence.claim_id,
+            created_at: evidence.created_at,
+        };
+
+        assert_ne!(
+            evidence.compute_hash().unwrap(),
+            epigraph_crypto::ContentHasher::hash_canonical(&hashable).unwrap(),
+            "Evidence::compute_hash must prefix the digest with its domain tag"
+        );
+        assert_eq!(
+            evidence.compute_hash().unwrap(),
+            epigraph_crypto::ContentHasher::hash_canonical_domain(
+                Evidence::HASH_DOMAIN_TAG,
+                &hashable
+            )
+            .unwrap()
+        );
     }
 }

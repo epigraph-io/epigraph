@@ -33,6 +33,42 @@ impl ContentHasher {
         Ok(Self::hash(&bytes))
     }
 
+    /// Hash bytes under a domain-separation tag
+    ///
+    /// The preimage is `len(tag) as u64 (little-endian) || tag || data`. The
+    /// length prefix makes the `(tag, data)` encoding injective: without it
+    /// `("ab", b"cd")` and `("a", b"bcd")` would share a preimage and therefore
+    /// collide. Two different domains can thus never produce the same digest
+    /// for semantically different content.
+    ///
+    /// This is deliberately *not* `blake3::derive_key`: that is BLAKE3's KDF
+    /// mode, whose output is key material rather than a content address, and it
+    /// requires a compile-time context string.
+    #[must_use]
+    pub fn hash_domain(tag: &str, data: &[u8]) -> [u8; HASH_SIZE] {
+        let tag_bytes = tag.as_bytes();
+        let mut hasher = Self::incremental();
+        hasher.update(&(tag_bytes.len() as u64).to_le_bytes());
+        hasher.update(tag_bytes);
+        hasher.update(data);
+        hasher.finalize().into()
+    }
+
+    /// Hash a canonically serializable type under a domain-separation tag
+    ///
+    /// The value is serialized to canonical JSON, then hashed via
+    /// [`Self::hash_domain`].
+    ///
+    /// # Errors
+    /// Returns error if canonical serialization fails.
+    pub fn hash_canonical_domain<T: Canonical>(
+        tag: &str,
+        value: &T,
+    ) -> Result<[u8; HASH_SIZE], CryptoError> {
+        let bytes = value.canonical_bytes()?;
+        Ok(Self::hash_domain(tag, &bytes))
+    }
+
     /// Create an incremental hasher for large content
     ///
     /// Use this when hashing large files or streams:
@@ -451,5 +487,79 @@ mod tests {
                 "Hash of {input:?} should not be all zeros"
             );
         }
+    }
+
+    // ==================== Domain separation tests ====================
+
+    #[test]
+    fn hash_domain_is_deterministic() {
+        let h1 = ContentHasher::hash_domain("epigraph.test.v1", b"same input");
+        let h2 = ContentHasher::hash_domain("epigraph.test.v1", b"same input");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_domain_differs_from_untagged_hash() {
+        let tagged = ContentHasher::hash_domain("epigraph.test.v1", b"payload");
+        let untagged = ContentHasher::hash(b"payload");
+        assert_ne!(tagged, untagged);
+    }
+
+    #[test]
+    fn hash_domain_differs_across_tags() {
+        let a = ContentHasher::hash_domain("epigraph.claim.v1", b"payload");
+        let b = ContentHasher::hash_domain("epigraph.evidence.v1", b"payload");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hash_domain_tag_boundary_is_unambiguous() {
+        // The length prefix makes the (tag, data) encoding injective. Without
+        // it, both of these would hash the byte string "abcd" and collide.
+        let a = ContentHasher::hash_domain("ab", b"cd");
+        let b = ContentHasher::hash_domain("a", b"bcd");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hash_domain_empty_tag_and_empty_data_is_well_defined() {
+        let empty_both = ContentHasher::hash_domain("", b"");
+        // Still framed, so it differs from an untagged hash of no bytes.
+        assert_ne!(empty_both, ContentHasher::hash(b""));
+        assert_eq!(empty_both, ContentHasher::hash_domain("", b""));
+        assert_ne!(empty_both, ContentHasher::hash_domain("", b"x"));
+        assert_ne!(empty_both, ContentHasher::hash_domain("x", b""));
+    }
+
+    #[test]
+    fn hash_canonical_domain_equals_hash_domain_of_canonical_bytes() {
+        let obj = json!({"a": 1, "b": 2});
+
+        let via_canonical = ContentHasher::hash_canonical_domain("epigraph.test.v1", &obj).unwrap();
+        let via_bytes =
+            ContentHasher::hash_domain("epigraph.test.v1", &obj.canonical_bytes().unwrap());
+
+        assert_eq!(via_canonical, via_bytes);
+    }
+
+    #[test]
+    fn hash_canonical_domain_is_key_order_independent() {
+        let obj1 = json!({"b": 2, "a": 1});
+        let obj2 = json!({"a": 1, "b": 2});
+
+        let h1 = ContentHasher::hash_canonical_domain("epigraph.test.v1", &obj1).unwrap();
+        let h2 = ContentHasher::hash_canonical_domain("epigraph.test.v1", &obj2).unwrap();
+
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_canonical_domain_differs_across_tags() {
+        let obj = json!({"a": 1, "b": 2});
+
+        let a = ContentHasher::hash_canonical_domain("epigraph.claim.v1", &obj).unwrap();
+        let b = ContentHasher::hash_canonical_domain("epigraph.evidence.v1", &obj).unwrap();
+
+        assert_ne!(a, b);
     }
 }

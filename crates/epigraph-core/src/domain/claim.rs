@@ -332,6 +332,8 @@ impl Verifiable for Claim {
 }
 
 impl ContentAddressable for Claim {
+    const HASH_DOMAIN_TAG: &'static str = "epigraph.claim.v1";
+
     fn content_hash(&self) -> &[u8; 32] {
         &self.content_hash
     }
@@ -350,7 +352,7 @@ impl ContentAddressable for Claim {
             created_at: self.created_at,
             updated_at: self.updated_at,
         };
-        epigraph_crypto::ContentHasher::hash_canonical(&hashable)
+        epigraph_crypto::ContentHasher::hash_canonical_domain(Self::HASH_DOMAIN_TAG, &hashable)
     }
 }
 
@@ -756,5 +758,39 @@ mod tests {
 
         let serialized = serde_json::to_string(&claim).expect("Serialization failed");
         assert!(serialized.contains("Epigraph Core is strictly decoupled"));
+    }
+
+    #[test]
+    fn claim_compute_hash_uses_domain_tag() {
+        let claim = Claim::new(
+            "Domain separation is applied".to_string(),
+            AgentId::new(),
+            [0u8; 32],
+            TruthValue::new(0.5).unwrap(),
+        );
+
+        let hashable = ClaimHashableContent {
+            id: claim.id,
+            content: claim.content.clone(),
+            truth_value: claim.truth_value,
+            agent_id: claim.agent_id,
+            trace_id: claim.trace_id,
+            created_at: claim.created_at,
+            updated_at: claim.updated_at,
+        };
+
+        assert_ne!(
+            claim.compute_hash().unwrap(),
+            epigraph_crypto::ContentHasher::hash_canonical(&hashable).unwrap(),
+            "Claim::compute_hash must prefix the digest with its domain tag"
+        );
+        assert_eq!(
+            claim.compute_hash().unwrap(),
+            epigraph_crypto::ContentHasher::hash_canonical_domain(
+                Claim::HASH_DOMAIN_TAG,
+                &hashable
+            )
+            .unwrap()
+        );
     }
 }

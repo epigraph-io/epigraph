@@ -60,6 +60,17 @@ pub trait Verifiable: Signable {
 
 /// Trait for entities that have a content hash
 pub trait ContentAddressable: Serialize {
+    /// Domain-separation tag mixed into this type's content digest
+    ///
+    /// Must be unique per implementing type: two types with structurally
+    /// identical serde output would otherwise share a preimage and produce the
+    /// same content address. Version it (`.v1`) so a future change to the
+    /// hashed preimage can be distinguished by bumping the tag.
+    ///
+    /// This const has no default on purpose — a shared default would let a new
+    /// implementor silently reuse another type's domain.
+    const HASH_DOMAIN_TAG: &'static str;
+
     /// Get the stored content hash of this entity
     fn content_hash(&self) -> &[u8; 32];
 
@@ -74,7 +85,7 @@ pub trait ContentAddressable: Serialize {
     where
         Self: Sized,
     {
-        ContentHasher::hash_canonical(self)
+        ContentHasher::hash_canonical_domain(Self::HASH_DOMAIN_TAG, self)
     }
 
     /// Verify the stored hash matches the computed hash
@@ -163,6 +174,8 @@ mod tests {
     }
 
     impl ContentAddressable for TestHashable {
+        const HASH_DOMAIN_TAG: &'static str = "epigraph.test.hashable.v1";
+
         fn content_hash(&self) -> &[u8; 32] {
             &self.stored_hash
         }
@@ -482,5 +495,110 @@ mod tests {
         let hash2 = entity.compute_hash().unwrap();
 
         assert_eq!(hash1, hash2, "Stored hash should not affect computed hash");
+    }
+
+    // ==================== Domain separation tests ====================
+
+    // Two types with byte-identical serde output, distinguished only by their
+    // domain tag.
+    #[derive(Debug, Clone, Serialize)]
+    struct TaggedA {
+        content: String,
+        #[serde(skip)]
+        stored_hash: [u8; 32],
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    struct TaggedB {
+        content: String,
+        #[serde(skip)]
+        stored_hash: [u8; 32],
+    }
+
+    impl ContentAddressable for TaggedA {
+        const HASH_DOMAIN_TAG: &'static str = "epigraph.test.tagged_a.v1";
+
+        fn content_hash(&self) -> &[u8; 32] {
+            &self.stored_hash
+        }
+
+        fn set_content_hash(&mut self, hash: [u8; 32]) {
+            self.stored_hash = hash;
+        }
+    }
+
+    impl ContentAddressable for TaggedB {
+        const HASH_DOMAIN_TAG: &'static str = "epigraph.test.tagged_b.v1";
+
+        fn content_hash(&self) -> &[u8; 32] {
+            &self.stored_hash
+        }
+
+        fn set_content_hash(&mut self, hash: [u8; 32]) {
+            self.stored_hash = hash;
+        }
+    }
+
+    #[test]
+    fn test_identical_content_under_different_domain_tags_hashes_differently() {
+        let a = TaggedA {
+            content: "identical".to_string(),
+            stored_hash: [0u8; 32],
+        };
+        let b = TaggedB {
+            content: "identical".to_string(),
+            stored_hash: [0u8; 32],
+        };
+
+        // Serde output is byte-identical; only HASH_DOMAIN_TAG differs.
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
+        );
+
+        assert_ne!(
+            a.compute_hash().unwrap(),
+            b.compute_hash().unwrap(),
+            "Distinct domain tags must yield distinct content addresses"
+        );
+    }
+
+    #[test]
+    fn test_domain_tags_are_pairwise_distinct() {
+        use crate::{Claim, Evidence, ReasoningTrace};
+
+        let tags = [
+            <Claim as ContentAddressable>::HASH_DOMAIN_TAG,
+            <Evidence as ContentAddressable>::HASH_DOMAIN_TAG,
+            <ReasoningTrace as ContentAddressable>::HASH_DOMAIN_TAG,
+        ];
+
+        for (i, left) in tags.iter().enumerate() {
+            assert!(!left.is_empty(), "Domain tag {i} must not be empty");
+            for right in tags.iter().skip(i + 1) {
+                assert_ne!(left, right, "Domain tags must be pairwise distinct");
+            }
+        }
+    }
+
+    #[test]
+    fn test_content_addressable_default_hash_uses_domain_tag() {
+        let entity = TestHashable {
+            content: "test".to_string(),
+            number: 7,
+            stored_hash: [0u8; 32],
+        };
+
+        let tagged = entity.compute_hash().unwrap();
+        let untagged = ContentHasher::hash_canonical(&entity).unwrap();
+
+        assert_ne!(
+            tagged, untagged,
+            "Default compute_hash must apply the domain tag"
+        );
+        assert_eq!(
+            tagged,
+            ContentHasher::hash_canonical_domain(TestHashable::HASH_DOMAIN_TAG, &entity).unwrap()
+        );
     }
 }
