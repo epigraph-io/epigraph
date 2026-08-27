@@ -58,6 +58,21 @@ use epigraph_engine::matching::verifier::WRITE_TIME_SCAN_SOURCE;
 /// note on [`MIN_LEXICAL_OVERLAP`].
 pub const CONTRADICTION_BAND: f64 = 0.30;
 
+/// Is `distance` inside [`CONTRADICTION_BAND`]?
+///
+/// Written as `<=` rather than as the negation of a `>` so that a NaN distance
+/// answers `false` and the neighbour is suppressed. pgvector's `<=>` returns
+/// NaN when either vector has zero norm, and NaN passes a bare
+/// `distance > BAND` skip-check unscathed — it would fire a signal, stage a row
+/// whose `score` is NaN, and Postgres sorts NaN as the LARGEST real, so that
+/// row would head every `ORDER BY score DESC` review queue permanently. Same
+/// discipline as [`epigraph_engine::matching::pipeline::stage_decision`], which
+/// keeps NaN out of the same queue from the matcher side.
+#[must_use]
+pub fn within_contradiction_band(distance: f64) -> bool {
+    distance <= CONTRADICTION_BAND
+}
+
 /// Jaccard floor over polarity-stripped tokens. Below this the two texts do not
 /// share enough subject matter for a polarity difference to mean anything, and
 /// the signal is dropped.
@@ -243,7 +258,7 @@ pub fn scan(incoming: &str, nearest: &[NearestClaimHit]) -> Vec<ContradictionSig
 
     let mut signals = Vec::new();
     for hit in nearest {
-        if hit.distance > CONTRADICTION_BAND {
+        if !within_contradiction_band(hit.distance) {
             continue;
         }
         let neighbor_tokens: BTreeSet<String> = tokenize(&hit.content).into_iter().collect();
@@ -387,8 +402,9 @@ mod tests {
         assert!(scan("the retry loop is safe under concurrent writes", &nearest).is_empty());
     }
 
-    /// `distance == CONTRADICTION_BAND` fires — the comparison is `>`, not
-    /// `>=`. Pinned the way novelty_gate pins its own band boundaries.
+    /// `distance == CONTRADICTION_BAND` fires — the band predicate is `<=`, not
+    /// `<`. Pinned the way novelty_gate pins its own band boundaries, and it
+    /// doubles as the guard against over-tightening the NaN fix below.
     #[test]
     fn boundary_distance_equal_to_contradiction_band_is_inclusive() {
         let nearest = [hit(
@@ -398,6 +414,21 @@ mod tests {
         let signals = scan("the retry loop is safe under concurrent writes", &nearest);
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].distance, CONTRADICTION_BAND);
+    }
+
+    /// pgvector's `<=>` returns NaN for a zero-norm embedding, and `NaN > BAND`
+    /// is false — a bare `>` skip-check lets it through. The staged row's score
+    /// would then be NaN (`(1.0 - NaN).clamp(..)` propagates), and Postgres
+    /// sorts NaN as the LARGEST real, so it would head every
+    /// `ORDER BY score DESC` review queue forever. Mirrors
+    /// `pipeline::stage_decision_drops_nan_scores`.
+    #[test]
+    fn nan_distance_is_suppressed_rather_than_treated_as_in_band() {
+        let nearest = [hit(
+            f64::NAN,
+            "the retry loop is not safe under concurrent writes",
+        )];
+        assert!(scan("the retry loop is safe under concurrent writes", &nearest).is_empty());
     }
 
     /// The canonical case the whole feature exists for: an embedding cannot
