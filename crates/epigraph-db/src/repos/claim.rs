@@ -3269,34 +3269,47 @@ impl ClaimRepository {
             .await?,
         );
 
-        // Symmetric-collision guard for `alternative_of` (migration 042).
+        // Pair-key collision guard for every relationship carrying a
+        // direction-agnostic partial unique index — `alternative_of`
+        // (migration 042) and `shifted_to` (migration 060). See
+        // [`crate::PAIR_UNIQUE_RELATIONSHIPS`], which is the single list both
+        // this site and `consolidate` are driven from.
         //
-        // That relationship is governed by `edges_alternative_of_symmetric_uniq`,
-        // a UNIQUE index on `(LEAST(source_id,target_id), GREATEST(source_id,target_id))`
-        // — so the pair {A,B} is unique *regardless of direction*.  The two
-        // directional pre-deletes above only recognise same-`(source,target,
-        // relationship)` triples, so they miss the case where `dup` and
-        // `canonical` are joined to a common third claim T by `alternative_of`
-        // edges of *opposite* orientation (e.g. `dup→T` and `T→canonical`).
-        // Migrating `dup→canonical` would then rewrite `dup→T` into `canonical→T`,
-        // whose symmetric key {canonical,T} collides with the existing `T→canonical`
-        // edge, tripping the unique index and rolling the whole transaction back
-        // before `is_current` is flipped (backlog 2905150e / issue #286).
+        // Those indexes are keyed on
+        // `(LEAST(source_id,target_id), GREATEST(source_id,target_id))` — so the
+        // pair {A,B} is unique *regardless of direction*.  The two directional
+        // pre-deletes above only recognise same-`(source,target,relationship)`
+        // triples, so they miss the case where `dup` and `canonical` are joined
+        // to a common third claim T by edges of *opposite* orientation (e.g.
+        // `dup→T` and `T→canonical`). Migrating `dup→canonical` would then
+        // rewrite `dup→T` into `canonical→T`, whose pair key {canonical,T}
+        // collides with the existing `T→canonical` edge, tripping the unique
+        // index and rolling the whole transaction back before `is_current` is
+        // flipped (backlog 2905150e / issue #286).
         //
-        // Pre-delete the redundant dup-side `alternative_of` edge whenever
-        // `canonical` already shares a symmetric `alternative_of` edge with the
-        // same third claim.  Edges where `canonical` is itself an endpoint are
-        // left for the self-loop guards in the migration UPDATEs below.
+        // Pre-delete the redundant dup-side edge whenever `canonical` already
+        // shares a pair-keyed edge OF THE SAME RELATIONSHIP with the same third
+        // claim.  Edges where `canonical` is itself an endpoint are left for
+        // the self-loop guards in the migration UPDATEs below.
+        //
+        // `e2.relationship = e.relationship` rather than a second `ANY($3)`:
+        // the indexes are PER-relationship partial indexes, so an
+        // `alternative_of` edge and a `shifted_to` edge over the same pair do
+        // not collide with each other and neither may delete the other.
+        let pair_unique: Vec<String> = crate::repos::edge::PAIR_UNIQUE_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         deleted_edges.extend(
             sqlx::query_as::<_, (Uuid, Uuid)>(
                 "DELETE FROM edges AS e \
-                 WHERE e.relationship = 'alternative_of' \
+                 WHERE e.relationship = ANY($3) \
                    AND e.source_type = 'claim' AND e.target_type = 'claim' \
                    AND (e.source_id = $2 OR e.target_id = $2) \
                    AND e.source_id != $1 AND e.target_id != $1 \
                    AND EXISTS ( \
                        SELECT 1 FROM edges e2 \
-                       WHERE e2.relationship = 'alternative_of' \
+                       WHERE e2.relationship = e.relationship \
                          AND e2.source_type = 'claim' AND e2.target_type = 'claim' \
                          AND e2.id <> e.id \
                          AND LEAST(e2.source_id, e2.target_id) = \
@@ -3308,6 +3321,7 @@ impl ClaimRepository {
             )
             .bind(canon_uuid)
             .bind(dup_uuid)
+            .bind(&pair_unique)
             .fetch_all(&mut *tx)
             .await?,
         );
@@ -3878,6 +3892,81 @@ impl ClaimRepository {
                     },
                 )
             })
+            .collect())
+    }
+
+    /// Temporal-succession signal for each of `claim_ids`, batched in one
+    /// round-trip (backlog 52eff3ab): the LIVE successors reachable from each
+    /// id by an outgoing `shifted_to` edge.
+    ///
+    /// A present key means "this claim is the SOURCE end of a succession" —
+    /// the value it holds was true of an earlier world and something newer has
+    /// taken its place. Absent key == not shifted, the same contract as
+    /// [`Self::dispute_batch`] and [`Self::in_epistemic_degree_batch`]; callers
+    /// must not read a missing key as an error.
+    ///
+    /// **This is not a dispute signal and must never be treated as one.** "The
+    /// throughput ceiling shifted from 400/s to 900/s" is not evidence that
+    /// 400/s was ever false — it was true of its own era. Succession licenses a
+    /// RETRIEVAL preference (`recall` sinks the source end below its successor),
+    /// never a belief update: `shifted_to` is deliberately absent from
+    /// [`crate::EPISTEMIC_RELATIONSHIPS`], maps to `RestrictionKind::Neutral`,
+    /// and has no `edge_to_factor_type` row.
+    ///
+    /// The `succ.is_current` join is load-bearing, mirroring `dispute_batch`'s
+    /// filter on contesters: a claim must not be de-ranked behind a successor
+    /// that has itself been retracted. Retract the 900/s remeasurement and
+    /// 400/s is the current best answer again, so it must climb back.
+    ///
+    /// Direction is read on ONE endpoint only — `shifted_to` is ORDERED, so
+    /// unlike the `contradicts` leg of `dispute_batch` there is no symmetric
+    /// UNION here. Mirroring it would report the successor as itself
+    /// superseded, which is exactly backwards.
+    ///
+    /// A post-fix batch query over ids retrieval already returned, NOT a join
+    /// inside the ANN/RRF SQL — same reasoning as `dispute_batch`: the signal
+    /// must not put the HNSW plan at risk.
+    ///
+    /// Runtime `query_as` rather than the `sqlx::query!` macro, for the same
+    /// reason as [`Self::dispute_batch`]: nothing here the macro's
+    /// compile-time checking would catch that the tuple type does not, and
+    /// zero `.sqlx` offline-data churn.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(pool, claim_ids))]
+    pub async fn shifted_from_batch(
+        pool: &PgPool,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<Uuid>>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, (Uuid, Option<Vec<Uuid>>)>(
+            r#"
+            SELECT e.source_id AS claim_id,
+                   array_agg(DISTINCT e.target_id) AS successors
+            FROM edges e
+            JOIN claims succ ON succ.id = e.target_id AND succ.is_current
+            WHERE e.source_id = ANY($1)
+              AND e.source_type = 'claim' AND e.target_type = 'claim'
+              AND e.relationship = $2
+            GROUP BY e.source_id
+            "#,
+        )
+        .bind(claim_ids.to_vec())
+        .bind(crate::repos::edge::TEMPORAL_SUCCESSION_RELATIONSHIP)
+        .fetch_all(pool)
+        .await?;
+
+        // `array_agg` over a non-empty group is never NULL, so the filter is
+        // belt-and-braces: it keeps "present key" and "actually shifted"
+        // identical, so a caller that only checks key presence cannot read an
+        // empty vector as a succession.
+        Ok(rows
+            .into_iter()
+            .map(|(claim_id, successors)| (claim_id, successors.unwrap_or_default()))
+            .filter(|(_, successors)| !successors.is_empty())
             .collect())
     }
 }
@@ -4923,10 +5012,16 @@ impl ClaimRepository {
             } else {
                 (e.source_id, e.source_type.clone())
             };
-            // alternative_of's unique index is keyed on (LEAST, GREATEST) and
-            // is therefore direction-agnostic; every other relationship
+            // The pair-unique relationships (`alternative_of`, migration 042;
+            // `shifted_to`, migration 060 — see
+            // [`crate::PAIR_UNIQUE_RELATIONSHIPS`]) carry a unique index keyed
+            // on (LEAST, GREATEST) and are therefore direction-agnostic: two
+            // edges over the same pair collide even when oriented oppositely,
+            // so they must share ONE dedup slot. Every other relationship
             // duplicates per-direction.
-            let direction = if e.relationship == "alternative_of" {
+            let direction = if crate::repos::edge::PAIR_UNIQUE_RELATIONSHIPS
+                .contains(&e.relationship.as_str())
+            {
                 0
             } else if src_in {
                 1

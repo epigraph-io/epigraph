@@ -96,6 +96,12 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "METHODOLOGY", // claim → claim (methodology relation, traversal)
     "SUPERSEDES", // upper-case alias of lower-case "supersedes" above; synthesis-side callers use upper-case per PROV-O convention
     "INSTANTIATES", // claim → claim (paper claim is an instance of textbook concept; cross-source anchor 2026-05-18-cross-source-anchor §3)
+    // Temporal succession (migration 060, backlog 52eff3ab): source held in an
+    // earlier world, target holds now. HTTP parity with `link_epistemic`'s
+    // TEMPORAL_RELATIONSHIPS. Inert by design — no `edge_to_factor_type` row,
+    // Neutral in the engine — so it re-ranks recall without moving belief; the
+    // pair is anti-symmetric, enforced by `edges_shifted_to_pair_uniq`.
+    "shifted_to", // claim → claim (temporal succession)
 ];
 
 /// Whether `s` is a registered entity type, per the in-process registry cache.
@@ -2588,6 +2594,7 @@ mod tests {
         assert!(is_valid_relationship("continues_argument"));
         assert!(is_valid_relationship("INSTANTIATES"));
         assert!(is_valid_relationship("alternative_of"));
+        assert!(is_valid_relationship("shifted_to"));
         assert!(!is_valid_relationship("invalid"));
         assert!(!is_valid_relationship(""));
     }

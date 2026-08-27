@@ -457,6 +457,10 @@ async fn recall_post_embed(
                             dispute_count: 0,
                             is_contested: false,
                             contesting_claim_ids: Vec::new(),
+                            // Populated by the bounded temporal post-pass below
+                            // (backlog 52eff3ab), keyed by claim_id. That pass
+                            // is also the only one that RE-ORDERS `results`.
+                            shifted_to: Vec::new(),
                             // The claim's real creation instant, straight off
                             // the row `get_by_id` already fetched — no extra
                             // round-trip, and specifically NOT `updated_at`,
@@ -487,6 +491,11 @@ async fn recall_post_embed(
                         dispute_count: 0,
                         is_contested: false,
                         contesting_claim_ids: Vec::new(),
+                        // Temporal succession is a claim relation; the
+                        // claim_id-keyed post-pass below never matches a
+                        // workflow_id, so this stays empty and a workflow hit
+                        // is never de-ranked as stale.
+                        shifted_to: Vec::new(),
                         // The workflow's OWN `workflows.created_at`, selected
                         // by the ANN leg. Not `Utc::now()`: a workflow row is
                         // not a claim, and inventing a timestamp to satisfy
@@ -601,6 +610,63 @@ async fn recall_post_embed(
         // (merged.truncate(limit) runs before the min_truth drop above).
         if params.exclude_contested {
             results.retain(|r| !r.is_contested);
+        }
+    }
+
+    // Bounded temporal-succession post-pass (backlog 52eff3ab). Same shape as
+    // the lens and dispute passes above: ONE batched follow-up query over the
+    // ids this page already returned — never a join inside the ANN/RRF SQL,
+    // which would put the HNSW plan at risk — and degrade-not-fail, so a
+    // failed lookup serves the page in its base order rather than failing the
+    // recall.
+    //
+    // WHY THIS ONE RE-RANKS WHEN THE DISPUTE PASS DELIBERATELY DOES NOT
+    // (see the "Ranking is deliberately untouched" note above): they are
+    // different signals about the world, not two flavours of the same one.
+    // Dispute means CONTESTED — two live claims disagree and the caller has to
+    // weigh them, so re-ordering behind the caller's back would bury
+    // legitimate counter-evidence. Succession means STALE — the source end
+    // states what was true of an earlier world, the target end states what is
+    // true now, and NEITHER is disputed. A caller asking "what is the
+    // throughput ceiling?" virtually always wants 900/s before 400/s.
+    //
+    // De-rank, never drop, and never touch belief: 400/s was true of its own
+    // era, so it stays retrievable one row further down, keeps its
+    // `truth_value`, and is not marked contested. That is the whole reason
+    // `shifted_to` exists apart from `contradicts`.
+    {
+        let claim_ids: Vec<uuid::Uuid> = results
+            .iter()
+            .filter(|r| r.result_type.is_none()) // workflows aren't claims
+            .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+            .collect();
+        match ClaimRepository::shifted_from_batch(&server.pool, &claim_ids).await {
+            Ok(mut by_claim) => {
+                for r in &mut results {
+                    let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
+                        continue;
+                    };
+                    // Absent key == not shifted (repo contract), so the empty
+                    // default already set at construction is the right reading.
+                    if let Some(successors) = by_claim.remove(&cid) {
+                        r.shifted_to = successors;
+                    }
+                }
+                // STABLE partition, not a score adjustment: `sort_by_key` on a
+                // bool sinks every shifted-from hit below every unshifted one
+                // while preserving RRF order strictly inside each group. A
+                // score penalty would need a magnitude nobody can justify and
+                // would interact unpredictably with RRF; a partition says
+                // exactly what is meant — stale material outranks nothing.
+                results.sort_by_key(|r| !r.shifted_to.is_empty());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "temporal succession batch failed; serving page without shifted_to \
+                     annotations or re-ranking"
+                );
+            }
         }
     }
 

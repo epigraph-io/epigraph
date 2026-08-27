@@ -1219,6 +1219,27 @@ pub struct RecallResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contesting_claim_ids: Vec<uuid::Uuid>,
 
+    /// LIVE successors of this claim reached by an outgoing `shifted_to` edge
+    /// — i.e. this hit is the SOURCE end of a temporal succession, so the
+    /// value it states held in an earlier world (backlog 52eff3ab). Empty
+    /// (and omitted, not `[]`) for an unshifted hit, so a page with no
+    /// succession edges is byte-identical to pre-52eff3ab output.
+    ///
+    /// This is the ONE annotation on `RecallResult` that also RE-RANKS: hits
+    /// carrying it sink below unshifted hits, stably. It is deliberately not
+    /// the `dispute_count` treatment (annotate-only) — the two signals mean
+    /// different things. `is_contested` means CONTESTED, where re-ordering
+    /// would hide legitimate counter-evidence from a caller who needs to weigh
+    /// both sides; `shifted_to` means STALE, where the caller virtually always
+    /// wants the current value first.
+    ///
+    /// De-ranked, never dropped: the prior value is still true of its own era
+    /// and stays retrievable one row further down. Populated only for claim
+    /// hits — succession is a claim relation, so workflow hits keep the empty
+    /// default and are never sunk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shifted_to: Vec<uuid::Uuid>,
+
     /// When this result was created — `claims.created_at` for a claim hit,
     /// `workflows.created_at` for a workflow hit. Never `updated_at`, never
     /// the request time.

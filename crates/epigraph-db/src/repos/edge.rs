@@ -44,6 +44,43 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
 /// never disagree about which relations are symmetric.
 pub const SYMMETRIC_RELATIONSHIPS: &[&str] = &["contradicts", "corroborates"];
 
+/// Relationships whose uniqueness the SCHEMA enforces DIRECTION-AGNOSTICALLY,
+/// via a partial unique index keyed on
+/// `(LEAST(source_id, target_id), GREATEST(source_id, target_id))`:
+///
+/// - `alternative_of` — `edges_alternative_of_symmetric_uniq` (migration 042)
+/// - `shifted_to` — `edges_shifted_to_pair_uniq` (migration 060)
+///
+/// **Not** the same concept as [`SYMMETRIC_RELATIONSHIPS`], and the two lists
+/// must not be merged. That one is about what a relation MEANS (`A contradicts
+/// B` is the same fact as `B contradicts A`, so the writer stores one row);
+/// this one is about what the INDEX will reject. `shifted_to` is genuinely
+/// directional — `A shifted_to B` is not `B shifted_to A`, it is its temporal
+/// contradiction — and it keeps the directional writer. Both relations
+/// nonetheless share the `(LEAST, GREATEST)` key, so both make the same demand
+/// of any code that re-points edges.
+///
+/// That demand is the reason this const exists. `ClaimRepository::mark_duplicate`
+/// and `ClaimRepository::consolidate` migrate a retired claim's edges onto a
+/// survivor; their ordinary dedup recognises only same-`(source, target,
+/// relationship)` triples, which misses a collision between two edges of
+/// OPPOSITE orientation joining the merge endpoints to a common third claim.
+/// Re-pointing one of them then collides on the pair key, trips the unique
+/// index and rolls the entire transaction back before `is_current` flips —
+/// backlog 2905150e / issue #286. Both sites read this list rather than
+/// hard-coding a relationship, so adding a third pair-unique index means
+/// adding one entry here, not finding two call sites.
+pub const PAIR_UNIQUE_RELATIONSHIPS: &[&str] = &["alternative_of", "shifted_to"];
+
+/// Temporal-succession relationship: `source` held earlier, `target` holds now.
+///
+/// Retrieval-affecting only. It is absent from [`EPISTEMIC_RELATIONSHIPS`] on
+/// purpose — a later measurement is not evidence that the earlier one was
+/// false, so succession must not move belief — and
+/// [`crate::repos::claim::ClaimRepository::shifted_from_batch`] is the read
+/// side that turns it into a recall re-ranking signal.
+pub const TEMPORAL_SUCCESSION_RELATIONSHIP: &str = "shifted_to";
+
 /// A row from the edges table
 #[derive(Debug, Clone)]
 pub struct EdgeRow {

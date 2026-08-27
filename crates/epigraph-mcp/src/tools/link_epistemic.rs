@@ -15,14 +15,19 @@
 //! Tight contract:
 //! - both endpoints are existing claims (`source_type`/`target_type` are always
 //!   `"claim"`, not caller-controllable),
-//! - `relationship` must be one of [`EPISTEMIC_RELATIONSHIPS`] or
-//!   [`STRUCTURAL_RELATIONSHIPS`] (lowercase canonical strings; `supersedes`
-//!   is intentionally excluded — it has dedicated semantics in
-//!   `supersede_claim`). The structural set (currently just `cites`) is kept
-//!   separate because its members map to `RestrictionKind::Neutral` by
+//! - `relationship` must be one of [`EPISTEMIC_RELATIONSHIPS`],
+//!   [`STRUCTURAL_RELATIONSHIPS`] or [`TEMPORAL_RELATIONSHIPS`] (lowercase
+//!   canonical strings; `supersedes` is intentionally excluded — it has
+//!   dedicated semantics in `supersede_claim`). The latter two sets are kept
+//!   separate because their members map to `RestrictionKind::Neutral` by
 //!   design — belief-wiring already no-ops on Neutral, so accepting them
-//!   here just lets citation/provenance edges be created MCP-natively
-//!   without a doomed detour through the raw HTTP edges route.
+//!   here just lets citation/provenance (`cites`) and temporal-succession
+//!   (`shifted_to`) edges be created MCP-natively without a doomed detour
+//!   through the raw HTTP edges route. They stay two lists rather than one
+//!   because they make different claims about the world and have different
+//!   read sides: `shifted_to` alone feeds recall's re-ranking (via
+//!   `ClaimRepository::shifted_from_batch`), while nothing reads `cites` for
+//!   ranking.
 //! - idempotent on `(source, target, relationship)` for the five ORDERED
 //!   relations (`supports`, `elaborates`, `generalizes`, `specializes`,
 //!   `refutes`) and on the UNORDERED pair for the two symmetric ones
@@ -113,6 +118,55 @@ fn is_structural_relationship(s: &str) -> bool {
     STRUCTURAL_RELATIONSHIPS.contains(&s)
 }
 
+/// TEMPORAL-SUCCESSION relations `link_epistemic` also accepts — a THIRD
+/// allow-list, kept separate from both sets above (backlog 52eff3ab).
+///
+/// `source shifted_to target` means the source is the value that held in an
+/// earlier world and the target is the value that holds now: "the throughput
+/// ceiling shifted from 400/s to 900/s" is `400/s -shifted_to-> 900/s`.
+///
+/// **Why this is not in [`EPISTEMIC_RELATIONSHIPS`], and must never be moved
+/// there.** That const is *defined* as the belief-affecting set: every member
+/// is asserted non-Neutral by `every_epistemic_relationship_maps_to_non_neutral`,
+/// it is pinned at exactly seven, it is mirrored in
+/// `epigraph_db::EPISTEMIC_RELATIONSHIPS`, and it drives
+/// `ClaimRepository::in_epistemic_degree_batch`. Adding `shifted_to` there
+/// would wire a Dempster–Shafer mass function onto the succession — the
+/// `contradicts` treatment — and so retroactively falsify a correct historical
+/// measurement. 400/s was TRUE of its own era; a later remeasurement is not
+/// counter-evidence against it. That is precisely why succession is a separate
+/// relationship from `contradicts` rather than a synonym for it.
+///
+/// **Why not fold it into [`STRUCTURAL_RELATIONSHIPS`].** Mechanically it would
+/// work — both sets get the same `Neutral` (inert) treatment. But "this is a
+/// citation" and "this value superseded that one in time" are different claims
+/// about the world, and the read sides differ: nothing reads `cites` for
+/// ranking, whereas `ClaimRepository::shifted_from_batch` turns `shifted_to`
+/// into a recall re-ranking signal. A separate const keeps the doc honest and
+/// keeps the partition test able to say which set a relation belongs to.
+///
+/// **What it DOES license: retrieval, not belief.** Inertness here is the
+/// default rather than something this module arranges —
+/// `restriction_kind_with_profile` falls through to `Neutral` for any unknown
+/// relationship, `auto_wire_ds_for_edge` short-circuits to `NonEpistemic` on
+/// Neutral before it queries anything, and the migration-001
+/// `edge_to_factor_type` table has no `shifted_to` row, so the
+/// `auto_create_factor_from_edge` trigger mints no BP factor. Inertness being
+/// the default is exactly why it is fragile: it breaks the moment someone adds
+/// `shifted_to` to `EPISTEMIC_RELATIONSHIPS`, so
+/// `shifted_to_is_temporal_and_maps_to_neutral` below pins it.
+///
+/// Routes through the DIRECTIONAL writer (`create_if_not_exists`), not the
+/// symmetric one: succession is ORDERED. The schema backs that with
+/// `edges_shifted_to_pair_uniq` (migration 060), which rejects the REVERSED
+/// assertion as well as the exact duplicate — `A shifted_to B` and
+/// `B shifted_to A` are a temporal contradiction, not two facts.
+pub const TEMPORAL_RELATIONSHIPS: &[&str] = &[epigraph_db::TEMPORAL_SUCCESSION_RELATIONSHIP];
+
+fn is_temporal_relationship(s: &str) -> bool {
+    TEMPORAL_RELATIONSHIPS.contains(&s)
+}
+
 /// Epistemic relations whose truth is UNORDERED: `A contradicts B` and
 /// `B contradicts A` assert the same fact about the pair, so the graph must
 /// hold ONE edge for them, not two.
@@ -173,18 +227,21 @@ pub async fn do_link_epistemic(
     let source_id = parse_uuid(&params.source_claim_id)?;
     let target_id = parse_uuid(&params.target_claim_id)?;
 
-    // Tight allow-list — lowercase canonical epistemic relations, plus the
-    // separate structural set (currently just `cites`; see
-    // STRUCTURAL_RELATIONSHIPS doc comment for why it isn't folded into
-    // EPISTEMIC_RELATIONSHIPS).
+    // Tight allow-list — lowercase canonical epistemic relations, plus the two
+    // separate inert sets: structural (currently just `cites`) and temporal
+    // (currently just `shifted_to`). See each const's doc comment for why
+    // neither is folded into EPISTEMIC_RELATIONSHIPS.
     if !is_epistemic_relationship(&params.relationship)
         && !is_structural_relationship(&params.relationship)
+        && !is_temporal_relationship(&params.relationship)
     {
         return Err(invalid_params(format!(
-            "invalid relationship '{}'. Valid epistemic types: {}. Valid structural types: {}",
+            "invalid relationship '{}'. Valid epistemic types: {}. Valid structural types: {}. \
+             Valid temporal types: {}",
             params.relationship,
             EPISTEMIC_RELATIONSHIPS.join(", "),
             STRUCTURAL_RELATIONSHIPS.join(", "),
+            TEMPORAL_RELATIONSHIPS.join(", "),
         )));
     }
 
@@ -238,7 +295,7 @@ pub async fn do_link_epistemic(
         .await
         .map_err(internal_error)?
     } else {
-        let (row, created) = EdgeRepository::create_if_not_exists(
+        let written = EdgeRepository::create_if_not_exists(
             pool,
             source_id,
             "claim",
@@ -249,8 +306,31 @@ pub async fn do_link_epistemic(
             None,
             None,
         )
-        .await
-        .map_err(internal_error)?;
+        .await;
+        let (row, created) = match written {
+            Ok(pair) => pair,
+            // A direction-agnostic partial unique index rejected the INSERT
+            // (`epigraph_db::PAIR_UNIQUE_RELATIONSHIPS` — `alternative_of`,
+            // migration 042; `shifted_to`, migration 060). The directional
+            // `WHERE NOT EXISTS` inside `create_if_not_exists` only sees the
+            // caller's own orientation, so the reversed row slips past it and
+            // the index is what stops the write. That is a caller mistake, not
+            // a server fault: report it as `invalid_params` rather than
+            // surfacing a raw constraint violation as an internal error.
+            Err(epigraph_db::DbError::DuplicateKey { .. })
+                if epigraph_db::PAIR_UNIQUE_RELATIONSHIPS
+                    .contains(&params.relationship.as_str()) =>
+            {
+                return Err(invalid_params(format!(
+                    "'{}' already relates {} and {} in the opposite direction. This pair is \
+                     unique regardless of direction, so the reversal is not a second fact — \
+                     for `shifted_to` it asserts that each value succeeded the other in time. \
+                     Retract the existing edge if the direction recorded is wrong.",
+                    params.relationship, source_id, target_id,
+                )));
+            }
+            Err(e) => return Err(internal_error(e)),
+        };
         (row.id, created)
     };
 
@@ -428,6 +508,79 @@ mod tests {
         );
     }
 
+    /// THE FORK, pinned as a unit test so it fails at `cargo test --lib` speed
+    /// rather than only in the DB-backed fixture: `shifted_to` maps to
+    /// `RestrictionKind::Neutral`, i.e. it moves NO belief (backlog 52eff3ab).
+    ///
+    /// "The throughput ceiling shifted from 400/s to 900/s" is not evidence
+    /// that 400/s was ever false — it was true of an earlier world. A
+    /// `Negative` mapping (the `contradicts` treatment) would retroactively
+    /// falsify a correct historical measurement, which is exactly why
+    /// succession is a separate relationship from contradiction.
+    ///
+    /// Neutral is the ENGINE DEFAULT for an unmapped string, so what this test
+    /// really guards is the mirror of
+    /// `every_epistemic_relationship_maps_to_non_neutral`: it fails the moment
+    /// someone "fixes" the allow-list by appending `shifted_to` to
+    /// `EPISTEMIC_RELATIONSHIPS` or teaches the engine a polarity for it.
+    #[test]
+    fn shifted_to_is_temporal_and_maps_to_neutral() {
+        let profile = RestrictionProfile::scientific();
+        assert!(
+            is_temporal_relationship("shifted_to"),
+            "'shifted_to' must be accepted via TEMPORAL_RELATIONSHIPS"
+        );
+        assert!(
+            !is_epistemic_relationship("shifted_to"),
+            "'shifted_to' must NOT be in EPISTEMIC_RELATIONSHIPS — succession is not \
+             counter-evidence, and membership there would wire a mass function that \
+             retroactively falsifies a correct historical measurement"
+        );
+        assert!(
+            matches!(
+                restriction_kind_with_profile("shifted_to", &profile),
+                RestrictionKind::Neutral
+            ),
+            "'shifted_to' must map to RestrictionKind::Neutral — it licenses a retrieval \
+             preference, not a belief update"
+        );
+    }
+
+    /// The three allow-lists are pairwise DISJOINT, and every temporal relation
+    /// is inert. A relation that appeared in two lists would have an ambiguous
+    /// belief contract; one that appeared in the temporal list while mapping
+    /// non-Neutral would move belief behind the caller's back.
+    #[test]
+    fn temporal_set_is_disjoint_and_inert() {
+        let profile = RestrictionProfile::scientific();
+        for rel in TEMPORAL_RELATIONSHIPS {
+            assert!(
+                !is_epistemic_relationship(rel),
+                "'{rel}' is temporal and must not also be epistemic (the epistemic set is \
+                 defined as the belief-affecting one)"
+            );
+            assert!(
+                !is_structural_relationship(rel),
+                "'{rel}' must belong to exactly one allow-list; temporal and structural are \
+                 different claims about the world even though both are inert"
+            );
+            assert!(
+                matches!(
+                    restriction_kind_with_profile(rel, &profile),
+                    RestrictionKind::Neutral
+                ),
+                "temporal relationship '{rel}' must be Neutral (inert) — it re-ranks \
+                 retrieval, it does not move belief"
+            );
+        }
+        for rel in STRUCTURAL_RELATIONSHIPS {
+            assert!(
+                !is_temporal_relationship(rel),
+                "'{rel}' is structural and must not also be temporal"
+            );
+        }
+    }
+
     /// Pin the polarity split from the spec §4 table: the five positive
     /// relationships strengthen the target (`Positive`), the two negative ones
     /// weaken it (`Negative`). This catches an accidental sign flip in the
@@ -573,6 +726,14 @@ mod tests {
             assert!(
                 !is_structural_relationship(rel),
                 "'{rel}' must not also be structural (structural relations are Neutral)"
+            );
+            assert!(
+                !is_temporal_relationship(rel),
+                "'{rel}' must not also be temporal: succession is ORDERED and keeps the \
+                 DIRECTIONAL writer, backed by the anti-symmetric pair index \
+                 `edges_shifted_to_pair_uniq` (migration 060). Routing it through the \
+                 symmetric writer would silently accept the REVERSED assertion as the same \
+                 fact, when it is that fact's temporal contradiction."
             );
         }
         assert_eq!(

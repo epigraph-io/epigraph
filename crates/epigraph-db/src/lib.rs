@@ -104,7 +104,8 @@ pub use repos::community::{CommunityMemberRow, CommunityRow};
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
 pub use repos::edge::{
-    AttributedClaimRow, EdgeRow, EPISTEMIC_RELATIONSHIPS, SYMMETRIC_RELATIONSHIPS,
+    AttributedClaimRow, EdgeRow, EPISTEMIC_RELATIONSHIPS, PAIR_UNIQUE_RELATIONSHIPS,
+    SYMMETRIC_RELATIONSHIPS, TEMPORAL_SUCCESSION_RELATIONSHIP,
 };
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};

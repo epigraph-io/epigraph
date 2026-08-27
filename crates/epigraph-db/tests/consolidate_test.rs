@@ -226,6 +226,107 @@ async fn opposed_direction_alternative_of_does_not_violate_symmetric_index(pool:
     assert_eq!(still_current, 0, "transaction committed; sources retired");
 }
 
+/// The same HARD class for the SECOND pair-unique relationship, `shifted_to`
+/// (migration 060, backlog 52eff3ab). Ships with the index, because the index
+/// is what creates the hazard: `edges_shifted_to_pair_uniq` is keyed on
+/// `(LEAST, GREATEST)` exactly like `alternative_of`'s, so a merge that
+/// re-points a `shifted_to` edge into an already-occupied pair slot trips it
+/// and rolls the entire merge back before `is_current` flips — backlog
+/// 2905150e / issue #286 reproduced verbatim for a second relationship.
+///
+/// Direction is deliberately opposed, for a sharper reason than in the
+/// `alternative_of` case above. `shifted_to` is genuinely DIRECTIONAL — it is
+/// pair-unique without being symmetric — so a direction-aware dedup looks
+/// correct here right up until the index rejects it. The dedup must key on the
+/// PAIR (`epigraph_db::PAIR_UNIQUE_RELATIONSHIPS` drives that), not on what
+/// the relationship means.
+#[sqlx::test(migrations = "../../migrations")]
+async fn opposed_direction_shifted_to_does_not_violate_pair_index(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, agent, "ceiling 400/s", &[]).await;
+    let s2 = seed_claim(&pool, agent, "ceiling 400 per second", &[]).await;
+    let c = seed_claim(&pool, agent, "ceiling 900/s", &[]).await;
+
+    seed_edge(&pool, s1, c, "shifted_to").await; // s1 -> C
+    seed_edge(&pool, c, s2, "shifted_to").await; // C  -> s2  (opposite direction)
+
+    let res = ClaimRepository::consolidate(
+        &pool,
+        &[s1, s2],
+        "merged ceiling",
+        0.8,
+        ConsolidateMode::Merge,
+        "shift merge",
+        agent,
+    )
+    .await
+    .expect("merge must not trip edges_shifted_to_pair_uniq");
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges WHERE relationship='shifted_to'
+           AND (source_id=$1 OR target_id=$1)",
+    )
+    .bind(res.merged_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(total, 1, "one shifted_to edge survives the pair collapse");
+
+    // The merge actually committed — a rollback would leave sources current.
+    let still_current: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE id = ANY($1) AND is_current")
+            .bind(vec![s1, s2])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(still_current, 0, "transaction committed; sources retired");
+}
+
+/// The two pair-unique relationships must not delete EACH OTHER. Their indexes
+/// are per-relationship PARTIAL indexes, so an `alternative_of` edge and a
+/// `shifted_to` edge over the same pair do not collide — a dedup that keyed on
+/// the pair alone (dropping the relationship from the key) would silently
+/// destroy one of two legitimate, non-colliding facts.
+#[sqlx::test(migrations = "../../migrations")]
+async fn pair_unique_relationships_do_not_collapse_into_each_other(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, agent, "mixed a", &[]).await;
+    let s2 = seed_claim(&pool, agent, "mixed b", &[]).await;
+    let c = seed_claim(&pool, agent, "mixed third", &[]).await;
+
+    seed_edge(&pool, s1, c, "alternative_of").await;
+    seed_edge(&pool, c, s2, "shifted_to").await;
+
+    let res = ClaimRepository::consolidate(
+        &pool,
+        &[s1, s2],
+        "merged mixed",
+        0.8,
+        ConsolidateMode::Merge,
+        "mixed merge",
+        agent,
+    )
+    .await
+    .expect("consolidate");
+
+    for rel in ["alternative_of", "shifted_to"] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM edges WHERE relationship=$2
+               AND (source_id=$1 OR target_id=$1)",
+        )
+        .bind(res.merged_id)
+        .bind(rel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 1,
+            "'{rel}' must survive the merge: the two pair-unique relationships have SEPARATE \
+             partial indexes and do not collide with one another"
+        );
+    }
+}
+
 /// Edges interior to the merge would become merged→merged self-loops.
 #[sqlx::test(migrations = "../../migrations")]
 async fn interior_edges_do_not_become_self_loops(pool: PgPool) {
