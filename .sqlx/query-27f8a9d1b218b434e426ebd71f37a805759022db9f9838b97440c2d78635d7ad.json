@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE claims SET canonical_hash = d.h FROM (SELECT UNNEST($1::uuid[]) AS id, UNNEST($2::bytea[]) AS h) AS d WHERE claims.id = d.id",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "ByteaArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "27f8a9d1b218b434e426ebd71f37a805759022db9f9838b97440c2d78635d7ad"
+}

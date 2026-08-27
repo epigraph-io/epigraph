@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO claims (\n                id, content, content_hash, truth_value, agent_id, trace_id,\n                created_at, updated_at\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n            RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at\n            ",
+  "query": "\n            INSERT INTO claims (\n                id, content, content_hash, canonical_hash, truth_value, agent_id, trace_id,\n                created_at, updated_at\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n            RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -44,6 +44,7 @@
         "Uuid",
         "Text",
         "Bytea",
+        "Bytea",
         "Float8",
         "Uuid",
         "Uuid",
@@ -61,5 +62,5 @@
       false
     ]
   },
-  "hash": "b93c68d5235227b73a98f090799bf9f7dd3c5a41a602ddb2dc191a67bd346c43"
+  "hash": "a79c37cdc3052f5071c309285c3127ade47983b1f845c0c8f1e8225d73e12c4c"
 }

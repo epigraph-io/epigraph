@@ -19,6 +19,7 @@ sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+unicode-normalization = { workspace = true }  # NFC for content-hash input canonicalization
 
 [features]
 recrypt = []  # Placeholder for future true PRE backend

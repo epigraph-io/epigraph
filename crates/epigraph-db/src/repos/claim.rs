@@ -207,6 +207,7 @@ impl ClaimRepository {
 
         // Calculate content hash using BLAKE3
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
+        let canonical_hash = ContentHasher::hash_canonical_text(&claim.content);
 
         // Dedup: if a claim with this content already exists, return it instead of
         // inserting a duplicate. Two round-trips are acceptable; the race window is
@@ -235,15 +236,16 @@ impl ClaimRepository {
         let row = sqlx::query!(
             r#"
             INSERT INTO claims (
-                id, content, content_hash, truth_value, agent_id, trace_id,
+                id, content, content_hash, canonical_hash, truth_value, agent_id, trace_id,
                 created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at
             "#,
             id,
             claim.content,
             content_hash.as_slice(),
+            canonical_hash.as_slice(),
             truth_value,
             agent_id,
             trace_id,
@@ -447,6 +449,7 @@ impl ClaimRepository {
         let created_at = claim.created_at;
         let updated_at = claim.updated_at;
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
+        let canonical_hash = ContentHasher::hash_canonical_text(&claim.content);
 
         use sqlx::Row;
 
@@ -474,13 +477,14 @@ impl ClaimRepository {
         }
 
         let row = sqlx::query(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            r#"INSERT INTO claims (id, content, content_hash, canonical_hash, truth_value, agent_id, trace_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
         )
         .bind(id)
         .bind(&claim.content)
         .bind(content_hash.as_slice())
+        .bind(canonical_hash.as_slice())
         .bind(truth_value)
         .bind(agent_id)
         .bind(trace_id)
@@ -2090,7 +2094,7 @@ impl ClaimRepository {
         // Build multi-value INSERT query dynamically
         // PostgreSQL supports multi-row VALUES: INSERT INTO t VALUES (...), (...), (...)
         let mut query_builder = String::from(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at)
+            r#"INSERT INTO claims (id, content, content_hash, canonical_hash, truth_value, agent_id, trace_id, created_at, updated_at)
                VALUES "#,
         );
 
@@ -2101,7 +2105,7 @@ impl ClaimRepository {
                 query_builder.push_str(", ");
             }
             query_builder.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 param_idx,
                 param_idx + 1,
                 param_idx + 2,
@@ -2109,9 +2113,10 @@ impl ClaimRepository {
                 param_idx + 4,
                 param_idx + 5,
                 param_idx + 6,
-                param_idx + 7
+                param_idx + 7,
+                param_idx + 8
             ));
-            param_idx += 8;
+            param_idx += 9;
         }
 
         query_builder.push_str(
@@ -2123,6 +2128,10 @@ impl ClaimRepository {
         let content_hashes: Vec<Vec<u8>> = claims
             .iter()
             .map(|c| ContentHasher::hash(c.content.as_bytes()).to_vec())
+            .collect();
+        let canonical_hashes: Vec<Vec<u8>> = claims
+            .iter()
+            .map(|c| ContentHasher::hash_canonical_text(&c.content).to_vec())
             .collect();
 
         // Build the query with all parameters
@@ -2137,6 +2146,7 @@ impl ClaimRepository {
                 .bind(id)
                 .bind(&claim.content)
                 .bind(&content_hashes[i])
+                .bind(&canonical_hashes[i])
                 .bind(claim.truth_value.value())
                 .bind(agent_id)
                 .bind(trace_id)
@@ -2267,6 +2277,7 @@ impl ClaimRepository {
         let old_uuid: Uuid = old_claim_id.into();
         let new_uuid = Uuid::new_v4();
         let content_hash = ContentHasher::hash(new_content.as_bytes());
+        let canonical_hash = ContentHasher::hash_canonical_text(new_content);
         let new_truth_val = new_truth.value();
 
         let mut tx = pool.begin().await?;
@@ -2321,14 +2332,15 @@ impl ClaimRepository {
         // search. Properties are NOT copied either (see above) — callers must
         // re-set them explicitly if needed.
         sqlx::query(
-            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+            "INSERT INTO claims (id, content, content_hash, canonical_hash, truth_value, agent_id, \
                                  supersedes, is_current, labels, \
                                  created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, true, $7, NOW(), NOW())",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, NOW(), NOW())",
         )
         .bind(new_uuid)
         .bind(new_content)
         .bind(content_hash.as_slice())
+        .bind(canonical_hash.as_slice())
         .bind(new_truth_val)
         .bind(agent_id)
         .bind(old_uuid)
@@ -2425,6 +2437,64 @@ impl ClaimRepository {
         }
     }
 
+    /// Find an existing claim by `(canonical_hash, agent_id)` (backlog e09986c2).
+    ///
+    /// The CANONICAL twin of [`Self::find_by_content_hash_and_agent`]. That one
+    /// keys on BLAKE3 over the submitted bytes; this one keys on BLAKE3 over
+    /// the canonicalized text (NFC, zero-width controls stripped, whitespace
+    /// runs collapsed — see `epigraph_crypto::canonicalize_for_hash`), so a
+    /// resubmission that renders identically but differs in normalization form,
+    /// invisible characters, or whitespace still finds the stored row.
+    ///
+    /// Rows whose `canonical_hash` is NULL — legacy rows awaiting the
+    /// `backfill_canonical_hash` CLI, and writers outside `ClaimRepository` —
+    /// are simply not found, exactly as before this column existed. The
+    /// `canonical_hash IS NOT NULL` predicate makes that explicit and lets the
+    /// partial index from migration 061 serve the query.
+    ///
+    /// `LIMIT 1` and not an error on multiplicity: `canonical_hash` is
+    /// deliberately NOT unique (migration 061 explains why), so cosmetic
+    /// duplicate pairs written before this change can both match. Returning
+    /// either collapses the pair going forward, which is the point.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn find_by_canonical_hash_and_agent(
+        conn: &mut sqlx::PgConnection,
+        canonical_hash: &[u8],
+        agent_id: Uuid,
+    ) -> Result<Option<Claim>, DbError> {
+        use sqlx::Row;
+
+        let row = sqlx::query(
+            r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+               FROM claims
+               WHERE canonical_hash = $1 AND agent_id = $2 AND canonical_hash IS NOT NULL
+               ORDER BY created_at, id
+               LIMIT 1"#,
+        )
+        .bind(canonical_hash)
+        .bind(agent_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        match row {
+            Some(row) => {
+                let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
+                Ok(Some(claim_from_row(
+                    row.get("id"),
+                    row.get("content"),
+                    row.get("agent_id"),
+                    row.get("trace_id"),
+                    tv,
+                    row.get("created_at"),
+                    row.get("updated_at"),
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Insert a claim row unconditionally (no implicit dedup).
     ///
     /// Use this when the caller has already determined that an insert is
@@ -2456,15 +2526,19 @@ impl ClaimRepository {
         let created_at = claim.created_at;
         let updated_at = claim.updated_at;
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
+        // Lookup-only second digest (backlog e09986c2). `content_hash` above is
+        // untouched — it still carries the UNIQUE constraint and the signature.
+        let canonical_hash = ContentHasher::hash_canonical_text(&claim.content);
 
         let row = sqlx::query(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            r#"INSERT INTO claims (id, content, content_hash, canonical_hash, truth_value, agent_id, trace_id, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
         )
         .bind(id)
         .bind(&claim.content)
         .bind(content_hash.as_slice())
+        .bind(canonical_hash.as_slice())
         .bind(truth_value)
         .bind(agent_id)
         .bind(trace_id)
@@ -2511,11 +2585,110 @@ impl ClaimRepository {
         ))
     }
 
-    /// Find-or-insert a claim by `(content_hash, agent_id)`.
+    /// How many rows still have no `canonical_hash` (backlog e09986c2).
+    ///
+    /// Drives the `backfill_canonical_hash` CLI's progress reporting and its
+    /// `--dry-run`. Trends to zero as the backfill runs; a rise afterwards
+    /// means a writer outside `ClaimRepository` is inserting claims without
+    /// the column, and stage 2 of `create_or_get` is blind to its rows.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn count_missing_canonical_hash(pool: &PgPool) -> Result<i64, DbError> {
+        let n = sqlx::query_scalar!("SELECT COUNT(*) FROM claims WHERE canonical_hash IS NULL")
+            .fetch_one(pool)
+            .await?;
+        Ok(n.unwrap_or(0))
+    }
+
+    /// Backfill one chunk of `canonical_hash`, returning how many rows it set.
+    ///
+    /// Returns `0` when nothing is left, which is the caller's termination
+    /// signal.
+    ///
+    /// # Why this is Rust and not SQL
+    ///
+    /// BLAKE3 has no PostgreSQL function and NFC normalization has no
+    /// stock-Postgres equivalent, so migration 061 could neither `DEFAULT` this
+    /// column nor fill it with an `UPDATE ... SET canonical_hash = <expr>`.
+    /// The digest has to be computed process-side by the same
+    /// `ContentHasher::hash_canonical_text` the write path uses — anything else
+    /// risks a backfilled value that the write path would never reproduce.
+    ///
+    /// # Why it is resumable without a cursor
+    ///
+    /// The `WHERE canonical_hash IS NULL` predicate is self-consuming: every
+    /// row this chunk touches leaves the candidate set permanently. An
+    /// interrupted run therefore resumes simply by being re-invoked, and a
+    /// completed run is a no-op. `ORDER BY id` only makes the paging
+    /// deterministic for logging.
+    ///
+    /// The whole chunk lands in one `UPDATE ... FROM (SELECT UNNEST(...))`, so
+    /// a chunk is atomic: it either sets every row it read or none of them.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn backfill_canonical_hash_chunk(
+        pool: &PgPool,
+        chunk_size: i64,
+    ) -> Result<u64, DbError> {
+        let rows = sqlx::query!(
+            "SELECT id, content FROM claims WHERE canonical_hash IS NULL ORDER BY id LIMIT $1",
+            chunk_size
+        )
+        .fetch_all(pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+        let hashes: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|r| ContentHasher::hash_canonical_text(&r.content).to_vec())
+            .collect();
+
+        let result = sqlx::query!(
+            "UPDATE claims SET canonical_hash = d.h \
+             FROM (SELECT UNNEST($1::uuid[]) AS id, UNNEST($2::bytea[]) AS h) AS d \
+             WHERE claims.id = d.id",
+            &ids[..],
+            &hashes[..]
+        )
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Find-or-insert a claim by `(content_hash, agent_id)`, falling back to
+    /// `(canonical_hash, agent_id)`.
     ///
     /// Looks up an existing row first; if found, returns it with
     /// `was_created=false`. Otherwise inserts and returns the new row with
     /// `was_created=true`.
+    ///
+    /// # Two-stage lookup (backlog e09986c2)
+    ///
+    /// 1. **Exact.** `(content_hash, agent_id)` — BLAKE3 over the submitted
+    ///    bytes. Cheapest, unchanged, and served by
+    ///    `uq_claims_content_hash_agent`'s index. It hits every row in the
+    ///    table, backfilled or not.
+    /// 2. **Canonical.** `(canonical_hash, agent_id)` — BLAKE3 over the
+    ///    canonicalized text. Catches the resubmission that renders identically
+    ///    but differs in Unicode normalization form (`caf\u{e9}` vs
+    ///    `cafe\u{301}`), in invisible characters (U+200B, U+FEFF), or in
+    ///    whitespace runs. Without it each such variant misses stage 1 and
+    ///    lands a SECOND row for the SAME agent.
+    ///
+    /// Exact-first is not merely an optimization: it guarantees that a
+    /// byte-identical resubmit resolves to the byte-identical row even when a
+    /// cosmetic sibling of it also exists from the pre-fix era.
+    ///
+    /// Stage 2 finds nothing on rows whose `canonical_hash` is still NULL
+    /// (legacy, pre-backfill), so before `backfill_canonical_hash` runs this is
+    /// exactly today's behaviour — never worse for anyone.
     ///
     /// **Post-107 race handling:** if a concurrent writer inserts the same
     /// `(content_hash, agent_id)` between the find and the insert, the INSERT
@@ -2545,8 +2718,18 @@ impl ClaimRepository {
         let agent_id: Uuid = claim.agent_id.into();
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
+        // Stage 1: exact bytes.
         if let Some(existing) =
             Self::find_by_content_hash_and_agent(&mut *conn, content_hash.as_slice(), agent_id)
+                .await?
+        {
+            return Ok((existing, false));
+        }
+
+        // Stage 2: canonicalized text.
+        let canonical_hash = ContentHasher::hash_canonical_text(&claim.content);
+        if let Some(existing) =
+            Self::find_by_canonical_hash_and_agent(&mut *conn, canonical_hash.as_slice(), agent_id)
                 .await?
         {
             return Ok((existing, false));
@@ -2556,6 +2739,13 @@ impl ClaimRepository {
             Ok(c) => Ok((c, true)),
             Err(DbError::DuplicateKey { .. }) => {
                 // Post-107 race: another writer won. Re-find and return.
+                //
+                // Re-found on `content_hash`, NOT `canonical_hash`: the only
+                // unique constraint on `claims` is
+                // `uq_claims_content_hash_agent`, so a DuplicateKey here can
+                // only mean a concurrent writer inserted this exact BYTE
+                // sequence. `canonical_hash` is deliberately non-unique
+                // (migration 061) and therefore can never raise this error.
                 let existing = Self::find_by_content_hash_and_agent(
                     &mut *conn,
                     content_hash.as_slice(),
@@ -2589,15 +2779,22 @@ impl ClaimRepository {
         truth: TruthValue,
         labels: &[String],
     ) -> Result<bool, DbError> {
+        // The caller supplies `content_hash` (ingest derives the row's PRIMARY
+        // KEY from it via `ids::atom_id`, so it must stay raw BLAKE3 over the
+        // submitted bytes — see backlog e09986c2). `canonical_hash` is derived
+        // here from `content` instead: it is lookup-only and feeds no id.
+        let canonical_hash = ContentHasher::hash_canonical_text(content);
+
         let row: Option<(bool,)> = sqlx::query_as(
-            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+            "INSERT INTO claims (id, content, content_hash, canonical_hash, agent_id, truth_value, labels) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (id) DO NOTHING \
              RETURNING (xmax = 0) AS was_inserted",
         )
         .bind(id)
         .bind(content)
         .bind(content_hash.as_slice())
+        .bind(canonical_hash.as_slice())
         .bind(agent_id)
         .bind(truth.value())
         .bind(labels)
@@ -3013,17 +3210,19 @@ impl ClaimRepository {
 
         let new_uuid = Uuid::new_v4();
         let hash = ContentHasher::hash(new_content.as_bytes());
+        let canonical_hash = ContentHasher::hash_canonical_text(new_content);
         let properties = serde_json::json!({
             "level": level,
             "step_lineage_id": lineage_id.to_string(),
         });
         sqlx::query(
-            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels, properties, step_lineage_id) \
-             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6)",
+            "INSERT INTO claims (id, content, content_hash, canonical_hash, truth_value, agent_id, is_current, labels, properties, step_lineage_id) \
+             VALUES ($1, $2, $3, $4, 0.5, $5, true, ARRAY[]::text[], $6, $7)",
         )
         .bind(new_uuid)
         .bind(new_content)
         .bind(hash.as_slice())
+        .bind(canonical_hash.as_slice())
         .bind(agent_id)
         .bind(&properties)
         .bind(lineage_id)
@@ -4927,6 +5126,8 @@ impl ClaimRepository {
             }
         });
         let content_hash = epigraph_crypto::ContentHasher::hash(merged_content.as_bytes()).to_vec();
+        let canonical_hash =
+            epigraph_crypto::ContentHasher::hash_canonical_text(merged_content).to_vec();
 
         // Post-107 (content_hash, agent_id) uniqueness: an identical merged
         // claim by this agent is returned rather than erroring (novelty-gate
@@ -4951,13 +5152,14 @@ impl ClaimRepository {
 
         let merged_id = sqlx::query_scalar!(
             r#"
-            INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current,
-                                labels, properties)
-            VALUES ($1, $2, $3, $4, true, $5, $6)
+            INSERT INTO claims (content, content_hash, canonical_hash, truth_value, agent_id,
+                                is_current, labels, properties)
+            VALUES ($1, $2, $3, $4, $5, true, $6, $7)
             RETURNING id
             "#,
             merged_content,
             content_hash.as_slice(),
+            canonical_hash.as_slice(),
             merged_truth.clamp(0.0, 1.0),
             acting_agent_id,
             &labels[..],

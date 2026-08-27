@@ -22,6 +22,7 @@ pub mod hasher;
 pub mod key_exchange;
 pub mod proxy_re;
 pub mod signer;
+pub mod text_canon;
 pub mod verifier;
 
 pub use canonical::{to_canonical_bytes, to_canonical_json, Canonical};
@@ -37,6 +38,7 @@ pub use key_exchange::{
     wrap_group_key,
 };
 pub use signer::AgentSigner;
+pub use text_canon::canonicalize_for_hash;
 pub use verifier::SignatureVerifier;
 
 /// Standard hash output size (BLAKE3 produces 32 bytes)

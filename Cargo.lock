@@ -1367,6 +1367,7 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror 1.0.69",
+ "unicode-normalization",
  "x25519-dalek",
 ]
 

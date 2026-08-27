@@ -121,6 +121,10 @@ ndarray = "0.15"
 # Text parsing
 regex = "1"
 walkdir = "2"
+# Unicode NFC normalization for content-hash input canonicalization (backlog
+# e09986c2). Already in the tree transitively via stringprep <- sqlx-postgres,
+# so this direct edge pulls no new crates.
+unicode-normalization = "0.1"
 
 # Testing
 proptest = "1"

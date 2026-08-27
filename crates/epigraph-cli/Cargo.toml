@@ -96,6 +96,11 @@ path = "src/bin/prune_recall_events.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "backfill_canonical_hash"
+path = "src/bin/backfill_canonical_hash.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "embed_backfill"
 path = "src/bin/embed_backfill.rs"
 required-features = ["db"]

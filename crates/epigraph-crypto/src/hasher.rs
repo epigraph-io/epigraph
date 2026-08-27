@@ -22,6 +22,27 @@ impl ContentHasher {
         blake3::hash(data).into()
     }
 
+    /// Hash text after canonicalizing the **hash input** (backlog e09986c2)
+    ///
+    /// Equivalent to `hash(canonicalize_for_hash(text).as_bytes())`: the text
+    /// is NFC-normalized, stripped of zero-width format controls, and its
+    /// whitespace runs collapsed before hashing. Two strings that render
+    /// identically therefore share a digest.
+    ///
+    /// This is deliberately a SECOND digest, not a replacement for
+    /// [`Self::hash`]. `claims.content_hash` — which carries a UNIQUE
+    /// constraint, backs client-supplied hash overrides, is signed by MCP, and
+    /// is recorded in the signature-revocation audit trail — stays raw BLAKE3
+    /// over the submitted bytes. Only `claims.canonical_hash`, a lookup-only
+    /// column with no uniqueness, uses this.
+    ///
+    /// Not a security control: see [`crate::text_canon`] for what
+    /// canonicalization does and does not fold together.
+    #[must_use]
+    pub fn hash_canonical_text(text: &str) -> [u8; HASH_SIZE] {
+        Self::hash(crate::text_canon::canonicalize_for_hash(text).as_bytes())
+    }
+
     /// Hash a canonically serializable type
     ///
     /// The value is first serialized to canonical JSON, then hashed.
@@ -487,6 +508,74 @@ mod tests {
                 "Hash of {input:?} should not be all zeros"
             );
         }
+    }
+
+    // ============ Canonical-text hashing (backlog e09986c2) ============
+
+    #[test]
+    fn hash_canonical_text_folds_cosmetic_variants() {
+        let pairs = [
+            (
+                "The caf\u{00e9} protocol raises yield.",
+                "The cafe\u{0301} protocol raises yield.",
+            ),
+            (
+                "Ribosome profiling resolves translation rates.",
+                "Ribosome\u{200b} profiling resolves translation\u{feff} rates.",
+            ),
+            (
+                "CRISPR knockouts reduce tumour volume.",
+                "CRISPR  knockouts reduce tumour volume.\n",
+            ),
+        ];
+
+        for (a, b) in pairs {
+            assert_ne!(
+                ContentHasher::hash(a.as_bytes()),
+                ContentHasher::hash(b.as_bytes()),
+                "fixture: raw hashes must differ, else the fold proves nothing"
+            );
+            assert_eq!(
+                ContentHasher::hash_canonical_text(a),
+                ContentHasher::hash_canonical_text(b),
+                "canonical digests must agree for {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_canonical_text_still_separates_different_text() {
+        assert_ne!(
+            ContentHasher::hash_canonical_text("yield rises"),
+            ContentHasher::hash_canonical_text("yield falls")
+        );
+    }
+
+    #[test]
+    fn hash_canonical_text_equals_hash_of_canonical_form() {
+        let messy = "  Ribosome\u{200b}  profiling\tresolves rates.\n";
+        assert_eq!(
+            ContentHasher::hash_canonical_text(messy),
+            ContentHasher::hash(crate::canonicalize_for_hash(messy).as_bytes())
+        );
+    }
+
+    #[test]
+    fn hash_canonical_text_leaves_raw_hash_untouched() {
+        // The invariant the additive design rests on: `hash` is unchanged, so
+        // every persisted `claims.content_hash` keeps its value.
+        let text = "already canonical text";
+        assert_eq!(
+            ContentHasher::hash(text.as_bytes()),
+            ContentHasher::hash_canonical_text(text),
+            "for already-canonical text the two digests coincide"
+        );
+        let messy = "already  canonical text ";
+        assert_ne!(
+            ContentHasher::hash(messy.as_bytes()),
+            ContentHasher::hash_canonical_text(messy),
+            "for non-canonical text they must diverge"
+        );
     }
 
     // ==================== Domain separation tests ====================
