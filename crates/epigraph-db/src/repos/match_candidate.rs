@@ -167,11 +167,18 @@ impl MatchCandidateRepo {
     /// path strictly additive — it either creates a fresh pending row or leaves
     /// the existing row byte-identical.
     ///
-    /// `matcher_run_id`, `verifier_verdict` and `verifier_rationale` are absent
-    /// from the column list on purpose, so they land NULL: this is not a matcher
-    /// run, and a lexical heuristic is not a verdict. See
+    /// `verifier_verdict` and `verifier_rationale` are absent from the column
+    /// list on purpose, so they land NULL: no model was asked anything on this
+    /// path, and a lexical heuristic is not a verdict. See
     /// `epigraph_engine::matching::verifier::is_unverified_write_time_scan` for
     /// the guard that stops a NULL verdict from being read as "corroborates".
+    ///
+    /// `run_id` is a parameter rather than a hardcoded NULL because two
+    /// verifier-free producers share this write: the write-time contradiction
+    /// scan (`None` — a submission is not a matcher run) and
+    /// `epigraph_engine::matching::pipeline::stage_candidates` (`Some(_)` — it
+    /// really is a blocking+scoring run, just an unverified one, and the tool
+    /// hands the operator that run id to find the rows again).
     pub async fn insert_if_absent(
         &self,
         claim_a: Uuid,
@@ -179,11 +186,13 @@ impl MatchCandidateRepo {
         score: f32,
         features: serde_json::Value,
         status: &str,
+        run_id: Option<Uuid>,
     ) -> sqlx::Result<Option<Uuid>> {
         debug_assert!(claim_a < claim_b, "callers must pass canonical order");
         sqlx::query_scalar(
-            "INSERT INTO match_candidates (claim_a, claim_b, score, features, status)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO match_candidates
+                (claim_a, claim_b, score, features, status, matcher_run_id)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (claim_a, claim_b) DO NOTHING
              RETURNING id",
         )
@@ -192,28 +201,47 @@ impl MatchCandidateRepo {
         .bind(score)
         .bind(Json(features))
         .bind(status)
+        .bind(run_id)
         .fetch_optional(&self.pool)
         .await
     }
 
-    /// Of the given pairs, which ones already carry a verifier verdict or an
-    /// operator decision. Caller MUST pass canonical (`claim_a < claim_b`)
-    /// pairs — the same contract `union_block`'s output satisfies.
+    /// Of the given pairs, which ones already have a `match_candidates` row —
+    /// in ANY status, verdict or decision state. Caller MUST pass canonical
+    /// (`claim_a < claim_b`) pairs, the same contract `union_block`'s output
+    /// satisfies.
     ///
-    /// This is the re-stage guard. [`MatchCandidateRepo::upsert`]'s status gate
-    /// keys on `decided_at IS NOT NULL`, which protects operator rulings — but
-    /// the matcher's own verifier-set `status='rejected'` rows have `decided_at`
-    /// NULL (deliberately, see the `upsert` doc above), so an unguarded
-    /// verifier-free re-stage would flip those rows back to `'pending'` while
-    /// `COALESCE` preserved their `distinct` verdict. The result is a row that
-    /// sits in the human review queue and that
-    /// `promotion_disposition_for_column` then refuses to promote: permanent
-    /// junk, and a resurrection of pairs the LLM already ruled distinct.
+    /// This is the pre-filter for the verifier-free staging path
+    /// (`epigraph_engine::matching::pipeline::stage_candidates`), and it is
+    /// deliberately "any existing row", not "verified or decided rows". Three
+    /// distinct hazards live under one predicate that way:
     ///
-    /// Verdict-carrying rows are excluded too, not just decided ones: a pair the
-    /// verifier has already answered on does not need a second, weaker,
-    /// unverified opinion.
-    pub async fn verified_or_decided_pairs(
+    /// 1. **Marker erasure.** The write-time contradiction scan stages rows
+    ///    whose `features->>'source'` is the `write_time_contradiction_scan`
+    ///    marker with `verifier_verdict` and `decided_at` both NULL — so a
+    ///    verdict/decision predicate does NOT match them. Re-staging such a
+    ///    pair through [`MatchCandidateRepo::upsert`] would overwrite `features`
+    ///    with the scorer's 9-feature blend, which carries no `source` key;
+    ///    `is_unverified_write_time_scan` would then return false and a
+    ///    *promote* would write CORROBORATES on a pair a detector flagged as
+    ///    contradictory. That inversion is exactly what that guard exists to
+    ///    block.
+    /// 2. **Rejected-row resurrection.** [`MatchCandidateRepo::upsert`]'s status
+    ///    gate keys on `decided_at IS NOT NULL`, but the matcher's own
+    ///    verifier-set `status='rejected'` rows carry `decided_at` NULL
+    ///    (deliberately, see the `upsert` doc above), so an unguarded re-stage
+    ///    would flip them back to `'pending'` while `COALESCE` kept their
+    ///    `distinct` verdict — a queue row `promotion_disposition_for_column`
+    ///    then refuses to promote: permanent junk.
+    /// 3. **Wasted work.** Each surviving pair costs a `score_pair` round trip.
+    ///    Skipping pairs whose row already exists is also the cheapest branch.
+    ///
+    /// The pre-filter is the first of two layers, not the only one: the staging
+    /// write itself goes through [`MatchCandidateRepo::insert_if_absent`], so a
+    /// pair that acquires a row between this read and that insert is still left
+    /// byte-identical. Do not "optimise" the staging path back onto `upsert` on
+    /// the strength of this filter.
+    pub async fn existing_pairs(
         &self,
         pairs: &[(Uuid, Uuid)],
     ) -> sqlx::Result<std::collections::HashSet<(Uuid, Uuid)>> {
@@ -224,8 +252,7 @@ impl MatchCandidateRepo {
         let b_side: Vec<Uuid> = pairs.iter().map(|&(_, b)| b).collect();
         let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
             "SELECT claim_a, claim_b FROM match_candidates
-             WHERE (claim_a, claim_b) IN (SELECT * FROM UNNEST($1::uuid[], $2::uuid[]))
-               AND (verifier_verdict IS NOT NULL OR decided_at IS NOT NULL)",
+             WHERE (claim_a, claim_b) IN (SELECT * FROM UNNEST($1::uuid[], $2::uuid[]))",
         )
         .bind(&a_side)
         .bind(&b_side)

@@ -289,7 +289,11 @@ fn stage_report_json(report: &StageReport, seeds: usize, dry_run: bool) -> serde
         "truncated_pairs": report.truncated_pairs,
         "staged":          report.staged,
         "below_band":      report.below_band,
-        "already_decided": report.already_decided,
+        // Pairs left alone because they already had a row. Staging is additive:
+        // it never overwrites an existing candidate, so re-running is a no-op
+        // on everything already in the queue.
+        "already_present": report.already_present,
+        "write_conflicts": report.write_conflicts,
         "dry_run":         dry_run,
         // Load-bearing, not decoration: staged rows carry
         // `verifier_verdict = NULL`, and `promotion_disposition_for_column(None)`
@@ -403,14 +407,16 @@ mod tests {
             scanned_pairs: 25,
             truncated_pairs: 10,
             staged: 7,
-            below_band: 18,
-            already_decided: 5,
+            below_band: 17,
+            already_present: 5,
+            write_conflicts: 1,
             wrote_rows: true,
         };
         let v = stage_report_json(&report, 3, false);
         assert_eq!(v["verified"], serde_json::json!(false));
         assert_eq!(v["truncated_pairs"], serde_json::json!(10));
-        assert_eq!(v["already_decided"], serde_json::json!(5));
+        assert_eq!(v["already_present"], serde_json::json!(5));
+        assert_eq!(v["write_conflicts"], serde_json::json!(1));
         assert_eq!(v["staged"], serde_json::json!(7));
         assert_eq!(v["seeds"], serde_json::json!(3));
         assert_eq!(v["dry_run"], serde_json::json!(false));

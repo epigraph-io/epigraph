@@ -32,7 +32,55 @@ pub enum PolicyAction {
     Stage,
 }
 
+/// How an action commits its `match_candidates` row.
+///
+/// This is a two-value enum rather than a bool so the call site reads as the
+/// SQL it selects, and so [`PolicyAction::write_mode`] can be table-tested
+/// without a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateWrite {
+    /// `MatchCandidateRepo::upsert` — re-scores an existing row in place.
+    /// Correct only for a path that carries new information about the pair,
+    /// i.e. one that writes a real `verifier_verdict` in the same statement.
+    Upsert,
+    /// `MatchCandidateRepo::insert_if_absent` — creates a row or leaves the
+    /// existing one byte-identical. The only safe mode for a verifier-free
+    /// path; see [`PolicyAction::write_mode`].
+    InsertIfAbsent,
+}
+
 impl PolicyAction {
+    /// Which write this action performs.
+    ///
+    /// The three verified actions upsert: `run_pipeline` always passes a
+    /// `Some(_)` verdict alongside them, so replacing the row's `features` and
+    /// `score` is the point of the write, and the fresh verdict lands in the
+    /// same statement.
+    ///
+    /// [`PolicyAction::Stage`] must NOT upsert, and this is a data-safety
+    /// requirement, not a preference. `upsert`'s `ON CONFLICT` sets
+    /// `features = EXCLUDED.features` unconditionally — only the verdict and
+    /// status columns sit behind the `decided_at` gate. The write-time
+    /// contradiction scan stages rows carrying
+    /// `features->>'source' = 'write_time_contradiction_scan'` with
+    /// `verifier_verdict` and `decided_at` both NULL, and
+    /// `MatchFeatures` has no `source` field. So a staging upsert over such a
+    /// row erases the marker, `is_unverified_write_time_scan(None, features)`
+    /// flips to false, and a subsequent *promote* falls through
+    /// `promotion_disposition_for_column(None)` to `Corroborate` — writing a
+    /// CORROBORATES edge on a pair a detector flagged as contradictory. Staging
+    /// learns nothing new about a pair that already has a row, so it writes
+    /// nothing.
+    #[must_use]
+    pub fn write_mode(self) -> CandidateWrite {
+        match self {
+            PolicyAction::AutoPromote | PolicyAction::WriteContradicts | PolicyAction::Reject => {
+                CandidateWrite::Upsert
+            }
+            PolicyAction::Stage => CandidateWrite::InsertIfAbsent,
+        }
+    }
+
     /// The `match_candidates.status` this action writes.
     ///
     /// `auto_promote` gates BOTH the edge write ([`Self::edge_relationship`])
@@ -153,6 +201,37 @@ impl Policy {
         Ok(outcome.id)
     }
 
+    /// Stage the pair as a new row, or leave an existing row untouched.
+    ///
+    /// Returns `Some(id)` when a row was created and `None` when one already
+    /// existed. `None` is a normal outcome, not an error: the caller pre-filters
+    /// with `MatchCandidateRepo::existing_pairs`, so it means this run lost a
+    /// race with a concurrent writer between that read and this insert.
+    ///
+    /// Uses [`CandidateWrite::InsertIfAbsent`] — see [`PolicyAction::write_mode`]
+    /// for why a verifier-free path may never overwrite an existing row's
+    /// `features`.
+    async fn stage_candidate(
+        &self,
+        lo: Uuid,
+        hi: Uuid,
+        f: &MatchFeatures,
+        features_json: serde_json::Value,
+        status: &str,
+    ) -> anyhow::Result<Option<Uuid>> {
+        Ok(self
+            .repo
+            .insert_if_absent(lo, hi, f.score, features_json, status, Some(self.run_id))
+            .await?)
+    }
+
+    /// Apply `action` to the pair: write the candidate row, and the edge when
+    /// the action commits one.
+    ///
+    /// Returns `true` when a candidate row was actually written. Only
+    /// [`PolicyAction::Stage`] can return `false` — it declines to touch a pair
+    /// that already has a row (see [`PolicyAction::write_mode`]); the upserting
+    /// actions always write.
     pub async fn act(
         &self,
         action: PolicyAction,
@@ -160,7 +239,7 @@ impl Policy {
         b: Uuid,
         f: &MatchFeatures,
         verdict: Option<Verdict>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         // Canonicalize: match_candidates has a CHECK (claim_a < claim_b).
         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
 
@@ -179,13 +258,30 @@ impl Policy {
         // body is what makes "Stage never writes an edge" assertable in a unit
         // test with no database.
         let status = action.candidate_status(self.auto_promote);
-        let id = self
-            .upsert_candidate(lo, hi, f, features_json, status, verdict.as_ref())
-            .await?;
+        let id = match action.write_mode() {
+            CandidateWrite::Upsert => Some(
+                self.upsert_candidate(lo, hi, f, features_json, status, verdict.as_ref())
+                    .await?,
+            ),
+            CandidateWrite::InsertIfAbsent => {
+                debug_assert!(
+                    verdict.is_none(),
+                    "an insert-if-absent action must not carry a verdict: the verdict columns \
+                     are not in that INSERT's column list, so it would be silently dropped"
+                );
+                self.stage_candidate(lo, hi, f, features_json, status)
+                    .await?
+            }
+        };
+        let Some(id) = id else {
+            // Nothing was written, so there is nothing to hang an edge off.
+            // Only reachable on the Stage path, which writes no edge anyway.
+            return Ok(false);
+        };
         if let Some(rel) = action.edge_relationship(self.auto_promote) {
             self.write_edge(a, b, rel, f, id, verdict.as_ref()).await?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Insert a claim→claim edge, skipping if the same relationship already
@@ -279,12 +375,68 @@ mod tests {
     }
 
     /// Casing is identity for edge dedup (see the `CONTRADICTS_RELATIONSHIP`
-    /// doc), so the contradicts edge must stay lowercase — and must never be
-    /// confused with CORROBORATES, which is its exact inverse.
+    /// doc), so the contradicts edge must stay lowercase.
     #[test]
     fn contradicts_edge_stays_lowercase_through_the_action_table() {
-        let rel = PolicyAction::WriteContradicts.edge_relationship(true);
-        assert_eq!(rel, Some("contradicts"));
-        assert_ne!(rel, Some(CORROBORATES_RELATIONSHIP));
+        assert_eq!(
+            PolicyAction::WriteContradicts.edge_relationship(true),
+            Some("contradicts")
+        );
+    }
+
+    /// The data-safety pin for `stage_cross_source_matches`.
+    ///
+    /// `MatchCandidateRepo::upsert` sets `features = EXCLUDED.features`
+    /// unconditionally, so routing the verifier-free Stage path through it
+    /// erases the write-time contradiction scan's `source` marker and re-opens
+    /// the promotion inversion `is_unverified_write_time_scan` exists to block.
+    /// The three verified actions keep upserting — they write a real verdict in
+    /// the same statement, which is what makes replacing the row correct.
+    #[test]
+    fn only_the_verifier_free_stage_action_declines_to_overwrite_an_existing_row() {
+        assert_eq!(
+            PolicyAction::Stage.write_mode(),
+            CandidateWrite::InsertIfAbsent,
+            "staging must never overwrite an existing row's features"
+        );
+        for action in [
+            PolicyAction::AutoPromote,
+            PolicyAction::WriteContradicts,
+            PolicyAction::Reject,
+        ] {
+            assert_eq!(
+                action.write_mode(),
+                CandidateWrite::Upsert,
+                "{action:?} carries a verdict and must re-score in place"
+            );
+        }
+    }
+
+    /// The mechanism behind the test above, asserted directly: the scorer's
+    /// payload has no `source` key, so overwriting a scan row's `features` with
+    /// it is what silently disables the promote guard. If `MatchFeatures` ever
+    /// grows a `source` field this fails, and the guard's marker vocabulary has
+    /// to be revisited before that field ships.
+    #[test]
+    fn scorer_features_carry_no_source_marker() {
+        let f = MatchFeatures {
+            embed_cosine: 0.9,
+            triple_overlap: 0.1,
+            entity_jaccard: 0.1,
+            method_match: false,
+            nbhd_overlap: 0.0,
+            citation_overlap: 0.0,
+            graph_overlap: 0.0,
+            belief_alignment: 1.0,
+            theme_proximity: 0.5,
+            temporal_dist_days: 3,
+            score: 0.8,
+        };
+        let v = serde_json::to_value(&f).expect("MatchFeatures must serialize");
+        assert!(
+            v.get("source").is_none(),
+            "MatchFeatures gained a `source` field; revisit \
+             is_unverified_write_time_scan before shipping it: {v}"
+        );
     }
 }

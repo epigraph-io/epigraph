@@ -268,8 +268,8 @@ pub struct StageInputs {
 
 /// Outcome of [`stage_candidates`].
 ///
-/// `blocked_pairs` = `truncated_pairs` + `already_decided` + `scanned_pairs`,
-/// and `scanned_pairs` = `staged` + `below_band`.
+/// `blocked_pairs` = `truncated_pairs` + `already_present` + `scanned_pairs`,
+/// and `scanned_pairs` = `staged` + `below_band` + `write_conflicts`.
 #[derive(Debug, Clone)]
 pub struct StageReport {
     pub run_id: Uuid,
@@ -279,12 +279,18 @@ pub struct StageReport {
     pub scanned_pairs: usize,
     /// Pairs dropped by the `max_pairs` cap. Nonzero means a PARTIAL scan.
     pub truncated_pairs: usize,
+    /// Rows this run created (in a dry run: would have created).
     pub staged: usize,
     pub below_band: usize,
-    /// Pairs skipped because they already carry a verifier verdict or an
-    /// operator decision. See
-    /// [`MatchCandidateRepo::verified_or_decided_pairs`].
-    pub already_decided: usize,
+    /// Pairs skipped before scoring because they already had a
+    /// `match_candidates` row, in any status. See
+    /// [`MatchCandidateRepo::existing_pairs`].
+    pub already_present: usize,
+    /// Pairs that cleared the band but whose insert found a row anyway — a
+    /// concurrent writer created it between the `existing_pairs` read and the
+    /// insert. Nonzero means two staging runs overlapped; nothing was
+    /// overwritten either way. Always 0 in a dry run.
+    pub write_conflicts: usize,
     /// Whether rows were actually written (`StageInputs::write`).
     pub wrote_rows: bool,
 }
@@ -305,10 +311,14 @@ pub struct StageReport {
 /// nightly verifying sweep for 7 days. Staging is therefore a *supplement* to
 /// `cross_source_sweep`, never a substitute for it.
 ///
-/// Pairs that already carry a verdict or an operator decision are skipped
-/// rather than re-staged — see
-/// [`MatchCandidateRepo::verified_or_decided_pairs`] for why an unguarded
-/// re-stage corrupts the review queue.
+/// Staging is strictly ADDITIVE: a pair that already has a `match_candidates`
+/// row is left byte-identical, in two layers. Pairs with an existing row are
+/// filtered out before scoring ([`MatchCandidateRepo::existing_pairs`]), and
+/// the write itself goes through `insert_if_absent` rather than `upsert`. Both
+/// layers exist because overwriting a row here corrupts the review queue three
+/// different ways — see that method's doc, and
+/// [`PolicyAction::write_mode`] for the promotion inversion in particular. Do
+/// not relax either one.
 pub async fn stage_candidates(pool: &PgPool, inputs: StageInputs) -> anyhow::Result<StageReport> {
     let run_id = Uuid::new_v4();
     let blockers = default_blockers(inputs.cfg.fan_out.max_per_claim);
@@ -326,7 +336,7 @@ pub async fn stage_candidates(pool: &PgPool, inputs: StageInputs) -> anyhow::Res
     // One batched read for the whole capped list — not per-pair, which would
     // double this path's query count.
     let repo = MatchCandidateRepo::new(pool.clone());
-    let decided = repo.verified_or_decided_pairs(&pairs).await?;
+    let existing = repo.existing_pairs(&pairs).await?;
 
     // `auto_promote = false` defensively: `PolicyAction::Stage` ignores the
     // flag, but a Policy built for a staging run should not be one flipped bit
@@ -336,21 +346,27 @@ pub async fn stage_candidates(pool: &PgPool, inputs: StageInputs) -> anyhow::Res
     let mut scanned_pairs = 0usize;
     let mut staged = 0usize;
     let mut below_band = 0usize;
-    let mut already_decided = 0usize;
+    let mut already_present = 0usize;
+    let mut write_conflicts = 0usize;
     for (a, b) in pairs {
-        if decided.contains(&(a, b)) {
-            already_decided += 1;
+        if existing.contains(&(a, b)) {
+            already_present += 1;
             continue;
         }
         let f = score_pair(pool, a, b, &inputs.cfg.weights).await?;
         scanned_pairs += 1;
         match stage_decision(f.score, inputs.cfg.bands.mid) {
             StageDecision::Stage => {
-                staged += 1;
-                if inputs.write {
+                if !inputs.write {
+                    staged += 1;
+                } else if policy.act(PolicyAction::Stage, a, b, &f, None).await? {
                     // `verdict: None` — nothing was asked, so nothing is
                     // reported.
-                    policy.act(PolicyAction::Stage, a, b, &f, None).await?;
+                    staged += 1;
+                } else {
+                    // A concurrent writer got there first. `act` routes Stage
+                    // through `insert_if_absent`, so that row is untouched.
+                    write_conflicts += 1;
                 }
             }
             StageDecision::BelowBand => below_band += 1,
@@ -364,7 +380,8 @@ pub async fn stage_candidates(pool: &PgPool, inputs: StageInputs) -> anyhow::Res
         truncated_pairs,
         staged,
         below_band,
-        already_decided,
+        already_present,
+        write_conflicts,
         wrote_rows: inputs.write,
     })
 }

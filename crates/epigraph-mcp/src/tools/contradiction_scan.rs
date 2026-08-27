@@ -331,7 +331,8 @@ pub async fn enqueue(pool: &PgPool, new_claim: Uuid, signals: &[ContradictionSig
 
         let score = (1.0 - sig.distance).clamp(0.0, 1.0) as f32;
         match repo
-            .insert_if_absent(lo, hi, score, features_json(new_claim, sig), "pending")
+            // `run_id: None` — a submission is not a matcher run.
+            .insert_if_absent(lo, hi, score, features_json(new_claim, sig), "pending", None)
             .await
         {
             Ok(Some(id)) => {
