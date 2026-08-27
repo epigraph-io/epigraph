@@ -350,8 +350,19 @@ pub async fn submit_claim(
                     frame_id: None,
                     // Nothing was inserted, so there is no claim id on this
                     // side of the pair to stage a `match_candidates` row
-                    // against. Any signals the scan produced are dropped
-                    // with the submission itself.
+                    // against.
+                    //
+                    // RESIDUAL, deliberately not fixed: reaching this branch
+                    // now means the NEAREST neighbour drew no signal (a signal
+                    // against it vetoes suppression — see
+                    // `novelty_gate::classify`), but a FARTHER neighbour may
+                    // still have fired, and those signals are dropped with the
+                    // submission. That is a hard constraint, not an oversight:
+                    // `match_candidates.claim_a/claim_b` are FKs into
+                    // `claims(id)` and no row exists to stage against, and
+                    // reporting them here unstaged would break this field's
+                    // documented invariant that each entry also staged a
+                    // `pending` row.
                     possible_contradictions: Vec::new(),
                 });
             }

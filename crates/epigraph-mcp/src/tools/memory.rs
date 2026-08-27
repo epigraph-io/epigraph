@@ -98,8 +98,11 @@ pub async fn memorize(
                     plausibility: None,
                     pignistic_prob: None,
                     // Nothing was inserted, so there is no claim id to pair a
-                    // flagged neighbour against — see submit_claim's identical
-                    // branch.
+                    // flagged neighbour against. Only signals against a
+                    // FARTHER neighbour can be lost here — one against the
+                    // nearest vetoes suppression outright, so this branch is
+                    // unreachable for it. See submit_claim's identical branch
+                    // for the FK reasoning.
                     possible_contradictions: Vec::new(),
                 });
             }

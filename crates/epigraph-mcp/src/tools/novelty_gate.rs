@@ -10,12 +10,23 @@
 //! the backlog plan's literal `<->`), and the closest neighbor's distance
 //! decides:
 //!
-//! - `dist < novelty_threshold` (default `0.05`) — semantic duplicate.
-//!   Suppress the insert; return the existing claim's id.
+//! - `dist < novelty_threshold` (default `0.05`) AND the write-time
+//!   contradiction scan did not fire against that same neighbour — semantic
+//!   duplicate. Suppress the insert; return the existing claim's id.
 //! - `dist < 0.15` — near-duplicate. Insert normally, but flag it with a
 //!   `near-duplicate` label so it is discoverable/reviewable. The 0.15 band
 //!   is fixed, NOT the tunable `novelty_threshold`.
 //! - otherwise — insert normally, no flag.
+//!
+//! The contradiction carve-out on the first branch is not a refinement, it is
+//! what makes the scan reachable at all. `contradiction_scan`'s premise is
+//! that embeddings are blind to negation, so "X is safe" and "X is not safe"
+//! sit at distance ~0 — i.e. squarely inside the suppression band. Keying
+//! suppression on distance alone therefore swallowed precisely the input the
+//! scan exists to catch, and handed the author back the id of the claim
+//! asserting the opposite. A neighbour that close but flagged for a polarity
+//! flip is not a duplicate; it is the opposite assertion, and it falls through
+//! to `InsertFlagged` (see [`classify`]).
 //!
 //! `novelty_threshold = 0.0` is the escape hatch: a distance is never `< 0.0`,
 //! so the semantic-duplicate branch never fires and every submission inserts
@@ -45,8 +56,9 @@ pub const DEFAULT_NOVELTY_THRESHOLD: f64 = 0.05;
 /// Outcome of the gate decision, independent of I/O — see [`classify`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
-    /// `dist < novelty_threshold`: suppress the insert, return the existing
-    /// claim's id unchanged.
+    /// `dist < novelty_threshold` and no contradiction signal fired against
+    /// that neighbour: suppress the insert, return the existing claim's id
+    /// unchanged.
     ReturnExisting(Uuid),
     /// `novelty_threshold <= dist < NEAR_DUPLICATE_BAND`: insert normally,
     /// but append the `near-duplicate` label.
@@ -76,13 +88,39 @@ pub struct GateOutcome {
 /// Pure decision function — no I/O, directly testable.
 ///
 /// `nearest` is the ANN result ordered closest-first (as returned by
-/// `ClaimRepository::nearest_by_embedding`); only `nearest.first()` is
-/// consulted since Step 2 of the backlog task is defined purely in terms of
-/// the single nearest neighbor's distance.
+/// `ClaimRepository::nearest_by_embedding`); only `nearest.first()` decides
+/// which band the submission lands in, since Step 2 of the backlog task is
+/// defined purely in terms of the single nearest neighbor's distance.
+///
+/// `contradictions` is [`crate::tools::contradiction_scan::scan`]'s output over
+/// that same `nearest` vec, and it can only ever VETO suppression, never cause
+/// it: a signal downgrades `ReturnExisting` to `InsertFlagged`, so the claim is
+/// still recorded as a lexical near-duplicate and still carries the
+/// `near-duplicate` label, but it is recorded rather than swallowed. That is
+/// deliberately the cheap side to err on — a flagged duplicate is recoverable
+/// by a reviewer, a silently discarded contradiction is not — and it also means
+/// the signals stay live for the caller's existing
+/// `contradiction_scan::enqueue`, which needs the inserted claim's id as an FK
+/// target.
+///
+/// The veto matches on the neighbour ID (`neighbor_id == hit.claim_id`), not on
+/// "any signal fired": a polarity flip against some FARTHER neighbour says
+/// nothing about whether `nearest[0]` is a duplicate of this submission.
 #[must_use]
-pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDecision {
+pub fn classify(
+    nearest: &[NearestClaimHit],
+    novelty_threshold: f64,
+    contradictions: &[ContradictionSignal],
+) -> GateDecision {
     match nearest.first() {
-        Some(hit) if hit.distance < novelty_threshold => GateDecision::ReturnExisting(hit.claim_id),
+        Some(hit)
+            if hit.distance < novelty_threshold
+                && !contradictions
+                    .iter()
+                    .any(|sig| sig.neighbor_id == hit.claim_id) =>
+        {
+            GateDecision::ReturnExisting(hit.claim_id)
+        }
         Some(hit) if hit.distance < NEAR_DUPLICATE_BAND => GateDecision::InsertFlagged,
         _ => GateDecision::Insert,
     }
@@ -127,10 +165,15 @@ pub async fn decide(
             return None;
         }
     };
+    // Scan BEFORE classifying: the gate decision consults the signals, so a
+    // contradicting nearest neighbour is not mistaken for a duplicate. Running
+    // it after (as this used to) left the feature's motivating case
+    // unreachable — see [`classify`].
+    let contradictions = contradiction_scan::scan(content, &nearest);
     Some(GateOutcome {
-        decision: classify(&nearest, novelty_threshold),
+        decision: classify(&nearest, novelty_threshold, &contradictions),
         pgvector: pgvec,
-        contradictions: contradiction_scan::scan(content, &nearest),
+        contradictions,
     })
 }
 
@@ -152,23 +195,23 @@ mod tests {
         }
     }
 
-    /// The neighbour text is inert for the gate decision — `classify` keys on
-    /// distance alone, and the contradiction scan reads the same vec without
-    /// influencing it.
+    /// `classify` never tokenizes the neighbour text itself: polarity reaches
+    /// the decision only through the `contradictions` argument. With no
+    /// signals passed, the text is inert and distance alone decides.
     #[test]
-    fn neighbor_content_does_not_affect_the_gate_decision() {
+    fn neighbor_content_is_inert_without_a_contradiction_signal() {
         let with_text = [hit_with(0.10, "the retry loop is not safe")];
         let without_text = [hit_with(0.10, "")];
         assert_eq!(
-            classify(&with_text, DEFAULT_NOVELTY_THRESHOLD),
-            classify(&without_text, DEFAULT_NOVELTY_THRESHOLD)
+            classify(&with_text, DEFAULT_NOVELTY_THRESHOLD, &[]),
+            classify(&without_text, DEFAULT_NOVELTY_THRESHOLD, &[])
         );
     }
 
     #[test]
     fn empty_neighbors_inserts_unflagged() {
         assert_eq!(
-            classify(&[], DEFAULT_NOVELTY_THRESHOLD),
+            classify(&[], DEFAULT_NOVELTY_THRESHOLD, &[]),
             GateDecision::Insert
         );
     }
@@ -179,7 +222,7 @@ mod tests {
         let expected_id = h.claim_id;
         let nearest = [h];
         assert_eq!(
-            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD),
+            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD, &[]),
             GateDecision::ReturnExisting(expected_id)
         );
     }
@@ -188,7 +231,7 @@ mod tests {
     fn distance_in_near_duplicate_band_inserts_flagged() {
         let nearest = [hit(0.10)];
         assert_eq!(
-            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD),
+            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD, &[]),
             GateDecision::InsertFlagged
         );
     }
@@ -198,7 +241,7 @@ mod tests {
         // dist == 0.15 is NOT < 0.15, so it must NOT be flagged.
         let nearest = [hit(NEAR_DUPLICATE_BAND)];
         assert_eq!(
-            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD),
+            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD, &[]),
             GateDecision::Insert
         );
     }
@@ -209,7 +252,7 @@ mod tests {
         // it falls through to the near-duplicate band check instead.
         let nearest = [hit(DEFAULT_NOVELTY_THRESHOLD)];
         assert_eq!(
-            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD),
+            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD, &[]),
             GateDecision::InsertFlagged
         );
     }
@@ -218,7 +261,7 @@ mod tests {
     fn distance_far_above_band_inserts_unflagged() {
         let nearest = [hit(0.9)];
         assert_eq!(
-            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD),
+            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD, &[]),
             GateDecision::Insert
         );
     }
@@ -231,19 +274,19 @@ mod tests {
     #[test]
     fn zero_threshold_never_suppresses_even_near_zero_distance() {
         let nearest = [hit(0.0001)];
-        assert_eq!(classify(&nearest, 0.0), GateDecision::InsertFlagged);
+        assert_eq!(classify(&nearest, 0.0, &[]), GateDecision::InsertFlagged);
     }
 
     #[test]
     fn zero_threshold_still_flags_within_near_duplicate_band() {
         let nearest = [hit(0.12)];
-        assert_eq!(classify(&nearest, 0.0), GateDecision::InsertFlagged);
+        assert_eq!(classify(&nearest, 0.0, &[]), GateDecision::InsertFlagged);
     }
 
     #[test]
     fn zero_threshold_still_inserts_unflagged_beyond_band() {
         let nearest = [hit(0.5)];
-        assert_eq!(classify(&nearest, 0.0), GateDecision::Insert);
+        assert_eq!(classify(&nearest, 0.0, &[]), GateDecision::Insert);
     }
 
     /// Only the closest neighbor matters — a very-close second neighbor
@@ -252,8 +295,86 @@ mod tests {
     fn only_nearest_neighbor_is_consulted() {
         let nearest = [hit(0.5), hit(0.001)];
         assert_eq!(
-            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD),
+            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD, &[]),
             GateDecision::Insert
+        );
+    }
+
+    // ── the contradiction veto on suppression (backlog `6ed02d04`) ────────
+    //
+    // These three compose the REAL `contradiction_scan::scan` against real
+    // text fixtures rather than hand-building `ContradictionSignal`s, so the
+    // detector and the gate are pinned as one pipeline: if `scan` stops firing
+    // on a canonical negation flip, the first test fails on its own assertion
+    // before it ever reaches `classify`.
+
+    /// The feature's motivating case. `contradiction_scan`'s stated premise is
+    /// that a negation barely moves an embedding, which puts a CONTRADICTING
+    /// neighbour inside the suppression band — so distance alone must not be
+    /// allowed to call it a duplicate. Before this veto existed, this fixture
+    /// classified `ReturnExisting` and handed the author back the id of the
+    /// claim asserting the opposite.
+    #[test]
+    fn contradicting_nearest_neighbour_is_not_suppressed_as_a_duplicate() {
+        let incoming = "the retry loop is safe under concurrent writes";
+        let neighbour = hit_with(0.03, "the retry loop is not safe under concurrent writes");
+        let neighbour_id = neighbour.claim_id;
+        let nearest = [neighbour];
+
+        let signals = contradiction_scan::scan(incoming, &nearest);
+        assert_eq!(signals.len(), 1, "fixture must actually fire the detector");
+        assert_eq!(signals[0].neighbor_id, neighbour_id);
+
+        assert_eq!(
+            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD, &signals),
+            GateDecision::InsertFlagged,
+            "a contradicting neighbour inside the suppression band must insert \
+             (flagged), never suppress the write"
+        );
+    }
+
+    /// The veto is narrow: an ordinary paraphrase with no polarity cue produces
+    /// no signal, so plain semantic dedup is untouched.
+    #[test]
+    fn non_contradicting_duplicate_still_returns_existing() {
+        let incoming = "the retry loop is safe under concurrent writes";
+        let neighbour = hit_with(0.03, "concurrent writes keep the retry loop safe");
+        let neighbour_id = neighbour.claim_id;
+        let nearest = [neighbour];
+
+        let signals = contradiction_scan::scan(incoming, &nearest);
+        assert!(
+            signals.is_empty(),
+            "a same-polarity paraphrase must not fire the detector"
+        );
+
+        assert_eq!(
+            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD, &signals),
+            GateDecision::ReturnExisting(neighbour_id)
+        );
+    }
+
+    /// A signal against a FARTHER neighbour says nothing about whether
+    /// `nearest[0]` is a duplicate of this submission. Pins the
+    /// `neighbor_id == hit.claim_id` match against a lazy
+    /// `!contradictions.is_empty()`.
+    #[test]
+    fn signal_against_a_farther_neighbour_does_not_rescue_the_nearest() {
+        let incoming = "the retry loop is safe under concurrent writes";
+        let nearest = [
+            hit_with(0.02, "concurrent writes keep the retry loop safe"),
+            hit_with(0.12, "the retry loop is not safe under concurrent writes"),
+        ];
+        let nearest_id = nearest[0].claim_id;
+        let farther_id = nearest[1].claim_id;
+
+        let signals = contradiction_scan::scan(incoming, &nearest);
+        assert_eq!(signals.len(), 1, "only the farther neighbour may fire");
+        assert_eq!(signals[0].neighbor_id, farther_id);
+
+        assert_eq!(
+            classify(&nearest, DEFAULT_NOVELTY_THRESHOLD, &signals),
+            GateDecision::ReturnExisting(nearest_id)
         );
     }
 
