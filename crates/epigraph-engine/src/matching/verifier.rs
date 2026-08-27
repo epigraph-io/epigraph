@@ -136,7 +136,8 @@ pub const WRITE_TIME_SCAN_SOURCE: &str = "write_time_contradiction_scan";
 #[must_use]
 pub fn is_unverified_write_time_scan(verdict: Option<&str>, features: &serde_json::Value) -> bool {
     verdict.is_none()
-        && features.get("source").and_then(serde_json::Value::as_str) == Some(WRITE_TIME_SCAN_SOURCE)
+        && features.get("source").and_then(serde_json::Value::as_str)
+            == Some(WRITE_TIME_SCAN_SOURCE)
 }
 
 /// What promoting a `match_candidates` row should write to the graph.
@@ -341,7 +342,10 @@ mod tests {
     #[test]
     fn write_time_scan_row_with_a_real_verdict_is_not_flagged() {
         let features = serde_json::json!({ "source": WRITE_TIME_SCAN_SOURCE });
-        assert!(!is_unverified_write_time_scan(Some("contradicts"), &features));
+        assert!(!is_unverified_write_time_scan(
+            Some("contradicts"),
+            &features
+        ));
         assert!(!is_unverified_write_time_scan(Some("same"), &features));
     }
 

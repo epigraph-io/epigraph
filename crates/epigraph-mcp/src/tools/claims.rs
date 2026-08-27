@@ -554,12 +554,15 @@ pub async fn submit_claim(
         // Best-effort by construction: `enqueue` never returns an error, so a
         // review queue that is down cannot fail a submission.
         if !contradiction_signals.is_empty() {
-            possible_contradictions =
-                crate::tools::contradiction_scan::enqueue(&server.pool, claim_uuid, &contradiction_signals)
-                    .await
-                    .into_iter()
-                    .map(|id| id.to_string())
-                    .collect();
+            possible_contradictions = crate::tools::contradiction_scan::enqueue(
+                &server.pool,
+                claim_uuid,
+                &contradiction_signals,
+            )
+            .await
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
         }
 
         let final_truth = ds

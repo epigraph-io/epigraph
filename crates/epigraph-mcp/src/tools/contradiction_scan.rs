@@ -332,7 +332,14 @@ pub async fn enqueue(pool: &PgPool, new_claim: Uuid, signals: &[ContradictionSig
         let score = (1.0 - sig.distance).clamp(0.0, 1.0) as f32;
         match repo
             // `run_id: None` — a submission is not a matcher run.
-            .insert_if_absent(lo, hi, score, features_json(new_claim, sig), "pending", None)
+            .insert_if_absent(
+                lo,
+                hi,
+                score,
+                features_json(new_claim, sig),
+                "pending",
+                None,
+            )
             .await
         {
             Ok(Some(id)) => {
@@ -373,7 +380,10 @@ mod tests {
     /// band must not fire, no matter how obvious the lexical signal is.
     #[test]
     fn neighbor_beyond_contradiction_band_is_ignored() {
-        let nearest = [hit(0.45, "the retry loop is not safe under concurrent writes")];
+        let nearest = [hit(
+            0.45,
+            "the retry loop is not safe under concurrent writes",
+        )];
         assert!(scan("the retry loop is safe under concurrent writes", &nearest).is_empty());
     }
 
@@ -394,7 +404,10 @@ mod tests {
     /// separate these two, a single token can.
     #[test]
     fn negation_parity_flip_on_near_identical_text_fires() {
-        let nearest = [hit(0.04, "the retry loop is not safe under concurrent writes")];
+        let nearest = [hit(
+            0.04,
+            "the retry loop is not safe under concurrent writes",
+        )];
         let signals = scan("the retry loop is safe under concurrent writes", &nearest);
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].cues, vec![ContradictionCue::NegationParity]);
@@ -530,7 +543,13 @@ mod tests {
             features["source"].as_str(),
             Some(epigraph_engine::matching::verifier::WRITE_TIME_SCAN_SOURCE)
         );
-        assert_eq!(features["neighbor_claim"].as_str(), Some(sig.neighbor_id.to_string().as_str()));
-        assert_eq!(features["incoming_claim"].as_str(), Some(incoming.to_string().as_str()));
+        assert_eq!(
+            features["neighbor_claim"].as_str(),
+            Some(sig.neighbor_id.to_string().as_str())
+        );
+        assert_eq!(
+            features["incoming_claim"].as_str(),
+            Some(incoming.to_string().as_str())
+        );
     }
 }

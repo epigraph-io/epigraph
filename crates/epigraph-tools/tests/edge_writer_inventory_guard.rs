@@ -34,8 +34,7 @@ const FILES_END: &str = "<!-- edge-writer-files:end -->";
 
 fn read_inventory() -> String {
     let path = Path::new(REPO_ROOT).join(INVENTORY);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
 /// Every `.rs` file under `crates/*/src/`, as a repo-relative path with `/`
@@ -209,13 +208,12 @@ fn inventory_cited_paths_all_exist() {
     let prose = strip_fenced_code(&doc);
 
     // Backticked repo paths, optionally suffixed with `:LINE`, which we drop.
-    let re = Regex::new(r"`((?:crates|scripts)/[A-Za-z0-9_./-]+\.(?:rs|py|sql|toml|md))(?::\d+(?:-\d+)?)?`")
-        .expect("static regex compiles");
+    let re = Regex::new(
+        r"`((?:crates|scripts)/[A-Za-z0-9_./-]+\.(?:rs|py|sql|toml|md))(?::\d+(?:-\d+)?)?`",
+    )
+    .expect("static regex compiles");
 
-    let cited: BTreeSet<String> = re
-        .captures_iter(&prose)
-        .map(|c| c[1].to_string())
-        .collect();
+    let cited: BTreeSet<String> = re.captures_iter(&prose).map(|c| c[1].to_string()).collect();
 
     assert!(
         !cited.is_empty(),
