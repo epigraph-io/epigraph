@@ -64,6 +64,9 @@ tracing-subscriber = { workspace = true }
 # HTTP client (for embedding service)
 reqwest = { workspace = true }
 
+# Base64 for the attach_blob MCP payload (MCP has no binary frame)
+base64 = "0.22"
+
 # Crypto primitives
 hex = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -85,6 +88,7 @@ tower = "0.5"
 # events emitted from src/ (different crate target). Without it, the macro's
 # default env filter scopes capture to the test crate only.
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+tempfile = "3"  # Real filesystem roots for the content-addressed blob tests
 
 [features]
 default = []

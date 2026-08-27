@@ -69,6 +69,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // ─── claims:write ──────────────────────────────────────────────────
     ("add_step", "claims:write"),
     ("assign_ownership", "claims:write"),
+    ("attach_blob", "claims:write"),
     ("backfill_embeddings", "claims:write"),
     ("batch_submit_claims", "claims:write"),
     ("challenge_claim", "claims:write"),

@@ -54,9 +54,15 @@ Current reservation:
   same files in-tree to `036–038` (cross-source matching port); prod
   `_sqlx_migrations` rows must be renumbered +1 on next public deploy.
 - **038**: public `corroborates_factor_strength_from_score` (PR #173)
-- **039+**: public next
+- **039–059**: public
+- **060–069**: intentionally UNUSED. Skipped to leave headroom for a
+  concurrently-developed branch so two in-flight branches could not both claim
+  the same number. Do not backfill them.
+- **070**: public `blobs` (content-addressed blob storage + the `blob`
+  `entity_types` row that makes `claim -[derived_from]-> blob` edges legal)
+- **071+**: public next
 
-Next public migration must be `039` or later. Picking a colliding version
+Next public migration must be `071` or later. Picking a colliding version
 (checksum mismatch on a `_sqlx_migrations` row that's already applied) will
 panic the api binary on restart.
 

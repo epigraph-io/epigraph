@@ -400,6 +400,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Content-addressed blob storage is always on; the only question is WHERE.
+    // stderr only — stdout is reserved for JSON-RPC frames.
+    let blob_dir = epigraph_core::blob_storage_root();
+    let max_blob_bytes = epigraph_core::max_blob_bytes();
+    if blob_dir == std::path::Path::new(epigraph_core::DEFAULT_BLOB_DIR) {
+        tracing::warn!(
+            blob_dir = %blob_dir.display(),
+            max_blob_bytes,
+            "attach_blob is using the cwd-relative default blob root; set \
+             EPIGRAPH_BLOB_DIR to a durable path shared with the API"
+        );
+    } else {
+        tracing::info!(
+            blob_dir = %blob_dir.display(),
+            max_blob_bytes,
+            "content-addressed blob storage"
+        );
+    }
+
     let tool_count = EpiGraphMcpFull::all_tools_json()
         .as_array()
         .map_or(0, Vec::len);

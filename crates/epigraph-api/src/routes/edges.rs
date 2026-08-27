@@ -3663,9 +3663,13 @@ mod db_tests {
     // entity_types registry (Phase 1 + Phase 2)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// All 23 seeded types are valid; the 6 DB-only ones the old Rust list
+    /// All 24 seeded types are valid; the 6 DB-only ones the old Rust list
     /// omitted are present; case-variants and junk are rejected. This absorbs
     /// the ex-`edges_validation.rs::synthesis_entity_type_is_valid` coverage.
+    ///
+    /// The count is a deliberate tripwire: adding a row to `entity_types`
+    /// without updating it here fails loudly. Migration 070 added `blob`
+    /// (23 -> 24).
     #[sqlx::test(migrations = "../../migrations")]
     async fn is_valid_entity_type_covers_all_seeded_types(pool: PgPool) {
         let state = test_state(pool).await;
@@ -3683,11 +3687,12 @@ mod db_tests {
             "claim",
             "node",
             "frame",
+            "blob",
         ] {
             assert!(is_valid_entity_type(&state, t).await, "{t} should be valid");
         }
-        // Exactly the 23 seeded rows.
-        assert_eq!(valid_entity_type_names(&state).len(), 23);
+        // Exactly the 24 seeded rows.
+        assert_eq!(valid_entity_type_names(&state).len(), 24);
         // Rejections.
         for bad in ["invalid", "", "CLAIM", "public.claims"] {
             assert!(
@@ -3706,6 +3711,60 @@ mod db_tests {
         for k in keys {
             assert!(is_valid_entity_type(&state, &k).await);
         }
+    }
+
+    /// Anti-inertness proof for migration 070: `create_edge` — an
+    /// already-shipped handler with ZERO code changes in this file — accepts
+    /// `target_type: "blob"` purely because the migration added one row to
+    /// `entity_types`. That row satisfies `edges_target_type_fkey`, and
+    /// `validate_edge_reference`'s registry-driven ELSE arm existence-checks
+    /// the id against `public.blobs`. If a reviewer ever "cleans up" that row,
+    /// this test and the count assertion above both go red.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_accepts_target_type_blob(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let claim = seed_claim(&pool, agent_id, "measurement read off an instrument file").await;
+
+        // A real blobs row (the repo is not involved — this is the raw
+        // registry/trigger path through the generic edges API).
+        let blob: Uuid = sqlx::query_scalar(
+            "INSERT INTO blobs (filename, mime_type, size_bytes, content_hash, uploader_id) \
+             VALUES ('scan.raw', 'application/octet-stream', 42, $1, $2) RETURNING id",
+        )
+        .bind(vec![7u8; 32])
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool).await;
+        let router = edges_router(state);
+        let body = Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "source_id": claim,
+                "target_id": blob,
+                "source_type": "claim",
+                "target_type": "blob",
+                "relationship": "derived_from",
+            }))
+            .unwrap(),
+        );
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "create_edge claim->blob must be 201 with no code change in edges.rs"
+        );
     }
 
     /// #344 regression: claim→{frame,perspective,analysis,experiment_result}

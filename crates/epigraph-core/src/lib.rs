@@ -27,6 +27,7 @@
 //! - [`domain::Evidence`]: Supporting material for claims
 //! - [`domain::ReasoningTrace`]: Logical derivation path
 
+pub mod blob;
 pub mod canonical_scopes;
 pub mod challenge;
 pub mod domain;
@@ -43,6 +44,10 @@ pub mod traits;
 pub mod truth;
 
 // Re-export primary types at crate root
+pub use blob::{
+    blob_storage_root, max_blob_bytes, BlobRef, InvalidBlobFilename, InvalidBlobHash, BLOB_DIR_ENV,
+    DEFAULT_BLOB_DIR, DEFAULT_MAX_BLOB_BYTES, MAX_BLOB_BYTES_ENV,
+};
 pub use edge::Edge;
 pub use errors::CoreError;
 pub use ids::{EdgeId, NodeId};

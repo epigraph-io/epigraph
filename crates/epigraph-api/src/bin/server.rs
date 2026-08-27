@@ -253,6 +253,26 @@ async fn main() {
             .expect("Failed to load entity_types registry cache");
         tracing::info!("entity_types registry cache loaded");
 
+        // Content-addressed blob storage is always on; the only question is
+        // WHERE. Log the resolved root at boot so an operator can see it
+        // without reading the code — and so the shared-volume requirement is
+        // visible: two replicas with different roots write rows the other
+        // cannot read (a 404 on download for a row that exists).
+        if state.blob_dir == std::path::Path::new(epigraph_core::DEFAULT_BLOB_DIR) {
+            tracing::warn!(
+                blob_dir = %state.blob_dir.display(),
+                max_blob_bytes = state.max_blob_bytes,
+                "content-addressed blob storage is using the cwd-relative default; \
+                 set EPIGRAPH_BLOB_DIR to a durable, shared path"
+            );
+        } else {
+            tracing::info!(
+                blob_dir = %state.blob_dir.display(),
+                max_blob_bytes = state.max_blob_bytes,
+                "content-addressed blob storage"
+            );
+        }
+
         (state, job_pool)
     };
 

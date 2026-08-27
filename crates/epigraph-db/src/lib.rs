@@ -63,11 +63,11 @@ pub use errors::DbError;
 pub use pool::{create_pool, create_pool_from_options, create_pool_with_options};
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentRepository, AnalysisRecord,
-    AnalysisRepository, BehavioralExecutionRepository, BehavioralExecutionRow, ChallengeRepository,
-    ChallengeRow, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository,
-    ClaimEncryptionRow, ClaimNeighbor, ClaimNeighborBetpRow, ClaimRepository, ClaimSummary,
-    ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository, ClaimVersionRow,
-    CommunityRepository, ConsolidateMode, ConsolidateResult, ContextRepository,
+    AnalysisRepository, BehavioralExecutionRepository, BehavioralExecutionRow, BlobRepository,
+    ChallengeRepository, ChallengeRow, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
+    ClaimEncryptionRepository, ClaimEncryptionRow, ClaimNeighbor, ClaimNeighborBetpRow,
+    ClaimRepository, ClaimSummary, ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository,
+    ClaimVersionRow, CommunityRepository, ConsolidateMode, ConsolidateResult, ContextRepository,
     CounterfactualRepository, CounterfactualRow, DedupRepair, DivergenceRepository,
     EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository, EmbeddingShareRepository,
     EmbeddingShareRow, EntityRepository, EntityRow, EntityTypeEntry, EntityTypeRepository,
@@ -87,10 +87,10 @@ pub use repos::{
     ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
     ReEncryptionKeyRepository, ReEncryptionKeyRow, ReasoningTraceRepository, RecallEventRepository,
     RecallEventRow, RefreshTokenRepository, RefreshTokenRow, ResolvedStep, ScopedBeliefRepository,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, SweepCandidate, TaskRepository,
-    TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository, WorkflowExecutionRow,
-    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
-    EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    SecurityEventRepository, SecurityEventRow, SheafRepository, StoredBlob, SweepCandidate,
+    TaskRepository, TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository,
+    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 
 // Re-export sqlx types that users will need

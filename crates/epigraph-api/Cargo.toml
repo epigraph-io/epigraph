@@ -113,6 +113,7 @@ wiremock = "0.6"  # HTTP fixture for OAuth provider integration tests
 rsa = "0.9"  # RSA keypair fixture for OAuth tests
 pkcs1 = "0.7"  # PKCS#1 encoding for RSA fixtures
 toml = "0.8"  # provider config TOML parsing in tests
+tempfile = "3"  # Real filesystem roots for the content-addressed blob route tests
 
 [[test]]
 name = "boot_secret_gate_test"

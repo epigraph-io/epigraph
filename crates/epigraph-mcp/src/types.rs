@@ -415,6 +415,52 @@ pub struct GetProvenanceChainParams {
     pub relationships: Option<Vec<String>>,
 }
 
+// ── Blobs ──
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AttachBlobParams {
+    #[schemars(
+        description = "Base64-encoded file content (standard alphabet, with padding). \
+                       MCP has no binary frame, so this is how raw bytes reach the server. \
+                       The size limit (EPIGRAPH_MAX_BLOB_BYTES, default 25 MiB) applies to the \
+                       DECODED payload, not to this string."
+    )]
+    pub file_bytes_base64: String,
+
+    #[schemars(
+        description = "Display filename, e.g. 'gel_image.tif' (default: 'unnamed'). Stored as \
+                       metadata only — the storage path is derived from the content hash and \
+                       never from this. Rejected if it contains a control character, a quote, \
+                       a backslash, or a path separator."
+    )]
+    #[serde(default)]
+    pub filename: Option<String>,
+
+    #[schemars(
+        description = "MIME type, e.g. 'image/tiff' (default: 'application/octet-stream'). \
+                       Stored verbatim as caller-supplied metadata; never sniffed or trusted \
+                       for dispatch."
+    )]
+    #[serde(default)]
+    pub mime_type: Option<String>,
+
+    #[schemars(description = "Optional claim UUID to attach this blob to. Writes a \
+                       claim -[derived_from]-> blob edge, the kernel's representation of \
+                       'this claim was read off that raw file'. Idempotent: re-attaching the \
+                       same blob to the same claim does not duplicate the edge. Other verbs \
+                       are reachable through POST /api/v1/edges with target_type='blob'.")]
+    #[serde(default)]
+    pub attach_to_claim_id: Option<String>,
+
+    #[schemars(description = "Tag-style labels for the blob, e.g. ['raw', 'microscopy']")]
+    #[serde(default)]
+    pub labels: Vec<String>,
+
+    #[schemars(description = "Free-form JSON properties object, e.g. instrument model or run id")]
+    #[serde(default)]
+    pub properties: serde_json::Value,
+}
+
 // ── Memory ──
 
 #[derive(Debug, Deserialize, JsonSchema)]

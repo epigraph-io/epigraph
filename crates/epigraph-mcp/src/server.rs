@@ -48,6 +48,15 @@ pub struct EpiGraphMcpFull {
     /// distinct `auth.agent_id` per session (a fast in-memory short-circuit; the
     /// DB `create_if_not_exists` is the actual dedup authority). Empty at boot.
     pub(crate) seen_auth_lineage: Arc<Mutex<HashSet<uuid::Uuid>>>,
+    /// Filesystem root for content-addressed blob bytes, resolved ONCE at
+    /// construction from `EPIGRAPH_BLOB_DIR` (default
+    /// `epigraph_core::DEFAULT_BLOB_DIR`). `BlobRepository` takes an explicit
+    /// `&Path` and never reads the environment; tests inject a `TempDir` via
+    /// [`with_blob_dir`](Self::with_blob_dir).
+    pub(crate) blob_dir: std::path::PathBuf,
+    /// Ceiling on a single `attach_blob` payload, applied to the DECODED bytes
+    /// (`EPIGRAPH_MAX_BLOB_BYTES`, default 25 MiB).
+    pub(crate) max_blob_bytes: usize,
 }
 
 impl EpiGraphMcpFull {
@@ -348,6 +357,8 @@ impl EpiGraphMcpFull {
             federation,
             llm_identity,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
+            blob_dir: epigraph_core::blob_storage_root(),
+            max_blob_bytes: epigraph_core::max_blob_bytes(),
         }
     }
 
@@ -395,6 +406,8 @@ impl EpiGraphMcpFull {
             federation,
             llm_identity,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
+            blob_dir: epigraph_core::blob_storage_root(),
+            max_blob_bytes: epigraph_core::max_blob_bytes(),
         }
     }
 
@@ -621,6 +634,43 @@ impl EpiGraphMcpFull {
         >,
     ) -> Result<CallToolResult, McpError> {
         crate::tools::alternative_sets::suggest_alternative_sets(self, params).await
+    }
+
+    /// Point content-addressed blob storage at `dir` (builder pattern).
+    ///
+    /// Every blob test injects a `TempDir` through this, so nothing ever writes
+    /// to the `data/blobs` default inside a checkout.
+    #[must_use]
+    pub fn with_blob_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.blob_dir = dir;
+        self
+    }
+
+    /// Override the per-payload blob size ceiling (builder pattern).
+    #[must_use]
+    pub fn with_max_blob_bytes(mut self, max_blob_bytes: usize) -> Self {
+        self.max_blob_bytes = max_blob_bytes;
+        self
+    }
+
+    // ── Blobs (1 tool) ──
+
+    #[tool(
+        description = "Attach a file to the graph as a content-addressed blob. Bytes are \
+                       base64-encoded (MCP has no binary frame), stored on the filesystem \
+                       keyed by their BLAKE3 digest, and recorded with you as the uploader. \
+                       Pass attach_to_claim_id to write a claim -[derived_from]-> blob edge, \
+                       the kernel's way of saying 'this claim was read off that raw file'. \
+                       Idempotent: re-uploading identical bytes returns the existing blob \
+                       (was_created=false) without duplicating the file or the edge. Reads \
+                       are served over HTTP (GET /api/v1/blobs/:id/content)."
+    )]
+    async fn attach_blob(
+        &self,
+        Parameters(params): Parameters<AttachBlobParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::blobs::attach_blob(self, params).await
     }
 
     // ── Memory (2 tools) ──

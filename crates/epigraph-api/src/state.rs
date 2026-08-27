@@ -252,6 +252,25 @@ pub struct AppState {
     /// read-through-on-miss in `entity_exists` / the admin write-through.
     #[cfg(feature = "db")]
     pub entity_type_cache: Arc<std::sync::RwLock<HashMap<String, epigraph_db::EntityTypeEntry>>>,
+
+    /// Filesystem root for content-addressed blob bytes.
+    ///
+    /// Resolved ONCE here from `EPIGRAPH_BLOB_DIR` (falling back to
+    /// `epigraph_core::DEFAULT_BLOB_DIR`) so no repository function ever reads
+    /// the environment. Deliberately NOT an `Option` and NOT behind a feature
+    /// flag: blob storage has no OFF state, so there is no disabled path for a
+    /// handler to mishandle or a test to accidentally exercise. Tests inject a
+    /// real `TempDir` via [`AppState::with_blob_dir`].
+    ///
+    /// Not on `ApiConfig`: that struct is written as a literal in ~70 places
+    /// across the workspace with no `..Default::default()` convention.
+    pub blob_dir: std::path::PathBuf,
+
+    /// Ceiling on a single blob upload, in bytes (`EPIGRAPH_MAX_BLOB_BYTES`,
+    /// default 25 MiB). Also installed as the blob upload route's own
+    /// `DefaultBodyLimit`, which must override the smaller router-wide
+    /// `config.max_request_size`.
+    pub max_blob_bytes: usize,
 }
 
 /// API configuration options
@@ -294,6 +313,8 @@ impl AppState {
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            blob_dir: epigraph_core::blob_storage_root(),
+            max_blob_bytes: epigraph_core::max_blob_bytes(),
         }
     }
 
@@ -339,6 +360,8 @@ impl AppState {
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            blob_dir: epigraph_core::blob_storage_root(),
+            max_blob_bytes: epigraph_core::max_blob_bytes(),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
@@ -370,6 +393,8 @@ impl AppState {
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            blob_dir: epigraph_core::blob_storage_root(),
+            max_blob_bytes: epigraph_core::max_blob_bytes(),
         }
     }
 
@@ -402,6 +427,8 @@ impl AppState {
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            blob_dir: epigraph_core::blob_storage_root(),
+            max_blob_bytes: epigraph_core::max_blob_bytes(),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
@@ -435,6 +462,8 @@ impl AppState {
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            blob_dir: epigraph_core::blob_storage_root(),
+            max_blob_bytes: epigraph_core::max_blob_bytes(),
         }
     }
 
@@ -469,6 +498,8 @@ impl AppState {
             policy_gate: Arc::new(NoOpPolicyGate::new()),
             orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            blob_dir: epigraph_core::blob_storage_root(),
+            max_blob_bytes: epigraph_core::max_blob_bytes(),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
@@ -558,6 +589,23 @@ impl AppState {
     #[must_use]
     pub fn with_rate_limiter(mut self, rate_limiter: AgentRateLimiter) -> Self {
         self.rate_limiter = Some(rate_limiter);
+        self
+    }
+
+    /// Point content-addressed blob storage at `dir` (builder pattern).
+    ///
+    /// Every blob test injects a `TempDir` through this so nothing ever writes
+    /// to the `data/blobs` default inside the repo checkout.
+    #[must_use]
+    pub fn with_blob_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.blob_dir = dir;
+        self
+    }
+
+    /// Override the per-upload blob size ceiling (builder pattern).
+    #[must_use]
+    pub fn with_max_blob_bytes(mut self, max_blob_bytes: usize) -> Self {
+        self.max_blob_bytes = max_blob_bytes;
         self
     }
 

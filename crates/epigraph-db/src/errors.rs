@@ -52,6 +52,16 @@ pub enum DbError {
         #[source]
         source: epigraph_core::CoreError,
     },
+
+    /// Filesystem I/O failed while reading or writing content-addressed blob
+    /// bytes.
+    ///
+    /// Distinct from [`DbError::InvalidData`] on purpose: a disk-full or
+    /// permission failure is a server fault (500), not a caller fault (400).
+    /// A *missing* blob file is not this variant — it is
+    /// `NotFound { entity: "blob_content", .. }`, so the route surfaces 404.
+    #[error("Blob I/O failed: {message}")]
+    Io { message: String },
 }
 
 impl From<sqlx::Error> for DbError {

@@ -94,6 +94,26 @@ Two calls. Two transactions. Composes cleanly. A combined "create-claim-and-edge
 
 Until migration 107 lands, the DB has no `(content_hash, agent_id)` UNIQUE constraint. Two concurrent `if_not_exists: true` requests for the same key can both find no existing row and both insert. Once 107 is applied, the second insert fails with a constraint violation; the handler catches that error and returns the existing row. S1 does not add advisory-lock serialization in the pre-107 window — the race window already exists for every claim-creation path today, S2 backfill cleans up any extra rows, and adding a per-key advisory lock now would be removed when 107 lands.
 
+## Non-claim nouns
+
+Not every noun is a `claims` row. `papers`, `workflows`, `experiments`, `frames` and friends are entity tables registered in `entity_types` (migration 054), which is what makes them addressable as `edges.source_type` / `edges.target_type`. Migration 070 adds `blobs` to that set.
+
+A content-addressed blob is the purest noun in the schema: its identity *is* its BLAKE3 digest. Accordingly `blobs` has **no subject column** — no `claim_id`, no polymorphic `(subject_type, subject_id)`. Subject binding is an edge:
+
+```
+claim --[derived_from]--> blob
+```
+
+Three reasons this is an edge and not a column:
+
+1. "Claim C was read off file B" is a relationship with a time, which is exactly what a verb-edge encodes.
+2. A nullable `claim_id` would impose 0..1 where the real cardinality is many-to-many — one instrument file evidences several measurements, one claim cites several files.
+3. A `(subject_type, subject_id)` pair would be a second, drifting copy of what `edges` + `validate_edge_reference` already implement. Migration 054's own EVIDENCE section names "hardcoded in three drifting places" as the defect it was written to kill.
+
+`blobs` follows the same canonical-key discipline as `claims`: `UNIQUE (content_hash, uploader_id)` mirrors migration 107's `UNIQUE (content_hash, agent_id)`, so `BlobRepository::store` is idempotent and returns `was_created` — the blob analogue of `if_not_exists: true`. Two different uploaders of identical bytes get two rows over one on-disk file: provenance preserved, storage deduplicated. Per Rule 1, the attach edge is still evaluated when the row is reused.
+
+The attach is a two-transaction sequence (row, then edge) and is covered by the Atomicity policy below: a crash between them leaves an unattached blob, which is inert.
+
 ## Atomicity policy
 
 Writers are responsible for retry/cleanup if the verb-edge call fails after the noun-claim call succeeds. Orphaned noun-claims are tolerated — they have no effect on graph queries that traverse from edges, and S2-style sweeps can collect them. S3 writer plans may add per-writer retry-on-edge-failure if the writer's audit semantics require strict consistency. The auto-emitted `AUTHORED` edge already gives every successful `POST /api/v1/claims` a baseline edge anchor, so total orphans only occur on transaction-commit failure.

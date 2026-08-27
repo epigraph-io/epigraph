@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT\n                   b.id            AS \"id!\",\n                   b.filename      AS \"filename!\",\n                   b.mime_type     AS \"mime_type!\",\n                   b.size_bytes    AS \"size_bytes!\",\n                   b.content_hash  AS \"content_hash!\",\n                   b.uploader_id   AS \"uploader_id!\",\n                   b.labels        AS \"labels!\",\n                   b.properties    AS \"properties!\",\n                   b.created_at    AS \"created_at!\"\n            FROM blobs b\n            JOIN edges e ON e.target_id = b.id\n            WHERE e.source_id = $1\n              AND e.source_type = 'claim'\n              AND e.target_type = 'blob'\n            ORDER BY \"created_at!\" DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "filename!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "mime_type!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "size_bytes!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "content_hash!",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 5,
+        "name": "uploader_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "labels!",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 7,
+        "name": "properties!",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "69244d9e684aa8ed0bdf05d19368526f6c86b37853e7f9ceefe9c8446bca8e6b"
+}

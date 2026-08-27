@@ -191,6 +191,16 @@ impl From<DbError> for ApiError {
                 field: "value".to_string(),
                 reason: source.to_string(),
             },
+            // Blob filesystem failure (disk full, permissions, unreadable
+            // mount) — a server fault, so 500. A *missing* blob file never
+            // reaches here: the repository reports that as
+            // `NotFound { entity: "blob_content", .. }` above, i.e. a 404.
+            DbError::Io { message } => {
+                tracing::error!(error = %message, "Blob filesystem operation failed");
+                ApiError::InternalError {
+                    message: "Blob storage error".to_string(),
+                }
+            }
         }
     }
 }

@@ -10,6 +10,7 @@ pub mod analysis;
 pub mod authorization_code;
 pub mod authorize_session;
 pub mod behavioral_execution;
+pub mod blob;
 pub mod challenge;
 pub mod claim;
 pub mod claim_encryption;
@@ -66,6 +67,7 @@ pub use activity::ActivityRepository;
 pub use agent::{AgentCapabilitiesRow, AgentIdentityRow, AgentRepository, CapabilityFilter};
 pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
+pub use blob::{BlobRepository, StoredBlob, ATTACH_RELATIONSHIP, BLOB_ENTITY_TYPE};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
     ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimNeighbor, ClaimPairDistance,

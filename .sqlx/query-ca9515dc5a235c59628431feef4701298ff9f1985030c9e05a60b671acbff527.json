@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT source_id, source_type, target_id, target_type, relationship FROM edges WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "source_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "source_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "target_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "relationship",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ca9515dc5a235c59628431feef4701298ff9f1985030c9e05a60b671acbff527"
+}

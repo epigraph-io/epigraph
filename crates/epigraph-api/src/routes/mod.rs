@@ -17,6 +17,8 @@ pub mod assess;
 pub mod audit;
 pub mod batch;
 pub mod belief;
+#[cfg(feature = "db")]
+pub mod blobs;
 pub mod challenge;
 pub mod claims;
 pub mod claims_query;
@@ -485,7 +487,24 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/match_candidates/:id/decide",
             post(cross_source::decide_candidate),
-        );
+        )
+        // Content-addressed blobs. On `protected` including the READS: the
+        // kernel has no blob-level privacy tier, and raw instrument bytes are
+        // at least as sensitive as claim text, so the default is closed.
+        //
+        // The upload carries its OWN DefaultBodyLimit. Without it the
+        // router-wide `DefaultBodyLimit::max(config.max_request_size)` applied
+        // at the bottom of this function (10 MiB by default) would silently cap
+        // every upload below the configured blob ceiling; in axum the inner
+        // layer wins.
+        .route(
+            "/api/v1/blobs",
+            post(blobs::upload_blob).layer(DefaultBodyLimit::max(state.max_blob_bytes)),
+        )
+        .route("/api/v1/blobs/:id", get(blobs::get_blob_metadata))
+        .route("/api/v1/blobs/:id/content", get(blobs::download_blob))
+        .route("/api/v1/blobs/:id/verify", get(blobs::verify_blob))
+        .route("/api/v1/claims/:id/blobs", get(blobs::list_blobs_for_claim));
 
     // Auth middleware stack (outermost runs first):
     // 1. bearer_auth_middleware: if Bearer token present, validate JWT + inject AuthContext
