@@ -122,6 +122,40 @@ pub struct DedupRepair {
     pub moved_bbas: u64,
 }
 
+/// Outcome of one [`ClaimRepository::backfill_canonical_hash_chunk`] pass
+/// (backlog e09986c2).
+///
+/// `scanned` and `updated` differ because the backfill honours the same
+/// eligibility rule as the write path: only a row whose `content_hash` is the
+/// PLAIN digest of its `content` gets a canonical twin. See that method for
+/// which rows are skipped and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CanonicalBackfillChunk {
+    /// Rows read by this chunk, eligible or not.
+    pub scanned: u64,
+    /// Rows whose `canonical_hash` was written.
+    pub updated: u64,
+    /// Rows left NULL on purpose: their `content_hash` is namespaced or
+    /// client-overridden, so a digest of their bare text would be a lookup key
+    /// they must not have.
+    pub skipped_foreign_digest: u64,
+    /// Resume point for the next chunk — the greatest `id` read, or `None`
+    /// when the scan reached the end of the table. `None` is the caller's
+    /// termination signal; "wrote nothing" is NOT, since a chunk can be made
+    /// entirely of skipped rows.
+    pub next_after: Option<Uuid>,
+}
+
+impl CanonicalBackfillChunk {
+    /// The end-of-scan value: nothing read, nothing written, no resume point.
+    pub const END: Self = Self {
+        scanned: 0,
+        updated: 0,
+        skipped_foreign_digest: 0,
+        next_after: None,
+    };
+}
+
 /// Input for [`ClaimRepository::patch_claim_atomic_conn`].
 #[derive(Debug, Clone, Default)]
 pub struct PatchClaimInput {
@@ -2437,7 +2471,8 @@ impl ClaimRepository {
         }
     }
 
-    /// Find an existing claim by `(canonical_hash, agent_id)` (backlog e09986c2).
+    /// Find an existing **live** claim by `(canonical_hash, agent_id)`
+    /// (backlog e09986c2).
     ///
     /// The CANONICAL twin of [`Self::find_by_content_hash_and_agent`]. That one
     /// keys on BLAKE3 over the submitted bytes; this one keys on BLAKE3 over
@@ -2446,11 +2481,39 @@ impl ClaimRepository {
     /// resubmission that renders identically but differs in normalization form,
     /// invisible characters, or whitespace still finds the stored row.
     ///
+    /// # Why this one filters `is_current` and its exact twin does not
+    ///
+    /// [`Self::find_by_content_hash_and_agent`] has never had an `is_current`
+    /// predicate: a byte-identical resubmit of a superseded claim resolves onto
+    /// the tombstone, and `routes/submit.rs`'s dead-node guard turns that into
+    /// a deliberate 409 `DuplicateNotCurrent`. That is long-standing, tested
+    /// behaviour (`submit_packet_rejects_tombstone_duplicate_with_409`) and
+    /// this function does not change it.
+    ///
+    /// A COSMETIC VARIANT of a superseded claim is a different story. Its
+    /// `content_hash` differs, so it always missed the lookup entirely and
+    /// landed a fresh live row — `201 Created`. Were this lookup to match
+    /// tombstones, that variant would start resolving onto the dead node and
+    /// the same guard would answer 409, turning a working submission into a
+    /// rejected one. Dedup exists to collapse a variant onto a LIVE row; it
+    /// must never resurrect a dead one, so a tombstone is invisible here and
+    /// the variant goes on creating its own live claim exactly as before.
+    /// Pinned by `cosmetic_variant_of_a_superseded_claim_starts_a_fresh_live_row`
+    /// and, at the HTTP boundary, by
+    /// `submit_packet_accepts_a_cosmetic_variant_of_a_superseded_claim`.
+    ///
+    /// `COALESCE(is_current, true)` rather than `is_current = true`: the column
+    /// is `NOT NULL DEFAULT true` today, but every other `is_current` predicate
+    /// in this repo is written defensively and a bare `= true` would silently
+    /// drop rows if that ever relaxed.
+    ///
     /// Rows whose `canonical_hash` is NULL — legacy rows awaiting the
-    /// `backfill_canonical_hash` CLI, and writers outside `ClaimRepository` —
-    /// are simply not found, exactly as before this column existed. The
-    /// `canonical_hash IS NOT NULL` predicate makes that explicit and lets the
-    /// partial index from migration 061 serve the query.
+    /// `backfill_canonical_hash` CLI, writers outside `ClaimRepository`, and
+    /// rows whose `content_hash` is namespaced or overridden (see
+    /// [`Self::create_with_id_if_absent`]) — are simply not found, exactly as
+    /// before this column existed. The `canonical_hash IS NOT NULL` predicate
+    /// makes that explicit and lets the partial index from migration 061 serve
+    /// the query.
     ///
     /// `LIMIT 1` and not an error on multiplicity: `canonical_hash` is
     /// deliberately NOT unique (migration 061 explains why), so cosmetic
@@ -2470,6 +2533,7 @@ impl ClaimRepository {
             r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
                FROM claims
                WHERE canonical_hash = $1 AND agent_id = $2 AND canonical_hash IS NOT NULL
+                 AND COALESCE(is_current, true) = true
                ORDER BY created_at, id
                LIMIT 1"#,
         )
@@ -2585,12 +2649,23 @@ impl ClaimRepository {
         ))
     }
 
-    /// How many rows still have no `canonical_hash` (backlog e09986c2).
+    /// How many rows have no `canonical_hash` (backlog e09986c2).
     ///
     /// Drives the `backfill_canonical_hash` CLI's progress reporting and its
-    /// `--dry-run`. Trends to zero as the backfill runs; a rise afterwards
-    /// means a writer outside `ClaimRepository` is inserting claims without
-    /// the column, and stage 2 of `create_or_get` is blind to its rows.
+    /// `--dry-run`.
+    ///
+    /// **This is an upper bound on the backfill's work, not a target of
+    /// zero.** BLAKE3 has no PostgreSQL function, so this cannot express the
+    /// eligibility rule that
+    /// [`Self::backfill_canonical_hash_chunk`] applies process-side: rows whose
+    /// `content_hash` is namespaced or client-overridden are counted here but
+    /// are deliberately never filled. A completed backfill therefore settles at
+    /// that population, not at 0 — read the chunk's
+    /// [`CanonicalBackfillChunk::skipped_foreign_digest`] to see how much of the
+    /// remainder is intentional. A rise in the *eligible* remainder after a
+    /// completed run means a writer outside `ClaimRepository` is inserting
+    /// claims without the column, and stage 2 of `create_or_get` is blind to
+    /// its rows.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -2601,10 +2676,12 @@ impl ClaimRepository {
         Ok(n.unwrap_or(0))
     }
 
-    /// Backfill one chunk of `canonical_hash`, returning how many rows it set.
+    /// Backfill one chunk of `canonical_hash`.
     ///
-    /// Returns `0` when nothing is left, which is the caller's termination
-    /// signal.
+    /// Scans forward from `after` (pass `None` to start), fills the twin on
+    /// every ELIGIBLE row it sees, and reports where to resume.
+    /// [`CanonicalBackfillChunk::next_after`] is `None` exactly when the scan
+    /// reached the end of the table, which is the caller's termination signal.
     ///
     /// # Why this is Rust and not SQL
     ///
@@ -2615,39 +2692,83 @@ impl ClaimRepository {
     /// `ContentHasher::hash_canonical_text` the write path uses — anything else
     /// risks a backfilled value that the write path would never reproduce.
     ///
-    /// # Why it is resumable without a cursor
+    /// # What it deliberately leaves NULL
     ///
-    /// The `WHERE canonical_hash IS NULL` predicate is self-consuming: every
-    /// row this chunk touches leaves the candidate set permanently. An
-    /// interrupted run therefore resumes simply by being re-invoked, and a
-    /// completed run is a no-op. `ORDER BY id` only makes the paging
-    /// deterministic for logging.
+    /// A row is eligible only when its `content_hash` IS the plain BLAKE3 of
+    /// its `content` — the same self-check the write path applies in
+    /// [`Self::create_with_id_if_absent`]. Rows that fail it carry a
+    /// NAMESPACED or OVERRIDDEN identity (document-scoped spine nodes seeded by
+    /// `epigraph_ingest::common::ids::compound_content_hash`; rows created
+    /// through the client-supplied `content_hash` override on
+    /// `POST /api/v1/claims`, including every `fully_private` claim, whose
+    /// stored `content` is the placeholder `"[private]"`). Filling those from
+    /// their bare text would give two documents' "Introduction" — or all of one
+    /// agent's private claims — a single lookup key, which is precisely the
+    /// collision the namespacing exists to prevent. They stay NULL, i.e.
+    /// invisible to stage 2, forever.
+    ///
+    /// Without this filter the backfill would silently UNDO the write path's
+    /// guard on every row it has ever written.
+    ///
+    /// # Why it needs a cursor
+    ///
+    /// `WHERE canonical_hash IS NULL` is no longer self-consuming: a skipped
+    /// row stays NULL and would be re-selected forever. Worse, a chunk made
+    /// entirely of skipped rows would report zero rows written, and a caller
+    /// terminating on "wrote nothing" would stop with eligible rows still
+    /// unfilled. Keyset-paging on `id` fixes both — the scan advances past
+    /// skipped rows and terminates on an empty read, not an empty write.
+    /// Resumption is still stateless in practice: re-invoking from `None`
+    /// re-scans cheaply (already-filled rows fail the `IS NULL` predicate) and
+    /// a completed run writes nothing.
     ///
     /// The whole chunk lands in one `UPDATE ... FROM (SELECT UNNEST(...))`, so
-    /// a chunk is atomic: it either sets every row it read or none of them.
+    /// a chunk is atomic: it either sets every eligible row it read or none.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     pub async fn backfill_canonical_hash_chunk(
         pool: &PgPool,
         chunk_size: i64,
-    ) -> Result<u64, DbError> {
+        after: Option<Uuid>,
+    ) -> Result<CanonicalBackfillChunk, DbError> {
         let rows = sqlx::query!(
-            "SELECT id, content FROM claims WHERE canonical_hash IS NULL ORDER BY id LIMIT $1",
-            chunk_size
+            "SELECT id, content, content_hash FROM claims \
+             WHERE canonical_hash IS NULL AND ($2::uuid IS NULL OR id > $2) \
+             ORDER BY id LIMIT $1",
+            chunk_size,
+            after
         )
         .fetch_all(pool)
         .await?;
 
-        if rows.is_empty() {
-            return Ok(0);
-        }
+        let Some(last) = rows.last() else {
+            return Ok(CanonicalBackfillChunk::END);
+        };
+        let scanned = rows.len() as u64;
+        let next_after = Some(last.id);
 
-        let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
-        let hashes: Vec<Vec<u8>> = rows
+        // Eligible == the stored digest is the PLAIN digest of the stored text.
+        let (ids, hashes): (Vec<Uuid>, Vec<Vec<u8>>) = rows
             .iter()
-            .map(|r| ContentHasher::hash_canonical_text(&r.content).to_vec())
-            .collect();
+            .filter(|r| r.content_hash == ContentHasher::hash(r.content.as_bytes()))
+            .map(|r| {
+                (
+                    r.id,
+                    ContentHasher::hash_canonical_text(&r.content).to_vec(),
+                )
+            })
+            .unzip();
+        let skipped_foreign_digest = scanned - ids.len() as u64;
+
+        if ids.is_empty() {
+            return Ok(CanonicalBackfillChunk {
+                scanned,
+                updated: 0,
+                skipped_foreign_digest,
+                next_after,
+            });
+        }
 
         let result = sqlx::query!(
             "UPDATE claims SET canonical_hash = d.h \
@@ -2659,7 +2780,12 @@ impl ClaimRepository {
         .execute(pool)
         .await?;
 
-        Ok(result.rows_affected())
+        Ok(CanonicalBackfillChunk {
+            scanned,
+            updated: result.rows_affected(),
+            skipped_foreign_digest,
+            next_after,
+        })
     }
 
     /// Find-or-insert a claim by `(content_hash, agent_id)`, falling back to
@@ -2675,9 +2801,9 @@ impl ClaimRepository {
     ///    bytes. Cheapest, unchanged, and served by
     ///    `uq_claims_content_hash_agent`'s index. It hits every row in the
     ///    table, backfilled or not.
-    /// 2. **Canonical.** `(canonical_hash, agent_id)` — BLAKE3 over the
-    ///    canonicalized text. Catches the resubmission that renders identically
-    ///    but differs in Unicode normalization form (`caf\u{e9}` vs
+    /// 2. **Canonical, LIVE rows only.** `(canonical_hash, agent_id)` — BLAKE3
+    ///    over the canonicalized text. Catches the resubmission that renders
+    ///    identically but differs in Unicode normalization form (`caf\u{e9}` vs
     ///    `cafe\u{301}`), in invisible characters (U+200B, U+FEFF), or in
     ///    whitespace runs. Without it each such variant misses stage 1 and
     ///    lands a SECOND row for the SAME agent.
@@ -2686,9 +2812,30 @@ impl ClaimRepository {
     /// byte-identical resubmit resolves to the byte-identical row even when a
     /// cosmetic sibling of it also exists from the pre-fix era.
     ///
-    /// Stage 2 finds nothing on rows whose `canonical_hash` is still NULL
-    /// (legacy, pre-backfill), so before `backfill_canonical_hash` runs this is
-    /// exactly today's behaviour — never worse for anyone.
+    /// # What stage 2 must NOT reach
+    ///
+    /// Stage 2 widened the set of rows a submission can be resolved onto, and
+    /// two kinds of row are deliberately outside it. Both are enforced by
+    /// leaving them invisible to the lookup rather than by a check here.
+    ///
+    /// * **Tombstones.** `find_by_canonical_hash_and_agent` filters
+    ///   `is_current`. A cosmetic variant of a SUPERSEDED claim always missed
+    ///   the lookup and landed a fresh live row; resolving it onto the
+    ///   tombstone instead would make `routes/submit.rs`'s dead-node guard
+    ///   answer 409 where it used to answer 201. Stage 1 still reaches
+    ///   tombstones — that is pre-existing and intended.
+    /// * **Rows whose `content_hash` is not the plain digest of their text** —
+    ///   document-scoped spine nodes and rows created through the
+    ///   client-supplied `content_hash` override. Both leave `canonical_hash`
+    ///   NULL (see [`Self::create_with_id_if_absent`] and
+    ///   `routes/claims.rs`), so their namespaced identity is not re-collapsed
+    ///   onto their bare text.
+    ///
+    /// Stage 2 also finds nothing on rows whose `canonical_hash` is still NULL
+    /// because they predate migration 061 (legacy, awaiting
+    /// `backfill_canonical_hash`). Between the exclusions above and that one,
+    /// every submission that succeeded before this column existed still
+    /// succeeds, backfilled or not.
     ///
     /// **Post-107 race handling:** if a concurrent writer inserts the same
     /// `(content_hash, agent_id)` between the find and the insert, the INSERT
@@ -2781,9 +2928,30 @@ impl ClaimRepository {
     ) -> Result<bool, DbError> {
         // The caller supplies `content_hash` (ingest derives the row's PRIMARY
         // KEY from it via `ids::atom_id`, so it must stay raw BLAKE3 over the
-        // submitted bytes — see backlog e09986c2). `canonical_hash` is derived
-        // here from `content` instead: it is lookup-only and feeds no id.
-        let canonical_hash = ContentHasher::hash_canonical_text(content);
+        // submitted bytes — see backlog e09986c2).
+        //
+        // `canonical_hash` is the canonicalization-tolerant TWIN of
+        // `content_hash`, and that relationship only holds while `content_hash`
+        // IS the plain digest of `content`. For a DOCUMENT-SCOPED (compound)
+        // node it is not: `epigraph_ingest::common::ids::compound_content_hash`
+        // namespaces the digest by `(artifact seed, text)` precisely so that
+        // paper A's "Introduction" and paper B's "Introduction" stay distinct
+        // rows. Deriving `canonical_hash` from the text ALONE would hand both
+        // of them one lookup key — re-opening, in the lookup dimension, exactly
+        // the collision the namespacing exists to prevent — and would let a
+        // plain `create_or_get("Introduction")` resolve onto a spine node it
+        // could never previously reach.
+        //
+        // We cannot re-derive the namespace here (the caller folded it in
+        // before calling), so the rule is a self-check: compute the twin only
+        // when the supplied digest is the plain one. ATOMS pass — global
+        // convergence across documents is their whole point — and every
+        // namespaced row leaves the column NULL, which
+        // `find_by_canonical_hash_and_agent` treats as "not a lookup target",
+        // i.e. exactly its behaviour before this column existed.
+        let canonical_hash: Option<[u8; 32]> = (content_hash
+            == &ContentHasher::hash(content.as_bytes()))
+            .then(|| ContentHasher::hash_canonical_text(content));
 
         let row: Option<(bool,)> = sqlx::query_as(
             "INSERT INTO claims (id, content, content_hash, canonical_hash, agent_id, truth_value, labels) \
@@ -2794,7 +2962,7 @@ impl ClaimRepository {
         .bind(id)
         .bind(content)
         .bind(content_hash.as_slice())
-        .bind(canonical_hash.as_slice())
+        .bind(canonical_hash.as_ref().map(|h| h.as_slice()))
         .bind(agent_id)
         .bind(truth.value())
         .bind(labels)

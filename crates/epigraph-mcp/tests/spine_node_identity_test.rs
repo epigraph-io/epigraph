@@ -286,3 +286,87 @@ async fn spine_path_also_scopes_structural_nodes_per_document(pool: PgPool) {
         "spine phase must not write level-3 atoms"
     );
 }
+
+/// The same document-scoping contract, asserted in the LOOKUP dimension.
+///
+/// Distinct `content_hash` values keep the two "Introduction" nodes distinct as
+/// ROWS. `claims.canonical_hash` (migration 061) is a second, lookup-only
+/// digest that `ClaimRepository::create_or_get` consults when the exact hash
+/// misses — and deriving it from the node's text alone would hand both papers
+/// one key, re-fusing them exactly where the namespacing was meant to keep them
+/// apart, and letting an ordinary claim submission land on a spine node.
+///
+/// So a document-scoped node must carry NO canonical_hash. Asserted here
+/// against the REAL ids module rather than a reconstruction of it, because the
+/// property depends on `compound_content_hash` genuinely differing from the
+/// plain digest — the write path's eligibility check is exactly that
+/// comparison.
+#[sqlx::test(migrations = "../../migrations")]
+async fn spine_nodes_carry_no_canonical_hash(pool: PgPool) {
+    let server = make_server(pool.clone());
+
+    do_ingest_document(&server, &alpha())
+        .await
+        .expect("alpha ingests");
+    do_ingest_document(&server, &beta())
+        .await
+        .expect("beta ingests");
+
+    let section_nodes = claims_with_content(&pool, SHARED_SECTION).await;
+    assert_eq!(
+        section_nodes.len(),
+        2,
+        "fixture: both papers must own a section node, got {section_nodes:?}"
+    );
+
+    let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT content_hash, canonical_hash FROM claims WHERE id = ANY($1) ORDER BY id",
+    )
+    .bind(&section_nodes)
+    .fetch_all(&pool)
+    .await
+    .expect("read digests");
+
+    let plain = blake3::hash(SHARED_SECTION.as_bytes()).as_bytes().to_vec();
+    for (content_hash, canonical_hash) in &rows {
+        assert_ne!(
+            content_hash, &plain,
+            "fixture: a spine node's content_hash must be NAMESPACED, not the \
+             plain digest of its text (see ids::compound_content_hash)"
+        );
+        assert_eq!(
+            canonical_hash, &None,
+            "a document-scoped spine node must not carry a canonical_hash — a \
+             digest of {SHARED_SECTION:?} alone is a lookup key both papers \
+             would share"
+        );
+    }
+
+    // The consequence: an ordinary claim whose text happens to match a section
+    // heading must get its own row, not one of the papers' spine nodes.
+    let agent = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, $2)")
+        .bind(agent)
+        .bind([9u8; 32].as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed agent");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let claim = epigraph_core::Claim::new(
+        SHARED_SECTION.to_string(),
+        epigraph_core::AgentId::from_uuid(agent),
+        [0u8; 32],
+        epigraph_core::TruthValue::new(0.5).expect("truth"),
+    );
+    let (found, created) = epigraph_db::ClaimRepository::create_or_get(&mut conn, &claim)
+        .await
+        .expect("create_or_get");
+    assert!(
+        created,
+        "a plain claim must not be resolved onto a document-scoped spine node \
+         — it resolved onto {}",
+        Uuid::from(found.id)
+    );
+    assert!(!section_nodes.contains(&Uuid::from(found.id)));
+}

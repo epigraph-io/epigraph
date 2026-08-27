@@ -344,10 +344,14 @@ async fn legacy_null_row_dedups_only_after_the_backfill(pool: PgPool) {
     );
 
     // Backfill, then assert it is complete and idempotent.
-    let n = ClaimRepository::backfill_canonical_hash_chunk(&pool, 1000)
+    let chunk = ClaimRepository::backfill_canonical_hash_chunk(&pool, 1000, None)
         .await
         .expect("backfill chunk");
-    assert_eq!(n, 1, "the one legacy row must be backfilled");
+    assert_eq!(chunk.updated, 1, "the one legacy row must be backfilled");
+    assert_eq!(
+        chunk.skipped_foreign_digest, 0,
+        "the legacy row carries a PLAIN content_hash, so nothing is skipped"
+    );
     assert_eq!(
         ClaimRepository::count_missing_canonical_hash(&pool)
             .await
@@ -355,10 +359,10 @@ async fn legacy_null_row_dedups_only_after_the_backfill(pool: PgPool) {
         0
     );
     assert_eq!(
-        ClaimRepository::backfill_canonical_hash_chunk(&pool, 1000)
+        ClaimRepository::backfill_canonical_hash_chunk(&pool, 1000, None)
             .await
             .expect("second backfill chunk"),
-        0,
+        epigraph_db::CanonicalBackfillChunk::END,
         "a completed backfill must be a no-op on re-run"
     );
 
@@ -477,5 +481,375 @@ async fn exact_match_wins_over_a_cosmetic_sibling(pool: PgPool) {
     assert_eq!(
         found.content, exact,
         "the exact lookup must win over the cosmetic sibling that was stored first"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCOPE GUARDS on the stage-2 lookup.
+//
+// Stage 2 widened what `create_or_get` can resolve a submission onto. Two rows
+// it must NOT reach, each pinned below:
+//
+//   1. a TOMBSTONE (`is_current = false`). Stage 1 has always been able to
+//      return one — that is pre-existing, and `submit.rs`'s dead-node guard
+//      turns it into a deliberate 409. Stage 2 reaching one is NOT pre-existing:
+//      a cosmetic variant of a superseded claim used to miss the lookup
+//      entirely and land a fresh LIVE row (201 Created). Letting stage 2 find
+//      the tombstone converts that 201 into a 409 — a user-visible regression.
+//
+//   2. a DOCUMENT-SCOPED (compound) row, whose `content_hash` is namespaced by
+//      its host artifact (`epigraph_ingest::common::ids::compound_content_hash`)
+//      precisely so paper A's "Introduction" and paper B's "Introduction" stay
+//      distinguishable. A `canonical_hash` over the text ALONE would re-open
+//      that collision in the lookup dimension and let a plain claim submission
+//      resolve onto a spine node.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// REGRESSION (defect 1). A cosmetic variant of a SUPERSEDED claim must still
+/// start a fresh live row.
+///
+/// Before stage 2 existed, the variant's `content_hash` differed from the
+/// tombstone's, so the lookup missed and `create_or_get` inserted — the
+/// submitter got a new live claim. A stage 2 with no `is_current` predicate
+/// resolves the variant onto the tombstone instead, and every caller that
+/// guards against dead nodes (`routes/submit.rs`) then rejects the submission
+/// with 409 `DuplicateNotCurrent`. Dedup must never resurrect a tombstone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cosmetic_variant_of_a_superseded_claim_starts_a_fresh_live_row(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let original = "Mitochondrial density predicts endurance.";
+    // Same text to a reader: collapsed whitespace run + a zero-width space.
+    let variant = "Mitochondrial  density predicts\u{200b} endurance.";
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let (stored, created) = ClaimRepository::create_or_get(&mut conn, &make_claim(original, agent))
+        .await
+        .expect("create_or_get original");
+    assert!(created, "fixture: the original must insert");
+
+    // Retire it. Different content, so the ORIGINAL row keeps its digests and
+    // merely flips to `is_current = false` — a tombstone.
+    ClaimRepository::supersede(
+        &pool,
+        stored.id,
+        "Mitochondrial density predicts endurance only in trained subjects.",
+        TruthValue::new(0.6).unwrap(),
+        "test: retire the original to create a tombstone",
+    )
+    .await
+    .expect("supersede");
+
+    let tombstoned: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(Uuid::from(stored.id))
+        .fetch_one(&pool)
+        .await
+        .expect("read is_current");
+    assert!(!tombstoned, "fixture: the original must now be a tombstone");
+
+    let (found, created_variant) =
+        ClaimRepository::create_or_get(&mut conn, &make_claim(variant, agent))
+            .await
+            .expect("create_or_get variant");
+
+    assert!(
+        created_variant,
+        "a cosmetic variant of a SUPERSEDED claim must insert a fresh live row, \
+         exactly as it did before the canonical lookup existed — instead it \
+         resolved onto claim {}",
+        Uuid::from(found.id)
+    );
+    assert_ne!(
+        found.id, stored.id,
+        "the variant must never be handed back the tombstone's id"
+    );
+    let live: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(Uuid::from(found.id))
+        .fetch_one(&pool)
+        .await
+        .expect("read is_current of the new row");
+    assert!(live, "the freshly created row must be live");
+}
+
+/// The other half of defect 1: excluding tombstones must not cost a LIVE hit.
+/// With a tombstone and a live row sharing one canonical digest — the state a
+/// supersede-then-resubmit leaves behind — a third cosmetic variant must
+/// resolve onto the LIVE row, not fork and not resurrect the dead one.
+///
+/// The tombstone is seeded FIRST so it sorts first under the lookup's
+/// `ORDER BY created_at, id`: a predicate-free stage 2 would return it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn canonical_lookup_prefers_the_live_row_over_a_tombstone_sibling(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let dead = "Chaperone  binding stabilises the fold.\n"; // canonicalizes to `live`
+    let live = "Chaperone binding stabilises the fold.";
+    let third = "Chaperone binding stabilises\u{feff} the  fold."; // same canonical form
+
+    let dead_id = Uuid::new_v4();
+    let live_id = Uuid::new_v4();
+    for (id, text, is_current) in [(dead_id, dead, false), (live_id, live, true)] {
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, canonical_hash, truth_value, \
+                                 agent_id, is_current) \
+             VALUES ($1, $2, $3, $4, 0.5, $5, $6)",
+        )
+        .bind(id)
+        .bind(text)
+        .bind(ContentHasher::hash(text.as_bytes()).as_slice())
+        .bind(ContentHasher::hash_canonical_text(text).as_slice())
+        .bind(agent)
+        .bind(is_current)
+        .execute(&pool)
+        .await
+        .expect("seed row");
+    }
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let (found, created) = ClaimRepository::create_or_get(&mut conn, &make_claim(third, agent))
+        .await
+        .expect("create_or_get third variant");
+
+    assert!(
+        !created,
+        "a cosmetic variant of a LIVE row must still dedup onto it"
+    );
+    assert_eq!(
+        Uuid::from(found.id),
+        live_id,
+        "stage 2 must resolve onto the LIVE sibling, not the tombstone that \
+         sorts ahead of it"
+    );
+}
+
+/// REGRESSION (defect 2). A row whose `content_hash` is NAMESPACED must not
+/// advertise a `canonical_hash` over its text alone.
+///
+/// `epigraph_ingest::common::ids::compound_content_hash` derives a structural
+/// node's digest over `(plain text hash ‖ artifact seed)` so that paper A's
+/// "Introduction" and paper B's "Introduction" stay distinct rows. Deriving
+/// `canonical_hash` from the text alone hands both of them the SAME lookup key
+/// and makes either reachable by a plain `create_or_get("Introduction")`.
+///
+/// `create_with_id_if_absent` cannot know the namespace — the caller folded it
+/// into `content_hash` before calling — so the only safe rule is: derive
+/// `canonical_hash` only when `content_hash` IS the plain digest of `content`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn namespaced_content_hash_row_gets_no_canonical_hash(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let shared_text = "Introduction";
+
+    // Mirrors `compound_content_hash`: blake3(plain_hash ‖ artifact_seed).
+    // Reconstructed here rather than imported because `epigraph-db` sits below
+    // `epigraph-ingest`; `spine_node_identity_test.rs` pins the real function.
+    let namespaced = |seed: &str| -> [u8; 32] {
+        let mut material = Vec::new();
+        material.extend_from_slice(ContentHasher::hash(shared_text.as_bytes()).as_slice());
+        material.extend_from_slice(seed.as_bytes());
+        *blake3::hash(&material).as_bytes()
+    };
+
+    let paper_a = Uuid::new_v4();
+    let paper_b = Uuid::new_v4();
+    for (id, seed) in [(paper_a, "paper-a"), (paper_b, "paper-b")] {
+        assert!(
+            ClaimRepository::create_with_id_if_absent(
+                &pool,
+                id,
+                shared_text,
+                &namespaced(seed),
+                agent,
+                TruthValue::new(0.5).unwrap(),
+                &[],
+            )
+            .await
+            .expect("insert spine node"),
+            "fixture: each spine node must insert"
+        );
+    }
+
+    let distinct_content_hashes: i64 =
+        sqlx::query_scalar("SELECT COUNT(DISTINCT content_hash) FROM claims WHERE id = ANY($1)")
+            .bind(vec![paper_a, paper_b])
+            .fetch_one(&pool)
+            .await
+            .expect("count distinct content_hash");
+    assert_eq!(
+        distinct_content_hashes, 2,
+        "fixture: the two spine nodes must carry DISTINCT namespaced content_hash"
+    );
+
+    let with_canonical: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM claims WHERE id = ANY($1) AND canonical_hash IS NOT NULL",
+    )
+    .bind(vec![paper_a, paper_b])
+    .fetch_one(&pool)
+    .await
+    .expect("count canonical_hash");
+    assert_eq!(
+        with_canonical, 0,
+        "a namespaced (document-scoped) row must leave canonical_hash NULL — \
+         a text-only digest would collapse both papers onto one lookup key"
+    );
+
+    // The consequence that matters: a plain claim submission must not be
+    // resolved onto a document's structural node.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let (found, created) =
+        ClaimRepository::create_or_get(&mut conn, &make_claim(shared_text, agent))
+            .await
+            .expect("create_or_get plain claim");
+    assert!(
+        created,
+        "a plain claim must never be resolved onto a document-scoped spine \
+         node — it resolved onto {}",
+        Uuid::from(found.id)
+    );
+    assert_ne!(Uuid::from(found.id), paper_a);
+    assert_ne!(Uuid::from(found.id), paper_b);
+}
+
+/// The complement of the guard above: an ATOM — whose `content_hash` IS the
+/// plain digest of its text, because global convergence across documents is
+/// exactly its point — must still get a `canonical_hash`. The scope guard
+/// narrows the namespaced case only; it must not switch the feature off for
+/// every `create_with_id_if_absent` caller.
+#[sqlx::test(migrations = "../../migrations")]
+async fn plain_content_hash_row_still_gets_its_canonical_hash(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let text = "Kinesin  steps along the microtubule.\n";
+    let id = Uuid::new_v4();
+
+    assert!(
+        ClaimRepository::create_with_id_if_absent(
+            &pool,
+            id,
+            text,
+            &ContentHasher::hash(text.as_bytes()),
+            agent,
+            TruthValue::new(0.5).unwrap(),
+            &[],
+        )
+        .await
+        .expect("insert atom"),
+        "fixture: the atom must insert"
+    );
+
+    let canon: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT canonical_hash FROM claims WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read canonical_hash");
+    assert_eq!(
+        canon,
+        Some(ContentHasher::hash_canonical_text(text).to_vec()),
+        "a row whose content_hash is the PLAIN digest must still carry the \
+         canonical twin — this is the atom/global-convergence case"
+    );
+}
+
+/// REGRESSION. The BACKFILL must honour the same scope rule as the write path.
+///
+/// `backfill_canonical_hash_chunk` fills every row where `canonical_hash IS
+/// NULL`. Left unqualified, one run would UNDO the guard above on every row
+/// the write path ever protected — re-fusing two documents' "Introduction",
+/// and giving every `fully_private` claim of one agent the digest of the
+/// literal placeholder `"[private]"` they all store as `content`.
+///
+/// This also pins the paging hazard that eligibility introduces: `WHERE
+/// canonical_hash IS NULL` stops being self-consuming once rows are skipped,
+/// so a chunk that writes NOTHING must still advance and must not be read as
+/// end-of-scan. The eligible row here sorts AFTER both skipped rows under
+/// `ORDER BY id`, and `chunk_size = 1` forces each into its own chunk, so a
+/// run that terminated on "wrote nothing" would stop before ever reaching it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_skips_foreign_digests_without_truncating_the_scan(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let shared_text = "Introduction";
+    let eligible_text = "Legacy row whose digest is the plain one.";
+
+    // Two namespaced rows (ids forced low) and one eligible legacy row (id
+    // forced high) so `ORDER BY id` puts the skips first.
+    let skip_a = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+    let skip_b = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+    let eligible = Uuid::parse_str("ffffffff-0000-4000-8000-000000000003").unwrap();
+
+    let namespaced = |seed: &str| -> Vec<u8> {
+        let mut material = Vec::new();
+        material.extend_from_slice(ContentHasher::hash(shared_text.as_bytes()).as_slice());
+        material.extend_from_slice(seed.as_bytes());
+        blake3::hash(&material).as_bytes().to_vec()
+    };
+
+    for (id, text, hash) in [
+        (skip_a, shared_text, namespaced("paper-a")),
+        (skip_b, shared_text, namespaced("paper-b")),
+        (
+            eligible,
+            eligible_text,
+            ContentHasher::hash(eligible_text.as_bytes()).to_vec(),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id) \
+             VALUES ($1, $2, $3, 0.5, $4)",
+        )
+        .bind(id)
+        .bind(text)
+        .bind(hash)
+        .bind(agent)
+        .execute(&pool)
+        .await
+        .expect("seed row");
+    }
+
+    // Drive the loop the CLI drives: one row per chunk, terminating ONLY on
+    // end-of-scan (`next_after == None`), never on "this chunk wrote nothing".
+    let mut after: Option<Uuid> = None;
+    let (mut updated, mut skipped, mut chunks) = (0_u64, 0_u64, 0_u32);
+    loop {
+        let chunk = ClaimRepository::backfill_canonical_hash_chunk(&pool, 1, after)
+            .await
+            .expect("backfill chunk");
+        let Some(next) = chunk.next_after else { break };
+        after = Some(next);
+        updated += chunk.updated;
+        skipped += chunk.skipped_foreign_digest;
+        chunks += 1;
+        assert!(
+            chunks < 10,
+            "cursor failed to advance — the scan is looping"
+        );
+    }
+
+    assert_eq!(chunks, 3, "every row must be scanned, skips included");
+    assert_eq!(
+        updated, 1,
+        "exactly the one plain-digest row may be backfilled"
+    );
+    assert_eq!(skipped, 2, "both namespaced rows must be skipped");
+
+    let still_null: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM claims WHERE canonical_hash IS NULL ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("read remaining NULLs");
+    assert_eq!(
+        still_null,
+        vec![skip_a, skip_b],
+        "the namespaced rows must remain NULL after a COMPLETE backfill pass"
+    );
+
+    // And the guard still holds end-to-end: a plain submission of the spine
+    // text must not be resolved onto either document's node.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let (found, created) =
+        ClaimRepository::create_or_get(&mut conn, &make_claim(shared_text, agent))
+            .await
+            .expect("create_or_get after backfill");
+    assert!(
+        created,
+        "after a full backfill a plain claim must still not resolve onto a \
+         document-scoped node — it resolved onto {}",
+        Uuid::from(found.id)
     );
 }

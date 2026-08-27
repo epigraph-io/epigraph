@@ -1163,3 +1163,84 @@ async fn submit_packet_sets_labels_at_creation(pool: PgPool) {
         );
     }
 }
+
+/// **Dead-node guard, the OTHER side of it.** The 409 above is deliberate and
+/// must stay; what must NOT happen is that guard firing on a submission it
+/// never used to see.
+///
+/// A packet whose claim text is a COSMETIC VARIANT of a superseded claim —
+/// same text to any reader, differing only in a collapsed whitespace run and a
+/// zero-width space — has a different `content_hash`, so it always missed the
+/// dedup lookup and landed a fresh live claim: **201 Created**. When the
+/// canonicalized stage-2 lookup (backlog e09986c2) was added without an
+/// `is_current` predicate, that variant started resolving onto the TOMBSTONE
+/// and this endpoint began answering **409 DuplicateNotCurrent** — a
+/// user-visible regression on a path with no prior coverage.
+///
+/// Dedup may collapse a variant onto a LIVE row; it must never resurrect a
+/// dead one. This pins the 201.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_accepts_a_cosmetic_variant_of_a_superseded_claim(pool: PgPool) {
+    let agent = fixed_agent(44, "cosmetic-variant-agent");
+    let created_agent = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed");
+    let agent_uuid: Uuid = created_agent.id.into();
+
+    let original = "Superseded claim whose cosmetic twin must still be accepted";
+    // Same rendered text: a doubled space and an inserted zero-width space.
+    let variant = "Superseded claim whose  cosmetic twin must still be\u{200b} accepted";
+
+    let router = create_test_router(pool.clone());
+    let (status_1, body_1) = post_packet(&router, evidence_packet(agent_uuid, original)).await;
+    assert_eq!(
+        status_1,
+        StatusCode::CREATED,
+        "first submit should be 201, got {status_1}: {body_1}"
+    );
+    let claim_id_1 = Uuid::parse_str(
+        serde_json::from_str::<serde_json::Value>(&body_1).expect("json")["claim_id"]
+            .as_str()
+            .expect("claim_id present"),
+    )
+    .expect("claim_id should parse as uuid");
+
+    // Retire it: the original row flips to is_current = false, digests intact.
+    ClaimRepository::supersede(
+        &pool,
+        ClaimId::from_uuid(claim_id_1),
+        "A corrected, different claim that replaces the original",
+        TruthValue::new(0.6).expect("valid truth value"),
+        "test: retire the original to create a tombstone",
+    )
+    .await
+    .expect("supersede should succeed");
+
+    // The cosmetic variant must still be accepted as a NEW live claim.
+    let (status_2, body_2) = post_packet(&router, evidence_packet(agent_uuid, variant)).await;
+    assert_eq!(
+        status_2,
+        StatusCode::CREATED,
+        "a cosmetic variant of a SUPERSEDED claim must still be accepted as a \
+         new live claim (201), got {status_2}: {body_2}"
+    );
+
+    let json_2: serde_json::Value = serde_json::from_str(&body_2).expect("201 response is JSON");
+    assert_eq!(
+        json_2["was_duplicate"], false,
+        "the variant must be reported as a fresh claim, not a duplicate: {body_2}"
+    );
+    let claim_id_2 = Uuid::parse_str(json_2["claim_id"].as_str().expect("claim_id present"))
+        .expect("claim_id should parse as uuid");
+    assert_ne!(
+        claim_id_2, claim_id_1,
+        "the variant must never be handed back the tombstone's id"
+    );
+
+    let is_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(claim_id_2)
+        .fetch_one(&pool)
+        .await
+        .expect("is_current query should succeed");
+    assert!(is_current, "the newly created claim must be live");
+}

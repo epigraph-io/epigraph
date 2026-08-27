@@ -460,6 +460,17 @@ pub async fn create_claim(
         })?;
 
     // Persist claim — branch on if_not_exists per noun-claims-and-verb-edges S1.
+    //
+    // No `is_current` guard here, unlike `routes/submit.rs`: `create_or_get`
+    // can hand back a tombstone only through its EXACT `content_hash` lookup,
+    // which has behaved that way since long before this endpoint gained
+    // `if_not_exists` — a byte-identical re-create of a superseded claim
+    // returns the superseded row. Its canonicalized stage-2 lookup is
+    // live-only (`find_by_canonical_hash_and_agent`), so widening the dedup to
+    // cosmetic variants did NOT widen the set of dead rows reachable here.
+    // Adding a 409 would therefore be a new behaviour change, not a repair;
+    // if this endpoint should start refusing tombstones, that is its own
+    // decision with its own tests.
     let (created_claim, was_created) = if request.if_not_exists {
         ClaimRepository::create_or_get(&mut tx, &claim).await?
     } else {
@@ -516,12 +527,37 @@ pub async fn create_claim(
             None
         };
 
+        // `claims.canonical_hash` (migration 061) is the canonicalization-
+        // tolerant TWIN of `content_hash`, and that relationship only holds
+        // while `content_hash` IS the plain BLAKE3 of the stored `content`.
+        // `create_strict` wrote the twin from the text; an override REPLACES
+        // the row's identity with a foreign or namespaced one — an ingest
+        // spine seed, or a `fully_private` claim whose stored `content` is the
+        // literal placeholder "[private]" while its real digest is supplied
+        // here. Leaving the twin in place would drag every such row back into
+        // the plain-text lookup dimension it deliberately left, making it
+        // reachable by `create_or_get`'s stage 2 (and, for `fully_private`,
+        // making every one of an agent's private claims share the digest of
+        // "[private]"). Clear it: NULL means "not a lookup target", which is
+        // exactly how an overridden row behaved before the column existed.
+        //
+        // Only when the override actually DIVERGES from the plain digest — a
+        // caller that re-sends the same value it would have got anyway keeps
+        // its twin. Pinned by `claims_content_hash_override_scope.rs`.
+        let clear_canonical_hash = content_hash_bytes.as_deref().is_some_and(|h| {
+            h != epigraph_crypto::ContentHasher::hash(created_claim.content.as_bytes()).as_slice()
+        });
+
         sqlx::query(
-            "UPDATE claims SET content_hash = COALESCE($1, content_hash), properties = COALESCE($2, properties) WHERE id = $3"
+            "UPDATE claims SET content_hash = COALESCE($1, content_hash), \
+                               canonical_hash = CASE WHEN $4 THEN NULL ELSE canonical_hash END, \
+                               properties = COALESCE($2, properties) \
+             WHERE id = $3",
         )
         .bind(content_hash_bytes.as_deref())
         .bind(&request.properties)
         .bind(claim_uuid)
+        .bind(clear_canonical_hash)
         .execute(&mut *tx)
         .await
         .map_err(|e| match e {
@@ -529,11 +565,10 @@ pub async fn create_claim(
             // row of the same agent. Spec §API surface (line 116) specifies this
             // surfaces as 409 Conflict from the UPDATE on the
             // if_not_exists: false path. Pre-107 this branch is unreachable.
-            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
-                ApiError::Conflict {
-                    reason: "content_hash override collides with an existing claim for this agent".to_string(),
-                }
-            }
+            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => ApiError::Conflict {
+                reason: "content_hash override collides with an existing claim for this agent"
+                    .to_string(),
+            },
             other => ApiError::DatabaseError {
                 message: format!("Failed to set content_hash/properties: {other}"),
             },
