@@ -1,0 +1,43 @@
+# Example sensitive-term list — copy to scripts/sensitive-terms.txt and add your
+# own entries, or edit this file to change what every checkout scans for.
+# scripts/sensitive-terms.txt itself is gitignored (it may name unannounced
+# partners or codenames); this checked-in copy is the template AND the list CI
+# actually uses, because the local one is never present on a runner.
+# The effective list is the UNION of both files.
+#
+# Format: one fixed string per line. A line whose first non-blank character is
+# '#' is a comment. Inline comments are NOT supported — terms are matched
+# literally and may contain '#'. Matching is CASE-SENSITIVE; add both casings
+# if you need them (case-folding short markers matches ordinary prose).
+#
+# Read by scripts/scan_sensitive_terms.sh (CI job `sensitive-scan`).
+# This file is excluded from the scan, so entries here never match themselves.
+
+# ---- private key headers ----
+BEGIN RSA PRIVATE KEY
+BEGIN OPENSSH PRIVATE KEY
+BEGIN DSA PRIVATE KEY
+BEGIN EC PRIVATE KEY
+BEGIN PGP PRIVATE KEY BLOCK
+-----BEGIN PRIVATE KEY-----
+
+# ---- cloud / SaaS credential prefixes ----
+AKIA
+AIzaSy
+xoxb-
+xoxp-
+xoxa-
+github_pat_
+sk-proj-
+
+# ---- deliberately NOT enabled ----
+# These match only benign fixtures and docs placeholders in this repo today
+# (crates/epigraph-cli/src/enrichment/llm_client.rs, scripts/README.md,
+# scripts/tests/test_git_ingest_reconciler.py, and a plan doc). Enabling one
+# without first cleaning those up turns CI red on unrelated PRs. Add them to
+# your LOCAL list if you want them anyway.
+# ghp_
+# sk-ant-api03-
+#
+# ---- org-specific terms belong in the LOCAL list, not here ----
+# Unannounced partner names, customer names, internal codenames, host names.

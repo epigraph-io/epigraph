@@ -157,3 +157,48 @@ find-or-create / idempotency path). Until then, run the reconciler
 **only with `--dry-run`**. Enabling the live cron against a server that
 predates Plan 2.5 risks duplicate or malformed claim writes.
 
+
+## scan_sensitive_terms.sh
+
+Fails the build if any **tracked** file contains a string from the
+sensitive-term list. Runs as the blocking `sensitive-scan` CI job
+(`.github/workflows/ci.yml`) and as the first step of `verify.sh`.
+
+The effective list is the **union** of two files:
+
+| File | Committed? | Purpose |
+|------|-----------|---------|
+| `scripts/sensitive-terms.example.txt` | yes | generic secret markers; the list CI actually uses |
+| `scripts/sensitive-terms.txt` | gitignored | org-specific terms (partners, codenames, hosts) |
+
+One fixed string per line; a line whose first non-blank character is `#`
+is a comment. Inline comments are **not** supported. Matching is
+case-sensitive fixed-string (`git grep -F`) — case-folding short
+credential prefixes matches ordinary prose.
+
+Local setup mirrors `providers.toml.example`:
+
+```bash
+cp scripts/sensitive-terms.example.txt scripts/sensitive-terms.txt
+$EDITOR scripts/sensitive-terms.txt   # add your org-specific terms
+```
+
+```bash
+./scripts/scan_sensitive_terms.sh                # redacted (CI default)
+./scripts/scan_sensitive_terms.sh --show-matches # full lines, local triage only
+```
+
+Exit codes: **0** clean · **1** term(s) found · **2** configuration error
+(no list, not a git repo, bad argument). Default output prints
+`path:match_count` and never the matched line, because CI logs are
+themselves a disclosure channel — re-run locally with `--show-matches`
+to triage.
+
+Scope is tracked files in the working tree (`git grep` semantics): it
+scans full file content, not just the PR diff, and does **not** see
+untracked or gitignored files. It is a pre-merge gate, not a
+filesystem-wide secret sweep.
+
+Adding a term to the committed list red-lights every open PR if it
+matches existing content — scan first. Self-test:
+`./scripts/tests/test_scan_sensitive_terms.sh` (pure shell + git, no DB).

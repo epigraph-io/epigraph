@@ -155,6 +155,27 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+  # Deterministic, content-only gate: it can only go red on strings introduced
+  # by the PR under test, so unlike `audit` below (which tracks an advisory DB
+  # fetched at run time and would red-light every open PR the moment a new CVE
+  # lands) it is safe to make BLOCKING. Foreman auto-merges epigraph PRs — a
+  # secret reaching main is exactly what must stop that, so no continue-on-error.
+  #
+  # No toolchain, no cache, no postgres: checkout + `git grep`, a few seconds.
+  # The self-test runs first so a broken scanner fails loudly instead of
+  # silently passing everything.
+  sensitive-scan:
+    name: Sensitive-term scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Scanner self-test
+        run: ./scripts/tests/test_scan_sensitive_terms.sh
+      - name: Scan tracked files for sensitive terms
+        # Redacted by default: prints path:match_count, never the matched line.
+        # CI logs are themselves a disclosure channel.
+        run: ./scripts/scan_sensitive_terms.sh
+
   # Advisory, NOT a merge gate. cargo audit checks Cargo.lock against the
   # RustSec DB fetched at run time, so a blocking gate would red-light every
   # open PR the moment a new advisory lands on any transitive dependency —

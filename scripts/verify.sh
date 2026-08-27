@@ -28,6 +28,13 @@ cd "$(git rev-parse --show-toplevel)"
 
 step() { printf '\n==> %s\n' "$*"; }
 
+# Cheapest gate first — a leaked secret should be caught before you spend two
+# minutes on a clippy build. Mirrors the `sensitive-scan` CI job, with one
+# deliberate divergence: CI also runs scripts/tests/test_scan_sensitive_terms.sh
+# (a test OF the scanner). That belongs in CI, not in every local pre-commit run.
+step "scan sensitive terms"
+./scripts/scan_sensitive_terms.sh
+
 step "cargo fmt --check"
 cargo fmt --check
 

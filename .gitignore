@@ -16,3 +16,8 @@ docs/superpowers/artifacts/2026-04-30-table-graph/narratives/
 # Live OAuth provider config — real allowed_emails, not for public repo (see providers.toml.example)
 providers.toml
 providers.toml.bak-*
+
+# Local sensitive-term list for scripts/scan_sensitive_terms.sh — may name
+# unannounced partners or codenames, so it must never be committed. The
+# committed scripts/sensitive-terms.example.txt is the template and the CI default.
+scripts/sensitive-terms.txt
