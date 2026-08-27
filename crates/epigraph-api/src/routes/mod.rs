@@ -403,8 +403,14 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/hypothesis/:id/promote",
             post(hypothesis::promote_hypothesis),
         )
-        // Encrypted subgraph group management
+        // Encrypted subgraph group management. ALL group routes are protected,
+        // GET included: PR-02 moved `GET /api/v1/groups/:id` out of the
+        // anonymous `public` router because a group's roster size and epoch
+        // state describe a tenancy boundary. The `protected` router layers
+        // `bearer_auth_middleware` unconditionally, so the handler gets a
+        // mandatory AuthContext with no further wiring.
         .route("/api/v1/groups", post(groups::create_group))
+        .route("/api/v1/groups/:id", get(groups::get_group))
         .route("/api/v1/groups/:id/members", post(groups::add_member))
         .route(
             "/api/v1/groups/:id/members/:agent_id",
@@ -767,8 +773,6 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/mirror-narratives",
             get(political::mirror_narratives),
         )
-        // Encrypted subgraph read endpoints
-        .route("/api/v1/groups/:id", get(groups::get_group))
         // /api/v1/isomorphism/patterns — episcience feature
         // Task management — read endpoints
         .route("/api/v1/tasks", get(tasks::list_tasks))

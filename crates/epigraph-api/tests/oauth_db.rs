@@ -40,6 +40,12 @@ fn config() -> ApiConfig {
         require_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
+        // These tests exercise provisioning MECHANICS (find-or-create,
+        // idempotency, the auto_provision flag) with `google_cfg`'s empty
+        // allowlists. PR-02 made an empty allowlist deny by default, so without
+        // this opt-out every one of them would 403 at the gate and stop testing
+        // anything. The gate itself is covered by `tests/idp_allowlist.rs`.
+        allow_all_identities: true,
     }
 }
 

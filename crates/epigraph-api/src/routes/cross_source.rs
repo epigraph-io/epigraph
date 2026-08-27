@@ -274,13 +274,17 @@ pub async fn decide_candidate(
 
     // Decision provenance: prefer agent_id, fall back to client_id (sub).
     //
-    // OAuth *service* clients — notably the Telegram approval bridge — are
-    // created with `agent_id = NULL` (see `oauth/register.rs`) and nothing ever
-    // links one, so `auth.agent_id` is `None` for every decision they make.
-    // Writing that through unchanged recorded `decided_by = NULL`, silently
-    // dropping the identity behind a promotion that creates a real CORROBORATES
-    // edge. Falling back to the authenticated client keeps every decision
-    // attributable to *something* without rejecting these callers.
+    // HISTORICAL NOTE (corrected in PR-02): OAuth *service* clients — notably
+    // the Telegram approval bridge — were created with `agent_id = NULL` and
+    // nothing ever linked one, so `auth.agent_id` was `None` for every decision
+    // they made and `decided_by` was written as NULL, silently dropping the
+    // identity behind a promotion that creates a real CORROBORATES edge.
+    // `AgentRepository::ensure_for_client` now materialises a principal at every
+    // token-mint site, so `auth.agent_id` is populated for any token minted
+    // since. The fallback stays: tokens minted BEFORE PR-02 are still in
+    // circulation until they expire, and test helpers mint `agent_id: None`
+    // directly. Collapsing the ~20 `agent_id.or(client_id)` sites across
+    // claims/edges/belief/graph_query is PR-03/PR-06 work.
     //
     // `agents.id` and `oauth_clients.id` are disjoint UUID spaces, so a reader
     // can tell which kind of principal a `decided_by` names by looking it up;

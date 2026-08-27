@@ -56,9 +56,24 @@ Current reservation:
 - **038**: public `corroborates_factor_strength_from_score` (PR #173)
 - **039–059**: public
 - **060–085**: RESERVED — public multi-user tenancy series (epigraph-io/epigraph
-  `feat/multi-user-tenancy`). 060–080 are the 21 migrations named in the tenancy
-  plan §3.1; 081–085 is headroom for the webhook-persistence migration and
-  follow-ups. `epigraph-internal` MUST NOT allocate in this range.
+  `feat/multi-user-tenancy`). `epigraph-internal` MUST NOT allocate in this range.
+  - **060**: PR-01 — group tenancy tables.
+  - **061**: PR-02 — `agents.key_kind`.
+  - **062–081**: the remaining 20 migrations named in the tenancy plan §3.1,
+    each **shifted +1** from the numbering printed in the plan (the plan's 061
+    is this tree's 062, and so on).
+  - **082–085**: headroom for the webhook-persistence migration and follow-ups.
+
+  **Why the +1 shift:** the plan assigns no migration to PR-02, yet PR-02's
+  `AgentRepository::ensure_for_client` writes `agents.key_kind = 'derived'` for
+  the blake3 placeholder key it materialises for every keyless OAuth principal,
+  and `routes/submit.rs` must filter `key_kind = 'ed25519'` on the signature
+  path. `key_kind` was scheduled inside PR-04's tenancy-columns migration, which
+  would have retroactively stamped every PR-02 placeholder agent as a real
+  Ed25519 verifier. PR-02 therefore claims 061 and everything after it moves up
+  one. **Do not "correct" this back to the plan's numbering** — 061 is applied.
+  PR-04's tenancy-columns file keeps its own guarded `ADD COLUMN IF NOT EXISTS
+  key_kind` statements; against a database that has 061 they no-op.
 - **086+**: public next
 
 Next public migration **outside the reserved tenancy range** must be `086` or

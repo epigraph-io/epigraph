@@ -93,8 +93,13 @@ pub struct TokenResponse {
 /// * the prefix resolves to no registered provider via [`ProviderRegistry::by_name`]
 ///   (unknown / removed provider — there is no allowlist left to consult here; whole-
 ///   provider de-authorization is an operational `status='suspended'` action), OR
-/// * the resolved provider configures no allowlist (both lists empty — allow-all,
-///   backward compatible with [`crate::oauth::providers::config::email_is_allowed`]).
+/// * the resolved provider configures no allowlist (both lists empty) **AND**
+///   `allow_all_identities` is explicitly true. PR-02 inverted this arm: with an
+///   empty allowlist and the flag false it now returns `false` (DENY), matching
+///   [`crate::oauth::providers::provision::provision_external_user_client`].
+///   Leaving it allow-all would have meant every already-provisioned client kept
+///   refreshing forever on an instance that had just been locked down — the
+///   provision gate never runs again for a client that already exists.
 ///
 /// Returns `false` (DENY) only when an external client's provider HAS a configured
 /// allowlist and `persisted_email` (from `oauth_clients.legal_contact_email`, `""`
@@ -111,6 +116,7 @@ fn refresh_allowed(
     registry: &crate::oauth::providers::ProviderRegistry,
     client_id: &str,
     persisted_email: &str,
+    allow_all_identities: bool,
 ) -> bool {
     // Provider names are validated to `[a-z0-9-]+` (cannot contain ':'), so the
     // FIRST ':' is the correct prefix splitter even when a subject embeds colons.
@@ -123,13 +129,81 @@ fn refresh_allowed(
     let allowed_emails = provider.allowed_emails();
     let allowed_domains = provider.allowed_domains();
     if allowed_emails.is_empty() && allowed_domains.is_empty() {
-        return true; // provider configures no allowlist — allow-all.
+        // No allowlist. Fail closed unless the operator opted out explicitly —
+        // otherwise de-allowlisting an instance would leave every existing
+        // external client refreshing indefinitely.
+        return allow_all_identities;
     }
     crate::oauth::providers::config::email_is_allowed(
         persisted_email,
         allowed_emails,
         allowed_domains,
     )
+}
+
+/// Resolve (materialising if necessary) the `agents.id` that this OAuth client
+/// speaks as, and link the client to it.
+///
+/// Called from all four production token-mint sites — `handle_client_credentials`,
+/// `handle_refresh_token`, `handle_authorization_code` here, and
+/// `providers::provision::provision_external_user` — so that
+/// `AuthContext.agent_id` is non-null on every authenticated request. Before
+/// PR-02 these passed `client.agent_id` straight through, and nothing ever
+/// populated it for a client created by `/oauth/register` or by external
+/// provisioning, so `require_group_admin` rejected every caller in practice.
+///
+/// The COLD path runs in one transaction: the `SELECT ... FOR UPDATE` on
+/// `oauth_clients`, the `agents` upsert, the write-once link and the
+/// personal-group bootstrap either all land or none do.
+///
+/// The WARM path does no database work at all. `client_agent_id` is
+/// `oauth_clients.agent_id` from the row the caller already loaded to
+/// authenticate this request, which is exactly the value the transaction would
+/// re-read; taking it as an argument avoids `BEGIN; SELECT … FOR UPDATE;
+/// COMMIT;` — three round-trips plus a row-level lock that serialises
+/// concurrent mints for one client — on every refresh, forever, for a value the
+/// caller is holding.
+///
+/// This is on the write path of every token mint, so a failure here is an
+/// authentication failure — it is deliberately NOT best-effort.
+///
+/// # Errors
+/// Returns `ApiError::InternalError` if the transaction cannot be opened,
+/// committed, or if the principal cannot be materialised.
+#[cfg(feature = "db")]
+pub(crate) async fn principal_agent_id(
+    state: &AppState,
+    client_row_id: uuid::Uuid,
+    client_agent_id: Option<uuid::Uuid>,
+) -> Result<uuid::Uuid, ApiError> {
+    use epigraph_db::repos::agent::AgentRepository;
+
+    if let Some(agent_id) = client_agent_id {
+        return Ok(agent_id);
+    }
+
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to open principal transaction: {e}"),
+        })?;
+
+    // `client_type` is read from the locked row inside `ensure_for_client`
+    // rather than passed in: a caller cannot then pass one inconsistent with
+    // what is stored (`providers::provision` used to hardcode "human").
+    let agent_id = AgentRepository::ensure_for_client(&mut tx, client_row_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to resolve principal agent: {e}"),
+        })?;
+
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("Failed to commit principal transaction: {e}"),
+    })?;
+
+    Ok(agent_id.as_uuid())
 }
 
 /// POST /oauth/token
@@ -413,6 +487,10 @@ async fn handle_client_credentials(
         }
     };
 
+    // Every authenticated principal gets an `agents.id`. Materialised at MINT
+    // time (not at registration) so clients that predate PR-02 acquire theirs on
+    // their next token, and so all four mint sites share one code path.
+    let agent_id = principal_agent_id(state, client.id, client.agent_id).await?;
     let (access_token, _jti) = state
         .jwt_config
         .issue_access_token(
@@ -420,7 +498,7 @@ async fn handle_client_credentials(
             effective_scopes.clone(),
             &client.client_type,
             client.owner_id,
-            client.agent_id,
+            Some(agent_id),
             ttl,
         )
         .map_err(|e| ApiError::InternalError {
@@ -525,6 +603,7 @@ async fn handle_refresh_token(
         &state.providers,
         &client.client_id,
         client.legal_contact_email.as_deref().unwrap_or(""),
+        state.config.allow_all_identities,
     ) {
         tracing::warn!(
             client_id = %client.client_id,
@@ -555,6 +634,10 @@ async fn handle_refresh_token(
     // Use client's current granted_scopes (may have been updated since refresh token was issued)
     let effective_scopes = client.granted_scopes.clone();
 
+    // Every authenticated principal gets an `agents.id`. Materialised at MINT
+    // time (not at registration) so clients that predate PR-02 acquire theirs on
+    // their next token, and so all four mint sites share one code path.
+    let agent_id = principal_agent_id(state, client.id, client.agent_id).await?;
     let (access_token, _jti) = state
         .jwt_config
         .issue_access_token(
@@ -562,7 +645,7 @@ async fn handle_refresh_token(
             effective_scopes.clone(),
             &client.client_type,
             client.owner_id,
-            client.agent_id,
+            Some(agent_id),
             ttl,
         )
         .map_err(|e| ApiError::InternalError {
@@ -706,6 +789,7 @@ async fn handle_authorization_code(
         &state.providers,
         &client.client_id,
         client.legal_contact_email.as_deref().unwrap_or(""),
+        state.config.allow_all_identities,
     ) {
         tracing::warn!(
             client_id = %client.client_id,
@@ -736,6 +820,10 @@ async fn handle_authorization_code(
         _ => Duration::minutes(15),
     };
     let effective_scopes = row.scopes.clone();
+    // Every authenticated principal gets an `agents.id`. Materialised at MINT
+    // time (not at registration) so clients that predate PR-02 acquire theirs on
+    // their next token, and so all four mint sites share one code path.
+    let agent_id = principal_agent_id(state, client.id, client.agent_id).await?;
     let (access_token, _jti) = state
         .jwt_config
         .issue_access_token(
@@ -743,7 +831,7 @@ async fn handle_authorization_code(
             effective_scopes.clone(),
             &client.client_type,
             client.owner_id,
-            client.agent_id,
+            Some(agent_id),
             ttl,
         )
         .map_err(|e| ApiError::InternalError {
@@ -998,7 +1086,8 @@ mod refresh_gate_tests {
         assert!(refresh_allowed(
             &r,
             "google:107485523387294236292",
-            "jeremy.barton@gmail.com"
+            "jeremy.barton@gmail.com",
+            false
         ));
     }
 
@@ -1015,7 +1104,8 @@ mod refresh_gate_tests {
         assert!(!refresh_allowed(
             &r,
             "google:999999999999999999999",
-            "evil@attacker.com"
+            "evil@attacker.com",
+            false
         ));
     }
 
@@ -1034,35 +1124,53 @@ mod refresh_gate_tests {
         assert!(refresh_allowed(
             &r,
             "a1b2c3d4e5f6071829aabbccddeeff00112233445566778899aabbccddeeff00",
-            ""
+            "",
+            false
         ));
         // service / DCR: no ':' → skip.
-        assert!(refresh_allowed(&r, "epigraph_deadbeefcafef00d", ""));
+        assert!(refresh_allowed(&r, "epigraph_deadbeefcafef00d", "", false));
         // unrecognized provider prefix (e.g. legacy underscore `google_<sub>` has no
         // ':'; a colon-bearing id for an UNregistered provider also skips).
         assert!(refresh_allowed(
             &r,
             "google_107485523387294236292",
-            "evil@attacker.com"
+            "evil@attacker.com",
+            false
         ));
         assert!(refresh_allowed(
             &r,
             "removed-provider:subject",
-            "evil@attacker.com"
+            "evil@attacker.com",
+            false
         ));
     }
 
     #[test]
-    fn empty_allowlist_provider_allows_all() {
-        // (d) A registered provider that configures NO allowlist (both lists empty)
-        // is allow-all (backward compatible) — even an empty persisted email passes.
+    fn empty_allowlist_provider_denies_unless_allow_all_identities() {
+        // (d) PR-02 INVERTED this case. A registered provider that configures NO
+        // allowlist used to be allow-all on refresh, which meant closing only the
+        // provision gate left every already-provisioned client renewing forever
+        // on an instance that had just been locked down — the provision gate
+        // never runs again for a client that already exists.
         let r = registry_with("google", "google_id_token", vec![], vec![]);
+
+        // allow_all_identities = false (the default): DENY.
+        assert!(!refresh_allowed(
+            &r,
+            "google:any-subject",
+            "anyone@example.com",
+            false
+        ));
+        assert!(!refresh_allowed(&r, "google:any-subject", "", false));
+
+        // The explicit operator opt-out still works.
         assert!(refresh_allowed(
             &r,
             "google:any-subject",
-            "anyone@example.com"
+            "anyone@example.com",
+            true
         ));
-        assert!(refresh_allowed(&r, "google:any-subject", ""));
+        assert!(refresh_allowed(&r, "google:any-subject", "", true));
     }
 
     #[test]
@@ -1074,7 +1182,20 @@ mod refresh_gate_tests {
             vec![],
             vec!["baros.associates".into()],
         );
-        assert!(refresh_allowed(&r, "google:sub", "anyone@baros.associates"));
-        assert!(!refresh_allowed(&r, "google:sub", "anyone@gmail.com"));
+        assert!(refresh_allowed(
+            &r,
+            "google:sub",
+            "anyone@baros.associates",
+            false
+        ));
+        assert!(!refresh_allowed(
+            &r,
+            "google:sub",
+            "anyone@gmail.com",
+            false
+        ));
+        // A configured allowlist is NOT widened by allow_all_identities: the flag
+        // only governs the no-allowlist-at-all case.
+        assert!(!refresh_allowed(&r, "google:sub", "anyone@gmail.com", true));
     }
 }

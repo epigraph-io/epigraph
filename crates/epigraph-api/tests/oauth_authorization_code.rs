@@ -21,6 +21,11 @@ fn config() -> ApiConfig {
         require_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "https://test.example".to_string(),
+        // Empty provider allowlists in this file's fixtures + PR-02's
+        // fail-closed default would 403 every external grant here. These tests
+        // are about the surrounding mechanics, not the gate (see
+        // `tests/idp_allowlist.rs` for that), so opt out explicitly.
+        allow_all_identities: true,
     }
 }
 
@@ -451,13 +456,18 @@ async fn protected_resource_metadata_points_at_this_as() {
     // scopes_supported MUST advertise only the scopes a connector authorizing
     // through THIS AS can actually obtain AND use against /mcp. epigraph-mcp's
     // SCOPE_MAP codomain is {claims:read, claims:write, claims:admin}, but
-    // claims:admin is unreachable here: no register.rs grant path (agent/service/
-    // human) hands it out — it is provisioned only to the separate epigraph-admin
-    // client out-of-band. Advertising it would (a) be a scope this AS's clients
+    // claims:admin is unreachable here: no register.rs grant path hands it out.
+    //
+    // That premise is STRONGER since PR-02, not weaker: the DCR arm grants
+    // `canonical_scopes::PUBLIC_CLIENT_READ_SCOPES` (read/analysis only), the
+    // `client_type:"agent"` arm now grants NOTHING at all pending admin
+    // approval, and `service`/`human` register pending. claims:admin (and
+    // instance:admin) reach a token only via `bootstrap_clients` or an operator
+    // grant. Advertising claims:admin would (a) name a scope this AS's clients
     // can never get, and (b) break RFC 8414/9728 subset coherence (the AS doc's
-    // scopes_supported omits claims:admin). So the resource doc must list exactly
-    // the connector-reachable /mcp scopes: claims:read + claims:write. It must
-    // NOT advertise claims:admin (unreachable) or analysis:belief (no MCP tool
+    // scopes_supported omits it). So the resource doc lists exactly the
+    // connector-reachable /mcp scopes: claims:read + claims:write. It must NOT
+    // advertise claims:admin (unreachable) or analysis:belief (no MCP tool
     // requires it, not in SCOPE_MAP codomain).
     let scopes = body["scopes_supported"].as_array().unwrap();
     assert_eq!(

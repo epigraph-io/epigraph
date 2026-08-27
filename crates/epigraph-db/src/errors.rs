@@ -28,6 +28,17 @@ pub enum DbError {
     #[error("Duplicate {entity} already exists")]
     DuplicateKey { entity: String },
 
+    /// Foreign-key constraint violation (SQLSTATE 23503).
+    ///
+    /// A referencing row named a parent row that does not exist. Distinguished
+    /// from `QueryFailed` because it is a CLIENT error, not a server fault:
+    /// `groups.created_by_agent_id` FKs to `agents`, so a token whose
+    /// `agent_id` claim names a deleted (or never-created) agent must surface
+    /// as 403, not 500. `constraint` is the PostgreSQL constraint name when the
+    /// driver reports one.
+    #[error("Foreign key constraint {constraint} violated")]
+    ForeignKeyViolation { constraint: String },
+
     /// Invalid data provided
     #[error("Invalid data: {reason}")]
     InvalidData { reason: String },
@@ -61,6 +72,13 @@ impl From<sqlx::Error> for DbError {
             sqlx::Error::Database(db_err) if db_err.is_unique_violation() => Self::DuplicateKey {
                 entity: "entity".to_string(),
             },
+            // 23503. Kept alongside the unique-violation arm so every repo gets
+            // the classification for free; without it a bad FK is a 500.
+            sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
+                Self::ForeignKeyViolation {
+                    constraint: db_err.constraint().unwrap_or("<unnamed>").to_string(),
+                }
+            }
             // All other database errors become QueryFailed
             other => Self::QueryFailed { source: other },
         }

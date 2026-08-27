@@ -128,16 +128,12 @@ fn parse_public_key(hex_key: &str) -> Result<[u8; ED25519_PUBLIC_KEY_BYTE_LENGTH
 
 /// Standard harvester-level scopes for auto-provisioned agent OAuth clients.
 /// These allow the agent to read/write claims, edges, and evidence.
+///
+/// Re-exported from `epigraph_core::canonical_scopes` (identical contents) so
+/// this is no longer one of three divergent private grant lists. It is
+/// deliberately NOT `read_write_scopes()` — see the constant's doc comment.
 #[cfg(feature = "db")]
-const AGENT_DEFAULT_SCOPES: &[&str] = &[
-    "claims:read",
-    "claims:write",
-    "edges:read",
-    "edges:write",
-    "evidence:read",
-    "evidence:write",
-    "agents:read",
-];
+const AGENT_DEFAULT_SCOPES: &[&str] = epigraph_core::canonical_scopes::AGENT_PROVISION_SCOPES;
 
 /// Create a new agent
 ///
@@ -188,6 +184,24 @@ pub async fn create_agent(
             let client_name = created_agent.display_name.as_deref().unwrap_or("Agent");
             let scopes: Vec<String> = AGENT_DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
 
+            // This path passes a REAL agent_id at creation time, so it is not
+            // part of the "oauth_clients.agent_id is never populated" bug that
+            // `AgentRepository::ensure_for_client` fixes for the other three
+            // creation paths (`oauth/register.rs`, external provisioning,
+            // `bootstrap_clients`). `ensure_for_client` is a no-op for a client
+            // created here — it early-returns on the existing link.
+            //
+            // Do NOT "unify" the two: this one has a real Ed25519 agent whose
+            // public_key IS a signature verifier (key_kind='ed25519'), whereas
+            // ensure_for_client materialises a `derived` placeholder for a
+            // keyless OAuth principal. Collapsing them would either lose the
+            // real key or mark it derived.
+            //
+            // status="active" here, while /oauth/register's agent arm now
+            // registers "pending", is a deliberate asymmetry, not an oversight:
+            // reaching this line requires an authenticated caller holding
+            // `agents:write` (checked above) — which IS the admin approval that
+            // the anonymous registration endpoint lacks.
             if let Err(e) = OAuthClientRepository::create(
                 &state.db_pool,
                 &client_id_str,

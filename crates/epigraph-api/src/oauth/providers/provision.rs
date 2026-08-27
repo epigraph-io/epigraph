@@ -35,13 +35,37 @@ pub async fn provision_external_user_client(
     // (token.rs, device.rs, and authorize.rs which calls this inner fn directly
     // for the consent screen, bypassing the token-minting wrapper).
     //
-    // Semantics: when the provider configures no allowlist (both lists empty) the
-    // gate is allow-all and the original behavior is preserved. When an allowlist
-    // IS configured we additionally require a verified email (Google may assert an
-    // unverified address; CloudflareAccess hardcodes email_verified=true so it is
-    // unaffected) and a case-insensitive match against the allowlist.
+    // Semantics (PR-02 — FAIL CLOSED; this INVERTS the previous default):
+    // * No allowlist at all (both lists empty) -> DENY, unless the operator has
+    //   explicitly set `allow_all_identities`. This branch used to be the
+    //   ALLOW-ALL path, i.e. any identity the IdP authenticated got a `human`
+    //   client carrying write scopes. `build_registry` additionally refuses to
+    //   boot in this posture under EPIGRAPH_ENV=production.
+    // * An allowlist IS configured -> require a verified email (Google may
+    //   assert an unverified address; CloudflareAccess hardcodes
+    //   email_verified=true so it is unaffected) AND a case-insensitive match.
     let allowed_emails = provider.allowed_emails();
     let allowed_domains = provider.allowed_domains();
+    if allowed_emails.is_empty() && allowed_domains.is_empty() && !state.config.allow_all_identities
+    {
+        tracing::warn!(
+            provider = provider.name(),
+            "Denied external provisioning: provider has no identity allowlist and \
+             allow_all_identities is false"
+        );
+        emit_oauth_audit(
+            &state.db_pool,
+            "oauth_provision_denied",
+            false,
+            serde_json::json!({
+                "provider": provider.name(),
+                "reason": "no_allowlist_and_allow_all_identities_false",
+            }),
+        );
+        return Err(ApiError::Forbidden {
+            reason: "provider has no identity allowlist and allow_all_identities is false".into(),
+        });
+    }
     let allowlist_configured = !allowed_emails.is_empty() || !allowed_domains.is_empty();
     if allowlist_configured {
         let denied = !identity.email_verified
@@ -153,14 +177,23 @@ pub async fn provision_external_user(
         None => client.granted_scopes.clone(),
     };
 
+    // The FOURTH token-mint site (the other three are in oauth/token.rs). It
+    // previously passed literal `None` for both owner_id and agent_id, so every
+    // externally provisioned human held a token with no principal at all.
+    // `client.agent_id` is the warm-path shortcut; `client_type` is no longer
+    // passed at all — `ensure_for_client` reads it from the locked row, so this
+    // site can no longer disagree with what is stored (it hardcoded "human").
+    let agent_id =
+        crate::oauth::token::principal_agent_id(state, client.id, client.agent_id).await?;
+
     let (access_token, _jti) = state
         .jwt_config
         .issue_access_token(
             client.id,
             effective_scopes.clone(),
             "human",
-            None,
-            None,
+            client.owner_id,
+            Some(agent_id),
             ttl,
         )
         .map_err(|e| ApiError::InternalError {

@@ -85,7 +85,7 @@ pub use repos::{
     PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository, ProvenanceChain,
     ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
     ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
-    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, ScopedBeliefRepository,
+    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RevokeOutcome, ScopedBeliefRepository,
     SecurityEventRepository, SecurityEventRow, SheafRepository, SweepCandidate, TaskRepository,
     TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository, WorkflowExecutionRow,
     WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,

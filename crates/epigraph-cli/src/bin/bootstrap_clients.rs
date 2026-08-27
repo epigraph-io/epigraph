@@ -76,8 +76,17 @@ async fn main() -> Result<()> {
     let mut created_count = 0usize;
     for o in &outcomes {
         match o {
-            ClientOutcome::Existing { name, client_id } => {
-                println!("EXISTS:  name={name:<16} client_id={client_id}");
+            ClientOutcome::Existing {
+                name,
+                client_id,
+                scopes_reconciled,
+            } => {
+                let note = if *scopes_reconciled {
+                    " scopes=RECONCILED"
+                } else {
+                    ""
+                };
+                println!("EXISTS:  name={name:<16} client_id={client_id}{note}");
             }
             ClientOutcome::Created {
                 name,

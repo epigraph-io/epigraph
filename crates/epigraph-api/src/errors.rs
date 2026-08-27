@@ -163,6 +163,15 @@ impl From<DbError> for ApiError {
                 field: "data".to_string(),
                 reason,
             },
+            // 23503 — the request named a parent row that does not exist. A
+            // client error; the default 500 hid it. Routes that can say
+            // something more specific (e.g. `create_group` → 403 when the
+            // token's agent principal is unknown) match on it before this.
+            DbError::ForeignKeyViolation { constraint } => ApiError::BadRequest {
+                message: format!(
+                    "request references a row that does not exist (constraint {constraint})"
+                ),
+            },
             DbError::ConnectionFailed { source } => {
                 tracing::error!(error = %source, "Database connection failed");
                 ApiError::DatabaseError {

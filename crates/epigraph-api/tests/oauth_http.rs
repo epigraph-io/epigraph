@@ -35,6 +35,11 @@ fn config() -> ApiConfig {
         require_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "https://test.example".to_string(),
+        // Empty provider allowlists in this file's fixtures + PR-02's
+        // fail-closed default would 403 every external grant here. These tests
+        // are about the surrounding mechanics, not the gate (see
+        // `tests/idp_allowlist.rs` for that), so opt out explicitly.
+        allow_all_identities: true,
     }
 }
 

@@ -6,6 +6,14 @@ repository.workspace = true
 edition = "2021"
 
 [dependencies]
+# PR-02: AgentRepository::ensure_for_client derives the 32-byte placeholder
+# public key for a keyless OAuth principal with blake3::derive_key. blake3 was
+# already a dev-dependency below; this promotes it to a real one.
+blake3 = { workspace = true }
+# PR-02: ensure_for_client decodes an agent client's client_id, which IS its hex
+# Ed25519 public key, to find the real signer row instead of minting a second
+# derived principal beside it.
+hex = { workspace = true }
 epigraph-core = { workspace = true }
 epigraph-crypto = { workspace = true }
 epigraph-ds = { workspace = true }  # DS/TBM types for mass function persistence
@@ -22,7 +30,6 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
-blake3 = { workspace = true }
 serde = { workspace = true }
 epigraph-crypto = { workspace = true }
 

@@ -76,6 +76,7 @@ fn create_test_router(pool: PgPool) -> Router {
         require_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
+        ..ApiConfig::default()
     };
     let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
     let state = AppState::with_db_and_signature_state(pool, config, signature_state);
@@ -646,6 +647,7 @@ fn create_test_router_with_embedder(pool: PgPool) -> Router {
         require_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
+        ..ApiConfig::default()
     };
     let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
     let service: Arc<dyn EmbeddingService> =

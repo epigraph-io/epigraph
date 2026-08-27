@@ -265,6 +265,18 @@ pub struct ApiConfig {
     /// used to build OAuth discovery documents and consent/redirect links.
     /// e.g. "https://5-78-124-36.nip.io"
     pub public_base_url: String,
+    /// Re-open the pre-PR-02 identity posture: permit an external IdP to
+    /// provision (and to refresh) an identity even when the provider configures
+    /// NO `allowed_emails`/`allowed_domains` allowlist.
+    ///
+    /// Defaults to `false` — an empty allowlist DENIES. Setting it true is an
+    /// explicit operator declaration that "any identity this IdP authenticates
+    /// may have an account here", which is exactly what the old empty-list
+    /// default meant silently. Read from `EPIGRAPH_ALLOW_ALL_IDENTITIES` in
+    /// `bin/server.rs`; also consulted by
+    /// `oauth::providers::build_registry`, which refuses to boot under
+    /// `EPIGRAPH_ENV=production` with an empty allowlist and this false.
+    pub allow_all_identities: bool,
 }
 
 impl AppState {
@@ -649,6 +661,9 @@ impl Default for ApiConfig {
             require_signatures: false,
             max_request_size: 10 * 1024 * 1024, // 10MB
             public_base_url: "http://localhost:8080".to_string(),
+            // Fail closed. An operator who wants the old allow-all posture must
+            // say so with EPIGRAPH_ALLOW_ALL_IDENTITIES=true.
+            allow_all_identities: false,
         }
     }
 }
@@ -678,6 +693,12 @@ mod tests {
         let config = ApiConfig::default();
         assert!(!config.require_signatures);
         assert_eq!(config.max_request_size, 10 * 1024 * 1024);
+        // PR-02 decision Q4: fail closed. Flipping this default silently
+        // restores allow-all external provisioning on every deployment.
+        assert!(
+            !config.allow_all_identities,
+            "allow_all_identities must default to false"
+        );
     }
 
     #[test]
@@ -685,7 +706,7 @@ mod tests {
         let config = ApiConfig {
             require_signatures: true,
             max_request_size: 2048,
-            public_base_url: "http://localhost:8080".to_string(),
+            ..ApiConfig::default()
         };
         let cloned = config.clone();
         assert!(cloned.require_signatures);

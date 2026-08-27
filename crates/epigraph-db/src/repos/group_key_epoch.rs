@@ -22,7 +22,10 @@ pub struct KeyEpochRow {
 pub struct GroupKeyEpochRepository;
 
 impl GroupKeyEpochRepository {
-    /// Create a new key epoch for a group
+    /// Create a new key epoch for a group.
+    ///
+    /// Thin wrapper over [`Self::create_epoch_conn`] for callers that are not
+    /// already inside a transaction.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -32,18 +35,45 @@ impl GroupKeyEpochRepository {
         group_id: Uuid,
         epoch: i32,
         wrapped_key: Option<&[u8]>,
+        status: &str,
+    ) -> Result<Uuid, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_epoch_conn(&mut conn, group_id, epoch, wrapped_key, status).await
+    }
+
+    /// `create_epoch` over a borrowed connection, for callers already inside a
+    /// transaction.
+    ///
+    /// `GroupRepository::create_with_admin` inlined an equivalent INSERT that
+    /// additionally pinned `status = 'active'`, which left this function with
+    /// zero callers workspace-wide and two statements free to drift apart —
+    /// exactly the pair migration 060's ROTATION CONTRACT comment addresses by
+    /// name. `status` is therefore an explicit parameter rather than relying on
+    /// the column DEFAULT: an epoch row's status is the rotation state machine,
+    /// and a caller must say which state it is writing.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, wrapped_key))]
+    pub async fn create_epoch_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+        epoch: i32,
+        wrapped_key: Option<&[u8]>,
+        status: &str,
     ) -> Result<Uuid, DbError> {
         let row: (Uuid,) = sqlx::query_as(
             r#"
-            INSERT INTO group_key_epochs (group_id, epoch, wrapped_key)
-            VALUES ($1, $2, $3)
+            INSERT INTO group_key_epochs (group_id, epoch, wrapped_key, status)
+            VALUES ($1, $2, $3, $4)
             RETURNING id
             "#,
         )
         .bind(group_id)
         .bind(epoch)
         .bind(wrapped_key)
-        .fetch_one(pool)
+        .bind(status)
+        .fetch_one(&mut *conn)
         .await?;
 
         Ok(row.0)

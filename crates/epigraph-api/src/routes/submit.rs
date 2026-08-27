@@ -722,22 +722,38 @@ async fn validate_packet(
         // perform the real Ed25519 verification below.
         #[cfg(feature = "db")]
         {
+            // `AgentRepository::public_key_if_signer` filters
+            // `key_kind = 'ed25519'`, so the BLAKE3 placeholder keys that
+            // `ensure_for_client` writes for keyless OAuth principals can never
+            // reach the verifier. They are not forgeable (nobody knows a private
+            // key for a hash output), but they are indistinguishable from real
+            // keys to any reader that does not filter — and the SQL belongs in
+            // the repo layer regardless (CLAUDE.md).
             let agent_id: Uuid = packet.claim.agent_id;
-            let pub_key_row: Option<(Vec<u8>,)> =
-                sqlx::query_as("SELECT public_key FROM agents WHERE id = $1")
-                    .bind(agent_id)
-                    .fetch_optional(&state.db_pool)
-                    .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            ErrorResponse::with_details(
-                                "InternalError",
-                                "Failed to look up agent public key",
-                                serde_json::json!({ "error": e.to_string() }),
-                            ),
-                        )
-                    })?;
+            let mut conn = state.db_pool.acquire().await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::with_details(
+                        "InternalError",
+                        "Failed to acquire a database connection",
+                        serde_json::json!({ "error": e.to_string() }),
+                    ),
+                )
+            })?;
+            let pub_key_row = epigraph_db::repos::agent::AgentRepository::public_key_if_signer(
+                &mut conn, agent_id,
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::with_details(
+                        "InternalError",
+                        "Failed to look up agent public key",
+                        serde_json::json!({ "error": e.to_string() }),
+                    ),
+                )
+            })?;
 
             let pub_key_bytes: [u8; 32] = pub_key_row
                 .ok_or_else(|| {
@@ -745,12 +761,11 @@ async fn validate_packet(
                         StatusCode::UNAUTHORIZED,
                         ErrorResponse::with_details(
                             "SignatureError",
-                            "Agent not registered",
+                            "Agent not registered, or is not an Ed25519 signer",
                             serde_json::json!({ "field": "claim.agent_id" }),
                         ),
                     )
                 })?
-                .0
                 .try_into()
                 .map_err(|_| {
                     (

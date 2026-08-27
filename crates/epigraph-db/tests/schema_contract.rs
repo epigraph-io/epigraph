@@ -36,6 +36,7 @@ use sqlx::{PgPool, Row};
 
 /// The migration file itself, embedded so replay tests cannot drift from it.
 const MIGRATION_060: &str = include_str!("../../../migrations/060_group_tenancy_tables.sql");
+const MIGRATION_061: &str = include_str!("../../../migrations/061_agents_key_kind.sql");
 
 /// `(column_name, data_type, is_nullable)` triples for one table, sorted by
 /// column name — the exact shape `information_schema.columns` reports.
@@ -328,4 +329,167 @@ async fn tenancy_roles_are_nologin(pool: PgPool) {
             "role `{name}` must be NOLOGIN — migration 060 creates it that way"
         );
     }
+}
+
+// =============================================================================
+// PR-02 — agents.key_kind (migration 061)
+// =============================================================================
+
+/// `agents` is deliberately NOT covered by a full `ColumnContract` above: it is
+/// created by migration 001, not 060, and pinning its whole shape here would
+/// make this file the contract for a table PR-01 does not own.
+///
+/// What IS pinned is the ONE column the signature path now depends on.
+/// `AgentRepository::public_key_if_signer` filters `key_kind = 'ed25519'`, which
+/// is the only thing separating a real Ed25519 verifier from the 32-byte BLAKE3
+/// placeholder `ensure_for_client` writes for every keyless OAuth principal. A
+/// later migration that dropped the column, widened the CHECK, or made it
+/// nullable would silently readmit those placeholders to the verifier — and
+/// because that query is a runtime `sqlx::query_as`, `SQLX_OFFLINE=true cargo
+/// check` would not notice.
+#[sqlx::test(migrations = "../../migrations")]
+async fn agents_key_kind_discriminator_is_intact(pool: PgPool) {
+    let row = sqlx::query(
+        "SELECT data_type, is_nullable, column_default \
+         FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'agents' AND column_name = 'key_kind'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("information_schema lookup")
+    .expect("agents.key_kind must exist (migration 061)");
+
+    let data_type: String = row.get("data_type");
+    let is_nullable: String = row.get("is_nullable");
+    let column_default: Option<String> = row.get("column_default");
+
+    assert_eq!(data_type, "character varying");
+    assert_eq!(
+        is_nullable, "NO",
+        "a NULL key_kind would be neither 'ed25519' nor 'derived' and would fall \
+         out of every signature filter"
+    );
+    assert!(
+        column_default
+            .as_deref()
+            .unwrap_or("")
+            .contains("'ed25519'"),
+        "pre-existing agents predate the discriminator and must default to being \
+         real signers; got {column_default:?}"
+    );
+
+    // The CHECK is what makes the two-valued vocabulary enforceable.
+    let check: Option<(String,)> = sqlx::query_as(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conname = 'agents_key_kind_check'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_constraint lookup");
+
+    let check = check.expect("agents_key_kind_check must exist").0;
+    for value in ["ed25519", "derived"] {
+        assert!(
+            check.contains(value),
+            "CHECK must admit {value}; got {check}"
+        );
+    }
+
+    // `contains` alone is the wrong shape of assertion: a CHECK widened to
+    // `key_kind IN ('ed25519','derived','legacy')` satisfies it, and a widened
+    // CHECK is exactly the regression this test exists to catch. Prove EXCLUSION
+    // by making the database reject a third value.
+    let bogus = sqlx::query(
+        "INSERT INTO agents (public_key, display_name, key_kind) \
+         VALUES (decode(repeat('ab', 32), 'hex'), 'widened-check-probe', 'legacy')",
+    )
+    .execute(&pool)
+    .await;
+    let err = bogus.expect_err("agents_key_kind_check must reject a third value");
+    let code = err
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or_default();
+    assert_eq!(
+        code, "23514",
+        "expected a CHECK violation (23514), got {err}"
+    );
+
+    // And the two real values are actually storable — otherwise a CHECK that
+    // rejects EVERYTHING would pass the assertion above.
+    for (i, kind) in ["ed25519", "derived"].iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO agents (public_key, display_name, key_kind) \
+             VALUES (decode(repeat($1, 32), 'hex'), $2, $3)",
+        )
+        .bind(format!("{:02x}", 0x10 + i))
+        .bind(format!("probe-{kind}"))
+        .bind(kind)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("key_kind={kind} must be storable: {e}"));
+    }
+}
+
+/// 061 must be re-runnable by hand against an already-migrated database, for the
+/// same reason 060 must (see [`migration_060_is_idempotent`]) — and for one more:
+/// 061's own header tells PR-04 it may keep the identical statements in its
+/// tenancy-columns migration, "where they will simply no-op". That is a promise
+/// a later PR will rely on, so it is pinned here rather than left as a comment.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_061_is_idempotent(pool: PgPool) {
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::raw_sql(MIGRATION_061)
+        .execute(&mut *tx)
+        .await
+        .expect("re-applying migration 061 must succeed");
+
+    // Exactly one constraint, still valid — a second ADD CONSTRAINT would have
+    // been rejected outright, but a guard that silently created a differently
+    // named duplicate would not.
+    let n: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pg_constraint \
+         WHERE conrelid = 'public.agents'::regclass AND contype = 'c' \
+           AND conname = 'agents_key_kind_check' AND convalidated",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("pg_constraint count");
+    assert_eq!(
+        n.0, 1,
+        "expected exactly one VALIDATED agents_key_kind_check"
+    );
+
+    tx.commit().await.expect("commit");
+}
+
+/// 061's drift guard, the counterpart to `drift_guard_rejects_a_pre_060_table_shape`.
+///
+/// `ADD COLUMN IF NOT EXISTS` is silent about a column that already exists in a
+/// DIFFERENT shape, and a SQL CHECK passes on NULL — so a pre-existing NULLABLE
+/// `agents.key_kind` would survive the file untouched and every NULL row would
+/// fall out of `public_key_if_signer`'s `key_kind = 'ed25519'` filter, silently
+/// disabling packet signing for those agents. Catalog-guarded and shape-guarded
+/// are not the same thing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_061_refuses_a_nullable_key_kind(pool: PgPool) {
+    let mut tx = pool.begin().await.expect("begin");
+
+    sqlx::query("ALTER TABLE public.agents ALTER COLUMN key_kind DROP NOT NULL")
+        .execute(&mut *tx)
+        .await
+        .expect("make key_kind nullable");
+
+    let err = sqlx::raw_sql(MIGRATION_061)
+        .execute(&mut *tx)
+        .await
+        .expect_err("061 must refuse a nullable agents.key_kind");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("already exists in a shape 061 did not create"),
+        "unexpected error text: {msg}"
+    );
+
+    tx.rollback().await.expect("rollback");
 }

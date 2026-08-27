@@ -1381,6 +1381,7 @@ dependencies = [
  "epigraph-crypto",
  "epigraph-ds",
  "futures",
+ "hex",
  "serde",
  "serde_json",
  "sqlx",

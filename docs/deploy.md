@@ -111,3 +111,54 @@ name like `_reconcile.sql` produces an empty version string and is a
 hard parse error, not a skip. Keeping the file under `ops/` avoids
 that entirely — the embedded migrator never sees it, and it is run
 by hand exactly once.
+
+## PR-02 (multi-user tenancy) — required rollout steps
+
+PR-02 changes two things that a plain `git pull && restart` does **not** carry
+over. Both fail closed, so the symptom is 403s and a refused boot, not silent
+degradation — but both need an operator action.
+
+### 1. Re-run `bootstrap_clients` to widen the canonical scopes
+
+`POST /api/v1/groups` now requires `groups:write`, and
+`POST`/`DELETE /api/v1/groups/:id/members` now require `groups:admin`. Both are
+new entries in `epigraph_core::canonical_scopes`, and `oauth_clients.granted_scopes`
+is persisted per client at registration — so an instance bootstrapped before this
+release keeps its old arrays and 403s on all three routes, `epigraph-admin`
+included. No migration can fix this: the rows are data, not schema.
+
+```bash
+cargo run -p epigraph-cli --bin bootstrap_clients -- \
+  --legal-entity-name "<same as before>" --legal-contact-email "<same as before>"
+```
+
+It is convergent as of PR-02: an existing canonical client has its
+`allowed_scopes`/`granted_scopes` rewritten to `scopes_for(<name>)` and is
+reported `EXISTS: … scopes=RECONCILED`. Non-canonical clients are untouched.
+Externally provisioned humans get theirs from `default_scopes` in
+`providers.toml`; if yours still says `groups:manage` (a scope that never
+existed), change it to `groups:write` — see `providers.toml.example`.
+
+### 2. Set `EPIGRAPH_ENV`
+
+`EPIGRAPH_ENV` is introduced by PR-02 and is therefore **unset everywhere
+today**, so **unset is treated as production**. With a provider whose
+`allowed_emails` and `allowed_domains` are both empty, `auto_provision = true`,
+and no `EPIGRAPH_ALLOW_ALL_IDENTITIES=true`, the server now **refuses to boot**.
+
+That is the intended discovery mechanism: PR-02 also makes
+`provision_external_user_client` and the refresh-token gate deny by default, so
+an instance that booted in that posture would 403 every already-provisioned
+Google identity on its next refresh, with nothing in the logs naming the cause.
+
+Choose one before deploying:
+
+* populate `allowed_emails` / `allowed_domains` in `providers.toml` (recommended);
+* or set `EPIGRAPH_ALLOW_ALL_IDENTITIES=true` to declare that any identity the
+  IdP authenticates may have an account here (the pre-PR-02 behaviour, now said
+  out loud);
+* dev/CI only: set `EPIGRAPH_ENV` to `development` / `dev` / `test` / `testing` /
+  `local` / `ci` to downgrade the abort to a warning.
+
+Existing external clients are re-checked against the allowlist on **refresh**
+too, so removing an address stops that client renewing.

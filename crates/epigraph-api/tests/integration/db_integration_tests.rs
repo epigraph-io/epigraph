@@ -1243,12 +1243,16 @@ async fn test_delete_agent_with_claims_fails(pool: PgPool) {
         "Deleting agent with claims should fail due to ON DELETE RESTRICT"
     );
 
-    // Verify the error is a constraint violation (QueryFailed wraps FK errors)
+    // Verify the error is a constraint violation. PR-02 gave `DbError` a
+    // dedicated `ForeignKeyViolation` variant (23503 used to fall into the
+    // catch-all `QueryFailed`, which every route mapped to a 500 — so a request
+    // naming a row that does not exist answered "server fault"). This assertion
+    // is now sharper than it was: it pins the constraint by name.
     match delete_result.unwrap_err() {
-        DbError::QueryFailed { .. } => {
-            // Expected: FK constraint violation wrapped as QueryFailed
+        DbError::ForeignKeyViolation { constraint } => {
+            assert_eq!(constraint, "claims_agent_id_fkey");
         }
-        other => panic!("Expected QueryFailed (FK constraint), got: {:?}", other),
+        other => panic!("Expected ForeignKeyViolation (FK constraint), got: {other:?}"),
     }
 
     // Verify agent still exists

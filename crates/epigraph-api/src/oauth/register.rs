@@ -50,21 +50,14 @@ pub struct RegisterResponse {
     pub message: String,
 }
 
-/// Default read-only scopes for pending service clients.
-const PENDING_SERVICE_SCOPES: &[&str] = &[
-    "claims:read",
-    "evidence:read",
-    "edges:read",
-    "agents:read",
-    "groups:read",
-    "analysis:belief",
-    "analysis:propagation",
-    "analysis:reasoning",
-    "analysis:gaps",
-    "analysis:structural",
-    "analysis:hypothesis",
-    "analysis:political",
-];
+/// Default read-only scopes for DCR public clients and pending service clients.
+///
+/// Re-exported from `epigraph_core::canonical_scopes` (identical contents) so
+/// this is no longer a private fourth copy of a grant list. It is NOT
+/// `read_only_scopes()`: that set additionally carries `audit:read` and
+/// `tasks:read`, which no dynamically registered client should hold. See the
+/// doc comment on `PUBLIC_CLIENT_READ_SCOPES`.
+const PENDING_SERVICE_SCOPES: &[&str] = epigraph_core::canonical_scopes::PUBLIC_CLIENT_READ_SCOPES;
 
 #[cfg(feature = "db")]
 pub async fn register_endpoint(
@@ -160,23 +153,36 @@ pub async fn register_endpoint(
 
     let redirect_uris = req.redirect_uris.clone();
 
-    // Check for existing client (idempotent for agents)
+    // Check for existing client (idempotent for agents).
+    //
+    // STATUS-AGNOSTIC (PR-02). This used `get_by_client_id`, which filters
+    // `status = 'active'`. That was harmless while the agent arm below
+    // auto-activated; now that it registers `pending`, an active-only lookup
+    // cannot see the row it just created, so a re-registering agent fell through
+    // to `create` and raised a duplicate-`client_id` 500 instead of the
+    // documented idempotent 200. The reported `status` is the row's real one for
+    // the same reason — a hardcoded "active" would now be a lie.
     {
         use epigraph_db::repos::oauth_client::OAuthClientRepository;
-        if let Ok(Some(_)) =
-            OAuthClientRepository::get_by_client_id(&state.db_pool, &client_id).await
+        if let Ok(Some(row)) =
+            OAuthClientRepository::get_by_client_id_any_status(&state.db_pool, &client_id).await
         {
+            let message = if row.status == "pending" {
+                "Client already registered and still awaiting admin approval."
+            } else {
+                "Client already registered."
+            };
             return Ok((
                 StatusCode::OK,
                 Json(RegisterResponse {
                     client_id,
                     client_secret: None,
                     client_name: req.client_name,
-                    client_type: client_type.to_string(),
-                    status: "active".to_string(),
-                    allowed_scopes: vec![],
+                    client_type: row.client_type.clone(),
+                    status: row.status.clone(),
+                    allowed_scopes: row.allowed_scopes.clone(),
                     redirect_uris,
-                    message: "Client already registered.".to_string(),
+                    message: message.to_string(),
                 }),
             ));
         }
@@ -198,21 +204,30 @@ pub async fn register_endpoint(
     } else {
         match client_type {
             "agent" => {
-                // Agents are auto-activated with full write scopes
-                let scopes = vec![
-                    "claims:read".to_string(),
-                    "claims:write".to_string(),
-                    "evidence:read".to_string(),
-                    "evidence:write".to_string(),
-                    "edges:read".to_string(),
-                    "edges:write".to_string(),
-                    "agents:read".to_string(),
-                    "agents:write".to_string(),
-                    "analysis:belief".to_string(),
-                    "analysis:propagation".to_string(),
-                    "ingest:write".to_string(),
-                ];
-                ("active", scopes.clone(), scopes)
+                // AUTO-ACTIVATION KILL (PR-02). This arm previously returned
+                // ("active", scopes, scopes) with eleven scopes including
+                // claims:write and ingest:write — i.e. an unauthenticated POST
+                // to this endpoint yielded a usable write credential. It now
+                // registers PENDING with an EMPTY granted set: `allowed_scopes`
+                // records what an admin MAY approve
+                // (POST /api/v1/admin/clients/:id/approve), `granted_scopes` is
+                // what the client actually holds, and the client_credentials
+                // grant refuses it entirely until then because
+                // `OAuthClientRepository::get_by_client_id` filters
+                // status='active'.
+                //
+                // NOTE the asymmetry with routes/agents.rs, which DOES
+                // auto-activate: that path requires an authenticated caller
+                // holding `agents:write`, which is the admin approval this one
+                // lacks.
+                (
+                    "pending",
+                    epigraph_core::canonical_scopes::AGENT_PROVISION_SCOPES
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect::<Vec<_>>(),
+                    vec![],
+                )
             }
             "service" => ("pending", dcr_scopes(), vec![]),
             "human" => ("pending", vec![], vec![]),
@@ -246,7 +261,14 @@ pub async fn register_endpoint(
             &allowed_scopes,
             &granted_scopes,
             status,
-            None, // agent_id linked later via ensure_agent_by_content
+            // agent_id is linked at TOKEN-MINT time, not here, by
+            // AgentRepository::ensure_for_client (oauth/token.rs::principal_agent_id).
+            // Doing it here would materialise a principal for a client that may
+            // never be approved. (The comment this replaces promised the link
+            // would happen later, and named a function that never existed —
+            // which is why oauth_clients.agent_id was NULL for every client
+            // this endpoint ever created.)
+            None,
             owner_id,
             req.legal_entity_name.as_deref(),
             req.legal_contact_email.as_deref(),
@@ -262,11 +284,12 @@ pub async fn register_endpoint(
         "Client registered. Use the authorization_code flow with PKCE.".to_string()
     } else {
         match status {
-            "pending" => {
-                "Registration received. An admin must approve before write scopes are granted."
-                    .to_string()
-            }
-            "active" => "Agent registered and activated.".to_string(),
+            "pending" => "Registration received. An admin must approve this client before any \
+                 scopes are granted and before it can obtain a token."
+                .to_string(),
+            // Unreachable for the agent path since PR-02 (it registers
+            // "pending"); retained for any future arm that returns "active".
+            "active" => "Client registered and activated.".to_string(),
             _ => "Client registered successfully.".to_string(),
         }
     };

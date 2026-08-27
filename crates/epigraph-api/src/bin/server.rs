@@ -190,10 +190,28 @@ async fn main() {
     // links. Defaults to localhost for local dev/CI.
     let public_base_url = std::env::var("EPIGRAPH_PUBLIC_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:8080".to_string());
+    // Re-open the pre-PR-02 allow-all identity posture. Default false: a
+    // provider with no `allowed_emails`/`allowed_domains` provisions NOBODY,
+    // and under EPIGRAPH_ENV=production that combination refuses to boot at all
+    // (see oauth::providers::build_registry).
+    //
+    // EPIGRAPH_ENV is introduced by PR-02. Read ONCE here and threaded into
+    // build_registry, rather than read inside the library: a hidden env read in
+    // a library function is untestable without mutating process state.
+    //
+    // UNSET means production. That is the whole point — EPIGRAPH_ENV is new, so
+    // it is unset in every deployment that exists today, which is exactly the
+    // population the boot assertion is for. Set it explicitly to "development" /
+    // "test" / "ci" / "local" (see providers::NON_PRODUCTION_ENVS) to downgrade
+    // the empty-allowlist abort to a warning so dev and CI still run.
+    let epigraph_env = std::env::var("EPIGRAPH_ENV").unwrap_or_default();
+    let allow_all_identities =
+        std::env::var("EPIGRAPH_ALLOW_ALL_IDENTITIES").as_deref() == Ok("true");
     let config = ApiConfig {
         require_signatures,
         max_request_size: 10 * 1024 * 1024, // 10MB — figure evidence carries base64 images
         public_base_url,
+        allow_all_identities,
     };
 
     // Create embedding service for semantic search
@@ -280,8 +298,17 @@ async fn main() {
         let providers_path = std::env::var("EPIGRAPH_PROVIDERS_CONFIG")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("providers.toml"));
-        let providers = epigraph_api::oauth::providers::build_registry(providers_path.as_path())
-            .expect("failed to build providers registry");
+        // build_registry now returns Err (rather than only warning) when a
+        // provider has an empty identity allowlist, allow_all_identities is
+        // false and EPIGRAPH_ENV does not name a non-production environment.
+        // The existing .expect() turns that into a clean startup abort — no new
+        // panic site is needed.
+        let providers = epigraph_api::oauth::providers::build_registry(
+            providers_path.as_path(),
+            allow_all_identities,
+            &epigraph_env,
+        )
+        .expect("failed to build providers registry");
         state.with_providers(providers)
     };
 

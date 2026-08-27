@@ -218,6 +218,7 @@ fn create_test_app() -> axum::Router {
         require_signatures: true,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
+        ..ApiConfig::default()
     };
     let state = AppState::new(config);
     create_router(state)
@@ -232,6 +233,7 @@ fn create_test_app_no_sig() -> axum::Router {
         require_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
+        ..ApiConfig::default()
     };
     let state = AppState::new(config);
     create_router(state)

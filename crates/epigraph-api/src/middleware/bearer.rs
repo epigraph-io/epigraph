@@ -148,6 +148,15 @@ macro_rules! require_scope_extractor {
 require_scope_extractor!(RequireScopeAdmin, "claims:admin");
 require_scope_extractor!(RequireScopeWrite, "claims:write");
 require_scope_extractor!(RequireScopeWebhooksWrite, "webhooks:write");
+// Group management. `groups:write` creates a group (the creator becomes its sole
+// admin); `groups:admin` manages an EXISTING group's membership and is checked
+// alongside a live `role='admin'` membership in that group
+// (`middleware::group_authz::require_group_admin`) — scope AND membership.
+// Using the extractor rather than `check_scopes` inside the handler matters
+// here: these routes take a `Json` body, and an extractor rejection runs before
+// body parsing, so a scope failure is 403 rather than 422 (issue #128).
+require_scope_extractor!(RequireScopeGroupsWrite, "groups:write");
+require_scope_extractor!(RequireScopeGroupsAdmin, "groups:admin");
 
 #[cfg(test)]
 mod require_scope_tests {
