@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT\n                para.id AS \"paragraph_id!\",\n                atom.id AS \"atom_id!\",\n                (atom.labels @> ARRAY[$2]::text[]) AS \"carries_doi_label!\",\n                EXISTS (\n                    SELECT 1 FROM edges a\n                    WHERE a.source_id = $1\n                      AND a.source_type = 'paper'\n                      AND a.target_id = atom.id\n                      AND a.target_type = 'claim'\n                      AND a.relationship = 'asserts'\n                ) AS \"asserted!\"\n            FROM edges pe\n            JOIN claims para ON para.id = pe.target_id\n            JOIN edges d ON d.source_id = para.id\n                        AND d.source_type = 'claim'\n                        AND d.target_type = 'claim'\n                        AND d.relationship = 'decomposes_to'\n            JOIN claims atom ON atom.id = d.target_id\n            WHERE pe.source_id = $1\n              AND pe.source_type = 'paper'\n              AND pe.target_type = 'claim'\n              AND pe.relationship = 'asserts'\n              AND para.properties ->> 'level' = '2'\n              AND atom.properties ->> 'level' = '3'\n            ORDER BY \"paragraph_id!\", \"atom_id!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "paragraph_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "atom_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "carries_doi_label!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "asserted!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "fe0c78ec3ce7b5de94145cc646a72812b0ec87a69d3a604bcd257ee2673637ce"
+}

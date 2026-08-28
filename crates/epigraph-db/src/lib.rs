@@ -119,8 +119,10 @@ pub use repos::frame::{ClaimFrameRow, FrameRow};
 pub use repos::mass_function::MassFunctionRow;
 pub use repos::obligation::ANCHOR_KIND_CLAIM;
 pub use repos::ownership::OwnershipRow;
+pub use repos::paper::{AssertedClaimBinding, DecomposedAtomRow};
 pub use repos::perspective::PerspectiveRow;
 pub use repos::scoped_belief::ScopedBeliefRow;
+pub use repos::source_artifact::EssenceRendition;
 
 // Re-export Political network monitoring types
 pub use repos::political::{

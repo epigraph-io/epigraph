@@ -68,6 +68,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("traverse", "claims:read"),
     ("verify_anchor", "claims:read"),
     ("verify_manifest", "claims:read"),
+    ("verify_paper_essence", "claims:read"),
     // ─── claims:write ──────────────────────────────────────────────────
     ("add_step", "claims:write"),
     ("anchor_manifest", "claims:write"),

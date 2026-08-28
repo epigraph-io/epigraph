@@ -641,6 +641,22 @@ pub struct QueryPaperParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct VerifyPaperEssenceParams {
+    #[schemars(
+        description = "DOI (or synthesized document_key) of the paper to verify. Supply this or paper_id."
+    )]
+    pub doi: Option<String>,
+
+    #[schemars(description = "UUID of the paper node. Supply this or doi.")]
+    pub paper_id: Option<String>,
+
+    #[schemars(
+        description = "Fail closed (default true): return an error, not a report, when any fault is found."
+    )]
+    pub strict: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryClaimsByEvidenceParams {
     #[schemars(
         description = "Evidence type: observation, computation, reference, testimony, document"

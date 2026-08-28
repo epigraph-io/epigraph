@@ -673,6 +673,29 @@ impl EpiGraphMcpFull {
         tools::blobs::attach_blob(self, params).await
     }
 
+    // ── Essence (1 tool) ──
+
+    #[tool(
+        description = "Prove that every claim a paper asserts still names bytes we can produce. \
+                       Walks paper -has_essence-> rendition, re-hashes the stored artifact off \
+                       disk, then checks every paper -asserts-> claim edge against it: an edge \
+                       with no essence_digest (unbound_claim), one naming a rendition this paper \
+                       does not have (unknown_digest), a rendition whose bytes are gone \
+                       (bytes_missing) or were altered (digest_mismatch), and a labelled level-3 \
+                       atom reachable through decomposes_to that the paper never asserts \
+                       (atom_unbound). For verbatim source_text renditions it additionally \
+                       requires every paragraph claim to be a byte substring of the essence. \
+                       FAILS CLOSED: with strict (the default) any fault is an error, not a \
+                       report. stale_binding — a claim on an older but still-resolvable \
+                       rendition — is only a warning."
+    )]
+    async fn verify_paper_essence(
+        &self,
+        Parameters(params): Parameters<VerifyPaperEssenceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::essence::verify_paper_essence(self, params).await
+    }
+
     // ── Manifests (2 tools) ──
 
     #[tool(

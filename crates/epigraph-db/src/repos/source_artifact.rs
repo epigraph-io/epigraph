@@ -39,6 +39,19 @@ use crate::errors::DbError;
 /// integrity infrastructure, not GUI node expansion.
 pub const HAS_ESSENCE_RELATIONSHIP: &str = "has_essence";
 
+/// One essence rendition: an exact byte payload some ingest run consumed.
+#[derive(Debug, Clone)]
+pub struct EssenceRendition {
+    pub id: Uuid,
+    pub name: String,
+    /// BLAKE3-256 of the bytes. Also the key into the blob store.
+    pub content_hash: [u8; 32],
+    /// Carries `essence_kind` (`source_text` | `extraction_json`),
+    /// `size_bytes` and `blob_id`.
+    pub properties: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 pub struct SourceArtifactRepository;
 
 impl SourceArtifactRepository {
@@ -102,5 +115,67 @@ impl SourceArtifactRepository {
                 .to_string(),
         })?;
         Ok((existing, false))
+    }
+
+    /// Every rendition `paper_id` is joined to by `has_essence`, newest first.
+    ///
+    /// Newest first is load-bearing: an `asserts` edge bound to anything but
+    /// `[0]` is a `stale_binding` — legitimate, since multi-rendition history
+    /// is the whole reason the digest lives per-rendition, but worth reporting.
+    ///
+    /// # Errors
+    /// - [`DbError::QueryFailed`] on a database error.
+    /// - [`DbError::InvalidData`] if a rendition's `content_hash` is not 32
+    ///   bytes, which the writer and `uq_source_artifacts_essence_hash` make
+    ///   unreachable for rows this crate created.
+    #[instrument(skip(pool))]
+    pub async fn list_for_paper(
+        pool: &PgPool,
+        paper_id: Uuid,
+    ) -> Result<Vec<EssenceRendition>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT sa.id           AS "id!",
+                   sa.name         AS "name!",
+                   sa.content_hash AS "content_hash!",
+                   sa.properties   AS "properties!",
+                   sa.created_at   AS "created_at!"
+            FROM edges e
+            JOIN source_artifacts sa ON sa.id = e.target_id
+            WHERE e.source_id = $1
+              AND e.source_type = 'paper'
+              AND e.target_type = 'source_artifact'
+              AND e.relationship = 'has_essence'
+              AND sa.artifact_type = 'essence'
+              AND sa.content_hash IS NOT NULL
+            ORDER BY sa.created_at DESC, sa.id
+            "#,
+            paper_id,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                let content_hash: [u8; 32] =
+                    r.content_hash
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| DbError::InvalidData {
+                            reason: format!(
+                                "essence rendition {} has content_hash of length {} (expected 32)",
+                                r.id,
+                                r.content_hash.len()
+                            ),
+                        })?;
+                Ok(EssenceRendition {
+                    id: r.id,
+                    name: r.name,
+                    content_hash,
+                    properties: r.properties,
+                    created_at: r.created_at,
+                })
+            })
+            .collect()
     }
 }

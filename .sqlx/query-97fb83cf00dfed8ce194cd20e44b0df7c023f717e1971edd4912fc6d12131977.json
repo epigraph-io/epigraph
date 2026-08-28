@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, doi, title as \"title?\", journal\n            FROM papers\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "doi",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "title?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "journal",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "97fb83cf00dfed8ce194cd20e44b0df7c023f717e1971edd4912fc6d12131977"
+}

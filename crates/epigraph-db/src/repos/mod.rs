@@ -116,7 +116,9 @@ pub use method::{
 };
 pub use obligation::{NewObligation, ObligationRepository, ObligationRow, ANCHOR_KIND_CLAIM};
 pub use ownership::OwnershipRepository;
-pub use paper::{AssertedClaimRow, PaperRepository, PaperRow};
+pub use paper::{
+    AssertedClaimBinding, AssertedClaimRow, DecomposedAtomRow, PaperRepository, PaperRow,
+};
 pub use perspective::PerspectiveRepository;
 pub use political::{
     AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,
@@ -155,7 +157,7 @@ pub use provenance::{ProvenanceLogRow, ProvenanceRepository, AUTO_POLICY_AUTHORI
 pub use re_encryption_key::{ReEncryptionKeyRepository, ReEncryptionKeyRow};
 pub use refresh_token::{RefreshTokenRepository, RefreshTokenRow};
 pub use security_event::{SecurityEventFilter, SecurityEventRepository, SecurityEventRow};
-pub use source_artifact::{SourceArtifactRepository, HAS_ESSENCE_RELATIONSHIP};
+pub use source_artifact::{EssenceRendition, SourceArtifactRepository, HAS_ESSENCE_RELATIONSHIP};
 pub use span::{SpanRepository, SpanRow};
 pub use task::{TaskRepository, TaskRow};
 pub use workflow_execution::{WorkflowExecutionRepository, WorkflowExecutionRow};

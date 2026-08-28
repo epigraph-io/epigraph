@@ -82,6 +82,35 @@ impl PaperRepository {
         }))
     }
 
+    /// Find a paper by node id. Returns `None` if no such paper exists.
+    ///
+    /// The id-keyed twin of [`Self::find_by_doi`], for callers holding a
+    /// `paper_id` (every ingest response returns one) rather than a DOI.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<PaperRow>, DbError> {
+        // `as "title?"` for the same reason as find_by_doi: the migration
+        // declares `title` nullable, the dev DB has historical NOT NULL drift.
+        let row = sqlx::query!(
+            r#"
+            SELECT id, doi, title as "title?", journal
+            FROM papers
+            WHERE id = $1
+            "#,
+            id
+        )
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(|r| PaperRow {
+            id: r.id,
+            doi: r.doi,
+            title: r.title,
+            journal: r.journal,
+        }))
+    }
+
     /// Returns true if the paper has any outgoing `processed_by` edge whose
     /// `properties.pipeline` matches `pipeline_version`. Used as the
     /// re-ingestion version gate by hierarchical ingestion.
@@ -267,6 +296,112 @@ impl PaperRepository {
             })
             .collect()
     }
+
+    /// Every `paper -asserts-> claim` edge with its essence binding.
+    ///
+    /// Unlike [`Self::list_asserted_claims`] this returns the EDGE's
+    /// `essence_digest` and the CLAIM's hierarchy level — what
+    /// `verify_paper_essence` needs and what a claim-shaped row cannot carry.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn list_asserted_claim_bindings(
+        pool: &PgPool,
+        paper_id: Uuid,
+    ) -> Result<Vec<AssertedClaimBinding>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT e.id      AS "edge_id!",
+                   c.id      AS "claim_id!",
+                   c.content AS "content!",
+                   c.properties ->> 'level'          AS level,
+                   e.properties ->> 'essence_digest' AS essence_digest
+            FROM edges e
+            JOIN claims c ON c.id = e.target_id
+            WHERE e.source_id = $1
+              AND e.source_type = 'paper'
+              AND e.target_type = 'claim'
+              AND e.relationship = 'asserts'
+            ORDER BY c.created_at, c.id
+            "#,
+            paper_id,
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AssertedClaimBinding {
+                edge_id: r.edge_id,
+                claim_id: r.claim_id,
+                content: r.content,
+                level: r.level,
+                essence_digest: r.essence_digest,
+            })
+            .collect())
+    }
+
+    /// The level-3 atoms reachable as `paragraph -decomposes_to-> atom` from a
+    /// level-2 paragraph this paper asserts.
+    ///
+    /// `doi_label` is this paper's `doi:<doi>` label. An atom carrying it
+    /// provably belongs to this paper, so one that carries it and has NO
+    /// `asserts` edge from this paper is a real gap — the incident shape
+    /// essence binding exists to name. An atom WITHOUT the label may be a
+    /// convergent node another document contributed, which is not a fault.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn list_atoms_of_asserted_paragraphs(
+        pool: &PgPool,
+        paper_id: Uuid,
+        doi_label: &str,
+    ) -> Result<Vec<DecomposedAtomRow>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT DISTINCT
+                para.id AS "paragraph_id!",
+                atom.id AS "atom_id!",
+                (atom.labels @> ARRAY[$2]::text[]) AS "carries_doi_label!",
+                EXISTS (
+                    SELECT 1 FROM edges a
+                    WHERE a.source_id = $1
+                      AND a.source_type = 'paper'
+                      AND a.target_id = atom.id
+                      AND a.target_type = 'claim'
+                      AND a.relationship = 'asserts'
+                ) AS "asserted!"
+            FROM edges pe
+            JOIN claims para ON para.id = pe.target_id
+            JOIN edges d ON d.source_id = para.id
+                        AND d.source_type = 'claim'
+                        AND d.target_type = 'claim'
+                        AND d.relationship = 'decomposes_to'
+            JOIN claims atom ON atom.id = d.target_id
+            WHERE pe.source_id = $1
+              AND pe.source_type = 'paper'
+              AND pe.target_type = 'claim'
+              AND pe.relationship = 'asserts'
+              AND para.properties ->> 'level' = '2'
+              AND atom.properties ->> 'level' = '3'
+            ORDER BY "paragraph_id!", "atom_id!"
+            "#,
+            paper_id,
+            doi_label,
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DecomposedAtomRow {
+                paragraph_id: r.paragraph_id,
+                atom_id: r.atom_id,
+                carries_doi_label: r.carries_doi_label,
+                asserted: r.asserted,
+            })
+            .collect())
+    }
 }
 
 /// Minimal claim shape returned by [`PaperRepository::list_asserted_claims`].
@@ -278,4 +413,30 @@ pub struct AssertedClaimRow {
     pub agent_id: Uuid,
     pub content_hash: [u8; 32],
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One `paper -asserts-> claim` edge plus what the verifier needs to judge it.
+#[derive(Debug, Clone)]
+pub struct AssertedClaimBinding {
+    pub edge_id: Uuid,
+    pub claim_id: Uuid,
+    pub content: String,
+    /// `claims.properties->>'level'` — `"0"` thesis … `"3"` atom, or `None`
+    /// for a claim that never got hierarchy metadata.
+    pub level: Option<String>,
+    /// `edges.properties->>'essence_digest'`. `None` is the legacy,
+    /// pre-essence state the verifier reports as `unbound_claim`.
+    pub essence_digest: Option<String>,
+}
+
+/// One level-3 atom reached from a level-2 paragraph this paper asserts.
+#[derive(Debug, Clone)]
+pub struct DecomposedAtomRow {
+    pub paragraph_id: Uuid,
+    pub atom_id: Uuid,
+    /// Does the atom carry this paper's `doi:<doi>` label? Only a labelled
+    /// atom is provably this paper's.
+    pub carries_doi_label: bool,
+    /// Does this paper assert the atom directly?
+    pub asserted: bool,
 }

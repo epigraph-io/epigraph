@@ -205,6 +205,37 @@ impl BlobRepository {
         })
     }
 
+    /// Every `blobs` row over these exact bytes, newest first.
+    ///
+    /// Deliberately a `Vec` and not an `Option`: migration 070's canonical key
+    /// is `(content_hash, uploader_id)`, so N uploaders of identical bytes hold
+    /// N rows over ONE on-disk file. Any of them resolves the content — the
+    /// storage path is derived from the digest alone — so a caller that only
+    /// needs the bytes may take the first, while a caller auditing provenance
+    /// sees all of them. An empty result means the bytes were never recorded.
+    ///
+    /// # Errors
+    /// [`DbError::QueryFailed`] on a database error.
+    pub async fn find_by_content_hash(
+        pool: &PgPool,
+        content_hash: &[u8; 32],
+    ) -> Result<Vec<BlobRef>, DbError> {
+        let rows = sqlx::query_as!(
+            BlobRef,
+            r#"
+            SELECT id, filename, mime_type, size_bytes, content_hash,
+                   uploader_id, labels, properties, created_at
+            FROM blobs
+            WHERE content_hash = $1
+            ORDER BY created_at DESC, id
+            "#,
+            &content_hash[..],
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Blobs reachable from `claim_id` over an outgoing edge, newest first.
     ///
     /// Deliberately unfiltered on `relationship`: `store` writes

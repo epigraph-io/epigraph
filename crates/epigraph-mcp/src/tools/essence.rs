@@ -40,17 +40,22 @@
 //! blobs live. There is no on/off switch: the only configuration is *where*,
 //! never *whether*.
 
+use std::collections::{HashMap, HashSet};
+
+use rmcp::model::{CallToolResult, Content};
 use uuid::Uuid;
 
 use epigraph_core::blob::hash_hex;
 use epigraph_crypto::ContentHasher;
 use epigraph_db::{
-    BlobRepository, EdgeRepository, SourceArtifactRepository, HAS_ESSENCE_RELATIONSHIP,
+    BlobRepository, EdgeRepository, PaperRepository, SourceArtifactRepository,
+    HAS_ESSENCE_RELATIONSHIP,
 };
 use epigraph_ingest::schema::DocumentExtraction;
 
-use crate::errors::{internal_error, McpError};
+use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
+use crate::types::VerifyPaperEssenceParams;
 
 /// `essence_kind` when the essence is the document's own verbatim text.
 pub const ESSENCE_KIND_SOURCE_TEXT: &str = "source_text";
@@ -59,6 +64,12 @@ pub const ESSENCE_KIND_EXTRACTION_JSON: &str = "extraction_json";
 
 /// `entity_types.type_name` of a rendition node.
 const SOURCE_ARTIFACT_ENTITY_TYPE: &str = "source_artifact";
+
+fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
+    Ok(CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(value).map_err(internal_error)?,
+    )]))
+}
 
 /// What one ingest run bound itself to.
 #[derive(Debug, Clone)]
@@ -196,6 +207,298 @@ fn essence_payload(
         ));
     }
     Ok((bytes, kind, mime_type, extension))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// verify_paper_essence — fail closed when a paper's asserted claims name bytes
+// we cannot produce
+// ────────────────────────────────────────────────────────────────────────────
+
+/// One condition that makes a paper's essence binding unsound.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EssenceFinding {
+    /// Machine-readable condition, e.g. `unbound_claim`.
+    pub kind: &'static str,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+impl EssenceFinding {
+    fn new(kind: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+            claim_id: None,
+            digest: None,
+        }
+    }
+    fn on_claim(mut self, claim_id: Uuid) -> Self {
+        self.claim_id = Some(claim_id);
+        self
+    }
+    fn with_digest(mut self, digest: impl Into<String>) -> Self {
+        self.digest = Some(digest.into());
+        self
+    }
+}
+
+struct ResolvedRendition {
+    kind: String,
+    bytes: Vec<u8>,
+}
+
+/// Prove that every claim this paper asserts names bytes we can still produce.
+///
+/// FAILS CLOSED. With `strict` (the default) any fault is an MCP **error**, not
+/// a soft report, because a verifier that returns `200 {"verified": false}` is a
+/// verifier whose result gets ignored. The full report travels in the error
+/// message either way.
+///
+/// # Faults
+/// - `no_essence` — the paper has no `has_essence` rendition at all.
+/// - `blob_row_missing` — a rendition's digest has no `blobs` row.
+/// - `bytes_missing` — the row exists but its file does not (in a multi-replica
+///   deployment, the symptom of replicas not sharing a blob volume).
+/// - `digest_mismatch` — the file exists but does not re-hash to its digest.
+/// - `unbound_claim` — an `asserts` edge with no `essence_digest`. This is the
+///   legacy, pre-essence corpus: migration 074's trigger grandfathers those
+///   rows for writes, and this is where they are surfaced rather than hidden.
+/// - `unknown_digest` — an `asserts` edge naming a digest this paper has no
+///   rendition for.
+/// - `atom_unbound` — a level-3 atom reached through
+///   `paragraph -decomposes_to-> atom`, carrying this paper's `doi:<doi>` label,
+///   with no `asserts` edge from this paper. Exactly the incident shape that
+///   opened backlog 7c909c49.
+/// - `paragraph_not_in_essence` — see containment below.
+///
+/// # Warnings
+/// - `stale_binding` — a claim bound to an older but still-resolvable
+///   rendition. NOT a fault: multi-rendition history is legitimate and is the
+///   whole reason the digest lives per-rendition instead of in a column on
+///   `papers`.
+///
+/// # Containment, and its two deliberate gaps
+///
+/// For `essence_kind = 'source_text'` renditions every level-2 (paragraph)
+/// claim's content must be a byte substring of the essence read back off disk.
+/// This is sound because the writer-side verbatim guard already forces Tier-1
+/// paragraphs to be exact slices of `source_text`.
+///
+/// Two things are deliberately NOT containment-checked, and neither is a bug:
+/// 1. **Atoms** (level 3) are LLM rewrites of a paragraph, not verbatim slices,
+///    so substring containment would fail on correct data.
+/// 2. **`extraction_json` renditions** hold paragraph text JSON-escaped, so a
+///    paragraph containing a quote or a newline is legitimately not a raw
+///    substring of the envelope.
+pub async fn verify_paper_essence(
+    server: &EpiGraphMcpFull,
+    params: VerifyPaperEssenceParams,
+) -> Result<CallToolResult, McpError> {
+    let strict = params.strict.unwrap_or(true);
+    let (paper_id, doi) = resolve_paper(server, &params).await?;
+
+    let mut faults: Vec<EssenceFinding> = Vec::new();
+    let mut warnings: Vec<EssenceFinding> = Vec::new();
+
+    // ── 1. The renditions this paper is joined to ──
+    let renditions = SourceArtifactRepository::list_for_paper(&server.pool, paper_id)
+        .await
+        .map_err(internal_error)?;
+    if renditions.is_empty() {
+        faults.push(EssenceFinding::new(
+            "no_essence",
+            format!("paper {paper_id} has no has_essence rendition, so its claims name nothing"),
+        ));
+    }
+
+    // ── 2. Do those renditions still resolve to bytes? ──
+    let mut resolved: HashMap<String, ResolvedRendition> = HashMap::new();
+    let mut rendition_report = Vec::new();
+    for r in &renditions {
+        let digest_hex = hash_hex(&r.content_hash[..]);
+        let kind = r
+            .properties
+            .get("essence_kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+
+        let blobs = BlobRepository::find_by_content_hash(&server.pool, &r.content_hash)
+            .await
+            .map_err(internal_error)?;
+        let mut bytes_verified = false;
+        match blobs.first() {
+            None => faults.push(
+                EssenceFinding::new(
+                    "blob_row_missing",
+                    format!("rendition {} names bytes with no blobs row", r.id),
+                )
+                .with_digest(digest_hex.clone()),
+            ),
+            Some(blob) => match BlobRepository::read_content(&server.blob_dir, blob).await {
+                Err(e) => faults.push(
+                    EssenceFinding::new("bytes_missing", format!("blob {}: {e}", blob.id))
+                        .with_digest(digest_hex.clone()),
+                ),
+                Ok(bytes) => {
+                    if hash_hex(&ContentHasher::hash(&bytes)[..]) == digest_hex {
+                        bytes_verified = true;
+                        resolved.insert(
+                            digest_hex.clone(),
+                            ResolvedRendition {
+                                kind: kind.clone(),
+                                bytes,
+                            },
+                        );
+                    } else {
+                        faults.push(
+                            EssenceFinding::new(
+                                "digest_mismatch",
+                                format!("blob {} was modified after it was written", blob.id),
+                            )
+                            .with_digest(digest_hex.clone()),
+                        );
+                    }
+                }
+            },
+        }
+        rendition_report.push(serde_json::json!({
+            "artifact_id": r.id,
+            "digest": digest_hex,
+            "essence_kind": kind,
+            "bytes_verified": bytes_verified,
+        }));
+    }
+
+    // ── 3. Every asserted claim must name one of them ──
+    let known: HashSet<String> = renditions
+        .iter()
+        .map(|r| hash_hex(&r.content_hash[..]))
+        .collect();
+    let newest = renditions.first().map(|r| hash_hex(&r.content_hash[..]));
+
+    let bindings = PaperRepository::list_asserted_claim_bindings(&server.pool, paper_id)
+        .await
+        .map_err(internal_error)?;
+
+    for b in &bindings {
+        let Some(digest) = b.essence_digest.as_deref() else {
+            faults.push(
+                EssenceFinding::new(
+                    "unbound_claim",
+                    "asserts edge carries no essence_digest (pre-essence row)",
+                )
+                .on_claim(b.claim_id),
+            );
+            continue;
+        };
+        if !known.contains(digest) {
+            faults.push(
+                EssenceFinding::new(
+                    "unknown_digest",
+                    "asserts edge names a rendition this paper is not joined to",
+                )
+                .on_claim(b.claim_id)
+                .with_digest(digest),
+            );
+            continue;
+        }
+        if newest.as_deref() != Some(digest) {
+            warnings.push(
+                EssenceFinding::new(
+                    "stale_binding",
+                    "claim is bound to an older, still-resolvable rendition",
+                )
+                .on_claim(b.claim_id)
+                .with_digest(digest),
+            );
+        }
+        // Containment teeth: source_text renditions, level-2 claims only.
+        if b.level.as_deref() == Some("2") {
+            if let Some(res) = resolved.get(digest) {
+                if res.kind == ESSENCE_KIND_SOURCE_TEXT
+                    && std::str::from_utf8(&res.bytes).is_ok_and(|text| !text.contains(&b.content))
+                {
+                    faults.push(
+                        EssenceFinding::new(
+                            "paragraph_not_in_essence",
+                            "level-2 claim content is not a byte substring of the essence",
+                        )
+                        .on_claim(b.claim_id)
+                        .with_digest(digest),
+                    );
+                }
+            }
+        }
+    }
+
+    // ── 4. The paper -> paragraph -> atom walk ──
+    let doi_label = format!("doi:{doi}");
+    let atoms =
+        PaperRepository::list_atoms_of_asserted_paragraphs(&server.pool, paper_id, &doi_label)
+            .await
+            .map_err(internal_error)?;
+    for a in &atoms {
+        if a.carries_doi_label && !a.asserted {
+            faults.push(
+                EssenceFinding::new(
+                    "atom_unbound",
+                    format!(
+                        "atom carries {doi_label} and decomposes from paragraph {} but this \
+                         paper does not assert it, so it is bound to no bytes",
+                        a.paragraph_id
+                    ),
+                )
+                .on_claim(a.atom_id),
+            );
+        }
+    }
+
+    let report = serde_json::json!({
+        "paper_id": paper_id,
+        "doi": doi,
+        "strict": strict,
+        "verified": faults.is_empty(),
+        "renditions": rendition_report,
+        "asserted_claims": bindings.len(),
+        "atoms_reached": atoms.len(),
+        "faults": faults,
+        "warnings": warnings,
+    });
+
+    if strict && !faults.is_empty() {
+        return Err(internal_error(format!(
+            "verify_paper_essence FAILED for {doi}: {} fault(s); {report}",
+            faults.len(),
+        )));
+    }
+    success_json(&report)
+}
+
+/// `doi` or `paper_id`, exactly one of which must resolve.
+async fn resolve_paper(
+    server: &EpiGraphMcpFull,
+    params: &VerifyPaperEssenceParams,
+) -> Result<(Uuid, String), McpError> {
+    if let Some(doi) = params.doi.as_deref() {
+        let paper = PaperRepository::find_by_doi(&server.pool, doi)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| invalid_params(format!("no paper with doi {doi}")))?;
+        return Ok((paper.id, paper.doi));
+    }
+    if let Some(raw) = params.paper_id.as_deref() {
+        let id = parse_uuid(raw)?;
+        let paper = PaperRepository::find_by_id(&server.pool, id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| invalid_params(format!("no paper with id {id}")))?;
+        return Ok((paper.id, paper.doi));
+    }
+    Err(invalid_params("supply either doi or paper_id"))
 }
 
 #[cfg(test)]
