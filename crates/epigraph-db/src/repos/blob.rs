@@ -30,7 +30,7 @@
 
 use std::path::Path;
 
-use epigraph_core::blob::{sanitize_filename, storage_path};
+use epigraph_core::blob::{sanitize_filename, sanitize_mime_type, storage_path};
 use epigraph_core::BlobRef;
 use epigraph_crypto::ContentHasher;
 use sqlx::PgPool;
@@ -79,8 +79,8 @@ impl BlobRepository {
     /// one on-disk file — provenance preserved, storage deduplicated.
     ///
     /// # Errors
-    /// - [`DbError::InvalidData`] for an empty payload or an unsafe filename
-    ///   (nothing is written in either case).
+    /// - [`DbError::InvalidData`] for an empty payload, an unsafe filename, or
+    ///   an unsafe or over-long `mime_type` (nothing is written in any case).
     /// - [`DbError::Io`] if the bytes cannot be written to `blob_dir`.
     /// - [`DbError::QueryFailed`] if the metadata insert or the attach edge
     ///   fails — including when `attach_to_claim` names a claim that does not
@@ -107,12 +107,13 @@ impl BlobRepository {
         let filename = sanitize_filename(filename).map_err(|e| DbError::InvalidData {
             reason: e.to_string(),
         })?;
-        let mime_type = mime_type.trim();
-        if mime_type.is_empty() {
-            return Err(DbError::InvalidData {
-                reason: "blob mime_type must not be empty".to_string(),
-            });
-        }
+        // Same position as the filename guard and for the same reason: the
+        // value is echoed into a `Content-Type` response header, and an
+        // over-wide one would otherwise fail only at INSERT — after
+        // `write_content` has fsynced, leaving an orphan file with no row.
+        let mime_type = sanitize_mime_type(mime_type).map_err(|e| DbError::InvalidData {
+            reason: e.to_string(),
+        })?;
 
         let content_hash = ContentHasher::hash(content);
         let size_bytes = i64::try_from(content.len()).map_err(|_| DbError::InvalidData {
@@ -949,5 +950,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Hostile mime types are rejected before anything is written — the twin of
+    /// `store_rejects_hostile_filename`.
+    ///
+    /// The over-long case is the one that used to leave debris: `varchar(255)`
+    /// rejected it only at INSERT time, i.e. after `write_content` had already
+    /// fsynced the bytes, so the caller got an opaque database error and the
+    /// store kept an orphan file with no row pointing at it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn store_rejects_hostile_mime_type(pool: PgPool) {
+        let dir = TempDir::new().unwrap();
+        let agent = seed_agent(&pool, "blob-hostile-mime").await;
+
+        let over_long = format!("text/{}", "a".repeat(300));
+        for bad in [
+            "text/plain\nX-Injected: yes",
+            "text/plain\u{7f}",
+            over_long.as_str(),
+            "   ",
+        ] {
+            let result = BlobRepository::store(
+                &pool,
+                dir.path(),
+                "probe.bin",
+                bad,
+                &payload(32, 9),
+                agent,
+                None,
+                &[],
+                &empty_props(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(DbError::InvalidData { .. })),
+                "{bad:?} must be InvalidData, got {result:?}"
+            );
+        }
+
+        assert!(walk_files(dir.path()).is_empty(), "nothing may be written");
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Real mime grammar survives: `/`, `;`, `=` and space are required
+        // syntax, not header-breaking characters.
+        let stored = BlobRepository::store(
+            &pool,
+            dir.path(),
+            "table.csv",
+            "  text/csv; charset=utf-8  ",
+            &payload(32, 10),
+            agent,
+            None,
+            &[],
+            &empty_props(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.blob.mime_type, "text/csv; charset=utf-8");
     }
 }

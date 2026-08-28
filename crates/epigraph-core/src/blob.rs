@@ -72,6 +72,24 @@ pub enum InvalidBlobFilename {
     IllegalCharacter(char),
 }
 
+/// The maximum length the `blobs.mime_type varchar(255)` column accepts.
+const MAX_MIME_TYPE_LEN: usize = 255;
+
+/// A `mime_type` that cannot be safely echoed into a `Content-Type` response
+/// header, or that the `blobs.mime_type` column cannot hold.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum InvalidBlobMimeType {
+    /// Empty, or whitespace-only.
+    #[error("blob mime_type must not be empty")]
+    Empty,
+    /// Contains a control character.
+    #[error("blob mime_type contains an illegal character: {0:?}")]
+    IllegalCharacter(char),
+    /// Longer than `varchar(255)` can hold.
+    #[error("blob mime_type must be at most {MAX_MIME_TYPE_LEN} characters, got {0}")]
+    TooLong(usize),
+}
+
 /// Metadata reference to a content-addressed blob.
 ///
 /// The bytes themselves are never carried here — see [`BlobRef::storage_path`].
@@ -169,6 +187,50 @@ pub fn sanitize_filename(filename: &str) -> Result<String, InvalidBlobFilename> 
     Ok(trimmed.to_string())
 }
 
+/// Reduce a caller-supplied media type to a value that is safe to echo into a
+/// `Content-Type` response header.
+///
+/// The twin of [`sanitize_filename`], with the character set moved from the
+/// quoted-string grammar to the header-value grammar. A filename lands *inside*
+/// a quoted string in `Content-Disposition`, so `"`, `\\` and `/` end it early;
+/// a mime type is a whole header value in which `/`, `;`, `=` and space are
+/// required syntax (`text/csv; charset=utf-8`). What the two share is that a
+/// control character terminates the header itself, so that — and only that — is
+/// the rejected class here.
+///
+/// The length cap mirrors the `blobs.mime_type varchar(255)` column. Without it
+/// an over-wide value is caught only by the INSERT, i.e. *after*
+/// [`crate::BlobRef`]'s repository has already fsynced the content, which
+/// leaves an orphan file with no row and reports a caller mistake as an opaque
+/// database error.
+///
+/// This mirrors the `blobs_mime_type_not_empty` / `blobs_mime_type_safe`
+/// CHECKs for the same reason [`sanitize_filename`] mirrors
+/// `blobs_filename_safe`: the CHECK is the at-rest guarantee, this is the one
+/// that produces a clean validation error instead of a constraint violation.
+/// It is deliberately the stricter of the two — `char::is_control` is Unicode
+/// `Cc` (U+0000..=U+001F, U+007F..=U+009F) while Postgres `[[:cntrl:]]` under
+/// the `C` ctype stops at U+007F — because the Rust guard runs first on every
+/// write path and the CHECK only has to catch what bypasses it.
+///
+/// # Errors
+/// [`InvalidBlobMimeType`] if the value is empty, carries a control character,
+/// or exceeds [`MAX_MIME_TYPE_LEN`] characters.
+pub fn sanitize_mime_type(mime_type: &str) -> Result<String, InvalidBlobMimeType> {
+    let trimmed = mime_type.trim();
+    if trimmed.is_empty() {
+        return Err(InvalidBlobMimeType::Empty);
+    }
+    if let Some(c) = trimmed.chars().find(|c| c.is_control()) {
+        return Err(InvalidBlobMimeType::IllegalCharacter(c));
+    }
+    let len = trimmed.chars().count();
+    if len > MAX_MIME_TYPE_LEN {
+        return Err(InvalidBlobMimeType::TooLong(len));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Filesystem root for blob content: [`BLOB_DIR_ENV`] when set and non-empty,
 /// else [`DEFAULT_BLOB_DIR`].
 ///
@@ -253,6 +315,47 @@ mod tests {
             sanitize_filename("run-2026-08-27_A1.czi").unwrap(),
             "run-2026-08-27_A1.czi"
         );
+    }
+
+    #[test]
+    fn sanitize_mime_type_rejects_header_breaking_values() {
+        assert_eq!(
+            sanitize_mime_type("text/plain\nX-Injected: yes"),
+            Err(InvalidBlobMimeType::IllegalCharacter('\n'))
+        );
+        assert_eq!(
+            sanitize_mime_type("text/plain\u{7f}"),
+            Err(InvalidBlobMimeType::IllegalCharacter('\u{7f}'))
+        );
+        assert_eq!(sanitize_mime_type("  "), Err(InvalidBlobMimeType::Empty));
+        assert_eq!(sanitize_mime_type(""), Err(InvalidBlobMimeType::Empty));
+
+        // The column is varchar(255); the guard must fire one character before
+        // the INSERT would, i.e. before any bytes are on disk.
+        let over = format!("text/{}", "a".repeat(300));
+        assert_eq!(
+            sanitize_mime_type(&over),
+            Err(InvalidBlobMimeType::TooLong(305))
+        );
+        let exact = format!("text/{}", "a".repeat(MAX_MIME_TYPE_LEN - 5));
+        assert_eq!(sanitize_mime_type(&exact).unwrap(), exact);
+    }
+
+    /// `/`, `;`, `=` and space are mime grammar, not header-breaking
+    /// characters: unlike `sanitize_filename` this guard must let them through.
+    #[test]
+    fn sanitize_mime_type_keeps_real_media_types() {
+        for good in [
+            "text/plain",
+            "application/octet-stream",
+            "image/tiff",
+            "text/csv; charset=utf-8",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "multipart/form-data; boundary=\"abc\"",
+        ] {
+            assert_eq!(sanitize_mime_type(good).unwrap(), good, "{good:?}");
+        }
+        assert_eq!(sanitize_mime_type("  image/png  ").unwrap(), "image/png");
     }
 
     #[test]

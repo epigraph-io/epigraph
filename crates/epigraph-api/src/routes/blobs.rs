@@ -40,7 +40,7 @@ use uuid::Uuid;
 
 use crate::errors::ApiError;
 use crate::state::AppState;
-use epigraph_core::blob::sanitize_filename;
+use epigraph_core::blob::{sanitize_filename, sanitize_mime_type};
 use epigraph_core::BlobRef;
 use epigraph_db::BlobRepository;
 
@@ -55,7 +55,9 @@ pub struct UploadBlobQuery {
     #[serde(default)]
     pub filename: Option<String>,
     /// MIME type. Falls back to the request's `Content-Type` header, then to
-    /// `application/octet-stream`. Stored verbatim; never trusted for dispatch.
+    /// `application/octet-stream`. Never trusted for dispatch, and rejected at
+    /// write time if it carries a control character or exceeds 255 characters —
+    /// it is echoed into the `Content-Type` of `GET .../content`.
     #[serde(default)]
     pub mime_type: Option<String>,
     /// When set, a `claim -[derived_from]-> blob` edge is written in-band.
@@ -96,8 +98,8 @@ pub struct VerifyBlobResponse {
 /// # Errors
 /// - 401 when the request carries no `AuthContext`.
 /// - 403 when the token is not bound to an agent, so no uploader can be recorded.
-/// - 400 for an empty body, an oversize body, an unsafe filename, or
-///   unparseable `properties`.
+/// - 400 for an empty body, an oversize body, an unsafe filename, an unsafe or
+///   over-long `mime_type`, or unparseable `properties`.
 #[cfg(feature = "db")]
 pub async fn upload_blob(
     State(state): State<AppState>,
@@ -219,6 +221,10 @@ pub async fn get_blob_metadata(
 
 /// `GET /api/v1/blobs/:id/content`
 ///
+/// Both header-bearing columns are re-checked here even though the write path
+/// already guarantees them: a row poisoned before those guards shipped must
+/// still be downloadable, with a fallback value rather than a 500.
+///
 /// # Errors
 /// 404 when the row or its file is missing; 500 on any other I/O failure.
 #[cfg(feature = "db")]
@@ -243,8 +249,21 @@ pub async fn download_blob(
         }
     };
 
+    // Same belt and braces for the mime type, and for a sharper reason: an
+    // unrenderable value here is not a truncated header but a dead row.
+    // `Response::builder` defers the parse failure to `.body()`, so a blob
+    // stored before `blobs_mime_type_safe` existed would answer 500 on every
+    // download, forever. Falling back keeps the bytes reachable.
+    let mime_type = match sanitize_mime_type(&blob.mime_type) {
+        Ok(mime) => mime,
+        Err(e) => {
+            tracing::error!(blob_id = %blob.id, error = %e, "stored blob mime_type is unsafe");
+            DEFAULT_MIME.to_string()
+        }
+    };
+
     Response::builder()
-        .header(header::CONTENT_TYPE, blob.mime_type.as_str())
+        .header(header::CONTENT_TYPE, mime_type.as_str())
         .header(header::CONTENT_DISPOSITION, disposition)
         .header("X-Content-Hash", hash_hex.as_str())
         .body(Body::from(content))
@@ -717,6 +736,150 @@ mod db_tests {
                 .to_str()
                 .unwrap(),
             "attachment; filename=\"good-name.bin\""
+        );
+    }
+
+    /// A `mime_type` that cannot be echoed into a `Content-Type` header never
+    /// reaches storage; a legitimate one round-trips verbatim.
+    ///
+    /// The unguarded twin of `download_sanitizes_content_disposition`. Before
+    /// this guard, the upload was accepted, the bytes were fsynced, and every
+    /// subsequent `GET .../content` answered 500 forever, because
+    /// `Response::builder` defers the bad header until `.body()`. The over-long
+    /// case was worse still: `varchar(255)` overflowed *after* `write_content`
+    /// had already fsynced, leaving an orphan file with no row.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn upload_rejects_header_breaking_mime_type(pool: PgPool) {
+        let dir = TempDir::new().unwrap();
+        let agent = ensure_system_agent(&pool).await;
+        let state = test_state(pool.clone(), &dir).await;
+        let router = blobs_router(state).layer(Extension(auth_ctx(agent)));
+
+        let over_long = format!("text/{}", "a".repeat(300));
+        let cases = [
+            ("newline", "text/plain%0AX-Injected:%20yes"),
+            ("DEL", "text/plain%7F"),
+            ("over 255 chars", over_long.as_str()),
+        ];
+        for (seed, (label, raw)) in cases.into_iter().enumerate() {
+            let response = router
+                .clone()
+                .oneshot(upload_request(
+                    &format!("/api/v1/blobs?filename=probe.bin&mime_type={raw}"),
+                    "application/octet-stream",
+                    payload(128, 100 + seed as u64),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{label}: an unsafe mime_type must be rejected at write time"
+            );
+        }
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "no row may survive a rejected upload");
+        assert!(
+            walk_files(dir.path()).is_empty(),
+            "no bytes may survive a rejected upload"
+        );
+
+        // `/`, `;`, `=` and space are mime grammar, not header-breaking: the
+        // legitimate value must survive both the guard and the round trip.
+        let response = router
+            .clone()
+            .oneshot(upload_request(
+                "/api/v1/blobs?filename=table.csv&mime_type=text/csv%3B%20charset%3Dutf-8",
+                "application/octet-stream",
+                payload(128, 7),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = parse_body(response).await;
+        assert_eq!(body["mime_type"], "text/csv; charset=utf-8");
+        let id = body["id"].as_str().unwrap().to_string();
+
+        let response = router
+            .oneshot(get_request(&format!("/api/v1/blobs/{id}/content")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/csv; charset=utf-8"
+        );
+    }
+
+    /// A row already poisoned in a live database must still be readable.
+    ///
+    /// Closing the write path does nothing for bytes uploaded before migration
+    /// 075 shipped: their rows persist, and without a read-time fallback every
+    /// `GET .../content` on them answers 500 forever. This is the same
+    /// belt-and-braces `download_sanitizes_content_disposition` relies on for
+    /// `filename`, which is why the CHECK has to be dropped to construct the
+    /// case at all — that drop is exactly the pre-075 schema.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn download_falls_back_when_stored_mime_type_is_unsafe(pool: PgPool) {
+        let dir = TempDir::new().unwrap();
+        let agent = ensure_system_agent(&pool).await;
+        let state = test_state(pool.clone(), &dir).await;
+        let router = blobs_router(state).layer(Extension(auth_ctx(agent)));
+
+        let response = router
+            .clone()
+            .oneshot(upload_request(
+                "/api/v1/blobs?filename=legacy.bin&mime_type=text/plain",
+                "application/octet-stream",
+                payload(256, 11),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let id: Uuid = parse_body(response).await["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        sqlx::query("ALTER TABLE blobs DROP CONSTRAINT blobs_mime_type_safe")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE blobs SET mime_type = $1 WHERE id = $2")
+            .bind("text/plain\nX-Injected: yes")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = router
+            .oneshot(get_request(&format!("/api/v1/blobs/{id}/content")))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a poisoned mime_type must not make the bytes unreadable forever"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            DEFAULT_MIME,
+            "the fallback must be the same default an unlabelled upload gets"
         );
     }
 }
