@@ -341,33 +341,3 @@ async fn non_object_subject_is_rejected(pool: PgPool) {
         "expected the subject CHECK to fire, got: {err}"
     );
 }
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn list_for_row_finds_every_manifest_committing_to_a_claim(pool: PgPool) {
-    let agent = seed_agent(&pool, "list-signer").await;
-    let shared = seed_claim(&pool, agent, "committed twice").await;
-    let other = seed_claim(&pool, agent, "committed once").await;
-
-    let first = make_manifest(Some(agent), &[("claim", shared)]);
-    let second = make_manifest(Some(agent), &[("claim", shared), ("claim", other)]);
-    let unrelated = make_manifest(Some(agent), &[("claim", other)]);
-    for m in [&first, &second, &unrelated] {
-        ManifestRepository::insert(&pool, m).await.unwrap();
-    }
-
-    let found = ManifestRepository::list_for_row(&pool, "claim", shared, 10)
-        .await
-        .expect("list_for_row");
-    let ids: Vec<Uuid> = found.iter().map(|m| m.id).collect();
-    assert_eq!(ids.len(), 2, "got {ids:?}");
-    assert!(ids.contains(&first.id) && ids.contains(&second.id));
-    assert!(!ids.contains(&unrelated.id));
-
-    assert!(
-        ManifestRepository::list_for_row(&pool, "edge", shared, 10)
-            .await
-            .unwrap()
-            .is_empty(),
-        "row_kind participates in the lookup — a claim id is not an edge id"
-    );
-}

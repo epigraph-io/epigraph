@@ -18,6 +18,26 @@
 //!
 //! `claim_from_row` is untouched: these are new SELECTs over new shapes, not a
 //! widening of its signature.
+//!
+//! # `idx_manifest_entries_row` has no reader
+//!
+//! That index (`migrations/071_manifests.sql:133`) supports the reverse lookup
+//! "which manifests commit to this row?". The `list_for_row` helper that used it
+//! never acquired a production caller and was deleted; its only consumer had been
+//! a test, which is what made a dead helper look live. The index is KEPT on
+//! purpose: dropping it is schema churn on an already-applied migration,
+//! `manifest_entries` is append-only so it costs one index write per leaf insert,
+//! and it is precisely what a future discovery tool would want.
+//!
+//! If that tool ever arrives it MUST be scoped. `manifests` / `manifest_entries`
+//! carry no ownership or visibility columns, so an unscoped
+//! row-id -> manifest-metadata read turns an attacker-chosen row id into the
+//! signer's DID and public key plus the `subject` JSON, which itself embeds
+//! `root_claim_id`. Every manifest tool shipped today is capability-shaped:
+//! `export_subgraph_manifest` and `anchor_manifest` write under the caller's own
+//! identity, and `verify_manifest` is keyed by a manifest_id the caller already
+//! holds. A row-keyed lookup is the only one that would manufacture a handle from
+//! an identifier the caller was never given.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -331,40 +351,5 @@ impl ManifestRepository {
         .await
         .map_err(|source| DbError::QueryFailed { source })?;
         Ok(count)
-    }
-
-    /// Every manifest committing to `(row_kind, row_id)`, newest first.
-    ///
-    /// Answers "what commitments have been published over this claim?" — the
-    /// reverse lookup `idx_manifest_entries_row` exists for.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool))]
-    pub async fn list_for_row(
-        pool: &PgPool,
-        row_kind: &str,
-        row_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<ManifestRow>, DbError> {
-        let rows = sqlx::query_as!(
-            ManifestRow,
-            r#"
-            SELECT m.id, m.algo, m.root, m.entry_count, m.subject, m.signed_header,
-                   m.signature, m.signer_id, m.signer_public_key, m.created_at
-            FROM manifests m
-            JOIN manifest_entries e ON e.manifest_id = m.id
-            WHERE e.row_kind = $1 AND e.row_id = $2
-            ORDER BY m.created_at DESC
-            LIMIT $3
-            "#,
-            row_kind,
-            row_id,
-            limit
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|source| DbError::QueryFailed { source })?;
-        Ok(rows)
     }
 }
