@@ -58,6 +58,7 @@ pub mod scoped_belief;
 pub mod security_event;
 pub mod semantic_link;
 pub mod sheaf;
+pub mod source_artifact;
 pub mod span;
 pub mod task;
 pub mod trace;
@@ -154,6 +155,7 @@ pub use provenance::{ProvenanceLogRow, ProvenanceRepository, AUTO_POLICY_AUTHORI
 pub use re_encryption_key::{ReEncryptionKeyRepository, ReEncryptionKeyRow};
 pub use refresh_token::{RefreshTokenRepository, RefreshTokenRow};
 pub use security_event::{SecurityEventFilter, SecurityEventRepository, SecurityEventRow};
+pub use source_artifact::{SourceArtifactRepository, HAS_ESSENCE_RELATIONSHIP};
 pub use span::{SpanRepository, SpanRow};
 pub use task::{TaskRepository, TaskRow};
 pub use workflow_execution::{WorkflowExecutionRepository, WorkflowExecutionRow};

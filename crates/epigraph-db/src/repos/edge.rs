@@ -26,6 +26,25 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
     "refutes",
 ];
 
+/// Property key on a `paper -asserts-> claim` edge naming the artifact bytes
+/// the claim was extracted from. Required by migration 074's
+/// `edges_paper_asserts_requires_essence` trigger.
+pub const ESSENCE_DIGEST_KEY: &str = "essence_digest";
+
+/// Does `value` have the exact shape migration 074's trigger accepts —
+/// 64 lowercase hex characters, i.e. a BLAKE3-256 digest?
+///
+/// This is the Rust mirror of the SQL regex `'^[0-9a-f]{64}$'`. Both exist on
+/// purpose: the trigger is the at-rest guarantee, and this lets a caller decide
+/// "already bound / not yet bound" without provoking a constraint violation.
+#[must_use]
+pub fn is_essence_digest_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+
 /// A row from the edges table
 #[derive(Debug, Clone)]
 pub struct EdgeRow {
@@ -91,6 +110,161 @@ impl EdgeRepository {
         .await?;
 
         Ok(row.id)
+    }
+
+    /// Write the `paper -asserts-> claim` edge for a claim extracted from the
+    /// artifact bytes whose BLAKE3-256 digest is `essence_digest`.
+    ///
+    /// This exists instead of a plain
+    /// [`create_if_not_exists`](Self::create_if_not_exists) call because the
+    /// digest is a **non-optional positional argument**: an ingestion call site
+    /// physically cannot write an asserts edge and forget to say which bytes it
+    /// came from. That is the compile-time half of the guarantee; migration
+    /// 074's `edges_paper_asserts_requires_essence` trigger is the runtime half,
+    /// and it is the load-bearing one — `routes/edges.rs` allowlists `asserts`
+    /// on the generic `POST /api/v1/edges`, so a Rust-only guard is routable
+    /// around.
+    ///
+    /// # Merge, never overwrite
+    ///
+    /// A plain create-if-not-exists would leave the FIRST-written edge unbound
+    /// forever on a re-ingest, so an existing row that carries no digest is
+    /// patched with this one. An existing row that already carries a
+    /// well-formed digest is left **exactly** as it is: the edge names the
+    /// bytes this claim was first extracted from, and a later rendition of the
+    /// same document is a different rendition, not a correction. The verifier
+    /// reports that state as `stale_binding` — a warning, because multi-
+    /// rendition history is legitimate and is the whole reason the digest lives
+    /// per-rendition rather than in a column on `papers`.
+    ///
+    /// Returns `(EdgeRow, was_created)`, `was_created = false` for both the
+    /// untouched and the digest-patched existing row.
+    ///
+    /// # Errors
+    /// - [`DbError::InvalidData`] if `properties` is present but is not a JSON
+    ///   object (there would be nowhere to put the digest).
+    /// - [`DbError::QueryFailed`] if any database operation fails.
+    #[instrument(skip(pool, properties))]
+    pub async fn upsert_asserts_edge(
+        pool: &PgPool,
+        paper_id: Uuid,
+        claim_id: Uuid,
+        essence_digest: &[u8; 32],
+        properties: Option<serde_json::Value>,
+    ) -> Result<(EdgeRow, bool), DbError> {
+        let digest_hex = epigraph_core::blob::hash_hex(&essence_digest[..]);
+
+        let mut tx = pool.begin().await?;
+
+        // FOR UPDATE, unlike `create_if_not_exists`'s plain SELECT: this
+        // statement can be followed by an UPDATE of the row it just read, so
+        // two concurrent binders of the same (paper, claim) must serialize
+        // rather than both patch.
+        let existing = sqlx::query!(
+            r#"
+            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            FROM edges
+            WHERE source_id = $1 AND target_id = $2 AND relationship = 'asserts'
+            LIMIT 1
+            FOR UPDATE
+            "#,
+            paper_id,
+            claim_id,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(row) = existing {
+            let already_bound = row
+                .properties
+                .get(ESSENCE_DIGEST_KEY)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_essence_digest_hex);
+
+            let edge = if already_bound {
+                EdgeRow {
+                    id: row.id,
+                    source_id: row.source_id,
+                    source_type: row.source_type,
+                    target_id: row.target_id,
+                    target_type: row.target_type,
+                    relationship: row.relationship,
+                    properties: row.properties,
+                    valid_from: row.valid_from,
+                    valid_to: row.valid_to,
+                }
+            } else {
+                // `||` merges, so the planner's own properties survive. The
+                // key is spelled out here because a query! macro cannot
+                // interpolate a Rust const; it must stay equal to
+                // ESSENCE_DIGEST_KEY and to migration 074's regex subject.
+                let patched = sqlx::query!(
+                    r#"
+                    UPDATE edges
+                    SET properties = properties || jsonb_build_object('essence_digest', $2::text)
+                    WHERE id = $1
+                    RETURNING id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+                    "#,
+                    row.id,
+                    digest_hex,
+                )
+                .fetch_one(&mut *tx)
+                .await?;
+                EdgeRow {
+                    id: patched.id,
+                    source_id: patched.source_id,
+                    source_type: patched.source_type,
+                    target_id: patched.target_id,
+                    target_type: patched.target_type,
+                    relationship: patched.relationship,
+                    properties: patched.properties,
+                    valid_from: patched.valid_from,
+                    valid_to: patched.valid_to,
+                }
+            };
+            tx.commit().await?;
+            return Ok((edge, false));
+        }
+
+        let mut properties = properties.unwrap_or_else(|| serde_json::json!({}));
+        let Some(map) = properties.as_object_mut() else {
+            return Err(DbError::InvalidData {
+                reason: "asserts edge properties must be a JSON object".to_string(),
+            });
+        };
+        map.insert(
+            ESSENCE_DIGEST_KEY.to_string(),
+            serde_json::Value::String(digest_hex),
+        );
+
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
+            VALUES ($1, 'paper', $2, 'claim', 'asserts', $3)
+            RETURNING id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            "#,
+            paper_id,
+            claim_id,
+            properties,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok((
+            EdgeRow {
+                id: row.id,
+                source_id: row.source_id,
+                source_type: row.source_type,
+                target_id: row.target_id,
+                target_type: row.target_type,
+                relationship: row.relationship,
+                properties: row.properties,
+                valid_from: row.valid_from,
+                valid_to: row.valid_to,
+            },
+            true,
+        ))
     }
 
     /// Like [`create`], but if an edge with the same

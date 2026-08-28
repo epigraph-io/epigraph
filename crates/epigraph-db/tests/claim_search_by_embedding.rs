@@ -116,8 +116,9 @@ async fn search_by_embedding_filters_by_paper_doi(pool: PgPool) {
         .expect("insert claim");
 
         sqlx::query(
-            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
-             VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts')",
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts', \
+                     jsonb_build_object('essence_digest', '0000000000000000000000000000000000000000000000000000000000000000'))",
         )
         .bind(paper)
         .bind(id)

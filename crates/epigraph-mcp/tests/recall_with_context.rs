@@ -113,6 +113,13 @@ mod fixture {
         }
     }
 
+    /// Migration 074 requires every `paper -asserts-> claim` edge to name the
+    /// bytes its claim was extracted from. This fixture is about the recall
+    /// WALK, not about any particular artifact, so its paper edges bind to one
+    /// synthetic rendition.
+    const FIXTURE_ESSENCE: &str =
+        r#"{"essence_digest":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+
     async fn insert_edge(
         pool: &PgPool,
         source_id: Uuid,
@@ -122,6 +129,13 @@ mod fixture {
         relationship: &str,
         properties: Option<&str>,
     ) {
+        let properties = properties.or({
+            if source_type == "paper" && relationship == "asserts" {
+                Some(FIXTURE_ESSENCE)
+            } else {
+                None
+            }
+        });
         if let Some(props) = properties {
             sqlx::query(
                 "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
@@ -881,8 +895,13 @@ mod diverse_fixture {
 
         // Paper-attribution edge so the recall pipeline keeps the hit.
         sqlx::query(
-            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
-             VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts')",
+            // Migration 074 requires every `paper -asserts-> claim` edge to name
+            // the bytes its claim was extracted from. This fixture is about the
+            // read path, not about any particular artifact, so it binds to one
+            // synthetic rendition.
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts', \
+                     jsonb_build_object('essence_digest', '0000000000000000000000000000000000000000000000000000000000000000'))",
         )
         .bind(paper_id)
         .bind(id)

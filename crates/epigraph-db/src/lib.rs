@@ -95,11 +95,12 @@ pub use repos::{
     ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
     ProvenanceRepository, ReEncryptionKeyRepository, ReEncryptionKeyRow, ReasoningTraceRepository,
     RecallEventRepository, RecallEventRow, RefreshTokenRepository, RefreshTokenRow, ResolvedStep,
-    ScopedBeliefRepository, SecurityEventRepository, SecurityEventRow, SheafRepository, StoredBlob,
-    SweepCandidate, TaskRepository, TaskRow, TripleRepository, TripleRow,
-    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
-    WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS, MANIFEST_ALGO,
-    PRUNABLE_EVENT_TYPES, ROOT_TYPE_MANIFEST,
+    ScopedBeliefRepository, SecurityEventRepository, SecurityEventRow, SheafRepository,
+    SourceArtifactRepository, StoredBlob, SweepCandidate, TaskRepository, TaskRow,
+    TripleRepository, TripleRow, WorkflowExecutionRepository, WorkflowExecutionRow,
+    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    EXPANSION_RELATIONSHIPS, HAS_ESSENCE_RELATIONSHIP, MANIFEST_ALGO, PRUNABLE_EVENT_TYPES,
+    ROOT_TYPE_MANIFEST,
 };
 
 // Re-export sqlx types that users will need
@@ -110,7 +111,9 @@ pub use repos::activity::ActivityRow;
 pub use repos::community::{CommunityMemberRow, CommunityRow};
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
-pub use repos::edge::{AttributedClaimRow, EdgeRow, EPISTEMIC_RELATIONSHIPS};
+pub use repos::edge::{
+    is_essence_digest_hex, AttributedClaimRow, EdgeRow, EPISTEMIC_RELATIONSHIPS, ESSENCE_DIGEST_KEY,
+};
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
 pub use repos::mass_function::MassFunctionRow;

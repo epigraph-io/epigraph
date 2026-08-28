@@ -17,7 +17,13 @@ use sqlx::PgPool;
 fn make_server(pool: PgPool) -> EpiGraphMcpFull {
     let signer = AgentSigner::generate();
     let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    // Ingestion now stores the essence bytes of every document it consumes, so
+    // point them at a throwaway root: the suite must not write into the
+    // checkout's `data/blobs` default, nor require a writable cwd. `keep()`
+    // rather than holding the `TempDir`, because dropping it here would delete
+    // the bytes while the test is still running.
+    let blob_dir = tempfile::tempdir().expect("temp blob dir").keep();
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_blob_dir(blob_dir)
 }
 
 /// Two-section paper, 3 paragraphs total, no atoms (spine mode).

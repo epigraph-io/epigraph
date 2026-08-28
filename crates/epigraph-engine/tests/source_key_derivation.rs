@@ -59,10 +59,13 @@ async fn insert_paper(pool: &PgPool, doi: &str) -> Uuid {
     id
 }
 
+/// Migration 074 requires every `paper -asserts-> claim` edge to name the bytes
+/// its claim was extracted from. This fixture is about the source-key WALK, not
+/// about any particular artifact, so it binds to one synthetic rendition.
 async fn insert_asserts_edge(pool: &PgPool, paper_id: Uuid, claim_id: Uuid) {
     sqlx::query(
-        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship)
-         VALUES ($1, 'paper', $2, 'claim', 'asserts')",
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
+         VALUES ($1, 'paper', $2, 'claim', 'asserts', jsonb_build_object('essence_digest', '0000000000000000000000000000000000000000000000000000000000000000'))",
     )
     .bind(paper_id)
     .bind(claim_id)

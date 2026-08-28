@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO source_artifacts (agent_id, name, artifact_type, content_hash, properties)\n            VALUES ($1, $2, 'essence', $3, $4)\n            ON CONFLICT (content_hash) WHERE artifact_type = 'essence' AND content_hash IS NOT NULL\n            DO NOTHING\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bytea",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7557e89034566fe3d904ca8fd3a1cd7e741949aba97beeb8561d216a8a21c758"
+}

@@ -66,9 +66,12 @@ Current reservation:
   manifest Merkle roots to a ledger outside this database; backlog 94e62824)
 - **073**: public `obligations` (coverage-standard contracts + the arithmetic
   completeness checker; backlog 4b48ffb5)
-- **074+**: public next
+- **074**: public `essence_binding` (the `source_artifacts` rendition key plus
+  the `edges_paper_asserts_requires_essence` trigger that stops a document
+  asserting a claim without naming the bytes it came from; backlog 7c909c49)
+- **075+**: public next
 
-Next public migration must be `074` or later. Picking a colliding version
+Next public migration must be `075` or later. Picking a colliding version
 (checksum mismatch on a `_sqlx_migrations` row that's already applied) will
 panic the api binary on restart.
 

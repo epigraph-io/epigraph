@@ -268,8 +268,13 @@ async fn seed_paragraph(pool: &PgPool, agent: Uuid, content: &str, pgvec: &str) 
     .await
     .expect("seed paragraph");
     sqlx::query(
-        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
-         VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts')",
+        // Migration 074 requires every `paper -asserts-> claim` edge to name
+        // the bytes its claim was extracted from. This fixture is about the
+        // read path, not about any particular artifact, so it binds to one
+        // synthetic rendition.
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
+         VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts', \
+                 jsonb_build_object('essence_digest', '0000000000000000000000000000000000000000000000000000000000000000'))",
     )
     .bind(paper)
     .bind(id)

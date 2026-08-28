@@ -10,6 +10,7 @@ pub mod dedup_sweep;
 pub mod ds;
 pub mod ds_auto;
 pub mod embeddings;
+pub mod essence;
 pub mod events;
 pub mod evolve_step;
 pub mod graph;

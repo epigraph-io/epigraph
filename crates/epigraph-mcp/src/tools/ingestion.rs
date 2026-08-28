@@ -172,12 +172,17 @@ pub async fn ingest_document(
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
+    // `new_shared` re-resolves the blob root from the environment, which would
+    // silently strand the detached task's essence bytes somewhere the caller's
+    // server cannot read (and would defeat a test's injected `with_blob_dir`).
+    // Carry the ALREADY-RESOLVED root across instead.
     let bg = EpiGraphMcpFull::new_shared(
         server.pool.clone(),
         Arc::clone(&server.signer),
         Arc::clone(&server.embedder),
         server.read_only,
-    );
+    )
+    .with_blob_dir(server.blob_dir.clone());
     let doi_log = doi.clone();
     tokio::spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &extraction).await {
@@ -200,12 +205,17 @@ pub async fn ingest_document_inline(
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
+    // `new_shared` re-resolves the blob root from the environment, which would
+    // silently strand the detached task's essence bytes somewhere the caller's
+    // server cannot read (and would defeat a test's injected `with_blob_dir`).
+    // Carry the ALREADY-RESOLVED root across instead.
     let bg = EpiGraphMcpFull::new_shared(
         server.pool.clone(),
         Arc::clone(&server.signer),
         Arc::clone(&server.embedder),
         server.read_only,
-    );
+    )
+    .with_blob_dir(server.blob_dir.clone());
     let doi_log = doi.clone();
     tokio::spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &extraction).await {
@@ -232,14 +242,22 @@ async fn ensure_paper_node(
     extraction: &DocumentExtraction,
     doi: &str,
 ) -> Result<Uuid, McpError> {
-    PaperRepository::get_or_create(
+    let paper_id = PaperRepository::get_or_create(
         &server.pool,
         doi,
         Some(&extraction.source.title),
         extraction.source.journal.as_deref(),
     )
     .await
-    .map_err(internal_error)
+    .map_err(internal_error)?;
+
+    // Essence binding pre-flight. Deliberately SYNCHRONOUS and deliberately
+    // fatal: if the artifact bytes cannot be stored, the caller learns it now
+    // rather than discovering later that a detached task wrote claims bound to
+    // nothing. Idempotent, so the background pass re-runs it for free.
+    crate::tools::essence::bind_essence(server, extraction, paper_id, doi).await?;
+
+    Ok(paper_id)
 }
 
 /// Shared response body for the two queued ingest entry points.
@@ -400,6 +418,13 @@ pub async fn do_ingest_document(
     .await
     .map_err(internal_error)?;
 
+    // ── 2. Bind this run to the bytes it consumed ──
+    // Every `paper -asserts-> claim` edge written below carries
+    // `essence.digest`, so "which bytes did this claim come out of?" has an
+    // answer that a DOI alone could never give. Fails the whole ingest if the
+    // bytes cannot be stored (backlog 7c909c49).
+    let essence = crate::tools::essence::bind_essence(server, extraction, paper_id, &doi).await?;
+
     // ── 3. Ensure author agents + agent --authored--> paper ──
     // Each author gets a deterministic ed25519 keypair via
     // `did_key_for_author` — same name (or ORCID, when present in the
@@ -543,16 +568,12 @@ pub async fn do_ingest_document(
             .await
             .map_err(internal_error)?;
         if resolved_to_existing {
-            let (_row, _was_created) = EdgeRepository::create_if_not_exists(
+            let (_row, _was_created) = EdgeRepository::upsert_asserts_edge(
                 pool,
                 paper_id,
-                "paper",
                 persisted_id,
-                "claim",
-                "asserts",
+                &essence.digest,
                 Some(planned.properties.clone()),
-                None,
-                None,
             )
             .await
             .map_err(internal_error)?;
@@ -617,16 +638,12 @@ pub async fn do_ingest_document(
             .await
             .map_err(internal_error)?;
 
-        let (_row, _was_created) = EdgeRepository::create_if_not_exists(
+        let (_row, _was_created) = EdgeRepository::upsert_asserts_edge(
             pool,
             paper_id,
-            "paper",
             persisted_id,
-            "claim",
-            "asserts",
+            &essence.digest,
             Some(planned.properties.clone()),
-            None,
-            None,
         )
         .await
         .map_err(internal_error)?;
@@ -1092,6 +1109,9 @@ pub async fn do_ingest_document_spine(
     .await
     .map_err(internal_error)?;
 
+    // ── 1b. Bind this run to the bytes it consumed (see do_ingest_document) ──
+    let essence = crate::tools::essence::bind_essence(server, extraction, paper_id, &doi).await?;
+
     // ── 2. Ensure author agents + authored edges ──
     let mut author_responses = Vec::new();
     let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
@@ -1224,16 +1244,12 @@ pub async fn do_ingest_document_spine(
             .map_err(internal_error)?;
 
         if resolved_to_existing {
-            let (_row, _) = EdgeRepository::create_if_not_exists(
+            let (_row, _) = EdgeRepository::upsert_asserts_edge(
                 pool,
                 paper_id,
-                "paper",
                 persisted_id,
-                "claim",
-                "asserts",
+                &essence.digest,
                 Some(planned.properties.clone()),
-                None,
-                None,
             )
             .await
             .map_err(internal_error)?;
@@ -1296,16 +1312,12 @@ pub async fn do_ingest_document_spine(
             .await
             .map_err(internal_error)?;
 
-        let (_row, _) = EdgeRepository::create_if_not_exists(
+        let (_row, _) = EdgeRepository::upsert_asserts_edge(
             pool,
             paper_id,
-            "paper",
             persisted_id,
-            "claim",
-            "asserts",
+            &essence.digest,
             Some(planned.properties.clone()),
-            None,
-            None,
         )
         .await
         .map_err(internal_error)?;

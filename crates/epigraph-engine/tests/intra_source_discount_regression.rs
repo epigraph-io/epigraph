@@ -106,6 +106,12 @@ async fn seed_claim_with_belief(
     claim_id
 }
 
+/// Migration 074 requires every `paper -asserts-> claim` edge to name the bytes
+/// its claim was extracted from. These fixtures are about graph SHAPE, not
+/// about any particular artifact, so they bind to one synthetic rendition.
+const FIXTURE_ESSENCE: &str =
+    r#"{"essence_digest":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+
 async fn insert_edge(
     pool: &PgPool,
     source: Uuid,
@@ -115,9 +121,14 @@ async fn insert_edge(
     relationship: &str,
 ) -> Uuid {
     let edge_id = Uuid::new_v4();
+    let properties = if source_type == "paper" && relationship == "asserts" {
+        FIXTURE_ESSENCE
+    } else {
+        "{}"
+    };
     sqlx::query(
-        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
     )
     .bind(edge_id)
     .bind(source)
@@ -125,6 +136,7 @@ async fn insert_edge(
     .bind(target)
     .bind(target_type)
     .bind(relationship)
+    .bind(properties)
     .execute(pool)
     .await
     .expect("insert edge");

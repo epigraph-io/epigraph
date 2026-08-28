@@ -5,6 +5,13 @@ mod helpers;
 use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, PaperRepository, PgPool};
 use helpers::{make_agent, make_claim};
 
+/// Unconstrained verb on purpose. `paper -asserts-> claim` now has a dedicated
+/// writer (`upsert_asserts_edge`) and a DB trigger requiring an
+/// `essence_digest`, so it is the wrong subject for a test about the GENERIC
+/// dedup contract — and `properties` could no longer be asserted empty. The
+/// asserts-specific behaviour is covered in `essence_asserts_upsert.rs`.
+const GENERIC_VERB: &str = "mentions";
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn create_if_not_exists_is_idempotent(pool: PgPool) {
     // Set up real source (paper) and target (claim) so the edge-validation
@@ -20,7 +27,15 @@ async fn create_if_not_exists_is_idempotent(pool: PgPool) {
     let claim_id: uuid::Uuid = claim_row.id.into();
 
     let (row1, was_created1) = EdgeRepository::create_if_not_exists(
-        &pool, paper_id, "paper", claim_id, "claim", "asserts", None, None, None,
+        &pool,
+        paper_id,
+        "paper",
+        claim_id,
+        "claim",
+        GENERIC_VERB,
+        None,
+        None,
+        None,
     )
     .await
     .expect("first call inserts");
@@ -32,7 +47,7 @@ async fn create_if_not_exists_is_idempotent(pool: PgPool) {
         "paper",
         claim_id,
         "claim",
-        "asserts",
+        GENERIC_VERB,
         Some(serde_json::json!({"different": "props"})),
         None,
         None,
@@ -66,7 +81,15 @@ async fn create_if_not_exists_distinguishes_by_relationship(pool: PgPool) {
     let claim_id: uuid::Uuid = claim_row.id.into();
 
     let (row_a, _) = EdgeRepository::create_if_not_exists(
-        &pool, paper_id, "paper", claim_id, "claim", "asserts", None, None, None,
+        &pool,
+        paper_id,
+        "paper",
+        claim_id,
+        "claim",
+        GENERIC_VERB,
+        None,
+        None,
+        None,
     )
     .await
     .unwrap();
