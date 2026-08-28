@@ -13,6 +13,10 @@ use crate::types::*;
 /// `obligations.source_tool` for the batch path.
 const SOURCE_TOOL: &str = "batch_submit_claims";
 
+/// Largest storable denominator: `obligations.declared_total` is a Postgres
+/// INTEGER (migration 073), so a `u32` above this cannot round-trip.
+const MAX_DECLARED_TOTAL: u32 = i32::MAX.unsigned_abs();
+
 /// Batch submit multiple claims (max 100).
 ///
 /// # The implicit coverage contract
@@ -51,6 +55,14 @@ pub async fn batch_submit_claims(
     // is a caller error, and letting it through would silently produce a batch
     // that owes nothing.
     let contract = coverage_contract(params.coverage.as_ref(), params.claims.len())?;
+
+    // Proven in range by `coverage_contract`. Convert once, before any write,
+    // so the number that reaches the row is the number the response reports.
+    // A saturating `unwrap_or(i32::MAX)` here is what let one obligation row
+    // carry two different denominators — an `INTEGER` column truncated to
+    // 2147483647 beside a `verdict_reason` rendered from the full u32.
+    let declared_total = i32::try_from(contract.declared_total)
+        .map_err(|e| invalid_params(format!("coverage.declared_total is unstorable: {e}")))?;
 
     let agent_id = server.agent_id().await?;
     let mut submitted = Vec::new();
@@ -127,7 +139,7 @@ pub async fn batch_submit_claims(
             agent_id: Some(agent_id),
             standard: contract.standard,
             unit: contract.unit.clone(),
-            declared_total: i32::try_from(contract.declared_total).unwrap_or(i32::MAX),
+            declared_total,
             anchors: anchors.iter().copied().collect(),
             anchor_kind: ANCHOR_KIND_CLAIM.to_string(),
             observed_total: i32::try_from(assessment.observed_total).unwrap_or(i32::MAX),
@@ -197,6 +209,21 @@ fn coverage_contract(
     let declared_total = coverage
         .and_then(|c| c.declared_total)
         .unwrap_or_else(|| u32::try_from(entry_count).unwrap_or(u32::MAX));
+
+    // A denominator the record cannot hold is REJECTED, exactly as an unknown
+    // standard is four lines above. Saturating it into the column instead
+    // would be the same quiet repair, applied to the denominator: the row
+    // would then disagree with both the response and its own
+    // `verdict_reason`, which `ObligationRepository::recheck` re-renders from
+    // the truncated column on the next `check_obligation`. The default
+    // denominator is `entry_count` under a hard 100-entry cap, so nothing but
+    // an explicit override can reach this.
+    if declared_total > MAX_DECLARED_TOTAL {
+        return Err(invalid_params(format!(
+            "coverage.declared_total must be at most {MAX_DECLARED_TOTAL} \
+             (obligations.declared_total is a 32-bit integer); got {declared_total}"
+        )));
+    }
 
     Ok(CoverageContract {
         standard,

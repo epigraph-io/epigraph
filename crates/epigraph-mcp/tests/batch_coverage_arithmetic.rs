@@ -332,3 +332,100 @@ async fn an_externally_declared_zero_denominator_is_indeterminate(pool: PgPool) 
     // The claim itself was still written — the verdict is advisory.
     assert_eq!(summary["submitted"], 1, "{summary}");
 }
+
+/// A denominator that cannot fit `obligations.declared_total` is REJECTED, not
+/// saturated.
+///
+/// Before this was closed, `coverage.declared_total = 3_000_000_000` was
+/// accepted and the stored row contradicted ITSELF, because the column was
+/// saturated with `unwrap_or(i32::MAX)` while `verdict_reason` was rendered
+/// from the untruncated `u32`:
+///
+/// ```text
+/// declared_total column = 2147483647
+/// verdict_reason        = exhaustive shortfall: 1 of 3000000000 emitter
+///                         anchored, 2999999999 unaccounted for
+/// ```
+///
+/// `ObligationRepository::recheck` re-renders the reason from the column, so
+/// the first `check_obligation` call then overwrote the number the caller had
+/// been handed, and `check_obligation` served `2147483647` to a caller
+/// `batch_submit_claims` had told `3000000000`.
+///
+/// The rule is the one
+/// `an_unknown_coverage_standard_is_rejected_before_any_write` already pins
+/// one parameter over: an uninterpretable contract is refused at the boundary,
+/// never silently repaired.
+#[sqlx::test(migrations = "../../migrations")]
+async fn declared_total_above_i32_max_is_rejected_before_any_write(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+
+    let err = epigraph_mcp::tools::batch::batch_submit_claims(
+        &server,
+        BatchSubmitClaimsParams {
+            claims: vec![entry("a claim whose denominator does not fit")],
+            coverage: Some(CoverageParams {
+                standard: Some("exhaustive".into()),
+                unit: Some("emitter".into()),
+                declared_total: Some(3_000_000_000),
+            }),
+        },
+    )
+    .await
+    .expect_err("a denominator above i32::MAX must be a parameter error");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+    assert!(
+        err.message.contains("2147483647") && err.message.contains("3000000000"),
+        "the error must name both the cap and what was supplied: {err:?}"
+    );
+
+    let claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM claims WHERE content = 'a claim whose denominator does not fit'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(claims, 0, "the batch must be rejected before any write");
+    assert!(
+        obligation_rows(&pool).await.is_empty(),
+        "a rejected batch opens no obligation"
+    );
+
+    // The boundary itself is ACCEPTED — the fix must reject only what the
+    // column cannot hold — and the row it writes agrees with itself: one
+    // denominator, in the column, in the prose, and in the response.
+    let max = i32::MAX.unsigned_abs();
+    let ok = epigraph_mcp::tools::batch::batch_submit_claims(
+        &server,
+        BatchSubmitClaimsParams {
+            claims: vec![entry("a claim whose denominator just fits")],
+            coverage: Some(CoverageParams {
+                standard: Some("exhaustive".into()),
+                unit: Some("emitter".into()),
+                declared_total: Some(max),
+            }),
+        },
+    )
+    .await
+    .expect("i32::MAX is storable and must not be rejected");
+    let summary = first_text(&ok);
+    assert_eq!(summary["declared"], max, "{summary}");
+
+    // `::bigint` in the SELECT so this decodes under any future column width.
+    let (stored, reason) = sqlx::query_as::<_, (i64, String)>(
+        "SELECT declared_total::bigint, verdict_reason
+         FROM obligations WHERE source_tool = 'batch_submit_claims'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        i64::from(max),
+        "the stored denominator must equal the one the response reported"
+    );
+    assert!(
+        reason.contains(&max.to_string()),
+        "the row's prose must carry the same denominator as its column: {reason}"
+    );
+}
