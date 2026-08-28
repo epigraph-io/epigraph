@@ -41,7 +41,7 @@ pub use cardano::{CardanoBlockfrostBackend, METADATUM_LABEL, PROJECT_ID_ENV};
 pub use mock::{MockAnchorBackend, MOCK_METADATUM_LABEL};
 pub use root_source::{AnchorRootSource, ManifestRootSource, SealedRoot};
 pub use service::{
-    anchor_manifest_best_effort, parse_backend_name, AnchorService, AnchorServiceError,
-    AnchorVerdict, AnchorVerification, BackendKind, BACKEND_ENV, TRUST_OPERATOR_HELD,
-    TRUST_THIRD_PARTY,
+    anchor_manifest_best_effort, parse_backend_name, trust_basis_for_backend, AnchorService,
+    AnchorServiceError, AnchorVerdict, AnchorVerification, BackendKind, BACKEND_ENV,
+    TRUST_OPERATOR_HELD, TRUST_THIRD_PARTY,
 };

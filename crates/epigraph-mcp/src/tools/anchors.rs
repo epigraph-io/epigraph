@@ -29,7 +29,7 @@
 
 use rmcp::model::{CallToolResult, Content};
 
-use epigraph_db::anchor::{AnchorService, AnchorServiceError};
+use epigraph_db::anchor::{trust_basis_for_backend, AnchorService, AnchorServiceError};
 use epigraph_db::ROOT_TYPE_MANIFEST;
 
 use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
@@ -79,7 +79,13 @@ pub async fn anchor_manifest(
         "sealed_at": row.sealed_at,
         "failure_reason": row.failure_reason,
         "commitment_bytes_len": row.commitment_bytes.len(),
-        "trust_basis": service.trust_basis(),
+        // Derived from the ROW, not from `service`, so the label names the ledger
+        // this anchor actually lives on. The two agree here today only because
+        // `insert_pending` keys ON CONFLICT by (root_type, root_id, backend,
+        // network) and so can only hand back a row for this process's backend;
+        // deriving it from the row makes that structural instead of incidental,
+        // and matches `verify_row`.
+        "trust_basis": trust_basis_for_backend(&row.backend),
     });
 
     Ok(CallToolResult::success(vec![Content::text(

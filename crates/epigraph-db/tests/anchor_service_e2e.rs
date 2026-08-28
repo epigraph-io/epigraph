@@ -656,3 +656,66 @@ async fn verify_all_sweeps_every_anchor_and_flags_the_broken_one(pool: PgPool) {
         .iter()
         .any(|r| r.root_id == good && r.verdict == AnchorVerdict::Verified));
 }
+
+/// `trust_basis` is an HONESTY guard, and `verify_all` sweeps `list_all` —
+/// which is NOT filtered by backend. So a process configured for one ledger
+/// routinely verifies rows recorded under another (the ordinary dev-mock ->
+/// prod-chain migration leaves exactly that mixture behind). The label must
+/// describe the LEDGER THE ROW WAS ANCHORED TO, not the one this process
+/// happens to be holding.
+#[sqlx::test(migrations = "../../migrations")]
+async fn trust_basis_describes_the_rows_backend_not_the_process(pool: PgPool) {
+    let (mock_root, _) = seed_manifest(&pool, 2).await;
+    let (chain_root, _) = seed_manifest(&pool, 2).await;
+
+    // A real, confirmed, operator-held anchor on the in-Postgres mock ledger.
+    service(&pool)
+        .anchor(&pool, ROOT_TYPE_MANIFEST, mock_root)
+        .await
+        .expect("anchor on the mock ledger");
+
+    // A row recorded under cardano. The stub refuses to submit, so this lands
+    // `failed` with backend = "cardano" — still an anchors row, still swept.
+    let chain_svc = AnchorService::new(
+        Arc::new(CardanoBlockfrostBackend::with_project_id(None)),
+        Arc::new(ManifestRootSource),
+    );
+    let chain_row = chain_svc
+        .anchor(&pool, ROOT_TYPE_MANIFEST, chain_root)
+        .await
+        .expect("a refused submit is recorded, not raised");
+    assert_eq!(chain_row.backend, "cardano");
+
+    fn basis_for(reports: &[epigraph_db::anchor::AnchorVerification], root: Uuid) -> &'static str {
+        reports
+            .iter()
+            .find(|r| r.root_id == root)
+            .unwrap_or_else(|| panic!("no report for {root}"))
+            .trust_basis
+    }
+
+    // (a) Swept by a MOCK-configured process. Both rows are returned.
+    let reports = service(&pool).verify_all(&pool, 50).await.expect("sweep");
+    assert_eq!(reports.len(), 2, "list_all is not filtered by backend");
+    assert_eq!(
+        basis_for(&reports, mock_root),
+        TRUST_OPERATOR_HELD,
+        "the mock row is operator-held"
+    );
+    assert_eq!(
+        basis_for(&reports, chain_root),
+        TRUST_THIRD_PARTY,
+        "a row anchored to cardano is third-party however this process is configured"
+    );
+
+    // (b) The reciprocal, and the DANGEROUS direction: a chain-configured
+    // process must not stamp third-party proof onto the operator's own ledger.
+    let reports = chain_svc.verify_all(&pool, 50).await.expect("sweep");
+    assert_eq!(
+        basis_for(&reports, mock_root),
+        TRUST_OPERATOR_HELD,
+        "the mock ledger is in THIS Postgres — calling it third-party is the honesty \
+         guard lying about itself"
+    );
+    assert_eq!(basis_for(&reports, chain_root), TRUST_THIRD_PARTY);
+}

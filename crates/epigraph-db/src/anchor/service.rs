@@ -202,13 +202,12 @@ impl AnchorService {
     }
 
     /// `"operator-held"` unless the backend is somebody else's ledger.
+    ///
+    /// Describes THIS PROCESS's backend. For a report about a stored row use
+    /// [`trust_basis_for_backend`] on `row.backend` instead — see its docs.
     #[must_use]
     pub fn trust_basis(&self) -> &'static str {
-        if self.backend.name() == "mock" {
-            TRUST_OPERATOR_HELD
-        } else {
-            TRUST_THIRD_PARTY
-        }
+        trust_basis_for_backend(self.backend.name())
     }
 
     /// Anchor `root_id`, or return the anchor it already has.
@@ -445,7 +444,7 @@ impl AnchorService {
             sealed_after_block: row
                 .block_time
                 .map(|bt| sealed_after_block(row.sealed_at, bt.timestamp())),
-            trust_basis: self.trust_basis(),
+            trust_basis: trust_basis_for_backend(&row.backend),
             detail: None,
         };
 
@@ -615,6 +614,25 @@ pub async fn anchor_manifest_best_effort(pool: &PgPool, manifest_id: Uuid) {
             );
         }
         Err(e) => warn!(manifest_id = %manifest_id, "anchoring failed: {e}"),
+    }
+}
+
+/// `"operator-held"` for the in-Postgres mock ledger, `"third-party"` for any
+/// other, keyed on the backend NAME AS RECORDED ON THE ROW.
+///
+/// `AnchorService::verify_all` sweeps `AnchorRepository::list_all`, which is
+/// not filtered by backend, so a process configured for one ledger routinely
+/// reports on rows another one wrote — the ordinary dev-mock -> prod-chain
+/// migration leaves exactly that mixture behind. Deriving the label from the
+/// process would make an honesty guard lie about itself in both directions,
+/// including the dangerous one: stamping `"third-party"` on an anchor whose
+/// ledger is a table in this same database.
+#[must_use]
+pub fn trust_basis_for_backend(backend: &str) -> &'static str {
+    if backend == "mock" {
+        TRUST_OPERATOR_HELD
+    } else {
+        TRUST_THIRD_PARTY
     }
 }
 
