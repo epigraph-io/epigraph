@@ -28,16 +28,20 @@
 //!      BEFORE `binary_truth`, so `binary_truth` is written last and the edge
 //!      belief survives. (2)+(3) isolated the defect to frame-NAME ordering in
 //!      the recompute cascade's per-frame loop.
-//!   4. `unframed_get_belief_reports_truth_value_not_the_ds_cache` — **RED**,
-//!      and `#[ignore]`d: a SEPARATE defect, filed on its own, not fixed here.
-//!      A SECOND, INDEPENDENT defect, and the one that produced the field
-//!      report's exact numbers. `belief_query::get_belief` with no `frame_id`
-//!      returns `BeliefInterval::cached_from_truth(claim.truth_value)` —
+//!   4. `unframed_get_belief_reports_truth_value_not_the_ds_cache` — was
+//!      **RED** and `#[ignore]`d, now GREEN and live. A SECOND, INDEPENDENT
+//!      defect (backlog `152d9af6`), and the one that produced the field
+//!      report's exact numbers: `belief_query::get_belief` with no `frame_id`
+//!      returned `BeliefInterval::cached_from_truth(claim.truth_value)` —
 //!      belief=truth_value, plausibility=1.0, BetP=truth_value — while
-//!      labelling the result `source: "cached"` and while the tool schema says
+//!      labelling the result `source: "cached"` and while the tool schema said
 //!      "If omitted, returns cached DS columns". For a claim seeded at
-//!      truth_value 0.6 that reads out as belief=0.600 / ignorance=0.400 /
-//!      pignistic=0.600 both BEFORE and AFTER any recompute. File separately.
+//!      truth_value 0.6 that read out as belief=0.600 / ignorance=0.400 /
+//!      pignistic=0.600 both BEFORE and AFTER any recompute. Fixed by having
+//!      the unframed branch read `claims.{belief, plausibility,
+//!      pignistic_prob, mass_on_empty, mass_on_missing}` via
+//!      `ClaimRepository::get_belief_columns`, falling back to `truth_value`
+//!      (and saying so in `source`) only when the cache is NULL.
 
 mod common;
 
@@ -313,25 +317,23 @@ async fn recompute_beliefs_survives_when_binary_frame_sorts_last(pool: PgPool) {
     );
 }
 
-/// SECOND (independent) DEFECT the field report's exact numbers point at:
-/// `get_belief` WITHOUT a `frame_id` does not read the cached DS columns at
-/// all. `belief_query::get_belief`'s unframed branch returns
-/// `BeliefInterval::cached_from_truth(claim.truth_value)` — belief =
+/// Regression guard for the SECOND (independent) defect the field report's
+/// exact numbers pointed at — backlog `152d9af6`: `get_belief` WITHOUT a
+/// `frame_id` did not read the cached DS columns at all. Its unframed branch
+/// returned `BeliefInterval::cached_from_truth(claim.truth_value)` — belief =
 /// truth_value, plausibility = 1.0, BetP = truth_value — while labelling the
-/// result `source: "cached"`. So an unframed `get_belief` reports
+/// result `source: "cached"`, so an unframed `get_belief` reported
 /// belief=0.600 / ignorance=0.400 / pignistic=0.600 for a claim seeded at
 /// truth_value 0.6 no matter what the seven contradicts edges did.
 ///
-/// `#[ignore]`d rather than deleted: it is a KNOWN-RED, ready-made
-/// reproduction for a defect filed separately from 696d3a1c, deliberately not
-/// folded into that fix. Drop the attribute to reproduce; the fix is for
-/// `belief_query::get_belief`'s unframed branch to read
-/// `claims.{belief, plausibility, pignistic_prob, mass_on_empty,
-/// mass_on_missing}` and fall back to `cached_from_truth` only when they are
-/// NULL — which is what its own doc comment and the MCP tool schema already
-/// promise.
-#[ignore = "reproduction for a SEPARATE, unfixed defect: unframed get_belief \
-            ignores the DS cache. Not part of backlog 696d3a1c."]
+/// This is the END-TO-END witness for that fix, and the reason it is here
+/// rather than only beside the fix site: the cached scalars it compares against
+/// are produced by the REAL pipeline — seven `contradicts` edges wired through
+/// `do_link_epistemic` and then `recompute_beliefs` — not by a hand-seeded row.
+/// The narrow column-mapping fixtures live in `belief_query::tests`.
+///
+/// Was `#[ignore]`d as a known-RED reproduction while 696d3a1c was fixed; the
+/// attribute came off with the `152d9af6` fix.
 #[sqlx::test(migrations = "../../migrations")]
 async fn unframed_get_belief_reports_truth_value_not_the_ds_cache(pool: PgPool) {
     let server = build_test_server(pool.clone());

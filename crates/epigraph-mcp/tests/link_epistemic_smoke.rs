@@ -14,9 +14,12 @@
 //!     plausibility = 0.9), else `auto_wire_ds_for_edge` short-circuits to
 //!     `SourceFactorless` and writes no BBA;
 //!   * the move is asserted against the target's cached `pignistic_prob`
-//!     column (the column the recompute writes), NOT the unframed
-//!     `belief_query::get_belief`, which reads `truth_value` and would show no
-//!     movement.
+//!     column directly — the column the recompute writes. Since backlog
+//!     `152d9af6` the unframed `belief_query::get_belief` reports that same
+//!     column and would show the same movement, but reading it here would put
+//!     a second layer between the assertion and the write this fixture is
+//!     about. The get_belief channel has its own guard:
+//!     `recompute_beliefs_edge_regression::unframed_get_belief_reports_truth_value_not_the_ds_cache`.
 
 mod common;
 

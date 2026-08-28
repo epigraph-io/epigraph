@@ -19,13 +19,24 @@ const _: () = assert!(ClaimRepository::MAX_AGENT_CLAIMS > 0);
 /// Cached Dempster–Shafer belief columns for a claim, as read by
 /// [`ClaimRepository::get_belief_columns`].
 ///
-/// Each field is `Option` because the column is NULL on claims that have never
+/// Every field is `Option` because the column is NULL on claims that have never
 /// had a BBA combined onto them (the edge-wiring recompute populates them).
+/// Only `belief`, `plausibility` and `pignistic_prob` distinguish the two
+/// states, though: `mass_on_empty` and `mass_on_missing` carry `DEFAULT 0.0`
+/// (migration 001), so they are non-NULL on a freshly inserted claim and cannot
+/// serve as the cache-hit gate. Read them as `unwrap_or(0.0)` *after* the other
+/// three have proved the cache populated.
+///
+/// `mass_on_empty` is the mass on the conflict focal element — the HTTP route
+/// `GET /api/v1/claims/:id/belief` surfaces this same column as
+/// `mass_on_conflict`, and so does the unframed `belief_query::get_belief`.
 #[derive(Debug, Clone, Copy, sqlx::FromRow, serde::Serialize)]
 pub struct ClaimBeliefColumns {
     pub belief: Option<f64>,
     pub plausibility: Option<f64>,
     pub pignistic_prob: Option<f64>,
+    pub mass_on_empty: Option<f64>,
+    pub mass_on_missing: Option<f64>,
 }
 
 /// Result row for [`ClaimRepository::search_by_embedding`].
@@ -368,20 +379,22 @@ impl ClaimRepository {
         Ok(flag.flatten())
     }
 
-    /// Read a claim's cached Dempster–Shafer belief columns
-    /// (`belief`, `plausibility`, `pignistic_prob`).
+    /// Read a claim's cached Dempster–Shafer belief columns (`belief`,
+    /// `plausibility`, `pignistic_prob`, `mass_on_empty`, `mass_on_missing`).
     ///
     /// These are the columns the edge-wiring recompute path
     /// (`MassFunctionRepository::update_claim_belief`) writes — distinct from
     /// `truth_value`, which the recompute leaves untouched. Callers that need
-    /// the *post-wire* combined belief (e.g. the MCP `link_epistemic` readback)
-    /// must read these columns, NOT `truth_value`; the unframed
-    /// `belief_query::get_belief` path reads `truth_value` and so does not
-    /// reflect a recompute.
+    /// the *post-wire* combined belief must read these columns, NOT
+    /// `truth_value`. This is now the single reader all three channels share:
+    /// the MCP `link_epistemic` readback, the unframed
+    /// `belief_query::get_belief`, and (by the identical `SELECT`) the HTTP
+    /// route `GET /api/v1/claims/:id/belief`.
     ///
     /// Returns `Ok(None)` when the claim does not exist; the columns inside
     /// [`ClaimBeliefColumns`] are individually `Option` (NULL when the claim
-    /// has never had a BBA combined onto it).
+    /// has never had a BBA combined onto it) — see that type for why only
+    /// three of the five can gate a cache hit.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -391,11 +404,13 @@ impl ClaimRepository {
         claim_id: ClaimId,
     ) -> Result<Option<ClaimBeliefColumns>, DbError> {
         let id: Uuid = claim_id.into();
-        let row: Option<ClaimBeliefColumns> =
-            sqlx::query_as("SELECT belief, plausibility, pignistic_prob FROM claims WHERE id = $1")
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
+        let row: Option<ClaimBeliefColumns> = sqlx::query_as(
+            "SELECT belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing \
+             FROM claims WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
         Ok(row)
     }
 

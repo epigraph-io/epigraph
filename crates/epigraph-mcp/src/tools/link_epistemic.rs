@@ -408,9 +408,11 @@ pub async fn do_link_epistemic(
     }
 
     // Best-effort readback of the target's cached DS columns — the ones the
-    // recompute wrote (belief / plausibility / pignistic_prob). NOT the unframed
-    // `belief_query::get_belief`, which reads `truth_value` and so would NOT
-    // reflect the wire.
+    // recompute wrote (belief / plausibility / pignistic_prob). The unframed
+    // `belief_query::get_belief` now reads the same columns through the same
+    // repo call and applies the same all-three-`Some` gate, so the two channels
+    // agree; this stays a direct read because the readback needs no interval
+    // and no `truth_value` fallback.
     let target_belief =
         match ClaimRepository::get_belief_columns(pool, ClaimId::from_uuid(target_id)).await {
             Ok(Some(cols)) => match (cols.belief, cols.plausibility, cols.pignistic_prob) {

@@ -66,7 +66,21 @@ pub struct BeliefInterval {
     pub framed: bool,
     /// Short string describing how the value was derived.
     ///
-    /// Possible values: `"recomputed"`, `"no_bbas"`, `"cached"`.
+    /// Possible values:
+    /// * `"recomputed"` — framed, live-combined from stored BBAs.
+    /// * `"recomputed_perspective"` — as above, under a perspective lens.
+    /// * `"no_bbas"` — framed, but the claim carries no BBA in that frame.
+    /// * `"cached"` — unframed, read from the persisted `claims.{belief,
+    ///   plausibility, pignistic_prob, mass_on_empty, mass_on_missing}` DS
+    ///   cache.
+    /// * `"truth_value"` — unframed, and the DS cache is NULL because the claim
+    ///   has never had a BBA combined onto it, so the interval is derived from
+    ///   `claims.truth_value` alone.
+    ///
+    /// The last two were BOTH reported as `"cached"` until the unframed path
+    /// learned to read the DS cache; collapsing them is what let a
+    /// `truth_value`-derived interval pass for a recomputed one. Nothing in the
+    /// workspace branches on this string — it is diagnostic only.
     pub source: String,
 }
 
@@ -84,7 +98,13 @@ impl BeliefInterval {
         }
     }
 
-    /// Default returned when no frame is specified and the claim has no DS data.
+    /// Fallback returned when no frame is specified AND the claim's DS cache is
+    /// NULL — i.e. no BBA has ever been combined onto it. The interval is
+    /// vacuous above `truth_value`: belief = truth_value, plausibility = 1.0.
+    ///
+    /// `source` is `"truth_value"`, not `"cached"`: this value does NOT come
+    /// from the DS cache, and labelling it as though it did is precisely the
+    /// confusion that made a stale-looking `get_belief` readback plausible.
     pub fn cached_from_truth(truth_value: f64) -> Self {
         Self {
             belief: truth_value,
@@ -93,7 +113,7 @@ impl BeliefInterval {
             mass_on_conflict: 0.0,
             mass_on_missing: 0.0,
             framed: false,
-            source: "cached".to_string(),
+            source: "truth_value".to_string(),
         }
     }
 }
@@ -103,7 +123,12 @@ impl BeliefInterval {
 /// - If `frame_id` is `Some`, live-recomputes Bel/Pl/BetP from stored BBAs
 ///   using Dempster's combination rule (mirrors the MCP framed path).
 /// - If `frame_id` is `None`, returns the cached DS columns from the claim row
-///   (mirrors the MCP unframed path).
+///   — `claims.{belief, plausibility, pignistic_prob, mass_on_empty,
+///   mass_on_missing}`, the values the recompute path wrote — with
+///   `source: "cached"`. When those columns are NULL (no BBA has ever been
+///   combined onto this claim) it falls back to
+///   [`BeliefInterval::cached_from_truth`] over `claims.truth_value`, with
+///   `source: "truth_value"` to mark the difference.
 ///
 /// # Errors
 ///
@@ -157,7 +182,43 @@ pub async fn get_belief(
         });
     }
 
-    // ── Unframed path: cached DS columns from claim row ───────────────────
+    // ── Unframed path: cached DS columns from the claim row ───────────────
+    //
+    // These are the columns `MassFunctionRepository::update_claim_belief`
+    // writes on every recompute — the *post-wire* combined belief. Reading
+    // `truth_value` here instead (as this branch used to) made the unframed
+    // read the ONE channel of three that ignored the recompute: the MCP
+    // `link_epistemic` readback (tools/link_epistemic.rs) and the HTTP route
+    // `GET /api/v1/claims/:id/belief` (routes/belief.rs) both already read
+    // these five columns, and both disagreed with this one.
+    let cols = ClaimRepository::get_belief_columns(pool, ClaimId::from_uuid(claim_id))
+        .await?
+        .ok_or(BeliefQueryError::ClaimNotFound(claim_id))?;
+
+    // Gate on the three columns that are genuinely NULL before a BBA is
+    // combined — byte-identical to the gate `link_epistemic` applies, which is
+    // the point: the two channels must now agree. `mass_on_empty` and
+    // `mass_on_missing` carry `DEFAULT 0.0`, so they are non-NULL on a fresh
+    // claim and cannot distinguish a wired claim from an unwired one; they are
+    // read only once the other three have proved the cache populated.
+    if let (Some(belief), Some(plausibility), Some(pignistic_prob)) =
+        (cols.belief, cols.plausibility, cols.pignistic_prob)
+    {
+        return Ok(BeliefInterval {
+            belief,
+            plausibility,
+            pignistic_prob,
+            mass_on_conflict: cols.mass_on_empty.unwrap_or(0.0),
+            mass_on_missing: cols.mass_on_missing.unwrap_or(0.0),
+            framed: false,
+            source: "cached".to_string(),
+        });
+    }
+
+    // No DS cache: the claim has never had a BBA combined onto it. Fall back to
+    // `truth_value` exactly as before — but say so in `source`, so a caller can
+    // no longer read the word "cached" and conclude it is holding a recomputed
+    // interval.
     let claim = ClaimRepository::get_by_id(pool, ClaimId::from_uuid(claim_id))
         .await?
         .ok_or(BeliefQueryError::ClaimNotFound(claim_id))?;
@@ -492,3 +553,132 @@ async fn perspective_belief_for_claim(
 // its source in `edge_factor::tests` (effective_source_strength_with_perspective).
 // The full DB chain — get_perspective_belief vs get_belief over stored BBAs —
 // is covered by the `perspective_frame_function` sqlx integration test.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Seed one claim, optionally with the five cached DS columns populated.
+    ///
+    /// `truth_value` is ALWAYS 0.6 and always differs from every DS column, so
+    /// no assertion below can pass by reading the wrong source.
+    async fn seed_claim(pool: &PgPool, ds: Option<(f64, f64, f64, f64, f64)>) -> Uuid {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'unframed-belief-cache', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let content = format!("unframed-ds-cache-{}", Uuid::new_v4());
+        match ds {
+            Some((belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing)) => {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO claims (
+                         content, content_hash, truth_value, agent_id,
+                         belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing
+                     )
+                     VALUES ($1, sha256($1::bytea), 0.6, $2, $3, $4, $5, $6, $7)
+                     RETURNING id",
+                )
+                .bind(content)
+                .bind(agent_id)
+                .bind(belief)
+                .bind(plausibility)
+                .bind(mass_on_empty)
+                .bind(pignistic_prob)
+                .bind(mass_on_missing)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+            }
+            None => sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO claims (content, content_hash, truth_value, agent_id)
+                 VALUES ($1, sha256($1::bytea), 0.6, $2)
+                 RETURNING id",
+            )
+            .bind(content)
+            .bind(agent_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        }
+    }
+
+    /// The defect: an unframed `get_belief` must report the persisted DS cache
+    /// — the columns `MassFunctionRepository::update_claim_belief` writes — not
+    /// `truth_value`, which the recompute never touches.
+    ///
+    /// Seeded so that every one of the five returned scalars has a distinct
+    /// expected value AND all five differ from `truth_value = 0.6`: reading the
+    /// wrong column, or falling back to `cached_from_truth`, fails a named
+    /// assertion rather than coincidentally matching.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unframed_get_belief_reads_the_ds_cache(pool: PgPool) {
+        let claim_id = seed_claim(&pool, Some((0.10, 0.20, 0.05, 0.15, 0.03))).await;
+
+        let got = get_belief(&pool, claim_id, None).await.expect("get_belief");
+
+        assert_eq!(
+            got.belief, 0.10,
+            "must report claims.belief, not truth_value"
+        );
+        assert_eq!(got.plausibility, 0.20, "must report claims.plausibility");
+        assert_eq!(
+            got.pignistic_prob, 0.15,
+            "must report claims.pignistic_prob — the scalar every consumer orders on"
+        );
+        assert_eq!(
+            got.mass_on_conflict, 0.05,
+            "mass_on_conflict must come from claims.mass_on_empty, matching the \
+             HTTP route GET /api/v1/claims/:id/belief"
+        );
+        assert_eq!(
+            got.mass_on_missing, 0.03,
+            "must report claims.mass_on_missing"
+        );
+        assert!(!got.framed, "unframed read stays unframed");
+        assert_eq!(
+            got.source, "cached",
+            "a real cache hit is labelled 'cached'"
+        );
+    }
+
+    /// The other half of the contract, and what stops the fix from regressing
+    /// claims that were never DS-wired: with the three gating columns NULL
+    /// there is no cache to report, so the read still falls back to
+    /// `truth_value` — now labelled honestly.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unframed_get_belief_falls_back_to_truth_when_cache_is_null(pool: PgPool) {
+        let claim_id = seed_claim(&pool, None).await;
+
+        let got = get_belief(&pool, claim_id, None).await.expect("get_belief");
+
+        assert_eq!(got, BeliefInterval::cached_from_truth(0.6));
+        assert_eq!(
+            got.source, "truth_value",
+            "the fallback must NOT claim to be a DS-cache hit — mislabelling it \
+             'cached' is what produced the field report"
+        );
+    }
+
+    /// The not-found contract is unchanged by swapping which query proves the
+    /// claim row exists: MCP `get_belief` maps `ClaimNotFound` to an
+    /// `invalid_params` error, so a typo'd UUID must not read as a claim with
+    /// an empty cache.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unframed_get_belief_still_reports_a_missing_claim(pool: PgPool) {
+        let missing = Uuid::new_v4();
+
+        let err = get_belief(&pool, missing, None)
+            .await
+            .expect_err("absent claim must not resolve");
+
+        assert!(
+            matches!(err, BeliefQueryError::ClaimNotFound(id) if id == missing),
+            "expected ClaimNotFound({missing}), got {err:?}"
+        );
+    }
+}

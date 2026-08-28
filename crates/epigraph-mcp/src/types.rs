@@ -1015,7 +1015,10 @@ pub struct GetBeliefParams {
     pub claim_id: String,
 
     #[schemars(
-        description = "Optional frame UUID. If provided, recomputes Bel/Pl/BetP from stored BBAs. If omitted, returns cached DS columns."
+        description = "Optional frame UUID. If provided, recomputes Bel/Pl/BetP from stored BBAs (source='recomputed'). \
+                       If omitted, returns the claim's cached DS columns — the values the last recompute wrote \
+                       (source='cached'); for a claim that has never had a BBA combined onto it those columns are \
+                       NULL, and the response falls back to belief=truth_value / plausibility=1.0 (source='truth_value')."
     )]
     pub frame_id: Option<String>,
 
