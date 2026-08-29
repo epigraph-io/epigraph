@@ -72,9 +72,13 @@ Current reservation:
 - **075**: public `blob_mime_type_safe` (the `blobs_mime_type_not_empty` /
   `blobs_mime_type_safe` CHECKs, closing the unguarded twin of the filename
   hardening migration 070 shipped)
-- **076+**: public next
+- **076**: public `blob_header_safety_narrow_to_c0_and_del` (narrows
+  `blobs_filename_safe` and `blobs_mime_type_safe` from `[[:cntrl:]]`, which a
+  `SQL_ASCII` server evaluates byte-wise and so rejects all of General
+  Punctuation, to the C0 + DEL characters that actually break a header)
+- **077+**: public next
 
-Next public migration must be `076` or later. Picking a colliding version
+Next public migration must be `077` or later. Picking a colliding version
 (checksum mismatch on a `_sqlx_migrations` row that's already applied) will
 panic the api binary on restart.
 

@@ -72,8 +72,17 @@ pub enum InvalidBlobFilename {
     IllegalCharacter(char),
 }
 
-/// The maximum length the `blobs.mime_type varchar(255)` column accepts.
-const MAX_MIME_TYPE_LEN: usize = 255;
+/// The maximum length the `blobs.mime_type varchar(255)` column accepts,
+/// **in bytes**.
+///
+/// The unit is load-bearing, which is why the name carries it. `varchar(255)`
+/// counts characters, but against a `SQL_ASCII` server a character *is* a byte
+/// — `length(repeat('—', 200))` is 600 there, not 200 — so a cap on
+/// `chars().count()` admitted 200-character multi-byte values that the column
+/// then refused, after `BlobRepository::store` had already fsynced the content.
+/// Byte length is never below character length, so capping bytes keeps the
+/// guard inside the column under either encoding.
+const MAX_MIME_TYPE_BYTES: usize = 255;
 
 /// A `mime_type` that cannot be safely echoed into a `Content-Type` response
 /// header, or that the `blobs.mime_type` column cannot hold.
@@ -86,7 +95,7 @@ pub enum InvalidBlobMimeType {
     #[error("blob mime_type contains an illegal character: {0:?}")]
     IllegalCharacter(char),
     /// Longer than `varchar(255)` can hold.
-    #[error("blob mime_type must be at most {MAX_MIME_TYPE_LEN} characters, got {0}")]
+    #[error("blob mime_type must be at most {MAX_MIME_TYPE_BYTES} bytes, got {0}")]
     TooLong(usize),
 }
 
@@ -169,20 +178,27 @@ pub fn storage_path(root: &Path, content_hash: &[u8]) -> Result<PathBuf, Invalid
 ///
 /// # Errors
 /// [`InvalidBlobFilename`] if the name is empty or carries an illegal
-/// character.
+/// character — including one at either end, which is checked before the
+/// surrounding whitespace is trimmed away.
 pub fn sanitize_filename(filename: &str) -> Result<String, InvalidBlobFilename> {
-    let trimmed = filename.trim();
-    if trimmed.is_empty() {
-        return Err(InvalidBlobFilename::Empty);
-    }
-    // Reject BEFORE taking the basename: a name containing `/` is a path, not
-    // a filename, and silently keeping only its tail would hide the caller's
-    // mistake (and quietly change what gets stored).
-    if let Some(c) = trimmed
+    // Scan the RAW input, before trimming. `str::trim` strips Unicode
+    // `White_Space`, which includes several `Cc` characters (U+0009..U+000D,
+    // U+0085), so trimming first would silently swallow a trailing NEL or TAB
+    // instead of reporting it -- a rejected character must be reported, not
+    // quietly removed.
+    //
+    // Reject BEFORE taking the basename too: a name containing `/` is a path,
+    // not a filename, and silently keeping only its tail would hide the
+    // caller's mistake (and quietly change what gets stored).
+    if let Some(c) = filename
         .chars()
         .find(|c| c.is_control() || matches!(c, '"' | '\\' | '/'))
     {
         return Err(InvalidBlobFilename::IllegalCharacter(c));
+    }
+    let trimmed = filename.trim();
+    if trimmed.is_empty() {
+        return Err(InvalidBlobFilename::Empty);
     }
     Ok(trimmed.to_string())
 }
@@ -198,34 +214,49 @@ pub fn sanitize_filename(filename: &str) -> Result<String, InvalidBlobFilename> 
 /// control character terminates the header itself, so that — and only that — is
 /// the rejected class here.
 ///
-/// The length cap mirrors the `blobs.mime_type varchar(255)` column. Without it
-/// an over-wide value is caught only by the INSERT, i.e. *after*
-/// [`crate::BlobRef`]'s repository has already fsynced the content, which
-/// leaves an orphan file with no row and reports a caller mistake as an opaque
-/// database error.
+/// The length cap mirrors the `blobs.mime_type varchar(255)` column and is
+/// measured in **bytes** — see [`MAX_MIME_TYPE_BYTES`]. Without it an over-wide
+/// value is caught only by the INSERT, i.e. *after* [`crate::BlobRef`]'s
+/// repository has already fsynced the content, which leaves an orphan file with
+/// no row and reports a caller mistake as an opaque database error.
 ///
 /// This mirrors the `blobs_mime_type_not_empty` / `blobs_mime_type_safe`
 /// CHECKs for the same reason [`sanitize_filename`] mirrors
 /// `blobs_filename_safe`: the CHECK is the at-rest guarantee, this is the one
 /// that produces a clean validation error instead of a constraint violation.
 /// It is deliberately the stricter of the two — `char::is_control` is Unicode
-/// `Cc` (U+0000..=U+001F, U+007F..=U+009F) while Postgres `[[:cntrl:]]` under
-/// the `C` ctype stops at U+007F — because the Rust guard runs first on every
-/// write path and the CHECK only has to catch what bypasses it.
+/// `Cc` (U+0000..=U+001F, U+007F..=U+009F) while the CHECK rejects only C0 and
+/// DEL — because the Rust guard runs first on every write path and the CHECK
+/// only has to catch what bypasses it.
+///
+/// That direction is load-bearing and must not invert. `BlobRepository::store`
+/// fsyncs the content *before* the INSERT, so a value this guard admits and the
+/// CHECK then refuses leaves an orphan file with no row. The CHECK was
+/// originally written `[[:cntrl:]]`, which is not Unicode `Cc`: Postgres
+/// resolves a POSIX class through the database ctype, and against a
+/// `SQL_ASCII` / `C` cluster it matches byte-wise, where `iscntrl` counts
+/// 0x80..0x9F as control — so it rejected every character whose UTF-8 encoding
+/// carries such a byte, i.e. all of General Punctuation, none of which is
+/// `Cc`. Migration 076 narrowed both CHECKs to C0 and DEL to restore the
+/// containment.
 ///
 /// # Errors
-/// [`InvalidBlobMimeType`] if the value is empty, carries a control character,
-/// or exceeds [`MAX_MIME_TYPE_LEN`] characters.
+/// [`InvalidBlobMimeType`] if the value is empty, carries a control character —
+/// including one at either end, which is checked before the surrounding
+/// whitespace is trimmed away — or exceeds [`MAX_MIME_TYPE_BYTES`] bytes.
 pub fn sanitize_mime_type(mime_type: &str) -> Result<String, InvalidBlobMimeType> {
+    // Scan the RAW input, before trimming -- see `sanitize_filename`: trimming
+    // first turned `"text/plain\u{85}"` into `Ok("text/plain")`, contradicting
+    // the contract documented above.
+    if let Some(c) = mime_type.chars().find(|c| c.is_control()) {
+        return Err(InvalidBlobMimeType::IllegalCharacter(c));
+    }
     let trimmed = mime_type.trim();
     if trimmed.is_empty() {
         return Err(InvalidBlobMimeType::Empty);
     }
-    if let Some(c) = trimmed.chars().find(|c| c.is_control()) {
-        return Err(InvalidBlobMimeType::IllegalCharacter(c));
-    }
-    let len = trimmed.chars().count();
-    if len > MAX_MIME_TYPE_LEN {
+    let len = trimmed.len();
+    if len > MAX_MIME_TYPE_BYTES {
         return Err(InvalidBlobMimeType::TooLong(len));
     }
     Ok(trimmed.to_string())
@@ -337,7 +368,7 @@ mod tests {
             sanitize_mime_type(&over),
             Err(InvalidBlobMimeType::TooLong(305))
         );
-        let exact = format!("text/{}", "a".repeat(MAX_MIME_TYPE_LEN - 5));
+        let exact = format!("text/{}", "a".repeat(MAX_MIME_TYPE_BYTES - 5));
         assert_eq!(sanitize_mime_type(&exact).unwrap(), exact);
     }
 
@@ -370,5 +401,60 @@ mod tests {
     fn default_max_blob_bytes_is_positive() {
         assert_eq!(DEFAULT_MAX_BLOB_BYTES, 25 * 1024 * 1024);
         assert!(max_blob_bytes() > 0);
+    }
+
+    /// A control character at either end must be *rejected*, not silently
+    /// trimmed away.
+    ///
+    /// `str::trim` strips Unicode `White_Space`, which includes U+0085 NEL and
+    /// U+000B..U+000D — all of them `Cc`. Trimming before the scan therefore
+    /// turned `"text/plain\u{85}"` into `Ok("text/plain")`, contradicting the
+    /// documented contract that the guard rejects every control character. The
+    /// outcome was safe either way; the contract was not true.
+    #[test]
+    fn sanitize_rejects_edge_control_characters_instead_of_trimming_them() {
+        for c in ['\u{85}', '\u{0b}', '\u{0c}', '\r', '\n', '\t'] {
+            assert_eq!(
+                sanitize_mime_type(&format!("text/plain{c}")),
+                Err(InvalidBlobMimeType::IllegalCharacter(c)),
+                "trailing {c:?} must be rejected"
+            );
+            assert_eq!(
+                sanitize_mime_type(&format!("{c}text/plain")),
+                Err(InvalidBlobMimeType::IllegalCharacter(c)),
+                "leading {c:?} must be rejected"
+            );
+            assert_eq!(
+                sanitize_filename(&format!("gel{c}.tif")),
+                Err(InvalidBlobFilename::IllegalCharacter(c)),
+                "embedded {c:?} must be rejected"
+            );
+            assert_eq!(
+                sanitize_filename(&format!("gel.tif{c}")),
+                Err(InvalidBlobFilename::IllegalCharacter(c)),
+                "trailing {c:?} must be rejected"
+            );
+        }
+
+        // Ordinary space padding is still trimmed, not rejected: space is not
+        // a control character and padding is a caller typo, not an injection.
+        assert_eq!(sanitize_mime_type("  image/png  ").unwrap(), "image/png");
+        assert_eq!(sanitize_filename("  gel.tif ").unwrap(), "gel.tif");
+    }
+
+    /// The guard must admit every non-control character, including the
+    /// General Punctuation that `[[:cntrl:]]` rejected byte-wise.
+    #[test]
+    fn sanitize_admits_non_control_unicode() {
+        for s in [
+            "text/plain; x=a\u{2014}b",
+            "text/plain; x=a\u{2019}b",
+            "text/plain; x=a\u{200b}b",
+        ] {
+            assert_eq!(sanitize_mime_type(s).unwrap(), s, "{s:?}");
+        }
+        for s in ["em\u{2014}dash.csv", "M\u{fc}ller_gel.tif", "\u{3042}.czi"] {
+            assert_eq!(sanitize_filename(s).unwrap(), s, "{s:?}");
+        }
     }
 }

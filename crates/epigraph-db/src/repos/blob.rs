@@ -1013,4 +1013,175 @@ mod tests {
         .unwrap();
         assert_eq!(stored.blob.mime_type, "text/csv; charset=utf-8");
     }
+
+    /// Whatever the Rust guard admits, the database must also admit.
+    ///
+    /// `store` fsyncs the bytes *before* the INSERT, so any value that passes
+    /// `sanitize_filename` / `sanitize_mime_type` and is then refused by a
+    /// CHECK produces an orphan file with no row — the exact failure the
+    /// mime_type guard was added to remove, reintroduced from the other side.
+    ///
+    /// U+2014 EM DASH, U+2019 RIGHT SINGLE QUOTATION MARK and U+200B ZERO
+    /// WIDTH SPACE are not Unicode control characters, so both guards pass
+    /// them. `[[:cntrl:]]` did not: against a `SQL_ASCII` server the class is
+    /// evaluated byte-wise, and the C-locale `iscntrl` counts 0x80..0x9F as
+    /// control, so every character whose UTF-8 encoding carries a byte in that
+    /// range tripped the CHECK — all of General Punctuation.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn store_accepts_the_non_control_unicode_its_guard_admits(pool: PgPool) {
+        let dir = TempDir::new().unwrap();
+        let agent = seed_agent(&pool, "blob-unicode-round-trip").await;
+
+        let cases = [
+            ("em\u{2014}dash.csv", "text/plain; x=a\u{2014}b"),
+            ("curly\u{2019}quote.csv", "text/plain; x=a\u{2019}b"),
+            ("zwsp\u{200b}.csv", "text/plain; x=a\u{200b}b"),
+        ];
+        for (seed, (filename, mime)) in cases.into_iter().enumerate() {
+            // Both guards accept these; if they did not, the assertion below
+            // would be measuring the guard rather than the CHECK.
+            assert!(sanitize_filename(filename).is_ok(), "{filename:?}");
+            assert!(sanitize_mime_type(mime).is_ok(), "{mime:?}");
+
+            let result = BlobRepository::store(
+                &pool,
+                dir.path(),
+                filename,
+                mime,
+                &payload(64, 700 + seed as u64),
+                agent,
+                None,
+                &[],
+                &empty_props(),
+            )
+            .await;
+
+            let stored = match result {
+                Ok(stored) => stored,
+                Err(e) => {
+                    let files = walk_files(dir.path()).len();
+                    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM blobs")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                    panic!(
+                        "{mime:?} / {filename:?} passed the Rust guard and was then refused by \
+                         the database ({e:?}); {files} file(s) on disk against {rows} row(s) — \
+                         the orphan this guard exists to prevent"
+                    );
+                }
+            };
+            assert_eq!(stored.blob.mime_type, mime);
+            assert_eq!(stored.blob.filename, filename);
+        }
+
+        assert_eq!(walk_files(dir.path()).len(), 3, "one file per upload");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 3, "one row per upload");
+    }
+
+    /// Narrowing the CHECKs must not disarm them: the characters that actually
+    /// terminate an HTTP header are still refused at rest, by the database
+    /// alone, with the Rust guard bypassed entirely.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn checks_still_refuse_header_breakers_at_rest(pool: PgPool) {
+        let agent = seed_agent(&pool, "blob-at-rest-check").await;
+
+        // (column, value, constraint that must fire)
+        let cases: [(&str, &str, &str); 6] = [
+            ("mime_type", "text/plain\nX: y", "blobs_mime_type_safe"),
+            ("mime_type", "text/plain\rX: y", "blobs_mime_type_safe"),
+            ("mime_type", "text/plain\u{7f}", "blobs_mime_type_safe"),
+            ("filename", "probe\nX: y.bin", "blobs_filename_safe"),
+            ("filename", "probe\u{7f}.bin", "blobs_filename_safe"),
+            ("filename", "probe\".bin", "blobs_filename_safe"),
+        ];
+        for (seed, (column, value, expected)) in cases.into_iter().enumerate() {
+            let (filename, mime) = if column == "filename" {
+                (value, "application/octet-stream")
+            } else {
+                ("probe.bin", value)
+            };
+            let err = sqlx::query(
+                "INSERT INTO blobs (filename, mime_type, size_bytes, content_hash, uploader_id) \
+                 VALUES ($1, $2, 32, $3, $4)",
+            )
+            .bind(filename)
+            .bind(mime)
+            .bind(vec![seed as u8; 32])
+            .bind(agent)
+            .execute(&pool)
+            .await
+            .expect_err(&format!("{column}={value:?} must violate {expected}"));
+            let text = err.to_string();
+            assert!(
+                text.contains(expected),
+                "{column}={value:?} must violate {expected}, got {text}"
+            );
+        }
+
+        // …and the legitimate values still insert.
+        sqlx::query(
+            "INSERT INTO blobs (filename, mime_type, size_bytes, content_hash, uploader_id) \
+             VALUES ($1, $2, 32, $3, $4)",
+        )
+        .bind("table\u{2014}one.csv")
+        .bind("text/csv; charset=utf-8")
+        .bind(vec![0xEEu8; 32])
+        .bind(agent)
+        .execute(&pool)
+        .await
+        .expect("an em dash breaks no header and must be storable");
+    }
+
+    /// The length cap has to be in the unit the column actually counts.
+    ///
+    /// `MAX_MIME_TYPE_LEN` is compared against `chars().count()`, but
+    /// `blobs.mime_type` is `varchar(255)` and against a `SQL_ASCII` server a
+    /// character IS a byte — `length(repeat('—', 200))` is 600, not 200. A
+    /// 200-character multi-byte mime type therefore cleared the guard and then
+    /// overflowed the column, after `write_content` had already fsynced: the
+    /// same orphan the cap exists to prevent, one unit conversion away.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn store_rejects_a_mime_type_too_wide_for_the_column(pool: PgPool) {
+        let dir = TempDir::new().unwrap();
+        let agent = seed_agent(&pool, "blob-mime-width").await;
+
+        // 200 characters, 600 bytes: inside a 255-character cap, outside a
+        // 255-byte column.
+        let wide = "\u{2014}".repeat(200);
+        assert_eq!(wide.chars().count(), 200);
+        assert_eq!(wide.len(), 600);
+
+        let result = BlobRepository::store(
+            &pool,
+            dir.path(),
+            "probe.bin",
+            &wide,
+            &payload(32, 12),
+            agent,
+            None,
+            &[],
+            &empty_props(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(DbError::InvalidData { .. })),
+            "a mime_type too wide for the column must be refused by the guard, not by the \
+             INSERT after the bytes are on disk; got {result:?}"
+        );
+        assert!(
+            walk_files(dir.path()).is_empty(),
+            "a rejected upload may leave no bytes behind"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
 }

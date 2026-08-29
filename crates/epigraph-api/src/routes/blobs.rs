@@ -882,4 +882,70 @@ mod db_tests {
             "the fallback must be the same default an unlabelled upload gets"
         );
     }
+
+    /// A mime type the write guard accepts must survive the round trip, not
+    /// die on a CHECK after the bytes are already on disk.
+    ///
+    /// The inverse of `upload_rejects_header_breaking_mime_type`: that test
+    /// proves the hostile values are refused *before* `write_content`; this one
+    /// proves the accepted values are not refused *after* it. U+2014 EM DASH is
+    /// not a control character and does not terminate a header — `http` accepts
+    /// it in a header value — so the only thing that ever rejected it was
+    /// `[[:cntrl:]]` read byte-wise against a `SQL_ASCII` server. That produced
+    /// a 500 and a permanent orphan file on the very path this guard hardened.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn upload_accepts_non_control_unicode_and_round_trips_it(pool: PgPool) {
+        let dir = TempDir::new().unwrap();
+        let agent = ensure_system_agent(&pool).await;
+        let state = test_state(pool.clone(), &dir).await;
+        let router = blobs_router(state).layer(Extension(auth_ctx(agent)));
+
+        let response = router
+            .clone()
+            .oneshot(upload_request(
+                "/api/v1/blobs?filename=em%E2%80%94dash.bin&mime_type=text/plain%3B%20x%3Da%E2%80%94b",
+                "application/octet-stream",
+                payload(128, 44),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "an em dash is not a header breaker and must not 500"
+        );
+        let body = parse_body(response).await;
+        assert_eq!(body["mime_type"], "text/plain; x=a\u{2014}b");
+        assert_eq!(body["filename"], "em\u{2014}dash.bin");
+        let id = body["id"].as_str().unwrap().to_string();
+
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the row must exist");
+        assert_eq!(
+            walk_files(dir.path()).len(),
+            1,
+            "exactly one file, and it must have a row — no orphan"
+        );
+
+        let response = router
+            .oneshot(get_request(&format!("/api/v1/blobs/{id}/content")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Compared as bytes, not via `to_str`: `HeaderValue::to_str` refuses
+        // anything outside visible ASCII, so it would fail on the very
+        // character under test even though the header itself is well formed.
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .as_bytes(),
+            "text/plain; x=a\u{2014}b".as_bytes(),
+            "the value must reach the header verbatim, not the fallback"
+        );
+    }
 }
