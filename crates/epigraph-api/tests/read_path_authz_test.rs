@@ -173,6 +173,66 @@ async fn get_claim_owner_token_ignores_wire_param_and_sees_full() {
     );
 }
 
+/// PR-05: the `community` partition arm, over HTTP.
+///
+/// Every fixture in this file — all fifteen `seed_private_ownership` calls —
+/// writes `'private'`. `ownership.partition_type` admits three values and this
+/// crate's read path had never exercised the third, so the whole two-hop
+/// `community_members ⋈ perspectives` branch of `check_content_access` was
+/// reached by no `epigraph-api` test at all. PR-05 rewrites that branch
+/// (migration 068 moves the gate from the overloaded `encryption_key_id` text
+/// column into a typed `ownership.community_id`), and
+/// `crates/epigraph-mcp/tests/community_partition.rs` covers it at the MCP
+/// surface. This is the HTTP half: same decision function, different handler,
+/// and it goes through the production middleware stack rather than calling a
+/// tool directly.
+///
+/// Both dispositions in one test on purpose — a redaction assertion alone
+/// cannot distinguish "redacted" from "fixture never worked".
+#[tokio::test(flavor = "multi_thread")]
+async fn get_claim_community_member_sees_content_and_outsider_does_not() {
+    let (pool, addr, _shutdown) = pool_and_app().await;
+    let owner = Uuid::new_v4();
+    let member = Uuid::new_v4();
+    let claim_id =
+        common::seed_claim_with_agent(&pool, "COMMUNITY-GATED claim body", owner).await;
+    let community = common::seed_community_with_member(&pool, member).await;
+    common::seed_community_ownership(&pool, claim_id, owner, Some(community)).await;
+
+    let member_resp = reqwest::Client::new()
+        .get(format!("http://{addr}/claims/{claim_id}"))
+        .bearer_auth(common::mint_token_with_agent(&["claims:read"], member))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_resp.status(), 200);
+    let member_body: serde_json::Value = member_resp.json().await.unwrap();
+    assert_eq!(
+        content_of(&member_body),
+        "COMMUNITY-GATED claim body",
+        "an agent owning a perspective in the gating community must see the content \
+         over HTTP, not only through the MCP tool"
+    );
+
+    // A stranger who is authenticated, and who spoofs ?agent_id=<member> for
+    // good measure: the decision must come from the token, and membership must
+    // be the whole test.
+    let outsider_resp = reqwest::Client::new()
+        .get(format!("http://{addr}/claims/{claim_id}?agent_id={member}"))
+        .bearer_auth(stranger_token())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(outsider_resp.status(), 200);
+    let outsider_body: serde_json::Value = outsider_resp.json().await.unwrap();
+    assert_eq!(
+        content_of(&outsider_body),
+        "[REDACTED]",
+        "a non-member must be redacted, and a spoofed ?agent_id must not launder them \
+         into the community"
+    );
+}
+
 /// PR-03 INVERSION. This test used to assert the opposite: that an anonymous
 /// GET of an ownership-less claim returned 200 with full content, on the
 /// grounds that a claim nobody has claimed is a claim anybody may read.

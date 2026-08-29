@@ -57,7 +57,12 @@ pub struct OwnershipResponse {
     pub node_type: String,
     pub partition_type: String,
     pub owner_id: Uuid,
+    /// DEPRECATED. Always `None` for anything this handler writes after
+    /// migration 068; retained on the wire until the column is dropped in 084
+    /// so an existing client's deserializer does not break.
     pub encryption_key_id: Option<String>,
+    /// The gating community for `partition_type = "community"` (migration 068).
+    pub community_id: Option<Uuid>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -184,6 +189,7 @@ fn ownership_to_response(row: epigraph_db::OwnershipRow) -> OwnershipResponse {
         partition_type: row.partition_type,
         owner_id: row.owner_id,
         encryption_key_id: row.encryption_key_id,
+        community_id: row.community_id,
         created_at: row.created_at.to_rfc3339(),
         updated_at: row.updated_at.to_rfc3339(),
     }
@@ -205,6 +211,7 @@ pub async fn assign_ownership(
             partition_type: request.partition_type,
             owner_id: request.owner_id,
             encryption_key_id: None,
+            community_id: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }),
@@ -281,6 +288,7 @@ mod tests {
             partition_type: "public".to_string(),
             owner_id: Uuid::new_v4(),
             encryption_key_id: None,
+            community_id: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         };

@@ -32,13 +32,14 @@ async fn run_migrations_applies_all_from_empty(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("count query should succeed");
-    // The floor is the migration-file count at the time of writing (66 files,
-    // 001..067 with one gap). The old floor of 26 could not notice 34
+    // The floor is the migration-file count at the time of writing (68 files,
+    // 001..069 with one gap). The old floor of 26 could not notice 34
     // migrations silently failing to resolve — which is precisely the
     // cross-worktree stale-binary failure mode docs/deploy.md documents.
+    // BUMP THIS TOO, or the floor stops meaning "all of them".
     assert!(
-        applied >= 66,
-        "expected >= 66 migrations applied, got {}",
+        applied >= 68,
+        "expected >= 68 migrations applied, got {}",
         applied
     );
 
@@ -48,13 +49,18 @@ async fn run_migrations_applies_all_from_empty(pool: PgPool) {
     //
     // BUMP THIS WITH EVERY MIGRATION. PR-02 shipped 061 and left this at 60, so
     // for one PR the comment above claimed a guarantee the assertion no longer
-    // gave. PR-04 ships 062-067; 067 is the head.
+    // gave. PR-04 shipped 062-067; PR-05 ships 068-069, so 069 is the head.
     //
     // 063-066 are `-- no-transaction` migrations, and their bookkeeping is NOT
     // atomic with their DDL (sqlx-postgres 0.8.6 src/migrate.rs:214). Asserting
-    // the head is 067 therefore also asserts that all four of them recorded a
+    // a head above 066 therefore also asserts that all four of them recorded a
     // row rather than dying half-applied.
-    const MIGRATION_HEAD: i64 = 67;
+    //
+    // 068/069 are ordinary transactional migrations (no CREATE INDEX
+    // CONCURRENTLY), which is what keeps
+    // `tenancy_migration_shape.rs::no_transaction_files_contain_exactly_one_statement`
+    // passing without extending its INDEX_MIGRATIONS list.
+    const MIGRATION_HEAD: i64 = 69;
     let head_ok: Option<bool> =
         sqlx::query_scalar("SELECT success FROM _sqlx_migrations WHERE version = $1")
             .bind(MIGRATION_HEAD)

@@ -544,3 +544,100 @@ pub async fn seed_private_ownership(pool: &PgPool, node_id: Uuid, owner_id: Uuid
     .await
     .expect("seed private ownership");
 }
+
+/// Mark `node_id` (a claim) as a `community` partition owned by `owner_id` and
+/// gated by `community_id`.
+///
+/// The counterpart to [`seed_private_ownership`] for the arm that, until PR-05,
+/// NO test in this repository exercised — every fixture in the suite wrote
+/// `'private'`. `check_content_access` returns Full only to a requester whose
+/// agent owns a perspective in `community_id` (a two-hop join through
+/// `community_members`), and Redacted to everyone else including an anonymous
+/// requester. Pass `None` for `community_id` to reach the owner-only fallback.
+///
+/// Writes `community_id`, NEVER `encryption_key_id`. Before migration 068 the
+/// gating community lived stringified in `encryption_key_id`, a `text` column
+/// whose name meant something else entirely; a fixture that still wrote it
+/// would keep passing while the production writer had moved on. Migration 068's
+/// `ownership_key_id_is_uuid` CHECK also refuses any non-UUID value there now.
+///
+/// Create the claim, the owner agent, the community, the member's perspective
+/// and the `community_members` row first; this helper writes only the
+/// `ownership` row.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
+pub async fn seed_community_ownership(
+    pool: &PgPool,
+    node_id: Uuid,
+    owner_id: Uuid,
+    community_id: Option<Uuid>,
+) {
+    sqlx::query(
+        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, community_id) \
+         VALUES ($1, 'claim', 'community', $2, $3) \
+         ON CONFLICT (node_id) DO UPDATE SET partition_type = 'community', \
+             owner_id = $2, community_id = $3, encryption_key_id = NULL",
+    )
+    .bind(node_id)
+    .bind(owner_id)
+    .bind(community_id)
+    .execute(pool)
+    .await
+    .expect("seed community ownership");
+}
+
+/// Create a community and put `agent` in it the ONLY way
+/// `check_content_access` recognises: via a perspective the agent owns.
+///
+/// The community arm is a two-hop join — `community_members ⋈ perspectives ON
+/// p.owner_agent_id` — not a direct agent membership table. A fixture that
+/// inserted a `community_members` row without an owning perspective would
+/// produce a community the agent is "in" and still cannot read from.
+///
+/// Returns the community id, for [`seed_community_ownership`]'s `community_id`.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
+pub async fn seed_community_with_member(pool: &PgPool, agent_id: Uuid) -> Uuid {
+    // `agents.public_key` is UNIQUE and length-checked; derive 32 bytes from
+    // the id so repeated calls for the same agent are idempotent.
+    let pk: Vec<u8> = agent_id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, agent_type) \
+         VALUES ($1, $2, 'system') ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(agent_id)
+    .bind(&pk)
+    .execute(pool)
+    .await
+    .expect("seed agent for community member");
+
+    // `communities.name` is UNIQUE varchar(200), so randomise it.
+    let community_id: Uuid =
+        sqlx::query_scalar("INSERT INTO communities (name) VALUES ($1) RETURNING id")
+            .bind(format!("community-{}", Uuid::new_v4()))
+            .fetch_one(pool)
+            .await
+            .expect("seed community");
+
+    let perspective_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(format!("perspective-{}", Uuid::new_v4()))
+    .bind(agent_id)
+    .fetch_one(pool)
+    .await
+    .expect("seed perspective");
+
+    sqlx::query("INSERT INTO community_members (community_id, perspective_id) VALUES ($1, $2)")
+        .bind(community_id)
+        .bind(perspective_id)
+        .execute(pool)
+        .await
+        .expect("seed community membership");
+
+    community_id
+}

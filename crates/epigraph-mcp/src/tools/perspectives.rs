@@ -210,6 +210,7 @@ pub async fn assign_ownership(
         "partition_type": row.partition_type,
         "owner_id": row.owner_id.to_string(),
         "encryption_key_id": row.encryption_key_id,
+        "community_id": row.community_id.map(|id| id.to_string()),
         "created_at": row.created_at.to_rfc3339(),
     }))
 }
@@ -232,6 +233,7 @@ pub async fn get_ownership(
         "partition_type": row.partition_type,
         "owner_id": row.owner_id.to_string(),
         "encryption_key_id": row.encryption_key_id,
+        "community_id": row.community_id.map(|id| id.to_string()),
         "created_at": row.created_at.to_rfc3339(),
         "updated_at": row.updated_at.to_rfc3339(),
     }))

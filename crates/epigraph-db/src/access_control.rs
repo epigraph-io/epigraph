@@ -5,7 +5,8 @@
 //!
 //! Access rules:
 //! - `public`    → full content returned to all requesters
-//! - `community` → full content if requester's perspective is a member of the owning community; otherwise coarse metadata only
+//! - `community` → full content if the requester's agent owns a perspective that
+//!   is a member of `ownership.community_id`; otherwise coarse metadata only
 //! - `private` → full content only for the owner agent; coarse metadata for all others
 
 use sqlx::PgPool;
@@ -53,17 +54,40 @@ pub async fn check_content_access(
     node_id: Uuid,
     requester_agent_id: Option<Uuid>,
 ) -> ContentAccess {
-    // 1. Look up ownership (partition_type, owner_id, encryption_key_id)
-    // For community partitions, encryption_key_id stores the community UUID.
-    let ownership: Option<(String, Uuid, Option<String>)> = sqlx::query_as(
-        "SELECT partition_type, owner_id, encryption_key_id FROM ownership WHERE node_id = $1",
+    // 1. Look up ownership (partition_type, owner_id, community_id).
+    // `community_id` is the TYPED gate for community partitions. Before
+    // migration 068 this value lived stringified in `encryption_key_id`, a
+    // column whose name meant something else entirely; 068 drained it into a
+    // real `uuid` column with an FK to `communities`. Nothing reads
+    // `encryption_key_id` any more — it is dropped with the table in 084.
+    //
+    // A QUERY ERROR IS NOT "NO OWNERSHIP ROW". This used to be
+    // `.unwrap_or(None)`, which laundered every `Err` into the same value that
+    // means *public* — so a pool timeout, a reset connection or a schema that
+    // predates `community_id` returned FULL CONTENT for a private or
+    // community-gated claim. `EPIGRAPH_MIGRATE_ON_BOOT` is default-off, so a
+    // binary rolled ahead of migration 068 is an operator-reachable state, and
+    // the MCP server has no startup probe that would catch it. Fail closed and
+    // say so in the log.
+    let ownership: Option<(String, Uuid, Option<Uuid>)> = match sqlx::query_as(
+        "SELECT partition_type, owner_id, community_id FROM ownership WHERE node_id = $1",
     )
     .bind(node_id)
     .fetch_optional(pool)
     .await
-    .unwrap_or(None);
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::error!(
+                node_id = %node_id,
+                error = %e,
+                "ownership lookup failed; redacting rather than assuming public"
+            );
+            return ContentAccess::Redacted;
+        }
+    };
 
-    let (partition, owner_id, encryption_key_id) = match ownership {
+    let (partition, owner_id, community_id) = match ownership {
         Some(row) => row,
         None => return ContentAccess::Full, // No ownership → public
     };
@@ -75,20 +99,20 @@ pub async fn check_content_access(
             _ => ContentAccess::Redacted,
         },
         "community" => {
-            // For community-partition nodes, encryption_key_id stores the
-            // community UUID. We check if the requester's agent has any
-            // perspective that is a member of that community.
+            // For community-partition nodes, `community_id` names the gating
+            // community directly (migration 068 made it a real `uuid` column;
+            // there is no string to parse and no parse failure to handle). We
+            // check whether the requester's agent owns any perspective that is
+            // a member of that community.
             let Some(agent_id) = requester_agent_id else {
                 return ContentAccess::Redacted;
             };
 
-            // Parse community_id from encryption_key_id
-            let community_id = encryption_key_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok());
-
             let Some(community_id) = community_id else {
-                // No community_id stored → owner-only access as fallback
+                // No gating community recorded → owner-only access as fallback.
+                // Reached today when `community_id IS NULL` on a `community`
+                // row; before 068 the same arm was reached by an unparseable
+                // `encryption_key_id`.
                 return if agent_id == owner_id {
                     ContentAccess::Full
                 } else {
@@ -110,6 +134,9 @@ pub async fn check_content_access(
             .bind(agent_id)
             .fetch_one(pool)
             .await
+            // `false` on error is already the closed direction here: not a
+            // member -> Redacted. Unlike the lookup above, this default cannot
+            // widen access.
             .unwrap_or(false);
 
             if is_member {

@@ -13,23 +13,30 @@
 //! the four decisions, say so in the commit body; do not leave the reviewer to
 //! infer it from an untouched test file.
 //!
-//! ## Status at PR-04
+//! ## Status at PR-05
 //!
 //! * **D3 — no anonymous read authority.** Asserted below, in full.
-//! * **D1 — tenancy is declared, never defaulted.** *Not yet assertable.*
-//!   Migration 062 ships `DEFAULT 'public'` / `DEFAULT <world group>` on purpose:
-//!   they are the transition artifacts that make the widening metadata-only on a
-//!   live table. Asserting D1 today would fail by construction. See the
-//!   placeholder comment in the D1 section below.
+//! * **D1 — tenancy is declared, never defaulted.** *Half asserted.* PR-05's
+//!   migration 069 adds `entity_types.tenancy_tier`, and — unusually for this
+//!   series — drops its DEFAULT **in the same migration**, because a type that
+//!   does not exist yet has no live table to widen metadata-only and therefore
+//!   needs no transition DEFAULT at all. That makes one column, today, the first
+//!   place D1 is a machine-checkable predicate rather than an intention:
+//!   `d1_tenancy_tier_is_declared_never_defaulted` below.
+//!
+//!   The OTHER half — the tier-A `visibility` / `owner_group_id` DEFAULTs
+//!   migration 062 ships on purpose — is still not assertable, and stays a
+//!   comment in the D1 section until migration 074 drops them in PR-16.
 //! * **D4 — privatization is an explicit, audited administrative act.** Nothing
 //!   to assert until the D4 surface exists. See the placeholder in the D4
 //!   section.
 //!
-//! Both placeholders are *comments*, not `#[ignore]`d tests: an ignored test is
-//! a red herring in `cargo test` output, and a parked `panic!` body is a trap for
-//! whoever runs the suite with `--include-ignored`. PR-03 used the parked-test
-//! form for one specific obligation with a silent failure mode; these two have
-//! no such mode, so a comment naming the owning PR is the honest shape.
+//! The remaining placeholders are *comments*, not `#[ignore]`d tests: an ignored
+//! test is a red herring in `cargo test` output, and a parked `panic!` body is a
+//! trap for whoever runs the suite with `--include-ignored`. PR-03 used the
+//! parked-test form for one specific obligation with a silent failure mode;
+//! these have no such mode, so a comment naming the owning PR is the honest
+//! shape.
 //!
 //! ## Relationship to the other lint files
 //!
@@ -43,6 +50,7 @@
 //! and documents why axum 0.7.9 makes a runtime walk of "both variants"
 //! impossible. What is here is the cheaper, structural half.
 
+use sqlx::PgPool;
 use std::collections::BTreeSet;
 
 // ===========================================================================
@@ -275,15 +283,106 @@ fn route_literals(chain: &str) -> Vec<&str> {
 // D1 — tenancy is declared on write, never defaulted
 // ===========================================================================
 //
+// STILL A PLACEHOLDER, for the tier-A columns only:
+//
 // PR-16: after migration 074 drops the DEFAULTs, assert here that no tier-A
 // table has a `column_default` on `visibility` or `owner_group_id`, and that
 // `count(*) FROM claims WHERE owner_group_id = <world>` is 0.
 //
-// It is NOT assertable at PR-04. Migration 062 ships
+// That half is NOT assertable at PR-05. Migration 062 ships
 // `DEFAULT 'public'` and `DEFAULT '00000000-…-000000000000'::uuid` deliberately:
 // they are what makes `ADD COLUMN` metadata-only on a live `claims` table, and
 // dropping them is stage two, not stage one. An assertion written now would fail
 // by construction and would be silenced rather than fixed.
+//
+// What IS assertable, as of PR-05, is below.
+
+/// D1, the half that is live: **a tenancy column with no absence value.**
+///
+/// PR-05's migration 069 adds `entity_types.tenancy_tier` and drops its DEFAULT
+/// in the same file. It can, where 062 could not: `entity_types` holds 23 rows,
+/// not a live `claims` table, so there is no metadata-only widening to protect
+/// and no two-stage rollout to sequence. The 23 existing rows are classified by
+/// the migration itself and the DEFAULT is then removed, which is exactly the
+/// end-state 074 will bring the tier-A columns to.
+///
+/// Two things together are what make D1 true here, and BOTH are asserted:
+///
+/// 1. **No DEFAULT.** An `INSERT` that omits the column raises 23502 rather than
+///    silently landing on a value nobody chose. This is what makes
+///    `EntityTypeRepository::upsert_non_core`'s `tenancy_tier` parameter
+///    load-bearing rather than cosmetic.
+/// 2. **No absence value inside the vocabulary.** `entity_types_no_unclassified`
+///    forbids `'unclassified'` at rest, so "I did not decide" cannot be
+///    laundered into a stored value. Without this, dropping the DEFAULT would
+///    only move the silence from the schema into the caller.
+///
+/// A PR that reinstates either — a convenience DEFAULT, or dropping the CHECK so
+/// a registration can park at `'unclassified'` — relitigates D1, and this is
+/// where it is caught.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d1_tenancy_tier_is_declared_never_defaulted(pool: PgPool) {
+    // (1) No DEFAULT, read from the catalog rather than inferred from an error.
+    let default: Option<String> = sqlx::query_scalar(
+        "SELECT column_default FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'entity_types' \
+            AND column_name = 'tenancy_tier'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("column_default probe");
+    assert_eq!(
+        default, None,
+        "entity_types.tenancy_tier must have NO column_default. A DEFAULT here is \
+         D1 being relitigated: it would let a registration omit the field and land \
+         on a tier nobody declared."
+    );
+
+    // And it is still NOT NULL, so "no default" means "you must say", not
+    // "it can be blank".
+    let nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'entity_types' \
+            AND column_name = 'tenancy_tier'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("is_nullable probe");
+    assert_eq!(
+        nullable, "NO",
+        "dropping the DEFAULT only declares tenancy if the column is also NOT NULL"
+    );
+
+    // (2) The absence value is not storable.
+    let constraint_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_constraint \
+                        WHERE conrelid = 'public.entity_types'::regclass \
+                          AND conname = 'entity_types_no_unclassified')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("constraint probe");
+    assert!(
+        constraint_exists,
+        "entity_types_no_unclassified must exist. Without it, 'unclassified' is a \
+         storable absence value and dropping the DEFAULT merely moves the silence \
+         from the schema to the caller."
+    );
+
+    // CONRELID-QUALIFIED above on purpose: `pg_constraint.conname` is unique per
+    // RELATION, not per database, so a bare name lookup would be satisfied by a
+    // same-named constraint on any other table — the exact blind spot migration
+    // 062's own comments call out.
+
+    // And no row is parked at the absence value.
+    let unclassified: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM entity_types WHERE tenancy_tier = 'unclassified'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("unclassified count");
+    assert_eq!(unclassified, 0);
+}
 
 // ===========================================================================
 // D4 — privatization is an explicit, audited administrative act

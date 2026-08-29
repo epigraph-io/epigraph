@@ -3837,8 +3837,8 @@ mod db_tests {
         // Register a NON-core owned type pointing at a table that doesn't exist,
         // then load the cache so table_present=false with is_optional=false.
         sqlx::query(
-            "INSERT INTO entity_types (type_name, table_name, is_optional, is_core) \
-             VALUES ('phantom_owned', 'does_not_exist_tbl', false, false)",
+            "INSERT INTO entity_types (type_name, table_name, is_optional, is_core, tenancy_tier) \
+             VALUES ('phantom_owned', 'does_not_exist_tbl', false, false, 'derived')",
         )
         .execute(&pool)
         .await
@@ -3857,7 +3857,12 @@ mod db_tests {
     async fn injection_check_rejects_bad_table_name(pool: PgPool) {
         for bad in ["claims; DROP TABLE claims", "a\"b", "public.claims"] {
             let res = sqlx::query(
-                "INSERT INTO entity_types (type_name, table_name, is_core) VALUES ('inj_t', $1, false)",
+                // `tenancy_tier` is supplied so this still tests the table_name
+                // CHECK regex. Migration 069 dropped the column's DEFAULT, so
+                // omitting it would make every iteration fail with 23502 and the
+                // test would pass for the wrong reason.
+                "INSERT INTO entity_types (type_name, table_name, is_core, tenancy_tier) \
+                 VALUES ('inj_t', $1, false, 'derived')",
             )
             .bind(bad)
             .execute(&pool)
@@ -3883,6 +3888,7 @@ mod db_tests {
                     is_optional: false,
                     is_core: false,
                     table_present: true,
+                    tenancy_tier: "derived".to_string(),
                 },
             );
         }
@@ -4032,8 +4038,8 @@ mod db_tests {
                 .await
                 .unwrap();
         sqlx::query(
-            "INSERT INTO entity_types (type_name, table_name, is_optional, is_core) \
-             VALUES ('widget', 'widgets', true, false)",
+            "INSERT INTO entity_types (type_name, table_name, is_optional, is_core, tenancy_tier) \
+             VALUES ('widget', 'widgets', true, false, 'derived')",
         )
         .execute(&pool)
         .await

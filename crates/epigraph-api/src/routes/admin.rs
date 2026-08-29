@@ -258,6 +258,13 @@ pub async fn approve_client(
 /// `type_name` is required. `schema_name` defaults to `public`, `id_column` to
 /// `id`, `is_optional` to `false`. `table_name` may be omitted for a table-less
 /// type. All identifier fields are validated with `is_pg_ident`.
+///
+/// `tenancy_tier` is REQUIRED and has NO `#[serde(default)]` (migration 069
+/// dropped the column's DEFAULT — see D1, "tenancy is declared, never
+/// defaulted"). It is typed `Option<String>` rather than `String` on purpose:
+/// axum's `Json` extractor turns a missing non-`Option` field into a 422
+/// deserialization error, and the acceptance criterion is a **400** naming the
+/// field. Absent -> `None` -> the explicit `ValidationError` below.
 #[derive(Debug, Deserialize)]
 pub struct RegisterEntityTypeRequest {
     pub type_name: String,
@@ -266,7 +273,14 @@ pub struct RegisterEntityTypeRequest {
     pub id_column: Option<String>,
     #[serde(default)]
     pub is_optional: bool,
+    pub tenancy_tier: Option<String>,
 }
+
+/// The tenancy tiers a registration may claim. `unclassified` is deliberately
+/// absent: migration 069's `entity_types_no_unclassified` CHECK forbids it at
+/// rest, and letting it reach the database would surface as a 500 from a CHECK
+/// violation instead of a 400 naming the constraint.
+const REGISTRABLE_TENANCY_TIERS: &[&str] = &["columns", "derived", "identity"];
 
 #[derive(Debug, Serialize)]
 pub struct RegisterEntityTypeResponse {
@@ -278,6 +292,8 @@ pub struct RegisterEntityTypeResponse {
     pub is_core: bool,
     /// Whether the backing table currently resolves (via `to_regclass`).
     pub table_present: bool,
+    /// The tier as persisted (migration 069).
+    pub tenancy_tier: String,
 }
 
 /// POST /api/v1/admin/entity-types
@@ -353,7 +369,52 @@ pub async fn register_entity_type(
         }
     }
 
+    // -----------------------------------------------------------------
+    // TENANCY TIER (migration 069). Two gates, in this order.
+    // -----------------------------------------------------------------
+    //
+    // GATE 1 — vocabulary. The field is required (D1: declared, never
+    // defaulted) and `unclassified` is not registrable. Both are 400s raised
+    // HERE rather than 23502 / 23514 surfacing as a 500 from the database.
+    let Some(tenancy_tier) = req.tenancy_tier.as_deref() else {
+        return Err(ApiError::ValidationError {
+            field: "tenancy_tier".to_string(),
+            reason: format!(
+                "tenancy_tier is required and must be one of: {}. \
+                 entity_types.tenancy_tier has no DEFAULT (migration 069) — a \
+                 type must declare how its backing table carries tenancy.",
+                REGISTRABLE_TENANCY_TIERS.join(", ")
+            ),
+        });
+    };
+    if !REGISTRABLE_TENANCY_TIERS.contains(&tenancy_tier) {
+        let hint = if tenancy_tier == "unclassified" {
+            " 'unclassified' is forbidden by the entity_types_no_unclassified \
+             CHECK constraint; it exists only as the pre-069 transition value."
+        } else {
+            ""
+        };
+        return Err(ApiError::ValidationError {
+            field: "tenancy_tier".to_string(),
+            reason: format!(
+                "tenancy_tier '{tenancy_tier}' is not registrable; must be one of: {}.{hint}",
+                REGISTRABLE_TENANCY_TIERS.join(", ")
+            ),
+        });
+    }
+
     // HIJACK GUARD: refuse to touch a core type.
+    //
+    // ORDERING IS LOAD-BEARING, AND IT IS *ABOVE* GATE 2 ON PURPOSE. Gate 2
+    // runs three catalog probes; running them first would (a) spend those
+    // probes on a request that is going to be refused anyway and (b) turn the
+    // endpoint into a small catalog oracle — a caller holding only
+    // `entity-types:write` could read `visibility` / `owner_group_id`
+    // nullability, the policy command set and the RLS flags of any
+    // `is_registrable_target` table by asking to register a core type against
+    // it, and get that state back inside the 400's reason string. With the
+    // guard here, `{"type_name":"claim","table_name":"claims",
+    // "tenancy_tier":"columns"}` is a 403 that discloses nothing.
     use epigraph_db::EntityTypeRepository;
     if let Some(true) = EntityTypeRepository::core_status(&state.db_pool, &req.type_name)
         .await
@@ -366,6 +427,67 @@ pub async fn register_entity_type(
         });
     }
 
+    // GATE 2 — the §2.5 precondition. Claiming the `columns` tier is a claim
+    // ABOUT the backing table: that it carries NOT NULL (visibility,
+    // owner_group_id), that RLS policies cover all four commands, that RLS is
+    // ENABLEd so those policies apply at all, and that it is FORCEd so the
+    // table owner is not exempt. Checked against the live catalogs, at
+    // registration time, not asserted in a test.
+    //
+    // AT MIGRATION HEAD 069 THIS REFUSES EVERY TABLE. No table has
+    // `relrowsecurity`, `relforcerowsecurity` or a single `pg_policy` row until
+    // PR-17 ships migrations 077/079, so the `columns` tier is unregisterable
+    // through this endpoint for the whole PR-05 → PR-17 window. That is
+    // intended, not a regression: the six seeded `columns` types are
+    // `is_core = true` and the hijack guard above has already 403'd them.
+    if tenancy_tier == "columns" {
+        let Some(ref table) = req.table_name else {
+            return Err(ApiError::ValidationError {
+                field: "table_name".to_string(),
+                reason: "tenancy_tier 'columns' requires a table_name: the tier is a \
+                         claim about a backing table's columns and policies, and a \
+                         table-less type has none"
+                    .to_string(),
+            });
+        };
+        let precondition =
+            EntityTypeRepository::tenancy_precondition(&state.db_pool, schema_name, table)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: e.to_string(),
+                })?;
+        if !precondition.is_satisfied() {
+            let mut missing: Vec<String> = Vec::new();
+            if !precondition.visibility_not_null {
+                missing.push("column 'visibility' NOT NULL".to_string());
+            }
+            if !precondition.owner_group_not_null {
+                missing.push("column 'owner_group_id' NOT NULL".to_string());
+            }
+            let missing_cmds = precondition.missing_policy_cmds();
+            if !missing_cmds.is_empty() {
+                missing.push(format!(
+                    "RLS policies for pg_policy.polcmd {:?} (or one '*' policy)",
+                    missing_cmds
+                ));
+            }
+            if !precondition.rls_enabled {
+                missing.push("ROW LEVEL SECURITY (not ENABLEd)".to_string());
+            }
+            if !precondition.force_rls {
+                missing.push("FORCE ROW LEVEL SECURITY".to_string());
+            }
+            return Err(ApiError::ValidationError {
+                field: "tenancy_tier".to_string(),
+                reason: format!(
+                    "tenancy_tier 'columns' requires '{schema_name}.{table}' to have: {}. \
+                     Register the type as 'derived' until those land.",
+                    missing.join("; ")
+                ),
+            });
+        }
+    }
+
     // Upsert (is_core forced false; registered_by = caller).
     let (name, entry) = EntityTypeRepository::upsert_non_core(
         &state.db_pool,
@@ -375,6 +497,7 @@ pub async fn register_entity_type(
         id_column,
         req.is_optional,
         auth.client_id,
+        tenancy_tier,
     )
     .await
     .map_err(|e| ApiError::InternalError {
@@ -390,6 +513,7 @@ pub async fn register_entity_type(
         is_optional: entry.is_optional,
         is_core: entry.is_core,
         table_present: entry.table_present,
+        tenancy_tier: entry.tenancy_tier.clone(),
     };
     if let Ok(mut cache) = state.entity_type_cache.write() {
         cache.insert(name, entry);
@@ -440,6 +564,7 @@ mod db_tests {
                 table_name: Some("attacker_claims".to_string()),
                 id_column: Some("id".to_string()),
                 is_optional: false,
+                tenancy_tier: Some("derived".to_string()),
             }),
         )
         .await;
@@ -474,6 +599,7 @@ mod db_tests {
                 table_name: Some("widgets".to_string()),
                 id_column: None,
                 is_optional: true,
+                tenancy_tier: Some("derived".to_string()),
             }),
         )
         .await
@@ -510,6 +636,7 @@ mod db_tests {
                 table_name: None,
                 id_column: None,
                 is_optional: false,
+                tenancy_tier: Some("derived".to_string()),
             }),
         )
         .await;
@@ -534,6 +661,7 @@ mod db_tests {
                 table_name: Some("oauth_clients".to_string()),
                 id_column: Some("id".to_string()),
                 is_optional: true,
+                tenancy_tier: Some("derived".to_string()),
             }),
         )
         .await;
@@ -552,6 +680,7 @@ mod db_tests {
                 table_name: Some("pg_class".to_string()),
                 id_column: Some("oid".to_string()),
                 is_optional: true,
+                tenancy_tier: Some("derived".to_string()),
             }),
         )
         .await;
@@ -570,6 +699,220 @@ mod db_tests {
         assert_eq!(count, 0, "no sensitive/cross-schema type may persist");
     }
 
+    /// PR-05 / migration 069. `tenancy_tier` is REQUIRED. The field is typed
+    /// `Option<String>` precisely so a missing field is a 400 naming the field,
+    /// not axum's 422 deserialization error — this asserts the 400 the
+    /// acceptance criterion demands, and that the body still DESERIALIZES (so
+    /// the handler, not serde, is what refuses).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_without_tenancy_tier_is_400(pool: PgPool) {
+        // Deserialize from a body with no `tenancy_tier` key at all, exactly as
+        // an existing pre-PR-05 client would send it.
+        let req: RegisterEntityTypeRequest = serde_json::from_value(serde_json::json!({
+            "type_name": "widget",
+            "schema_name": "public",
+            "table_name": "widgets",
+            "id_column": "id",
+            "is_optional": true,
+        }))
+        .expect("body without tenancy_tier must still deserialize — the 400 is the handler's");
+        assert!(req.tenancy_tier.is_none());
+
+        let state = state_with_cache(pool.clone()).await;
+        let result = register_entity_type(
+            axum::extract::State(state),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(req),
+        )
+        .await;
+        match result {
+            Err(ApiError::ValidationError { ref field, .. }) => {
+                assert_eq!(field, "tenancy_tier");
+            }
+            other => panic!("missing tenancy_tier must be a 400 on tenancy_tier; got {other:?}"),
+        }
+
+        // Nothing persisted.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM entity_types WHERE type_name = 'widget'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// `unclassified` is the pre-069 transition value and is not registrable.
+    /// It must be refused BY THE HANDLER (400), never allowed to reach the
+    /// `entity_types_no_unclassified` CHECK and come back as a 500.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_unclassified_is_400(pool: PgPool) {
+        let state = state_with_cache(pool.clone()).await;
+        let result = register_entity_type(
+            axum::extract::State(state),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(RegisterEntityTypeRequest {
+                type_name: "widget".to_string(),
+                schema_name: None,
+                table_name: Some("widgets".to_string()),
+                id_column: None,
+                is_optional: true,
+                tenancy_tier: Some("unclassified".to_string()),
+            }),
+        )
+        .await;
+        match result {
+            Err(ApiError::ValidationError { ref field, ref reason }) => {
+                assert_eq!(field, "tenancy_tier");
+                assert!(
+                    reason.contains("entity_types_no_unclassified"),
+                    "the 400 must NAME the constraint so the caller knows why; got: {reason}"
+                );
+            }
+            other => panic!("unclassified must be a 400; got {other:?}"),
+        }
+    }
+
+    /// The §2.5 precondition, checked at runtime against the live catalogs.
+    ///
+    /// MEASURED AT MIGRATION HEAD 069: `relforcerowsecurity = false` and
+    /// `count(DISTINCT polcmd) = 0` for EVERY table in the schema, `claims`
+    /// included — RLS is PR-17's migrations 077/079. So this fires for every
+    /// table, and `claims` (which DOES have both NOT NULL columns) is the
+    /// discriminating target: it isolates the policy/FORCE half of the
+    /// precondition from the column half.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_columns_tier_without_policies_is_400(pool: PgPool) {
+        let state = state_with_cache(pool.clone()).await;
+        let result = register_entity_type(
+            axum::extract::State(state),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(RegisterEntityTypeRequest {
+                // NOT a core type name — the hijack guard must not be what
+                // refuses this, or the test would pass for the wrong reason.
+                type_name: "shadow_claim".to_string(),
+                schema_name: Some("public".to_string()),
+                table_name: Some("claims".to_string()),
+                id_column: Some("id".to_string()),
+                is_optional: false,
+                tenancy_tier: Some("columns".to_string()),
+            }),
+        )
+        .await;
+        match result {
+            Err(ApiError::ValidationError { ref field, ref reason }) => {
+                assert_eq!(field, "tenancy_tier");
+                assert!(
+                    reason.contains("FORCE ROW LEVEL SECURITY"),
+                    "claims has both NOT NULL columns already, so the shortfall must be \
+                     the RLS half; got: {reason}"
+                );
+                assert!(
+                    reason.contains("polcmd"),
+                    "the 400 must name the missing policy commands; got: {reason}"
+                );
+            }
+            other => panic!("columns tier without RLS must be a 400; got {other:?}"),
+        }
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entity_types WHERE type_name = 'shadow_claim'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "a refused columns-tier registration persists nothing");
+    }
+
+    /// ORDERING: the hijack guard runs ABOVE the §2.5 tier gate.
+    ///
+    /// `register_entity_type_hijack_guard_blocks_core` sends `derived`, which
+    /// skips gate 2 entirely, so it cannot see this. A core type asking for the
+    /// `columns` tier must still be a 403 naming the immutable type — not a 400
+    /// describing `public.claims`'s RLS state, which would spend three catalog
+    /// probes on a doomed request and hand a caller holding only
+    /// `entity-types:write` a readout of any registrable table's tenancy
+    /// catalog.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_core_type_is_403_before_the_tier_gate(pool: PgPool) {
+        let state = state_with_cache(pool).await;
+        let result = register_entity_type(
+            axum::extract::State(state),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(RegisterEntityTypeRequest {
+                type_name: "claim".to_string(),
+                schema_name: Some("public".to_string()),
+                table_name: Some("claims".to_string()),
+                id_column: Some("id".to_string()),
+                is_optional: false,
+                tenancy_tier: Some("columns".to_string()),
+            }),
+        )
+        .await;
+        match result {
+            Err(ApiError::Forbidden { ref reason }) => assert!(
+                reason.contains("core entity type 'claim' is immutable"),
+                "the refusal must be the hijack guard's, not the tier gate's; got: {reason}"
+            ),
+            other => panic!(
+                "a core type must be refused by the hijack guard BEFORE the tier gate \
+                 leaks catalog state; got {other:?}"
+            ),
+        }
+    }
+
+    /// A table-less type cannot claim `columns`: the tier is a claim about a
+    /// backing table, and there is no table to make it about.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_columns_tier_without_table_is_400(pool: PgPool) {
+        let state = state_with_cache(pool).await;
+        let result = register_entity_type(
+            axum::extract::State(state),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(RegisterEntityTypeRequest {
+                type_name: "tableless".to_string(),
+                schema_name: None,
+                table_name: None,
+                id_column: None,
+                is_optional: true,
+                tenancy_tier: Some("columns".to_string()),
+            }),
+        )
+        .await;
+        match result {
+            Err(ApiError::ValidationError { ref field, .. }) => assert_eq!(field, "table_name"),
+            other => panic!("columns tier without a table must be a 400; got {other:?}"),
+        }
+    }
+
+    /// The tier round-trips: what the caller declared is what is persisted and
+    /// what comes back on the wire.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_persists_the_declared_tier(pool: PgPool) {
+        let state = state_with_cache(pool.clone()).await;
+        let (_status, Json(resp)) = register_entity_type(
+            axum::extract::State(state),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(RegisterEntityTypeRequest {
+                type_name: "widget".to_string(),
+                schema_name: None,
+                table_name: Some("widgets".to_string()),
+                id_column: None,
+                is_optional: true,
+                tenancy_tier: Some("derived".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.tenancy_tier, "derived");
+
+        let stored: String =
+            sqlx::query_scalar("SELECT tenancy_tier FROM entity_types WHERE type_name = 'widget'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, "derived");
+    }
+
     /// Missing the entity-types:write scope -> 403.
     #[sqlx::test(migrations = "../../migrations")]
     async fn register_entity_type_requires_scope(pool: PgPool) {
@@ -583,6 +926,7 @@ mod db_tests {
                 table_name: Some("widgets".to_string()),
                 id_column: None,
                 is_optional: true,
+                tenancy_tier: Some("derived".to_string()),
             }),
         )
         .await;

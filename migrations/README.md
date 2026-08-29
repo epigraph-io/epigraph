@@ -93,6 +93,26 @@ Current reservation:
   | **083** | PR-18 | `instance_admins` |
   | **084** | PR-22 | retire `ownership` |
 
+  **Non-table objects the reserved range introduces.** A number in the table
+  above names a migration, not everything it creates. These are the objects
+  inside 060–090 that a later `DROP` has to know about by name, because they are
+  not tables and so do not appear in the Tombstones section below:
+
+  | Object | `relkind` | Created by | Dropped by |
+  |---|---|---|---|
+  | `public.ownership_key_id_quarantine` | VIEW (`v`) | 068 | **084**, with the `ownership` table it reads. Its pre-flight is `SELECT count(*) FROM ownership_key_id_quarantine` — a non-empty result is an operator action item, and 084 must not `DROP TABLE ownership CASCADE` past it. |
+  | `public.tenancy_exempt` | TABLE (`r`) | 069 | **never** — it is the §2.4 exemption registry and outlives the series. Listed here so it is not mistaken for scaffolding. |
+
+  A VIEW is deliberate for the quarantine (ops F20): a `CREATE TABLE AS`
+  snapshot taken at 068 time cannot see a row that becomes unparseable
+  afterwards, so 084's pre-flight would pass over exactly the value it exists to
+  catch. It is created `WITH (security_invoker = true)` — a view without that
+  option executes as its OWNER and bypasses the invoker's policies once
+  migration 079 FORCEs RLS, which is the open finding migration 069 files
+  against `alternative_set` and `alt_set_decisions`. **Any VIEW added in this
+  range must set it.** Both properties are pinned by
+  `crates/epigraph-db/tests/tenancy_coverage.rs::ownership_key_id_quarantine_is_a_view`.
+
   Two comments in migrations already applied to a database still carry
   pre-shift numbers and **cannot be corrected**: editing an applied file changes
   its checksum and `sqlx migrate run` then refuses to start. They are

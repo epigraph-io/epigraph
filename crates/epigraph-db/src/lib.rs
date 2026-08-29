@@ -91,8 +91,9 @@ pub use repos::{
     ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
     RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RevokeOutcome, ScopedBeliefRepository,
     SecurityEventRepository, SecurityEventRow, SheafRepository, SweepCandidate, TaskRepository,
-    TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository, WorkflowExecutionRow,
-    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    TaskRow, TenancyPrecondition, TripleRepository, TripleRow, WorkflowExecutionRepository,
+    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository,
     EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 pub use visibility::{MaintenanceLease, SystemReason, Viewer};

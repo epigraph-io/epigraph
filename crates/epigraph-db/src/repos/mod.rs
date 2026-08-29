@@ -84,7 +84,7 @@ pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
 pub use divergence::DivergenceRepository;
 pub use edge::EdgeRepository;
 pub use entity::{EntityRepository, EntityRow};
-pub use entity_type::{EntityTypeEntry, EntityTypeRepository};
+pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
 pub use event::{EventRepository, EventRow};
 pub use evidence::{EvidenceRepository, EvidenceSearchResult};
 pub use experiment::{

@@ -42,7 +42,7 @@ Group-scoped encryption (`seal`) is last and deliberately optional.
 | PR-02 | agents.id for every principal; close both registration gates (061) | **landed** `6429097` — 3634 pass / 0 fail |
 | PR-03 | anonymous allowlist, RFC 6750 challenge, unforgeable Viewer (D3) | **landed** `8c70e5a` — 3669 pass / 0 fail |
 | PR-04 | tenancy columns, world/seed groups, ScopedPool, resolvable Viewer (062–067) | **landed** `1e310bc` — 3723 pass / 0 fail; discharged PR-03's ignore obligation |
-| PR-05 | project communities onto groups; de-overload `ownership.encryption_key_id` | not started |
+| PR-05 | project communities onto groups; de-overload `ownership.encryption_key_id` (068–069) | **landed** — sha recorded by the next docs pass, as PR-04's row was by `40c04d3`. 3763 pass / 0 fail / 68 ignored (PR-04 baseline 3723). New files: `tenancy_coverage.rs` (16/16) and `community_partition.rs` (10/10); `routes::admin::db_tests` grew to 11/11, `locked_decisions.rs` to 4/4, and `read_path_authz_test.rs` gained the HTTP community case. First-ever coverage of the `community` partition arm, on both the MCP and HTTP surfaces |
 | PR-06 | visibility predicate required on every claim read | not started |
 | PR-07 | derive a Viewer on every HTTP read path | not started |
 | PR-08 | authenticate + viewer-filter the structural-features endpoint | not started |
@@ -114,6 +114,62 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   backfill. That index is corpus-sized when migration 066 builds it, because
   `owner_group_id` defaults to the world group; the backfill empties it without
   reclaiming pages.
+- **PR-17 owes** `security_invoker = true` on `public.alternative_set` and
+  `public.alt_set_decisions` in migration 077 — or a `DROP VIEW`. Both are
+  `relkind = 'v'` with the option UNSET, so after 079's `FORCE ROW LEVEL
+  SECURITY` they execute as the view OWNER and bypass the invoker's policies
+  entirely: `alt_set_decisions` returns `belief`, `plausibility` and
+  label-derived state for claims the caller cannot read. Discovered in PR-05,
+  not in the plan. Recorded in their `tenancy_exempt.residual` text and pinned
+  by `tenancy_coverage.rs::the_two_view_exemptions_are_still_security_definer`,
+  which INVERTS when PR-17 discharges it. Two in-tree tests already query these
+  views (`crates/epigraph-api/tests/alt_set_decisions_view_test.rs`,
+  `alternative_set_view_closure.rs`).
+- **PR-16 or PR-18 owes** promoting five content-bearing tables to tier A before
+  privatization ships. Migration 069 exempts them **under protest**, because
+  giving them tenancy columns now would grant coverage that migrations
+  070/074/077 do not extend to — worse than a stated exemption. Each carries
+  real claim-derived plaintext: `experiments.protocol` /
+  `protocol_source`, `counterfactual_scenarios.scenario_a` / `scenario_b`,
+  `learning_events.lesson` / `resolution`, `match_candidates.verifier_rationale`
+  (whose `(claim_a, claim_b)` pair is itself a near-duplicate oracle over the
+  private corpus), and `behavioral_executions.goal_text` / `goal_embedding`.
+  This is exactly the failure class the plan's §12 summary names — *"a derived
+  table nobody listed keeps the plaintext public after privatization"*. The
+  registry CATCHES it; it does not CLOSE it. All twelve `tenancy_exempt` rows
+  carry `reviewed_by = 'PENDING'`, which is honest — nothing in PR-05 could
+  cause a review — but it means the registry's "named reviewer" property is
+  currently unmet for every row. `tenancy_coverage.rs::
+  tenancy_exempt_rows_state_a_residual` ratchets that count DOWNWARD (a review
+  lowers it; a thirteenth unreviewed exemption fails the build). **Reviewing
+  those five is the gate this bullet names.**
+- **PR-12 owes** ongoing community→group projection, in BOTH directions.
+  Migration 068's projection is a **one-time snapshot**:
+  - `CommunityRepository::create` and `add_member`
+    (`crates/epigraph-db/src/repos/community.rs:42,110`) still write only
+    `communities` / `community_members`, so any membership added through
+    `POST /communities/:id/members` after 068 produces no `group_memberships`
+    row until PR-12's write-side stamping triggers land. That is the plan's R7.
+  - **`remove_member` (`:144`) is the permissive half and is NOT in the plan.**
+    It deletes the `community_members` row and does not set `revoked_at` on the
+    corresponding `group_memberships` row, so the two membership models drift in
+    the direction that GRANTS: an agent removed from a community keeps its
+    projected group membership and, at PR-17, keeps read access to the group's
+    private corpus. The projection is least-privilege (`role = 'reader'`), which
+    bounds the damage, but it does not remove it.
+
+  `tenancy_coverage.rs::every_community_projects_onto_a_group_and_its_members_onto_memberships`
+  seeds and then REPLAYS 068 before asserting, so it tests the migration's
+  output and is structurally incapable of observing either drift. Its doc
+  comment says so; do not read it as coverage of this gap.
+- **PR-12 or PR-18 owes** an administrator for every projected community group.
+  Migration 068 projects members as `reader` and leaves
+  `groups.created_by_agent_id` NULL (`communities` has no creator column to
+  derive one from), so a projected group has **zero admins**: `POST
+  /groups/:id/members` can never be used on it, and PR-18's "≥2 other live
+  admins" precondition is unsatisfiable by construction. Deliberate — inventing
+  an admin from `community_members`, which attests read eligibility only, would
+  be worse — but it must be discharged before those PRs rely on it.
 - **PR-06 may want** a substitution helper on `Viewer::predicate_fragment`. It
   ships `{alias}` and `$V` placeholders with no helper, so every call site will
   hand-roll `.replace()` and choose its own positional parameter number.
@@ -205,8 +261,64 @@ began running) — but only a per-suite diff shows it.
    `_sqlx_migrations` has nothing at 060 or above. **Eight migrations (060–067) are already
    written against that assumption.** If production holds anything at 060+, all eight need
    renumbering before this branch can merge. This is the single highest-risk open item.
-2. Start at **PR-05** (`feat(db): project communities onto groups, de-overload
-   ownership.encryption_key_id, and classify every entity type`), spec in the plan's §7.
+2. Start at **PR-06** (`feat(db): make the visibility predicate a required parameter
+   on every claim read`), spec in the plan's §7. PR-05 landed migrations 068–069; the
+   live `_sqlx_migrations` head is now **69**, and
+   `crates/epigraph-api/tests/migrate_on_startup.rs::MIGRATION_HEAD` was bumped with it.
+
+   **Deploy ordering for PR-05 — MIGRATIONS FIRST. Apply 068 and 069 BEFORE the
+   PR-05 binary rolls.** `EPIGRAPH_MIGRATE_ON_BOOT` is default-off (PR-01), so
+   this ordering is operator-controlled, not automatic. Both directions have
+   teeth, and the binary-first direction is the severe one:
+
+   - **Binary before migrations (DO NOT):** `EntityTypeRepository::list_all`
+     now selects `tenancy_tier`, and `AppState::load_entity_type_cache`
+     (`crates/epigraph-api/src/state.rs:575`) is `.expect()`ed at
+     `crates/epigraph-api/src/bin/server.rs:372`. **The API panics on every
+     boot** until 069 lands. That fails closed and loudly, which is the right
+     failure, but it is an outage. The MCP server does not load that cache and
+     boots fine — and would then hit a missing `ownership.community_id` on
+     every read; `check_content_access` was hardened in this PR to REDACT on a
+     query error rather than treat it as "no ownership row, therefore public",
+     so that window degrades to over-redaction instead of disclosure.
+   - **Migrations before binary (the correct order, with one cost):** 069 drops
+     `entity_types.tenancy_tier`'s DEFAULT, so any `INSERT INTO entity_types`
+     omitting the column raises 23502. `EntityTypeRepository::upsert_non_core`
+     is the only in-tree writer and is fixed in the same commit, so the cost is
+     that **entity-type registration is broken for the length of the roll** —
+     a narrow, recoverable window, unlike the panic above.
+
+   This inverts the code-first-then-migration ordering the plan prescribes for
+   PR-16. That is intended here: PR-16's ordering protects a data migration,
+   PR-05's protects a startup invariant.
+
+   **Release-note item for PR-05.** `POST /api/v1/admin/entity-types` is now
+   strictly more restrictive in two ways at once: `tenancy_tier` is a required
+   body field (an existing client omitting it gets 400), and
+   `tenancy_tier='columns'` is refused for **every** table until PR-17 lands —
+   measured at head 069, `relforcerowsecurity = false` and zero `pg_policy` rows
+   on every table in the schema, `claims` included, because RLS is PR-17's
+   migrations 077/079. The `columns` tier is therefore write-locked through the
+   API for the whole PR-05 → PR-17 window. Intended (the six seeded `columns`
+   types are `is_core = true` and the hijack guard 403s them first), but it must
+   be stated.
+
+   Two smaller wire changes in the same release. `GET/POST /api/v1/ownership`
+   returns a new REQUIRED `community_id` field, and
+   `POST /api/v1/admin/entity-types` a new REQUIRED `tenancy_tier` field; the
+   DEPRECATED `encryption_key_id` is retained on the `ownership` response (now
+   always `null` for anything the handler writes) purely so an existing
+   deserializer does not break, and is dropped with the column in 084. The
+   wire-compatibility argument is therefore applied to the field being REMOVED
+   and not to the fields being ADDED — deliberate, because a strict client
+   breaks on an unknown field either way and the added fields are the point of
+   the change, but it is an inconsistency worth naming in the release note.
+
+   `PUT /api/v1/ownership/:node_id` also now clears `encryption_key_id`
+   alongside `community_id`. On a database still holding a pre-068 non-UUID
+   value, the previous behaviour would have raised 23514 from the `NOT VALID`
+   `ownership_key_id_is_uuid` CHECK (Postgres re-checks the whole new row
+   version even when the constrained column is untouched) and returned a 500.
 3. `stash@{0}` holds an abandoned, unverified partial PR-04 from an interrupted run
    (its own migrations 062–068, numbered differently from what actually landed). It is
    superseded and **should be dropped**: `git stash drop`. Inspect first with
