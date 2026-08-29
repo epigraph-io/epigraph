@@ -54,9 +54,31 @@ Current reservation:
   same files in-tree to `036–038` (cross-source matching port); prod
   `_sqlx_migrations` rows must be renumbered +1 on next public deploy.
 - **038**: public `corroborates_factor_strength_from_score` (PR #173)
-- **039+**: public next
+- **039–059**: public — `main` currently ends at `059`
+- **060–067**: RESERVED by the unmerged branch `feat/multi-user-tenancy`
+  (`060_group_tenancy_tables` … `067_session_functions`). Do not reuse.
+- **070–076**: taken by the unmerged branch `feat/blob-manifest-anchor`
+  (blobs, manifests, anchors, obligations, essence binding, blob mime safety)
+- **077**: this branch — `shifted_to_edge_type`
+- **078**: this branch — `claims_canonical_hash`
+- **079+**: public next
 
-Next public migration must be `039` or later. Picking a colliding version
+Next public migration must be `079` or later.
+
+> **Cross-branch hazard — read before numbering.** `sqlx::migrate!` keys on the
+> NUMERIC version, not the filename, so two unmerged branches that each add an
+> `060_*.sql` produce two version-60 rows once both land and `Migrator::run`
+> fails on the second. Checking only `main` is not sufficient: at the time of
+> writing `main` ends at 059 while three unmerged branches already occupy
+> 060–067 and 070–078. Before picking a number, check every live branch:
+>
+> ```
+> for b in $(git branch -r --format='%(refname:short)'); do
+>   git ls-tree --name-only "$b" migrations/ ; done | sort -u | tail
+> ```
+>
+> This branch originally took 060/061 and collided with `feat/multi-user-tenancy`;
+> the files were renumbered to 077/078 before merge. Picking a colliding version
 (checksum mismatch on a `_sqlx_migrations` row that's already applied) will
 panic the api binary on restart.
 
