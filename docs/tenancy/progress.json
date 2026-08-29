@@ -59,15 +59,14 @@
         "notes": "dropped 2 orphaned .sqlx entries left by PR-05"
       }
     ],
-    "current": "PR-06 (BLOCKED)",
+    "current": "PR-06 (running, resumed from cached analyze phase)",
     "failed": [],
     "halted": "Loop halted after PR-04 by user request 2026-08-27. PR-05 not started. 18 PRs remain.",
     "blocked_reason": {
-      "what": "Anthropic weekly usage limit reached 2026-08-29 ~12:20 PDT",
-      "resets": "2026-08-30 10:00 America/Los_Angeles (~21.5h from the halt)",
-      "detail": "5 of PR-06's 7 agents failed with 'You've hit your weekly limit'. analyze+blast completed; implement died partway, leaving 228 modified files.",
-      "partial_work": "stash@{0} - PR-06 read-path Viewer conversion, 228 files, UNVERIFIED. stash@{1} is the older superseded PR-04 partial.",
-      "retry_guidance": "Retrying before the reset fails identically - the limit is account-wide, not per-workflow. Resume after 10:00 PDT 2026-08-30 by re-running the pr-impl workflow for PR-06 from a CLEAN tree; prefer dropping stash@{0} over popping it, since it was interrupted mid-implement and never verified."
+      "what": "TRANSIENT, CLEARED. A weekly usage limit killed 5 of PR-06's 7 agents on 2026-08-29.",
+      "resolution": "Quota refreshed; PR-06 relaunched via resumeFromRunId wf_433cf05a-9cc so the two completed analyze agents replay from cache.",
+      "lesson": "Do not infer a quota block's duration from the reset string plus a clock reading. If the session is executing, capacity exists - just retry.",
+      "partial_work": "stash@{0} PR-06 partial (228 files, UNVERIFIED, superseded by the relaunch). stash@{1} older PR-04 partial. Both droppable."
     }
   },
   "env": {
