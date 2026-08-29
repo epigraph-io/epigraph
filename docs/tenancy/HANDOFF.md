@@ -2,8 +2,11 @@
 
 **Branch:** `feat/multi-user-tenancy` · **Base:** `main` @ `3948445`
 **Status as of 2026-08-27.** Nothing pushed. No PRs opened. Everything below is local commits.
-**The implementation loop was HALTED after PR-04 by request.** PR-05 was never started.
-4 of 22 PRs are landed and independently verified; 18 remain.
+**The loop is BLOCKED at PR-06 on an Anthropic weekly usage limit** (hit 2026-08-29
+~12:20 PDT, resets 2026-08-30 10:00 PDT). 5 of PR-06's 7 agents died mid-run; its
+partial, UNVERIFIED work (228 files of read-path Viewer conversion) is in `stash@{0}`.
+Retrying before the reset fails identically — the limit is account-wide.
+**5 of 22 plan PRs are landed and independently verified; 17 remain.**
 
 This document is the durable record for whoever (human or agent) picks this up next.
 It assumes no access to this session's scratchpad, which is ephemeral.
@@ -43,7 +46,7 @@ Group-scoped encryption (`seal`) is last and deliberately optional.
 | PR-03 | anonymous allowlist, RFC 6750 challenge, unforgeable Viewer (D3) | **landed** `8c70e5a` — 3669 pass / 0 fail |
 | PR-04 | tenancy columns, world/seed groups, ScopedPool, resolvable Viewer (062–067) | **landed** `1e310bc` — 3723 pass / 0 fail; discharged PR-03's ignore obligation |
 | PR-05 | project communities onto groups; de-overload `ownership.encryption_key_id` (068–069) | **landed** — sha recorded by the next docs pass, as PR-04's row was by `40c04d3`. 3763 pass / 0 fail / 68 ignored (PR-04 baseline 3723). New files: `tenancy_coverage.rs` (16/16) and `community_partition.rs` (10/10); `routes::admin::db_tests` grew to 11/11, `locked_decisions.rs` to 4/4, and `read_path_authz_test.rs` gained the HTTP community case. First-ever coverage of the `community` partition arm, on both the MCP and HTTP surfaces |
-| PR-06 | visibility predicate required on every claim read | not started |
+| PR-06 | visibility predicate required on every claim read | **BLOCKED** — usage limit; partial in `stash@{0}`, unverified |
 | PR-07 | derive a Viewer on every HTTP read path | not started |
 | PR-08 | authenticate + viewer-filter the structural-features endpoint | not started |
 | PR-09 | derive a Viewer on every content-reading MCP tool | not started |

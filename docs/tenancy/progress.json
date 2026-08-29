@@ -45,11 +45,30 @@
         "verified_by": "main-agent",
         "tests": "3723 passed / 0 failed / 68 ignored (verified on pgvector 0.6.2 AND 0.8.6)",
         "notes": "migrations 062-067; ScopedPool + Viewer; discharged PR-03's ignore obligation"
+      },
+      {
+        "pr": "PR-05",
+        "sha": "9820553",
+        "verified_by": "main-agent",
+        "tests": "3763 passed / 0 failed / 68 ignored",
+        "notes": "migrations 068-069 (renumbered from plan's stale 064/065); fixed check_content_access laundering query Err into public; first-ever community-partition coverage"
+      },
+      {
+        "pr": "chore",
+        "sha": "b58dc09",
+        "notes": "dropped 2 orphaned .sqlx entries left by PR-05"
       }
     ],
-    "current": null,
+    "current": "PR-06 (BLOCKED)",
     "failed": [],
-    "halted": "Loop halted after PR-04 by user request 2026-08-27. PR-05 not started. 18 PRs remain."
+    "halted": "Loop halted after PR-04 by user request 2026-08-27. PR-05 not started. 18 PRs remain.",
+    "blocked_reason": {
+      "what": "Anthropic weekly usage limit reached 2026-08-29 ~12:20 PDT",
+      "resets": "2026-08-30 10:00 America/Los_Angeles (~21.5h from the halt)",
+      "detail": "5 of PR-06's 7 agents failed with 'You've hit your weekly limit'. analyze+blast completed; implement died partway, leaving 228 modified files.",
+      "partial_work": "stash@{0} - PR-06 read-path Viewer conversion, 228 files, UNVERIFIED. stash@{1} is the older superseded PR-04 partial.",
+      "retry_guidance": "Retrying before the reset fails identically - the limit is account-wide, not per-workflow. Resume after 10:00 PDT 2026-08-30 by re-running the pr-impl workflow for PR-06 from a CLEAN tree; prefer dropping stash@{0} over popping it, since it was interrupted mid-implement and never verified."
+    }
   },
   "env": {
     "postgres": "16.2 @127.0.0.1:55432",
@@ -61,5 +80,14 @@
   "deferred_obligations": [],
   "resolved_measurements": {
     "M2": "ANSWERED by user 2026-08-27: production pgvector is 0.8 series. hnsw.iterative_scan IS available in prod; pgvector upgrade is OFF the critical path; plan R1 mitigation (a) is viable. CAVEAT: exact prod patch level unconfirmed - local will be 0.8.6, so do not depend on anything added after 0.8.0 without checking prod's patch version."
-  }
+  },
+  "open_findings": [
+    {
+      "id": "F-failopen-catchall",
+      "where": "crates/epigraph-db/src/access_control.rs:148",
+      "what": "`_ => ContentAccess::Full // Unknown partition -> safe default` is FAIL-OPEN and mislabeled",
+      "status": "unreachable today (CHECK restricts vocabulary) but contradicts D1 'no public by default-on-error'; untested",
+      "assigned": "PR-06 via operator note"
+    }
+  ]
 }
