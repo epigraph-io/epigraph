@@ -22,6 +22,9 @@
 //! - Topological order ensures ancestors always precede descendants
 //! - Diamond dependencies require proper deduplication
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod helpers;
 
 use epigraph_core::domain::reasoning_trace::Methodology;
@@ -93,11 +96,12 @@ async fn create_claim_chain(pool: &PgPool, depth: usize) -> Vec<Uuid> {
 /// **Reasoning**: Base case validation - every claim is part of its own lineage
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_no_ancestors_returns_only_itself(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Create a single claim with no parents
     let claim_id = create_test_claim(&pool, "Standalone claim with no ancestors", 0.75).await;
 
     // Execute: Query lineage
-    let lineage = LineageRepository::get_lineage(&pool, claim_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, claim_id, None)
         .await
         .expect("Failed to query lineage");
 
@@ -132,6 +136,7 @@ async fn test_lineage_no_ancestors_returns_only_itself(pool: PgPool) {
 /// **Reasoning**: Simple two-node lineage validates basic traversal
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_single_parent_returns_both(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Create parent and child claims
     let parent_id = create_test_claim(&pool, "Parent claim", 0.8).await;
     let child_id = create_test_claim(&pool, "Child claim derived from parent", 0.7).await;
@@ -140,7 +145,7 @@ async fn test_lineage_single_parent_returns_both(pool: PgPool) {
     create_claim_edge(&pool, parent_id, child_id, "supports").await;
 
     // Execute: Query lineage from child
-    let lineage = LineageRepository::get_lineage(&pool, child_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, child_id, None)
         .await
         .expect("Failed to query lineage");
 
@@ -177,12 +182,13 @@ async fn test_lineage_single_parent_returns_both(pool: PgPool) {
 /// **Reasoning**: Validates recursive CTE traverses arbitrarily deep graphs
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_deep_ancestry_returns_all(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Create chain of 7 claims (0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6)
     let chain = create_claim_chain(&pool, 7).await;
 
     // Execute: Query lineage from the leaf (last) claim
     let leaf_id = *chain.last().unwrap();
-    let lineage = LineageRepository::get_lineage(&pool, leaf_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None)
         .await
         .expect("Failed to query lineage");
 
@@ -234,6 +240,7 @@ async fn test_lineage_deep_ancestry_returns_all(pool: PgPool) {
 /// **Reasoning**: Full provenance requires evidence at all levels
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_includes_all_evidence_at_each_level(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Create agent and 3 claims with evidence at each level
     let agent = make_agent(Some("Evidence Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
@@ -272,7 +279,7 @@ async fn test_lineage_includes_all_evidence_at_each_level(pool: PgPool) {
     let evidence_leaf: Uuid = ev_leaf.id.as_uuid();
 
     // Execute: Query lineage from leaf
-    let lineage = LineageRepository::get_lineage(&pool, leaf_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None)
         .await
         .expect("Failed to query lineage");
 
@@ -320,6 +327,7 @@ async fn test_lineage_includes_all_evidence_at_each_level(pool: PgPool) {
 /// **Reasoning**: Traces explain how claims were derived, essential for provenance
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_includes_all_reasoning_traces(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Create agent and claims with reasoning traces
     let agent = make_agent(Some("Trace Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
@@ -370,7 +378,7 @@ async fn test_lineage_includes_all_reasoning_traces(pool: PgPool) {
         .unwrap();
 
     // Execute: Query lineage from child
-    let lineage = LineageRepository::get_lineage(&pool, child_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, child_id, None)
         .await
         .expect("Failed to query lineage");
 
@@ -408,12 +416,13 @@ async fn test_lineage_includes_all_reasoning_traces(pool: PgPool) {
 /// **Reasoning**: Depth limiting enables efficient queries on large graphs
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_respects_max_depth_parameter(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Create chain of 5 claims
     let chain = create_claim_chain(&pool, 5).await;
 
     // Execute: Query lineage with max_depth=2
     let leaf_id = *chain.last().unwrap();
-    let lineage = LineageRepository::get_lineage(&pool, leaf_id, Some(2))
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, Some(2))
         .await
         .expect("Failed to query lineage");
 
@@ -439,6 +448,7 @@ async fn test_lineage_respects_max_depth_parameter(pool: PgPool) {
 /// **Reasoning**: Real provenance graphs often have shared ancestors
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_handles_diamond_dependencies(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Create diamond pattern
     //       A (common ancestor)
     //      / \
@@ -458,7 +468,7 @@ async fn test_lineage_handles_diamond_dependencies(pool: PgPool) {
     create_claim_edge(&pool, c_id, d_id, "supports").await;
 
     // Execute: Query lineage from D
-    let lineage = LineageRepository::get_lineage(&pool, d_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, d_id, None)
         .await
         .expect("Failed to query lineage");
 
@@ -526,6 +536,7 @@ async fn test_lineage_handles_diamond_dependencies(pool: PgPool) {
 /// **Reasoning**: Production graphs may have deep/wide provenance chains
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_performance_with_large_graph(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Create a tree structure with 1000+ nodes
     // Root -> 10 children -> 10 grandchildren each -> 10 great-grandchildren each
     // Total: 1 + 10 + 100 + 1000 = 1111 nodes
@@ -568,7 +579,7 @@ async fn test_lineage_performance_with_large_graph(pool: PgPool) {
 
     // Execute: Query lineage and measure time
     let start = Instant::now();
-    let lineage = LineageRepository::get_lineage(&pool, leaf_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None)
         .await
         .expect("Failed to query lineage");
     let elapsed = start.elapsed();
@@ -598,6 +609,7 @@ async fn test_lineage_performance_with_large_graph(pool: PgPool) {
 /// **Reasoning**: Cycles violate DAG invariant but system should handle gracefully
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_detects_and_reports_cycles(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Create a cycle (A -> B -> C -> A)
     let a_id = create_test_claim(&pool, "Claim A in cycle", 0.7).await;
     let b_id = create_test_claim(&pool, "Claim B in cycle", 0.7).await;
@@ -609,7 +621,7 @@ async fn test_lineage_detects_and_reports_cycles(pool: PgPool) {
     create_claim_edge(&pool, c_id, a_id, "supports").await;
 
     // Execute: Detect cycles
-    let has_cycle = LineageRepository::detect_cycles(&pool, a_id)
+    let has_cycle = LineageRepository::detect_cycles(&pool, &viewer, a_id)
         .await
         .expect("Failed to detect cycles");
 
@@ -617,7 +629,7 @@ async fn test_lineage_detects_and_reports_cycles(pool: PgPool) {
     assert!(has_cycle, "Cycle should be detected in A -> B -> C -> A");
 
     // Query lineage should still work (with cycle detection)
-    let lineage = LineageRepository::get_lineage(&pool, a_id, Some(10))
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, a_id, Some(10))
         .await
         .expect("Failed to query lineage");
 
@@ -634,6 +646,7 @@ async fn test_lineage_detects_and_reports_cycles(pool: PgPool) {
 /// **Reasoning**: Topological order enables deterministic processing
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_returns_topological_order(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Create complex DAG
     //     A
     //    /|\
@@ -660,7 +673,7 @@ async fn test_lineage_returns_topological_order(pool: PgPool) {
     create_claim_edge(&pool, e_id, f_id, "supports").await;
 
     // Execute: Query lineage from F
-    let lineage = LineageRepository::get_lineage(&pool, f_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, f_id, None)
         .await
         .expect("Failed to query lineage");
 
@@ -701,6 +714,7 @@ async fn test_lineage_returns_topological_order(pool: PgPool) {
 /// **Reasoning**: Claims can derive from multiple independent sources
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_handles_multiple_roots(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Two independent roots both supporting one claim
     let root1_id = create_test_claim(&pool, "Independent root 1", 0.9).await;
     let root2_id = create_test_claim(&pool, "Independent root 2", 0.85).await;
@@ -710,7 +724,7 @@ async fn test_lineage_handles_multiple_roots(pool: PgPool) {
     create_claim_edge(&pool, root2_id, leaf_id, "supports").await;
 
     // Execute
-    let lineage = LineageRepository::get_lineage(&pool, leaf_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None)
         .await
         .expect("Failed to query lineage");
 
@@ -740,6 +754,7 @@ async fn test_lineage_handles_multiple_roots(pool: PgPool) {
 /// **Reasoning**: Wide graphs are common in evidence aggregation
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_handles_wide_graph(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Root with 50 children all supporting one grandchild
     let root_id = create_test_claim(&pool, "Root of wide graph", 0.9).await;
 
@@ -756,7 +771,7 @@ async fn test_lineage_handles_wide_graph(pool: PgPool) {
     }
 
     // Execute
-    let lineage = LineageRepository::get_lineage(&pool, leaf_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None)
         .await
         .expect("Failed to query lineage");
 
@@ -774,9 +789,10 @@ async fn test_lineage_handles_wide_graph(pool: PgPool) {
 /// Test: Empty database returns empty lineage for non-existent claim
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_nonexistent_claim_returns_empty(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Execute: Query lineage for a UUID that doesn't exist
     let nonexistent_id = Uuid::new_v4();
-    let lineage = LineageRepository::get_lineage(&pool, nonexistent_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, nonexistent_id, None)
         .await
         .expect("Failed to query lineage");
 
@@ -798,6 +814,7 @@ async fn test_lineage_nonexistent_claim_returns_empty(pool: PgPool) {
 /// **Reasoning**: Provenance includes supports, derives_from, etc.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_with_mixed_relationship_types(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Setup: Claims with different relationship types
     let source_id = create_test_claim(&pool, "Source claim", 0.9).await;
     let derived_id = create_test_claim(&pool, "Derived claim", 0.8).await;
@@ -811,7 +828,7 @@ async fn test_lineage_with_mixed_relationship_types(pool: PgPool) {
     create_claim_edge(&pool, refined_id, final_id, "supports").await;
 
     // Execute
-    let lineage = LineageRepository::get_lineage(&pool, final_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, final_id, None)
         .await
         .expect("Failed to query lineage");
 

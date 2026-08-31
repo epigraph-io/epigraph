@@ -137,14 +137,24 @@ impl ReasoningTraceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: TraceId) -> Result<Option<ReasoningTrace>, DbError> {
+    #[instrument(skip(pool, viewer))]
+    pub async fn get_by_id(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        id: TraceId,
+    ) -> Result<Option<ReasoningTrace>, DbError> {
         let uuid: Uuid = id.into();
 
         // JOIN with claims table to get the correct agent_id
         // This preserves provenance tracking - the agent who made the claim
         // is the agent associated with the reasoning trace
-        let row: Option<TraceWithAgentRow> = sqlx::query_as(
+        //
+        // BOTH aliases are marked. `reasoning_traces` carries its own tenancy
+        // columns (062) and `explanation` is free prose about the claim, so
+        // filtering only the joined `claims` row would still be wrong the other
+        // way round: a trace private to another group hanging off a public
+        // claim.
+        let sql = viewer.splice(
             r#"
             SELECT rt.id, rt.claim_id, rt.reasoning_type, rt.confidence,
                    rt.explanation, rt.properties, rt.created_at,
@@ -152,11 +162,15 @@ impl ReasoningTraceRepository {
             FROM reasoning_traces rt
             INNER JOIN claims c ON rt.claim_id = c.id
             WHERE rt.id = $1
+              /* {VISIBILITY:rt} */ /* {VISIBILITY:c} */
             "#,
-        )
-        .bind(uuid)
-        .fetch_optional(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, TraceWithAgentRow>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<TraceWithAgentRow> = q.fetch_optional(pool).await?;
 
         match row {
             Some(row) => {
@@ -192,15 +206,16 @@ impl ReasoningTraceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_by_claim(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: ClaimId,
     ) -> Result<Vec<ReasoningTrace>, DbError> {
         let uuid: Uuid = claim_id.into();
 
         // JOIN with claims table to get the correct agent_id
-        let rows: Vec<TraceWithAgentRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT rt.id, rt.claim_id, rt.reasoning_type, rt.confidence,
                    rt.explanation, rt.properties, rt.created_at,
@@ -208,12 +223,16 @@ impl ReasoningTraceRepository {
             FROM reasoning_traces rt
             INNER JOIN claims c ON rt.claim_id = c.id
             WHERE rt.claim_id = $1
+              /* {VISIBILITY:rt} */ /* {VISIBILITY:c} */
             ORDER BY rt.created_at DESC
             "#,
-        )
-        .bind(uuid)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut qy = sqlx::query_as::<_, TraceWithAgentRow>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            qy = qy.bind(g);
+        }
+        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(pool).await?;
 
         let mut traces = Vec::with_capacity(rows.len());
 
@@ -277,15 +296,16 @@ impl ReasoningTraceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_parents(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         trace_id: TraceId,
     ) -> Result<Vec<ReasoningTrace>, DbError> {
         let uuid: Uuid = trace_id.into();
 
         // JOIN with claims table to get the correct agent_id for each parent trace
-        let rows: Vec<TraceWithAgentRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT rt.id, rt.claim_id, rt.reasoning_type, rt.confidence,
                    rt.explanation, rt.properties, rt.created_at,
@@ -294,11 +314,15 @@ impl ReasoningTraceRepository {
             INNER JOIN trace_parents tp ON rt.id = tp.parent_id
             INNER JOIN claims c ON rt.claim_id = c.id
             WHERE tp.trace_id = $1
+              /* {VISIBILITY:rt} */ /* {VISIBILITY:c} */
             "#,
-        )
-        .bind(uuid)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut qy = sqlx::query_as::<_, TraceWithAgentRow>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            qy = qy.bind(g);
+        }
+        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(pool).await?;
 
         let mut traces = Vec::with_capacity(rows.len());
 
@@ -334,15 +358,16 @@ impl ReasoningTraceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_children(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         trace_id: TraceId,
     ) -> Result<Vec<ReasoningTrace>, DbError> {
         let uuid: Uuid = trace_id.into();
 
         // JOIN with claims table to get the correct agent_id for each child trace
-        let rows: Vec<TraceWithAgentRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT rt.id, rt.claim_id, rt.reasoning_type, rt.confidence,
                    rt.explanation, rt.properties, rt.created_at,
@@ -351,11 +376,15 @@ impl ReasoningTraceRepository {
             INNER JOIN trace_parents tp ON rt.id = tp.trace_id
             INNER JOIN claims c ON rt.claim_id = c.id
             WHERE tp.parent_id = $1
+              /* {VISIBILITY:rt} */ /* {VISIBILITY:c} */
             "#,
-        )
-        .bind(uuid)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut qy = sqlx::query_as::<_, TraceWithAgentRow>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            qy = qy.bind(g);
+        }
+        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(pool).await?;
 
         let mut traces = Vec::with_capacity(rows.len());
 
@@ -493,7 +522,7 @@ mod tests {
         );
 
         // Now fetch the trace by ID and verify agent_id is correct
-        let fetched_trace = ReasoningTraceRepository::get_by_id(&pool, created_trace.id)
+        let fetched_trace = ReasoningTraceRepository::get_by_id(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), created_trace.id)
             .await
             .expect("Failed to fetch trace")
             .expect("Trace should exist");
@@ -506,7 +535,7 @@ mod tests {
 
         // Verify by fetching via get_by_claim
         let traces_for_claim =
-            ReasoningTraceRepository::get_by_claim(&pool, ClaimId::from_uuid(claim_id))
+            ReasoningTraceRepository::get_by_claim(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), ClaimId::from_uuid(claim_id))
                 .await
                 .expect("Failed to fetch traces by claim");
 
@@ -608,7 +637,7 @@ mod tests {
             .expect("Failed to add parent");
 
         // Verify get_parents returns correct agent_id for parent
-        let parents = ReasoningTraceRepository::get_parents(&pool, child.id)
+        let parents = ReasoningTraceRepository::get_parents(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), child.id)
             .await
             .expect("Failed to get parents");
         assert_eq!(parents.len(), 1);
@@ -619,7 +648,7 @@ mod tests {
         );
 
         // Verify get_children returns correct agent_id for child
-        let children = ReasoningTraceRepository::get_children(&pool, parent.id)
+        let children = ReasoningTraceRepository::get_children(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), parent.id)
             .await
             .expect("Failed to get children");
         assert_eq!(children.len(), 1);

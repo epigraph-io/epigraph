@@ -10,6 +10,7 @@
 //! - `DELETE /api/v1/communities/:id/members/:perspective_id` — remove member
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 #[cfg(feature = "db")]
@@ -147,11 +148,13 @@ pub async fn create_community(
 /// `GET /api/v1/communities`
 #[cfg(feature = "db")]
 pub async fn list_communities(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListCommunitiesQuery>,
 ) -> Result<Json<Vec<CommunityResponse>>, ApiError> {
     let pool = &state.db_pool;
-    let rows = epigraph_db::CommunityRepository::list(pool, params.limit, params.offset).await?;
+    let rows =
+        epigraph_db::CommunityRepository::list(pool, &viewer, params.limit, params.offset).await?;
 
     Ok(Json(rows.into_iter().map(community_to_response).collect()))
 }
@@ -161,19 +164,20 @@ pub async fn list_communities(
 /// `GET /api/v1/communities/:id`
 #[cfg(feature = "db")]
 pub async fn get_community(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<CommunityDetailResponse>, ApiError> {
     let pool = &state.db_pool;
 
-    let row = epigraph_db::CommunityRepository::get_by_id(pool, id)
+    let row = epigraph_db::CommunityRepository::get_by_id(pool, &viewer, id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "community".to_string(),
             id: id.to_string(),
         })?;
 
-    let members = epigraph_db::CommunityRepository::get_members(pool, id).await?;
+    let members = epigraph_db::CommunityRepository::get_members(pool, &viewer, id).await?;
 
     let member_entries: Vec<CommunityMemberEntry> = members
         .into_iter()
@@ -196,6 +200,7 @@ pub async fn get_community(
 /// `POST /api/v1/communities/:id/members`
 #[cfg(feature = "db")]
 pub async fn add_member(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(community_id): Path<Uuid>,
     Json(request): Json<AddMemberRequest>,
@@ -203,7 +208,7 @@ pub async fn add_member(
     let pool = &state.db_pool;
 
     // Verify community exists
-    epigraph_db::CommunityRepository::get_by_id(pool, community_id)
+    epigraph_db::CommunityRepository::get_by_id(pool, &viewer, community_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "community".to_string(),
@@ -211,7 +216,7 @@ pub async fn add_member(
         })?;
 
     // Verify perspective exists
-    epigraph_db::PerspectiveRepository::get_by_id(pool, request.perspective_id)
+    epigraph_db::PerspectiveRepository::get_by_id(pool, &viewer, request.perspective_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "perspective".to_string(),

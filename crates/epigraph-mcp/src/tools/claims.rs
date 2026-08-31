@@ -141,6 +141,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 pub async fn submit_claim(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     mut params: SubmitClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let methodology = parse_methodology(&params.methodology).map_err(invalid_params)?;
@@ -169,7 +170,7 @@ pub async fn submit_claim(
     // path, it does not replace it). See crate::tools::novelty_gate.
     let is_exact_resubmit = {
         let mut conn = server.pool.acquire().await.map_err(internal_error)?;
-        ClaimRepository::find_by_content_hash_and_agent(&mut conn, &content_hash, agent_id)
+        ClaimRepository::find_by_content_hash_and_agent(&mut conn, viewer, &content_hash, agent_id)
             .await
             .map_err(internal_error)?
             .is_some()
@@ -181,6 +182,7 @@ pub async fn submit_claim(
             .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
         if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
             &server.pool,
+            viewer,
             server.embedder.as_ref(),
             &params.content,
             novelty_threshold,
@@ -218,15 +220,18 @@ pub async fn submit_claim(
                 //      nothing is inserted. `resolve_backlog_item` is
                 //      unaffected (it hardcodes novelty_threshold=0.0 so
                 //      this branch never fires for it).
-                let existing =
-                    ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(existing_id))
-                        .await
-                        .map_err(internal_error)?
-                        .ok_or_else(|| {
-                            internal_error(format!(
-                            "novelty gate: nearest claim {existing_id} vanished before read-back"
-                        ))
-                        })?;
+                let existing = ClaimRepository::get_by_id(
+                    &server.pool,
+                    viewer,
+                    ClaimId::from_uuid(existing_id),
+                )
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    internal_error(format!(
+                        "novelty gate: nearest claim {existing_id} vanished before read-back"
+                    ))
+                })?;
                 return success_json(&SubmitClaimResponse {
                     claim_id: existing_id.to_string(),
                     truth_value: existing.truth_value.value(),
@@ -257,7 +262,8 @@ pub async fn submit_claim(
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "submit_claim").await?;
+        crate::claim_helper::create_claim_idempotent(&server.pool, viewer, &claim, "submit_claim")
+            .await?;
     let claim_uuid = claim.id.as_uuid();
 
     if !params.labels.is_empty() {
@@ -350,6 +356,7 @@ pub async fn submit_claim(
 
         let ds_result = ds_auto::auto_wire_ds_for_claim(
             &server.pool,
+            viewer,
             claim_uuid,
             agent_id,
             confidence,
@@ -425,6 +432,7 @@ pub async fn submit_claim(
 
 pub async fn query_claims(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: QueryClaimsParams,
     requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
@@ -434,7 +442,7 @@ pub async fn query_claims(
 
     // Filter by truth range in SQL (before LIMIT) so matching claims outside
     // the most-recent `limit` rows are still reachable (bug 5a55a48e).
-    let claims = ClaimRepository::list_by_truth_range(&server.pool, min, max, limit, 0)
+    let claims = ClaimRepository::list_by_truth_range(&server.pool, viewer, min, max, limit, 0)
         .await
         .map_err(internal_error)?;
 
@@ -457,7 +465,7 @@ pub async fn query_claims(
     // N+1 fan-out of per-claim get_labels calls; the helper does NOT filter on
     // is_current so superseded rows (which list_by_truth_range returns) keep
     // their labels, matching get_labels' label source. A missing id → no labels.
-    let labels_map = ClaimRepository::labels_by_ids(&server.pool, &ids)
+    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
         .await
         .map_err(internal_error)?;
 
@@ -490,6 +498,7 @@ pub async fn query_claims(
 
 pub async fn get_claim(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetClaimParams,
     requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
@@ -503,10 +512,11 @@ pub async fn get_claim(
         params.perspective_id.as_deref(),
     )?;
     if let Some((frame_id, perspective_id)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
+        crate::tools::lens::validate_lens_exists(&server.pool, viewer, frame_id, perspective_id)
+            .await?;
     }
 
-    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&server.pool, claim_id)
+    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&server.pool, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
@@ -516,7 +526,7 @@ pub async fn get_claim(
     // Cached CDST classification ('supported' | 'contradicted' |
     // 'not_enough_info' | null). Flattened onto the standard claim response so
     // existing `ClaimResponse` consumers are unaffected.
-    let classification = ClaimRepository::get_classification(&server.pool, id)
+    let classification = ClaimRepository::get_classification(&server.pool, viewer, id)
         .await
         .map_err(internal_error)?;
 
@@ -528,6 +538,7 @@ pub async fn get_claim(
         Some((frame_id, perspective_id)) => {
             let interval = epigraph_engine::belief_query::get_perspective_belief(
                 &server.pool,
+                viewer,
                 id,
                 frame_id,
                 perspective_id,
@@ -585,10 +596,11 @@ pub async fn get_claim(
 
 pub async fn verify_claim(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: VerifyClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
-    let claim = ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(id))
+    let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(id))
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
@@ -616,6 +628,7 @@ pub async fn verify_claim(
 
 pub async fn update_with_evidence(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: UpdateWithEvidenceParams,
 ) -> Result<CallToolResult, McpError> {
     // Two addressing modes, exactly one required: id-mode (`claim_id`) or
@@ -629,7 +642,7 @@ pub async fn update_with_evidence(
         }
         parse_uuid(params.claim_id.trim())?
     } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
-        epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, name, idx, true)
+        epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, viewer, name, idx, true)
             .await
             .map_err(internal_error)?
             .ok_or_else(|| {
@@ -645,7 +658,7 @@ pub async fn update_with_evidence(
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
 
-    let claim = ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id))
+    let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(claim_id))
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
@@ -683,7 +696,7 @@ pub async fn update_with_evidence(
     // by the prior column value for supports=true, so the warning is only ever
     // reachable on the NULL-column (no-prior-DS-state) path.
     let pre_pignistic =
-        ClaimRepository::get_belief_columns(&server.pool, ClaimId::from_uuid(claim_id))
+        ClaimRepository::get_belief_columns(&server.pool, viewer, ClaimId::from_uuid(claim_id))
             .await
             .map_err(internal_error)?
             .and_then(|c| c.pignistic_prob);
@@ -696,6 +709,7 @@ pub async fn update_with_evidence(
     // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
     let ds = ds_auto::auto_wire_ds_update(
         &server.pool,
+        viewer,
         claim_id,
         agent_id,
         strength,
@@ -819,6 +833,7 @@ pub(crate) async fn require_owner_or_admin(
 /// the `resolution_claim_id` so the reconciler can back-fill.
 pub async fn resolve_backlog_item(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: crate::types::ResolveBacklogItemParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
@@ -828,7 +843,7 @@ pub async fn resolve_backlog_item(
     // Confirm the target exists; we do NOT require the "backlog" label —
     // a stricter precondition belongs to the call site (HTTP filters /
     // operator UI) rather than the verb.
-    let original = ClaimRepository::get_by_id(&server.pool, original_claim_id)
+    let original = ClaimRepository::get_by_id(&server.pool, viewer, original_claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {original_id} not found")))?;
@@ -868,7 +883,7 @@ pub async fn resolve_backlog_item(
         // never suppress or flag them via the semantic gate.
         novelty_threshold: Some(0.0),
     };
-    let submit_result = submit_claim(server, submit_params).await?;
+    let submit_result = submit_claim(server, viewer, submit_params).await?;
     let resolution_id = extract_submit_claim_id(&submit_result)?;
 
     // 2. PATCH the original's labels: add "resolved", keep "backlog".
@@ -979,13 +994,14 @@ pub async fn patch_claim(
 
 pub async fn query_undecomposed_claims(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: crate::types::QueryUndecomposedClaimsParams,
     requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 1000);
     let offset = params.offset.unwrap_or(0).max(0);
 
-    let claims = ClaimRepository::list_undecomposed(&server.pool, limit, offset)
+    let claims = ClaimRepository::list_undecomposed(&server.pool, viewer, limit, offset)
         .await
         .map_err(internal_error)?;
 

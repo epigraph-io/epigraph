@@ -92,14 +92,15 @@ impl ScopedBeliefRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         scope_type: &str,
         scope_id: Option<Uuid>,
     ) -> Result<Option<ScopedBeliefRow>, DbError> {
-        let row: Option<ScopedBeliefRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, frame_id, claim_id, scope_type, scope_id,
                    belief, plausibility, mass_on_empty, mass_on_missing,
@@ -107,15 +108,20 @@ impl ScopedBeliefRepository {
             FROM ds_combined_beliefs
             WHERE claim_id = $1 AND scope_type = $2
               AND (($3::uuid IS NULL AND scope_id IS NULL) OR scope_id = $3)
+              /* {VISIBILITY:ds_combined_beliefs} */
             ORDER BY computed_at DESC
             LIMIT 1
             "#,
-        )
-        .bind(claim_id)
-        .bind(scope_type)
-        .bind(scope_id)
-        .fetch_optional(pool)
-        .await?;
+            4,
+        );
+        let mut q = sqlx::query_as::<_, ScopedBeliefRow>(&sql)
+            .bind(claim_id)
+            .bind(scope_type)
+            .bind(scope_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<ScopedBeliefRow> = q.fetch_optional(pool).await?;
 
         Ok(row)
     }
@@ -124,24 +130,29 @@ impl ScopedBeliefRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn list_for_claim(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<ScopedBeliefRow>, DbError> {
-        let rows: Vec<ScopedBeliefRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, frame_id, claim_id, scope_type, scope_id,
                    belief, plausibility, mass_on_empty, mass_on_missing,
                    conflict_k, strategy_used, pignistic_prob, computed_at
             FROM ds_combined_beliefs
             WHERE claim_id = $1
+              /* {VISIBILITY:ds_combined_beliefs} */
             ORDER BY scope_type, computed_at DESC
             "#,
-        )
-        .bind(claim_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ScopedBeliefRow>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<ScopedBeliefRow> = q.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -150,16 +161,18 @@ impl ScopedBeliefRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_for_scope(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         scope_type: &str,
         scope_id: Option<Uuid>,
         frame_id: Option<Uuid>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<ScopedBeliefRow>, DbError> {
-        let rows: Vec<ScopedBeliefRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, frame_id, claim_id, scope_type, scope_id,
                    belief, plausibility, mass_on_empty, mass_on_missing,
@@ -168,17 +181,22 @@ impl ScopedBeliefRepository {
             WHERE scope_type = $1
               AND (($2::uuid IS NULL AND scope_id IS NULL) OR scope_id = $2)
               AND ($3::uuid IS NULL OR frame_id = $3)
+              /* {VISIBILITY:ds_combined_beliefs} */
             ORDER BY belief DESC
             LIMIT $4 OFFSET $5
             "#,
-        )
-        .bind(scope_type)
-        .bind(scope_id)
-        .bind(frame_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+            6,
+        );
+        let mut q0 = sqlx::query_as::<_, ScopedBeliefRow>(&sql)
+            .bind(scope_type)
+            .bind(scope_id)
+            .bind(frame_id)
+            .bind(limit)
+            .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q0 = q0.bind(g);
+        }
+        let rows: Vec<ScopedBeliefRow> = q0.fetch_all(pool).await?;
 
         Ok(rows)
     }

@@ -26,6 +26,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use epigraph_db::EdgeRepository;
 
@@ -250,6 +251,7 @@ pub fn is_valid_relationship(s: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn trigger_edge_ds_recomputation(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     was_created: bool,
     edge_id: uuid::Uuid,
     source_claim_id: uuid::Uuid,
@@ -274,6 +276,7 @@ async fn trigger_edge_ds_recomputation(
 
     let outcome = auto_wire_edge_if_epistemic(
         pool,
+        viewer,
         was_created,
         edge_id,
         source_claim_id,
@@ -294,7 +297,7 @@ async fn trigger_edge_ds_recomputation(
 
     let mut visited = std::collections::HashSet::new();
     visited.insert(target_claim_id);
-    match propagate_to_dependents(pool, target_claim_id, &mut visited).await {
+    match propagate_to_dependents(pool, viewer, target_claim_id, &mut visited).await {
         Ok(recomputed) => {
             if !recomputed.is_empty() {
                 tracing::info!(
@@ -331,6 +334,7 @@ async fn trigger_edge_ds_recomputation(
 #[cfg(feature = "db")]
 async fn propagate_to_dependents(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     updated_claim_id: Uuid,
     visited: &mut std::collections::HashSet<Uuid>,
 ) -> Result<Vec<Uuid>, crate::errors::ApiError> {
@@ -377,7 +381,7 @@ async fn propagate_to_dependents(
 
         // Recompute this dependent claim's belief using the same DS combination
         // pattern: load all mass functions, combine, compute BetP, update.
-        if let Err(e) = recompute_claim_belief(pool, dependent_claim_id).await {
+        if let Err(e) = recompute_claim_belief(pool, viewer, dependent_claim_id).await {
             tracing::warn!(
                 dependent = %dependent_claim_id,
                 error = %e,
@@ -401,9 +405,10 @@ async fn propagate_to_dependents(
 #[cfg(feature = "db")]
 async fn recompute_claim_belief(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
 ) -> Result<(), crate::errors::ApiError> {
-    epigraph_engine::edge_factor::recompute_claim_belief_binary(pool, claim_id)
+    epigraph_engine::edge_factor::recompute_claim_belief_binary(pool, viewer, claim_id)
         .await
         .map(|recomputed| {
             if recomputed {
@@ -510,6 +515,7 @@ pub struct NeighborhoodResponse {
 /// - relationship must be from the allowed set
 #[cfg(feature = "db")]
 pub async fn create_edge(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateEdgeRequest>,
@@ -667,6 +673,7 @@ pub async fn create_edge(
     // contradicts/refutes/refines/...) instead of just the 4 evidentials.
     if let Err(e) = trigger_edge_ds_recomputation(
         pool,
+        &viewer,
         was_created,
         edge_id,
         request.source_id,
@@ -936,6 +943,7 @@ pub struct LinkHierarchicalResponse {
 /// retried wiring calls don't need to distinguish status codes.
 #[cfg(feature = "db")]
 pub async fn create_hierarchical_edge(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<LinkHierarchicalRequest>,
@@ -972,6 +980,7 @@ pub async fn create_hierarchical_edge(
     // so callers can fix the right end of the link.
     if epigraph_db::ClaimRepository::get_by_id(
         pool,
+        &viewer,
         epigraph_core::ClaimId::from_uuid(request.source_claim_id),
     )
     .await?
@@ -984,6 +993,7 @@ pub async fn create_hierarchical_edge(
     }
     if epigraph_db::ClaimRepository::get_by_id(
         pool,
+        &viewer,
         epigraph_core::ClaimId::from_uuid(request.target_claim_id),
     )
     .await?
@@ -1464,6 +1474,7 @@ async fn entity_exists(state: &AppState, id: Uuid, entity_type: &str) -> Result<
 /// At least one filter parameter must be provided.
 #[cfg(feature = "db")]
 pub async fn list_edges(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<EdgeQueryParams>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -1480,6 +1491,7 @@ pub async fn list_edges(
     // callers querying non-claim sources don't get silently filtered.
     let rows = EdgeRepository::list_filtered(
         pool,
+        &viewer,
         params.source_id,
         params.target_id,
         params.relationship.as_deref(),
@@ -1525,6 +1537,7 @@ pub async fn list_edges(
 /// Requires a Bearer token (PR-03: registered on the `protected` router).
 #[cfg(feature = "db")]
 pub async fn claim_neighborhood(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<NeighborhoodParams>,
@@ -1543,8 +1556,8 @@ pub async fn claim_neighborhood(
     let mut visited_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     visited_ids.insert(claim_id);
 
-    let outgoing = EdgeRepository::get_by_source(pool, claim_id, "claim").await?;
-    let incoming = EdgeRepository::get_by_target(pool, claim_id, "claim").await?;
+    let outgoing = EdgeRepository::get_by_source(pool, &viewer, claim_id, "claim").await?;
+    let incoming = EdgeRepository::get_by_target(pool, &viewer, claim_id, "claim").await?;
 
     // Collect 1-hop neighbor IDs
     let mut frontier: Vec<Uuid> = Vec::new();
@@ -1565,8 +1578,8 @@ pub async fn claim_neighborhood(
     for _hop in 1..max_depth {
         let mut next_frontier = Vec::new();
         for &node_id in &frontier {
-            let out = EdgeRepository::get_by_source(pool, node_id, "claim").await?;
-            let inc = EdgeRepository::get_by_target(pool, node_id, "claim").await?;
+            let out = EdgeRepository::get_by_source(pool, &viewer, node_id, "claim").await?;
+            let inc = EdgeRepository::get_by_target(pool, &viewer, node_id, "claim").await?;
 
             for edge in out.iter().chain(inc.iter()) {
                 let neighbor_id = if edge.source_id == node_id {
@@ -1705,6 +1718,7 @@ pub struct GraphEdgesResponse {
 /// fields extracted from the edge properties JSONB.
 #[cfg(feature = "db")]
 pub async fn graph_edges(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(_params): Query<GraphAccessParams>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -1715,7 +1729,7 @@ pub async fn graph_edges(
         .as_ref()
         .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
-    let rows = EdgeRepository::list_all(pool, 5000).await?;
+    let rows = EdgeRepository::list_all(pool, &viewer, 5000).await?;
 
     // Filter to claim-to-claim edges, excluding edges touching redacted claims
     let mut filtered = Vec::new();
@@ -1844,6 +1858,7 @@ pub struct FullGraphResponse {
 /// batch-fetches each entity type, and assembles a unified graph response.
 #[cfg(feature = "db")]
 pub async fn graph_full(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(_params): Query<GraphAccessParams>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -1855,7 +1870,7 @@ pub async fn graph_full(
         .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     // 1. Fetch all edges (capped)
-    let edge_rows = EdgeRepository::list_all(pool, 2000).await?;
+    let edge_rows = EdgeRepository::list_all(pool, &viewer, 2000).await?;
 
     // 2. Collect unique entity IDs by type
     let mut claim_ids = std::collections::HashSet::new();

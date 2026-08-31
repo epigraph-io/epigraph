@@ -98,6 +98,7 @@ pub async fn create_frame(
 
 pub async fn submit_ds_evidence(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: SubmitDsEvidenceParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
@@ -117,7 +118,7 @@ pub async fn submit_ds_evidence(
     let method_name = format!("{method:?}");
 
     // Get frame from DB
-    let frame_row = FrameRepository::get_by_id(&server.pool, frame_id)
+    let frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("frame {frame_id} not found")))?;
@@ -212,10 +213,11 @@ pub async fn submit_ds_evidence(
     .map_err(internal_error)?;
 
     // Count stored BBAs for the response (bba_count is informational only).
-    let bba_count = MassFunctionRepository::get_for_claim_frame(&server.pool, claim_id, frame_id)
-        .await
-        .map_err(internal_error)?
-        .len();
+    let bba_count =
+        MassFunctionRepository::get_for_claim_frame(&server.pool, viewer, claim_id, frame_id)
+            .await
+            .map_err(internal_error)?
+            .len();
 
     // Combine + persist the claim's cached belief via the SAME code path
     // `recompute_beliefs` uses (`recompute_claim_belief_on_frame` ->
@@ -232,9 +234,14 @@ pub async fn submit_ds_evidence(
     // path always resolves method adaptively (via `combine_multiple`) and
     // targets hypothesis index 0 (the canonical binary_truth convention).
     // This is the accepted consequence of unification, not a follow-up bug.
-    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(&server.pool, claim_id, frame_id)
-        .await
-        .map_err(internal_error)?;
+    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+        &server.pool,
+        viewer,
+        claim_id,
+        frame_id,
+    )
+    .await
+    .map_err(internal_error)?;
 
     // Read back exactly what the shared recompute path just wrote, so the
     // response can never drift from what a later `recompute_beliefs` call
@@ -273,6 +280,7 @@ pub async fn submit_ds_evidence(
 
 pub async fn get_belief(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetBeliefParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
@@ -287,24 +295,30 @@ pub async fn get_belief(
         params.perspective_id.as_deref(),
     )?;
     if let Some((lens_frame, lens_perspective)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, lens_frame, lens_perspective)
-            .await?;
+        crate::tools::lens::validate_lens_exists(
+            &server.pool,
+            viewer,
+            lens_frame,
+            lens_perspective,
+        )
+        .await?;
     }
 
-    let interval = epigraph_engine::belief_query::get_belief(&server.pool, claim_id, frame_id)
-        .await
-        .map_err(|e| match e {
-            epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
-                invalid_params(format!("frame {id} not found"))
-            }
-            epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
-                invalid_params(format!("claim {id} not found"))
-            }
-            epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
-                invalid_params(format!("invalid mass function: {msg}"))
-            }
-            other => internal_error(other),
-        })?;
+    let interval =
+        epigraph_engine::belief_query::get_belief(&server.pool, viewer, claim_id, frame_id)
+            .await
+            .map_err(|e| match e {
+                epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
+                    invalid_params(format!("frame {id} not found"))
+                }
+                epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
+                    invalid_params(format!("claim {id} not found"))
+                }
+                epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
+                    invalid_params(format!("invalid mass function: {msg}"))
+                }
+                other => internal_error(other),
+            })?;
 
     // Additive lensed interval, computed under the chosen (frame, perspective).
     // The top-level belief/plausibility/etc above stay the global (unlensed)
@@ -313,6 +327,7 @@ pub async fn get_belief(
         Some((lens_frame, lens_perspective)) => {
             let lensed = epigraph_engine::belief_query::get_perspective_belief(
                 &server.pool,
+                viewer,
                 claim_id,
                 lens_frame,
                 lens_perspective,
@@ -355,10 +370,11 @@ pub async fn get_belief(
 
 pub async fn list_frames(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ListFramesParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
-    let frames = FrameRepository::list(&server.pool, limit, 0)
+    let frames = FrameRepository::list(&server.pool, viewer, limit, 0)
         .await
         .map_err(internal_error)?;
 
@@ -380,12 +396,13 @@ pub async fn list_frames(
 
 pub async fn compare_methods(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: CompareMethodsParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
     let frame_id = parse_uuid(&params.frame_id)?;
 
-    let frame_row = FrameRepository::get_by_id(&server.pool, frame_id)
+    let frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("frame {frame_id} not found")))?;
@@ -393,9 +410,10 @@ pub async fn compare_methods(
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())
         .map_err(internal_error)?;
 
-    let all_bbas = MassFunctionRepository::get_for_claim_frame(&server.pool, claim_id, frame_id)
-        .await
-        .map_err(internal_error)?;
+    let all_bbas =
+        MassFunctionRepository::get_for_claim_frame(&server.pool, viewer, claim_id, frame_id)
+            .await
+            .map_err(internal_error)?;
 
     if all_bbas.is_empty() {
         return Err(invalid_params("no BBAs stored for this claim/frame"));
@@ -476,6 +494,7 @@ pub async fn compare_methods(
 
 pub async fn scoped_belief(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ScopedBeliefParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
@@ -500,6 +519,7 @@ pub async fn scoped_belief(
             let frame_id = parse_uuid(frame_id_str)?;
             let interval = epigraph_engine::belief_query::get_perspective_belief(
                 &server.pool,
+                viewer,
                 claim_id,
                 frame_id,
                 scope_id,
@@ -533,14 +553,15 @@ pub async fn scoped_belief(
         }
     }
 
-    let row = ScopedBeliefRepository::get(&server.pool, claim_id, scope_type, Some(scope_id))
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| {
-            invalid_params(format!(
-                "no scoped belief for claim {claim_id} with {scope_type} {scope_id}"
-            ))
-        })?;
+    let row =
+        ScopedBeliefRepository::get(&server.pool, viewer, claim_id, scope_type, Some(scope_id))
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "no scoped belief for claim {claim_id} with {scope_type} {scope_id}"
+                ))
+            })?;
 
     success_json(&ScopedBeliefResponse {
         claim_id: claim_id.to_string(),
@@ -556,11 +577,12 @@ pub async fn scoped_belief(
 
 pub async fn get_divergence(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetDivergenceParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
 
-    let row = DivergenceRepository::get_latest(&server.pool, claim_id)
+    let row = DivergenceRepository::get_latest(&server.pool, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("no divergence data for claim {claim_id}")))?;

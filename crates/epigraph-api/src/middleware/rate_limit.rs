@@ -351,7 +351,10 @@ mod tests {
     #[test]
     fn metrics_no_longer_bypasses_rate_limiting() {
         assert!(!should_bypass_rate_limit("/metrics", &Method::GET));
-        assert!(!should_bypass_rate_limit("/metrics-not-really", &Method::GET));
+        assert!(!should_bypass_rate_limit(
+            "/metrics-not-really",
+            &Method::GET
+        ));
     }
 
     #[test]

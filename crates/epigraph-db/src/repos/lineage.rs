@@ -203,16 +203,22 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_lineage(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
     ) -> Result<LineageResult, DbError> {
         let max_depth = max_depth.unwrap_or(100);
 
-        // Query claim lineage with recursive CTE
-        let lineage_rows: Vec<LineageRow> = sqlx::query_as(
+        // RECURSIVE CTE. The predicate is on the ANCHOR term, on the
+        // RECURSIVE term's `claims` alias, AND on the `edges` join that carries
+        // the walk. Marking only the anchor is the classic half-conversion: an
+        // invisible claim re-enters through the recursive arm and is returned
+        // in full, and `visibility_lint.rs` -- which checks that a marker is
+        // present, not where -- would not catch it.
+        let sql = viewer.splice(
             r#"
             WITH RECURSIVE lineage AS (
                 -- Base case: start with the target claim
@@ -226,6 +232,7 @@ impl LineageRepository {
                     false as cycle_detected
                 FROM claims c
                 WHERE c.id = $1
+                  /* {VISIBILITY:c} */
 
                 UNION ALL
 
@@ -243,6 +250,7 @@ impl LineageRepository {
                 JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
                 WHERE l.depth < $2
                   AND NOT c.id = ANY(l.path)
+                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
             )
             SELECT DISTINCT ON (id)
                 id,
@@ -255,11 +263,15 @@ impl LineageRepository {
             FROM lineage
             ORDER BY id, depth
             "#,
-        )
-        .bind(claim_id)
-        .bind(max_depth)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut lq = sqlx::query_as::<_, LineageRow>(&sql)
+            .bind(claim_id)
+            .bind(max_depth);
+        if let Some(g) = viewer.group_bind() {
+            lq = lq.bind(g);
+        }
+        let lineage_rows: Vec<LineageRow> = lq.fetch_all(pool).await?;
 
         // Check for cycles
         let cycle_detected = lineage_rows.iter().any(|r| r.cycle_detected);
@@ -273,7 +285,7 @@ impl LineageRepository {
         }
 
         // Query edges to build parent relationships
-        let edges: Vec<EdgeQueryRow> = sqlx::query_as(
+        let esql = viewer.splice(
             r#"
             SELECT source_id, target_id
             FROM edges
@@ -281,11 +293,15 @@ impl LineageRepository {
               AND target_type = 'claim'
               AND source_id = ANY($1)
               AND target_id = ANY($1)
+              /* {VISIBILITY:edges} */
             "#,
-        )
-        .bind(&claim_ids)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut eq = sqlx::query_as::<_, EdgeQueryRow>(&esql).bind(&claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            eq = eq.bind(g);
+        }
+        let edges: Vec<EdgeQueryRow> = eq.fetch_all(pool).await?;
 
         // Build parent map
         let mut parent_map: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
@@ -297,16 +313,20 @@ impl LineageRepository {
         }
 
         // Query all evidence for claims in lineage
-        let evidence_rows: Vec<EvidenceQueryRow> = sqlx::query_as(
+        let vsql = viewer.splice(
             r#"
             SELECT id, claim_id, evidence_type, content_hash
             FROM evidence
             WHERE claim_id = ANY($1)
+              /* {VISIBILITY:evidence} */
             "#,
-        )
-        .bind(&claim_ids)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut vq = sqlx::query_as::<_, EvidenceQueryRow>(&vsql).bind(&claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let evidence_rows: Vec<EvidenceQueryRow> = vq.fetch_all(pool).await?;
 
         // Build evidence map
         let mut evidence_map: HashMap<Uuid, LineageEvidence> = HashMap::new();
@@ -328,16 +348,20 @@ impl LineageRepository {
         // Query all reasoning traces for claims in lineage
         let trace_ids: Vec<Uuid> = lineage_rows.iter().filter_map(|r| r.trace_id).collect();
 
-        let trace_rows: Vec<TraceQueryRow> = sqlx::query_as(
+        let tsql = viewer.splice(
             r#"
             SELECT id, claim_id, reasoning_type, confidence
             FROM reasoning_traces
             WHERE claim_id = ANY($1)
+              /* {VISIBILITY:reasoning_traces} */
             "#,
-        )
-        .bind(&claim_ids)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut tq = sqlx::query_as::<_, TraceQueryRow>(&tsql).bind(&claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            tq = tq.bind(g);
+        }
+        let trace_rows: Vec<TraceQueryRow> = tq.fetch_all(pool).await?;
 
         // Query trace parents for DAG structure
         let trace_parent_rows: Vec<TraceParentRow> = if !trace_ids.is_empty() {
@@ -423,18 +447,29 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn detect_cycles(pool: &PgPool, claim_id: Uuid) -> Result<bool, DbError> {
+    #[instrument(skip(pool, viewer))]
+    pub async fn detect_cycles(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, DbError> {
         #[derive(sqlx::FromRow)]
         struct CycleResult {
             has_cycle: Option<bool>,
         }
 
-        let result: CycleResult = sqlx::query_as(
+        // RECURSIVE CTE. The predicate is on the ANCHOR term, on the
+        // RECURSIVE term's `claims` alias, AND on the `edges` join that carries
+        // the walk. Marking only the anchor is the classic half-conversion: an
+        // invisible claim re-enters through the recursive arm and is returned
+        // in full, and `visibility_lint.rs` -- which checks that a marker is
+        // present, not where -- would not catch it.
+        let sql = viewer.splice(
             r#"
             WITH RECURSIVE lineage AS (
                 SELECT id, ARRAY[id] as path, false as has_cycle
                 FROM claims WHERE id = $1
+                  /* {VISIBILITY:claims} */
 
                 UNION ALL
 
@@ -444,13 +479,17 @@ impl LineageRepository {
                 JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
                 WHERE NOT l.has_cycle
                   AND array_length(l.path, 1) < 1000
+                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
             )
             SELECT bool_or(has_cycle) as has_cycle FROM lineage
             "#,
-        )
-        .bind(claim_id)
-        .fetch_one(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, CycleResult>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let result: CycleResult = q.fetch_one(pool).await?;
 
         Ok(result.has_cycle.unwrap_or(false))
     }
@@ -469,18 +508,29 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_depth(pool: &PgPool, claim_id: Uuid) -> Result<i32, DbError> {
+    #[instrument(skip(pool, viewer))]
+    pub async fn get_depth(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<i32, DbError> {
         #[derive(sqlx::FromRow)]
         struct DepthResult {
             max_depth: Option<i32>,
         }
 
-        let result: DepthResult = sqlx::query_as(
+        // RECURSIVE CTE. The predicate is on the ANCHOR term, on the
+        // RECURSIVE term's `claims` alias, AND on the `edges` join that carries
+        // the walk. Marking only the anchor is the classic half-conversion: an
+        // invisible claim re-enters through the recursive arm and is returned
+        // in full, and `visibility_lint.rs` -- which checks that a marker is
+        // present, not where -- would not catch it.
+        let sql = viewer.splice(
             r#"
             WITH RECURSIVE lineage AS (
                 SELECT id, 0 as depth, ARRAY[id] as path
                 FROM claims WHERE id = $1
+                  /* {VISIBILITY:claims} */
 
                 UNION ALL
 
@@ -490,13 +540,17 @@ impl LineageRepository {
                 JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
                 WHERE NOT c.id = ANY(l.path)
                   AND l.depth < 1000
+                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
             )
             SELECT MAX(depth) as max_depth FROM lineage
             "#,
-        )
-        .bind(claim_id)
-        .fetch_one(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, DepthResult>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let result: DepthResult = q.fetch_one(pool).await?;
 
         Ok(result.max_depth.unwrap_or(0))
     }
@@ -516,9 +570,10 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_ancestor_ids(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
     ) -> Result<Vec<Uuid>, DbError> {
@@ -530,11 +585,18 @@ impl LineageRepository {
             depth: i32,
         }
 
-        let rows: Vec<IdDepthRow> = sqlx::query_as(
+        // RECURSIVE CTE. The predicate is on the ANCHOR term, on the
+        // RECURSIVE term's `claims` alias, AND on the `edges` join that carries
+        // the walk. Marking only the anchor is the classic half-conversion: an
+        // invisible claim re-enters through the recursive arm and is returned
+        // in full, and `visibility_lint.rs` -- which checks that a marker is
+        // present, not where -- would not catch it.
+        let sql = viewer.splice(
             r#"
             WITH RECURSIVE lineage AS (
                 SELECT id, 0 as depth, ARRAY[id] as path
                 FROM claims WHERE id = $1
+                  /* {VISIBILITY:claims} */
 
                 UNION ALL
 
@@ -544,16 +606,21 @@ impl LineageRepository {
                 JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
                 WHERE l.depth < $2
                   AND NOT c.id = ANY(l.path)
+                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
             )
             SELECT DISTINCT ON (id) id, depth
             FROM lineage
             ORDER BY id, depth
             "#,
-        )
-        .bind(claim_id)
-        .bind(max_depth)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, IdDepthRow>(&sql)
+            .bind(claim_id)
+            .bind(max_depth);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<IdDepthRow> = q.fetch_all(pool).await?;
 
         // Sort by depth descending (ancestors first)
         let mut sorted: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.id, r.depth)).collect();
@@ -593,16 +660,22 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_descendants(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
     ) -> Result<LineageResult, DbError> {
         let max_depth = max_depth.unwrap_or(100);
 
-        // Query descendant claims with recursive CTE (reverse direction)
-        let lineage_rows: Vec<LineageRow> = sqlx::query_as(
+        // RECURSIVE CTE. The predicate is on the ANCHOR term, on the
+        // RECURSIVE term's `claims` alias, AND on the `edges` join that carries
+        // the walk. Marking only the anchor is the classic half-conversion: an
+        // invisible claim re-enters through the recursive arm and is returned
+        // in full, and `visibility_lint.rs` -- which checks that a marker is
+        // present, not where -- would not catch it.
+        let sql = viewer.splice(
             r#"
             WITH RECURSIVE descendants AS (
                 -- Base case: start with the source claim
@@ -616,6 +689,7 @@ impl LineageRepository {
                     false as cycle_detected
                 FROM claims c
                 WHERE c.id = $1
+                  /* {VISIBILITY:c} */
 
                 UNION ALL
 
@@ -633,6 +707,7 @@ impl LineageRepository {
                 JOIN descendants d ON e.source_id = d.id AND e.source_type = 'claim'
                 WHERE d.depth < $2
                   AND NOT c.id = ANY(d.path)
+                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
             )
             SELECT DISTINCT ON (id)
                 id,
@@ -645,11 +720,15 @@ impl LineageRepository {
             FROM descendants
             ORDER BY id, depth
             "#,
-        )
-        .bind(claim_id)
-        .bind(max_depth)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut dq = sqlx::query_as::<_, LineageRow>(&sql)
+            .bind(claim_id)
+            .bind(max_depth);
+        if let Some(g) = viewer.group_bind() {
+            dq = dq.bind(g);
+        }
+        let lineage_rows: Vec<LineageRow> = dq.fetch_all(pool).await?;
 
         // Check for cycles
         let cycle_detected = lineage_rows.iter().any(|r| r.cycle_detected);
@@ -663,7 +742,7 @@ impl LineageRepository {
         }
 
         // Query edges to build parent relationships (for descendants, parents are in reverse)
-        let edges: Vec<EdgeQueryRow> = sqlx::query_as(
+        let esql = viewer.splice(
             r#"
             SELECT source_id, target_id
             FROM edges
@@ -671,11 +750,15 @@ impl LineageRepository {
               AND target_type = 'claim'
               AND source_id = ANY($1)
               AND target_id = ANY($1)
+              /* {VISIBILITY:edges} */
             "#,
-        )
-        .bind(&claim_ids)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut eq = sqlx::query_as::<_, EdgeQueryRow>(&esql).bind(&claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            eq = eq.bind(g);
+        }
+        let edges: Vec<EdgeQueryRow> = eq.fetch_all(pool).await?;
 
         // Build parent map (source supports target)
         let mut parent_map: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
@@ -687,16 +770,20 @@ impl LineageRepository {
         }
 
         // Query all evidence for claims in lineage
-        let evidence_rows: Vec<EvidenceQueryRow> = sqlx::query_as(
+        let vsql = viewer.splice(
             r#"
             SELECT id, claim_id, evidence_type, content_hash
             FROM evidence
             WHERE claim_id = ANY($1)
+              /* {VISIBILITY:evidence} */
             "#,
-        )
-        .bind(&claim_ids)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut vq = sqlx::query_as::<_, EvidenceQueryRow>(&vsql).bind(&claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let evidence_rows: Vec<EvidenceQueryRow> = vq.fetch_all(pool).await?;
 
         // Build evidence map
         let mut evidence_map: HashMap<Uuid, LineageEvidence> = HashMap::new();
@@ -718,16 +805,20 @@ impl LineageRepository {
         // Query all reasoning traces for claims in lineage
         let trace_ids: Vec<Uuid> = lineage_rows.iter().filter_map(|r| r.trace_id).collect();
 
-        let trace_rows: Vec<TraceQueryRow> = sqlx::query_as(
+        let tsql = viewer.splice(
             r#"
             SELECT id, claim_id, reasoning_type, confidence
             FROM reasoning_traces
             WHERE claim_id = ANY($1)
+              /* {VISIBILITY:reasoning_traces} */
             "#,
-        )
-        .bind(&claim_ids)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut tq = sqlx::query_as::<_, TraceQueryRow>(&tsql).bind(&claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            tq = tq.bind(g);
+        }
+        let trace_rows: Vec<TraceQueryRow> = tq.fetch_all(pool).await?;
 
         // Query trace parents for DAG structure
         let trace_parent_rows: Vec<TraceParentRow> = if !trace_ids.is_empty() {
@@ -814,9 +905,10 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_descendant_ids(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
     ) -> Result<Vec<Uuid>, DbError> {
@@ -828,11 +920,18 @@ impl LineageRepository {
             depth: i32,
         }
 
-        let rows: Vec<IdDepthRow> = sqlx::query_as(
+        // RECURSIVE CTE. The predicate is on the ANCHOR term, on the
+        // RECURSIVE term's `claims` alias, AND on the `edges` join that carries
+        // the walk. Marking only the anchor is the classic half-conversion: an
+        // invisible claim re-enters through the recursive arm and is returned
+        // in full, and `visibility_lint.rs` -- which checks that a marker is
+        // present, not where -- would not catch it.
+        let sql = viewer.splice(
             r#"
             WITH RECURSIVE descendants AS (
                 SELECT id, 0 as depth, ARRAY[id] as path
                 FROM claims WHERE id = $1
+                  /* {VISIBILITY:claims} */
 
                 UNION ALL
 
@@ -842,16 +941,21 @@ impl LineageRepository {
                 JOIN descendants d ON e.source_id = d.id AND e.source_type = 'claim'
                 WHERE d.depth < $2
                   AND NOT c.id = ANY(d.path)
+                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
             )
             SELECT DISTINCT ON (id) id, depth
             FROM descendants
             ORDER BY id, depth
             "#,
-        )
-        .bind(claim_id)
-        .bind(max_depth)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, IdDepthRow>(&sql)
+            .bind(claim_id)
+            .bind(max_depth);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<IdDepthRow> = q.fetch_all(pool).await?;
 
         // Sort by depth ascending (root first)
         let mut sorted: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.id, r.depth)).collect();
@@ -878,9 +982,10 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_lca(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_a: Uuid,
         claim_b: Uuid,
         max_depth: Option<i32>,
@@ -895,12 +1000,20 @@ impl LineageRepository {
             total_depth: i32,
         }
 
-        let row: Option<LcaRow> = sqlx::query_as(
+        // RECURSIVE CTE. The predicate is on the ANCHOR term, on the
+        // RECURSIVE term's `claims` alias, AND on the `edges` join that carries
+        // the walk. Marking only the anchor is the classic half-conversion: an
+        // invisible claim re-enters through the recursive arm and is returned
+        // in full, and `visibility_lint.rs` -- which checks that a marker is
+        // present, not where -- would not catch it.
+        // TWO recursive CTEs: six markers, all resolving to the same bind.
+        let sql = viewer.splice(
             r#"
             WITH RECURSIVE ancestors_a AS (
                 -- Ancestor set for claim A
                 SELECT id, 0 as depth, ARRAY[id] as path
                 FROM claims WHERE id = $1
+                  /* {VISIBILITY:claims} */
 
                 UNION ALL
 
@@ -910,11 +1023,13 @@ impl LineageRepository {
                 JOIN ancestors_a a ON e.target_id = a.id AND e.target_type = 'claim'
                 WHERE a.depth < $3
                   AND NOT c.id = ANY(a.path)
+                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
             ),
             ancestors_b AS (
                 -- Ancestor set for claim B
                 SELECT id, 0 as depth, ARRAY[id] as path
                 FROM claims WHERE id = $2
+                  /* {VISIBILITY:claims} */
 
                 UNION ALL
 
@@ -924,6 +1039,7 @@ impl LineageRepository {
                 JOIN ancestors_b b ON e.target_id = b.id AND e.target_type = 'claim'
                 WHERE b.depth < $3
                   AND NOT c.id = ANY(b.path)
+                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
             )
             SELECT
                 a.id AS ancestor_id,
@@ -936,12 +1052,16 @@ impl LineageRepository {
             ORDER BY total_depth ASC
             LIMIT 1
             "#,
-        )
-        .bind(claim_a)
-        .bind(claim_b)
-        .bind(max_depth)
-        .fetch_optional(pool)
-        .await?;
+            4,
+        );
+        let mut q = sqlx::query_as::<_, LcaRow>(&sql)
+            .bind(claim_a)
+            .bind(claim_b)
+            .bind(max_depth);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<LcaRow> = q.fetch_optional(pool).await?;
 
         Ok(row.map(|r| LcaResult {
             ancestor_id: r.ancestor_id,
@@ -1027,7 +1147,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = LineageRepository::get_lca(&pool, child_a, child_b, None)
+        let result = LineageRepository::get_lca(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), child_a, child_b, None)
             .await
             .unwrap();
 
@@ -1063,7 +1183,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = LineageRepository::get_lca(&pool, claim_a, claim_b, None)
+        let result = LineageRepository::get_lca(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), claim_a, claim_b, None)
             .await
             .unwrap();
 
@@ -1111,7 +1231,7 @@ mod tests {
                 .unwrap();
         }
 
-        let result = LineageRepository::get_lca(&pool, mid_a, mid_b, None)
+        let result = LineageRepository::get_lca(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), mid_a, mid_b, None)
             .await
             .unwrap();
 
@@ -1154,7 +1274,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = LineageRepository::get_lca(&pool, ancestor, descendant, None)
+        let result = LineageRepository::get_lca(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), ancestor, descendant, None)
             .await
             .unwrap();
 

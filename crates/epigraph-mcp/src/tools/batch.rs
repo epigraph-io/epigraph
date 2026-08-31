@@ -9,6 +9,7 @@ use crate::types::*;
 /// Batch submit multiple claims (max 100).
 pub async fn batch_submit_claims(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: BatchSubmitClaimsParams,
 ) -> Result<CallToolResult, McpError> {
     if params.claims.is_empty() {
@@ -35,7 +36,7 @@ pub async fn batch_submit_claims(
             novelty_threshold: None,
         };
 
-        match crate::tools::claims::submit_claim(server, claim_params).await {
+        match crate::tools::claims::submit_claim(server, viewer, claim_params).await {
             Ok(result) => {
                 // Extract claim_id from the JSON text content returned by submit_claim
                 let claim_id = result
@@ -121,6 +122,7 @@ pub async fn stage_claims(
 /// Get system statistics.
 pub async fn system_stats(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: SystemStatsParams,
 ) -> Result<CallToolResult, McpError> {
     let detailed = params.detailed.unwrap_or(false);
@@ -180,7 +182,7 @@ pub async fn system_stats(
         // unpopulated RDF layer is observable, rather than silently reported as
         // count=0 / entity-not-found by query_triples/search_triples/
         // entity_neighborhood (backlog ae2784a9).
-        let index = epigraph_db::TripleRepository::index_counts(&server.pool)
+        let index = epigraph_db::TripleRepository::index_counts(&server.pool, viewer)
             .await
             .map_err(internal_error)?;
 

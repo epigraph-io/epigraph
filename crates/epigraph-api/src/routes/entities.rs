@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::{errors::ApiError, state::AppState};
 
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use axum::extract::Path;
 #[cfg(feature = "db")]
@@ -238,6 +239,7 @@ pub async fn batch_create_triples(
 /// callers can distinguish "no entity found" from "entity found but no triples."
 #[cfg(feature = "db")]
 pub async fn query_triples(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(req): Json<QueryTriplesRequest>,
 ) -> Result<Json<Vec<epigraph_db::TripleRow>>, ApiError> {
@@ -268,6 +270,7 @@ pub async fn query_triples(
 
     let rows = TripleRepository::query(
         &state.db_pool,
+        &viewer,
         subject_id,
         req.predicate.as_deref(),
         object_id,
@@ -293,6 +296,7 @@ pub async fn query_triples(
 /// another entity, this endpoint returns the neighborhood of the survivor.
 #[cfg(feature = "db")]
 pub async fn entity_neighborhood(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(entity_id): Path<Uuid>,
 ) -> Result<Json<Vec<epigraph_db::TripleRow>>, ApiError> {
@@ -307,7 +311,8 @@ pub async fn entity_neighborhood(
     // If this entity has been merged into another, use the survivor's ID
     let canonical_id = entity.merged_into.unwrap_or(entity.id);
 
-    let rows = TripleRepository::entity_neighborhood(&state.db_pool, canonical_id, 200).await?;
+    let rows =
+        TripleRepository::entity_neighborhood(&state.db_pool, &viewer, canonical_id, 200).await?;
     Ok(Json(rows))
 }
 

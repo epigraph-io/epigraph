@@ -15,6 +15,9 @@
 //!     against the entity-type allowlist; paper-attribution uses
 //!     `'paper'` / `'claim'`, all other edges `'claim'` / `'claim'`.
 
+#[path = "viewer_fixture.rs"]
+mod viewerfx;
+
 // rustfmt 1.8 sorts `NeighborPath` before `__test_only`; older CI rustfmt sorts
 // the reverse. #[rustfmt::skip] keeps both happy by opting out of the sort.
 #[rustfmt::skip]
@@ -513,6 +516,7 @@ async fn corroborates_appears_on_both_endpoints_when_both_in_result_set(pool: Pg
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_crypto::AgentSigner;
     use epigraph_mcp::embed::McpEmbedder;
     use epigraph_mcp::tools::recall::{recall_with_context, RecallWithContextParams};
@@ -557,7 +561,7 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
         since: None,
     };
 
-    let result = recall_with_context(&server, params).await;
+    let result = recall_with_context(&server, &viewer, params).await;
     let err = result.expect_err("expected an error for centroid_dim=3072 with no population");
     let msg = format!("{err:?}");
     assert!(
@@ -992,6 +996,7 @@ fn parse_response(result: rmcp::model::CallToolResult) -> RecallResponseStruct {
 /// flat ANN and still return results. Mirrors the REST fallback.
 #[sqlx::test(migrations = "../../migrations")]
 async fn diverse_mode_falls_back_to_flat_when_themes_empty(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1015,7 +1020,7 @@ async fn diverse_mode_falls_back_to_flat_when_themes_empty(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     let params = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 10);
-    let result = recall_with_context_with_pgvec(&server, params, 1536, &pgvec)
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &pgvec)
         .await
         .expect("diverse-on-empty-themes must succeed");
     let resp = parse_response(result);
@@ -1039,6 +1044,7 @@ async fn diverse_mode_falls_back_to_flat_when_themes_empty(pool: PgPool) {
 /// Compares against `ClaimRepository::search_by_embedding` directly.
 #[sqlx::test(migrations = "../../migrations")]
 async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1066,14 +1072,14 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     // uses in diverse=false mode. If diverse=false matches this ordering
     // verbatim, the diverse-routing change preserves the flat path.
     let direct_hits =
-        epigraph_db::ClaimRepository::search_by_embedding(&pool, &query_pgvec, 1536, 10, None)
+        epigraph_db::ClaimRepository::search_by_embedding(&pool, &viewer, &query_pgvec, 1536, 10, None)
             .await
             .expect("direct flat ANN");
     let direct_order: Vec<Uuid> = direct_hits.iter().map(|h| h.claim_id).collect();
 
     let server = build_test_server(pool.clone());
     let params = diverse_params(/*diverse=*/ false, None, None, 10);
-    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
         .await
         .expect("diverse=false");
     let resp = parse_response(result);
@@ -1095,6 +1101,7 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
 /// strictly excluded by SQL `LIMIT 20`) appear.
 #[sqlx::test(migrations = "../../migrations")]
 async fn candidate_pool_20_restricts_mcp_diverse_pool(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1132,7 +1139,7 @@ async fn candidate_pool_20_restricts_mcp_diverse_pool(pool: PgPool) {
         /*candidate_pool=*/ Some(20),
     );
 
-    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
         .await
         .expect("recall_with_context with candidate_pool=20");
     let resp = parse_response(result);
@@ -1165,6 +1172,7 @@ async fn candidate_pool_20_restricts_mcp_diverse_pool(pool: PgPool) {
 /// could never enter the candidate matrix.
 #[sqlx::test(migrations = "../../migrations")]
 async fn candidate_pool_200_widens_mcp_diverse_pool(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1201,7 +1209,7 @@ async fn candidate_pool_200_widens_mcp_diverse_pool(pool: PgPool) {
         /*candidate_pool=*/ Some(200),
     );
 
-    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
         .await
         .expect("recall_with_context with candidate_pool=200");
     let resp = parse_response(result);
@@ -1227,6 +1235,7 @@ async fn candidate_pool_200_widens_mcp_diverse_pool(pool: PgPool) {
 /// pulls in ≥1 from theme_b for graph coverage.
 #[sqlx::test(migrations = "../../migrations")]
 async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1283,7 +1292,7 @@ async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
 
     // Flat baseline: hit count by theme.
     let flat_params = diverse_params(/*diverse=*/ false, None, None, 5);
-    let flat_result = recall_with_context_with_pgvec(&server, flat_params, 1536, &query_pgvec)
+    let flat_result = recall_with_context_with_pgvec(&server, &viewer, flat_params, 1536, &query_pgvec)
         .await
         .expect("flat baseline");
     let flat_resp = parse_response(flat_result);
@@ -1315,7 +1324,7 @@ async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
     // Diverse path: budget 5, alpha 0.4 (MCP default).
     let diverse_params_v = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 5);
     let diverse_result =
-        recall_with_context_with_pgvec(&server, diverse_params_v, 1536, &query_pgvec)
+        recall_with_context_with_pgvec(&server, &viewer, diverse_params_v, 1536, &query_pgvec)
             .await
             .expect("diverse path");
     let diverse_resp = parse_response(diverse_result);
@@ -1358,6 +1367,7 @@ async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
 /// rather than relying on the plain-`recall` coverage.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1417,7 +1427,7 @@ async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     let result = recall_with_context_with_pgvec(
-        &server,
+        &server, &viewer,
         diverse_params(false, None, None, 10),
         1536,
         &pgvec,
@@ -1478,6 +1488,7 @@ async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
 /// evidence that this surface does — they are separate handlers.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_with_context_writes_its_own_audit_row(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1488,7 +1499,7 @@ async fn recall_with_context_writes_its_own_audit_row(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     let result = recall_with_context_with_pgvec(
-        &server,
+        &server, &viewer,
         diverse_params(false, None, None, 10),
         1536,
         &pgvec,

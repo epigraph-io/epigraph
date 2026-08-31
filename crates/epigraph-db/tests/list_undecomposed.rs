@@ -4,6 +4,9 @@
 //! two exclusion classes (telemetry, too-short) so a regression in ANY arm
 //! of the WHERE clause surfaces here.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_db::{ClaimRepository, EdgeRepository};
 use sqlx::PgPool;
@@ -45,6 +48,7 @@ async fn seed_claim(
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_undecomposed_excludes_both_edge_directions_and_noise(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     let parent = seed_claim(
@@ -95,7 +99,7 @@ async fn list_undecomposed_excludes_both_edge_directions_and_noise(pool: PgPool)
     .await;
     let short = seed_claim(&pool, agent, "tiny", &[], serde_json::json!({})).await;
 
-    let rows = ClaimRepository::list_undecomposed(&pool, 50, 0)
+    let rows = ClaimRepository::list_undecomposed(&pool, &viewer, 50, 0)
         .await
         .unwrap();
     let ids: std::collections::HashSet<Uuid> = rows.iter().map(|c| c.id.as_uuid()).collect();
@@ -127,6 +131,7 @@ async fn list_undecomposed_excludes_both_edge_directions_and_noise(pool: PgPool)
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_undecomposed_orders_oldest_first_and_pages(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let mut seeded = Vec::new();
     for i in 0..3 {
@@ -142,12 +147,12 @@ async fn list_undecomposed_orders_oldest_first_and_pages(pool: PgPool) {
         );
     }
     // created_at ASC => insertion order.
-    let page1 = ClaimRepository::list_undecomposed(&pool, 2, 0)
+    let page1 = ClaimRepository::list_undecomposed(&pool, &viewer, 2, 0)
         .await
         .unwrap();
     assert_eq!(page1.len(), 2);
     assert_eq!(page1[0].id.as_uuid(), seeded[0], "oldest first");
-    let page2 = ClaimRepository::list_undecomposed(&pool, 2, 2)
+    let page2 = ClaimRepository::list_undecomposed(&pool, &viewer, 2, 2)
         .await
         .unwrap();
     assert_eq!(page2.len(), 1);

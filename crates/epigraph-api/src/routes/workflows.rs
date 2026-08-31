@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "db")]
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 
@@ -174,6 +175,7 @@ fn slugify_goal(s: &str) -> String {
 /// Idempotent on `(slugify(goal), generation=0)`.
 #[cfg(feature = "db")]
 pub async fn store_workflow(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<StoreWorkflowRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -236,7 +238,7 @@ pub async fn store_workflow(
                 message: format!("workflow ingest: {e}"),
             })?;
 
-    auto_wire_inserted_edges(&state.db_pool, &result).await;
+    auto_wire_inserted_edges(&state.db_pool, &viewer, &result).await;
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
@@ -326,6 +328,7 @@ fn workflow_recall_to_json(r: &epigraph_db::WorkflowRecallResult) -> serde_json:
 /// GET /api/v1/workflows/search - Search workflows by semantic goal similarity.
 #[cfg(feature = "db")]
 pub async fn search_workflows(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<SearchWorkflowsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -337,6 +340,7 @@ pub async fn search_workflows(
         if let Ok(query_vec) = embedder.generate(&params.goal).await {
             let results = epigraph_db::WorkflowRepository::find_by_embedding(
                 &state.db_pool,
+                &viewer,
                 &query_vec,
                 min_truth,
                 limit,
@@ -358,6 +362,7 @@ pub async fn search_workflows(
             let affinity_map: std::collections::HashMap<uuid::Uuid, (f64, i64)> =
                 match epigraph_db::BehavioralExecutionRepository::behavioral_affinity_lineage(
                     &state.db_pool,
+                    &viewer,
                     &pgvec,
                     0.5,
                     1,
@@ -378,6 +383,7 @@ pub async fn search_workflows(
 
                 let lineage_root = epigraph_db::WorkflowRepository::find_lineage_root(
                     &state.db_pool,
+                    &viewer,
                     r.claim_id,
                 )
                 .await
@@ -417,6 +423,7 @@ pub async fn search_workflows(
     // Fallback: text search
     let results = epigraph_db::WorkflowRepository::find_by_text(
         &state.db_pool,
+        &viewer,
         &params.goal,
         min_truth,
         limit,
@@ -454,17 +461,19 @@ pub async fn search_workflows(
 /// GET /api/v1/workflows - List workflows.
 #[cfg(feature = "db")]
 pub async fn list_workflows(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListWorkflowsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
 
-    let workflows = epigraph_db::WorkflowRepository::list(&state.db_pool, min_truth, None, limit)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to list workflows: {e}"),
-        })?;
+    let workflows =
+        epigraph_db::WorkflowRepository::list(&state.db_pool, &viewer, min_truth, None, limit)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to list workflows: {e}"),
+            })?;
 
     let results: Vec<serde_json::Value> = workflows
         .iter()
@@ -775,6 +784,7 @@ pub async fn report_outcome(
     tag = "workflows"
 )]
 pub async fn find_workflow_hierarchical(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<HierarchicalSearchQuery>,
 ) -> Result<Json<HierarchicalSearchResponse>, ApiError> {
@@ -837,6 +847,7 @@ pub async fn find_workflow_hierarchical(
         let mut resolved_by_workflow =
             epigraph_db::WorkflowRepository::resolve_steps_to_heads_batched(
                 &state.db_pool,
+                &viewer,
                 &workflow_ids,
             )
             .await
@@ -1152,6 +1163,7 @@ pub async fn evolve_step(
     tag = "workflows"
 )]
 pub async fn deprecate_workflow(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
     Query(params): Query<DeprecateQuery>,
@@ -1177,7 +1189,7 @@ pub async fn deprecate_workflow(
     let mut ids_to_deprecate = vec![workflow_id];
     if cascade {
         let descendants =
-            epigraph_db::WorkflowRepository::find_descendants(&state.db_pool, workflow_id)
+            epigraph_db::WorkflowRepository::find_descendants(&state.db_pool, &viewer, workflow_id)
                 .await
                 .unwrap_or_default();
         ids_to_deprecate.extend(descendants);
@@ -1319,6 +1331,7 @@ pub async fn record_behavioral_execution(
     tag = "workflows"
 )]
 pub async fn ingest_workflow(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1330,7 +1343,7 @@ pub async fn ingest_workflow(
                 message: format!("workflow ingest: {e}"),
             })?;
 
-    auto_wire_inserted_edges(&state.db_pool, &result).await;
+    auto_wire_inserted_edges(&state.db_pool, &viewer, &result).await;
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
@@ -1429,6 +1442,7 @@ fn format_embedding(embedding: &[f32]) -> String {
 /// `system_agent_id` from the executor result.
 async fn auto_wire_inserted_edges(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     result: &epigraph_ingest_executor::WorkflowIngestExecutionResult,
 ) {
     let Some(agent_id) = result.system_agent_id else {
@@ -1437,6 +1451,7 @@ async fn auto_wire_inserted_edges(
     for e in &result.inserted_edges {
         epigraph_engine::edge_factor::auto_wire_edge_if_epistemic(
             pool,
+            viewer,
             true, // executor only emits InsertedPlanEdge when was_created=true
             e.edge_id,
             e.source_id,

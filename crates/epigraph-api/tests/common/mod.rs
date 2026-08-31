@@ -329,12 +329,14 @@ pub async fn seed_probe_claim_with_agent(
 ) -> (Uuid, String) {
     let claim_id = seed_claim_with_agent(pool, content, agent_id).await;
     let probe = Uuid::new_v4().to_string();
-    sqlx::query("UPDATE claims SET properties = jsonb_build_object('probe', $1::text) WHERE id = $2")
-        .bind(&probe)
-        .bind(claim_id)
-        .execute(pool)
-        .await
-        .expect("set probe property");
+    sqlx::query(
+        "UPDATE claims SET properties = jsonb_build_object('probe', $1::text) WHERE id = $2",
+    )
+    .bind(&probe)
+    .bind(claim_id)
+    .execute(pool)
+    .await
+    .expect("set probe property");
     (claim_id, probe)
 }
 
@@ -604,7 +606,13 @@ pub async fn seed_community_ownership(
 pub async fn seed_community_with_member(pool: &PgPool, agent_id: Uuid) -> Uuid {
     // `agents.public_key` is UNIQUE and length-checked; derive 32 bytes from
     // the id so repeated calls for the same agent are idempotent.
-    let pk: Vec<u8> = agent_id.as_bytes().iter().copied().cycle().take(32).collect();
+    let pk: Vec<u8> = agent_id
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(32)
+        .collect();
     sqlx::query(
         "INSERT INTO agents (id, public_key, agent_type) \
          VALUES ($1, $2, 'system') ON CONFLICT (id) DO NOTHING",

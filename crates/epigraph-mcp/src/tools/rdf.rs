@@ -22,6 +22,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 pub async fn query_triples(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: QueryTriplesParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
@@ -49,6 +50,7 @@ pub async fn query_triples(
     let min_confidence = params.min_confidence.unwrap_or(0.0);
     let triples = TripleRepository::query(
         &server.pool,
+        viewer,
         subject_id,
         params.predicate.as_deref(),
         object_id,
@@ -66,6 +68,7 @@ pub async fn query_triples(
 
 pub async fn entity_neighborhood(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: EntityNeighborhoodParams,
 ) -> Result<CallToolResult, McpError> {
     // Try UUID first, then name lookup
@@ -92,7 +95,7 @@ pub async fn entity_neighborhood(
         entity.merged_into.unwrap_or(entity.id)
     };
 
-    let triples = TripleRepository::entity_neighborhood(&server.pool, canonical_id, 100)
+    let triples = TripleRepository::entity_neighborhood(&server.pool, viewer, canonical_id, 100)
         .await
         .map_err(internal_error)?;
 
@@ -107,6 +110,7 @@ pub async fn entity_neighborhood(
 
 pub async fn search_triples(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: SearchTriplesParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
@@ -114,13 +118,13 @@ pub async fn search_triples(
     // Path B: Embedding fallback — find claims, then look up their triples
     let claim_results = server
         .embedder
-        .search(&params.query, limit)
+        .search(viewer, &params.query, limit)
         .await
         .map_err(internal_error)?;
 
     let mut triples = Vec::new();
     for (claim_id, _similarity) in &claim_results {
-        let claim_triples = TripleRepository::get_by_claim(&server.pool, *claim_id)
+        let claim_triples = TripleRepository::get_by_claim(&server.pool, viewer, *claim_id)
             .await
             .map_err(internal_error)?;
         triples.extend(claim_triples);

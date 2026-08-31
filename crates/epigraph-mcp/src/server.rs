@@ -23,6 +23,18 @@ use epigraph_crypto::AgentSigner;
 pub struct EpiGraphMcpFull {
     pub(crate) tool_router: ToolRouter<Self>,
     pub(crate) pool: PgPool,
+    /// The tenancy-aware pool, when this process built one.
+    ///
+    /// `Option` for the same reason as `epigraph_api::AppState::scoped`:
+    /// `ScopedPool::connect` owns pool construction (the `after_release` scrub
+    /// can only be installed at build time), so it cannot be wrapped around a
+    /// `PgPool` a caller already has. The four legacy constructors set `None`;
+    /// [`Self::with_scoped_pool`] is the one that populates it.
+    ///
+    /// A `None` here means `crate::maintenance::maintenance_viewer` fails
+    /// closed — the three maintenance tools refuse rather than silently reading
+    /// a scoped subset or a full corpus they were not licensed for.
+    pub(crate) scoped: Option<epigraph_db::ScopedPool>,
     pub(crate) signer: Arc<AgentSigner>,
     pub(crate) agent_db_id: Arc<Mutex<Option<uuid::Uuid>>>,
     pub(crate) embedder: Arc<McpEmbedder>,
@@ -341,6 +353,7 @@ impl EpiGraphMcpFull {
         Self {
             tool_router: Self::tool_router(),
             pool,
+            scoped: None,
             signer: Arc::new(signer),
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder: Arc::new(embedder),
@@ -349,6 +362,23 @@ impl EpiGraphMcpFull {
             llm_identity,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Attach a [`epigraph_db::ScopedPool`] to an already-built server.
+    ///
+    /// The only way `self.scoped` becomes `Some`, and therefore the only way
+    /// `crate::maintenance::maintenance_viewer` can succeed. Consumed and
+    /// returned so it composes with the four existing constructors rather than
+    /// forcing a fifth:
+    ///
+    /// ```ignore
+    /// let server = EpiGraphMcpFull::new(pool, signer, embedder, ro)
+    ///     .with_scoped_pool(scoped);
+    /// ```
+    #[must_use]
+    pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
+        self.scoped = Some(scoped);
+        self
     }
 
     /// Create from pre-wrapped `Arc` values (for HTTP transport factory closure).
@@ -388,6 +418,7 @@ impl EpiGraphMcpFull {
         Self {
             tool_router: Self::tool_router(),
             pool,
+            scoped: None,
             signer,
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder,
@@ -406,9 +437,12 @@ impl EpiGraphMcpFull {
     async fn submit_claim(
         &self,
         Parameters(params): Parameters<SubmitClaimParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::claims::submit_claim(self, params).await
+        tools::claims::submit_claim(self, viewer, params).await
     }
 
     #[tool(
@@ -420,9 +454,10 @@ impl EpiGraphMcpFull {
         extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         let server_agent = self.agent_id().await?;
         let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::claims::query_claims(self, params, requester).await
+        tools::claims::query_claims(self, viewer, params, requester).await
     }
 
     #[tool(
@@ -434,9 +469,10 @@ impl EpiGraphMcpFull {
         extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         let server_agent = self.agent_id().await?;
         let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::claims::query_undecomposed_claims(self, params, requester).await
+        tools::claims::query_undecomposed_claims(self, viewer, params, requester).await
     }
 
     #[tool(
@@ -448,9 +484,10 @@ impl EpiGraphMcpFull {
         extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         let server_agent = self.agent_id().await?;
         let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::claims::get_claim(self, params, requester).await
+        tools::claims::get_claim(self, viewer, params, requester).await
     }
 
     #[tool(
@@ -459,8 +496,11 @@ impl EpiGraphMcpFull {
     async fn verify_claim(
         &self,
         Parameters(params): Parameters<VerifyClaimParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::claims::verify_claim(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::claims::verify_claim(self, viewer, params).await
     }
 
     #[tool(
@@ -469,9 +509,12 @@ impl EpiGraphMcpFull {
     async fn update_with_evidence(
         &self,
         Parameters(params): Parameters<UpdateWithEvidenceParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::claims::update_with_evidence(self, params).await
+        tools::claims::update_with_evidence(self, viewer, params).await
     }
 
     #[tool(
@@ -484,7 +527,8 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
         let auth = extensions.get::<epigraph_auth::AuthContext>();
-        crate::tools::supersede::supersede_claim(self, params, auth).await
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::supersede::supersede_claim(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -497,7 +541,8 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
         let auth = extensions.get::<epigraph_auth::AuthContext>();
-        crate::tools::supersede::mark_duplicate(self, params, auth).await
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::supersede::mark_duplicate(self, viewer, params, auth).await
     }
 
     #[tool(description = "Atomically add and/or remove labels on an existing claim. Idempotent.")]
@@ -524,7 +569,8 @@ impl EpiGraphMcpFull {
         // we pass `None` and the handler falls back to agent-equality
         // against the server's own signer agent.
         let auth = extensions.get::<epigraph_auth::AuthContext>();
-        crate::tools::claims::resolve_backlog_item(self, params, auth).await
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::claims::resolve_backlog_item(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -546,8 +592,11 @@ impl EpiGraphMcpFull {
     async fn get_provenance(
         &self,
         Parameters(params): Parameters<GetProvenanceParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::provenance::get_provenance(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::provenance::get_provenance(self, viewer, params).await
     }
 
     #[tool(
@@ -560,8 +609,11 @@ impl EpiGraphMcpFull {
     async fn get_provenance_chain(
         &self,
         Parameters(params): Parameters<crate::types::GetProvenanceChainParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::provenance_chain::get_provenance_chain(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::provenance_chain::get_provenance_chain(self, viewer, params).await
     }
 
     #[tool(
@@ -573,8 +625,11 @@ impl EpiGraphMcpFull {
     async fn get_recall_events(
         &self,
         Parameters(params): Parameters<crate::types::GetRecallEventsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::recall_events::get_recall_events(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::recall_events::get_recall_events(self, viewer, params).await
     }
 
     #[tool(
@@ -588,9 +643,12 @@ impl EpiGraphMcpFull {
     async fn consolidate_claims(
         &self,
         Parameters(params): Parameters<crate::types::ConsolidateClaimsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::consolidate::consolidate_claims(self, params).await
+        tools::consolidate::consolidate_claims(self, viewer, params).await
     }
 
     #[tool(
@@ -605,8 +663,14 @@ impl EpiGraphMcpFull {
         &self,
         Parameters(params): Parameters<crate::types::SweepSemanticDuplicatesParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (_maint_conn, viewer) = crate::maintenance::maintenance_viewer(
+            self,
+            epigraph_db::visibility::SystemReason::DedupSweep,
+        )
+        .await?;
+        let viewer = &viewer;
         self.reject_if_read_only()?;
-        tools::dedup_sweep::sweep_semantic_duplicates(self, params).await
+        tools::dedup_sweep::sweep_semantic_duplicates(self, viewer, params).await
     }
 
     // ── Alternative-set candidate finder (1 tool) ──
@@ -631,9 +695,12 @@ impl EpiGraphMcpFull {
     async fn memorize(
         &self,
         Parameters(params): Parameters<MemorizeParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::memory::memorize(self, params).await
+        tools::memory::memorize(self, viewer, params).await
     }
 
     #[tool(
@@ -642,8 +709,11 @@ impl EpiGraphMcpFull {
     async fn recall(
         &self,
         Parameters(params): Parameters<RecallParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::memory::recall(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::memory::recall(self, viewer, params).await
     }
 
     #[tool(
@@ -652,8 +722,11 @@ impl EpiGraphMcpFull {
     async fn recall_with_context(
         &self,
         Parameters(params): Parameters<crate::tools::recall::RecallWithContextParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        crate::tools::recall::recall_with_context(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::recall::recall_with_context(self, viewer, params).await
     }
 
     #[tool(
@@ -662,9 +735,12 @@ impl EpiGraphMcpFull {
     async fn evolve_step(
         &self,
         Parameters(params): Parameters<crate::tools::evolve_step::EvolveStepParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        crate::tools::evolve_step::evolve_step(self, params).await
+        crate::tools::evolve_step::evolve_step(self, viewer, params).await
     }
 
     // ── Ingestion ──
@@ -675,9 +751,12 @@ impl EpiGraphMcpFull {
     async fn ingest_document(
         &self,
         Parameters(params): Parameters<IngestDocumentParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::ingestion::ingest_document(self, params).await
+        tools::ingestion::ingest_document(self, viewer, params).await
     }
 
     #[tool(
@@ -686,8 +765,11 @@ impl EpiGraphMcpFull {
     async fn check_already_ingested(
         &self,
         Parameters(params): Parameters<CheckAlreadyIngestedParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::ingestion::check_already_ingested(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::ingestion::check_already_ingested(self, viewer, params).await
     }
 
     #[tool(
@@ -707,9 +789,12 @@ impl EpiGraphMcpFull {
     async fn ingest_document_inline(
         &self,
         Parameters(params): Parameters<IngestDocumentInlineParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::ingestion::ingest_document_inline(self, params).await
+        tools::ingestion::ingest_document_inline(self, viewer, params).await
     }
 
     #[tool(
@@ -728,9 +813,12 @@ impl EpiGraphMcpFull {
     async fn link_hierarchical(
         &self,
         Parameters(params): Parameters<LinkHierarchicalParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::link_hierarchical::link_hierarchical(self, params).await
+        tools::link_hierarchical::link_hierarchical(self, viewer, params).await
     }
 
     #[tool(
@@ -739,9 +827,12 @@ impl EpiGraphMcpFull {
     async fn link_alternative(
         &self,
         Parameters(params): Parameters<crate::types::LinkAlternativeParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::link_alternative::link_alternative(self, params).await
+        tools::link_alternative::link_alternative(self, viewer, params).await
     }
 
     #[tool(
@@ -750,9 +841,12 @@ impl EpiGraphMcpFull {
     async fn link_epistemic(
         &self,
         Parameters(params): Parameters<LinkEpistemicParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::link_epistemic::link_epistemic(self, params).await
+        tools::link_epistemic::link_epistemic(self, viewer, params).await
     }
 
     // ── Paper Queries (3 tools) ──
@@ -764,9 +858,10 @@ impl EpiGraphMcpFull {
         extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         let server_agent = self.agent_id().await?;
         let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::paper_queries::query_paper(self, params, requester).await
+        tools::paper_queries::query_paper(self, viewer, params, requester).await
     }
 
     #[tool(
@@ -778,9 +873,10 @@ impl EpiGraphMcpFull {
         extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         let server_agent = self.agent_id().await?;
         let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::paper_queries::query_claims_by_evidence(self, params, requester).await
+        tools::paper_queries::query_claims_by_evidence(self, viewer, params, requester).await
     }
 
     #[tool(
@@ -792,9 +888,10 @@ impl EpiGraphMcpFull {
         extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         let server_agent = self.agent_id().await?;
         let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::paper_queries::query_claims_by_methodology(self, params, requester).await
+        tools::paper_queries::query_claims_by_methodology(self, viewer, params, requester).await
     }
 
     #[tool(
@@ -806,9 +903,10 @@ impl EpiGraphMcpFull {
         extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         let server_agent = self.agent_id().await?;
         let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::paper_queries::query_claims_by_label(self, params, requester).await
+        tools::paper_queries::query_claims_by_label(self, viewer, params, requester).await
     }
 
     #[tool(
@@ -818,8 +916,14 @@ impl EpiGraphMcpFull {
         &self,
         Parameters(params): Parameters<RecomputeBeliefsParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (_maint_conn, viewer) = crate::maintenance::maintenance_viewer(
+            self,
+            epigraph_db::visibility::SystemReason::BeliefRecomputation,
+        )
+        .await?;
+        let viewer = &viewer;
         self.reject_if_read_only()?;
-        tools::cdst_maintenance::recompute_beliefs(self, params).await
+        tools::cdst_maintenance::recompute_beliefs(self, viewer, params).await
     }
 
     // ── Workflows (8 tools) ──
@@ -830,17 +934,23 @@ impl EpiGraphMcpFull {
     async fn store_workflow(
         &self,
         Parameters(params): Parameters<StoreWorkflowParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflows::store_workflow(self, params).await
+        tools::workflows::store_workflow(self, viewer, params).await
     }
 
     #[tool(description = "Search for existing workflows by goal using semantic search.")]
     async fn find_workflow(
         &self,
         Parameters(params): Parameters<FindWorkflowParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::workflows::find_workflow(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::workflows::find_workflow(self, viewer, params).await
     }
 
     #[tool(
@@ -859,8 +969,11 @@ impl EpiGraphMcpFull {
     async fn evaluate_workflow_promotion(
         &self,
         Parameters(params): Parameters<EvaluateWorkflowPromotionParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::workflows::evaluate_workflow_promotion(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::workflows::evaluate_workflow_promotion(self, viewer, params).await
     }
 
     #[tool(
@@ -869,9 +982,12 @@ impl EpiGraphMcpFull {
     async fn refresh_workflow_promotion(
         &self,
         Parameters(params): Parameters<EvaluateWorkflowPromotionParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflows::refresh_workflow_promotion(self, params).await
+        tools::workflows::refresh_workflow_promotion(self, viewer, params).await
     }
 
     #[tool(
@@ -880,9 +996,12 @@ impl EpiGraphMcpFull {
     async fn report_workflow_outcome(
         &self,
         Parameters(params): Parameters<ReportWorkflowOutcomeParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflows::report_workflow_outcome(self, params).await
+        tools::workflows::report_workflow_outcome(self, viewer, params).await
     }
 
     #[tool(
@@ -891,9 +1010,12 @@ impl EpiGraphMcpFull {
     async fn deprecate_workflow(
         &self,
         Parameters(params): Parameters<DeprecateWorkflowParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflows::deprecate_workflow(self, params).await
+        tools::workflows::deprecate_workflow(self, viewer, params).await
     }
 
     // ── Hierarchical Workflows (4 tools) ──
@@ -909,9 +1031,12 @@ impl EpiGraphMcpFull {
     async fn ingest_workflow(
         &self,
         Parameters(params): Parameters<IngestWorkflowParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflow_ingest::ingest_workflow(self, params).await
+        tools::workflow_ingest::ingest_workflow(self, viewer, params).await
     }
 
     #[tool(
@@ -920,9 +1045,12 @@ impl EpiGraphMcpFull {
     async fn improve_workflow_hierarchy(
         &self,
         Parameters(params): Parameters<ImproveWorkflowHierarchyParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflow_ingest::improve_workflow_hierarchy(self, params).await
+        tools::workflow_ingest::improve_workflow_hierarchy(self, viewer, params).await
     }
 
     #[tool(
@@ -931,8 +1059,11 @@ impl EpiGraphMcpFull {
     async fn find_workflow_hierarchical(
         &self,
         Parameters(params): Parameters<FindWorkflowHierarchicalParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::workflow_hierarchical::find_workflow_hierarchical(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::workflow_hierarchical::find_workflow_hierarchical(self, viewer, params).await
     }
 
     #[tool(
@@ -976,8 +1107,11 @@ impl EpiGraphMcpFull {
     async fn get_neighborhood(
         &self,
         Parameters(params): Parameters<GetNeighborhoodParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::graph::get_neighborhood(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::graph::get_neighborhood(self, viewer, params).await
     }
 
     #[tool(
@@ -986,8 +1120,11 @@ impl EpiGraphMcpFull {
     async fn traverse(
         &self,
         Parameters(params): Parameters<TraverseParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::graph::traverse(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::graph::traverse(self, viewer, params).await
     }
 
     // ── Challenges (2 tools) ──
@@ -1007,8 +1144,11 @@ impl EpiGraphMcpFull {
     async fn list_challenges(
         &self,
         Parameters(params): Parameters<ListChallengesParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::challenges::list_challenges(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::challenges::list_challenges(self, viewer, params).await
     }
 
     // ── Events (2 tools) ──
@@ -1042,9 +1182,12 @@ impl EpiGraphMcpFull {
     async fn batch_submit_claims(
         &self,
         Parameters(params): Parameters<BatchSubmitClaimsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::batch::batch_submit_claims(self, params).await
+        tools::batch::batch_submit_claims(self, viewer, params).await
     }
 
     #[tool(
@@ -1063,8 +1206,11 @@ impl EpiGraphMcpFull {
     async fn system_stats(
         &self,
         Parameters(params): Parameters<SystemStatsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::batch::system_stats(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::batch::system_stats(self, viewer, params).await
     }
 
     // ── Perspectives & Ownership (6 tools) ──
@@ -1095,16 +1241,22 @@ impl EpiGraphMcpFull {
     async fn list_perspectives(
         &self,
         Parameters(params): Parameters<ListPerspectivesParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::perspectives::list_perspectives(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::perspectives::list_perspectives(self, viewer, params).await
     }
 
     #[tool(description = "Get a single perspective by UUID.")]
     async fn get_perspective(
         &self,
         Parameters(params): Parameters<GetPerspectiveParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::perspectives::get_perspective(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::perspectives::get_perspective(self, viewer, params).await
     }
 
     #[tool(
@@ -1156,9 +1308,12 @@ impl EpiGraphMcpFull {
     async fn submit_ds_evidence(
         &self,
         Parameters(params): Parameters<SubmitDsEvidenceParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::ds::submit_ds_evidence(self, params).await
+        tools::ds::submit_ds_evidence(self, viewer, params).await
     }
 
     #[tool(
@@ -1167,8 +1322,11 @@ impl EpiGraphMcpFull {
     async fn get_belief(
         &self,
         Parameters(params): Parameters<GetBeliefParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::ds::get_belief(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::ds::get_belief(self, viewer, params).await
     }
 
     #[tool(
@@ -1177,8 +1335,11 @@ impl EpiGraphMcpFull {
     async fn list_frames(
         &self,
         Parameters(params): Parameters<ListFramesParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::ds::list_frames(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::ds::list_frames(self, viewer, params).await
     }
 
     #[tool(
@@ -1187,8 +1348,11 @@ impl EpiGraphMcpFull {
     async fn compare_methods(
         &self,
         Parameters(params): Parameters<CompareMethodsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::ds::compare_methods(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::ds::compare_methods(self, viewer, params).await
     }
 
     #[tool(
@@ -1197,8 +1361,11 @@ impl EpiGraphMcpFull {
     async fn scoped_belief(
         &self,
         Parameters(params): Parameters<ScopedBeliefParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::ds::scoped_belief(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::ds::scoped_belief(self, viewer, params).await
     }
 
     #[tool(
@@ -1207,8 +1374,11 @@ impl EpiGraphMcpFull {
     async fn get_divergence(
         &self,
         Parameters(params): Parameters<GetDivergenceParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::ds::get_divergence(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::ds::get_divergence(self, viewer, params).await
     }
 
     // ── Sheaf (3 tools) ──
@@ -1219,8 +1389,11 @@ impl EpiGraphMcpFull {
     async fn check_sheaf_consistency(
         &self,
         Parameters(params): Parameters<CheckSheafConsistencyParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::sheaf::check_sheaf_consistency(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::sheaf::check_sheaf_consistency(self, viewer, params).await
     }
 
     #[tool(
@@ -1229,8 +1402,11 @@ impl EpiGraphMcpFull {
     async fn sheaf_cohomology(
         &self,
         Parameters(params): Parameters<SheafCohomologyParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::sheaf::sheaf_cohomology(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::sheaf::sheaf_cohomology(self, viewer, params).await
     }
 
     #[tool(
@@ -1239,8 +1415,11 @@ impl EpiGraphMcpFull {
     async fn reconcile_sheaf(
         &self,
         Parameters(params): Parameters<ReconcileSheafParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::sheaf::reconcile_sheaf(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::sheaf::reconcile_sheaf(self, viewer, params).await
     }
 
     // ── Embeddings (2 tools) ──
@@ -1264,8 +1443,14 @@ impl EpiGraphMcpFull {
         &self,
         Parameters(params): Parameters<crate::tools::embeddings::BackfillEmbeddingsParams>,
     ) -> Result<CallToolResult, McpError> {
+        let (_maint_conn, viewer) = crate::maintenance::maintenance_viewer(
+            self,
+            epigraph_db::visibility::SystemReason::EmbeddingBackfill,
+        )
+        .await?;
+        let viewer = &viewer;
         self.reject_if_read_only()?;
-        crate::tools::embeddings::backfill_embeddings(self, params).await
+        crate::tools::embeddings::backfill_embeddings(self, viewer, params).await
     }
 
     // ── Themes (1 tool) ──
@@ -1289,8 +1474,11 @@ impl EpiGraphMcpFull {
     async fn query_triples(
         &self,
         Parameters(params): Parameters<QueryTriplesParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::rdf::query_triples(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::rdf::query_triples(self, viewer, params).await
     }
 
     #[tool(
@@ -1299,8 +1487,11 @@ impl EpiGraphMcpFull {
     async fn entity_neighborhood(
         &self,
         Parameters(params): Parameters<EntityNeighborhoodParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::rdf::entity_neighborhood(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::rdf::entity_neighborhood(self, viewer, params).await
     }
 
     #[tool(
@@ -1309,8 +1500,11 @@ impl EpiGraphMcpFull {
     async fn search_triples(
         &self,
         Parameters(params): Parameters<SearchTriplesParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::rdf::search_triples(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::rdf::search_triples(self, viewer, params).await
     }
 
     // ── Cross-source matching (3 tools) ──
@@ -1341,8 +1535,11 @@ impl EpiGraphMcpFull {
     async fn decide_match_candidate(
         &self,
         Parameters(params): Parameters<DecideMatchCandidateParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::matching::decide_match_candidate(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::matching::decide_match_candidate(self, viewer, params).await
     }
 
     // ── Meta (1 tool) ──

@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "db")]
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 
@@ -176,6 +177,7 @@ pub async fn create_hypothesis(
 /// GET /api/v1/hypothesis/:id/status — Hypothesis status with promotion readiness.
 #[cfg(feature = "db")]
 pub async fn hypothesis_status(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -205,10 +207,14 @@ pub async fn hypothesis_status(
             })?;
 
     let (bel_supported, bel_unsupported) = if let Some((fid,)) = frame_id {
-        let mass_rows =
-            epigraph_db::MassFunctionRepository::get_for_claim_frame(&state.db_pool, id, fid)
-                .await
-                .unwrap_or_default();
+        let mass_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
+            &state.db_pool,
+            &viewer,
+            id,
+            fid,
+        )
+        .await
+        .unwrap_or_default();
 
         // Use the most recent mass function's masses for belief
         if let Some(latest) = mass_rows.last() {
@@ -231,10 +237,13 @@ pub async fn hypothesis_status(
     };
 
     // Count completed experiments with analysis
-    let completed_with_analysis =
-        epigraph_db::ExperimentRepository::count_completed_with_analysis(&state.db_pool, id)
-            .await
-            .unwrap_or(0);
+    let completed_with_analysis = epigraph_db::ExperimentRepository::count_completed_with_analysis(
+        &state.db_pool,
+        &viewer,
+        id,
+    )
+    .await
+    .unwrap_or(0);
 
     // Check scope: find analyses that provide_evidence to this hypothesis with scope_limitations
     let has_scope: (bool,) = sqlx::query_as(
@@ -284,11 +293,17 @@ pub async fn hypothesis_status(
 /// POST /api/v1/hypothesis/:id/promote — Promote hypothesis to research_validity.
 #[cfg(feature = "db")]
 pub async fn promote_hypothesis(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Re-check promotion gate
-    let status_response = hypothesis_status(State(state.clone()), Path(id)).await?;
+    let status_response = hypothesis_status(
+        ViewerExtractor(viewer.clone()),
+        State(state.clone()),
+        Path(id),
+    )
+    .await?;
     let status_json = status_response.0;
 
     let ready = status_json["promotion"]["ready"].as_bool().unwrap_or(false);
@@ -328,12 +343,16 @@ pub async fn promote_hypothesis(
         })?;
 
     // 1. Copy the most recent mass function from hypothesis_assessment to research_validity
-    let mass_rows =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(&state.db_pool, id, hyp_frame.0)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("{e}"),
-            })?;
+    let mass_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
+        &state.db_pool,
+        &viewer,
+        id,
+        hyp_frame.0,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("{e}"),
+    })?;
 
     if let Some(latest) = mass_rows.last() {
         sqlx::query(

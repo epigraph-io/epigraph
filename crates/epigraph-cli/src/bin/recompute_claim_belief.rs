@@ -66,19 +66,30 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
+    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
+        epigraph_db::visibility::SystemReason::BeliefRecomputation,
+    )
+    .await
+    .expect("maintenance viewer");
+    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+    if let Err(e) = run(cli, viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    cli: Cli,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Read the claim list first — fail fast if the file is missing /
     // unparseable, before touching the DB.
     let claim_ids = read_claim_ids(&cli)?;
@@ -117,10 +128,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let claims_empty = claims_empty.clone();
         let frame_writes = frame_writes.clone();
         let errors = errors.clone();
+        let viewer = viewer.clone();
         let progress_every = cli.progress_every;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            match recompute_one_claim_all_frames(&pool, claim_id).await {
+            match recompute_one_claim_all_frames(&pool, &viewer, claim_id).await {
                 Ok(written) => {
                     if written > 0 {
                         claims_with_work.fetch_add(1, Ordering::Relaxed);
@@ -172,6 +184,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// Returns the number of (claim, frame) pairs that produced a recompute.
 async fn recompute_one_claim_all_frames(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
 ) -> Result<usize, String> {
     let rows: Vec<(Uuid, String)> = sqlx::query_as(
@@ -187,9 +200,10 @@ async fn recompute_one_claim_all_frames(
     .map_err(|e| format!("list frames for claim: {e}"))?;
     let mut written = 0usize;
     for (frame_id, _frame_name) in rows {
-        let did =
-            epigraph_engine::edge_factor::recompute_claim_belief_on_frame(pool, claim_id, frame_id)
-                .await?;
+        let did = epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+            pool, viewer, claim_id, frame_id,
+        )
+        .await?;
         if did {
             written += 1;
         }

@@ -12,6 +12,9 @@
 //!   cargo test -p epigraph-api --test idempotency_2p5_tests
 //! ```
 
+#[path = "../viewer_fixture.rs"]
+mod fixture;
+
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
@@ -591,8 +594,9 @@ async fn submit_packet_dedup_onto_null_trace_claim_returns_null_trace(pool: PgPo
         chrono::Utc::now(),
         chrono::Utc::now(),
     );
+    let viewer = fixture::public_viewer(&pool).await;
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let (persisted, created) = ClaimRepository::create_or_get(&mut conn, &seeded)
+    let (persisted, created) = ClaimRepository::create_or_get(&mut conn, &viewer, &seeded)
         .await
         .expect("seeding the null-trace claim should succeed");
     assert!(created, "seed must be a fresh create");

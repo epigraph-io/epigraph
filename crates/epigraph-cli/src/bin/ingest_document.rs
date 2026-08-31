@@ -42,6 +42,14 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
+    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
+        epigraph_db::visibility::SystemReason::TenancyBackfill,
+    )
+    .await
+    .expect("maintenance viewer");
+    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -52,10 +60,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    run(cli).await
+    run(cli, viewer).await
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(cli: Cli, viewer: &epigraph_db::visibility::Viewer) -> anyhow::Result<()> {
     let data = tokio::fs::read_to_string(&cli.file)
         .await
         .with_context(|| format!("cannot read {}", cli.file.display()))?;
@@ -69,7 +77,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let embedder = McpEmbedder::new(pool.clone(), cli.openai_api_key);
     let server = EpiGraphMcpFull::new(pool, signer, embedder, false);
 
-    let result = do_ingest_document(&server, &extraction)
+    let result = do_ingest_document(&server, viewer, &extraction)
         .await
         .map_err(|e| anyhow!("ingest_document failed: {}", e.message))?;
     let text = result

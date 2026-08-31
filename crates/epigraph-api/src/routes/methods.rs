@@ -10,12 +10,14 @@ use uuid::Uuid;
 
 #[cfg(feature = "db")]
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 
 /// GET /api/v1/methods/:id — Method details with evidence strength.
 #[cfg(feature = "db")]
 pub async fn get_method(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -29,9 +31,10 @@ pub async fn get_method(
             id: id.to_string(),
         })?;
 
-    let evidence = epigraph_db::MethodRepository::get_evidence_strength(&state.db_pool, id)
-        .await
-        .ok();
+    let evidence =
+        epigraph_db::MethodRepository::get_evidence_strength(&state.db_pool, &viewer, id)
+            .await
+            .ok();
 
     Ok(Json(serde_json::json!({
         "id": method.id,

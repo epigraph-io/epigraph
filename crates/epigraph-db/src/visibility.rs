@@ -27,10 +27,45 @@
 //!   The lease makes "unrestricted viewer" and "maintenance connection"
 //!   inseparable at the type level.
 //!
-//! # What is deliberately NOT here yet
+//! # The splice mechanism (PR-06)
 //!
 //! [`Viewer::predicate_fragment`] landed in PR-04, alongside the tenancy columns
 //! it references (`claims.visibility`, `claims.owner_group_id`, migration 062).
+//! It is a *template*: `{alias}` and `$V` are placeholders, and PR-04 shipped no
+//! way to fill them in. PR-06 adds that way, and makes it the only one.
+//!
+//! A repo-layer read now writes its marker into the SQL text itself —
+//!
+//! ```sql
+//! WHERE c.is_current = true /* {VISIBILITY:c} */
+//! ```
+//!
+//! — and wraps the literal in [`Viewer::splice`], which replaces every marker
+//! with [`Viewer::render_predicate`]'s output at a caller-chosen bind index.
+//! Three properties make this safer than hand-substitution at each site:
+//!
+//! * `splice` **panics** when the literal contains no marker. A read that was
+//!   converted to take a `&Viewer` but never had its marker inserted is exactly
+//!   the fail-open this PR exists to prevent, and a required parameter that is
+//!   silently ignored is invisible in review. The panic is a programming-error
+//!   panic on a `&'static str` the developer just wrote, not a runtime path.
+//! * Every marker in one statement resolves to the **same** bind index, asserted
+//!   inside `splice`. Two CTEs over `claims` in one query (see
+//!   `ClaimRepository::search_hybrid_scoped_since`) must both filter, and both
+//!   read the same `$V`.
+//! * [`VISIBILITY_MARKER_PREFIX`] is the single spelling of the marker, shared
+//!   with `crates/epigraph-db/tests/visibility_lint.rs`, so the lint and the
+//!   repo layer cannot drift apart.
+//!
+//! `sqlx::query!` cannot be spliced — the macro needs a compile-time literal of
+//! fixed arity, and the two shapes differ in bind count. The four macro read
+//! sites in `repos/claim.rs` instead carry the static three-bind form
+//! `AND ($N::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($M::uuid[]))`,
+//! bound from [`Viewer::bypass_bind`] and [`Viewer::group_bind`]. That is the
+//! form `AgentRepository::get_public_profile` already uses (PR-04), and
+//! `visibility_lint.rs` accepts both spellings.
+//!
+//! # What is deliberately NOT here yet
 //!
 //! `edge_predicate_fragment` — the `edges` variant that carries the co-ownership
 //! INTERSECTION — is still deferred, now to **PR-13**. Plan §4.3 defines it in
@@ -43,6 +78,18 @@ use crate::errors::DbError;
 use crate::repos::GroupMembershipRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+/// The one spelling of the in-SQL visibility marker.
+///
+/// A repo-layer read writes `/* {VISIBILITY:<alias>} */` into its SQL text and
+/// [`Viewer::splice`] replaces it. `crates/epigraph-db/tests/visibility_lint.rs`
+/// matches on this same constant, so the lint and the repo layer cannot drift
+/// to two different spellings of "this query is filtered".
+pub const VISIBILITY_MARKER_PREFIX: &str = "/* {VISIBILITY:";
+
+/// The closing half of the marker, split out so the two halves are never
+/// written as separate literals at a call site.
+const VISIBILITY_MARKER_SUFFIX: &str = "} */";
 
 /// Read authority for one principal, for one request.
 ///
@@ -341,6 +388,92 @@ impl Viewer {
         }
     }
 
+    /// [`Self::predicate_fragment`] with its two placeholders filled in.
+    ///
+    /// `{alias}` becomes `alias`; `$V` becomes `$<bind_index>`. A `Bypass`
+    /// viewer renders to `" "` — the same single space the fragment returns,
+    /// preserved for the same reason (it is spliced between SQL tokens).
+    ///
+    /// `bind_index` is the positional parameter the caller will bind
+    /// [`Self::group_bind`] to. It is the caller's job to pick a free one; there
+    /// is no way for this function to know how many binds the surrounding
+    /// statement already has.
+    #[must_use]
+    pub fn render_predicate(&self, alias: &str, bind_index: usize) -> String {
+        match self.shape {
+            ViewerShape::Bypass { .. } => " ".to_string(),
+            ViewerShape::Scoped { .. } => self
+                .predicate_fragment()
+                .replace("{alias}", alias)
+                .replace("$V", &format!("${bind_index}")),
+        }
+    }
+
+    /// Replace every `/* {VISIBILITY:<alias>} */` marker in `sql` with
+    /// [`Self::render_predicate`] for that alias, at `first_bind`.
+    ///
+    /// Every marker in one statement resolves to the SAME bind index — a
+    /// statement with two CTEs over `claims` filters both and reads one `$V`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `sql` contains no marker at all. This is deliberate and it is
+    /// the point of the function: a read that takes a `&Viewer` and does not use
+    /// it is a fail-open that compiles, passes every "a stranger cannot read"
+    /// test (because it returns *more*, not less), and is invisible in a diff.
+    /// The input is a `&'static str` the developer wrote three lines above the
+    /// call, so the panic is a compile-time-shaped error that happens to fire at
+    /// first execution — the first test that touches the query, not a
+    /// user-facing path.
+    ///
+    /// Also panics on a marker that is opened and never closed.
+    #[must_use]
+    pub fn splice(&self, sql: &str, first_bind: usize) -> String {
+        assert!(
+            sql.contains(VISIBILITY_MARKER_PREFIX),
+            "Viewer::splice called on SQL with no {VISIBILITY_MARKER_PREFIX}…{VISIBILITY_MARKER_SUFFIX} \
+             marker. A read that takes a Viewer and does not filter on it is a \
+             fail-open. SQL was:\n{sql}"
+        );
+
+        let mut out = String::with_capacity(sql.len() + 96);
+        let mut rest = sql;
+        while let Some(open) = rest.find(VISIBILITY_MARKER_PREFIX) {
+            out.push_str(&rest[..open]);
+            let after_prefix = &rest[open + VISIBILITY_MARKER_PREFIX.len()..];
+            let close = after_prefix
+                .find(VISIBILITY_MARKER_SUFFIX)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "unterminated visibility marker: expected \
+                     {VISIBILITY_MARKER_SUFFIX} after {VISIBILITY_MARKER_PREFIX} in:\n{sql}"
+                    )
+                });
+            let alias = after_prefix[..close].trim();
+            assert!(
+                !alias.is_empty(),
+                "empty alias in visibility marker in:\n{sql}"
+            );
+            out.push_str(&self.render_predicate(alias, first_bind));
+            rest = &after_prefix[close + VISIBILITY_MARKER_SUFFIX.len()..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The `$N::bool` bypass flag for the four `sqlx::query!` macro read sites,
+    /// which cannot take a spliced literal.
+    ///
+    /// `true` disables the predicate the same way an emitted-nothing fragment
+    /// does; `false` leaves `visibility = 'public' OR owner_group_id = ANY(...)`
+    /// deciding. Pair it with [`Self::group_bind`]`.unwrap_or(&[])` — a `Bypass`
+    /// viewer has no group bind, and the empty array is inert behind a `true`
+    /// short-circuit.
+    #[must_use]
+    pub const fn bypass_bind(&self) -> bool {
+        self.is_bypass()
+    }
+
     /// `true` when this viewer emits no visibility predicate at all.
     #[must_use]
     pub const fn is_bypass(&self) -> bool {
@@ -528,6 +661,77 @@ mod tests {
             frag.matches(')').count(),
             "unbalanced parentheses: {frag}"
         );
+    }
+
+    #[test]
+    fn render_substitutes_both_placeholders() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        let rendered = v.render_predicate("c", 7);
+
+        assert!(!rendered.contains("{alias}"), "alias left unsubstituted");
+        assert!(!rendered.contains("$V"), "bind left unsubstituted");
+        assert_eq!(rendered.matches("c.").count(), 2);
+        assert_eq!(rendered.matches("$7").count(), 1);
+    }
+
+    /// The `search_hybrid_scoped_since` shape: two CTEs over `claims`, one bind.
+    #[test]
+    fn splicing_two_markers_yields_one_bind_index_twice() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        let sql = "WITH dense AS (SELECT 1 FROM claims c WHERE c.is_current /* {VISIBILITY:c} */ LIMIT $3), \
+                   lex AS (SELECT 1 FROM claims c WHERE c.is_current /* {VISIBILITY:c} */ LIMIT $3) \
+                   SELECT * FROM dense";
+        let out = v.splice(sql, 9);
+
+        assert_eq!(out.matches("$9").count(), 2, "both CTEs read the same bind");
+        assert_eq!(
+            out.matches("visibility = 'public'").count(),
+            2,
+            "both CTEs are filtered: {out}"
+        );
+        assert!(!out.contains(VISIBILITY_MARKER_PREFIX), "marker survived");
+    }
+
+    #[test]
+    fn splicing_distinct_aliases_qualifies_each_independently() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        let sql = "SELECT 1 FROM challenges ch JOIN claims c ON c.id = ch.claim_id \
+                   WHERE true /* {VISIBILITY:ch} */ /* {VISIBILITY:c} */";
+        let out = v.splice(sql, 2);
+
+        assert_eq!(out.matches("ch.visibility").count(), 1);
+        assert_eq!(out.matches("c.visibility").count(), 1);
+        assert_eq!(out.matches("$2").count(), 2);
+    }
+
+    #[test]
+    fn a_bypass_splice_leaves_no_bind_and_no_placeholder() {
+        let lease = MaintenanceLease::new();
+        let v = Viewer::system(&lease, SystemReason::SchemaContractTest);
+        let sql = "SELECT 1 FROM claims c WHERE c.is_current /* {VISIBILITY:c} */ AND true";
+        let out = v.splice(sql, 4);
+
+        assert!(!out.contains('$'), "a bypass splice binds nothing: {out}");
+        assert!(!out.contains("{alias}"), "{out}");
+        assert!(!out.contains(VISIBILITY_MARKER_PREFIX), "{out}");
+        assert!(
+            out.contains("c.is_current   AND true") || out.contains("c.is_current  AND true"),
+            "the bypass fragment separates the tokens it sat between: {out}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no")]
+    fn splicing_a_marker_free_literal_panics() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![]);
+        let _ = v.splice("SELECT * FROM claims WHERE is_current = true", 1);
+    }
+
+    #[test]
+    fn bypass_bind_tracks_the_shape() {
+        let lease = MaintenanceLease::new();
+        assert!(Viewer::system(&lease, SystemReason::DedupSweep).bypass_bind());
+        assert!(!Viewer::test_scoped(Uuid::new_v4(), vec![]).bypass_bind());
     }
 
     #[test]

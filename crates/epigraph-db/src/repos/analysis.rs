@@ -110,9 +110,10 @@ impl AnalysisRepository {
     /// Find all analyses that produced a given claim (via `concludes` edges).
     pub async fn get_for_claim(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<AnalysisRecord>, sqlx::Error> {
-        let rows: Vec<AnalysisRow> = sqlx::query_as(
+        let sql = viewer.splice(
             "SELECT a.id, a.analysis_type, a.method_description, a.inference_path, \
              a.constraints, a.coverage_context, a.input_evidence_ids, a.agent_id, \
              a.properties, a.created_at \
@@ -122,20 +123,25 @@ impl AnalysisRepository {
                AND e.relationship = 'concludes' \
                AND e.source_type = 'analysis' \
                AND e.target_type = 'claim' \
+               /* {VISIBILITY:e} */ \
              ORDER BY a.created_at DESC",
-        )
-        .bind(claim_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, AnalysisRow>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<AnalysisRow> = q.fetch_all(pool).await?;
         Ok(rows.into_iter().map(from_row).collect())
     }
 
     /// Find all claims produced by an analysis (via `concludes` edges).
     pub async fn get_claims_for_analysis(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         analysis_id: Uuid,
     ) -> Result<Vec<ClaimSummary>, sqlx::Error> {
-        let rows: Vec<ClaimSummaryRow> = sqlx::query_as(
+        let sql = viewer.splice(
             "SELECT c.id, c.content, c.truth_value, c.created_at \
              FROM claims c \
              JOIN edges e ON e.target_id = c.id \
@@ -143,11 +149,15 @@ impl AnalysisRepository {
                AND e.relationship = 'concludes' \
                AND e.source_type = 'analysis' \
                AND e.target_type = 'claim' \
+               /* {VISIBILITY:c} */ /* {VISIBILITY:e} */ \
              ORDER BY c.truth_value DESC",
-        )
-        .bind(analysis_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ClaimSummaryRow>(&sql).bind(analysis_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<ClaimSummaryRow> = q.fetch_all(pool).await?;
         Ok(rows
             .into_iter()
             .map(|r| ClaimSummary {

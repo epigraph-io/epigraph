@@ -51,6 +51,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// (which was already made whole by a subsequent full re-ingestion).
 pub async fn query_paper(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: QueryPaperParams,
     requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
@@ -68,18 +69,19 @@ pub async fn query_paper(
         });
     };
 
-    let asserted_count = PaperRepository::count_asserted_claims(&server.pool, paper.id)
+    let asserted_count = PaperRepository::count_asserted_claims(&server.pool, viewer, paper.id)
         .await
         .map_err(internal_error)?;
     // Node-existence probe, independent of the `asserts` edge: catches claims
     // a partial/crashed ingestion already labelled `doi:<doi>` but never got
     // to link, which `asserted_count` alone would silently report as zero.
-    let labeled_count = PaperRepository::count_claims_by_doi_label(&server.pool, &paper.doi)
-        .await
-        .map_err(internal_error)?;
+    let labeled_count =
+        PaperRepository::count_claims_by_doi_label(&server.pool, viewer, &paper.doi)
+            .await
+            .map_err(internal_error)?;
     let claim_count = asserted_count.max(labeled_count);
 
-    let authors = PaperRepository::list_authors(&server.pool, paper.id)
+    let authors = PaperRepository::list_authors(&server.pool, viewer, paper.id)
         .await
         .map_err(internal_error)?
         .into_iter()
@@ -89,7 +91,7 @@ pub async fn query_paper(
         })
         .collect();
 
-    let claim_rows = PaperRepository::list_asserted_claims(&server.pool, paper.id, 100)
+    let claim_rows = PaperRepository::list_asserted_claims(&server.pool, viewer, paper.id, 100)
         .await
         .map_err(internal_error)?;
 
@@ -122,6 +124,7 @@ pub async fn query_paper(
 
 pub async fn query_claims_by_evidence(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: QueryClaimsByEvidenceParams,
     requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
@@ -129,7 +132,7 @@ pub async fn query_claims_by_evidence(
     let min_truth = params.min_truth.unwrap_or(0.0);
 
     // Search claims and filter by evidence type
-    let claims = ClaimRepository::list(&server.pool, limit * 2, 0, None)
+    let claims = ClaimRepository::list(&server.pool, viewer, limit * 2, 0, None)
         .await
         .map_err(internal_error)?;
 
@@ -141,7 +144,7 @@ pub async fn query_claims_by_evidence(
             continue;
         }
 
-        let evidence_list = EvidenceRepository::get_by_claim(&server.pool, claim.id)
+        let evidence_list = EvidenceRepository::get_by_claim(&server.pool, viewer, claim.id)
             .await
             .unwrap_or_default();
 
@@ -188,13 +191,14 @@ pub async fn query_claims_by_evidence(
 
 pub async fn query_claims_by_methodology(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: QueryClaimsByMethodologyParams,
     requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
 
-    let claims = ClaimRepository::list(&server.pool, limit * 2, 0, None)
+    let claims = ClaimRepository::list(&server.pool, viewer, limit * 2, 0, None)
         .await
         .map_err(internal_error)?;
 
@@ -209,7 +213,7 @@ pub async fn query_claims_by_methodology(
         // Check reasoning traces for methodology
         if let Some(trace_id) = claim.trace_id {
             if let Ok(Some(trace)) =
-                ReasoningTraceRepository::get_by_id(&server.pool, trace_id).await
+                ReasoningTraceRepository::get_by_id(&server.pool, viewer, trace_id).await
             {
                 let method_name = trace.methodology.description().to_lowercase();
                 if method_name.contains(&methodology_lower) {
@@ -245,6 +249,7 @@ pub async fn query_claims_by_methodology(
 
 pub async fn query_claims_by_label(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: QueryClaimsByLabelParams,
     requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
@@ -262,6 +267,7 @@ pub async fn query_claims_by_label(
 
     let rows = ClaimRepository::list_by_labels(
         &server.pool,
+        viewer,
         &params.labels,
         &params.exclude_labels,
         params.current_only,

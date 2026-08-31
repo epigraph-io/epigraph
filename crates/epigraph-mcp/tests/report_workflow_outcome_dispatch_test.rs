@@ -13,6 +13,9 @@
 //!      row + update `workflows.metadata` counters.
 //!   2. Legacy compat: a flat workflow-labeled claim id (no row in
 //!      `workflows`) must still flow through the legacy claims-table path.
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 use common::*;
 
@@ -22,12 +25,13 @@ use uuid::Uuid;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn report_outcome_dispatches_to_hierarchical_when_id_is_a_workflows_row(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     // Use a unique goal so canonical_name is unique across reruns / DB sharing.
     let goal = format!("dispatch regression test {}", Uuid::new_v4());
     let store_result = epigraph_mcp::tools::workflows::store_workflow(
-        &server,
+        &server, &viewer,
         StoreWorkflowParams {
             goal: goal.clone(),
             steps: vec!["alpha step".to_string(), "beta step".to_string()],
@@ -59,7 +63,7 @@ async fn report_outcome_dispatches_to_hierarchical_when_id_is_a_workflows_row(po
 
     // The actual regression: this used to return "workflow not found".
     let report_result = epigraph_mcp::tools::workflows::report_workflow_outcome(
-        &server,
+        &server, &viewer,
         ReportWorkflowOutcomeParams {
             workflow_id: workflow_id.to_string(),
             success: true,
@@ -118,6 +122,7 @@ async fn report_outcome_dispatches_to_hierarchical_when_id_is_a_workflows_row(po
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn report_outcome_still_handles_legacy_flat_workflow_claim_id(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     // Seed a flat workflow-labeled claim — id lives in `claims`, NOT in
@@ -139,7 +144,7 @@ async fn report_outcome_still_handles_legacy_flat_workflow_claim_id(pool: PgPool
     // the test exists to catch a regression where the new dispatch
     // accidentally drops the fallback.
     epigraph_mcp::tools::workflows::report_workflow_outcome(
-        &server,
+        &server, &viewer,
         ReportWorkflowOutcomeParams {
             workflow_id: claim_id.to_string(),
             success: true,
@@ -181,11 +186,12 @@ async fn report_outcome_still_handles_legacy_flat_workflow_claim_id(pool: PgPool
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn report_outcome_404s_for_truly_unknown_id(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let bogus = Uuid::new_v4();
 
     let err = epigraph_mcp::tools::workflows::report_workflow_outcome(
-        &server,
+        &server, &viewer,
         ReportWorkflowOutcomeParams {
             workflow_id: bogus.to_string(),
             success: true,

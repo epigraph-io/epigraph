@@ -95,7 +95,10 @@ async fn resolve_returns_live_groups_only_and_splits_writable(pool: PgPool) {
     let viewer = Viewer::resolve(&pool, agent).await.expect("resolve");
 
     assert_eq!(viewer.principal(), Some(agent));
-    assert!(!viewer.is_bypass(), "resolve never produces a bypass viewer");
+    assert!(
+        !viewer.is_bypass(),
+        "resolve never produces a bypass viewer"
+    );
 
     let mut bind = viewer
         .group_bind()

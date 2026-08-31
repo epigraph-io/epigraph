@@ -8,6 +8,9 @@
 //! - evolve_step rejects bad edge_type
 //! - evolve_step rejects level=0/1
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_db::ClaimRepository;
 use epigraph_mcp::embed::McpEmbedder;
@@ -85,6 +88,7 @@ fn parse_body(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_supersedes_flips_head(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone());
     let agent = insert_seed_agent(&pool).await;
     let lineage = Uuid::new_v4();
@@ -101,9 +105,9 @@ async fn evolve_step_supersedes_flips_head(pool: PgPool) {
         rationale: Some("clarified wording".to_string()),
         level: Some(2),
     };
-    let _result = evolve_step(&server, params).await.expect("evolve_step");
+    let _result = evolve_step(&server, &viewer, params).await.expect("evolve_step");
 
-    let heads = ClaimRepository::latest_in_lineage(&pool, lineage)
+    let heads = ClaimRepository::latest_in_lineage(&pool, &viewer, lineage)
         .await
         .unwrap();
     assert_eq!(heads.len(), 1, "supersession produces one head");
@@ -128,6 +132,7 @@ async fn evolve_step_supersedes_flips_head(pool: PgPool) {
 /// prior `find_workflow_hierarchical` lookup.
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_addresses_by_canonical_name_and_index(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone());
     let agent = insert_seed_agent(&pool).await;
 
@@ -170,19 +175,19 @@ async fn evolve_step_addresses_by_canonical_name_and_index(pool: PgPool) {
         rationale: None,
         level: Some(2),
     };
-    evolve_step(&server, params)
+    evolve_step(&server, &viewer, params)
         .await
         .expect("name-mode evolve_step must resolve and succeed");
 
     // step1's head is now v2; step0 is untouched (proves the index selected the
     // right step).
-    let heads1 = ClaimRepository::latest_in_lineage(&pool, lin1)
+    let heads1 = ClaimRepository::latest_in_lineage(&pool, &viewer, lin1)
         .await
         .unwrap();
     assert_eq!(heads1.len(), 1);
     assert_eq!(heads1[0].content, "step1 v2 via name");
 
-    let heads0 = ClaimRepository::latest_in_lineage(&pool, lin0)
+    let heads0 = ClaimRepository::latest_in_lineage(&pool, &viewer, lin0)
         .await
         .unwrap();
     assert_eq!(heads0.len(), 1);
@@ -191,6 +196,7 @@ async fn evolve_step_addresses_by_canonical_name_and_index(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone());
     let agent = insert_seed_agent(&pool).await;
     let lineage = Uuid::new_v4();
@@ -199,7 +205,7 @@ async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
 
     // Agent A revises v1.
     evolve_step(
-        &server,
+        &server, &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -216,7 +222,7 @@ async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
 
     // Agent B revises v1 too.
     evolve_step(
-        &server,
+        &server, &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -231,7 +237,7 @@ async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
     .await
     .expect("revises B");
 
-    let heads = ClaimRepository::latest_in_lineage(&pool, lineage)
+    let heads = ClaimRepository::latest_in_lineage(&pool, &viewer, lineage)
         .await
         .unwrap();
     // v1 (no incoming supersedes) + A's revision + B's revision = 3 heads.
@@ -243,13 +249,14 @@ async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_rejects_bad_edge_type(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone());
     let agent = insert_seed_agent(&pool).await;
     let lineage = Uuid::new_v4();
     let v1 = seed_versioned_step(&pool, agent, lineage, "v1").await;
 
     let result = evolve_step(
-        &server,
+        &server, &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -267,6 +274,7 @@ async fn evolve_step_rejects_bad_edge_type(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_rejects_level_0_or_1(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone());
     let agent = insert_seed_agent(&pool).await;
     let lineage = Uuid::new_v4();
@@ -274,7 +282,7 @@ async fn evolve_step_rejects_level_0_or_1(pool: PgPool) {
 
     for bad_level in [0u32, 1, 4] {
         let result = evolve_step(
-            &server,
+            &server, &viewer,
             EvolveStepParams {
                 canonical_name: None,
                 step_index: None,
@@ -295,6 +303,7 @@ async fn evolve_step_rejects_level_0_or_1(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn find_workflow_hierarchical_frozen_by_default(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone());
 
     let workflow_id = Uuid::new_v4();
@@ -310,7 +319,7 @@ async fn find_workflow_hierarchical_frozen_by_default(pool: PgPool) {
     .unwrap();
 
     let result = find_workflow_hierarchical(
-        &server,
+        &server, &viewer,
         FindWorkflowHierarchicalParams {
             query: "versioning probe".to_string(),
             limit: Some(5),
@@ -335,6 +344,7 @@ async fn find_workflow_hierarchical_frozen_by_default(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone());
     let agent = insert_seed_agent(&pool).await;
 
@@ -357,7 +367,7 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     // Step 0: lineage_a, evolved via supersedes (single head).
     let s0_v1 = seed_versioned_step(&pool, agent, lineage_a, "step 0 v1").await;
     evolve_step(
-        &server,
+        &server, &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -382,7 +392,7 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     // Step 1: lineage_b, two concurrent revises (multi-head).
     let s1_v1 = seed_versioned_step(&pool, agent, lineage_b, "step 1 v1").await;
     evolve_step(
-        &server,
+        &server, &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -397,7 +407,7 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     .await
     .expect("revises s1 A");
     evolve_step(
-        &server,
+        &server, &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -429,7 +439,7 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     }
 
     let result = find_workflow_hierarchical(
-        &server,
+        &server, &viewer,
         FindWorkflowHierarchicalParams {
             query: "resolve_to_latest target".to_string(),
             limit: Some(5),
@@ -495,6 +505,7 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
 // because spaces never match hyphens in either column.
 #[sqlx::test(migrations = "../../migrations")]
 async fn find_workflow_hierarchical_matches_canonical_name_across_diverged_goals(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone());
 
     let gen0 = Uuid::new_v4();
@@ -520,7 +531,7 @@ async fn find_workflow_hierarchical_matches_canonical_name_across_diverged_goals
     // Only the hyphen-normalized `(replace(canonical_name,'-',' ') || ' '
     // || goal)` concat surfaces gen-4.
     let result = find_workflow_hierarchical(
-        &server,
+        &server, &viewer,
         FindWorkflowHierarchicalParams {
             query: "scan norcal architecture rfps".to_string(),
             limit: Some(10),
@@ -562,6 +573,7 @@ async fn find_workflow_hierarchical_matches_canonical_name_across_diverged_goals
 // cascade has its own coverage in tests/deprecate_workflow_is_current_test.rs).
 #[sqlx::test(migrations = "../../migrations")]
 async fn find_workflow_hierarchical_filters_deprecated_via_min_truth(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone());
 
     let live_id = Uuid::new_v4();
@@ -580,7 +592,7 @@ async fn find_workflow_hierarchical_filters_deprecated_via_min_truth(pool: PgPoo
 
     // Default min_truth (0.3) → only the live row.
     let default_result = find_workflow_hierarchical(
-        &server,
+        &server, &viewer,
         FindWorkflowHierarchicalParams {
             query: "rfp monitor test".to_string(),
             limit: Some(10),
@@ -608,7 +620,7 @@ async fn find_workflow_hierarchical_filters_deprecated_via_min_truth(pool: PgPoo
 
     // min_truth=0.0 → both rows (caller opts into the cemetery).
     let all_result = find_workflow_hierarchical(
-        &server,
+        &server, &viewer,
         FindWorkflowHierarchicalParams {
             query: "rfp monitor test".to_string(),
             limit: Some(10),

@@ -692,7 +692,8 @@ mod tests {
     fn probe_verdict_diagnoses_a_pooler_before_a_missing_scrub() {
         let err = probe_verdict("", "").expect_err("must refuse");
         assert!(
-            !err.to_string().contains("after_release scrub is not running"),
+            !err.to_string()
+                .contains("after_release scrub is not running"),
             "an all-empty observation is a pooler, not a scrub failure"
         );
     }

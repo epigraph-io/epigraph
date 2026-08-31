@@ -1,3 +1,6 @@
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
 mod common;
 use common::*;
@@ -10,11 +13,12 @@ use common::*;
 /// labels supplied on a batch entry must survive to the persisted claim.
 #[sqlx::test(migrations = "../../migrations")]
 async fn batch_submit_claims_attaches_per_entry_labels(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     let content = "batched claim carrying a label";
     let result = epigraph_mcp::tools::batch::batch_submit_claims(
-        &server,
+        &server, &viewer,
         epigraph_mcp::types::BatchSubmitClaimsParams {
             claims: vec![epigraph_mcp::types::BatchClaimEntry {
                 content: content.into(),

@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "db")]
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 #[cfg(feature = "db")]
@@ -165,12 +166,13 @@ pub async fn scan_conflicts(
 /// POST /api/v1/conflicts/classify - Classify the conflict between two claims.
 #[cfg(feature = "db")]
 pub async fn classify_conflict(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<ClassifyConflictRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Fetch both claims
     let claim_a =
-        epigraph_db::ClaimRepository::get_by_id(&state.db_pool, request.claim_a_id.into())
+        epigraph_db::ClaimRepository::get_by_id(&state.db_pool, &viewer, request.claim_a_id.into())
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to fetch claim A: {e}"),
@@ -181,7 +183,7 @@ pub async fn classify_conflict(
             })?;
 
     let claim_b =
-        epigraph_db::ClaimRepository::get_by_id(&state.db_pool, request.claim_b_id.into())
+        epigraph_db::ClaimRepository::get_by_id(&state.db_pool, &viewer, request.claim_b_id.into())
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to fetch claim B: {e}"),

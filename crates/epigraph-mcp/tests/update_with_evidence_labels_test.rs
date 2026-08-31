@@ -23,6 +23,9 @@
 //! `update_labels` unions the new labels into the existing array via
 //! `array_agg(DISTINCT ...)`. `update_with_evidence` was the odd one out.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
 mod common;
 use common::*;
@@ -31,12 +34,13 @@ use epigraph_mcp::types::UpdateWithEvidenceParams;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn update_with_evidence_adds_labels_without_dropping_existing(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let claim_id =
         seed_claim_with_labels(&pool, "norcal-rfp weekly claim", &["norcal-rfp-2026-06-29"]).await;
     let server = build_test_server(pool.clone());
 
     let result = epigraph_mcp::tools::claims::update_with_evidence(
-        &server,
+        &server, &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,

@@ -4,6 +4,9 @@
 //! `evidence_type`, and combine — so two observers reach different beliefs from
 //! the SAME evidence, with no dependency on how that evidence was ingested.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use std::collections::HashMap;
 
 use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
@@ -76,6 +79,7 @@ async fn store_bba(
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_perspective_belief_diverges_by_observer(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = insert_agent(&pool).await;
     let claim_id = insert_claim(&pool, agent).await;
     let frame_row = FrameRepository::create(
@@ -158,12 +162,12 @@ async fn get_perspective_belief_diverges_by_observer(pool: PgPool) {
     .expect("believer map");
 
     let skeptic_belief = epigraph_engine::belief_query::get_perspective_belief(
-        &pool, claim_id, frame_id, skeptic.id,
+        &pool, &viewer, claim_id, frame_id, skeptic.id,
     )
     .await
     .expect("skeptic belief");
     let believer_belief = epigraph_engine::belief_query::get_perspective_belief(
-        &pool,
+        &pool, &viewer,
         claim_id,
         frame_id,
         believer.id,
@@ -182,7 +186,7 @@ async fn get_perspective_belief_diverges_by_observer(pool: PgPool) {
 
     // The all-α=1.0 believer must equal the global (no-perspective) belief —
     // a neutral observer adds no discount.
-    let global = epigraph_engine::belief_query::get_belief(&pool, claim_id, Some(frame_id))
+    let global = epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_id, Some(frame_id))
         .await
         .expect("global belief");
     assert!(
@@ -197,6 +201,7 @@ async fn get_perspective_belief_diverges_by_observer(pool: PgPool) {
 /// belief exactly (no silent divergence for un-configured observers).
 #[sqlx::test(migrations = "../../migrations")]
 async fn unmapped_perspective_equals_global(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = insert_agent(&pool).await;
     let claim_id = insert_claim(&pool, agent).await;
     let frame_row = FrameRepository::create(
@@ -234,14 +239,14 @@ async fn unmapped_perspective_equals_global(pool: PgPool) {
     .expect("plain perspective");
 
     let scoped = epigraph_engine::belief_query::get_perspective_belief(
-        &pool,
+        &pool, &viewer,
         claim_id,
         frame_row.id,
         plain.id,
     )
     .await
     .expect("scoped belief");
-    let global = epigraph_engine::belief_query::get_belief(&pool, claim_id, Some(frame_row.id))
+    let global = epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_id, Some(frame_row.id))
         .await
         .expect("global belief");
     assert!((scoped.belief - global.belief).abs() < 1e-9);
@@ -252,6 +257,7 @@ async fn unmapped_perspective_equals_global(pool: PgPool) {
 /// discounts (and vice-versa), changing the belief over identical evidence.
 #[sqlx::test(migrations = "../../migrations")]
 async fn perspective_locality_reliability_overrides_global(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = insert_agent(&pool).await;
     let claim_id = insert_claim(&pool, agent).await;
     let frame_row =
@@ -287,7 +293,7 @@ async fn perspective_locality_reliability_overrides_global(pool: PgPool) {
     .expect("store bba");
 
     // Global: empirical(1.0) × intra factor(0.3) discounts the belief.
-    let global = epigraph_engine::belief_query::get_belief(&pool, claim_id, Some(frame_row.id))
+    let global = epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_id, Some(frame_row.id))
         .await
         .expect("global belief");
 
@@ -312,7 +318,7 @@ async fn perspective_locality_reliability_overrides_global(pool: PgPool) {
     .await
     .expect("set locality");
     let trusted = epigraph_engine::belief_query::get_perspective_belief(
-        &pool,
+        &pool, &viewer,
         claim_id,
         frame_row.id,
         truster.id,
@@ -341,7 +347,7 @@ async fn perspective_locality_reliability_overrides_global(pool: PgPool) {
     .await
     .expect("set locality");
     let skeptical = epigraph_engine::belief_query::get_perspective_belief(
-        &pool,
+        &pool, &viewer,
         claim_id,
         frame_row.id,
         skeptic.id,

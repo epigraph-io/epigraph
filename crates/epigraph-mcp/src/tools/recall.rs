@@ -341,6 +341,7 @@ pub struct CorpusScope {
 
 pub async fn recall_with_context(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: RecallWithContextParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
@@ -392,11 +393,13 @@ pub async fn recall_with_context(
         params.perspective_id.as_deref(),
     )?;
     if let Some((frame_id, perspective_id)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
+        crate::tools::lens::validate_lens_exists(&server.pool, viewer, frame_id, perspective_id)
+            .await?;
     }
 
     recall_with_context_post_embed(
         server,
+        viewer,
         &params,
         centroid_dim,
         &pgvec,
@@ -450,6 +453,7 @@ const GRAPH_EXPANSION_DEGREE_WEIGHT: f64 = 0.1;
 ///    one query per claim.
 async fn apply_graph_expansion(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     seeds: Vec<epigraph_db::ClaimEmbeddingHit>,
     depth: u32,
     since: Option<chrono::DateTime<chrono::Utc>>,
@@ -464,10 +468,11 @@ async fn apply_graph_expansion(
     // walk itself is not pruned (an old claim may bridge to a new one); only
     // the emitted destinations are, and only in-window destinations consume
     // the expansion budget.
-    let expansion =
-        epigraph_db::ClaimRepository::graph_expand_seeds_since(pool, &seed_ids, depth, since)
-            .await
-            .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
+    let expansion = epigraph_db::ClaimRepository::graph_expand_seeds_since(
+        pool, viewer, &seed_ids, depth, since,
+    )
+    .await
+    .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
 
     // Best (highest) decayed score per expanded claim, in case it's
     // reachable from more than one seed at different hop counts / seed
@@ -505,7 +510,7 @@ async fn apply_graph_expansion(
     }
 
     let all_ids: Vec<Uuid> = combined.iter().map(|h| h.claim_id).collect();
-    let degree = epigraph_db::ClaimRepository::in_epistemic_degree_batch(pool, &all_ids)
+    let degree = epigraph_db::ClaimRepository::in_epistemic_degree_batch(pool, viewer, &all_ids)
         .await
         .map_err(|e| internal_error(format!("in_epistemic_degree_batch: {e}")))?;
 
@@ -531,6 +536,7 @@ async fn apply_graph_expansion(
 #[allow(clippy::too_many_arguments)]
 async fn recall_with_context_post_embed(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: &RecallWithContextParams,
     centroid_dim: u32,
     pgvec: &str,
@@ -601,10 +607,14 @@ async fn recall_with_context_post_embed(
             // silently ignore `since`.
             since: params.since,
         };
-        let selected =
-            epigraph_engine::diverse_retrieval::run_diverse_pipeline(&server.pool, pgvec, config)
-                .await
-                .map_err(|e| internal_error(format!("diverse retrieval: {e}")))?;
+        let selected = epigraph_engine::diverse_retrieval::run_diverse_pipeline(
+            &server.pool,
+            viewer,
+            pgvec,
+            config,
+        )
+        .await
+        .map_err(|e| internal_error(format!("diverse retrieval: {e}")))?;
 
         if selected.is_empty() {
             // No themes (or no candidates in themes) — fall back to flat ANN
@@ -612,6 +622,7 @@ async fn recall_with_context_post_embed(
             // unclustered corpus. Matches the REST diverse-mode fallback.
             epigraph_db::ClaimRepository::search_by_embedding_since(
                 &server.pool,
+                viewer,
                 pgvec,
                 centroid_dim,
                 flat_limit,
@@ -635,6 +646,7 @@ async fn recall_with_context_post_embed(
         // Flat paragraph-primary kNN (level=2 only, optional paper_doi pre-filter).
         epigraph_db::ClaimRepository::search_by_embedding_since(
             &server.pool,
+            viewer,
             pgvec,
             centroid_dim,
             flat_limit,
@@ -690,7 +702,8 @@ async fn recall_with_context_post_embed(
     // ANN seeds — matching "expand seeds, then rank" rather than "rank seeds,
     // then expand the winners".
     if let Some(depth) = params.graph_expansion_depth {
-        raw_hits = apply_graph_expansion(&server.pool, raw_hits, depth, params.since).await?;
+        raw_hits =
+            apply_graph_expansion(&server.pool, viewer, raw_hits, depth, params.since).await?;
     }
 
     // Stage 4.5: cross-encoder rerank + optional groundedness gate over the
@@ -703,7 +716,7 @@ async fn recall_with_context_post_embed(
     > = std::collections::HashMap::new();
     if params.rerank.unwrap_or(false) {
         let ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
-        let contents = epigraph_db::ClaimRepository::contents_by_ids(&server.pool, &ids)
+        let contents = epigraph_db::ClaimRepository::contents_by_ids(&server.pool, viewer, &ids)
             .await
             .map_err(|e| internal_error(format!("rerank content fetch: {e}")))?;
         let cands: Vec<epigraph_engine::rerank::RerankCandidate> = raw_hits
@@ -912,6 +925,7 @@ async fn recall_with_context_post_embed(
         let claim_ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
         match epigraph_engine::belief_query::get_perspective_belief_batch(
             &server.pool,
+            viewer,
             &claim_ids,
             frame_id,
             perspective_id,
@@ -968,7 +982,9 @@ async fn recall_with_context_post_embed(
     // dispute status can recall it as a hit in its own right.
     {
         let paragraph_ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
-        match epigraph_db::ClaimRepository::dispute_batch(&server.pool, &paragraph_ids).await {
+        match epigraph_db::ClaimRepository::dispute_batch(&server.pool, viewer, &paragraph_ids)
+            .await
+        {
             Ok(mut by_claim) => {
                 for hit in &mut results {
                     // Absent key == uncontested, per the repo contract.
@@ -1708,6 +1724,7 @@ pub mod __test_only {
     /// `recall_with_context` runs after `embedder.generate_at_dim`.
     pub async fn recall_with_context_with_pgvec(
         server: &EpiGraphMcpFull,
+        viewer: &epigraph_db::visibility::Viewer,
         params: RecallWithContextParams,
         centroid_dim: u32,
         pgvec: &str,
@@ -1724,11 +1741,17 @@ pub mod __test_only {
             params.perspective_id.as_deref(),
         )?;
         if let Some((frame_id, perspective_id)) = lens {
-            crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id)
-                .await?;
+            crate::tools::lens::validate_lens_exists(
+                &server.pool,
+                viewer,
+                frame_id,
+                perspective_id,
+            )
+            .await?;
         }
         recall_with_context_post_embed(
             server,
+            viewer,
             &params,
             centroid_dim,
             pgvec,

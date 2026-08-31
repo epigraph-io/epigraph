@@ -9,6 +9,9 @@
 //!   SQLX_OFFLINE=true \
 //!     cargo test -p epigraph-engine --test perspectival_divergence_check -- --ignored --nocapture
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::PgPool;
 use epigraph_engine::belief_query::get_perspective_belief;
 use uuid::Uuid;
@@ -18,6 +21,7 @@ use uuid::Uuid;
 async fn perspective_divergence_is_real() {
     let url = std::env::var("DATABASE_URL").expect("set DATABASE_URL");
     let pool = PgPool::connect(&url).await.expect("connect");
+    let viewer = fixture::public_viewer(&pool).await;
 
     let perspectives: Vec<(String, Uuid)> =
         sqlx::query_as("SELECT name, id FROM perspectives ORDER BY name")
@@ -63,7 +67,7 @@ async fn perspective_divergence_is_real() {
         println!("\n{content}   [{}T / {}F evidence]", counts.0, counts.1);
         let mut betps = vec![];
         for (pname, pid) in &perspectives {
-            let bi = get_perspective_belief(&pool, *cid, frame_id, *pid)
+            let bi = get_perspective_belief(&pool, &viewer, *cid, frame_id, *pid)
                 .await
                 .expect("belief");
             println!(

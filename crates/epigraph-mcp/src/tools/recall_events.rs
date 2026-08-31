@@ -50,6 +50,7 @@ fn parse_opt_time(
 
 pub async fn get_recall_events(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetRecallEventsParams,
 ) -> Result<CallToolResult, McpError> {
     let agent_id = parse_opt_uuid(params.agent_id.as_deref(), "agent_id")?;
@@ -59,6 +60,7 @@ pub async fn get_recall_events(
 
     let rows = RecallEventRepository::list(
         &server.pool,
+        viewer,
         agent_id,
         claim_id,
         since,

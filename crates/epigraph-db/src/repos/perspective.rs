@@ -249,19 +249,27 @@ impl PerspectiveRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<PerspectiveRow>, DbError> {
-        let row: Option<PerspectiveRow> = sqlx::query_as(
+    #[instrument(skip(pool, viewer))]
+    pub async fn get_by_id(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<PerspectiveRow>, DbError> {
+        let sql = viewer.splice(
             r#"
             SELECT id, name, description, owner_agent_id, perspective_type,
                    frame_ids, extraction_method, confidence_calibration, properties, created_at
             FROM perspectives
             WHERE id = $1
+              /* {VISIBILITY:perspectives} */
             "#,
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, PerspectiveRow>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<PerspectiveRow> = q.fetch_optional(pool).await?;
 
         Ok(row)
     }
@@ -270,28 +278,34 @@ impl PerspectiveRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn list_by_agent(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<PerspectiveRow>, DbError> {
-        let rows: Vec<PerspectiveRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, name, description, owner_agent_id, perspective_type,
                    frame_ids, extraction_method, confidence_calibration, properties, created_at
             FROM perspectives
             WHERE owner_agent_id = $1
+              /* {VISIBILITY:perspectives} */
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
             "#,
-        )
-        .bind(agent_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+            4,
+        );
+        let mut q = sqlx::query_as::<_, PerspectiveRow>(&sql)
+            .bind(agent_id)
+            .bind(limit)
+            .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<PerspectiveRow> = q.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -300,25 +314,31 @@ impl PerspectiveRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn list(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<PerspectiveRow>, DbError> {
-        let rows: Vec<PerspectiveRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, name, description, owner_agent_id, perspective_type,
                    frame_ids, extraction_method, confidence_calibration, properties, created_at
             FROM perspectives
+            WHERE true /* {VISIBILITY:perspectives} */
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
             "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, PerspectiveRow>(&sql)
+            .bind(limit)
+            .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<PerspectiveRow> = q.fetch_all(pool).await?;
 
         Ok(rows)
     }

@@ -20,6 +20,9 @@
 //! Tracking the missing first-class capability: see the epigraph feature
 //! request for a configurable ingest target (per-call DB / document-ingest CLI).
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
@@ -42,6 +45,8 @@ async fn ingest_extraction_into_target_db() {
         .expect("set EXTRACTION_PATH to the DocumentExtraction JSON file");
 
     let pool = PgPool::connect(&db).await.expect("connect to target DB");
+
+    let viewer = fixture::public_viewer(&pool).await;
     // Bring the chosen DB up to the repo schema; idempotent on an already-migrated DB.
     sqlx::migrate!("../../migrations")
         .run(&pool)
@@ -53,7 +58,7 @@ async fn ingest_extraction_into_target_db() {
         serde_json::from_str(&raw).expect("parse DocumentExtraction");
 
     let server = make_server(pool.clone());
-    let result = do_ingest_document(&server, &extraction)
+    let result = do_ingest_document(&server, &viewer, &extraction)
         .await
         .expect("do_ingest_document succeeds");
 

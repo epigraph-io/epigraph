@@ -15,6 +15,7 @@
 //! - `POST /api/v1/frames/:id/evidence` — submit mass function evidence
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 #[cfg(feature = "db")]
@@ -484,11 +485,13 @@ pub async fn get_claim_belief(
 /// `GET /api/v1/frames`
 #[cfg(feature = "db")]
 pub async fn list_frames(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListFramesQuery>,
 ) -> Result<Json<Vec<FrameResponse>>, ApiError> {
     let pool = &state.db_pool;
-    let rows = epigraph_db::FrameRepository::list(pool, params.limit, params.offset).await?;
+    let rows =
+        epigraph_db::FrameRepository::list(pool, &viewer, params.limit, params.offset).await?;
 
     let frames = rows.into_iter().map(frame_to_response).collect();
 
@@ -500,19 +503,21 @@ pub async fn list_frames(
 /// `GET /api/v1/frames/:id`
 #[cfg(feature = "db")]
 pub async fn get_frame(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
 ) -> Result<Json<FrameDetailResponse>, ApiError> {
     let pool = &state.db_pool;
 
-    let row = epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    let row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
             id: frame_id.to_string(),
         })?;
 
-    let claim_rows = epigraph_db::FrameRepository::get_claims_in_frame(pool, frame_id).await?;
+    let claim_rows =
+        epigraph_db::FrameRepository::get_claims_in_frame(pool, &viewer, frame_id).await?;
 
     let claims: Vec<FrameClaimEntry> = claim_rows
         .into_iter()
@@ -534,13 +539,14 @@ pub async fn get_frame(
 /// `GET /api/v1/frames/:id/conflict`
 #[cfg(feature = "db")]
 pub async fn frame_conflict(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
 ) -> Result<Json<FrameConflictResponse>, ApiError> {
     let pool = &state.db_pool;
 
     // Verify frame exists
-    epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -603,6 +609,7 @@ pub(crate) fn reconstruct_mass_function(
 /// `POST /api/v1/frames/:id/conflict-batch`
 #[cfg(feature = "db")]
 pub async fn conflict_batch(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
     Json(request): Json<ConflictBatchRequest>,
@@ -624,7 +631,7 @@ pub async fn conflict_batch(
     let pool = &state.db_pool;
 
     // Verify frame exists and get its hypotheses for reconstruction
-    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -650,7 +657,8 @@ pub async fn conflict_batch(
     let mut mass_fns: HashMap<Uuid, MassFunction> = HashMap::new();
     for &cid in &claim_ids {
         let rows =
-            epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, cid, frame_id).await?;
+            epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, &viewer, cid, frame_id)
+                .await?;
         // get_for_claim_frame returns ORDER BY created_at ASC, so last() is latest.
         // Use max_by_key as defense against ordering changes.
         if let Some(row) = rows.iter().max_by_key(|r| r.created_at) {
@@ -772,6 +780,7 @@ pub async fn create_frame(
 /// `POST /api/v1/frames/:id/evidence`
 #[cfg(feature = "db")]
 pub async fn submit_evidence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
     Json(request): Json<SubmitEvidenceRequest>,
@@ -782,7 +791,7 @@ pub async fn submit_evidence(
     let pool = &state.db_pool;
 
     // 1. Load and validate frame
-    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -849,7 +858,7 @@ pub async fn submit_evidence(
 
     // 4b. Apply active context modifiers for this frame (between discount and store)
     let mut modified = discounted;
-    let active_contexts = epigraph_db::ContextRepository::list_for_frame(pool, frame_id)
+    let active_contexts = epigraph_db::ContextRepository::list_for_frame(pool, &viewer, frame_id)
         .await
         .unwrap_or_default();
     let now = chrono::Utc::now();
@@ -898,7 +907,7 @@ pub async fn submit_evidence(
     // 4c. Apply perspective confidence_calibration as additional discount
     if let Some(perspective_id) = request.perspective_id {
         if let Ok(Some(perspective)) =
-            epigraph_db::PerspectiveRepository::get_by_id(pool, perspective_id).await
+            epigraph_db::PerspectiveRepository::get_by_id(pool, &viewer, perspective_id).await
         {
             if let Some(calibration) = perspective.confidence_calibration {
                 if (0.0..1.0).contains(&calibration) {
@@ -966,11 +975,11 @@ pub async fn submit_evidence(
 
         // Load edges where this claim is source or target
         let source_edges =
-            epigraph_db::EdgeRepository::get_by_source(pool, request.claim_id, "claim")
+            epigraph_db::EdgeRepository::get_by_source(pool, &viewer, request.claim_id, "claim")
                 .await
                 .unwrap_or_default();
         let target_edges =
-            epigraph_db::EdgeRepository::get_by_target(pool, request.claim_id, "claim")
+            epigraph_db::EdgeRepository::get_by_target(pool, &viewer, request.claim_id, "claim")
                 .await
                 .unwrap_or_default();
 
@@ -1103,9 +1112,13 @@ pub async fn submit_evidence(
     // 7. Retrieve all BBAs for this (claim, frame), excluding system-combined results.
     //    Only include user-submitted BBAs (combination_method = "discount") to avoid
     //    double-counting derived artifacts (violates TBM independence assumption).
-    let all_rows =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, request.claim_id, frame_id)
-            .await?;
+    let all_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
+        pool,
+        &viewer,
+        request.claim_id,
+        frame_id,
+    )
+    .await?;
 
     // 8. Sort mass functions by row ID for canonical combination ordering.
     //    This ensures identical results regardless of evidence submission order.
@@ -1126,7 +1139,7 @@ pub async fn submit_evidence(
             indexed_rows.iter().map(|(_, _, m)| m.clone()).collect(),
         )
     } else {
-        super::independence::analyze_independence(pool, &indexed_rows, 5).await?
+        super::independence::analyze_independence(pool, &viewer, &indexed_rows, 5).await?
     };
 
     // 10a. Cautious-combine within each dependent group
@@ -1169,9 +1182,13 @@ pub async fn submit_evidence(
     };
 
     // 11. Look up claim's hypothesis_index in claim_frames for correct Bel/Pl
-    let claim_assignment =
-        epigraph_db::FrameRepository::get_claim_assignment(pool, request.claim_id, frame_id)
-            .await?;
+    let claim_assignment = epigraph_db::FrameRepository::get_claim_assignment(
+        pool,
+        &viewer,
+        request.claim_id,
+        frame_id,
+    )
+    .await?;
     let h_idx = claim_assignment.and_then(|ca| ca.hypothesis_index);
 
     let (final_bel, final_pl, final_betp, m_missing) =
@@ -1322,6 +1339,7 @@ pub async fn submit_evidence(
 
     let total_sources = epigraph_db::MassFunctionRepository::count_for_claim_frame(
         pool,
+        &viewer,
         request.claim_id,
         frame_id,
     )
@@ -1410,6 +1428,7 @@ pub async fn submit_evidence(
         let perspective_rows =
             epigraph_db::MassFunctionRepository::get_for_claim_frame_perspective(
                 pool,
+                &viewer,
                 request.claim_id,
                 frame_id,
                 perspective_id,
@@ -1485,7 +1504,7 @@ pub async fn submit_evidence(
             for community_id in community_ids {
                 // Check for community mass_override before combining member BBAs
                 let use_override = if let Ok(Some(comm)) =
-                    epigraph_db::CommunityRepository::get_by_id(pool, community_id).await
+                    epigraph_db::CommunityRepository::get_by_id(pool, &viewer, community_id).await
                 {
                     if let Some(ref overrides) = comm.mass_override {
                         // Look up override for this specific frame
@@ -1538,6 +1557,7 @@ pub async fn submit_evidence(
                     let community_rows =
                         epigraph_db::MassFunctionRepository::get_for_claim_frame_perspectives(
                             pool,
+                            &viewer,
                             request.claim_id,
                             frame_id,
                             &member_ids,
@@ -1906,6 +1926,7 @@ pub async fn claims_by_belief(
 #[cfg(feature = "db")]
 #[allow(clippy::type_complexity)]
 pub async fn frame_claims_sorted(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
     Query(params): Query<FrameClaimsQuery>,
@@ -1914,7 +1935,7 @@ pub async fn frame_claims_sorted(
     let pool = &state.db_pool;
 
     // Verify frame exists
-    epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -2015,11 +2036,12 @@ pub async fn frame_claims_sorted(
 /// `GET /api/v1/claims/:id/divergence`
 #[cfg(feature = "db")]
 pub async fn claim_divergence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<Option<DivergenceResponse>>, ApiError> {
     let pool = &state.db_pool;
-    let row = epigraph_db::DivergenceRepository::get_latest(pool, claim_id).await?;
+    let row = epigraph_db::DivergenceRepository::get_latest(pool, &viewer, claim_id).await?;
 
     Ok(Json(row.map(|r| DivergenceResponse {
         id: r.id,
@@ -2038,11 +2060,13 @@ pub async fn claim_divergence(
 /// `GET /api/v1/divergence/top`
 #[cfg(feature = "db")]
 pub async fn top_divergence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<TopDivergenceQuery>,
 ) -> Result<Json<Vec<DivergenceResponse>>, ApiError> {
     let pool = &state.db_pool;
-    let rows = epigraph_db::DivergenceRepository::top_divergent(pool, params.limit).await?;
+    let rows =
+        epigraph_db::DivergenceRepository::top_divergent(pool, &viewer, params.limit).await?;
 
     let result = rows
         .into_iter()
@@ -2068,6 +2092,7 @@ pub async fn top_divergence(
 /// Query params: `scope` (global|perspective|community), `scope_id` (UUID)
 #[cfg(feature = "db")]
 pub async fn get_scoped_belief(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<ScopedBeliefQuery>,
@@ -2082,8 +2107,14 @@ pub async fn get_scoped_belief(
         });
     }
 
-    let row = epigraph_db::ScopedBeliefRepository::get(pool, claim_id, scope_type, params.scope_id)
-        .await?;
+    let row = epigraph_db::ScopedBeliefRepository::get(
+        pool,
+        &viewer,
+        claim_id,
+        scope_type,
+        params.scope_id,
+    )
+    .await?;
 
     Ok(Json(row.map(scoped_belief_to_entry)))
 }
@@ -2093,11 +2124,12 @@ pub async fn get_scoped_belief(
 /// `GET /api/v1/claims/:id/belief/all-scopes`
 #[cfg(feature = "db")]
 pub async fn all_scopes_belief(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<AllScopesBeliefResponse>, ApiError> {
     let pool = &state.db_pool;
-    let rows = epigraph_db::ScopedBeliefRepository::list_for_claim(pool, claim_id).await?;
+    let rows = epigraph_db::ScopedBeliefRepository::list_for_claim(pool, &viewer, claim_id).await?;
 
     let scopes = rows.into_iter().map(scoped_belief_to_entry).collect();
 
@@ -2129,6 +2161,7 @@ fn scoped_belief_to_entry(row: epigraph_db::ScopedBeliefRow) -> ScopedBeliefEntr
 /// credal-level storage, pignistic-level computation at decision time).
 #[cfg(feature = "db")]
 pub async fn get_pignistic(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<PignisticQuery>,
@@ -2139,7 +2172,7 @@ pub async fn get_pignistic(
     let frame_id = params.frame_id;
 
     // Load frame
-    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -2155,7 +2188,8 @@ pub async fn get_pignistic(
 
     // Load all individual evidence BBAs (exclude system-combined)
     let all_rows =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id).await?;
+        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, &viewer, claim_id, frame_id)
+            .await?;
 
     let mut indexed: Vec<(Uuid, MassFunction)> = all_rows
         .iter()
@@ -2241,6 +2275,7 @@ pub async fn get_pignistic(
 /// `POST /api/v1/frames/:id/refine`
 #[cfg(feature = "db")]
 pub async fn refine_frame(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(parent_id): Path<Uuid>,
     Json(request): Json<RefineFrameRequest>,
@@ -2248,7 +2283,7 @@ pub async fn refine_frame(
     let pool = &state.db_pool;
 
     // Validate parent frame exists and is refinable
-    let parent = epigraph_db::FrameRepository::get_by_id(pool, parent_id)
+    let parent = epigraph_db::FrameRepository::get_by_id(pool, &viewer, parent_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -2293,20 +2328,21 @@ pub async fn refine_frame(
 /// `GET /api/v1/frames/:id/refinements`
 #[cfg(feature = "db")]
 pub async fn frame_refinements(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
 ) -> Result<Json<Vec<FrameResponse>>, ApiError> {
     let pool = &state.db_pool;
 
     // Verify frame exists
-    epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
             id: frame_id.to_string(),
         })?;
 
-    let children = epigraph_db::FrameRepository::get_children(pool, frame_id).await?;
+    let children = epigraph_db::FrameRepository::get_children(pool, &viewer, frame_id).await?;
     Ok(Json(children.into_iter().map(frame_to_response).collect()))
 }
 
@@ -2315,11 +2351,12 @@ pub async fn frame_refinements(
 /// `GET /api/v1/frames/:id/ancestry`
 #[cfg(feature = "db")]
 pub async fn frame_ancestry(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
 ) -> Result<Json<Vec<FrameResponse>>, ApiError> {
     let pool = &state.db_pool;
-    let ancestry = epigraph_db::FrameRepository::get_ancestry(pool, frame_id).await?;
+    let ancestry = epigraph_db::FrameRepository::get_ancestry(pool, &viewer, frame_id).await?;
 
     if ancestry.is_empty() {
         return Err(ApiError::NotFound {

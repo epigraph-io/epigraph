@@ -8,6 +8,7 @@ use epigraph_db::ClaimRepository;
 
 pub async fn supersede_claim(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: SupersedeClaimParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
@@ -16,7 +17,7 @@ pub async fn supersede_claim(
 
     // Per-resource ownership check: only the claim's author or a
     // claims:admin token holder may supersede it.
-    let existing = ClaimRepository::get_by_id(&server.pool, old_claim_id)
+    let existing = ClaimRepository::get_by_id(&server.pool, viewer, old_claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {} not found", old)))?;
@@ -45,7 +46,8 @@ pub async fn supersede_claim(
     // Reported rather than silent so a caller reading a downstream claim
     // straight after this call can see exactly what was repaired.
     let cascade =
-        epigraph_engine::retraction_cascade::cascade_after_supersede(&server.pool, new_id).await;
+        epigraph_engine::retraction_cascade::cascade_after_supersede(&server.pool, viewer, new_id)
+            .await;
 
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&serde_json::json!({
@@ -60,6 +62,7 @@ pub async fn supersede_claim(
 
 pub async fn mark_duplicate(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: MarkDuplicateParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
@@ -69,7 +72,7 @@ pub async fn mark_duplicate(
 
     // Per-resource ownership check: only the duplicate claim's author or a
     // claims:admin token holder may mark it as a duplicate.
-    let dup_claim = ClaimRepository::get_by_id(&server.pool, dup_claim_id)
+    let dup_claim = ClaimRepository::get_by_id(&server.pool, viewer, dup_claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {} not found", dup)))?;
@@ -82,6 +85,7 @@ pub async fn mark_duplicate(
     // supersede: the dedup's own failure is an error, the cascade's is not.
     let cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
         &server.pool,
+        viewer,
         dup_claim_id.into(),
         canon,
     )

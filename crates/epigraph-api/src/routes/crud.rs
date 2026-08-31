@@ -9,6 +9,7 @@
 //! - `POST /api/v1/edges-staging/promote` — Promote approved staged edges
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 use axum::{
     extract::{Path, State},
@@ -596,6 +597,7 @@ pub struct UpsertClusterRequest {
 /// named after the cluster. If no frame exists for the cluster, creates one.
 #[cfg(feature = "db")]
 pub async fn upsert_cluster(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<UpsertClusterRequest>,
@@ -612,7 +614,7 @@ pub async fn upsert_cluster(
     let frame_name = format!("cluster:{}", request.cluster_label);
 
     // Find or create the frame for this cluster
-    let frame = FrameRepository::get_by_name(&state.db_pool, &frame_name).await?;
+    let frame = FrameRepository::get_by_name(&state.db_pool, &viewer, &frame_name).await?;
     let frame_id = match frame {
         Some(f) => f.id,
         None => {
@@ -694,6 +696,7 @@ pub struct AssignClaimToFrameRequest {
 /// POST /api/v1/frames/:id/assign-claim
 #[cfg(feature = "db")]
 pub async fn assign_claim_to_frame(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(frame_id): Path<Uuid>,
@@ -709,7 +712,7 @@ pub async fn assign_claim_to_frame(
     crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     // Verify frame exists
-    FrameRepository::get_by_id(&state.db_pool, frame_id)
+    FrameRepository::get_by_id(&state.db_pool, &viewer, frame_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Frame".to_string(),
@@ -903,6 +906,7 @@ pub struct BoundaryClaimsQuery {
 /// assigned centroid — candidates for theme reassignment.
 #[cfg(feature = "db")]
 pub async fn get_boundary_claims(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<BoundaryClaimsQuery>,
@@ -918,7 +922,8 @@ pub async fn get_boundary_claims(
     let limit = params.limit.unwrap_or(500).min(500);
 
     let rows =
-        ClaimThemeRepository::find_boundary_claims(&state.db_pool, min_br, min_cd, limit).await?;
+        ClaimThemeRepository::find_boundary_claims(&state.db_pool, &viewer, min_br, min_cd, limit)
+            .await?;
 
     let results: Vec<serde_json::Value> = rows
         .iter()
@@ -979,6 +984,7 @@ pub struct ReassignClaimRequest {
 /// unthemes if claim is an outlier everywhere, or leaves in place.
 #[cfg(feature = "db")]
 pub async fn reassign_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     _scope: crate::middleware::bearer::RequireScopeAdmin,
     Json(request): Json<ReassignClaimRequest>,
@@ -994,7 +1000,8 @@ pub async fn reassign_claim(
 
     // Get claim's embedding as pgvector string
     let emb_str =
-        ClaimThemeRepository::get_claim_embedding_str(&state.db_pool, request.claim_id).await?;
+        ClaimThemeRepository::get_claim_embedding_str(&state.db_pool, &viewer, request.claim_id)
+            .await?;
 
     let emb_str = match emb_str {
         Some(e) => e,
@@ -1010,7 +1017,8 @@ pub async fn reassign_claim(
 
     // Get current theme distance
     let current_distance =
-        ClaimThemeRepository::get_claim_theme_distance(&state.db_pool, request.claim_id).await?;
+        ClaimThemeRepository::get_claim_theme_distance(&state.db_pool, &viewer, request.claim_id)
+            .await?;
 
     // Get current theme_id and label
     let current_theme = sqlx::query(
@@ -1302,6 +1310,7 @@ pub struct AssignUnthemedRequest {
 /// Returns total count of newly assigned claims.
 #[cfg(feature = "db")]
 pub async fn assign_unthemed(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<AssignUnthemedRequest>,
@@ -1320,7 +1329,8 @@ pub async fn assign_unthemed(
 
     loop {
         let assigned =
-            ClaimThemeRepository::assign_unthemed_batch(&state.db_pool, batch_size).await?;
+            ClaimThemeRepository::assign_unthemed_batch(&state.db_pool, &viewer, batch_size)
+                .await?;
 
         if assigned == 0 {
             break;
@@ -1362,6 +1372,7 @@ pub struct RecomputeCentroidsRequest {
 /// If theme_ids provided, only recompute those. Otherwise recompute all.
 #[cfg(feature = "db")]
 pub async fn recompute_centroids(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<RecomputeCentroidsRequest>,
@@ -1380,7 +1391,8 @@ pub async fn recompute_centroids(
             let mut results = Vec::new();
             for id in &ids {
                 if let Some((label, count)) =
-                    ClaimThemeRepository::recompute_centroid_for_theme(&state.db_pool, *id).await?
+                    ClaimThemeRepository::recompute_centroid_for_theme(&state.db_pool, &viewer, *id)
+                        .await?
                 {
                     results.push(serde_json::json!({
                         "id": id,
@@ -1392,7 +1404,8 @@ pub async fn recompute_centroids(
             results
         }
         None => {
-            let rows = ClaimThemeRepository::recompute_all_centroids(&state.db_pool).await?;
+            let rows =
+                ClaimThemeRepository::recompute_all_centroids(&state.db_pool, &viewer).await?;
             rows.iter()
                 .map(|r| {
                     serde_json::json!({
@@ -1439,6 +1452,7 @@ pub struct SplitCandidatesQuery {
 /// GET /api/v1/themes/split-candidates
 #[cfg(feature = "db")]
 pub async fn get_split_candidates(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<SplitCandidatesQuery>,
@@ -1451,6 +1465,7 @@ pub async fn get_split_candidates(
 
     let rows = ClaimThemeRepository::find_split_candidates(
         &state.db_pool,
+        &viewer,
         params.variance_threshold.unwrap_or(0.35),
         params.min_claims.unwrap_or(500),
         params.limit.unwrap_or(20),
@@ -1497,6 +1512,7 @@ pub struct DistantClaimsQuery {
 /// GET /api/v1/themes/distant-claims
 #[cfg(feature = "db")]
 pub async fn get_distant_claims(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<DistantClaimsQuery>,
@@ -1509,6 +1525,7 @@ pub async fn get_distant_claims(
 
     let rows = ClaimThemeRepository::find_distant_claims(
         &state.db_pool,
+        &viewer,
         params.distance_threshold.unwrap_or(0.45),
         params.min_cluster_size.unwrap_or(20),
         params.limit.unwrap_or(20),
@@ -1551,6 +1568,7 @@ pub struct ThemeEmbeddingsQuery {
 /// GET /api/v1/themes/:id/embeddings
 #[cfg(feature = "db")]
 pub async fn get_theme_embeddings(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(theme_id): Path<Uuid>,
@@ -1563,7 +1581,8 @@ pub async fn get_theme_embeddings(
     use epigraph_db::ClaimThemeRepository;
 
     let limit = params.limit.unwrap_or(5000).min(5000);
-    let rows = ClaimThemeRepository::get_theme_embeddings(&state.db_pool, theme_id, limit).await?;
+    let rows = ClaimThemeRepository::get_theme_embeddings(&state.db_pool, &viewer, theme_id, limit)
+        .await?;
 
     let claims: Vec<serde_json::Value> = rows
         .iter()

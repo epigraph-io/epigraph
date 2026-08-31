@@ -45,13 +45,37 @@ const REFUTATION_THRESHOLD: f64 = 0.2;
 /// ```
 pub struct DbReputationService {
     pool: PgPool,
+    /// The tenancy-aware pool, when the process built one.
+    ///
+    /// `ReputationJobService` is a trait in `epigraph-jobs` whose signature
+    /// cannot carry a `Viewer` (the trait is transport- and tenancy-agnostic by
+    /// design, and widening it would push a `Viewer` into every mock in the
+    /// test suite). But `ClaimRepository::get_by_agent` now requires one, and
+    /// reputation is a **corpus-wide aggregate over an agent's whole output** —
+    /// a scoped view of it would compute a different reputation per reader,
+    /// which is not what a reputation is.
+    ///
+    /// So this reads under a bypass, and the bypass needs a
+    /// `MaintenanceLease`, which only a `ScopedPool` can mint. Without one the
+    /// service fails closed rather than reading unfiltered.
+    scoped: Option<epigraph_db::ScopedPool>,
 }
 
 impl DbReputationService {
     /// Create a new `DbReputationService` with the given connection pool.
+    ///
+    /// The resulting service cannot compute outcomes until
+    /// [`Self::with_scoped_pool`] supplies a `ScopedPool` — see [`Self::scoped`].
     #[must_use]
     pub const fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool, scoped: None }
+    }
+
+    /// Attach the pool that can mint a maintenance lease.
+    #[must_use]
+    pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
+        self.scoped = Some(scoped);
+        self
     }
 }
 
@@ -63,7 +87,33 @@ impl ReputationJobService for DbReputationService {
     ) -> Result<Vec<ClaimOutcomeData>, ReputationJobError> {
         let agent = AgentId::from(agent_id);
 
-        let claims = ClaimRepository::get_by_agent(&self.pool, agent)
+        // Corpus-wide aggregate; see the `scoped` field docs for why this is a
+        // bypass and why it fails closed without a `ScopedPool`.
+        // `BeliefRecomputation` is the enumerated reason: reputation is a
+        // derived belief statistic recomputed over the whole corpus, and adding
+        // a variant here would break `viewer_ratchet.rs`'s monotone-decreasing
+        // property for a job that is already covered by an existing reason.
+        let scoped = self
+            .scoped
+            .as_ref()
+            .ok_or_else(|| ReputationJobError::StorageError {
+                message: "DbReputationService has no ScopedPool, so it cannot mint the \
+                      maintenance lease a corpus-wide reputation read requires; \
+                      construct it with DbReputationService::with_scoped_pool"
+                    .to_string(),
+            })?;
+        let (_maint_conn, lease) = scoped
+            .unscoped_for_maintenance(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .map_err(|e| ReputationJobError::StorageError {
+                message: format!("maintenance acquire failed: {e}"),
+            })?;
+        let viewer = epigraph_db::visibility::Viewer::system(
+            &lease,
+            epigraph_db::visibility::SystemReason::BeliefRecomputation,
+        );
+
+        let claims = ClaimRepository::get_by_agent(&self.pool, &viewer, agent)
             .await
             .map_err(|e| ReputationJobError::StorageError {
                 message: format!("Failed to fetch claims for agent {agent_id}: {e}"),

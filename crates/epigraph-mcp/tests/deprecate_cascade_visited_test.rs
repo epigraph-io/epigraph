@@ -1,3 +1,6 @@
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
 mod common;
 use common::*;
@@ -15,6 +18,7 @@ use common::*;
 /// and appear twice in `deprecated_ids`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn deprecate_workflow_diamond_dag_no_duplicates(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let root = seed_workflow_claim(&pool, "root workflow", &["step1"]).await;
     let a = seed_workflow_claim(&pool, "variant A", &["step1"]).await;
     let b = seed_workflow_claim(&pool, "variant B", &["step1"]).await;
@@ -28,7 +32,7 @@ async fn deprecate_workflow_diamond_dag_no_duplicates(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     let result = epigraph_mcp::tools::workflows::deprecate_workflow(
-        &server,
+        &server, &viewer,
         epigraph_mcp::types::DeprecateWorkflowParams {
             workflow_id: root.to_string(),
             reason: "diamond test".into(),

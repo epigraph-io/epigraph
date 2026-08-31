@@ -1,3 +1,6 @@
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
 mod common;
 use common::*;
@@ -18,11 +21,12 @@ async fn plant_stub_embedding(pool: &PgPool, id: uuid::Uuid) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn mcp_deprecate_workflow_sets_is_current_false(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let id = seed_workflow_claim(&pool, "to-deprecate", &["s1"]).await;
     let server = build_test_server(pool.clone());
 
     epigraph_mcp::tools::workflows::deprecate_workflow(
-        &server,
+        &server, &viewer,
         epigraph_mcp::types::DeprecateWorkflowParams {
             workflow_id: id.to_string(),
             reason: "obsolete".into(),
@@ -49,12 +53,13 @@ async fn mcp_deprecate_workflow_sets_is_current_false(pool: PgPool) {
 /// of semantic recall.  Regression for the is_current=false → embedding=NULL invariant.
 #[sqlx::test(migrations = "../../migrations")]
 async fn deprecate_workflow_nulls_embedding(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let id = seed_workflow_claim(&pool, "to-deprecate-embed", &["s1"]).await;
     plant_stub_embedding(&pool, id).await;
 
     let server = build_test_server(pool.clone());
     epigraph_mcp::tools::workflows::deprecate_workflow(
-        &server,
+        &server, &viewer,
         epigraph_mcp::types::DeprecateWorkflowParams {
             workflow_id: id.to_string(),
             reason: "embedding test".into(),
@@ -81,6 +86,7 @@ async fn deprecate_workflow_nulls_embedding(pool: PgPool) {
 /// transitive workflow descendants.
 #[sqlx::test(migrations = "../../migrations")]
 async fn deprecate_workflow_cascade_nulls_embeddings(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let root = seed_workflow_claim(&pool, "root-embed", &["s1"]).await;
     let child = seed_workflow_claim(&pool, "child-embed", &["s1"]).await;
     insert_claim_edge(&pool, child, root, "variant_of").await;
@@ -91,7 +97,7 @@ async fn deprecate_workflow_cascade_nulls_embeddings(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     epigraph_mcp::tools::workflows::deprecate_workflow(
-        &server,
+        &server, &viewer,
         epigraph_mcp::types::DeprecateWorkflowParams {
             workflow_id: root.to_string(),
             reason: "cascade embed test".into(),
@@ -117,6 +123,7 @@ async fn deprecate_workflow_cascade_nulls_embeddings(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn deprecate_workflow_cascade_walks_supersedes_and_variant_of(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let root = seed_workflow_claim(&pool, "root", &["s1"]).await;
     let child_old = seed_workflow_claim(&pool, "child_old", &["s1"]).await;
     let child_new = seed_workflow_claim(&pool, "child_new", &["s1"]).await;
@@ -130,7 +137,7 @@ async fn deprecate_workflow_cascade_walks_supersedes_and_variant_of(pool: PgPool
 
     let server = build_test_server(pool.clone());
     epigraph_mcp::tools::workflows::deprecate_workflow(
-        &server,
+        &server, &viewer,
         epigraph_mcp::types::DeprecateWorkflowParams {
             workflow_id: root.to_string(),
             reason: "cascade test".into(),

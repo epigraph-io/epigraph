@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "db")]
 use crate::access_control::{check_content_access, ContentAccess};
+use crate::middleware::bearer::ViewerExtractor;
 use crate::{errors::ApiError, state::AppState};
 // set_group_context (from epigraph-privacy) lives in the epigraph-enterprise
 // repo. Add epigraph-privacy as a dep there to restore RLS group context
@@ -300,6 +301,7 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
 /// - Claim + encryption metadata are written atomically in a transaction
 #[cfg(feature = "db")]
 pub async fn create_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     // Still `Option<Extension<..>>` rather than a required extractor: PR-07
     // replaces the whole `Option<AuthContext>` idiom with `ViewerExtractor`
@@ -506,7 +508,7 @@ pub async fn create_claim(
 
     // Persist claim — branch on if_not_exists per noun-claims-and-verb-edges S1.
     let (created_claim, was_created) = if request.if_not_exists {
-        ClaimRepository::create_or_get(&mut tx, &claim).await?
+        ClaimRepository::create_or_get(&mut tx, &viewer, &claim).await?
     } else {
         // The (content_hash, agent_id) UNIQUE constraint that create_strict's
         // 409-on-duplicate contract relied on was dropped (migration 107), so
@@ -525,6 +527,7 @@ pub async fn create_claim(
         };
         if ClaimRepository::find_by_content_hash_and_agent(
             &mut tx,
+            &viewer,
             content_hash.as_slice(),
             agent_uuid,
         )
@@ -850,6 +853,7 @@ pub struct GetClaimQuery {
 /// does not have access, the content field is redacted.
 #[cfg(feature = "db")]
 pub async fn get_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(params): Query<GetClaimQuery>,
@@ -895,7 +899,7 @@ pub async fn get_claim(
     // epigraph-privacy dep to enable
 
     // Query claim on the same transaction (RLS arrives with migrations 073-075)
-    let claim = ClaimRepository::get_by_id_conn(&mut tx, claim_id)
+    let claim = ClaimRepository::get_by_id_conn(&mut tx, &viewer, claim_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Claim".to_string(),
@@ -984,6 +988,7 @@ pub async fn get_claim(
 /// Returns a paginated list of claims ordered by creation date (newest first).
 #[cfg(feature = "db")]
 pub async fn list_claims(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -1030,12 +1035,13 @@ pub async fn list_claims(
     // Fetch on the same transaction (RLS arrives with migrations 073-075)
     let claims = ClaimRepository::list_conn(
         &mut tx,
+        &viewer,
         pagination.limit,
         pagination.offset,
         params.search.as_deref(),
     )
     .await?;
-    let total = ClaimRepository::count_conn(&mut tx, params.search.as_deref()).await?;
+    let total = ClaimRepository::count_conn(&mut tx, &viewer, params.search.as_deref()).await?;
 
     let mut items: Vec<ClaimResponse> = claims.into_iter().map(Into::into).collect();
 
@@ -1137,11 +1143,13 @@ pub struct EvidenceResponse {
 /// GET /api/v1/claims/:id/evidence
 #[cfg(feature = "db")]
 pub async fn list_claim_evidence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<Vec<EvidenceResponse>>, ApiError> {
     let evidence_list =
-        EvidenceRepository::get_by_claim(&state.db_pool, ClaimId::from_uuid(claim_id)).await?;
+        EvidenceRepository::get_by_claim(&state.db_pool, &viewer, ClaimId::from_uuid(claim_id))
+            .await?;
 
     let responses: Vec<EvidenceResponse> = evidence_list
         .into_iter()
@@ -1209,7 +1217,25 @@ pub async fn find_claims_needing_embeddings(
     Query(params): Query<NeedingEmbeddingsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = params.limit.unwrap_or(100).min(500);
-    let claims = ClaimRepository::find_claims_needing_embeddings(&state.db_pool, limit)
+    // MAINTENANCE ROUTE, not a content read. A `ViewerExtractor` here would be
+    // wrong in the dangerous direction: the caller's group set would decide
+    // which rows the embedder is told about, so every claim outside the
+    // operator's own groups would stay unembedded forever and semantic recall
+    // would go quietly blind for those tenants. `claims:admin` is the gate; the
+    // read itself runs under `SystemReason::EmbeddingBackfill`.
+    //
+    // The lease comes from `AppState::maintenance_viewer` rather than being
+    // minted here, because `tests/no_bypass_in_handlers.rs` bans the literals
+    // `Viewer::system(` and `MaintenanceLease` under `routes/` — correctly.
+    // `_maint_conn` is bound, not dropped: releasing it releases the
+    // maintenance connection the viewer is paired with.
+    let (_maint_conn, viewer) = state
+        .maintenance_viewer(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+        .await
+        .map_err(|e| ApiError::DatabaseError {
+            message: e.to_string(),
+        })?;
+    let claims = ClaimRepository::find_claims_needing_embeddings(&state.db_pool, &viewer, limit)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: e.to_string(),
@@ -1291,6 +1317,7 @@ impl PatchClaimRequest {
 /// superseding claim instead). Truth value and trace_id can be updated.
 #[cfg(feature = "db")]
 pub async fn update_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
@@ -1307,7 +1334,7 @@ pub async fn update_claim(
     let claim_id = ClaimId::from_uuid(id);
 
     // Verify claim exists (404 if not found)
-    let mut current = ClaimRepository::get_by_id(&state.db_pool, claim_id)
+    let mut current = ClaimRepository::get_by_id(&state.db_pool, &viewer, claim_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Claim".to_string(),
@@ -1425,6 +1452,7 @@ pub async fn update_claim(
     tag = "claims"
 )]
 pub async fn patch_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
@@ -1508,7 +1536,7 @@ pub async fn patch_claim(
     let after_trace = diff.after_trace;
 
     // ── 8. Re-fetch updated claim (for response) ─────────────────────────────
-    let updated_claim = ClaimRepository::get_by_id_conn(&mut tx, claim_id)
+    let updated_claim = ClaimRepository::get_by_id_conn(&mut tx, &viewer, claim_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: e.to_string(),
@@ -1755,6 +1783,7 @@ pub struct ClaimByLabelsResponse {
 /// metadata, same as `GET /api/v1/claims` and `GET /api/v1/claims/by-belief`.
 #[cfg(feature = "db")]
 pub async fn list_by_labels(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(q): Query<ClaimsByLabelsQuery>,
 ) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
@@ -1788,6 +1817,7 @@ pub async fn list_by_labels(
 
     let rows = ClaimRepository::list_by_labels(
         &state.db_pool,
+        &viewer,
         &labels,
         &exclude_labels,
         current_only,
@@ -1834,6 +1864,7 @@ pub async fn list_by_labels(
 /// Returns 202 Accepted with `{ "challenge_id": "..." }`.
 #[cfg(feature = "db")]
 pub async fn delete_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
@@ -1852,7 +1883,7 @@ pub async fn delete_claim(
     }
 
     // Verify claim exists
-    let claim = ClaimRepository::get_by_id(&state.db_pool, ClaimId::from(id))
+    let claim = ClaimRepository::get_by_id(&state.db_pool, &viewer, ClaimId::from(id))
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Claim".to_string(),

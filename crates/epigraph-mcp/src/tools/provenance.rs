@@ -10,11 +10,12 @@ use epigraph_db::LineageRepository;
 
 pub async fn get_provenance(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetProvenanceParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
 
-    let lineage = LineageRepository::get_lineage(&server.pool, claim_id, Some(5))
+    let lineage = LineageRepository::get_lineage(&server.pool, viewer, claim_id, Some(5))
         .await
         .map_err(internal_error)?;
 

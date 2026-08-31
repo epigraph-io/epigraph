@@ -46,10 +46,14 @@ impl SheafRepository {
     /// frame_validates).
     pub async fn get_claim_neighbor_betp_pairs(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         _frame_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<ClaimNeighborBetpRow>, crate::DbError> {
-        let rows = sqlx::query_as::<_, ClaimNeighborBetpRow>(
+        // Three aliases, three markers: the claim, the neighbour, and the edge
+        // between them. Filtering only `c` would still disclose that an
+        // invisible claim `n` exists and what its belief interval is.
+        let sql = viewer.splice(
             r#"
             SELECT
                 c.id AS claim_id,
@@ -72,14 +76,17 @@ impl SheafRepository {
             WHERE e.relationship IN ('supports', 'refutes', 'contradicts', 'corroborates', 'elaborates', 'specializes', 'generalizes', 'frame_validates')
             AND c.pignistic_prob IS NOT NULL
             AND n.pignistic_prob IS NOT NULL
+            /* {VISIBILITY:c} */ /* {VISIBILITY:n} */ /* {VISIBILITY:e} */
             ORDER BY c.id
             LIMIT $1
             "#,
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-        .map_err(crate::DbError::from)?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ClaimNeighborBetpRow>(&sql).bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(pool).await.map_err(crate::DbError::from)?;
 
         Ok(rows)
     }
@@ -87,9 +94,10 @@ impl SheafRepository {
     /// Fetch all claim-to-claim epistemic edges with both endpoints' BetP.
     pub async fn get_epistemic_edge_pairs(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         _frame_id: Option<Uuid>,
     ) -> Result<Vec<EpistemicEdgePairRow>, crate::DbError> {
-        let rows = sqlx::query_as::<_, EpistemicEdgePairRow>(
+        let sql = viewer.splice(
             r#"
             SELECT
                 e.source_id,
@@ -111,11 +119,15 @@ impl SheafRepository {
             AND e.relationship IN ('supports', 'refutes', 'contradicts', 'corroborates', 'elaborates', 'specializes', 'generalizes', 'frame_validates')
             AND src.pignistic_prob IS NOT NULL
             AND tgt.pignistic_prob IS NOT NULL
+            /* {VISIBILITY:e} */ /* {VISIBILITY:src} */ /* {VISIBILITY:tgt} */
             "#,
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(crate::DbError::from)?;
+            1,
+        );
+        let mut q = sqlx::query_as::<_, EpistemicEdgePairRow>(&sql);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(pool).await.map_err(crate::DbError::from)?;
 
         Ok(rows)
     }

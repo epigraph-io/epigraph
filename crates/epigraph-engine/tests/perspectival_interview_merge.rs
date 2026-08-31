@@ -26,6 +26,9 @@
 //!   DELTA_OUT=$SEED_DIR/data/interview-belief-delta.json \
 //!   SQLX_OFFLINE=true cargo test -p epigraph-engine --test perspectival_interview_merge -- --nocapture
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use epigraph_db::{
@@ -71,7 +74,8 @@ async fn assign(pool: &PgPool, claim: Uuid, frame: Uuid) {
         .bind(claim).bind(frame).execute(pool).await.expect("assign");
 }
 async fn betp0(pool: &PgPool, claim: Uuid, frame: Uuid, persp: Uuid) -> f64 {
-    epigraph_engine::belief_query::get_perspective_belief(pool, claim, frame, persp)
+    let viewer = fixture::public_viewer(pool).await;
+    epigraph_engine::belief_query::get_perspective_belief(pool, &viewer, claim, frame, persp)
         .await
         .expect("belief")
         .pignistic_prob

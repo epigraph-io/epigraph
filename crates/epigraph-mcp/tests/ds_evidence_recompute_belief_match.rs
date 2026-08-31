@@ -9,6 +9,9 @@
 //! effective-reliability discount chain and the adaptive `combine_multiple`
 //! rule selection before combining. Same BBA rows, two different answers.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_db::PerspectiveRepository;
 use epigraph_mcp::tools::ds_auto::ensure_binary_frame;
@@ -75,6 +78,7 @@ async fn cached_pignistic(pool: &PgPool, claim_id: Uuid) -> f64 {
 /// for one BBA.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "ds-recompute-match").await;
     let claim = insert_claim(
@@ -83,10 +87,10 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
         &format!("ds-recompute-match-{}", Uuid::new_v4()),
     )
     .await;
-    let frame_id = ensure_binary_frame(&pool).await.expect("binary frame");
+    let frame_id = ensure_binary_frame(&pool, &viewer).await.expect("binary frame");
 
     let submit_out = tools::ds::submit_ds_evidence(
-        &server,
+        &server, &viewer,
         SubmitDsEvidenceParams {
             claim_id: claim.to_string(),
             frame_id: frame_id.to_string(),
@@ -118,7 +122,7 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
     // No new evidence submitted — recompute_beliefs must reproduce the exact
     // same number from the exact same stored BBA rows.
     let recompute_out = tools::cdst_maintenance::recompute_beliefs(
-        &server,
+        &server, &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
@@ -161,6 +165,7 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
 /// actually folds over 2 BBAs.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "ds-recompute-match-2").await;
     let claim = insert_claim(
@@ -169,7 +174,7 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
         &format!("ds-recompute-match-2-{}", Uuid::new_v4()),
     )
     .await;
-    let frame_id = ensure_binary_frame(&pool).await.expect("binary frame");
+    let frame_id = ensure_binary_frame(&pool, &viewer).await.expect("binary frame");
 
     let perspective = PerspectiveRepository::create(
         &pool,
@@ -198,7 +203,7 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
     let mut last_bba_count = 0i64;
     for (masses, perspective_id) in submissions {
         let out = tools::ds::submit_ds_evidence(
-            &server,
+            &server, &viewer,
             SubmitDsEvidenceParams {
                 claim_id: claim.to_string(),
                 frame_id: frame_id.to_string(),
@@ -226,7 +231,7 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
     let submit_pignistic = cached_pignistic(&pool, claim).await;
 
     let recompute_out = tools::cdst_maintenance::recompute_beliefs(
-        &server,
+        &server, &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,

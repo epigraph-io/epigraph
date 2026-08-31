@@ -1,6 +1,9 @@
 //! Tier-1 unit tests for create_claim_idempotent.
 //! Patterns after crates/epigraph-db/tests/claim_repo_helpers.rs.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 #[macro_use]
 mod common;
 
@@ -17,6 +20,7 @@ use uuid::Uuid;
 #[tokio::test]
 async fn helper_creates_when_absent() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -24,7 +28,7 @@ async fn helper_creates_when_absent() {
 
     let claim = make_claim(&format!("absent {}", Uuid::new_v4()), agent_id);
 
-    let (returned, was_created) = create_claim_idempotent(&pool, &claim, "test_tool")
+    let (returned, was_created) = create_claim_idempotent(&pool, &viewer, &claim, "test_tool")
         .await
         .expect("helper call");
     assert!(was_created, "first call should be was_created=true");
@@ -58,6 +62,7 @@ async fn helper_creates_when_absent() {
 #[tokio::test]
 async fn helper_returns_existing_when_present() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -67,10 +72,10 @@ async fn helper_returns_existing_when_present() {
     let claim_a = make_claim(&content, agent_id);
     let claim_b = make_claim(&content, agent_id);
 
-    let (first, first_created) = create_claim_idempotent(&pool, &claim_a, "test_tool")
+    let (first, first_created) = create_claim_idempotent(&pool, &viewer, &claim_a, "test_tool")
         .await
         .expect("first call");
-    let (second, second_created) = create_claim_idempotent(&pool, &claim_b, "test_tool")
+    let (second, second_created) = create_claim_idempotent(&pool, &viewer, &claim_b, "test_tool")
         .await
         .expect("second call");
 
@@ -127,6 +132,7 @@ async fn helper_returns_existing_when_present() {
 #[tokio::test]
 async fn helper_emits_authored_on_both_branches() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -135,10 +141,10 @@ async fn helper_emits_authored_on_both_branches() {
     let content = format!("both-branches {}", Uuid::new_v4());
     let claim = make_claim(&content, agent_id);
 
-    let _ = create_claim_idempotent(&pool, &claim, "test_tool")
+    let _ = create_claim_idempotent(&pool, &viewer, &claim, "test_tool")
         .await
         .expect("first");
-    let _ = create_claim_idempotent(&pool, &claim, "test_tool")
+    let _ = create_claim_idempotent(&pool, &viewer, &claim, "test_tool")
         .await
         .expect("second");
 
@@ -189,6 +195,7 @@ async fn helper_emits_authored_on_both_branches() {
 #[tokio::test]
 async fn helper_post_107_idempotent() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     add_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -197,10 +204,10 @@ async fn helper_post_107_idempotent() {
     let content = format!("post-107 {}", Uuid::new_v4());
     let claim = make_claim(&content, agent_id);
 
-    let (first, first_created) = create_claim_idempotent(&pool, &claim, "test_tool")
+    let (first, first_created) = create_claim_idempotent(&pool, &viewer, &claim, "test_tool")
         .await
         .expect("first call");
-    let (second, second_created) = create_claim_idempotent(&pool, &claim, "test_tool")
+    let (second, second_created) = create_claim_idempotent(&pool, &viewer, &claim, "test_tool")
         .await
         .expect("second call");
 
@@ -218,6 +225,7 @@ async fn helper_post_107_idempotent() {
 #[tokio::test]
 async fn helper_pre_107_no_constraint() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -226,10 +234,10 @@ async fn helper_pre_107_no_constraint() {
     let content = format!("pre-107 {}", Uuid::new_v4());
     let claim = make_claim(&content, agent_id);
 
-    let (_first, first_created) = create_claim_idempotent(&pool, &claim, "test_tool")
+    let (_first, first_created) = create_claim_idempotent(&pool, &viewer, &claim, "test_tool")
         .await
         .expect("first call");
-    let (_second, second_created) = create_claim_idempotent(&pool, &claim, "test_tool")
+    let (_second, second_created) = create_claim_idempotent(&pool, &viewer, &claim, "test_tool")
         .await
         .expect("second call");
 
@@ -264,6 +272,7 @@ async fn helper_pre_107_no_constraint() {
 #[tokio::test]
 async fn helper_authored_failure_does_not_propagate() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -282,7 +291,7 @@ async fn helper_authored_failure_does_not_propagate() {
     .await
     .expect("add no-AUTHORED constraint");
 
-    let result = create_claim_idempotent(&pool, &claim, "test_tool").await;
+    let result = create_claim_idempotent(&pool, &viewer, &claim, "test_tool").await;
 
     sqlx::query("ALTER TABLE edges DROP CONSTRAINT no_authored_edges_for_test")
         .execute(&pool)

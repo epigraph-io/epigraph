@@ -5,6 +5,9 @@
 //! a handful of test rows in production. Without this fallback every
 //! scheduled-agent first action returned an empty list. Resolves claim 903e5120.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -14,6 +17,7 @@ use common::*;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn find_workflow_falls_back_to_text_search_when_semantic_empty(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Unique phrase guarantees no other seeded data interferes.
     let unique_phrase = format!("test-find-fallback-{}", Uuid::new_v4());
 
@@ -29,7 +33,7 @@ async fn find_workflow_falls_back_to_text_search_when_semantic_empty(pool: PgPoo
 
     // Sanity: DB-level ILIKE on workflow-labeled claims finds it.
     let direct = ClaimRepository::search_by_label_and_text(
-        &pool,
+        &pool, &viewer,
         &["workflow".to_string()],
         &unique_phrase,
         0.0,
@@ -50,7 +54,7 @@ async fn find_workflow_falls_back_to_text_search_when_semantic_empty(pool: PgPoo
         limit: Some(5),
         min_truth: Some(0.0),
     };
-    let result = epigraph_mcp::tools::workflows::find_workflow(&server, params)
+    let result = epigraph_mcp::tools::workflows::find_workflow(&server, &viewer, params)
         .await
         .expect("find_workflow");
 

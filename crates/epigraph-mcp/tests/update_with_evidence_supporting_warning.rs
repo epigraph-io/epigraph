@@ -12,6 +12,9 @@
 //! (NULL `pignistic_prob` column). `seed_claim` leaves that column NULL, so the
 //! fresh BBA is combined against the claim's `truth_value`.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 use common::*;
 
@@ -19,12 +22,13 @@ use epigraph_mcp::types::UpdateWithEvidenceParams;
 
 async fn run_update(
     server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: uuid::Uuid,
     strength: f64,
     supports: bool,
 ) -> serde_json::Value {
     let result = epigraph_mcp::tools::claims::update_with_evidence(
-        server,
+        server, &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,
@@ -46,11 +50,12 @@ async fn run_update(
 /// claim pulls the pignistic below the prior belief → `warning` is present.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supporting_evidence_lowers_belief_emits_warning(pool: sqlx::PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // High prior belief, NULL pignistic column (seed_claim leaves it NULL).
     let claim_id = seed_claim(&pool, "high-belief claim for warning test", 0.85).await;
     let server = build_test_server(pool.clone());
 
-    let json = run_update(&server, claim_id, 0.6, true).await;
+    let json = run_update(&server, &viewer, claim_id, 0.6, true).await;
 
     let after = json["pignistic_prob"].as_f64().expect("pignistic_prob");
     let before = json["truth_before"].as_f64().expect("truth_before");
@@ -75,10 +80,11 @@ async fn supporting_evidence_lowers_belief_emits_warning(pool: sqlx::PgPool) {
 /// raises the pignistic → belief does NOT drop → `warning` absent.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supporting_evidence_raising_belief_emits_no_warning(pool: sqlx::PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let claim_id = seed_claim(&pool, "lower-belief claim for no-warning test", 0.4).await;
     let server = build_test_server(pool.clone());
 
-    let json = run_update(&server, claim_id, 0.95, true).await;
+    let json = run_update(&server, &viewer, claim_id, 0.95, true).await;
 
     let after = json["pignistic_prob"].as_f64().expect("pignistic_prob");
     let before = json["truth_before"].as_f64().expect("truth_before");

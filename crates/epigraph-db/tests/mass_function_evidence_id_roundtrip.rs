@@ -12,6 +12,9 @@
 //! exercises the forward-write plumbing through `auto_wire_ds_update`.
 //! This test pins the repo-layer signature and the migration's FK semantics.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::{MassFunctionRepository, MassFunctionRow};
 use serde_json::json;
 use sqlx::PgPool;
@@ -84,7 +87,8 @@ async fn seed_evidence(pool: &PgPool, claim_id: Uuid, tag: u32) -> Uuid {
 }
 
 async fn fetch_row(pool: &PgPool, claim_id: Uuid, frame_id: Uuid) -> MassFunctionRow {
-    let rows = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
+    let viewer = fixture::public_viewer(pool).await;
+    let rows = MassFunctionRepository::get_for_claim_frame(pool, &viewer, claim_id, frame_id)
         .await
         .expect("get_for_claim_frame");
     assert_eq!(

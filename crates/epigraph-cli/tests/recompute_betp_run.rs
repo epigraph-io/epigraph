@@ -16,6 +16,9 @@ use uuid::Uuid;
 
 use epigraph_cli::recompute_betp::{preview_claim, run_claim};
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 async fn seed_agent(pool: &PgPool) -> Uuid {
     sqlx::query_scalar(
         "INSERT INTO agents (public_key, display_name, agent_type, labels) \
@@ -119,7 +122,8 @@ async fn dry_run_previews_without_writing_and_differs_from_stale_cache(pool: PgP
 
     // --- dry-run: preview_claim must compute a value that differs from the
     // stale cache, and must NOT write anything.
-    let previews = preview_claim(&pool, hub_claim)
+    let viewer = fixture::public_viewer(&pool).await;
+    let previews = preview_claim(&pool, &viewer, hub_claim)
         .await
         .expect("preview_claim");
     assert!(
@@ -141,7 +145,7 @@ async fn dry_run_previews_without_writing_and_differs_from_stale_cache(pool: PgP
 
     // --- real run: run_claim must write the same value preview_claim
     // computed.
-    let written = run_claim(&pool, hub_claim).await.expect("run_claim");
+    let written = run_claim(&pool, &viewer, hub_claim).await.expect("run_claim");
     assert!(written > 0, "expected at least one frame write");
 
     let cached_after_write = cached_pignistic(&pool, hub_claim).await;

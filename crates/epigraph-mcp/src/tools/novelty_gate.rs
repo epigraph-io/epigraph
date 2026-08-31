@@ -90,13 +90,15 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
 /// server-wide trait-object refactor.
 pub async fn decide(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     embedder: &dyn epigraph_embeddings::EmbeddingService,
     content: &str,
     novelty_threshold: f64,
 ) -> Option<(GateDecision, String)> {
     let vector = embedder.generate(content).await.ok()?;
     let pgvec = crate::embed::format_pgvector(&vector);
-    let nearest = match ClaimRepository::nearest_by_embedding(pool, &pgvec, NEAREST_K).await {
+    let nearest = match ClaimRepository::nearest_by_embedding(pool, viewer, &pgvec, NEAREST_K).await
+    {
         Ok(hits) => hits,
         Err(e) => {
             tracing::warn!("novelty gate: nearest_by_embedding failed: {e}");
@@ -267,7 +269,7 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(&pool, &embedder, text, DEFAULT_NOVELTY_THRESHOLD)
+        let (decision, _pgvec) = decide(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &embedder, text, DEFAULT_NOVELTY_THRESHOLD)
             .await
             .expect("decide must succeed with a working mock embedder");
 
@@ -309,7 +311,7 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(&pool, &embedder, text, 0.0)
+        let (decision, _pgvec) = decide(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &embedder, text, 0.0)
             .await
             .expect("decide must succeed with a working mock embedder");
 
@@ -329,7 +331,7 @@ mod tests {
         let embedder = MockProvider::new(EmbeddingConfig::openai(1536));
 
         let (decision, _pgvec) = decide(
-            &pool,
+            &pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"),
             &embedder,
             "an utterly unrelated claim with no corpus neighbors",
             DEFAULT_NOVELTY_THRESHOLD,

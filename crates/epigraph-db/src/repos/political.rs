@@ -257,12 +257,17 @@ impl PoliticalRepository {
 
     /// Get all claims attributed to an agent for profile building.
     /// Traverses both ATTRIBUTED_TO and ORIGINATED_BY edges.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_agent_profile_claims(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
     ) -> Result<Vec<AgentClaimProfileRow>, DbError> {
-        let rows = sqlx::query_as::<_, AgentClaimProfileRow>(
+        // The `edges` marker is in the LEFT JOIN's ON clause (a WHERE-clause
+        // marker would null-filter it into an inner join), and the pre-existing
+        // OR is parenthesised so the claim predicate ANDs with the whole
+        // disjunction rather than only its right arm.
+        let sql = viewer.splice(
             r#"
             SELECT DISTINCT c.id AS claim_id, c.content, c.truth_value,
                    c.created_at, c.properties, c.labels
@@ -270,24 +275,30 @@ impl PoliticalRepository {
             LEFT JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
                               AND e.target_id = $1 AND e.target_type = 'agent'
                               AND e.relationship IN ('attributed_to', 'ATTRIBUTED_TO', 'ORIGINATED_BY')
-            WHERE c.agent_id = $1 OR e.id IS NOT NULL
+                              /* {VISIBILITY:e} */
+            WHERE (c.agent_id = $1 OR e.id IS NOT NULL)
+              /* {VISIBILITY:c} */
             ORDER BY c.created_at DESC
             "#,
-        )
-        .bind(agent_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut vq = sqlx::query_as::<_, AgentClaimProfileRow>(&sql).bind(agent_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
 
     /// Get evidence type distribution for an agent's claims
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_agent_evidence_distribution(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
     ) -> Result<Vec<EvidenceTypeCount>, DbError> {
-        let rows = sqlx::query_as::<_, EvidenceTypeCount>(
+        let sql = viewer.splice(
             r#"
             SELECT ev.evidence_type::TEXT AS evidence_type, COUNT(*) AS count
             FROM evidence ev
@@ -296,13 +307,17 @@ impl PoliticalRepository {
                         AND e.relationship IN ('supports', 'SUPPORTS', 'uses_evidence')
             JOIN claims c ON e.target_id = c.id
             WHERE c.agent_id = $1
+              /* {VISIBILITY:ev} */ /* {VISIBILITY:e} */ /* {VISIBILITY:c} */
             GROUP BY ev.evidence_type
             ORDER BY count DESC
             "#,
-        )
-        .bind(agent_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut vq = sqlx::query_as::<_, EvidenceTypeCount>(&sql).bind(agent_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -311,9 +326,10 @@ impl PoliticalRepository {
 
     /// Get claims for an agent on a given topic, ordered by date.
     /// Uses semantic similarity if an embedding is provided.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_agent_position_timeline(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
         since: Option<chrono::DateTime<chrono::Utc>>,
         until: Option<chrono::DateTime<chrono::Utc>>,
@@ -321,7 +337,7 @@ impl PoliticalRepository {
         let since_date = since.unwrap_or(chrono::DateTime::UNIX_EPOCH);
         let until_date = until.unwrap_or_else(chrono::Utc::now);
 
-        let rows = sqlx::query_as::<_, TimelineClaimRow>(
+        let sql = viewer.splice(
             r#"
             SELECT c.id AS claim_id, c.content, c.truth_value,
                    c.created_at, c.properties,
@@ -331,17 +347,24 @@ impl PoliticalRepository {
                 AND sup_edge.source_type = 'claim'
                 AND sup_edge.target_type = 'claim'
                 AND sup_edge.relationship IN ('supersedes', 'SUPERSEDES')
+                /* {VISIBILITY:sup_edge} */
             WHERE c.agent_id = $1
               AND c.created_at >= $2
               AND c.created_at <= $3
+              /* {VISIBILITY:c} */
+              /* the sup_edge LEFT JOIN is marked in its ON clause above */
             ORDER BY c.created_at ASC
             "#,
-        )
-        .bind(agent_id)
-        .bind(since_date)
-        .bind(until_date)
-        .fetch_all(pool)
-        .await?;
+            4,
+        );
+        let mut vq = sqlx::query_as::<_, TimelineClaimRow>(&sql)
+            .bind(agent_id)
+            .bind(since_date)
+            .bind(until_date);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -349,12 +372,13 @@ impl PoliticalRepository {
     // ── Talking Point Genealogy (Item 8) ─────────────────────────────────
 
     /// Get the propagation tree for a claim — walk ORIGINATED_BY and AMPLIFIED_BY edges.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_claim_genealogy(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<PropagationStepRow>, DbError> {
-        let rows = sqlx::query_as::<_, PropagationStepRow>(
+        let sql = viewer.splice(
             r#"
             SELECT e.id AS edge_id, e.target_id AS agent_id,
                    a.display_name AS agent_name,
@@ -366,27 +390,32 @@ impl PoliticalRepository {
               AND e.source_type = 'claim'
               AND e.target_type = 'agent'
               AND e.relationship IN ('ORIGINATED_BY', 'AMPLIFIED_BY')
+              /* {VISIBILITY:e} */
             ORDER BY e.properties->>'date_asserted' ASC NULLS LAST,
                      e.properties->>'date_amplified' ASC NULLS LAST,
                      e.created_at ASC
             "#,
-        )
-        .bind(claim_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut vq = sqlx::query_as::<_, PropagationStepRow>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
 
     /// Get claims originated by an agent that were amplified by N+ others.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_originated_claims_with_amplification(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
         min_amplifiers: i64,
         limit: i64,
     ) -> Result<Vec<(Uuid, String, i64)>, DbError> {
-        let rows: Vec<(Uuid, String, i64)> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, COUNT(amp.id) AS amplifier_count
             FROM claims c
@@ -394,21 +423,28 @@ impl PoliticalRepository {
                 AND orig.source_type = 'claim'
                 AND orig.target_id = $1 AND orig.target_type = 'agent'
                 AND orig.relationship = 'ORIGINATED_BY'
+                /* {VISIBILITY:orig} */
             LEFT JOIN edges amp ON amp.source_id = c.id
                 AND amp.source_type = 'claim'
                 AND amp.target_type = 'agent'
                 AND amp.relationship = 'AMPLIFIED_BY'
+                /* {VISIBILITY:amp} */
+            WHERE true /* {VISIBILITY:c} */
             GROUP BY c.id, c.content
             HAVING COUNT(amp.id) >= $2
             ORDER BY amplifier_count DESC
             LIMIT $3
             "#,
-        )
-        .bind(agent_id)
-        .bind(min_amplifiers)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+            4,
+        );
+        let mut vq = sqlx::query_as::<_, (Uuid, String, i64)>(&sql)
+            .bind(agent_id)
+            .bind(min_amplifiers)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows: Vec<(Uuid, String, i64)> = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -417,23 +453,29 @@ impl PoliticalRepository {
 
     /// Get claims with quantitative assertions and their counter-evidence.
     /// Looks for claims with inflation_factor in properties.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_agent_inflation_claims(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
     ) -> Result<Vec<(Uuid, String, f64, serde_json::Value)>, DbError> {
-        let rows: Vec<(Uuid, String, f64, serde_json::Value)> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.properties
             FROM claims c
             WHERE c.agent_id = $1
               AND c.properties ? 'inflation_factor'
+              /* {VISIBILITY:c} */
             ORDER BY (c.properties->>'inflation_factor')::FLOAT DESC NULLS LAST
             "#,
-        )
-        .bind(agent_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut vq =
+            sqlx::query_as::<_, (Uuid, String, f64, serde_json::Value)>(&sql).bind(agent_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows: Vec<(Uuid, String, f64, serde_json::Value)> = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -441,10 +483,11 @@ impl PoliticalRepository {
     // ── Techniques on a claim ────────────────────────────────────────────
 
     /// Get propaganda techniques used by a claim via USES_TECHNIQUE edges.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     #[allow(clippy::type_complexity)]
     pub async fn get_claim_techniques(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<(PropagandaTechniqueRow, serde_json::Value)>, DbError> {
         #[allow(clippy::type_complexity)]
@@ -458,8 +501,9 @@ impl PoliticalRepository {
             chrono::DateTime<chrono::Utc>,
             chrono::DateTime<chrono::Utc>,
             serde_json::Value,
-        )> = sqlx::query_as(
-            r#"
+        )> = {
+            let sql = viewer.splice(
+                r#"
             SELECT pt.id, pt.name, pt.category, pt.description, pt.detection_guidance,
                    pt.properties, pt.created_at, pt.updated_at,
                    e.properties AS edge_properties
@@ -469,12 +513,17 @@ impl PoliticalRepository {
               AND e.source_type = 'claim'
               AND e.target_type = 'propaganda_technique'
               AND e.relationship = 'USES_TECHNIQUE'
+              /* {VISIBILITY:e} */
             ORDER BY (e.properties->>'confidence')::FLOAT DESC NULLS LAST
             "#,
-        )
-        .bind(claim_id)
-        .fetch_all(pool)
-        .await?;
+                2,
+            );
+            let mut vq = sqlx::query_as(&sql).bind(claim_id);
+            if let Some(g) = viewer.group_bind() {
+                vq = vq.bind(g);
+            }
+            vq.fetch_all(pool).await?
+        };
 
         Ok(rows
             .into_iter()

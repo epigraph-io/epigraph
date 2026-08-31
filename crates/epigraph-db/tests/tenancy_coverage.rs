@@ -106,7 +106,9 @@ async fn tenancy_columns(pool: &PgPool, relname: &str) -> (bool, bool) {
     .await
     .expect("column probe");
     (
-        row.try_get::<Option<bool>, _>("vis").unwrap().unwrap_or(false),
+        row.try_get::<Option<bool>, _>("vis")
+            .unwrap()
+            .unwrap_or(false),
         row.try_get::<Option<bool>, _>("ogid")
             .unwrap()
             .unwrap_or(false),
@@ -318,7 +320,10 @@ async fn tenancy_exempt_rows_state_a_residual(pool: PgPool) {
     .await
     .expect("tenancy_exempt read");
 
-    assert!(!rows.is_empty(), "the registry must not be empty at head 069");
+    assert!(
+        !rows.is_empty(),
+        "the registry must not be empty at head 069"
+    );
 
     for row in &rows {
         let table: String = row.try_get("table_name").unwrap();
@@ -352,11 +357,12 @@ async fn tenancy_exempt_rows_state_a_residual(pool: PgPool) {
     // `counterfactual_scenarios`, `learning_events`, `match_candidates`,
     // `behavioral_executions`) are named in docs/tenancy/HANDOFF.md as a
     // PR-16/PR-18 gate; that is where the obligation lives.
-    let pending: i64 =
-        sqlx::query_scalar("SELECT count(*)::bigint FROM tenancy_exempt WHERE reviewed_by = 'PENDING'")
-            .fetch_one(&pool)
-            .await
-            .expect("pending count");
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM tenancy_exempt WHERE reviewed_by = 'PENDING'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("pending count");
     assert!(
         pending <= 12,
         "{pending} exemptions are still 'PENDING' — 069 seeded 12 and this number may \
@@ -393,8 +399,7 @@ async fn the_generated_exemptions_are_exactly_the_nine_measured(pool: PgPool) {
     }
     uncovered.sort();
     assert_eq!(
-        uncovered,
-        GENERATED_EXEMPT,
+        uncovered, GENERATED_EXEMPT,
         "the set of generated-but-uncovered relations changed. If a table was ADDED, \
          give it tenancy columns or a tenancy_exempt row AND update this constant. If \
          one was COVERED, drop its tenancy_exempt row in the same migration."
@@ -465,7 +470,11 @@ async fn unclassified_is_unregisterable(pool: PgPool) {
     .expect_err("'unclassified' must be rejected");
 
     let db = err.as_database_error().expect("a database error");
-    assert_eq!(db.code().as_deref(), Some("23514"), "expected a CHECK violation");
+    assert_eq!(
+        db.code().as_deref(),
+        Some("23514"),
+        "expected a CHECK violation"
+    );
     assert_eq!(
         db.constraint(),
         Some("entity_types_no_unclassified"),
@@ -515,7 +524,10 @@ async fn all_23_core_types_are_classified(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("count");
-    assert_eq!(unclassified, 0, "migration 069 must leave nothing unclassified");
+    assert_eq!(
+        unclassified, 0,
+        "migration 069 must leave nothing unclassified"
+    );
 
     // `WHERE is_core = true` IS NOT COSMETIC. The assertion is about the 23
     // types migration 054 seeded. Without the filter the histogram also counts
@@ -563,7 +575,14 @@ async fn all_23_core_types_are_classified(pool: PgPool) {
     .expect("columns types");
     assert_eq!(
         columns_types,
-        vec!["claim", "community", "context", "evidence", "frame", "perspective"]
+        vec![
+            "claim",
+            "community",
+            "context",
+            "evidence",
+            "frame",
+            "perspective"
+        ]
     );
 }
 
@@ -610,7 +629,10 @@ async fn migration_068_and_069_apply_twice(pool: PgPool) {
         .fetch_one(&mut *tx)
         .await
         .expect("constraint count");
-        assert_eq!(n, 1, "{relation}.{constraint} must exist exactly once after a replay");
+        assert_eq!(
+            n, 1,
+            "{relation}.{constraint} must exist exactly once after a replay"
+        );
     }
 
     // The projections are INSERT ... ON CONFLICT DO NOTHING; a replay must not
@@ -787,7 +809,11 @@ async fn the_drain_clears_the_source_column(pool: PgPool) {
             .fetch_one(&mut *tx)
             .await
             .expect("post-drain read");
-    assert_eq!(drained, Some(community), "the value must reach the typed column");
+    assert_eq!(
+        drained,
+        Some(community),
+        "the value must reach the typed column"
+    );
     assert_eq!(
         leftover, None,
         "and must NOT also remain in encryption_key_id — a drained row carrying both \
@@ -799,7 +825,10 @@ async fn the_drain_clears_the_source_column(pool: PgPool) {
             .fetch_one(&mut *tx)
             .await
             .expect("quarantine count");
-    assert_eq!(quarantined, 0, "a resolvable value must not appear in the quarantine");
+    assert_eq!(
+        quarantined, 0,
+        "a resolvable value must not appear in the quarantine"
+    );
 }
 
 /// A gate on a row that is not on the community partition gates nothing today
@@ -910,7 +939,10 @@ async fn every_community_projects_onto_a_group_and_its_members_onto_memberships(
     .fetch_one(&mut *tx)
     .await
     .expect("acceptance q1");
-    assert_eq!(unprojected_communities, 0, "every community must have a group");
+    assert_eq!(
+        unprojected_communities, 0,
+        "every community must have a group"
+    );
 
     let unprojected_members: i64 = sqlx::query_scalar(
         "SELECT count(*)::bigint FROM community_members cm \
@@ -930,13 +962,12 @@ async fn every_community_projects_onto_a_group_and_its_members_onto_memberships(
     );
 
     // The orphan pair produced no membership, and could not have.
-    let memberships: i64 = sqlx::query_scalar(
-        "SELECT count(*)::bigint FROM group_memberships WHERE group_id = $1",
-    )
-    .bind(community)
-    .fetch_one(&mut *tx)
-    .await
-    .expect("membership count");
+    let memberships: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM group_memberships WHERE group_id = $1")
+            .bind(community)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("membership count");
     assert_eq!(
         memberships, 1,
         "two community_members rows, one with a NULL owner_agent_id -> exactly one \
@@ -950,12 +981,11 @@ async fn every_community_projects_onto_a_group_and_its_members_onto_memberships(
     // community member write authority over the group's corpus at PR-11/PR-17
     // and privatization eligibility at PR-18, on the strength of a row that
     // never said so.
-    let role: String =
-        sqlx::query_scalar("SELECT role FROM group_memberships WHERE group_id = $1")
-            .bind(community)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("role");
+    let role: String = sqlx::query_scalar("SELECT role FROM group_memberships WHERE group_id = $1")
+        .bind(community)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("role");
     assert_eq!(
         role, "reader",
         "a projected community membership must be least-privilege; upgrading this to \

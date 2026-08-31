@@ -25,6 +25,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
+    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
+        epigraph_db::visibility::SystemReason::SchemaContractTest,
+    )
+    .await
+    .expect("maintenance viewer");
+    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
@@ -32,13 +40,16 @@ async fn main() {
 
     let args = Args::parse();
 
-    if let Err(e) = run(args).await {
+    if let Err(e) = run(args, viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    args: Args,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pool = epigraph_cli::db_connect().await?;
 
     // 1. Load hypothesis claim
@@ -62,10 +73,11 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(method_ids) = &exp.method_ids {
             for mid in method_ids {
                 if let Some(method) = epigraph_db::MethodRepository::get(&pool, *mid).await? {
-                    let evidence =
-                        epigraph_db::MethodRepository::get_evidence_strength(&pool, method.id)
-                            .await
-                            .ok();
+                    let evidence = epigraph_db::MethodRepository::get_evidence_strength(
+                        &pool, viewer, method.id,
+                    )
+                    .await
+                    .ok();
                     let score = evidence.map(|e| e.avg_belief).unwrap_or(0.0);
                     method_context.push(serde_json::json!({
                         "name": method.name,

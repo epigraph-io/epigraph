@@ -113,10 +113,11 @@ impl RecallEventRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     #[allow(clippy::too_many_arguments)]
     pub async fn list(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         agent_id: Option<Uuid>,
         claim_id: Option<Uuid>,
         since: Option<chrono::DateTime<chrono::Utc>>,
@@ -134,6 +135,7 @@ impl RecallEventRepository {
               AND ($2::uuid[] IS NULL OR returned_claim_ids @> $2)
               AND ($3::timestamptz IS NULL OR created_at >= $3)
               AND ($4::timestamptz IS NULL OR created_at <= $4)
+              AND ($7::bool OR visibility = 'public' OR owner_group_id = ANY($8::uuid[]))
             ORDER BY created_at DESC
             LIMIT $5 OFFSET $6
             "#,
@@ -143,6 +145,8 @@ impl RecallEventRepository {
             until,
             limit.clamp(1, 500),
             offset.max(0),
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;

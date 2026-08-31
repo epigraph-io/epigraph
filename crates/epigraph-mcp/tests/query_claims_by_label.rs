@@ -6,6 +6,9 @@
 //! resolved, one superseded pointing at the open one), then exercises the
 //! filter cross-product through the MCP tool entry point.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_mcp::tools::paper_queries::query_claims_by_label;
 use epigraph_mcp::types::QueryClaimsByLabelParams;
@@ -19,6 +22,7 @@ use common::build_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let backlog_open = seed_claim(&pool, agent, &["backlog"], true, None).await;
     let backlog_resolved = seed_claim(&pool, agent, &["backlog", "resolved"], true, None).await;
@@ -30,7 +34,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
     // Default call (no filters): all 3 claims, with labels populated and
     // is_current/supersedes carried through.
     let result = query_claims_by_label(
-        &server,
+        &server, &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec![],
@@ -75,7 +79,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
 
     // exclude_labels=["resolved"]: drops the resolved one.
     let result = query_claims_by_label(
-        &server,
+        &server, &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec!["resolved".into()],
@@ -100,7 +104,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
 
     // current_only=true: drops the superseded one.
     let result = query_claims_by_label(
-        &server,
+        &server, &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec![],
@@ -125,7 +129,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
 
     // Both filters combined: only the live open backlog claim survives.
     let result = query_claims_by_label(
-        &server,
+        &server, &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec!["resolved".into()],
@@ -157,6 +161,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
 /// (= BLAKE3(content)) is leaked for a redacted claim.
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_by_label_redacts_private_content_for_strangers(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, owner, &["backlog"], true, None).await;
     let expected_content = format!("test claim {}", claim_id.as_uuid());
@@ -184,7 +189,7 @@ async fn query_by_label_redacts_private_content_for_strangers(pool: PgPool) {
 
     // Owner → full content + real hash.
     let owner_claims = parse_claims(
-        &query_claims_by_label(&server, params(), Some(owner))
+        &query_claims_by_label(&server, &viewer, params(), Some(owner))
             .await
             .expect("query as owner"),
     );
@@ -202,7 +207,7 @@ async fn query_by_label_redacts_private_content_for_strangers(pool: PgPool) {
     // Stranger → redacted content + blank hash.
     let stranger = Uuid::new_v4();
     let stranger_claims = parse_claims(
-        &query_claims_by_label(&server, params(), Some(stranger))
+        &query_claims_by_label(&server, &viewer, params(), Some(stranger))
             .await
             .expect("query as stranger"),
     );

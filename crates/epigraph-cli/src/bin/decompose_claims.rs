@@ -137,10 +137,18 @@ async fn mint_service_token(api_base: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
+    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
+        epigraph_db::visibility::SystemReason::TenancyBackfill,
+    )
+    .await
+    .expect("maintenance viewer");
+    let viewer = &viewer;
     let cli = Cli::parse();
     let pool = epigraph_cli::db_connect().await?;
 
-    let claims = ClaimRepository::list_undecomposed(&pool, cli.limit, 0).await?;
+    let claims = ClaimRepository::list_undecomposed(&pool, viewer, cli.limit, 0).await?;
     eprintln!("found {} undecomposed claims", claims.len());
     if cli.dry_run || claims.is_empty() {
         for c in &claims {
@@ -213,6 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let totals = run_decomposition_batches(
         &pool,
+        viewer,
         &batch_claims,
         llm.as_ref(),
         cli.batch_size,

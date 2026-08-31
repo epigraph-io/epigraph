@@ -14,6 +14,9 @@
 //! fail; under a deleted/inverted redaction branch the private assertions fail;
 //! under the content_hash oracle leak the blank-hash assertion fails.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_mcp::tools::claims::query_claims;
 use epigraph_mcp::types::QueryClaimsParams;
@@ -27,6 +30,7 @@ use common::build_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_claims_redacts_only_the_private_claim_per_id(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let public_owner = seed_agent(&pool).await;
     let private_owner = seed_agent(&pool).await;
 
@@ -54,7 +58,7 @@ async fn query_claims_redacts_only_the_private_claim_per_id(pool: PgPool) {
     // private one redacted.
     let stranger = Uuid::new_v4();
     let result = query_claims(
-        &server,
+        &server, &viewer,
         QueryClaimsParams {
             min_truth: Some(0.0),
             max_truth: Some(1.0),

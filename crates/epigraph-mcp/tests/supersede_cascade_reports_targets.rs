@@ -16,6 +16,9 @@
 //! implementation logs "0 downstream claims, cascade complete" while being
 //! completely wrong. `targets` being non-empty is what falsifies that.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 
 use common::{admin_auth, build_test_server, seed_claim, seed_claim_with_belief};
@@ -37,9 +40,9 @@ fn body(result: &rmcp::model::CallToolResult) -> serde_json::Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("response JSON: {e}; raw={text}"))
 }
 
-async fn wire_supports(server: &epigraph_mcp::server::EpiGraphMcpFull, s: Uuid, t: Uuid) {
+async fn wire_supports(server: &epigraph_mcp::server::EpiGraphMcpFull, viewer: &epigraph_db::visibility::Viewer, s: Uuid, t: Uuid) {
     let r = do_link_epistemic(
-        server,
+        server, &viewer,
         LinkEpistemicParams {
             source_claim_id: s.to_string(),
             target_claim_id: t.to_string(),
@@ -59,18 +62,19 @@ async fn wire_supports(server: &epigraph_mcp::server::EpiGraphMcpFull, s: Uuid, 
 /// C4 + C1(b) for `supersede_claim`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersede_reports_the_downstream_target_it_repaired(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
     let b = seed_claim(&pool, "downstream claim B", 0.5).await;
-    wire_supports(&server, a, b).await;
-    wire_supports(&server, c, b).await;
+    wire_supports(&server, &viewer, a, b).await;
+    wire_supports(&server, &viewer, c, b).await;
 
     // The enumeration the proposal sketched, run here to prove it is a trap:
     // after the commit, nothing outgoing is still sourced at the retracted id.
     let result = supersede_claim(
-        &server,
+        &server, &viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
@@ -151,14 +155,15 @@ async fn supersede_reports_the_downstream_target_it_repaired(pool: PgPool) {
 /// up in `unbacked`, not vanish into an empty report.
 #[sqlx::test(migrations = "../../migrations")]
 async fn sole_supporter_retraction_is_reported_as_unbacked_not_as_nothing_to_do(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let b = seed_claim(&pool, "sole-supported claim B", 0.5).await;
-    wire_supports(&server, a, b).await;
+    wire_supports(&server, &viewer, a, b).await;
 
     let result = supersede_claim(
-        &server,
+        &server, &viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
@@ -199,13 +204,14 @@ async fn sole_supporter_retraction_is_reported_as_unbacked_not_as_nothing_to_do(
 /// genuinely errors.
 #[sqlx::test(migrations = "../../migrations")]
 async fn cascade_errors_are_reported_not_propagated(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
     let b = seed_claim(&pool, "downstream claim B", 0.5).await;
-    wire_supports(&server, a, b).await;
-    wire_supports(&server, c, b).await;
+    wire_supports(&server, &viewer, a, b).await;
+    wire_supports(&server, &viewer, c, b).await;
 
     sqlx::query(
         "UPDATE mass_functions SET masses = '{\"0\": \"not-a-number\"}'::jsonb \
@@ -218,7 +224,7 @@ async fn cascade_errors_are_reported_not_propagated(pool: PgPool) {
     .expect("corrupt surviving BBA");
 
     let result = supersede_claim(
-        &server,
+        &server, &viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
@@ -248,15 +254,16 @@ async fn cascade_errors_are_reported_not_propagated(pool: PgPool) {
 /// C1 for `mark_duplicate`: pre-existing keys intact, cascade reported.
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_duplicate_keeps_its_keys_and_reports_the_cascade(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     let canonical = seed_claim(&pool, "canonical claim", 0.5).await;
     let dup = seed_claim(&pool, "duplicate claim", 0.5).await;
     let u = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
-    wire_supports(&server, u, dup).await;
+    wire_supports(&server, &viewer, u, dup).await;
 
     let result = mark_duplicate(
-        &server,
+        &server, &viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),

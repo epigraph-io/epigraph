@@ -12,6 +12,9 @@
 //! BetP1 is the discounted recombine, BetP1 < BetP0. After Fix(1) the initial
 //! cache is itself the discounted recombine, so adding support is monotonic.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 use common::*;
 
@@ -34,13 +37,14 @@ async fn cached_betp(pool: &sqlx::PgPool, claim_id: uuid::Uuid) -> f64 {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn adding_supporting_evidence_does_not_drop_cached_betp(pool: sqlx::PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, "b3d12e2a monotonicity regression claim", 0.5).await;
 
     // 1. Write initial DS cache via the REAL ingestion batch writer, tagged with
     //    a hard-discounting evidence_type so raw-vs-discounted diverge starkly.
     let (_frame_id, wired) = auto_wire_ds_batch(
-        &pool,
+        &pool, &viewer,
         &[BatchDsEntry {
             claim_id,
             confidence: 0.9,
@@ -59,7 +63,7 @@ async fn adding_supporting_evidence_does_not_drop_cached_betp(pool: sqlx::PgPool
     // 2. Add a SUPPORTING evidence through the canonical update path.
     let server = build_test_server(pool.clone());
     let res = epigraph_mcp::tools::claims::update_with_evidence(
-        &server,
+        &server, &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,

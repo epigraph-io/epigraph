@@ -42,6 +42,9 @@
 //! and each case runs against its own fresh database so a redaction assertion
 //! proves REDACTION and not a missing row.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_mcp::tools::claims::{get_claim, query_claims};
 use epigraph_mcp::types::{GetClaimParams, QueryClaimsParams};
@@ -64,6 +67,7 @@ const REDACTED: &str = "[REDACTED]";
 // simplified to a one-hop lookup, this case is what fails.
 #[sqlx::test(migrations = "../../migrations")]
 async fn community_member_via_perspective_sees_content(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let member = seed_agent(&pool).await;
     let community = seed_community(&pool).await;
@@ -74,7 +78,7 @@ async fn community_member_via_perspective_sees_content(pool: PgPool) {
     seed_community_ownership(&pool, claim_id, owner, Some(community)).await;
 
     let server = build_test_server(pool.clone());
-    let body = get_claim_as(&server, claim_id, Some(member)).await;
+    let body = get_claim_as(&server, &viewer, claim_id, Some(member)).await;
     assert_eq!(
         body["content"].as_str().unwrap(),
         expected,
@@ -90,6 +94,7 @@ async fn community_member_via_perspective_sees_content(pool: PgPool) {
 // membership join is load-bearing rather than always-true.
 #[sqlx::test(migrations = "../../migrations")]
 async fn community_non_member_is_redacted(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let member = seed_agent(&pool).await;
     let outsider = seed_agent(&pool).await;
@@ -104,7 +109,7 @@ async fn community_non_member_is_redacted(pool: PgPool) {
     seed_community_ownership(&pool, claim_id, owner, Some(community)).await;
 
     let server = build_test_server(pool.clone());
-    let body = get_claim_as(&server, claim_id, Some(outsider)).await;
+    let body = get_claim_as(&server, &viewer, claim_id, Some(outsider)).await;
     assert_eq!(
         body["content"].as_str().unwrap(),
         REDACTED,
@@ -120,6 +125,7 @@ async fn community_non_member_is_redacted(pool: PgPool) {
 // here.
 #[sqlx::test(migrations = "../../migrations")]
 async fn community_anonymous_requester_is_redacted(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let community = seed_community(&pool).await;
     // Make the owner a member, so the ONLY reason to redact is anonymity.
@@ -129,7 +135,7 @@ async fn community_anonymous_requester_is_redacted(pool: PgPool) {
     seed_community_ownership(&pool, claim_id, owner, Some(community)).await;
 
     let server = build_test_server(pool.clone());
-    let body = get_claim_as(&server, claim_id, None).await;
+    let body = get_claim_as(&server, &viewer, claim_id, None).await;
     assert_eq!(
         body["content"].as_str().unwrap(),
         REDACTED,
@@ -154,6 +160,7 @@ async fn community_anonymous_requester_is_redacted(pool: PgPool) {
 // with the Viewer predicate, owns that decision.
 #[sqlx::test(migrations = "../../migrations")]
 async fn community_row_with_null_community_id_falls_back_to_owner_only(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let stranger = seed_agent(&pool).await;
 
@@ -163,14 +170,14 @@ async fn community_row_with_null_community_id_falls_back_to_owner_only(pool: PgP
 
     let server = build_test_server(pool.clone());
 
-    let owner_body = get_claim_as(&server, claim_id, Some(owner)).await;
+    let owner_body = get_claim_as(&server, &viewer, claim_id, Some(owner)).await;
     assert_eq!(
         owner_body["content"].as_str().unwrap(),
         expected,
         "with no gating community recorded, the owner keeps access"
     );
 
-    let stranger_body = get_claim_as(&server, claim_id, Some(stranger)).await;
+    let stranger_body = get_claim_as(&server, &viewer, claim_id, Some(stranger)).await;
     assert_eq!(
         stranger_body["content"].as_str().unwrap(),
         REDACTED,
@@ -191,6 +198,7 @@ async fn community_row_with_null_community_id_falls_back_to_owner_only(pool: PgP
 // a member. Asserted explicitly so that change has to be argued.
 #[sqlx::test(migrations = "../../migrations")]
 async fn community_owner_who_is_not_a_member_is_redacted(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let member = seed_agent(&pool).await;
     let community = seed_community(&pool).await;
@@ -203,7 +211,7 @@ async fn community_owner_who_is_not_a_member_is_redacted(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
 
-    let owner_body = get_claim_as(&server, claim_id, Some(owner)).await;
+    let owner_body = get_claim_as(&server, &viewer, claim_id, Some(owner)).await;
     assert_eq!(
         owner_body["content"].as_str().unwrap(),
         REDACTED,
@@ -213,7 +221,7 @@ async fn community_owner_who_is_not_a_member_is_redacted(pool: PgPool) {
     );
 
     // And the member does, so the fixture is not simply broken.
-    let member_body = get_claim_as(&server, claim_id, Some(member)).await;
+    let member_body = get_claim_as(&server, &viewer, claim_id, Some(member)).await;
     assert_eq!(member_body["content"].as_str().unwrap(), expected);
 }
 
@@ -226,6 +234,7 @@ async fn community_owner_who_is_not_a_member_is_redacted(pool: PgPool) {
 // and asserts each gets its own.
 #[sqlx::test(migrations = "../../migrations")]
 async fn batch_check_mixed_community_and_public(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let member = seed_agent(&pool).await;
     let community = seed_community(&pool).await;
@@ -247,7 +256,7 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     let result = query_claims(
-        &server,
+        &server, &viewer,
         QueryClaimsParams {
             min_truth: Some(0.0),
             max_truth: Some(1.0),
@@ -288,6 +297,7 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
 // the row by hand.
 #[sqlx::test(migrations = "../../migrations")]
 async fn assign_with_community_writes_the_column_access_control_reads(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     use epigraph_db::OwnershipRepository;
 
     let owner = seed_agent(&pool).await;
@@ -326,7 +336,7 @@ async fn assign_with_community_writes_the_column_access_control_reads(pool: PgPo
     assert_eq!(quarantined, 0);
 
     let server = build_test_server(pool.clone());
-    let body = get_claim_as(&server, claim_id, Some(member)).await;
+    let body = get_claim_as(&server, &viewer, claim_id, Some(member)).await;
     assert_eq!(
         body["content"].as_str().unwrap(),
         expected,
@@ -343,6 +353,7 @@ async fn assign_with_community_writes_the_column_access_control_reads(pool: PgPo
 // would resurrect the old gate.
 #[sqlx::test(migrations = "../../migrations")]
 async fn demoting_out_of_community_clears_the_gate(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     use epigraph_db::OwnershipRepository;
 
     let owner = seed_agent(&pool).await;
@@ -408,7 +419,7 @@ async fn demoting_out_of_community_clears_the_gate(pool: PgPool) {
 
     // The member (who is not the owner) now sees nothing: the row is private.
     let server = build_test_server(pool.clone());
-    let body = get_claim_as(&server, claim_id, Some(member)).await;
+    let body = get_claim_as(&server, &viewer, claim_id, Some(member)).await;
     assert_eq!(body["content"].as_str().unwrap(), REDACTED);
 }
 
@@ -552,11 +563,12 @@ async fn join_community(pool: &PgPool, community: Uuid, agent: Uuid) {
 
 async fn get_claim_as(
     server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: ClaimId,
     requester: Option<Uuid>,
 ) -> Value {
     let result = get_claim(
-        server,
+        server, &viewer,
         GetClaimParams {
             claim_id: claim_id.as_uuid().to_string(),
             frame_id: None,

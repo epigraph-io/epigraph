@@ -44,9 +44,10 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 pub async fn link_hierarchical(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: LinkHierarchicalParams,
 ) -> Result<CallToolResult, McpError> {
-    do_link_hierarchical(server, params).await
+    do_link_hierarchical(server, viewer, params).await
 }
 
 /// Core wiring logic factored out so integration tests can call it directly
@@ -54,6 +55,7 @@ pub async fn link_hierarchical(
 /// `do_ingest_document` factoring in `tools/ingestion.rs`.
 pub async fn do_link_hierarchical(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: LinkHierarchicalParams,
 ) -> Result<CallToolResult, McpError> {
     let source_id = parse_uuid(&params.source_claim_id)?;
@@ -81,7 +83,7 @@ pub async fn do_link_hierarchical(
     // Verify both claims exist via the repo layer (per CLAUDE.md, SQL stays
     // in epigraph-db). Disambiguate which side is missing so the caller can
     // fix the right end of the link.
-    if ClaimRepository::get_by_id(pool, ClaimId::from_uuid(source_id))
+    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(source_id))
         .await
         .map_err(internal_error)?
         .is_none()
@@ -90,7 +92,7 @@ pub async fn do_link_hierarchical(
             "source_claim_id {source_id} not found"
         )));
     }
-    if ClaimRepository::get_by_id(pool, ClaimId::from_uuid(target_id))
+    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(target_id))
         .await
         .map_err(internal_error)?
         .is_none()

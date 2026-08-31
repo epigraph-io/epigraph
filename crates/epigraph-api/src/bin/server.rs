@@ -274,9 +274,13 @@ async fn main() {
         let scoped = epigraph_db::ScopedPool::connect(&database_url, guc_mode)
             .await
             .expect("Failed to connect to PostgreSQL");
-        // `AppState::with_db` keeps taking the inner `PgPool`, so nothing else
-        // changes shape in this PR; PR-06/PR-07 migrate call sites onto
-        // `ScopedPool::acquire_as` incrementally.
+        // PR-06 stops discarding the `ScopedPool`. `AppState` now carries it
+        // alongside the inner `PgPool`, because `Viewer::system` requires a
+        // `MaintenanceLease` and `ScopedPool::unscoped_for_maintenance` is the
+        // only mint — a process that throws the `ScopedPool` away can never
+        // construct a bypass viewer for its own backfill routes. Handlers still
+        // read `state.db_pool`; migrating them onto `ScopedPool::acquire_as` is
+        // PR-07/PR-15.
         let pool = scoped.inner().clone();
         tracing::info!("PostgreSQL connected");
 
@@ -362,7 +366,8 @@ async fn main() {
             "Background job pool ready"
         );
 
-        let state = AppState::with_db(pool, config).with_embedding_service(embedding_service);
+        let state =
+            AppState::with_scoped_pool(scoped, config).with_embedding_service(embedding_service);
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
         // SELECT, so the cache loads here — after migrations (054 seeds the

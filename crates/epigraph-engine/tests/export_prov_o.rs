@@ -23,6 +23,9 @@
 //! `target_id` bound to the claim being superseded). The fixture mirrors
 //! real data rather than the more "natural"-looking old-to-new direction.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_engine::export::prov::export_provenance_prov_o;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -97,6 +100,7 @@ async fn insert_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &s
 #[tokio::test]
 async fn export_maps_predicates_and_leaves_edges_relationship_column_unchanged() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
 
     let agent = insert_agent(&pool).await;
     let root_claim = insert_claim(&pool, agent, "Root: computational model baseline").await;
@@ -108,7 +112,7 @@ async fn export_maps_predicates_and_leaves_edges_relationship_column_unchanged()
     // target = superseded claim.
     let supersedes_edge_id = insert_edge(&pool, child_claim, prior_claim, "supersedes").await;
 
-    let document = export_provenance_prov_o(&pool, child_claim, Some(5))
+    let document = export_provenance_prov_o(&pool, &viewer, child_claim, Some(5))
         .await
         .expect("export should succeed");
 

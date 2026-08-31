@@ -761,7 +761,10 @@ mod db_tests {
         )
         .await;
         match result {
-            Err(ApiError::ValidationError { ref field, ref reason }) => {
+            Err(ApiError::ValidationError {
+                ref field,
+                ref reason,
+            }) => {
                 assert_eq!(field, "tenancy_tier");
                 assert!(
                     reason.contains("entity_types_no_unclassified"),
@@ -799,7 +802,10 @@ mod db_tests {
         )
         .await;
         match result {
-            Err(ApiError::ValidationError { ref field, ref reason }) => {
+            Err(ApiError::ValidationError {
+                ref field,
+                ref reason,
+            }) => {
                 assert_eq!(field, "tenancy_tier");
                 assert!(
                     reason.contains("FORCE ROW LEVEL SECURITY"),
@@ -820,7 +826,10 @@ mod db_tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(count, 0, "a refused columns-tier registration persists nothing");
+        assert_eq!(
+            count, 0,
+            "a refused columns-tier registration persists nothing"
+        );
     }
 
     /// ORDERING: the hijack guard runs ABOVE the §2.5 tier gate.

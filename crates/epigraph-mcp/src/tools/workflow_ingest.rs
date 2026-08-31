@@ -47,6 +47,7 @@ pub struct IngestWorkflowResponse {
 /// can drive the same embed loop without duplicating the executor wiring.
 pub(crate) async fn execute_workflow_ingest_with_inserted(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     extraction: &WorkflowExtraction,
 ) -> Result<(IngestWorkflowResponse, Vec<(uuid::Uuid, String)>), McpError> {
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
@@ -62,6 +63,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         for e in &result.inserted_edges {
             ds_auto::auto_wire_edge_if_epistemic(
                 pool,
+                viewer,
                 true, // executor only emits an InsertedPlanEdge when was_created=true
                 e.edge_id,
                 e.source_id,
@@ -102,7 +104,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
             })
             .collect();
         if !ds_entries.is_empty() {
-            if let Err(e) = ds_auto::auto_wire_ds_batch(pool, &ds_entries, agent_id).await {
+            if let Err(e) = ds_auto::auto_wire_ds_batch(pool, viewer, &ds_entries, agent_id).await {
                 tracing::warn!("workflow ds auto-wire batch failed: {e}");
             }
         }
@@ -132,9 +134,11 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
 /// has access to `server.embedder`.
 pub async fn do_ingest_workflow_via_pool(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     extraction: &WorkflowExtraction,
 ) -> Result<IngestWorkflowResponse, McpError> {
-    let (response, _inserted) = execute_workflow_ingest_with_inserted(pool, extraction).await?;
+    let (response, _inserted) =
+        execute_workflow_ingest_with_inserted(pool, viewer, extraction).await?;
     Ok(response)
 }
 
@@ -143,10 +147,11 @@ pub async fn do_ingest_workflow_via_pool(
 /// MCP tool: ingest a `WorkflowExtraction` JSON.
 pub async fn do_ingest_workflow(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     extraction: &WorkflowExtraction,
 ) -> Result<CallToolResult, McpError> {
     let (response, inserted) =
-        execute_workflow_ingest_with_inserted(&server.pool, extraction).await?;
+        execute_workflow_ingest_with_inserted(&server.pool, viewer, extraction).await?;
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue —
@@ -180,9 +185,10 @@ pub async fn do_ingest_workflow(
 /// Param-driven MCP tool entry point. Thin wrapper over `do_ingest_workflow`.
 pub async fn ingest_workflow(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: IngestWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
-    do_ingest_workflow(server, &params.extraction).await
+    do_ingest_workflow(server, viewer, &params.extraction).await
 }
 
 // ── improve_workflow_hierarchy ─────────────────────────────────────────────
@@ -217,6 +223,7 @@ pub struct ImproveWorkflowHierarchyResponse {
 /// no other module needs the inserted vec for this path.
 async fn improve_workflow_hierarchy_with_inserted(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     parent_canonical_name: &str,
     mut extraction: WorkflowExtraction,
 ) -> Result<(ImproveWorkflowHierarchyResponse, Vec<(uuid::Uuid, String)>), McpError> {
@@ -237,7 +244,8 @@ async fn improve_workflow_hierarchy_with_inserted(
         .map_err(|e| internal_error(format!("new_generation does not fit in u32: {e}")))?;
     extraction.source.parent_canonical_name = Some(parent_canonical_name.to_string());
 
-    let (response, inserted) = execute_workflow_ingest_with_inserted(pool, &extraction).await?;
+    let (response, inserted) =
+        execute_workflow_ingest_with_inserted(pool, viewer, &extraction).await?;
 
     let improve_response = ImproveWorkflowHierarchyResponse {
         parent_canonical_name: parent_canonical_name.to_string(),
@@ -262,23 +270,27 @@ async fn improve_workflow_hierarchy_with_inserted(
 /// the MCP entry point [`improve_workflow_hierarchy`].
 pub async fn improve_workflow_hierarchy_via_pool(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     parent_canonical_name: &str,
     extraction: WorkflowExtraction,
 ) -> Result<ImproveWorkflowHierarchyResponse, McpError> {
     let (response, _inserted) =
-        improve_workflow_hierarchy_with_inserted(pool, parent_canonical_name, extraction).await?;
+        improve_workflow_hierarchy_with_inserted(pool, viewer, parent_canonical_name, extraction)
+            .await?;
     Ok(response)
 }
 
 /// MCP tool entry point for `improve_workflow_hierarchy`.
 pub async fn improve_workflow_hierarchy(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ImproveWorkflowHierarchyParams,
 ) -> Result<CallToolResult, McpError> {
     // Save goal before params.extraction is consumed by improve_workflow_hierarchy_with_inserted.
     let goal = params.extraction.source.goal.clone();
     let (response, inserted) = improve_workflow_hierarchy_with_inserted(
         &server.pool,
+        viewer,
         &params.parent_canonical_name,
         params.extraction,
     )
@@ -357,7 +369,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn ingest_workflow_smoke(pool: sqlx::PgPool) {
         let extraction = minimal_extraction();
-        let result = do_ingest_workflow_via_pool(&pool, &extraction)
+        let result = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &extraction)
             .await
             .expect("ingest must succeed");
 
@@ -380,12 +392,12 @@ mod tests {
         // Use a unique canonical_name so this test doesn't collide with smoke.
         extraction.source.canonical_name = "test-workflow-idempotent".to_string();
 
-        let r1 = do_ingest_workflow_via_pool(&pool, &extraction)
+        let r1 = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &extraction)
             .await
             .expect("first ingest");
         assert!(!r1.already_ingested);
 
-        let r2 = do_ingest_workflow_via_pool(&pool, &extraction)
+        let r2 = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &extraction)
             .await
             .expect("second ingest");
         assert!(r2.already_ingested, "second ingest should be a no-op");
@@ -480,7 +492,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let wf_result = do_ingest_workflow_via_pool(&pool, &wf_extraction)
+        let wf_result = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &wf_extraction)
             .await
             .unwrap();
 
@@ -512,7 +524,7 @@ mod tests {
         let mut extraction = minimal_extraction();
         extraction.source.canonical_name = "test-workflow-executes".to_string();
 
-        let result = do_ingest_workflow_via_pool(&pool, &extraction)
+        let result = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &extraction)
             .await
             .expect("ingest must succeed");
 
@@ -583,7 +595,7 @@ mod tests {
             relationships: vec![],
         };
 
-        do_ingest_workflow_via_pool(&pool, &extraction)
+        do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &extraction)
             .await
             .expect("ingest must succeed");
 
@@ -651,7 +663,7 @@ mod tests {
         // 1. Seed the base workflow (generation 0).
         let mut base = minimal_extraction();
         base.source.canonical_name = "weekly-capability-audit".to_string();
-        do_ingest_workflow_via_pool(&pool, &base)
+        do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &base)
             .await
             .expect("base workflow ingest must succeed");
 
@@ -687,7 +699,7 @@ mod tests {
 
         // 3. Must succeed without a constraint violation.
         let result =
-            improve_workflow_hierarchy_via_pool(&pool, "weekly-capability-audit", improved)
+            improve_workflow_hierarchy_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), "weekly-capability-audit", improved)
                 .await
                 .expect("improve must not violate claims_content_not_empty constraint");
 

@@ -24,6 +24,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::middleware::bearer::ViewerExtractor;
 use crate::{errors::ApiError, state::AppState};
 
 // Cross-source matches reads two tables (edges, match_candidates) via raw
@@ -260,6 +261,7 @@ pub struct DecideCandidateRequest {
 
 #[cfg(feature = "db")]
 pub async fn decide_candidate(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
@@ -330,6 +332,7 @@ pub async fn decide_candidate(
 
             let all_current = epigraph_db::ClaimRepository::are_all_current(
                 &state.db_pool,
+                &viewer,
                 &[row.claim_a, row.claim_b],
             )
             .await

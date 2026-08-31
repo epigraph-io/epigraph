@@ -112,22 +112,24 @@ impl BeliefInterval {
 /// the claim does not exist (unframed path only).
 pub async fn get_belief(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Option<Uuid>,
 ) -> Result<BeliefInterval, BeliefQueryError> {
     if let Some(frame_id) = frame_id {
         // ── Framed path: live recomputation from stored BBAs ──────────────
-        let frame_row = FrameRepository::get_by_id(pool, frame_id)
+        let frame_row = FrameRepository::get_by_id(pool, viewer, frame_id)
             .await?
             .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
 
         let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
 
-        let assignment = FrameRepository::get_claim_assignment(pool, claim_id, frame_id).await?;
+        let assignment =
+            FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
         let hypothesis_index = assignment.and_then(|a| a.hypothesis_index).unwrap_or(0) as usize;
 
         let all_bbas =
-            MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id).await?;
+            MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
 
         if all_bbas.is_empty() {
             return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
@@ -158,7 +160,7 @@ pub async fn get_belief(
     }
 
     // ── Unframed path: cached DS columns from claim row ───────────────────
-    let claim = ClaimRepository::get_by_id(pool, ClaimId::from_uuid(claim_id))
+    let claim = ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(claim_id))
         .await?
         .ok_or(BeliefQueryError::ClaimNotFound(claim_id))?;
 
@@ -185,19 +187,22 @@ pub async fn get_belief(
 /// query failure.
 pub async fn get_perspective_belief(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
     perspective_id: Uuid,
 ) -> Result<BeliefInterval, BeliefQueryError> {
-    let frame_row = FrameRepository::get_by_id(pool, frame_id)
+    let frame_row = FrameRepository::get_by_id(pool, viewer, frame_id)
         .await?
         .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
 
-    let assignment = FrameRepository::get_claim_assignment(pool, claim_id, frame_id).await?;
+    let assignment =
+        FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
     let hypothesis_index = assignment.and_then(|a| a.hypothesis_index).unwrap_or(0) as usize;
 
-    let all_bbas = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id).await?;
+    let all_bbas =
+        MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
     if all_bbas.is_empty() {
         // An empty BBA set is ambiguous on its own: it is equally the signature
         // of a real claim with no evidence in this frame AND of a `claim_id`
@@ -207,7 +212,7 @@ pub async fn get_perspective_belief(
         // .claim_id` is `REFERENCES claims(id)`, so a non-empty BBA set already
         // proves the claim row exists — which keeps the evidence-bearing path
         // at zero extra queries.
-        if ClaimRepository::get_by_id(pool, ClaimId::from_uuid(claim_id))
+        if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(claim_id))
             .await?
             .is_none()
         {
@@ -219,7 +224,7 @@ pub async fn get_perspective_belief(
     // The perspective's frame-function config: source-reliability (evidence
     // type) + locality-reliability (pathway). Absent/empty → no opinion → the
     // computation reduces to the global `get_belief`.
-    let perspective = PerspectiveRepository::get_by_id(pool, perspective_id)
+    let perspective = PerspectiveRepository::get_by_id(pool, viewer, perspective_id)
         .await?
         .map(|p| PerspectiveReliability {
             source_reliability: p.source_reliability().unwrap_or_default(),
@@ -271,6 +276,7 @@ impl FramedBeliefContext {
     /// so a lensed read over an un-configured observer equals the global read.
     async fn resolve(
         pool: &PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
         frame_id: Uuid,
         perspective_id: Option<Uuid>,
     ) -> Result<Self, BeliefQueryError> {
@@ -287,7 +293,7 @@ impl FramedBeliefContext {
                 .flatten();
         let perspective = match perspective_id {
             Some(pid) => Some(
-                PerspectiveRepository::get_by_id(pool, pid)
+                PerspectiveRepository::get_by_id(pool, viewer, pid)
                     .await?
                     .map(|p| PerspectiveReliability {
                         source_reliability: p.source_reliability().unwrap_or_default(),
@@ -430,24 +436,25 @@ async fn recompute_framed_belief(
 /// `FrameNotFound` if `frame_id` is absent; `Db` on a page-level query failure.
 pub async fn get_perspective_belief_batch(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_ids: &[Uuid],
     frame_id: Uuid,
     perspective_id: Uuid,
 ) -> Result<Vec<(Uuid, Result<BeliefInterval, BeliefQueryError>)>, BeliefQueryError> {
-    let frame_row = FrameRepository::get_by_id(pool, frame_id)
+    let frame_row = FrameRepository::get_by_id(pool, viewer, frame_id)
         .await?
         .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
 
     // Resolve perspective + per-frame overrides + calibration ONCE per page.
     // This is the hoist that removes the N+1.
-    let ctx = FramedBeliefContext::resolve(pool, frame_id, Some(perspective_id)).await?;
+    let ctx = FramedBeliefContext::resolve(pool, viewer, frame_id, Some(perspective_id)).await?;
 
     let mut out = Vec::with_capacity(claim_ids.len());
     for &claim_id in claim_ids {
         out.push((
             claim_id,
-            perspective_belief_for_claim(pool, claim_id, frame_id, &frame, &ctx).await,
+            perspective_belief_for_claim(pool, viewer, claim_id, frame_id, &frame, &ctx).await,
         ));
     }
     Ok(out)
@@ -459,15 +466,18 @@ pub async fn get_perspective_belief_batch(
 /// [`get_perspective_belief`] exactly so the two produce identical intervals.
 async fn perspective_belief_for_claim(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
     ctx: &FramedBeliefContext,
 ) -> Result<BeliefInterval, BeliefQueryError> {
-    let assignment = FrameRepository::get_claim_assignment(pool, claim_id, frame_id).await?;
+    let assignment =
+        FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
     let hypothesis_index = assignment.and_then(|a| a.hypothesis_index).unwrap_or(0) as usize;
 
-    let all_bbas = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id).await?;
+    let all_bbas =
+        MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
     if all_bbas.is_empty() {
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
     }

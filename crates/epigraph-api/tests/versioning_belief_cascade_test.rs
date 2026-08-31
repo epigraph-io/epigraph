@@ -20,6 +20,9 @@
 #[allow(dead_code)]
 mod common;
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
@@ -27,13 +30,14 @@ use uuid::Uuid;
 /// target actually carries a `perspective_id = edge_id` BBA — the derived
 /// record the cascade exists to repair.
 async fn wire_supports(pool: &sqlx::PgPool, agent: Uuid, source: Uuid, target: Uuid) {
+    let viewer = fixture::public_viewer(pool).await;
     let edge_id = epigraph_db::EdgeRepository::create(
         pool, source, "claim", target, "claim", "supports", None, None, None,
     )
     .await
     .expect("create edge");
     let outcome = epigraph_engine::edge_factor::auto_wire_ds_for_edge(
-        pool, edge_id, agent, source, target, "supports",
+        pool, &viewer, edge_id, agent, source, target, "supports",
     )
     .await
     .expect("auto-wire edge factor");
@@ -215,11 +219,12 @@ async fn dedup_route_reports_and_applies_the_belief_cascade() {
 
     // The inherited supporter is visible in the survivor's cache, and the
     // retired duplicate no longer claims a belief it lost the evidence for.
-    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(&pool)
+    let viewer = fixture::public_viewer(&pool).await;
+    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(&pool, &viewer)
         .await
         .expect("binary frame");
     let coherent =
-        epigraph_engine::edge_factor::preview_claim_belief_on_frame(&pool, canonical, frame_id)
+        epigraph_engine::edge_factor::preview_claim_belief_on_frame(&pool, &viewer, canonical, frame_id)
             .await
             .expect("preview")
             .expect("canonical inherited the supporter's BBA");

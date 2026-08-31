@@ -52,6 +52,7 @@ fn not_found(workflow_id: Uuid) -> McpError {
 
 pub async fn find_workflow_hierarchical(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: FindWorkflowHierarchicalParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
@@ -136,7 +137,7 @@ pub async fn find_workflow_hierarchical(
 
         if resolve_to_latest {
             let resolved =
-                epigraph_db::WorkflowRepository::resolve_steps_to_heads(&server.pool, r.id)
+                epigraph_db::WorkflowRepository::resolve_steps_to_heads(&server.pool, viewer, r.id)
                     .await
                     .map_err(internal_error)?;
             entry["resolved_steps"] = serde_json::to_value(resolved).map_err(internal_error)?;
@@ -361,7 +362,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_outcome_updates_counters_and_writes_step_rows(pool: sqlx::PgPool) {
         let ext = extraction("test-outcome-counters");
-        let ingest = do_ingest_workflow_via_pool(&pool, &ext).await.unwrap();
+        let ingest = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &ext).await.unwrap();
         let workflow_id = Uuid::parse_str(&ingest.workflow_id).unwrap();
 
         let steps = vec![

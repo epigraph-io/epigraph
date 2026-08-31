@@ -61,31 +61,48 @@ impl ChallengeRepository {
     }
 
     /// Get a single challenge by ID.
-    pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<ChallengeRow>, sqlx::Error> {
-        sqlx::query_as::<_, ChallengeRow>(
+    ///
+    /// `challenges.explanation` is free prose about a claim's weaknesses and is
+    /// the surface plan §2.4 / §4.9 #23 flags: it leaks the substance of a claim
+    /// the caller may not be able to read. `challenges` carries its own tenancy
+    /// columns (migration 062), so the predicate applies to the row directly.
+    pub async fn get(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<ChallengeRow>, sqlx::Error> {
+        let sql = viewer.splice(
             "SELECT id, claim_id, challenger_id, challenge_type, explanation, state, \
                     resolved_by, resolution_details, resolved_at, created_at \
-             FROM challenges WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await
+             FROM challenges WHERE id = $1 /* {VISIBILITY:challenges} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ChallengeRow>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(pool).await
     }
 
     /// List all challenges for a given claim.
     pub async fn list_for_claim(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<ChallengeRow>, sqlx::Error> {
-        sqlx::query_as::<_, ChallengeRow>(
+        let sql = viewer.splice(
             "SELECT id, claim_id, challenger_id, challenge_type, explanation, state, \
                     resolved_by, resolution_details, resolved_at, created_at \
              FROM challenges WHERE claim_id = $1 \
+             /* {VISIBILITY:challenges} */ \
              ORDER BY created_at DESC",
-        )
-        .bind(claim_id)
-        .fetch_all(pool)
-        .await
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ChallengeRow>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(pool).await
     }
 
     /// Update challenge state (e.g. pending -> accepted/rejected).
@@ -144,8 +161,11 @@ impl ChallengeRepository {
     }
 
     /// Query gap-originated challenges with optional filters.
+    /// The change inventory expected this to join `claims`; it does not — the
+    /// query reads `challenges` alone. One alias, one marker.
     pub async fn get_gap_challenges(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         gap_type: Option<&str>,
         state: Option<&str>,
         limit: i64,
@@ -155,16 +175,21 @@ impl ChallengeRepository {
             .unwrap_or_else(|| "epistemic_gap_%".into());
         let state_filter = state.unwrap_or("%");
 
-        sqlx::query_as::<_, GapChallengeRow>(
+        let sql = viewer.splice(
             "SELECT id, claim_id, challenge_type, explanation, state, created_at \
              FROM challenges \
              WHERE challenge_type LIKE $1 AND state LIKE $2 \
+             /* {VISIBILITY:challenges} */ \
              ORDER BY created_at DESC LIMIT $3",
-        )
-        .bind(&type_filter)
-        .bind(state_filter)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
+            4,
+        );
+        let mut q = sqlx::query_as::<_, GapChallengeRow>(&sql)
+            .bind(&type_filter)
+            .bind(state_filter)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(pool).await
     }
 }

@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::middleware::bearer::ViewerExtractor;
 use epigraph_core::AgentId;
 #[cfg(feature = "db")]
 use epigraph_db::{AgentRepository, PoliticalRepository};
@@ -291,6 +292,7 @@ pub struct MirrorNarrativeParams {
 /// evidence type distribution, truth value statistics, and refutation rate.
 #[cfg(feature = "db")]
 pub async fn epistemic_profile(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(_params): Query<EpistemicProfileParams>,
@@ -307,7 +309,7 @@ pub async fn epistemic_profile(
         })?;
 
     // Fetch claims
-    let claims = PoliticalRepository::get_agent_profile_claims(pool, id).await?;
+    let claims = PoliticalRepository::get_agent_profile_claims(pool, &viewer, id).await?;
     let claim_count = claims.len();
 
     if claim_count == 0 {
@@ -352,7 +354,7 @@ pub async fn epistemic_profile(
         .collect();
 
     // Evidence distribution
-    let ev_rows = PoliticalRepository::get_agent_evidence_distribution(pool, id).await?;
+    let ev_rows = PoliticalRepository::get_agent_evidence_distribution(pool, &viewer, id).await?;
     let ev_total: i64 = ev_rows.iter().map(|r| r.count).sum();
     let evidence_distribution: HashMap<String, f64> = if ev_total > 0 {
         ev_rows
@@ -400,6 +402,7 @@ pub async fn epistemic_profile(
 /// Returns epistemic profiles for multiple agents for side-by-side comparison.
 #[cfg(feature = "db")]
 pub async fn compare_agents(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<CompareAgentsParams>,
 ) -> Result<Json<Vec<EpistemicProfileResponse>>, ApiError> {
@@ -433,7 +436,7 @@ pub async fn compare_agents(
             None => continue, // Skip missing agents
         };
 
-        let claims = PoliticalRepository::get_agent_profile_claims(pool, id).await?;
+        let claims = PoliticalRepository::get_agent_profile_claims(pool, &viewer, id).await?;
         let claim_count = claims.len();
 
         let (mean_truth, refutation_rate) = if claim_count > 0 {
@@ -471,6 +474,7 @@ pub async fn compare_agents(
 /// including supersession events and consistency metrics.
 #[cfg(feature = "db")]
 pub async fn position_timeline(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(params): Query<PositionTimelineParams>,
@@ -497,7 +501,8 @@ pub async fn position_timeline(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&chrono::Utc));
 
-    let claims = PoliticalRepository::get_agent_position_timeline(pool, id, since, until).await?;
+    let claims =
+        PoliticalRepository::get_agent_position_timeline(pool, &viewer, id, since, until).await?;
 
     // Build timeline entries
     let mut timeline: Vec<TimelineEntry> = claims
@@ -559,6 +564,7 @@ pub async fn position_timeline(
 /// for a claim, identifying the originator and all amplifiers.
 #[cfg(feature = "db")]
 pub async fn claim_genealogy(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<GenealogyResponse>, ApiError> {
@@ -580,7 +586,7 @@ pub async fn claim_genealogy(
         });
     }
 
-    let steps = PoliticalRepository::get_claim_genealogy(pool, claim_id).await?;
+    let steps = PoliticalRepository::get_claim_genealogy(pool, &viewer, claim_id).await?;
 
     // Find origin (ORIGINATED_BY) and amplifiers (AMPLIFIED_BY)
     let origin = steps
@@ -658,6 +664,7 @@ pub async fn claim_genealogy(
 /// Returns claims originated by an agent that were amplified by N+ others.
 #[cfg(feature = "db")]
 pub async fn originated_claims(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(params): Query<OriginatedClaimsParams>,
@@ -675,9 +682,10 @@ pub async fn originated_claims(
     let limit = params.limit.clamp(1, 100);
     let min_amp = params.amplified_by_min.max(0);
 
-    let rows =
-        PoliticalRepository::get_originated_claims_with_amplification(pool, id, min_amp, limit)
-            .await?;
+    let rows = PoliticalRepository::get_originated_claims_with_amplification(
+        pool, &viewer, id, min_amp, limit,
+    )
+    .await?;
 
     let items: Vec<OriginatedClaimResponse> = rows
         .into_iter()
@@ -699,6 +707,7 @@ pub async fn originated_claims(
 /// exaggeration of threat magnitudes by comparing asserted vs evidenced quantities.
 #[cfg(feature = "db")]
 pub async fn inflation_index(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(_params): Query<InflationIndexParams>,
@@ -713,7 +722,7 @@ pub async fn inflation_index(
             id: id.to_string(),
         })?;
 
-    let rows = PoliticalRepository::get_agent_inflation_claims(pool, id).await?;
+    let rows = PoliticalRepository::get_agent_inflation_claims(pool, &viewer, id).await?;
 
     let sample_claims: Vec<InflationClaimEntry> = rows
         .iter()
@@ -873,12 +882,13 @@ pub async fn create_technique(
 /// Returns propaganda techniques detected on a claim via USES_TECHNIQUE edges.
 #[cfg(feature = "db")]
 pub async fn claim_techniques(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<Vec<ClaimTechniqueResponse>>, ApiError> {
     let pool = &state.db_pool;
 
-    let rows = PoliticalRepository::get_claim_techniques(pool, claim_id).await?;
+    let rows = PoliticalRepository::get_claim_techniques(pool, &viewer, claim_id).await?;
 
     let items: Vec<ClaimTechniqueResponse> = rows
         .into_iter()

@@ -1,0 +1,63 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH RECURSIVE chain AS (\n                SELECT $1::uuid AS node,\n                       0 AS depth,\n                       ARRAY[$1::uuid] AS path,\n                       false AS is_cycle,\n                       NULL::uuid AS e_source,\n                       NULL::uuid AS e_target,\n                       NULL::varchar AS e_rel\n                UNION ALL\n                SELECT nxt.id,\n                       c.depth + 1,\n                       c.path || nxt.id,\n                       nxt.id = ANY(c.path),\n                       e.source_id,\n                       e.target_id,\n                       e.relationship\n                FROM chain c\n                JOIN edges e\n                  ON e.source_type = 'claim'\n                 AND e.target_type = 'claim'\n                 AND ( (e.target_id = c.node AND e.relationship = ANY($2::text[]))\n                    OR (e.source_id = c.node AND e.relationship = ANY($3::text[])) )\n                CROSS JOIN LATERAL (\n                    SELECT CASE WHEN e.target_id = c.node\n                                THEN e.source_id ELSE e.target_id END AS id\n                ) nxt\n                WHERE c.depth < $4 AND NOT c.is_cycle\n                  AND ($5::bool OR e.visibility = 'public'\n                       OR e.owner_group_id = ANY($6::uuid[]))\n            )\n            SELECT node AS \"node!\", depth AS \"depth!\", is_cycle AS \"is_cycle!\",\n                   path AS \"path!\", e_source, e_target, e_rel\n            FROM chain\n            LIMIT 20000\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "node!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "depth!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "is_cycle!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "path!",
+        "type_info": "UuidArray"
+      },
+      {
+        "ordinal": 4,
+        "name": "e_source",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "e_target",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "e_rel",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "TextArray",
+        "Int4",
+        "Bool",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "ae667413a9c540cca0f7f4d3e4ca14a4aa2f3973a64e417c39f2206365fd0af3"
+}

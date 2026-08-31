@@ -6,6 +6,9 @@
 //! confirms that each call produces a fresh generation (no implicit
 //! idempotent no-op when the new generation hasn't been written yet).
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_ingest::common::schema::ThesisDerivation;
 use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
 use epigraph_ingest::workflow::WorkflowExtraction;
@@ -76,11 +79,12 @@ fn improved_extraction() -> WorkflowExtraction {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn improve_workflow_hierarchy_increments_generation(pool: sqlx::PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let canonical = "test-improve-hier-increments";
 
     // Ingest parent at generation 1.
     epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
-        &pool,
+        &pool, &viewer,
         &parent_extraction(canonical),
     )
     .await
@@ -88,7 +92,7 @@ async fn improve_workflow_hierarchy_increments_generation(pool: sqlx::PgPool) {
 
     // First improve: parent_max=1, new_generation=2.
     let new_gen = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
-        &pool,
+        &pool, &viewer,
         canonical,
         improved_extraction(),
     )
@@ -117,7 +121,7 @@ async fn improve_workflow_hierarchy_increments_generation(pool: sqlx::PgPool) {
     // produces a fresh variant; idempotency is on (canonical_name, generation),
     // not on the tool entrypoint.
     let new_gen2 = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
-        &pool,
+        &pool, &viewer,
         canonical,
         improved_extraction(),
     )
@@ -130,8 +134,9 @@ async fn improve_workflow_hierarchy_increments_generation(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn improve_workflow_hierarchy_errors_when_parent_missing(pool: sqlx::PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let result = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
-        &pool,
+        &pool, &viewer,
         "nonexistent-canonical-name-xyzzy",
         improved_extraction(),
     )
@@ -154,10 +159,11 @@ async fn improve_workflow_hierarchy_errors_when_parent_missing(pool: sqlx::PgPoo
 /// persisted phase claim must contain the title text.
 #[sqlx::test(migrations = "../../migrations")]
 async fn improve_workflow_hierarchy_empty_phase_summary_uses_title(pool: sqlx::PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let canonical = "test-improve-hier-empty-summary";
 
     epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
-        &pool,
+        &pool, &viewer,
         &parent_extraction(canonical),
     )
     .await
@@ -192,7 +198,7 @@ async fn improve_workflow_hierarchy_empty_phase_summary_uses_title(pool: sqlx::P
     };
 
     let result = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
-        &pool, canonical, extraction,
+        &pool, &viewer, canonical, extraction,
     )
     .await
     .expect("empty summary should not cause a constraint violation; builder falls back to title");
@@ -223,10 +229,11 @@ async fn improve_workflow_hierarchy_empty_phase_summary_uses_title(pool: sqlx::P
 /// thesis string (Some("")) before writing to the DB.
 #[sqlx::test(migrations = "../../migrations")]
 async fn improve_workflow_hierarchy_rejects_empty_thesis(pool: sqlx::PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let canonical = "test-improve-hier-empty-thesis";
 
     epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
-        &pool,
+        &pool, &viewer,
         &parent_extraction(canonical),
     )
     .await
@@ -254,7 +261,7 @@ async fn improve_workflow_hierarchy_rejects_empty_thesis(pool: sqlx::PgPool) {
     };
 
     let result = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
-        &pool,
+        &pool, &viewer,
         canonical,
         bad_extraction,
     )

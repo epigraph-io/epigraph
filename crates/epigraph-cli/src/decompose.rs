@@ -176,6 +176,7 @@ mod db_writes {
     /// edge would pollute the graph and is what `is_current`-atoms look like).
     pub async fn persist_decomposition<F, Fut>(
         pool: &PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
         parent_id: Uuid,
         decomp: &Decomposition,
         embedder: Option<Arc<dyn epigraph_embeddings::EmbeddingService>>,
@@ -194,7 +195,7 @@ mod db_writes {
             });
         }
         // Guard: parent must still be current (never wire onto a retired claim).
-        if !ClaimRepository::are_all_current(pool, &[parent_id]).await? {
+        if !ClaimRepository::are_all_current(pool, viewer, &[parent_id]).await? {
             return Err(format!("parent claim {parent_id} is not current").into());
         }
         let mut atom_ids = Vec::with_capacity(decomp.atoms.len());
@@ -269,6 +270,7 @@ mod db_writes {
     /// a persist failure aborts the run.
     pub async fn run_decomposition_batches<F, Fut>(
         pool: &PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
         claims: &[BatchClaim],
         llm: &dyn epigraph_interfaces::LlmProvider,
         batch_size: usize,
@@ -307,6 +309,7 @@ mod db_writes {
                 let submit_via = &submit_via;
                 let outcome = persist_decomposition(
                     pool,
+                    viewer,
                     parent.claim_id,
                     &decomp,
                     embedder.clone(),

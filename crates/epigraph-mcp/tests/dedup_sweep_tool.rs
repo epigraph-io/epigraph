@@ -7,6 +7,9 @@
 //! other are never auto-collapsed, because mark_duplicate discards the
 //! duplicate's text.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_mcp::tools::dedup_sweep::sweep_semantic_duplicates;
 use epigraph_mcp::types::SweepSemanticDuplicatesParams;
 use sqlx::PgPool;
@@ -88,6 +91,7 @@ fn json_of(out: rmcp::model::CallToolResult) -> serde_json::Value {
 /// claims on a default-arg call would be the worst possible failure here.
 #[sqlx::test(migrations = "../../migrations")]
 async fn dry_run_reports_without_mutating(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Identical content REQUIRES distinct agents: uq_claims_content_hash_agent
     // makes an exact within-agent duplicate impossible, which is precisely why
     // the real duplicate corpus is cross-agent.
@@ -98,7 +102,7 @@ async fn dry_run_reports_without_mutating(pool: PgPool) {
 
     let server = build_server(pool.clone());
     let j = json_of(
-        sweep_semantic_duplicates(&server, params(true))
+        sweep_semantic_duplicates(&server, &viewer, params(true))
             .await
             .expect("sweep"),
     );
@@ -124,6 +128,7 @@ async fn dry_run_reports_without_mutating(pool: PgPool) {
 /// claim and forwarding the other at it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn execute_collapses_exact_restatements_keeping_highest_truth(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let a1 = seed_agent(&pool).await;
     let a2 = seed_agent(&pool).await;
     let strong = seed(&pool, a1, "same words", 0.9, &pgvec(0, 0.0), &[]).await;
@@ -131,7 +136,7 @@ async fn execute_collapses_exact_restatements_keeping_highest_truth(pool: PgPool
 
     let server = build_server(pool.clone());
     let j = json_of(
-        sweep_semantic_duplicates(&server, params(false))
+        sweep_semantic_duplicates(&server, &viewer, params(false))
             .await
             .expect("sweep"),
     );
@@ -166,6 +171,7 @@ async fn execute_collapses_exact_restatements_keeping_highest_truth(pool: PgPool
 /// merge_candidates for consolidate_claims instead.
 #[sqlx::test(migrations = "../../migrations")]
 async fn similar_but_distinct_text_is_never_auto_collapsed(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let a = seed(
         &pool,
@@ -188,7 +194,7 @@ async fn similar_but_distinct_text_is_never_auto_collapsed(pool: PgPool) {
 
     let server = build_server(pool.clone());
     let j = json_of(
-        sweep_semantic_duplicates(&server, params(false))
+        sweep_semantic_duplicates(&server, &viewer, params(false))
             .await
             .expect("sweep"),
     );
@@ -218,6 +224,7 @@ async fn similar_but_distinct_text_is_never_auto_collapsed(pool: PgPool) {
 /// directly compared. A pairwise-only implementation would emit two clusters.
 #[sqlx::test(migrations = "../../migrations")]
 async fn transitive_similarity_forms_one_cluster(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let (a1, a2, a3) = (
         seed_agent(&pool).await,
         seed_agent(&pool).await,
@@ -229,7 +236,7 @@ async fn transitive_similarity_forms_one_cluster(pool: PgPool) {
 
     let server = build_server(pool.clone());
     let j = json_of(
-        sweep_semantic_duplicates(&server, params(true))
+        sweep_semantic_duplicates(&server, &viewer, params(true))
             .await
             .expect("sweep"),
     );
@@ -247,6 +254,7 @@ async fn transitive_similarity_forms_one_cluster(pool: PgPool) {
 /// the sweep, and neither do already-superseded claims.
 #[sqlx::test(migrations = "../../migrations")]
 async fn excluded_claim_classes_are_not_swept(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let a1 = seed_agent(&pool).await;
     let a2 = seed_agent(&pool).await;
     seed(
@@ -283,7 +291,7 @@ async fn excluded_claim_classes_are_not_swept(pool: PgPool) {
 
     let server = build_server(pool.clone());
     let j = json_of(
-        sweep_semantic_duplicates(&server, params(true))
+        sweep_semantic_duplicates(&server, &viewer, params(true))
             .await
             .expect("sweep"),
     );
@@ -299,6 +307,7 @@ async fn excluded_claim_classes_are_not_swept(pool: PgPool) {
 /// Paging is resumable: next_offset advances by what was scanned.
 #[sqlx::test(migrations = "../../migrations")]
 async fn next_offset_advances_for_resumable_paging(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     for i in 0..3 {
         seed(
@@ -315,7 +324,7 @@ async fn next_offset_advances_for_resumable_paging(pool: PgPool) {
     let server = build_server(pool.clone());
     let mut p = params(true);
     p.limit = Some(2);
-    let j = json_of(sweep_semantic_duplicates(&server, p).await.expect("sweep"));
+    let j = json_of(sweep_semantic_duplicates(&server, &viewer, p).await.expect("sweep"));
 
     assert_eq!(j["scanned"], serde_json::json!(2));
     assert_eq!(
@@ -336,6 +345,7 @@ async fn next_offset_advances_for_resumable_paging(pool: PgPool) {
 /// exactly where it hurts most.
 #[sqlx::test(migrations = "../../migrations")]
 async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let a1 = seed_agent(&pool).await;
     let a2 = seed_agent(&pool).await;
     let a3 = seed_agent(&pool).await;
@@ -361,7 +371,7 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
 
     let server = build_server(pool.clone());
     let link = epigraph_mcp::tools::link_epistemic::do_link_epistemic(
-        &server,
+        &server, &viewer,
         epigraph_mcp::types::LinkEpistemicParams {
             source_claim_id: supporter.to_string(),
             target_claim_id: weak.to_string(),
@@ -385,7 +395,7 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
     assert!(weak_betp_before.is_some(), "fixture: duplicate has a BetP");
 
     let j = json_of(
-        sweep_semantic_duplicates(&server, params(false))
+        sweep_semantic_duplicates(&server, &viewer, params(false))
             .await
             .expect("sweep"),
     );
@@ -421,11 +431,11 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
     assert_eq!(stranded, 0, "the migrated BBA moved onto the survivor");
 
     // The survivor inherited the supporter, and its cache says so.
-    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(&pool)
+    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(&pool, &viewer)
         .await
         .expect("binary frame");
     let coherent =
-        epigraph_engine::edge_factor::preview_claim_belief_on_frame(&pool, strong, frame_id)
+        epigraph_engine::edge_factor::preview_claim_belief_on_frame(&pool, &viewer, strong, frame_id)
             .await
             .expect("preview")
             .expect("the survivor inherited the duplicate's supporter");

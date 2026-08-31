@@ -47,27 +47,38 @@ enum Phase {
 
 #[tokio::main]
 async fn main() {
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
+    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
+        epigraph_db::visibility::SystemReason::BeliefRecomputation,
+    )
+    .await
+    .expect("maintenance viewer");
+    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+    if let Err(e) = run(cli, viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    cli: Cli,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pool = epigraph_cli::db_connect().await?;
 
     if matches!(cli.phase, Phase::All | Phase::Evidence) {
-        let summary = run_evidence_phase(&pool, cli.limit, cli.offset, cli.dry_run).await?;
+        let summary = run_evidence_phase(&pool, viewer, cli.limit, cli.offset, cli.dry_run).await?;
         println!("evidence phase: {summary}");
     }
     if matches!(cli.phase, Phase::All | Phase::Edges) {
-        let summary = run_edge_phase(&pool, cli.limit, cli.offset, cli.dry_run).await?;
+        let summary = run_edge_phase(&pool, viewer, cli.limit, cli.offset, cli.dry_run).await?;
         println!("edge phase: {summary}");
     }
     Ok(())
@@ -127,6 +138,7 @@ LIMIT $1 OFFSET $2
 
 async fn run_evidence_phase(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     limit: usize,
     offset: usize,
     dry_run: bool,
@@ -169,6 +181,7 @@ async fn run_evidence_phase(
         let weight = load_evidence_type_weight(&evidence_type);
         match ds_auto::auto_wire_ds_update(
             pool,
+            viewer,
             claim_id,
             signer_id,
             1.0, // confidence: only evidence-type weight shapes the BBA
@@ -213,6 +226,7 @@ LIMIT $1 OFFSET $2
 
 async fn run_edge_phase(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     limit: usize,
     offset: usize,
     dry_run: bool,
@@ -244,6 +258,7 @@ async fn run_edge_phase(
     for (edge_id, signer_id, source_id, target_id, relationship) in rows {
         match ds_auto::auto_wire_ds_for_edge(
             pool,
+            viewer,
             edge_id,
             signer_id,
             source_id,

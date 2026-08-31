@@ -46,28 +46,44 @@ impl ClaimVersionRepository {
     /// List all versions for a claim, most recent first.
     pub async fn list_by_claim(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<ClaimVersionRow>, DbError> {
-        let rows = sqlx::query_as::<_, ClaimVersionRow>(
+        let sql = viewer.splice(
             "SELECT id, claim_id, version_number, content, truth_value, created_by, created_at \
              FROM claim_versions \
              WHERE claim_id = $1 \
+             /* {VISIBILITY:claim_versions} */ \
              ORDER BY version_number DESC",
-        )
-        .bind(claim_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ClaimVersionRow>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(pool).await?;
         Ok(rows)
     }
 
     /// Return the highest version number recorded for a claim, or 0 if none.
-    pub async fn latest_version_number(pool: &PgPool, claim_id: Uuid) -> Result<i32, DbError> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(MAX(version_number), 0) FROM claim_versions WHERE claim_id = $1",
-        )
-        .bind(claim_id)
-        .fetch_one(pool)
-        .await?;
+    /// The predicate is here even though only an integer leaves the function:
+    /// an edit count is a side channel that says "this claim exists and has
+    /// been revised N times" for a claim the caller cannot read.
+    pub async fn latest_version_number(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<i32, DbError> {
+        let sql = viewer.splice(
+            "SELECT COALESCE(MAX(version_number), 0) FROM claim_versions \
+             WHERE claim_id = $1 /* {VISIBILITY:claim_versions} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (i64,)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: (i64,) = q.fetch_one(pool).await?;
         Ok(row.0 as i32)
     }
 }

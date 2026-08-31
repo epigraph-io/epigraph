@@ -361,7 +361,14 @@ fn the_final_router_merges_only_protected_public_and_oauth() {
 
     assert_eq!(
         merges,
-        vec!["protected", "public", "oauth", "protected", "public", "oauth"],
+        vec![
+            "protected",
+            "public",
+            "oauth",
+            "protected",
+            "public",
+            "oauth"
+        ],
         "routes/mod.rs merges something other than the three known routers \
          (db variant then not(db) variant). A fourth router is a fourth \
          authentication story; this file only knows three."

@@ -8,6 +8,9 @@
 //! reads as "not yet ingested" — causing it to re-run extraction on an
 //! already (partially) ingested paper.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::{Agent, AgentId, Claim, TruthValue};
 use epigraph_crypto::{AgentSigner, ContentHasher};
 use epigraph_db::{AgentRepository, ClaimRepository, PaperRepository};
@@ -36,6 +39,7 @@ fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let doi = "10.48550/arXiv.2504.18085";
 
@@ -73,7 +77,7 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
     // the partial-ingestion state under test.
 
     let result = query_paper(
-        &server,
+        &server, &viewer,
         QueryPaperParams {
             doi: doi.to_string(),
         },
@@ -94,10 +98,11 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_paper_reports_zero_for_unknown_doi(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
 
     let result = query_paper(
-        &server,
+        &server, &viewer,
         QueryPaperParams {
             doi: "10.9999/never-ingested".to_string(),
         },

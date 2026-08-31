@@ -14,6 +14,9 @@
 //! These tests seed claims with the ACTUAL legacy BBA format observed in
 //! production (c98b6dec, adf396a8) and verify the clamp holds.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 use common::*;
 
@@ -40,8 +43,9 @@ async fn add_evidence(
     evidence_type: &str,
     note: &str,
 ) -> f64 {
+    let viewer = fixture::public_viewer(pool).await;
     let res = epigraph_mcp::tools::claims::update_with_evidence(
-        server,
+        server, &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,
@@ -64,7 +68,8 @@ async fn add_evidence(
 
 /// Seed the binary frame and return its id (creates it if absent).
 async fn get_or_create_binary_frame(pool: &PgPool) -> Uuid {
-    epigraph_mcp::tools::ds_auto::ensure_binary_frame(pool)
+    let viewer = fixture::public_viewer(pool).await;
+    epigraph_mcp::tools::ds_auto::ensure_binary_frame(pool, &viewer)
         .await
         .expect("ensure_binary_frame")
 }
@@ -179,6 +184,7 @@ async fn supporting_evidence_never_lowers_betp_with_legacy_mixed_bbas(pool: PgPo
 /// that was the prior regression target (b3d12e2a).
 #[sqlx::test(migrations = "../../migrations")]
 async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let claim_id = seed_claim(
         &pool,
@@ -188,7 +194,7 @@ async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) 
     .await;
 
     let (_frame_id, wired) = auto_wire_ds_batch(
-        &pool,
+        &pool, &viewer,
         &[
             BatchDsEntry {
                 claim_id,
@@ -255,11 +261,12 @@ async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) 
 /// Two opposing BBAs: tests deeper conflict regime.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supporting_evidence_never_lowers_betp_two_opposing(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, "1c1360bb variant-2opp regression claim", 0.5).await;
 
     let (_frame_id, _wired) = auto_wire_ds_batch(
-        &pool,
+        &pool, &viewer,
         &[
             BatchDsEntry {
                 claim_id,

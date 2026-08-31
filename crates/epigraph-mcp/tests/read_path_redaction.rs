@@ -20,6 +20,9 @@
 //! implementation already landed in Task 11, so every assertion is GREEN on the
 //! first run.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::{Agent, ClaimId};
 use epigraph_crypto::AgentSigner;
 use epigraph_db::AgentRepository;
@@ -45,6 +48,7 @@ const REDACTED: &str = "[REDACTED]";
 // content; on this branch it must be `"[REDACTED]"`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn http_owner_sees_content_stranger_is_redacted(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, owner).await;
     let expected = format!("test claim {}", claim_id.as_uuid());
@@ -53,7 +57,7 @@ async fn http_owner_sees_content_stranger_is_redacted(pool: PgPool) {
     let server = build_test_server(pool.clone());
 
     // Owner (HTTP) → real content.
-    let owner_body = get_claim_as(&server, claim_id, Some(owner)).await;
+    let owner_body = get_claim_as(&server, &viewer, claim_id, Some(owner)).await;
     assert_eq!(
         owner_body["content"].as_str().unwrap(),
         expected,
@@ -62,7 +66,7 @@ async fn http_owner_sees_content_stranger_is_redacted(pool: PgPool) {
 
     // Stranger (HTTP), B ≠ A → "[REDACTED]". Fails on origin/main.
     let stranger = Uuid::new_v4();
-    let stranger_body = get_claim_as(&server, claim_id, Some(stranger)).await;
+    let stranger_body = get_claim_as(&server, &viewer, claim_id, Some(stranger)).await;
     assert_eq!(
         stranger_body["content"].as_str().unwrap(),
         REDACTED,
@@ -82,6 +86,7 @@ async fn http_owner_sees_content_stranger_is_redacted(pool: PgPool) {
 // is what ties this test to the stdio arm.
 #[sqlx::test(migrations = "../../migrations")]
 async fn stdio_fallback_uses_server_identity(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let server_agent = server_agent_id(&pool).await;
 
@@ -98,7 +103,7 @@ async fn stdio_fallback_uses_server_identity(pool: PgPool) {
         "stdio (no bearer) must resolve the requester to the server's identity"
     );
 
-    let owned_body = get_claim_as(&server, owned_id, requester).await;
+    let owned_body = get_claim_as(&server, &viewer, owned_id, requester).await;
     assert_eq!(
         owned_body["content"].as_str().unwrap(),
         owned_expected,
@@ -111,7 +116,7 @@ async fn stdio_fallback_uses_server_identity(pool: PgPool) {
     let foreign_id = seed_claim(&pool, other_owner).await;
     seed_private_ownership(&pool, foreign_id, other_owner).await;
 
-    let foreign_body = get_claim_as(&server, foreign_id, requester).await;
+    let foreign_body = get_claim_as(&server, &viewer, foreign_id, requester).await;
     assert_eq!(
         foreign_body["content"].as_str().unwrap(),
         REDACTED,
@@ -128,6 +133,7 @@ async fn stdio_fallback_uses_server_identity(pool: PgPool) {
 // fails closed on public rows.
 #[sqlx::test(migrations = "../../migrations")]
 async fn public_claim_is_never_redacted(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, owner).await; // no ownership row → public
     let expected = format!("test claim {}", claim_id.as_uuid());
@@ -139,7 +145,7 @@ async fn public_claim_is_never_redacted(pool: PgPool) {
         ("stranger", Some(Uuid::new_v4())),
         ("anonymous (stdio None)", None),
     ] {
-        let body = get_claim_as(&server, claim_id, requester).await;
+        let body = get_claim_as(&server, &viewer, claim_id, requester).await;
         assert_eq!(
             body["content"].as_str().unwrap(),
             expected,
@@ -158,6 +164,7 @@ async fn public_claim_is_never_redacted(pool: PgPool) {
 // row must get ITS OWN decision.
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_claims_redacts_only_unauthorized_rows(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let public_owner = seed_agent(&pool).await;
     let private_owner = seed_agent(&pool).await;
 
@@ -173,7 +180,7 @@ async fn query_claims_redacts_only_unauthorized_rows(pool: PgPool) {
     // one is redacted.
     let stranger = Uuid::new_v4();
     let result = query_claims(
-        &server,
+        &server, &viewer,
         QueryClaimsParams {
             min_truth: Some(0.0),
             max_truth: Some(1.0),
@@ -228,11 +235,12 @@ async fn server_agent_id(pool: &PgPool) -> Uuid {
 
 async fn get_claim_as(
     server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: ClaimId,
     requester: Option<Uuid>,
 ) -> Value {
     let result = get_claim(
-        server,
+        server, &viewer,
         GetClaimParams {
             claim_id: claim_id.as_uuid().to_string(),
             frame_id: None,

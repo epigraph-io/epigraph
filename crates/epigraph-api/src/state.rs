@@ -141,6 +141,22 @@ pub struct AppState {
     /// Database connection pool
     #[cfg(feature = "db")]
     pub db_pool: PgPool,
+    /// The tenancy-aware pool, when this process built one.
+    ///
+    /// `Option` on purpose. `ScopedPool::connect` owns pool construction —
+    /// `PgPoolOptions::after_release`, the release scrub that stands between a
+    /// recycled connection and a cross-tenant read, can only be installed at
+    /// BUILD time — so a `ScopedPool` cannot be wrapped around a `PgPool`
+    /// someone else made. `AppState`'s three existing constructors are
+    /// synchronous and receive a possibly-lazy `PgPool`, so they cannot build
+    /// one; only [`Self::with_scoped_pool`] (which `bin/server.rs` calls) can.
+    ///
+    /// The consequence is deliberate: a process that never built a `ScopedPool`
+    /// cannot mint a [`epigraph_db::visibility::MaintenanceLease`], and
+    /// therefore cannot construct a bypass `Viewer` at all. Fixtures and unit
+    /// tests get `None` and a clear error rather than a silent bypass.
+    #[cfg(feature = "db")]
+    pub scoped: Option<epigraph_db::ScopedPool>,
     /// API configuration
     pub config: ApiConfig,
     /// Idempotency store for duplicate request detection
@@ -373,6 +389,7 @@ impl AppState {
             SignatureVerificationState::new().with_max_request_size(config.max_request_size);
         Self {
             db_pool,
+            scoped: None,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -427,6 +444,64 @@ impl AppState {
         }
     }
 
+    /// Create application state from a [`epigraph_db::ScopedPool`].
+    ///
+    /// The only constructor that can populate [`Self::scoped`], and therefore
+    /// the only one after which [`Self::maintenance_viewer`] can succeed.
+    /// `bin/server.rs` uses it; it keeps the inner `PgPool` in `db_pool` so no
+    /// existing handler changes shape.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_scoped_pool(scoped: epigraph_db::ScopedPool, config: ApiConfig) -> Self {
+        let db_pool = scoped.inner().clone();
+        let mut st = Self::with_db(db_pool, config);
+        st.scoped = Some(scoped);
+        st
+    }
+
+    /// A bypass viewer plus the maintenance connection it is inseparable from.
+    ///
+    /// This lives in `state.rs` and NOT under `routes/` on purpose:
+    /// `crates/epigraph-api/tests/no_bypass_in_handlers.rs` (PR-03) fails the
+    /// build on the literals `Viewer::system(` or `MaintenanceLease` anywhere
+    /// under `crates/epigraph-api/src/routes/`. That lint is right — a bypass
+    /// inside a request handler is the bug it exists to prevent — and the three
+    /// genuine maintenance routes (`find_claims_needing_embeddings` is the one
+    /// PR-06 converts) reach their bypass through here instead, where a reviewer
+    /// looking for "who can bypass" will actually find it.
+    ///
+    /// The returned `MaintenanceConn` must be held for as long as the viewer is
+    /// used: dropping it returns the connection to the pool, and from PR-15 on
+    /// the maintenance connection is the privileged one.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` when this `AppState` was not built from a
+    /// `ScopedPool` (see [`Self::scoped`]); `DbError::ConnectionFailed` on the
+    /// acquire.
+    #[cfg(feature = "db")]
+    pub async fn maintenance_viewer(
+        &self,
+        reason: epigraph_db::visibility::SystemReason,
+    ) -> Result<
+        (
+            epigraph_db::MaintenanceConn<'_>,
+            epigraph_db::visibility::Viewer,
+        ),
+        epigraph_db::DbError,
+    > {
+        let scoped = self
+            .scoped
+            .as_ref()
+            .ok_or_else(|| epigraph_db::DbError::InvalidData {
+                reason: "AppState was not built from a ScopedPool, so no maintenance \
+                         lease can be minted; use AppState::with_scoped_pool"
+                    .to_string(),
+            })?;
+        let (conn, lease) = scoped.unscoped_for_maintenance(reason).await?;
+        let viewer = epigraph_db::visibility::Viewer::system(&lease, reason);
+        Ok((conn, viewer))
+    }
+
     /// Create new application state with database pool and custom signature verification state
     #[cfg(feature = "db")]
     pub fn with_db_and_signature_state(
@@ -436,6 +511,7 @@ impl AppState {
     ) -> Self {
         Self {
             db_pool,
+            scoped: None,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -503,6 +579,7 @@ impl AppState {
             SignatureVerificationState::new().with_max_request_size(config.max_request_size);
         Self {
             db_pool,
+            scoped: None,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,

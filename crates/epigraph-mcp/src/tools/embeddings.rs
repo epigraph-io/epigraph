@@ -130,14 +130,16 @@ pub struct BackfillEmbeddingsParams {
 /// not fatal — mirroring the CLI's per-row accounting.
 pub async fn backfill_embeddings(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: BackfillEmbeddingsParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(200).clamp(1, 2000);
     let dry_run = params.dry_run.unwrap_or(false);
 
-    let rows = epigraph_db::ClaimRepository::find_claims_needing_embeddings(&server.pool, limit)
-        .await
-        .map_err(internal_error)?;
+    let rows =
+        epigraph_db::ClaimRepository::find_claims_needing_embeddings(&server.pool, viewer, limit)
+            .await
+            .map_err(internal_error)?;
     let candidates = rows.len();
 
     if dry_run || candidates == 0 {

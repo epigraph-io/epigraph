@@ -117,12 +117,13 @@ impl ExperimentRepository {
     }
 
     /// Count completed experiments for a hypothesis that have analysis nodes.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn count_completed_with_analysis(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         hypothesis_id: Uuid,
     ) -> Result<i64, DbError> {
-        let row: (i64,) = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT COUNT(DISTINCT e.id)
             FROM experiments e
@@ -133,11 +134,15 @@ impl ExperimentRepository {
                          AND ed.relationship = 'analyzes'
             WHERE e.hypothesis_id = $1
               AND e.status = 'complete'
+              /* {VISIBILITY:ed} */
             "#,
-        )
-        .bind(hypothesis_id)
-        .fetch_one(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (i64,)>(&sql).bind(hypothesis_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: (i64,) = q.fetch_one(pool).await?;
         Ok(row.0)
     }
 }

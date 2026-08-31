@@ -25,13 +25,21 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
+    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
+        epigraph_db::visibility::SystemReason::SchemaContractTest,
+    )
+    .await
+    .expect("maintenance viewer");
+    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     let args = Args::parse();
-    let exit_code = match run(args).await {
+    let exit_code = match run(args, viewer).await {
         Ok(all_filled) => {
             if all_filled {
                 0
@@ -48,7 +56,10 @@ async fn main() {
 }
 
 /// Returns true if all gaps filled, false if gaps remain.
-async fn run(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
+async fn run(
+    args: Args,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let pool = epigraph_cli::db_connect().await?;
     let embedder = epigraph_cli::embedding_service()
         .ok_or("OPENAI_API_KEY not set — embeddings required for method_search ingestion")?;
@@ -70,10 +81,11 @@ async fn run(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
         if let Some(method_ids) = &exp.method_ids {
             for mid in method_ids {
                 if let Some(method) = epigraph_db::MethodRepository::get(&pool, *mid).await? {
-                    let evidence =
-                        epigraph_db::MethodRepository::get_evidence_strength(&pool, method.id)
-                            .await
-                            .ok();
+                    let evidence = epigraph_db::MethodRepository::get_evidence_strength(
+                        &pool, viewer, method.id,
+                    )
+                    .await
+                    .ok();
                     let score = evidence.map(|e| e.avg_belief).unwrap_or(0.0);
 
                     let is_gap = method.source_claim_ids.is_empty() || score < 0.3;
@@ -269,9 +281,10 @@ Return 3-8 claims."#,
     // 5. Report updated evidence scores
     println!("\nUpdated evidence scores:");
     for (method_id, method_name, old_score) in &gaps {
-        let evidence = epigraph_db::MethodRepository::get_evidence_strength(&pool, *method_id)
-            .await
-            .ok();
+        let evidence =
+            epigraph_db::MethodRepository::get_evidence_strength(&pool, viewer, *method_id)
+                .await
+                .ok();
         let new_score = evidence.map(|e| e.avg_belief).unwrap_or(0.0);
         let filled = if new_score >= 0.3 { "FILLED" } else { "GAP" };
         println!("  {method_name}: {old_score:.3} → {new_score:.3} [{filled}]");

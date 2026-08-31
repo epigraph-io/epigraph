@@ -14,6 +14,9 @@
 //!    truth_value DESC** — the cap must drop the weakest contester, not an
 //!    arbitrary one.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -63,6 +66,7 @@ async fn seed_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str
 /// otherwise every well-supported claim would report as contested.
 #[sqlx::test(migrations = "../../migrations")]
 async fn only_contradicts_and_refutes_count_as_disputes(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let target = seed_claim(&pool, agent, 0.8, true).await;
 
@@ -76,7 +80,7 @@ async fn only_contradicts_and_refutes_count_as_disputes(pool: PgPool) {
     seed_edge(&pool, supporter, target, "supports").await;
     seed_edge(&pool, corroborator, target, "corroborates").await;
 
-    let map = ClaimRepository::dispute_batch(&pool, &[target])
+    let map = ClaimRepository::dispute_batch(&pool, &viewer, &[target])
         .await
         .expect("dispute_batch");
     let row = map.get(&target).expect("target present");
@@ -98,6 +102,7 @@ async fn only_contradicts_and_refutes_count_as_disputes(pool: PgPool) {
 /// would mark its target contested forever.
 #[sqlx::test(migrations = "../../migrations")]
 async fn superseded_contester_does_not_count(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let target = seed_claim(&pool, agent, 0.8, true).await;
 
@@ -107,7 +112,7 @@ async fn superseded_contester_does_not_count(pool: PgPool) {
     seed_edge(&pool, live, target, "contradicts").await;
     seed_edge(&pool, retired, target, "contradicts").await;
 
-    let map = ClaimRepository::dispute_batch(&pool, &[target])
+    let map = ClaimRepository::dispute_batch(&pool, &viewer, &[target])
         .await
         .expect("dispute_batch");
     let row = map.get(&target).expect("target present");
@@ -129,6 +134,7 @@ async fn superseded_contester_does_not_count(pool: PgPool) {
 /// luck.
 #[sqlx::test(migrations = "../../migrations")]
 async fn contesting_ids_capped_at_top_three_by_truth(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let target = seed_claim(&pool, agent, 0.5, true).await;
 
@@ -141,7 +147,7 @@ async fn contesting_ids_capped_at_top_three_by_truth(pool: PgPool) {
         seed_edge(&pool, c, target, "contradicts").await;
     }
 
-    let map = ClaimRepository::dispute_batch(&pool, &[target])
+    let map = ClaimRepository::dispute_batch(&pool, &viewer, &[target])
         .await
         .expect("dispute_batch");
     let row = map.get(&target).expect("target present");
@@ -166,6 +172,7 @@ async fn contesting_ids_capped_at_top_three_by_truth(pool: PgPool) {
 /// with disputes and one without must be distinguishable in one round-trip.
 #[sqlx::test(migrations = "../../migrations")]
 async fn uncontested_claims_are_absent_from_the_map(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let contested = seed_claim(&pool, agent, 0.8, true).await;
     let clean = seed_claim(&pool, agent, 0.8, true).await;
@@ -173,7 +180,7 @@ async fn uncontested_claims_are_absent_from_the_map(pool: PgPool) {
     let contester = seed_claim(&pool, agent, 0.7, true).await;
     seed_edge(&pool, contester, contested, "refutes").await;
 
-    let map = ClaimRepository::dispute_batch(&pool, &[contested, clean])
+    let map = ClaimRepository::dispute_batch(&pool, &viewer, &[contested, clean])
         .await
         .expect("dispute_batch");
 
@@ -188,7 +195,8 @@ async fn uncontested_claims_are_absent_from_the_map(pool: PgPool) {
 /// path calls this on every page, including pages that returned nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn empty_input_returns_empty_map(pool: PgPool) {
-    let map = ClaimRepository::dispute_batch(&pool, &[])
+    let viewer = fixture::public_viewer(&pool).await;
+    let map = ClaimRepository::dispute_batch(&pool, &viewer, &[])
         .await
         .expect("dispute_batch on empty input");
     assert!(map.is_empty());

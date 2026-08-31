@@ -9,6 +9,9 @@
 //! in label-containment, exclusion, or supersession-state filtering surface
 //! here.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
@@ -16,6 +19,7 @@ use uuid::Uuid;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     // Seed: one current backlog claim, one resolved backlog claim, one
@@ -28,7 +32,7 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
 
     // Default call: returns all three with labels populated
     let rows = ClaimRepository::list_by_labels(
-        &pool,
+        &pool, &viewer,
         &["backlog".to_string()],
         &[],   // exclude_labels
         false, // current_only
@@ -56,7 +60,7 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
 
     // exclude_labels=["resolved"] drops the resolved one
     let filtered = ClaimRepository::list_by_labels(
-        &pool,
+        &pool, &viewer,
         &["backlog".to_string()],
         &["resolved".to_string()],
         false,
@@ -71,7 +75,7 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
 
     // current_only=true drops the superseded one
     let current =
-        ClaimRepository::list_by_labels(&pool, &["backlog".to_string()], &[], true, 0.0, 50, 0)
+        ClaimRepository::list_by_labels(&pool, &viewer, &["backlog".to_string()], &[], true, 0.0, 50, 0)
             .await
             .unwrap();
     assert_eq!(current.len(), 2);
@@ -79,7 +83,7 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
 
     // Both filters combined: only the live open backlog claim
     let open = ClaimRepository::list_by_labels(
-        &pool,
+        &pool, &viewer,
         &["backlog".to_string()],
         &["resolved".to_string()],
         true,
@@ -102,6 +106,7 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
 /// timestamp races).
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_by_labels_pagination(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     // Seed 5 claims one-at-a-time; collect in insertion order. created_at
@@ -117,7 +122,7 @@ async fn list_by_labels_pagination(pool: PgPool) {
 
     // Page 1: limit=2 offset=0 — first 2 newest.
     let page1 =
-        ClaimRepository::list_by_labels(&pool, &["page-test".to_string()], &[], false, 0.0, 2, 0)
+        ClaimRepository::list_by_labels(&pool, &viewer, &["page-test".to_string()], &[], false, 0.0, 2, 0)
             .await
             .unwrap();
     assert_eq!(page1.len(), 2, "page1 len");
@@ -126,7 +131,7 @@ async fn list_by_labels_pagination(pool: PgPool) {
 
     // Page 2: limit=2 offset=2 — next 2.
     let page2 =
-        ClaimRepository::list_by_labels(&pool, &["page-test".to_string()], &[], false, 0.0, 2, 2)
+        ClaimRepository::list_by_labels(&pool, &viewer, &["page-test".to_string()], &[], false, 0.0, 2, 2)
             .await
             .unwrap();
     assert_eq!(page2.len(), 2, "page2 len");
@@ -135,7 +140,7 @@ async fn list_by_labels_pagination(pool: PgPool) {
 
     // Page 3: limit=2 offset=4 — only 1 remaining (5 total).
     let page3 =
-        ClaimRepository::list_by_labels(&pool, &["page-test".to_string()], &[], false, 0.0, 2, 4)
+        ClaimRepository::list_by_labels(&pool, &viewer, &["page-test".to_string()], &[], false, 0.0, 2, 4)
             .await
             .unwrap();
     assert!(
@@ -162,7 +167,7 @@ async fn list_by_labels_pagination(pool: PgPool) {
 
     // Negative offset must clamp to 0 (matches the implementation contract).
     let clamped = ClaimRepository::list_by_labels(
-        &pool,
+        &pool, &viewer,
         &["page-test".to_string()],
         &[],
         false,

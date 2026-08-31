@@ -152,6 +152,7 @@ fn effective_pipeline_version(extraction: &DocumentExtraction) -> String {
 
 pub async fn ingest_document(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: IngestDocumentParams,
 ) -> Result<CallToolResult, McpError> {
     let canonical = std::fs::canonicalize(&params.file_path)
@@ -179,8 +180,9 @@ pub async fn ingest_document(
         server.read_only,
     );
     let doi_log = doi.clone();
+    let viewer = viewer.clone();
     tokio::spawn(async move {
-        if let Err(e) = do_ingest_document(&bg, &extraction).await {
+        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {
             tracing::warn!(doi = doi_log, "background ingest_document failed: {e:?}");
         }
     });
@@ -194,6 +196,7 @@ pub async fn ingest_document(
 /// Identical graph result and idempotency gate as the file-path path.
 pub async fn ingest_document_inline(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: IngestDocumentInlineParams,
 ) -> Result<CallToolResult, McpError> {
     let extraction = params.extraction;
@@ -207,8 +210,9 @@ pub async fn ingest_document_inline(
         server.read_only,
     );
     let doi_log = doi.clone();
+    let viewer = viewer.clone();
     tokio::spawn(async move {
-        if let Err(e) = do_ingest_document(&bg, &extraction).await {
+        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {
             tracing::warn!(
                 doi = doi_log,
                 "background ingest_document_inline failed: {e:?}"
@@ -275,6 +279,7 @@ fn queued_response(doi: &str, title: &str, paper_id: Uuid) -> serde_json::Value 
 /// `pipeline_version`. Mirrors the inline gate used by `do_ingest_document`.
 pub async fn paper_already_ingested(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     doi: &str,
     pipeline_version: &str,
 ) -> Result<Option<Uuid>, McpError> {
@@ -284,7 +289,7 @@ pub async fn paper_already_ingested(
     else {
         return Ok(None);
     };
-    if PaperRepository::has_processed_by_edge(pool, prior.id, pipeline_version)
+    if PaperRepository::has_processed_by_edge(pool, viewer, prior.id, pipeline_version)
         .await
         .map_err(internal_error)?
     {
@@ -309,6 +314,7 @@ pub async fn paper_already_ingested(
 /// must pass the exact stamp to gate a single chunk.
 pub async fn check_already_ingested(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: CheckAlreadyIngestedParams,
 ) -> Result<CallToolResult, McpError> {
     // A placeholder is not an identity. Answering the gate for `doi: "unknown"`
@@ -325,7 +331,7 @@ pub async fn check_already_ingested(
     let pipeline = params
         .pipeline_version
         .unwrap_or_else(|| PIPELINE_VERSION_BASE.to_string());
-    let paper_id = paper_already_ingested(&server.pool, &params.doi, &pipeline).await?;
+    let paper_id = paper_already_ingested(&server.pool, viewer, &params.doi, &pipeline).await?;
 
     success_json(&CheckAlreadyIngestedResponse {
         already_ingested: paper_id.is_some(),
@@ -355,6 +361,7 @@ pub async fn ingest_document_spine(
 #[allow(clippy::too_many_lines)]
 pub async fn do_ingest_document(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     extraction: &DocumentExtraction,
 ) -> Result<CallToolResult, McpError> {
     // D9 writer-side verbatim re-verification: when the extraction carries
@@ -704,6 +711,7 @@ pub async fn do_ingest_document(
         // non-claim edges are filtered inside the helper).
         ds_auto::auto_wire_edge_if_epistemic(
             pool,
+            viewer,
             was_created,
             row.id,
             src,
@@ -720,7 +728,7 @@ pub async fn do_ingest_document(
     let (claims_ds_wired, ds_frame_id) = if ds_entries.is_empty() {
         (None, None)
     } else {
-        match ds_auto::auto_wire_ds_batch(pool, &ds_entries, agent_id).await {
+        match ds_auto::auto_wire_ds_batch(pool, viewer, &ds_entries, agent_id).await {
             Ok((fid, count)) => (Some(count), Some(fid.to_string())),
             Err(e) => {
                 tracing::warn!("ds auto-wire batch failed: {e}");
@@ -1424,7 +1432,7 @@ mod tests {
         let doi = "urn:test:check-gate";
 
         // Unknown DOI → not ingested.
-        assert!(paper_already_ingested(&pool, doi, PIPELINE_VERSION_BASE)
+        assert!(paper_already_ingested(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), doi, PIPELINE_VERSION_BASE)
             .await
             .expect("gate query")
             .is_none());
@@ -1433,7 +1441,7 @@ mod tests {
         let paper_id = PaperRepository::get_or_create(&pool, doi, Some("test"), None)
             .await
             .expect("create paper");
-        assert!(paper_already_ingested(&pool, doi, PIPELINE_VERSION_BASE)
+        assert!(paper_already_ingested(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), doi, PIPELINE_VERSION_BASE)
             .await
             .expect("gate query")
             .is_none());
@@ -1460,7 +1468,7 @@ mod tests {
         )
         .await
         .expect("create edge with other pipeline");
-        assert!(paper_already_ingested(&pool, doi, PIPELINE_VERSION_BASE)
+        assert!(paper_already_ingested(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), doi, PIPELINE_VERSION_BASE)
             .await
             .expect("gate query")
             .is_none());
@@ -1486,7 +1494,7 @@ mod tests {
         )
         .await
         .expect("create edge with matching pipeline");
-        let hit = paper_already_ingested(&pool, doi, PIPELINE_VERSION_BASE)
+        let hit = paper_already_ingested(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), doi, PIPELINE_VERSION_BASE)
             .await
             .expect("gate query");
         assert_eq!(hit, Some(paper_id));

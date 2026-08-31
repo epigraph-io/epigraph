@@ -34,6 +34,7 @@ use epigraph_crypto::ContentHasher;
 use epigraph_events::EpiGraphEvent;
 
 // Database-related imports (only when db feature is enabled)
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use epigraph_core::{EvidenceId, EvidenceType, Methodology, TraceInput};
 #[cfg(feature = "db")]
@@ -1037,6 +1038,7 @@ struct PersistOutcome {
 #[cfg(feature = "db")]
 async fn persist_packet(
     pool: &epigraph_db::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     packet: &EpistemicPacket,
     claim_id: ClaimId,
     trace_id: TraceId,
@@ -1108,14 +1110,15 @@ async fn persist_packet(
         now,
     );
 
-    let (persisted, was_created) = epigraph_db::ClaimRepository::create_or_get(&mut tx, &claim)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new("DatabaseError", format!("Failed to insert claim: {}", e)),
-            )
-        })?;
+    let (persisted, was_created) =
+        epigraph_db::ClaimRepository::create_or_get(&mut tx, viewer, &claim)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new("DatabaseError", format!("Failed to insert claim: {}", e)),
+                )
+            })?;
     let canonical_id = persisted.id;
     // All dependent rows hang off the canonical claim id, not the
     // pre-generated one (which differs on a duplicate submit).
@@ -1405,7 +1408,7 @@ async fn persist_packet(
     let dedup_trace_id = if was_created {
         None
     } else {
-        let existing = epigraph_db::ClaimRepository::get_by_id(pool, canonical_id)
+        let existing = epigraph_db::ClaimRepository::get_by_id(pool, viewer, canonical_id)
             .await
             .map_err(|e| {
                 (
@@ -1487,6 +1490,7 @@ async fn persist_packet(
 /// - 401 Unauthorized: Invalid signature (when signatures required)
 /// - 201 Created: Success
 pub async fn submit_packet(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     payload: Result<Json<EpistemicPacket>, JsonRejection>,
 ) -> Response {
@@ -1573,6 +1577,7 @@ pub async fn submit_packet(
 
         match persist_packet(
             &state.db_pool,
+            &viewer,
             &packet,
             domain_claim_id,
             domain_trace_id,

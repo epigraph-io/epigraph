@@ -14,6 +14,9 @@
 //!   MODE=ingest DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_anxiety_ingest_dev \
 //!     SQLX_OFFLINE=true cargo test -p epigraph-engine --test herb_belief_dump -- --ignored --nocapture
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use std::collections::BTreeMap;
 
 use epigraph_db::PgPool;
@@ -26,6 +29,7 @@ async fn herb_belief_dump() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
     let mode = std::env::var("MODE").expect("MODE=demo|ingest");
     let pool = PgPool::connect(&url).await.expect("connect");
+    let viewer = fixture::public_viewer(&pool).await;
 
     let perspectives: Vec<(String, Uuid)> =
         sqlx::query_as("SELECT name, id FROM perspectives ORDER BY name")
@@ -69,7 +73,7 @@ async fn herb_belief_dump() {
         for (cid, content) in &claims {
             let herb = content.split_whitespace().next().unwrap_or("?").to_string();
             for (pname, pid) in &perspectives {
-                let bi = get_perspective_belief(&pool, *cid, frame_id, *pid)
+                let bi = get_perspective_belief(&pool, &viewer, *cid, frame_id, *pid)
                     .await
                     .expect("belief");
                 let e = acc.entry((herb.clone(), pname.clone())).or_insert((0.0, 0));

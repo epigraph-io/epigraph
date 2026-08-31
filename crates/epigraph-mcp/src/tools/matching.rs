@@ -128,6 +128,7 @@ pub async fn list_match_candidates(
 
 pub async fn decide_match_candidate(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: DecideMatchCandidateParams,
 ) -> Result<CallToolResult, McpError> {
     server.reject_if_read_only()?;
@@ -168,7 +169,7 @@ pub async fn decide_match_candidate(
             // false) since the candidate was generated, promoting would create
             // a structural inconsistency — an edge incident on a retired claim
             // (backlog bug 5c7fc645). Refuse rather than write it.
-            if !ClaimRepository::are_all_current(&server.pool, &[row.claim_a, row.claim_b])
+            if !ClaimRepository::are_all_current(&server.pool, viewer, &[row.claim_a, row.claim_b])
                 .await
                 .map_err(internal_error)?
             {

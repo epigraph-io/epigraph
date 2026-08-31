@@ -194,8 +194,7 @@ async fn get_claim_community_member_sees_content_and_outsider_does_not() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let owner = Uuid::new_v4();
     let member = Uuid::new_v4();
-    let claim_id =
-        common::seed_claim_with_agent(&pool, "COMMUNITY-GATED claim body", owner).await;
+    let claim_id = common::seed_claim_with_agent(&pool, "COMMUNITY-GATED claim body", owner).await;
     let community = common::seed_community_with_member(&pool, member).await;
     common::seed_community_ownership(&pool, claim_id, owner, Some(community)).await;
 

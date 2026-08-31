@@ -8,6 +8,9 @@
 //! reads both from a single SQL statement, which is inherently consistent
 //! under Postgres MVCC.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::{AgentId, Claim, TruthValue};
 use epigraph_db::ClaimRepository;
 use sqlx::postgres::PgPoolOptions;
@@ -61,8 +64,9 @@ fn make_claim(content: &str, agent_id: Uuid) -> Claim {
 #[tokio::test]
 async fn get_by_id_with_labels_returns_none_when_no_row() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
 
-    let found = ClaimRepository::get_by_id_with_labels(&pool, epigraph_core::ClaimId::new())
+    let found = ClaimRepository::get_by_id_with_labels(&pool, &viewer, epigraph_core::ClaimId::new())
         .await
         .expect("query call");
 
@@ -72,6 +76,7 @@ async fn get_by_id_with_labels_returns_none_when_no_row() {
 #[tokio::test]
 async fn get_by_id_with_labels_matches_separate_calls() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     let agent_id = Uuid::new_v4();
     insert_test_agent(&pool, agent_id).await;
 
@@ -89,16 +94,16 @@ async fn get_by_id_with_labels_matches_separate_calls() {
     .await
     .expect("seed labels");
 
-    let (via_new, labels_via_new) = ClaimRepository::get_by_id_with_labels(&pool, created.id)
+    let (via_new, labels_via_new) = ClaimRepository::get_by_id_with_labels(&pool, &viewer, created.id)
         .await
         .expect("get_by_id_with_labels")
         .expect("claim exists");
 
-    let via_old = ClaimRepository::get_by_id(&pool, created.id)
+    let via_old = ClaimRepository::get_by_id(&pool, &viewer, created.id)
         .await
         .expect("get_by_id")
         .expect("claim exists");
-    let labels_via_old = ClaimRepository::get_labels(&pool, created.id)
+    let labels_via_old = ClaimRepository::get_labels(&pool, &viewer, created.id)
         .await
         .expect("get_labels");
 

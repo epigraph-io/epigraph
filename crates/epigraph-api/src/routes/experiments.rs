@@ -390,6 +390,7 @@ pub async fn find_methods(
 /// GET /api/v1/methods/:id/gaps - Method gap analysis for a hypothesis.
 #[cfg(feature = "db")]
 pub async fn method_gap_analysis(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<MethodGapQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -436,15 +437,21 @@ pub async fn method_gap_analysis(
         let mut cap_flags: Vec<String> = Vec::new();
 
         for m in &methods {
-            let evidence =
-                epigraph_db::MethodRepository::get_evidence_strength(&state.db_pool, m.method_id)
-                    .await
-                    .ok();
+            let evidence = epigraph_db::MethodRepository::get_evidence_strength(
+                &state.db_pool,
+                &viewer,
+                m.method_id,
+            )
+            .await
+            .ok();
 
-            let papers =
-                epigraph_db::MethodRepository::get_source_papers(&state.db_pool, m.method_id)
-                    .await
-                    .unwrap_or_default();
+            let papers = epigraph_db::MethodRepository::get_source_papers(
+                &state.db_pool,
+                &viewer,
+                m.method_id,
+            )
+            .await
+            .unwrap_or_default();
 
             let newest_year = papers.iter().filter_map(|p| p.pub_year).max();
             let is_stale = newest_year.is_some_and(|y| current_year - y > max_age);
@@ -497,6 +504,7 @@ pub async fn method_gap_analysis(
 /// POST /api/v1/experiments/design - Design an experiment protocol from methods.
 #[cfg(feature = "db")]
 pub async fn design_experiment(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<DesignExperimentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -516,10 +524,13 @@ pub async fn design_experiment(
                 id: method_id.to_string(),
             })?;
 
-        let evidence =
-            epigraph_db::MethodRepository::get_evidence_strength(&state.db_pool, *method_id)
-                .await
-                .ok();
+        let evidence = epigraph_db::MethodRepository::get_evidence_strength(
+            &state.db_pool,
+            &viewer,
+            *method_id,
+        )
+        .await
+        .ok();
 
         // Flag methods with no published evidence
         if evidence.as_ref().is_none_or(|e| e.source_count == 0) {
@@ -558,6 +569,7 @@ pub async fn design_experiment(
 
 // ── Internal helpers ──
 
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use chrono::Datelike;
 

@@ -7,6 +7,9 @@
 //! The fix routes the check through `ClaimRepository::are_all_current`, which
 //! this test pins: a superseded or missing endpoint must make the guard fail.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -54,6 +57,7 @@ async fn seed_claim(
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn are_all_current_rejects_stale_or_missing(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let live_a = seed_claim(&pool, agent, true, None).await;
     let live_b = seed_claim(&pool, agent, true, None).await;
@@ -62,22 +66,22 @@ async fn are_all_current_rejects_stale_or_missing(pool: PgPool) {
     let missing = Uuid::new_v4();
 
     // Two live claims → guard passes (a CORROBORATES edge would be allowed).
-    assert!(ClaimRepository::are_all_current(&pool, &[live_a, live_b])
+    assert!(ClaimRepository::are_all_current(&pool, &viewer, &[live_a, live_b])
         .await
         .unwrap());
 
     // Any superseded endpoint → guard fails (the bug scenario).
     assert!(
-        !ClaimRepository::are_all_current(&pool, &[live_a, superseded])
+        !ClaimRepository::are_all_current(&pool, &viewer, &[live_a, superseded])
             .await
             .unwrap()
     );
 
     // A missing id → guard fails.
-    assert!(!ClaimRepository::are_all_current(&pool, &[live_a, missing])
+    assert!(!ClaimRepository::are_all_current(&pool, &viewer, &[live_a, missing])
         .await
         .unwrap());
 
     // Empty set is vacuously true.
-    assert!(ClaimRepository::are_all_current(&pool, &[]).await.unwrap());
+    assert!(ClaimRepository::are_all_current(&pool, &viewer, &[]).await.unwrap());
 }

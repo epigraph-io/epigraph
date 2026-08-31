@@ -5,6 +5,9 @@
 //! whether it logs the ids it really returned. A recall that silently writes
 //! nothing would pass every repo test.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use chrono::TimeZone;
 use epigraph_mcp::tools::memory::recall;
 use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
@@ -62,11 +65,12 @@ fn params(query: &str) -> RecallParams {
 /// Polls briefly because the write is intentionally spawned, not awaited.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_logs_the_claim_ids_it_returned(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let hit = seed_claim(&pool, agent, "wextonium audit fixture").await;
 
     let server = build_test_server(pool.clone());
-    let out = recall(&server, params("wextonium"))
+    let out = recall(&server, &viewer, params("wextonium"))
         .await
         .expect("recall ok");
 
@@ -114,6 +118,7 @@ async fn recall_logs_the_claim_ids_it_returned(pool: PgPool) {
 /// dropped the log write fails, and recall must still serve its results.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_survives_a_failing_audit_write(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let hit = seed_claim(&pool, agent, "brentalix resilience fixture").await;
 
@@ -124,7 +129,7 @@ async fn recall_survives_a_failing_audit_write(pool: PgPool) {
         .expect("drop");
 
     let server = build_test_server(pool.clone());
-    let out = recall(&server, params("brentalix"))
+    let out = recall(&server, &viewer, params("brentalix"))
         .await
         .expect("recall must succeed even when the audit log is unwritable");
 
@@ -159,6 +164,7 @@ async fn recall_survives_a_failing_audit_write(pool: PgPool) {
 /// `since_is_recorded_on_the_empty_recall_with_context_audit_row` below.
 #[sqlx::test(migrations = "../../migrations")]
 async fn since_is_recorded_in_recall_audit_params(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     seed_claim(&pool, agent, "quorbiline audit window fixture").await;
 
@@ -170,7 +176,7 @@ async fn since_is_recorded_in_recall_audit_params(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let mut p = params("quorbiline");
     p.since = Some(since.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
-    recall(&server, p).await.expect("recall ok");
+    recall(&server, &viewer, p).await.expect("recall ok");
 
     // Fire-and-forget write: poll rather than assume.
     let mut logged: Option<serde_json::Value> = None;
@@ -293,6 +299,7 @@ fn context_params(since: chrono::DateTime<chrono::Utc>) -> RecallWithContextPara
 /// The `recall_with_context` main-path audit literal records the window.
 #[sqlx::test(migrations = "../../migrations")]
 async fn since_is_recorded_in_recall_with_context_audit_params(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let pgvec = pgvec_bucket0();
     // Created now, so it is comfortably inside the 2025-06-01 window and the
@@ -301,7 +308,7 @@ async fn since_is_recorded_in_recall_with_context_audit_params(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     let out =
-        recall_with_context_with_pgvec(&server, context_params(since_fixture()), 1536, &pgvec)
+        recall_with_context_with_pgvec(&server, &viewer, context_params(since_fixture()), 1536, &pgvec)
             .await
             .expect("recall_with_context ok");
     let text = out
@@ -335,6 +342,7 @@ async fn since_is_recorded_in_recall_with_context_audit_params(pool: PgPool) {
 /// cover it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn since_is_recorded_on_the_empty_recall_with_context_audit_row(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let pgvec = pgvec_bucket0();
     // Seeded, but OUTSIDE the window — so the window itself is what empties
@@ -349,7 +357,7 @@ async fn since_is_recorded_on_the_empty_recall_with_context_audit_row(pool: PgPo
 
     let server = build_test_server(pool.clone());
     let out =
-        recall_with_context_with_pgvec(&server, context_params(since_fixture()), 1536, &pgvec)
+        recall_with_context_with_pgvec(&server, &viewer, context_params(since_fixture()), 1536, &pgvec)
             .await
             .expect("recall_with_context ok");
     let text = out

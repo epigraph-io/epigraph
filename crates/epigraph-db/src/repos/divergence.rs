@@ -86,27 +86,33 @@ impl DivergenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_latest(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Option<DivergenceRow>, DbError> {
         let cutoff = Utc::now() - Duration::days(DIVERGENCE_TTL_DAYS);
-        let row: Option<DivergenceRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, claim_id, frame_id, pignistic_prob, bayesian_posterior,
                    kl_divergence, frame_version, computed_at
             FROM ds_bayesian_divergence
             WHERE claim_id = $1
               AND computed_at >= $2
+              /* {VISIBILITY:ds_bayesian_divergence} */
             ORDER BY computed_at DESC
             LIMIT 1
             "#,
-        )
-        .bind(claim_id)
-        .bind(cutoff)
-        .fetch_optional(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, DivergenceRow>(&sql)
+            .bind(claim_id)
+            .bind(cutoff);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<DivergenceRow> = q.fetch_optional(pool).await?;
 
         Ok(row)
     }
@@ -116,22 +122,30 @@ impl DivergenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn top_divergent(pool: &PgPool, limit: i64) -> Result<Vec<DivergenceRow>, DbError> {
+    #[instrument(skip(pool, viewer))]
+    pub async fn top_divergent(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        limit: i64,
+    ) -> Result<Vec<DivergenceRow>, DbError> {
         let cutoff = Utc::now() - Duration::days(DIVERGENCE_TTL_DAYS);
-        let rows: Vec<DivergenceRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT DISTINCT ON (claim_id)
                    id, claim_id, frame_id, pignistic_prob, bayesian_posterior,
                    kl_divergence, frame_version, computed_at
             FROM ds_bayesian_divergence
             WHERE computed_at >= $1
+              /* {VISIBILITY:ds_bayesian_divergence} */
             ORDER BY claim_id, computed_at DESC
             "#,
-        )
-        .bind(cutoff)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, DivergenceRow>(&sql).bind(cutoff);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<DivergenceRow> = q.fetch_all(pool).await?;
 
         // Sort by KL divergence descending and take the top N.
         // We do this in Rust because DISTINCT ON + ORDER BY kl_divergence

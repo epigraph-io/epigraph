@@ -17,6 +17,9 @@
 //! must carry the old labels AND it must be the only one returned by the
 //! workflow label search.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::{ClaimId, TruthValue};
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
@@ -110,6 +113,7 @@ async fn supersede_carries_labels_but_not_properties_to_new_claim(pool: PgPool) 
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn search_by_label_and_text_excludes_superseded_returns_replacement(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let v1 = seed_workflow_claim(
         &pool,
@@ -129,7 +133,7 @@ async fn search_by_label_and_text_excludes_superseded_returns_replacement(pool: 
     .unwrap();
 
     let hits = ClaimRepository::search_by_label_and_text(
-        &pool,
+        &pool, &viewer,
         &["workflow".to_string()],
         "deploy widget",
         0.0,

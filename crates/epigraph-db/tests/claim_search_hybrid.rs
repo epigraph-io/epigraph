@@ -6,6 +6,9 @@
 //! `(content_hash, agent_id)` UNIQUE → use distinct hashes. `content_tsv` is a
 //! GENERATED column (migration 050), so inserting `content` auto-populates it.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -72,6 +75,7 @@ async fn insert_claim(
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn hybrid_fuses_both_legs_ranking_the_overlap_first(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let query = vec_hot(0); // dense query points at dim 0
 
@@ -116,7 +120,7 @@ async fn hybrid_fuses_both_legs_ranking_the_overlap_first(pool: PgPool) {
     .await;
 
     let hits = ClaimRepository::search_hybrid_scoped(
-        &pool,
+        &pool, &viewer,
         &query,
         "quasinormal mechanosynthesis",
         50,
@@ -150,6 +154,7 @@ async fn hybrid_fuses_both_legs_ranking_the_overlap_first(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn hybrid_surfaces_lexical_only_hit_outside_dense_pool(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let query = vec_hot(0);
 
@@ -181,7 +186,7 @@ async fn hybrid_surfaces_lexical_only_hit_outside_dense_pool(pool: PgPool) {
     // candidate_pool=1 → dense leg yields only `dense`; `lex` can only enter via
     // the lexical leg, so dense_similarity must be NULL there.
     let hits =
-        ClaimRepository::search_hybrid_scoped(&pool, &query, "zubuzonium", 1, 60, 10, None, None)
+        ClaimRepository::search_hybrid_scoped(&pool, &viewer, &query, "zubuzonium", 1, 60, 10, None, None)
             .await
             .expect("hybrid search");
 
@@ -198,6 +203,7 @@ async fn hybrid_surfaces_lexical_only_hit_outside_dense_pool(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn hybrid_excludes_non_current_and_honors_tag_scope(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let query = vec_hot(0);
 
@@ -243,7 +249,7 @@ async fn hybrid_excludes_non_current_and_honors_tag_scope(pool: PgPool) {
 
     let tags = vec!["keep".to_string()];
     let hits = ClaimRepository::search_hybrid_scoped(
-        &pool,
+        &pool, &viewer,
         &query,
         "zubuzonium",
         50,
@@ -266,6 +272,7 @@ async fn hybrid_excludes_non_current_and_honors_tag_scope(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn lexical_scoped_ranks_matches_and_honors_scope(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     let hit = Uuid::new_v4();
@@ -319,7 +326,7 @@ async fn lexical_scoped_ranks_matches_and_honors_scope(pool: PgPool) {
 
     let tags = vec!["keep".to_string()];
     let hits =
-        ClaimRepository::search_lexical_scoped(&pool, "zubuzonium", 60, 10, Some(&tags), None)
+        ClaimRepository::search_lexical_scoped(&pool, &viewer, "zubuzonium", 60, 10, Some(&tags), None)
             .await
             .expect("lexical search");
 

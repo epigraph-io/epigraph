@@ -17,6 +17,9 @@
 //! of what is under test (all structural claims are written by one server
 //! agent, so two rows with the same `content_hash` would violate it).
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
@@ -126,12 +129,13 @@ async fn asserting_papers(pool: &PgPool, claim_id: Uuid) -> Vec<Uuid> {
 /// and both papers `asserts` the single fused node.
 #[sqlx::test(migrations = "../../migrations")]
 async fn two_documents_sharing_a_section_heading_get_distinct_spine_nodes(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
 
-    do_ingest_document(&server, &alpha())
+    do_ingest_document(&server, &viewer, &alpha())
         .await
         .expect("alpha ingests");
-    do_ingest_document(&server, &beta())
+    do_ingest_document(&server, &viewer, &beta())
         .await
         .expect("beta ingests");
 
@@ -177,12 +181,13 @@ async fn two_documents_sharing_a_section_heading_get_distinct_spine_nodes(pool: 
 /// design (that is how cross-source corroboration works).
 #[sqlx::test(migrations = "../../migrations")]
 async fn shared_atom_text_still_converges_to_a_single_node(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
 
-    do_ingest_document(&server, &alpha())
+    do_ingest_document(&server, &viewer, &alpha())
         .await
         .expect("alpha ingests");
-    do_ingest_document(&server, &beta())
+    do_ingest_document(&server, &viewer, &beta())
         .await
         .expect("beta ingests");
 
@@ -218,9 +223,10 @@ async fn shared_atom_text_still_converges_to_a_single_node(pool: PgPool) {
 /// `create_with_id_if_absent`'s `ON CONFLICT (id) DO NOTHING` short-circuits.
 #[sqlx::test(migrations = "../../migrations")]
 async fn reingesting_the_same_document_reuses_its_spine_nodes(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
 
-    do_ingest_document(&server, &alpha())
+    do_ingest_document(&server, &viewer, &alpha())
         .await
         .expect("first ingest");
     let count_after_first: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
@@ -229,7 +235,7 @@ async fn reingesting_the_same_document_reuses_its_spine_nodes(pool: PgPool) {
         .expect("count");
     let section_first = claims_with_content(&pool, SHARED_SECTION).await;
 
-    do_ingest_document(&server, &alpha())
+    do_ingest_document(&server, &viewer, &alpha())
         .await
         .expect("second ingest");
     let count_after_second: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")

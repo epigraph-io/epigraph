@@ -10,6 +10,7 @@ use epigraph_engine::reputation::{ClaimOutcome, ReputationCalculator};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::middleware::bearer::ViewerExtractor;
 use crate::routes::claims::{ClaimResponse, PaginatedResponse};
 use crate::services::ValidationService;
 use crate::{errors::ApiError, state::AppState};
@@ -366,6 +367,7 @@ pub async fn list_agents(
 /// This prevents the "Appeal to Authority" fallacy.
 #[cfg(feature = "db")]
 pub async fn get_agent_reputation(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AgentReputationResponse>, ApiError> {
@@ -380,7 +382,7 @@ pub async fn get_agent_reputation(
         })?;
 
     // 2. Fetch all claims by this agent
-    let claims = ClaimRepository::get_by_agent(&state.db_pool, agent_id).await?;
+    let claims = ClaimRepository::get_by_agent(&state.db_pool, &viewer, agent_id).await?;
 
     // 3. Convert claims into ClaimOutcome structs
     let now = chrono::Utc::now();
@@ -498,6 +500,7 @@ pub struct AttributedClaimResponse {
 /// and optional minimum truth value filtering.
 #[cfg(feature = "db")]
 pub async fn agent_claims(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(params): Query<AgentClaimsParams>,
@@ -518,11 +521,18 @@ pub async fn agent_claims(
     let min_truth = params.min_truth.clamp(0.0, 1.0);
 
     // Query claims via ATTRIBUTED_TO edges
-    let rows =
-        EdgeRepository::get_claims_attributed_to(&state.db_pool, id, min_truth, limit, offset)
-            .await?;
+    let rows = EdgeRepository::get_claims_attributed_to(
+        &state.db_pool,
+        &viewer,
+        id,
+        min_truth,
+        limit,
+        offset,
+    )
+    .await?;
 
-    let total = EdgeRepository::count_claims_attributed_to(&state.db_pool, id, min_truth).await?;
+    let total =
+        EdgeRepository::count_claims_attributed_to(&state.db_pool, &viewer, id, min_truth).await?;
 
     let items: Vec<AttributedClaimResponse> = rows
         .into_iter()

@@ -4,6 +4,9 @@
 //! text + response payload, not on the claim row — `query_claims_by_label`
 //! returned empty for memorize'd claims.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 #[macro_use]
 mod common;
 
@@ -33,6 +36,7 @@ async fn server_agent_uuid(pool: &PgPool, signer_seed: [u8; 32]) -> Uuid {
 #[tokio::test]
 async fn memorize_with_tags_populates_claims_labels() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let signer_seed = [0xA1u8; 32];
@@ -46,7 +50,7 @@ async fn memorize_with_tags_populates_claims_labels() {
         novelty_threshold: None,
     };
 
-    tools::memory::memorize(&server, params)
+    tools::memory::memorize(&server, &viewer, params)
         .await
         .expect("memorize");
 
@@ -75,6 +79,7 @@ async fn memorize_with_tags_populates_claims_labels() {
 #[tokio::test]
 async fn memorize_resubmit_accumulates_labels() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let signer_seed = [0xA2u8; 32];
@@ -84,7 +89,7 @@ async fn memorize_resubmit_accumulates_labels() {
 
     // First call: tags = ["one"]
     tools::memory::memorize(
-        &server,
+        &server, &viewer,
         MemorizeParams {
             content: content.clone(),
             confidence: Some(0.7),
@@ -97,7 +102,7 @@ async fn memorize_resubmit_accumulates_labels() {
 
     // Second call (dedup hit): tags = ["two"]
     tools::memory::memorize(
-        &server,
+        &server, &viewer,
         MemorizeParams {
             content: content.clone(),
             confidence: Some(0.7),
@@ -129,6 +134,7 @@ async fn memorize_resubmit_accumulates_labels() {
 #[tokio::test]
 async fn memorize_without_tags_leaves_labels_empty() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let signer_seed = [0xA3u8; 32];
@@ -136,7 +142,7 @@ async fn memorize_without_tags_leaves_labels_empty() {
 
     let content = format!("memorize-no-tags test {}", Uuid::new_v4());
     tools::memory::memorize(
-        &server,
+        &server, &viewer,
         MemorizeParams {
             content: content.clone(),
             confidence: Some(0.7),

@@ -92,11 +92,12 @@ pub async fn get_workflow_executions(
 /// not promote (applying a promotion is a separate, deliberate step).
 pub async fn evaluate_workflow_promotion(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: EvaluateWorkflowPromotionParams,
 ) -> Result<CallToolResult, McpError> {
     let variant_id = parse_uuid(params.workflow_id.trim())?;
     let window = params.window.unwrap_or(50).clamp(1, 500);
-    let assessment = assess_workflow_promotion(server, variant_id, window).await?;
+    let assessment = assess_workflow_promotion(server, viewer, variant_id, window).await?;
     success_json(&assessment.to_json())
 }
 
@@ -154,6 +155,7 @@ impl PromotionAssessment {
 /// the Wilson gate. A lineage root yields `verdict: None`.
 async fn assess_workflow_promotion(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     variant_id: uuid::Uuid,
     window: i64,
 ) -> Result<PromotionAssessment, McpError> {
@@ -162,7 +164,7 @@ async fn assess_workflow_promotion(
     };
     let config = WorkflowPromotionConfig::default();
 
-    let parent_id = WorkflowRepository::immediate_variant_parent(&server.pool, variant_id)
+    let parent_id = WorkflowRepository::immediate_variant_parent(&server.pool, viewer, variant_id)
         .await
         .map_err(|e| internal_error(e.to_string()))?;
 
@@ -213,11 +215,12 @@ async fn assess_workflow_promotion(
 /// job calls this per candidate variant; `find_workflow` surfaces the flag.
 pub async fn refresh_workflow_promotion(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: EvaluateWorkflowPromotionParams,
 ) -> Result<CallToolResult, McpError> {
     let variant_id = parse_uuid(params.workflow_id.trim())?;
     let window = params.window.unwrap_or(50).clamp(1, 500);
-    let assessment = assess_workflow_promotion(server, variant_id, window).await?;
+    let assessment = assess_workflow_promotion(server, viewer, variant_id, window).await?;
 
     let Some(verdict) = &assessment.verdict else {
         return success_json(&serde_json::json!({
@@ -306,6 +309,7 @@ fn slugify_workflow_goal(s: &str) -> String {
 /// UUID from `(canonical_name, generation)`. Idempotent on `canonical_name`.
 pub async fn store_workflow(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: StoreWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
     use epigraph_ingest::common::schema::ThesisDerivation;
@@ -363,6 +367,7 @@ pub async fn store_workflow(
     let (response, inserted) =
         crate::tools::workflow_ingest::execute_workflow_ingest_with_inserted(
             &server.pool,
+            viewer,
             &extraction,
         )
         .await?;
@@ -407,6 +412,7 @@ pub async fn store_workflow(
 
 pub async fn find_workflow(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: FindWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
     // Generate embedding once — reused for both semantic search and behavioral
@@ -422,7 +428,7 @@ pub async fn find_workflow(
         }
     };
 
-    find_workflow_post_embed(server, &params, pgvec_opt).await
+    find_workflow_post_embed(server, viewer, &params, pgvec_opt).await
 }
 
 /// Post-embedding pipeline: shared by `find_workflow` and the
@@ -434,6 +440,7 @@ pub async fn find_workflow(
 /// sites cannot drift, mirroring recall.rs's wrapper pattern.
 async fn find_workflow_post_embed(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: &FindWorkflowParams,
     pgvec_opt: Option<String>,
 ) -> Result<CallToolResult, McpError> {
@@ -447,6 +454,7 @@ async fn find_workflow_post_embed(
     let semantic_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
         ClaimRepository::search_by_embedding_scoped(
             &server.pool,
+            viewer,
             pgvec,
             limit * 3,
             Some(&workflow_tag),
@@ -463,6 +471,7 @@ async fn find_workflow_post_embed(
         if let Some(pgvec) = pgvec_opt.as_deref() {
             match BehavioralExecutionRepository::behavioral_affinity_lineage(
                 &server.pool,
+                viewer,
                 pgvec,
                 0.5, // min_similarity
                 1,   // min_executions
@@ -488,12 +497,14 @@ async fn find_workflow_post_embed(
     for hit in semantic_hits {
         if let Ok(Some(claim)) = ClaimRepository::get_by_id(
             &server.pool,
+            viewer,
             epigraph_core::ClaimId::from_uuid(hit.claim_id),
         )
         .await
         {
             if let Some(r) = enrich_workflow_result(
                 &server.pool,
+                viewer,
                 hit.claim_id,
                 &claim,
                 hit.similarity,
@@ -522,6 +533,7 @@ async fn find_workflow_post_embed(
     if results.len() < half {
         let text_hits = ClaimRepository::search_by_label_and_text(
             &server.pool,
+            viewer,
             &["workflow".to_string()],
             &params.goal,
             min_truth,
@@ -546,6 +558,7 @@ async fn find_workflow_post_embed(
             }
             if let Some(r) = enrich_workflow_result(
                 &server.pool,
+                viewer,
                 claim_uuid,
                 &claim,
                 0.0, // text-fallback hit; no semantic similarity score
@@ -570,6 +583,7 @@ async fn find_workflow_post_embed(
 /// `find_workflow` to keep enrichment behavior identical.
 async fn enrich_workflow_result(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     workflow_id: uuid::Uuid,
     claim: &Claim,
     similarity: f64,
@@ -604,7 +618,7 @@ async fn enrich_workflow_result(
 
     // Look up behavioral data via lineage root (best-effort; reuse the
     // affinity_map already built from the original embedding query).
-    let lineage_root = WorkflowRepository::find_lineage_root(pool, workflow_id)
+    let lineage_root = WorkflowRepository::find_lineage_root(pool, viewer, workflow_id)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(workflow_id = %workflow_id, "find_lineage_root failed: {e}");
@@ -630,7 +644,7 @@ async fn enrich_workflow_result(
 
     // Promotion flag set by the refresh_workflow_promotion maintenance pass.
     // Advisory metadata; best-effort (a lookup failure must not drop the result).
-    let promotable = ClaimRepository::promotion_flag(pool, ClaimId::from_uuid(workflow_id))
+    let promotable = ClaimRepository::promotion_flag(pool, viewer, ClaimId::from_uuid(workflow_id))
         .await
         .unwrap_or(None);
 
@@ -653,6 +667,7 @@ async fn enrich_workflow_result(
 
 pub async fn report_workflow_outcome(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ReportWorkflowOutcomeParams,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
@@ -697,15 +712,18 @@ pub async fn report_workflow_outcome(
         .await;
     }
 
-    let claim =
-        ClaimRepository::get_by_id(&server.pool, epigraph_core::ClaimId::from_uuid(workflow_id))
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| {
-                invalid_params(format!(
-                    "workflow {workflow_id} not found in `workflows` or `claims` tables"
-                ))
-            })?;
+    let claim = ClaimRepository::get_by_id(
+        &server.pool,
+        viewer,
+        epigraph_core::ClaimId::from_uuid(workflow_id),
+    )
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| {
+        invalid_params(format!(
+            "workflow {workflow_id} not found in `workflows` or `claims` tables"
+        ))
+    })?;
 
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
@@ -751,6 +769,7 @@ pub async fn report_workflow_outcome(
     let weight = load_evidence_type_weight("observation");
     let ds = ds_auto::auto_wire_ds_update(
         &server.pool,
+        viewer,
         workflow_id,
         agent_id,
         quality,
@@ -864,6 +883,7 @@ pub async fn report_workflow_outcome(
 
 pub async fn deprecate_workflow(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: DeprecateWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
@@ -897,7 +917,7 @@ pub async fn deprecate_workflow(
         visited.insert(workflow_id);
         let mut queue = vec![workflow_id];
         while let Some(current) = queue.pop() {
-            let edges = EdgeRepository::get_by_target(&server.pool, current, "claim")
+            let edges = EdgeRepository::get_by_target(&server.pool, viewer, current, "claim")
                 .await
                 .unwrap_or_default();
 
@@ -957,9 +977,10 @@ pub mod __test_only {
     /// `find_workflow` runs after `embedder.generate`.
     pub async fn find_workflow_with_pgvec(
         server: &EpiGraphMcpFull,
+        viewer: &epigraph_db::visibility::Viewer,
         params: FindWorkflowParams,
         pgvec: Option<String>,
     ) -> Result<CallToolResult, McpError> {
-        find_workflow_post_embed(server, &params, pgvec).await
+        find_workflow_post_embed(server, viewer, &params, pgvec).await
     }
 }

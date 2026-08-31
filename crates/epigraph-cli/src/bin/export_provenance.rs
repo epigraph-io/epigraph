@@ -48,19 +48,30 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
+    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
+        epigraph_db::visibility::SystemReason::SchemaContractTest,
+    )
+    .await
+    .expect("maintenance viewer");
+    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+    if let Err(e) = run(cli, viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    cli: Cli,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
     if cli.format != "prov-o" {
         return Err(format!(
             "unsupported --format '{}': only 'prov-o' is implemented",
@@ -70,9 +81,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let pool = epigraph_cli::db_connect().await?;
-    let document =
-        epigraph_engine::export::prov::export_provenance_prov_o(&pool, cli.claim_id, cli.max_depth)
-            .await?;
+    let document = epigraph_engine::export::prov::export_provenance_prov_o(
+        &pool,
+        viewer,
+        cli.claim_id,
+        cli.max_depth,
+    )
+    .await?;
     let pretty = serde_json::to_string_pretty(&document)?;
 
     match cli.output {

@@ -9,6 +9,9 @@
 //! so ILIKE cannot match it and any result with similarity > 0 can only have
 //! come from the semantic (vector) path.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 // rustfmt 1.8 sorts __test_only differently than older CI rustfmt; opt out so
 // both versions accept the file (mirrors recall_with_context.rs's header fix).
 #[rustfmt::skip]
@@ -28,6 +31,7 @@ fn unit_pgvec_1536() -> String {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn find_workflow_semantic_path_uses_claims_embedding(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Seed agent + workflow claim.
     let agent_id = seed_agent(&pool).await;
     let id = Uuid::new_v4();
@@ -75,7 +79,7 @@ async fn find_workflow_semantic_path_uses_claims_embedding(pool: PgPool) {
         limit: Some(5),
         min_truth: Some(0.0),
     };
-    let result = find_workflow_with_pgvec(&server, params, Some(pgvec))
+    let result = find_workflow_with_pgvec(&server, &viewer, params, Some(pgvec))
         .await
         .expect("find_workflow_with_pgvec");
 

@@ -75,19 +75,27 @@ impl ContextRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<ContextRow>, DbError> {
-        let row: Option<ContextRow> = sqlx::query_as(
+    #[instrument(skip(pool, viewer))]
+    pub async fn get_by_id(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<ContextRow>, DbError> {
+        let sql = viewer.splice(
             r#"
             SELECT id, name, context_type, description, valid_from, valid_until,
                    applicable_frame_ids, parameters, modifier_type, properties, created_at
             FROM contexts
             WHERE id = $1
+              /* {VISIBILITY:contexts} */
             "#,
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ContextRow>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<ContextRow> = q.fetch_optional(pool).await?;
 
         Ok(row)
     }
@@ -96,21 +104,32 @@ impl ContextRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn list(pool: &PgPool, limit: i64, offset: i64) -> Result<Vec<ContextRow>, DbError> {
-        let rows: Vec<ContextRow> = sqlx::query_as(
+    #[instrument(skip(pool, viewer))]
+    pub async fn list(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ContextRow>, DbError> {
+        // No WHERE clause to append to, so the marker introduces one.
+        let sql = viewer.splice(
             r#"
             SELECT id, name, context_type, description, valid_from, valid_until,
                    applicable_frame_ids, parameters, modifier_type, properties, created_at
             FROM contexts
+            WHERE true /* {VISIBILITY:contexts} */
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
             "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, ContextRow>(&sql)
+            .bind(limit)
+            .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<ContextRow> = q.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -122,20 +141,28 @@ impl ContextRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn list_active(pool: &PgPool) -> Result<Vec<ContextRow>, DbError> {
-        let rows: Vec<ContextRow> = sqlx::query_as(
+    #[instrument(skip(pool, viewer))]
+    pub async fn list_active(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+    ) -> Result<Vec<ContextRow>, DbError> {
+        let sql = viewer.splice(
             r#"
             SELECT id, name, context_type, description, valid_from, valid_until,
                    applicable_frame_ids, parameters, modifier_type, properties, created_at
             FROM contexts
             WHERE (valid_from IS NULL OR valid_from <= NOW())
               AND (valid_until IS NULL OR valid_until >= NOW())
+              /* {VISIBILITY:contexts} */
             ORDER BY created_at DESC
             "#,
-        )
-        .fetch_all(pool)
-        .await?;
+            1,
+        );
+        let mut q = sqlx::query_as::<_, ContextRow>(&sql);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<ContextRow> = q.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -147,22 +174,34 @@ impl ContextRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn list_for_frame(pool: &PgPool, frame_id: Uuid) -> Result<Vec<ContextRow>, DbError> {
-        let rows: Vec<ContextRow> = sqlx::query_as(
+    #[instrument(skip(pool, viewer))]
+    pub async fn list_for_frame(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        frame_id: Uuid,
+    ) -> Result<Vec<ContextRow>, DbError> {
+        // PARENTHESES ARE LOAD-BEARING. The pre-existing predicate is an OR
+        // chain; `AND` binds tighter than `OR`, so appending the fragment
+        // without wrapping would parse as
+        // `a OR b OR (c AND visible)` — two thirds of the rows unfiltered.
+        let sql = viewer.splice(
             r#"
             SELECT id, name, context_type, description, valid_from, valid_until,
                    applicable_frame_ids, parameters, modifier_type, properties, created_at
             FROM contexts
-            WHERE $1 = ANY(applicable_frame_ids)
-               OR applicable_frame_ids = '{}'
-               OR applicable_frame_ids IS NULL
+            WHERE ($1 = ANY(applicable_frame_ids)
+                   OR applicable_frame_ids = '{}'
+                   OR applicable_frame_ids IS NULL)
+              /* {VISIBILITY:contexts} */
             ORDER BY created_at DESC
             "#,
-        )
-        .bind(frame_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ContextRow>(&sql).bind(frame_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<ContextRow> = q.fetch_all(pool).await?;
 
         Ok(rows)
     }

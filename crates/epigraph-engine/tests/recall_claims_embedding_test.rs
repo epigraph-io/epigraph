@@ -10,6 +10,9 @@
 //! is never populated) and asserts `recall` surfaces it via the semantic path with
 //! a real cosine similarity — impossible under the old evidence-column query.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_embeddings::{config::EmbeddingConfig, providers::MockProvider, EmbeddingService};
 use epigraph_engine::recall::recall;
 use sqlx::PgPool;
@@ -36,6 +39,7 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
 /// of its `claims.embedding` vector to the query embedding.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_semantic_path_reads_claims_embedding(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Deterministic mock: embedding a fixed query text always yields the same
     // 1536-d vector, so seeding a claim with that exact vector guarantees an
     // exact-match (cosine ~1.0) semantic hit.
@@ -68,7 +72,7 @@ async fn recall_semantic_path_reads_claims_embedding(pool: PgPool) {
     .await
     .expect("seed claim with claims.embedding vector");
 
-    let results = recall(&pool, &mock, query, 10, 0.5)
+    let results = recall(&pool, &viewer, &mock, query, 10, 0.5)
         .await
         .expect("recall must not error");
 

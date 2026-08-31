@@ -40,20 +40,28 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
+    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
+        epigraph_db::visibility::SystemReason::EmbeddingBackfill,
+    )
+    .await
+    .expect("maintenance viewer");
+    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     let cli = Cli::parse();
-    run(cli).await
+    run(cli, viewer).await
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(cli: Cli, viewer: &epigraph_db::visibility::Viewer) -> anyhow::Result<()> {
     let pool = epigraph_db::create_pool(&cli.database_url)
         .await
         .context("connect database")?;
-    let rows = ClaimRepository::find_claims_needing_embeddings(&pool, cli.limit)
+    let rows = ClaimRepository::find_claims_needing_embeddings(&pool, viewer, cli.limit)
         .await
         .context("find claims needing embeddings")?;
 

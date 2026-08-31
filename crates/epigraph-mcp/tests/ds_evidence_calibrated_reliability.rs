@@ -32,6 +32,9 @@
 //! the *calibrated* testimonial weight (0.6, `calibration.toml`) against the
 //! *0.5 fallback*, not against a fictitious "no discount" baseline.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_db::MassFunctionRepository;
 use epigraph_mcp::tools::ds_auto::ensure_binary_frame;
@@ -104,12 +107,13 @@ fn base_params(claim_id: Uuid, frame_id: Uuid) -> SubmitDsEvidenceParams {
 /// the belief computation.
 #[sqlx::test(migrations = "../../migrations")]
 async fn evidence_type_testimonial_diverges_from_no_evidence_type(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "ds-calibrated-testimonial").await;
-    let frame_id = ensure_binary_frame(&pool).await.expect("binary frame");
+    let frame_id = ensure_binary_frame(&pool, &viewer).await.expect("binary frame");
 
     let claim_a = insert_claim(&pool, agent, &format!("calib-a-{}", Uuid::new_v4())).await;
-    let out_a = tools::ds::submit_ds_evidence(&server, base_params(claim_a, frame_id))
+    let out_a = tools::ds::submit_ds_evidence(&server, &viewer, base_params(claim_a, frame_id))
         .await
         .expect("submit_ds_evidence (no evidence_type)");
     let pignistic_a = result_json(out_a)["pignistic_prob"]
@@ -119,7 +123,7 @@ async fn evidence_type_testimonial_diverges_from_no_evidence_type(pool: PgPool) 
     let claim_b = insert_claim(&pool, agent, &format!("calib-b-{}", Uuid::new_v4())).await;
     let mut params_b = base_params(claim_b, frame_id);
     params_b.evidence_type = Some("testimonial".to_string());
-    let out_b = tools::ds::submit_ds_evidence(&server, params_b)
+    let out_b = tools::ds::submit_ds_evidence(&server, &viewer, params_b)
         .await
         .expect("submit_ds_evidence (evidence_type=testimonial)");
     let pignistic_b = result_json(out_b)["pignistic_prob"]
@@ -134,7 +138,7 @@ async fn evidence_type_testimonial_diverges_from_no_evidence_type(pool: PgPool) 
 
     // Confirm the row actually landed with the resolved evidence_type
     // (not silently dropped), so future recomputes see consistent metadata.
-    let rows = MassFunctionRepository::get_for_claim_frame(&pool, claim_b, frame_id)
+    let rows = MassFunctionRepository::get_for_claim_frame(&pool, &viewer, claim_b, frame_id)
         .await
         .expect("get_for_claim_frame");
     assert_eq!(rows.len(), 1);
@@ -149,14 +153,15 @@ async fn evidence_type_testimonial_diverges_from_no_evidence_type(pool: PgPool) 
 /// semantics unchanged).
 #[sqlx::test(migrations = "../../migrations")]
 async fn omitting_evidence_type_is_byte_identical_to_legacy_behavior(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "ds-calibrated-backcompat").await;
-    let frame_id = ensure_binary_frame(&pool).await.expect("binary frame");
+    let frame_id = ensure_binary_frame(&pool, &viewer).await.expect("binary frame");
     let claim = insert_claim(&pool, agent, &format!("calib-compat-{}", Uuid::new_v4())).await;
 
     let mut params = base_params(claim, frame_id);
     params.reliability = Some(0.8);
-    let out = tools::ds::submit_ds_evidence(&server, params)
+    let out = tools::ds::submit_ds_evidence(&server, &viewer, params)
         .await
         .expect("submit_ds_evidence");
     let json = result_json(out);
@@ -189,7 +194,7 @@ async fn omitting_evidence_type_is_byte_identical_to_legacy_behavior(pool: PgPoo
          fallback of 0.5, same as origin/main's unconditional discount path)"
     );
 
-    let rows = MassFunctionRepository::get_for_claim_frame(&pool, claim, frame_id)
+    let rows = MassFunctionRepository::get_for_claim_frame(&pool, &viewer, claim, frame_id)
         .await
         .expect("get_for_claim_frame");
     assert_eq!(rows.len(), 1);

@@ -96,9 +96,10 @@ impl ProvenanceChainRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the traversal or hydration query
     /// fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn chain(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: u8,
         relationships: Option<&[String]>,
@@ -136,6 +137,13 @@ impl ProvenanceChainRepository {
         // The recursive term walks BOTH directions in one frontier (see module
         // docs). `is_cycle` rows are emitted so the caller can see the loop,
         // but are not expanded further — that is what makes this terminate.
+        //
+        // MACRO SITE — static three-bind spelling. The predicate lives on the
+        // RECURSIVE term, which is the only place `edges` is read: an edge the
+        // viewer cannot see must not extend the frontier, or the walk leaks the
+        // shape of another tenant's graph one hop at a time. The hydration
+        // query below filters `claims` the same way, so a node id that survived
+        // the walk still yields no content unless the claim itself is visible.
         let rows = sqlx::query!(
             r#"
             WITH RECURSIVE chain AS (
@@ -165,6 +173,8 @@ impl ProvenanceChainRepository {
                                 THEN e.source_id ELSE e.target_id END AS id
                 ) nxt
                 WHERE c.depth < $4 AND NOT c.is_cycle
+                  AND ($5::bool OR e.visibility = 'public'
+                       OR e.owner_group_id = ANY($6::uuid[]))
             )
             SELECT node AS "node!", depth AS "depth!", is_cycle AS "is_cycle!",
                    path AS "path!", e_source, e_target, e_rel
@@ -175,6 +185,8 @@ impl ProvenanceChainRepository {
             &incoming[..],
             &outgoing[..],
             depth,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -222,8 +234,11 @@ impl ProvenanceChainRepository {
             SELECT id, content, truth_value, labels, is_current
             FROM claims
             WHERE id = ANY($1)
+              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
             "#,
             &ids[..],
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;

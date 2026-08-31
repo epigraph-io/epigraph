@@ -38,9 +38,10 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 pub async fn link_alternative(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: LinkAlternativeParams,
 ) -> Result<CallToolResult, McpError> {
-    do_link_alternative(server, params).await
+    do_link_alternative(server, viewer, params).await
 }
 
 /// Core wiring logic factored out so integration tests can call it directly
@@ -48,6 +49,7 @@ pub async fn link_alternative(
 /// `do_link_hierarchical` factoring in `tools/link_hierarchical.rs`.
 pub async fn do_link_alternative(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: LinkAlternativeParams,
 ) -> Result<CallToolResult, McpError> {
     let a = parse_uuid(&params.claim_a)?;
@@ -66,14 +68,14 @@ pub async fn do_link_alternative(
     // Verify both claims exist via the repo layer (SQL stays in epigraph-db per
     // CLAUDE.md). Disambiguate which side is missing so the caller can fix the
     // right end of the pair.
-    if ClaimRepository::get_by_id(pool, ClaimId::from_uuid(a))
+    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(a))
         .await
         .map_err(internal_error)?
         .is_none()
     {
         return Err(invalid_params(format!("claim_a {a} not found")));
     }
-    if ClaimRepository::get_by_id(pool, ClaimId::from_uuid(b))
+    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(b))
         .await
         .map_err(internal_error)?
         .is_none()
@@ -87,7 +89,7 @@ pub async fn do_link_alternative(
     let mut props = Map::new();
     if let Some(t) = &params.target_claim_id {
         let tid = parse_uuid(t)?;
-        if ClaimRepository::get_by_id(pool, ClaimId::from_uuid(tid))
+        if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(tid))
             .await
             .map_err(internal_error)?
             .is_none()

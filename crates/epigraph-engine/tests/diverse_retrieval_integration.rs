@@ -11,6 +11,9 @@
 //!   * `claims.content_hash` is `bytea NOT NULL` UNIQUE with `agent_id`.
 //!   * `claim_themes.centroid` is `vector(1536)`.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_engine::diverse_retrieval::{
     find_similar_themes_at_dim, run_diverse_pipeline, DiverseRetrievalConfig,
     DEFAULT_CANDIDATE_POOL,
@@ -152,6 +155,7 @@ async fn seed_claim_in_theme(
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn run_diverse_pipeline_returns_empty_when_no_themes(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // No themes seeded — corpus has never run k-means.
     let query = cluster_pgvec(0, 1.0);
     let config = DiverseRetrievalConfig {
@@ -163,7 +167,7 @@ async fn run_diverse_pipeline_returns_empty_when_no_themes(pool: PgPool) {
         paragraph_only: true,
         since: None,
     };
-    let result = run_diverse_pipeline(&pool, &query, config)
+    let result = run_diverse_pipeline(&pool, &viewer, &query, config)
         .await
         .expect("pipeline should succeed against empty themes table");
     assert!(
@@ -175,6 +179,7 @@ async fn run_diverse_pipeline_returns_empty_when_no_themes(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn run_diverse_pipeline_returns_empty_when_themes_have_no_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Theme exists but no claims attached — second fallback branch.
     let _theme_a = seed_theme_with_centroid(&pool, "empty-theme", &cluster_pgvec(0, 1.0)).await;
 
@@ -188,7 +193,7 @@ async fn run_diverse_pipeline_returns_empty_when_themes_have_no_claims(pool: PgP
         paragraph_only: true,
         since: None,
     };
-    let result = run_diverse_pipeline(&pool, &query, config)
+    let result = run_diverse_pipeline(&pool, &viewer, &query, config)
         .await
         .expect("pipeline should succeed when themes have no claims");
     assert!(
@@ -230,6 +235,7 @@ async fn find_similar_themes_orders_by_centroid_proximity(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn diverse_selection_spreads_across_themes_when_flat_would_not(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Multi-theme corpus designed so:
     //
     //   - Flat ANN over `claims.embedding` (ordered by cosine distance)
@@ -290,7 +296,7 @@ async fn diverse_selection_spreads_across_themes_when_flat_would_not(pool: PgPoo
 
     // Sanity check (regression guard): the flat ANN path (i.e. what
     // diverse=false in MCP would call) returns 5 hits, ALL from theme_a.
-    let flat_hits = epigraph_db::ClaimRepository::search_by_embedding(&pool, &query, 1536, 5, None)
+    let flat_hits = epigraph_db::ClaimRepository::search_by_embedding(&pool, &viewer, &query, 1536, 5, None)
         .await
         .expect("flat ANN");
     assert_eq!(flat_hits.len(), 5, "flat ANN should fill the budget");
@@ -323,7 +329,7 @@ async fn diverse_selection_spreads_across_themes_when_flat_would_not(pool: PgPoo
         paragraph_only: true,
         since: None,
     };
-    let selected = run_diverse_pipeline(&pool, &query, config)
+    let selected = run_diverse_pipeline(&pool, &viewer, &query, config)
         .await
         .expect("diverse pipeline");
     assert!(!selected.is_empty(), "diverse pipeline must return results");
@@ -374,6 +380,7 @@ async fn diverse_selection_spreads_across_themes_when_flat_would_not(pool: PgPoo
 /// 5 from a pool of 30.
 #[sqlx::test(migrations = "../../migrations")]
 async fn candidate_pool_small_value_truncates_sql_input(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let theme = seed_theme_with_centroid(&pool, "pool-small", &cluster_pgvec(0, 1.0)).await;
 
@@ -399,7 +406,7 @@ async fn candidate_pool_small_value_truncates_sql_input(pool: PgPool) {
         paragraph_only: true,
         since: None,
     };
-    let selected = run_diverse_pipeline(&pool, &query, config)
+    let selected = run_diverse_pipeline(&pool, &viewer, &query, config)
         .await
         .expect("pipeline");
 
@@ -445,6 +452,7 @@ async fn candidate_pool_small_value_truncates_sql_input(pool: PgPool) {
 /// value reached the SQL.
 #[sqlx::test(migrations = "../../migrations")]
 async fn candidate_pool_large_value_widens_diverse_select_input(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let theme = seed_theme_with_centroid(&pool, "pool-large", &cluster_pgvec(0, 1.0)).await;
 
@@ -469,7 +477,7 @@ async fn candidate_pool_large_value_widens_diverse_select_input(pool: PgPool) {
         paragraph_only: true,
         since: None,
     };
-    let selected = run_diverse_pipeline(&pool, &query, config)
+    let selected = run_diverse_pipeline(&pool, &viewer, &query, config)
         .await
         .expect("pipeline");
 
@@ -490,6 +498,7 @@ async fn candidate_pool_large_value_widens_diverse_select_input(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn paragraph_only_filter_excludes_non_paragraph_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // When paragraph_only=true, the helper must filter out level≠2 claims
     // so MCP's downstream paragraph-context fetch never sees a section
     // or atom dressed up as a candidate.
@@ -513,7 +522,7 @@ async fn paragraph_only_filter_excludes_non_paragraph_claims(pool: PgPool) {
         paragraph_only: true,
         since: None,
     };
-    let strict = run_diverse_pipeline(&pool, &query, config_strict)
+    let strict = run_diverse_pipeline(&pool, &viewer, &query, config_strict)
         .await
         .expect("paragraph_only=true");
     let strict_ids: std::collections::HashSet<Uuid> = strict.iter().map(|(id, _, _)| *id).collect();
@@ -536,7 +545,7 @@ async fn paragraph_only_filter_excludes_non_paragraph_claims(pool: PgPool) {
         paragraph_only: false,
         since: None,
     };
-    let lax = run_diverse_pipeline(&pool, &query, config_lax)
+    let lax = run_diverse_pipeline(&pool, &viewer, &query, config_lax)
         .await
         .expect("paragraph_only=false");
     let lax_ids: std::collections::HashSet<Uuid> = lax.iter().map(|(id, _, _)| *id).collect();

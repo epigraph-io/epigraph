@@ -67,18 +67,26 @@ impl CommunityRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<CommunityRow>, DbError> {
-        let row: Option<CommunityRow> = sqlx::query_as(
+    #[instrument(skip(pool, viewer))]
+    pub async fn get_by_id(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<CommunityRow>, DbError> {
+        let sql = viewer.splice(
             r#"
             SELECT id, name, description, governance_type, ownership_type, mass_override, created_at
             FROM communities
             WHERE id = $1
+              /* {VISIBILITY:communities} */
             "#,
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, CommunityRow>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<CommunityRow> = q.fetch_optional(pool).await?;
 
         Ok(row)
     }
@@ -87,24 +95,30 @@ impl CommunityRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn list(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<CommunityRow>, DbError> {
-        let rows: Vec<CommunityRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, name, description, governance_type, ownership_type, mass_override, created_at
             FROM communities
+            WHERE true /* {VISIBILITY:communities} */
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
             "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, CommunityRow>(&sql)
+            .bind(limit)
+            .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<CommunityRow> = q.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -164,24 +178,29 @@ impl CommunityRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_members(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         community_id: Uuid,
     ) -> Result<Vec<PerspectiveRow>, DbError> {
-        let rows: Vec<PerspectiveRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT p.id, p.name, p.description, p.owner_agent_id, p.perspective_type,
                    p.frame_ids, p.extraction_method, p.confidence_calibration, p.created_at
             FROM perspectives p
             JOIN community_members cm ON cm.perspective_id = p.id
             WHERE cm.community_id = $1
+              /* {VISIBILITY:p} */
             ORDER BY cm.joined_at ASC
             "#,
-        )
-        .bind(community_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, PerspectiveRow>(&sql).bind(community_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<PerspectiveRow> = q.fetch_all(pool).await?;
 
         Ok(rows)
     }

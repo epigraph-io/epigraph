@@ -44,19 +44,30 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
+    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
+        epigraph_db::visibility::SystemReason::SchemaContractTest,
+    )
+    .await
+    .expect("maintenance viewer");
+    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+    if let Err(e) = run(cli, viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    cli: Cli,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pool = epigraph_cli::db_connect().await?;
 
     match cli.command {
@@ -75,8 +86,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
-        Command::Status { id } => status(&pool, id).await,
-        Command::Promote { id } => promote(&pool, id).await,
+        Command::Status { id } => status(&pool, viewer, id).await,
+        Command::Promote { id } => promote(&pool, viewer, id).await,
     }
 }
 
@@ -206,7 +217,11 @@ async fn create(
     Ok(())
 }
 
-async fn status(pool: &sqlx::PgPool, id: Uuid) -> Result<(), Box<dyn std::error::Error>> {
+async fn status(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    id: Uuid,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Load claim
     let (content, properties): (String, serde_json::Value) =
         sqlx::query_as("SELECT content, properties FROM claims WHERE id = $1")
@@ -218,7 +233,7 @@ async fn status(pool: &sqlx::PgPool, id: Uuid) -> Result<(), Box<dyn std::error:
     // Experiments
     let experiments = epigraph_db::ExperimentRepository::get_for_hypothesis(pool, id).await?;
     let completed_with_analysis =
-        epigraph_db::ExperimentRepository::count_completed_with_analysis(pool, id)
+        epigraph_db::ExperimentRepository::count_completed_with_analysis(pool, viewer, id)
             .await
             .unwrap_or(0);
 
@@ -229,9 +244,10 @@ async fn status(pool: &sqlx::PgPool, id: Uuid) -> Result<(), Box<dyn std::error:
             .await?;
 
     let (bel_supported, bel_unsupported) = if let Some((fid,)) = frame_id {
-        let mass_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, id, fid)
-            .await
-            .unwrap_or_default();
+        let mass_rows =
+            epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, viewer, id, fid)
+                .await
+                .unwrap_or_default();
         if let Some(latest) = mass_rows.last() {
             (
                 latest
@@ -312,10 +328,14 @@ async fn status(pool: &sqlx::PgPool, id: Uuid) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-async fn promote(pool: &sqlx::PgPool, id: Uuid) -> Result<(), Box<dyn std::error::Error>> {
+async fn promote(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    id: Uuid,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Re-check gate (inline the logic from status)
     let completed_with_analysis =
-        epigraph_db::ExperimentRepository::count_completed_with_analysis(pool, id)
+        epigraph_db::ExperimentRepository::count_completed_with_analysis(pool, viewer, id)
             .await
             .unwrap_or(0);
 
@@ -325,7 +345,8 @@ async fn promote(pool: &sqlx::PgPool, id: Uuid) -> Result<(), Box<dyn std::error
             .await?;
 
     let mass_rows =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, id, hyp_frame.0).await?;
+        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, viewer, id, hyp_frame.0)
+            .await?;
     let (bel_supported, bel_unsupported) = if let Some(latest) = mass_rows.last() {
         (
             latest

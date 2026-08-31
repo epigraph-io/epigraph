@@ -19,6 +19,7 @@ use sqlx;
 use uuid::Uuid;
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 use epigraph_core::{AgentId, ClaimId, TruthValue};
 use epigraph_db::ClaimRepository;
@@ -169,6 +170,7 @@ pub struct VersionHistoryResponse {
     tag = "claims"
 )]
 pub async fn supersede_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
@@ -289,7 +291,7 @@ pub async fn supersede_claim(
 
         // Get the next version number for the old claim chain, then +1 for new claim
         let version_number: i32 =
-            ClaimVersionRepository::latest_version_number(&state.db_pool, claim_id)
+            ClaimVersionRepository::latest_version_number(&state.db_pool, &viewer, claim_id)
                 .await
                 .unwrap_or(0)
                 + 1;
@@ -327,9 +329,12 @@ pub async fn supersede_claim(
     // inside the transaction. Best-effort: the transaction has already
     // committed, so a cascade failure must not turn a successful write into a
     // reported error (the retry would hit "already been superseded").
-    let belief_cascade =
-        epigraph_engine::retraction_cascade::cascade_after_supersede(&state.db_pool, new_uuid)
-            .await;
+    let belief_cascade = epigraph_engine::retraction_cascade::cascade_after_supersede(
+        &state.db_pool,
+        &viewer,
+        new_uuid,
+    )
+    .await;
 
     // 10. Trigger belief propagation for downstream factors (fire-and-forget).
     //
@@ -416,6 +421,7 @@ pub async fn supersede_claim(
     tag = "claims"
 )]
 pub async fn mark_duplicate(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(dup_id): Path<Uuid>,
@@ -448,6 +454,7 @@ pub async fn mark_duplicate(
     // Only the dedup's own failure is an error; the cascade's is reported.
     let belief_cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
         &state.db_pool,
+        &viewer,
         dup_id,
         req.canonical_id,
     )

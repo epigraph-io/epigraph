@@ -200,15 +200,21 @@ impl TripleRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn query(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         subject_id: Option<Uuid>,
         predicate_pattern: Option<&str>,
         object_id: Option<Uuid>,
         min_confidence: f64,
         limit: i64,
     ) -> Result<Vec<TripleRow>, DbError> {
+        // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
+        // spliced. BOTH `t` and `c` are filtered: `triples` carries its own
+        // tenancy columns (062) and a triple is a structured restatement of its
+        // claim's content, so either alone leaves a path to the other's rows.
         let rows = sqlx::query!(
             r#"
             SELECT t.id,
@@ -233,6 +239,8 @@ impl TripleRepository {
               AND ($1::uuid IS NULL OR t.subject_id = $1)
               AND ($2::uuid IS NULL OR t.object_id  = $2)
               AND ($3::text IS NULL OR similarity(t.predicate, $3) >= 0.3)
+              AND ($6::bool OR t.visibility = 'public' OR t.owner_group_id = ANY($7::uuid[]))
+              AND ($6::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($7::uuid[]))
             ORDER BY t.confidence DESC, t.created_at DESC
             LIMIT $5
             "#,
@@ -240,7 +248,9 @@ impl TripleRepository {
             object_id as Option<Uuid>,
             predicate_pattern as Option<&str>,
             min_confidence,
-            limit
+            limit,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -271,12 +281,17 @@ impl TripleRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn entity_neighborhood(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         entity_id: Uuid,
         limit: i64,
     ) -> Result<Vec<TripleRow>, DbError> {
+        // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
+        // spliced. BOTH `t` and `c` are filtered: `triples` carries its own
+        // tenancy columns (062) and a triple is a structured restatement of its
+        // claim's content, so either alone leaves a path to the other's rows.
         let rows = sqlx::query!(
             r#"
             SELECT t.id,
@@ -298,11 +313,15 @@ impl TripleRepository {
             WHERE c.is_current    = true
               AND se.is_canonical = true
               AND (t.subject_id = $1 OR t.object_id = $1)
+              AND ($3::bool OR t.visibility = 'public' OR t.owner_group_id = ANY($4::uuid[]))
+              AND ($3::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($4::uuid[]))
             ORDER BY t.predicate, t.confidence DESC
             LIMIT $2
             "#,
             entity_id,
-            limit
+            limit,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -334,8 +353,15 @@ impl TripleRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_claim(pool: &PgPool, claim_id: Uuid) -> Result<Vec<TripleRow>, DbError> {
+    #[instrument(skip(pool, viewer))]
+    pub async fn get_by_claim(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Vec<TripleRow>, DbError> {
+        // MACRO SITE — static bypass-bool spelling. Unlike `query` and
+        // `entity_neighborhood` this one does not join `claims`, so the only
+        // alias to filter is `t`.
         let rows = sqlx::query!(
             r#"
             SELECT t.id,
@@ -354,9 +380,12 @@ impl TripleRepository {
             JOIN  entities se ON se.id = t.subject_id
             LEFT JOIN entities oe ON oe.id = t.object_id
             WHERE t.claim_id = $1
+              AND ($2::bool OR t.visibility = 'public' OR t.owner_group_id = ANY($3::uuid[]))
             ORDER BY t.confidence DESC
             "#,
-            claim_id
+            claim_id,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -387,11 +416,23 @@ impl TripleRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn claim_has_triples(pool: &PgPool, claim_id: Uuid) -> Result<bool, DbError> {
+    #[instrument(skip(pool, viewer))]
+    pub async fn claim_has_triples(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, DbError> {
+        // MACRO SITE. A bare boolean is still an existence oracle.
         let row = sqlx::query!(
-            r#"SELECT EXISTS(SELECT 1 FROM triples WHERE claim_id = $1) AS "exists!""#,
-            claim_id
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM triples
+                   WHERE claim_id = $1
+                     AND ($2::bool OR visibility = 'public'
+                          OR owner_group_id = ANY($3::uuid[]))
+               ) AS "exists!""#,
+            claim_id,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_one(pool)
         .await?;
@@ -409,10 +450,21 @@ impl TripleRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn index_counts(pool: &PgPool) -> Result<IndexCounts, DbError> {
+    /// Takes `_viewer` so the exemption is visible at every call site rather
+    /// than only in this file.
+    #[instrument(skip(pool, _viewer))]
+    pub async fn index_counts(
+        pool: &PgPool,
+        _viewer: &crate::visibility::Viewer,
+    ) -> Result<IndexCounts, DbError> {
         let row = sqlx::query!(
             r#"
+            -- VISIBILITY-EXEMPT: corpus-wide index cardinality. Three scalars
+            -- leave this function and no row content does; the whole point of
+            -- the numbers (surfaced through `system_stats`) is to distinguish
+            -- "the RDF index is empty" from "your query matched nothing", which
+            -- a per-viewer count cannot answer. Reconsider if these are ever
+            -- exposed per-entity or per-claim.
             SELECT
               (SELECT COUNT(*) FROM triples)         AS "triples!",
               (SELECT COUNT(*) FROM entities)        AS "entities!",
@@ -476,7 +528,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn claim_has_triples_returns_false_when_empty(pool: sqlx::PgPool) {
         let (_agent_id, claim_id) = insert_agent_and_claim(&pool).await;
-        let result = TripleRepository::claim_has_triples(&pool, claim_id)
+        let result = TripleRepository::claim_has_triples(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), claim_id)
             .await
             .unwrap();
         assert!(!result, "new claim should have no triples");
@@ -503,7 +555,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = TripleRepository::claim_has_triples(&pool, claim_id)
+        let result = TripleRepository::claim_has_triples(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), claim_id)
             .await
             .unwrap();
         assert!(
@@ -518,7 +570,7 @@ mod tests {
     /// signal stays observable and a future populate-path regression is caught.
     #[sqlx::test(migrations = "../../migrations")]
     async fn index_counts_empty_db_is_all_zero(pool: sqlx::PgPool) {
-        let counts = TripleRepository::index_counts(&pool)
+        let counts = TripleRepository::index_counts(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]))
             .await
             .expect("index_counts query should succeed on an empty DB");
         assert_eq!(counts.triples, 0);
@@ -552,7 +604,7 @@ mod tests {
         .await
         .expect("upsert DNA origami");
 
-        let counts = TripleRepository::index_counts(&pool)
+        let counts = TripleRepository::index_counts(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]))
             .await
             .expect("index_counts should succeed");
         assert_eq!(counts.entities, 2, "two canonical entities inserted");

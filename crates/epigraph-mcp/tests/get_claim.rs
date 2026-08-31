@@ -6,6 +6,9 @@
 //! pointing at the open one), then verifies the MCP `get_claim` handler
 //! returns the new fields with real database state.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_mcp::tools::claims::get_claim;
 use epigraph_mcp::types::GetClaimParams;
@@ -19,6 +22,7 @@ use common::build_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     // Claim 1: an open backlog claim (is_current=true, supersedes=None).
@@ -27,7 +31,7 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
     let server = build_test_server(pool.clone());
 
     let result = get_claim(
-        &server,
+        &server, &viewer,
         GetClaimParams {
             claim_id: open_id.as_uuid().to_string(),
             frame_id: None,
@@ -55,7 +59,7 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
     let superseded_id = seed_claim(&pool, agent, &["backlog"], false, Some(open_id)).await;
 
     let result = get_claim(
-        &server,
+        &server, &viewer,
         GetClaimParams {
             claim_id: superseded_id.as_uuid().to_string(),
             frame_id: None,
@@ -83,6 +87,7 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
 /// `check_content_access` returns `Full` and the redaction branch is never run).
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, owner, &[], true, None).await;
     let expected_content = format!("test claim {}", claim_id.as_uuid());
@@ -103,7 +108,7 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
     // Owner requester → full content AND the real content_hash.
     let owner_body = parse_claim(
         &get_claim(
-            &server,
+            &server, &viewer,
             GetClaimParams {
                 claim_id: claim_id.as_uuid().to_string(),
                 frame_id: None,
@@ -132,7 +137,7 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
     let stranger = Uuid::new_v4();
     let stranger_body = parse_claim(
         &get_claim(
-            &server,
+            &server, &viewer,
             GetClaimParams {
                 claim_id: claim_id.as_uuid().to_string(),
                 frame_id: None,

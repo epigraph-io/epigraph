@@ -27,6 +27,7 @@ struct ConsolidateResponse {
 
 pub async fn consolidate_claims(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ConsolidateClaimsParams,
 ) -> Result<CallToolResult, McpError> {
     let acting_agent_id = server.agent_id().await?;
@@ -48,9 +49,12 @@ pub async fn consolidate_claims(
         None => {
             let mut best: f64 = 0.0;
             for id in &source_ids {
-                if let Ok(Some(c)) =
-                    ClaimRepository::get_by_id(&server.pool, epigraph_core::ClaimId::from_uuid(*id))
-                        .await
+                if let Ok(Some(c)) = ClaimRepository::get_by_id(
+                    &server.pool,
+                    viewer,
+                    epigraph_core::ClaimId::from_uuid(*id),
+                )
+                .await
                 {
                     best = best.max(c.truth_value.value());
                 }

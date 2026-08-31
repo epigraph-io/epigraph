@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "db")]
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 
@@ -82,6 +83,7 @@ pub struct BeliefAtQuery {
 /// GET /api/v1/sheaf/consistency - Check sheaf consistency across claims.
 #[cfg(feature = "db")]
 pub async fn sheaf_consistency(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<SheafConsistencyQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -90,6 +92,7 @@ pub async fn sheaf_consistency(
 
     let rows = epigraph_db::SheafRepository::get_claim_neighbor_betp_pairs(
         &state.db_pool,
+        &viewer,
         params.frame_id,
         limit * 10, // fetch more rows since multiple neighbors per claim
     )
@@ -210,17 +213,21 @@ pub async fn sheaf_consistency(
 /// GET /api/v1/sheaf/cohomology - Compute sheaf cohomology (global inconsistency).
 #[cfg(feature = "db")]
 pub async fn sheaf_cohomology(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<SheafCohomologyQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let threshold = params.threshold.unwrap_or(0.05);
 
-    let edge_pairs =
-        epigraph_db::SheafRepository::get_epistemic_edge_pairs(&state.db_pool, params.frame_id)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to fetch edge pairs: {e}"),
-            })?;
+    let edge_pairs = epigraph_db::SheafRepository::get_epistemic_edge_pairs(
+        &state.db_pool,
+        &viewer,
+        params.frame_id,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to fetch edge pairs: {e}"),
+    })?;
 
     let profile = epigraph_engine::sheaf::RestrictionProfile::scientific();
 
@@ -309,17 +316,19 @@ pub async fn sheaf_cohomology(
 /// POST /api/v1/sheaf/reconcile - Reconcile sheaf obstructions via interval BP.
 #[cfg(feature = "db")]
 pub async fn sheaf_reconcile(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<ReconcileRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let threshold = 0.05_f64; // Use default cohomology threshold to discover obstructions.
 
     // Step 1: fetch all epistemic edges and build CDST obstructions.
-    let edge_pairs = epigraph_db::SheafRepository::get_epistemic_edge_pairs(&state.db_pool, None)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to fetch edge pairs for reconciliation: {e}"),
-        })?;
+    let edge_pairs =
+        epigraph_db::SheafRepository::get_epistemic_edge_pairs(&state.db_pool, &viewer, None)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to fetch edge pairs for reconciliation: {e}"),
+            })?;
 
     let profile = match request.profile.as_deref() {
         Some("regulatory") => epigraph_engine::sheaf::RestrictionProfile::regulatory(),
@@ -466,6 +475,7 @@ pub async fn sheaf_reconcile(
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
 #[cfg(feature = "db")]
 pub async fn propagate_beliefs(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<PropagateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -544,10 +554,13 @@ pub async fn propagate_beliefs(
         "scalar" | "interval" => false,
         _ => {
             // Auto: load mass functions and check coverage
-            let mf_rows =
-                epigraph_db::MassFunctionRepository::get_for_claims(&state.db_pool, &all_var_ids)
-                    .await
-                    .unwrap_or_default();
+            let mf_rows = epigraph_db::MassFunctionRepository::get_for_claims(
+                &state.db_pool,
+                &viewer,
+                &all_var_ids,
+            )
+            .await
+            .unwrap_or_default();
             let claims_with_mf: std::collections::HashSet<Uuid> =
                 mf_rows.iter().map(|r| r.claim_id).collect();
             !all_var_ids.is_empty() && claims_with_mf.len() * 2 > all_var_ids.len()
@@ -555,12 +568,15 @@ pub async fn propagate_beliefs(
     };
 
     if use_cdst {
-        let mf_rows =
-            epigraph_db::MassFunctionRepository::get_for_claims(&state.db_pool, &all_var_ids)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Failed to load mass functions: {e}"),
-                })?;
+        let mf_rows = epigraph_db::MassFunctionRepository::get_for_claims(
+            &state.db_pool,
+            &viewer,
+            &all_var_ids,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to load mass functions: {e}"),
+        })?;
 
         // Combine multiple mass functions per claim via adaptive combination
         // (a claim may have evidence from multiple sources/agents)
@@ -781,12 +797,13 @@ pub async fn compose_subgraphs(
 /// GET /api/v1/claims/:id/belief-at - Reconstruct belief at a past timestamp.
 #[cfg(feature = "db")]
 pub async fn belief_at_time(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<BeliefAtQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Verify claim exists
-    let _claim = epigraph_db::ClaimRepository::get_by_id(&state.db_pool, claim_id.into())
+    let _claim = epigraph_db::ClaimRepository::get_by_id(&state.db_pool, &viewer, claim_id.into())
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("Failed to fetch claim: {e}"),

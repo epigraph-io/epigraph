@@ -1,5 +1,8 @@
 //! Tier-2 integration tests for the trickiest two MCP tools post-S3a.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 #[macro_use]
 mod common;
 
@@ -29,6 +32,7 @@ async fn server_agent_uuid(pool: &PgPool, signer_seed: [u8; 32]) -> Uuid {
 #[tokio::test]
 async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let signer_seed = [0x42u8; 32];
@@ -58,10 +62,10 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         novelty_threshold: None,
     };
 
-    tools::claims::submit_claim(&server, params1)
+    tools::claims::submit_claim(&server, &viewer, params1)
         .await
         .expect("first submit_claim");
-    tools::claims::submit_claim(&server, params2)
+    tools::claims::submit_claim(&server, &viewer, params2)
         .await
         .expect("second submit_claim");
 
@@ -268,6 +272,7 @@ use epigraph_mcp::types::MemorizeParams;
 #[tokio::test]
 async fn memorize_resubmit_option_a_skip() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let signer_seed = [0x33u8; 32];
@@ -281,10 +286,10 @@ async fn memorize_resubmit_option_a_skip() {
         novelty_threshold: None,
     };
 
-    tools::memory::memorize(&server, make_params())
+    tools::memory::memorize(&server, &viewer, make_params())
         .await
         .expect("first memorize");
-    tools::memory::memorize(&server, make_params())
+    tools::memory::memorize(&server, &viewer, make_params())
         .await
         .expect("second memorize");
 
@@ -309,6 +314,7 @@ use epigraph_mcp::types::StoreWorkflowParams;
 #[tokio::test]
 async fn store_workflow_resubmit_is_idempotent_at_workflow_row() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let signer_seed = [0x44u8; 32];
@@ -326,10 +332,10 @@ async fn store_workflow_resubmit_is_idempotent_at_workflow_row() {
         tags: Some(vec!["s3a-test".to_string()]),
     };
 
-    tools::workflows::store_workflow(&server, make_params())
+    tools::workflows::store_workflow(&server, &viewer, make_params())
         .await
         .expect("first store_workflow");
-    tools::workflows::store_workflow(&server, make_params())
+    tools::workflows::store_workflow(&server, &viewer, make_params())
         .await
         .expect("second store_workflow");
 

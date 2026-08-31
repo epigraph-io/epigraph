@@ -27,11 +27,12 @@ use crate::errors::{internal_error, McpError};
 /// not returned (logged + swallowed).
 pub async fn create_claim_idempotent(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim: &Claim,
     tool_name: &'static str,
 ) -> Result<(Claim, bool), McpError> {
     let mut conn = pool.acquire().await.map_err(internal_error)?;
-    let (claim, was_created) = ClaimRepository::create_or_get(&mut conn, claim)
+    let (claim, was_created) = ClaimRepository::create_or_get(&mut conn, viewer, claim)
         .await
         .map_err(internal_error)?;
     drop(conn);

@@ -64,19 +64,30 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
+    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
+        epigraph_db::visibility::SystemReason::BeliefRecomputation,
+    )
+    .await
+    .expect("maintenance viewer");
+    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+    if let Err(e) = run(cli, viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    cli: Cli,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pool = epigraph_cli::db_connect().await?;
 
     let cohort = select_cohort(&pool).await?;
@@ -87,18 +98,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if cli.dry_run {
-        run_dry(&pool, &cohort).await?;
+        run_dry(&pool, viewer, &cohort).await?;
         return Ok(());
     }
 
-    run_for_real(&pool, cohort, cli.concurrency, cli.progress_every).await
+    run_for_real(&pool, viewer, cohort, cli.concurrency, cli.progress_every).await
 }
 
 /// Dry-run path: sequential (no concurrency needed — read-only, and the
 /// point is a readable before/after/delta report, not throughput) preview
 /// of every cohort claim. Prints claim_id, cached_before, recomputed_after,
 /// delta. Writes nothing.
-async fn run_dry(pool: &sqlx::PgPool, cohort: &[Uuid]) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_dry(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    cohort: &[Uuid],
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("DRY-RUN — no writes");
     println!(
         "{:<38} {:>14} {:>16} {:>10}",
@@ -114,7 +129,7 @@ async fn run_dry(pool: &sqlx::PgPool, cohort: &[Uuid]) -> Result<(), Box<dyn std
                 .await?
                 .flatten();
 
-        let previews = preview_claim(pool, claim_id).await?;
+        let previews = preview_claim(pool, viewer, claim_id).await?;
         // claims.pignistic_prob is frame-agnostic — last writer wins across
         // a claim's frames, same ordering `run_claim` writes in. Report the
         // last preview's value as "what a real run would leave cached".
@@ -157,6 +172,7 @@ async fn run_dry(pool: &sqlx::PgPool, cohort: &[Uuid]) -> Result<(), Box<dyn std
 /// `recompute_claim_belief.rs`'s fan-out shape.
 async fn run_for_real(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     cohort: Vec<Uuid>,
     concurrency: usize,
     progress_every: usize,
@@ -178,9 +194,10 @@ async fn run_for_real(
         let claims_empty = claims_empty.clone();
         let frame_writes = frame_writes.clone();
         let errors = errors.clone();
+        let viewer = viewer.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            match run_claim(&pool, claim_id).await {
+            match run_claim(&pool, &viewer, claim_id).await {
                 Ok(written) => {
                     if written > 0 {
                         claims_with_work.fetch_add(1, Ordering::Relaxed);

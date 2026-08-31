@@ -8,6 +8,14 @@
 //! - `community` → full content if the requester's agent owns a perspective that
 //!   is a member of `ownership.community_id`; otherwise coarse metadata only
 //! - `private` → full content only for the owner agent; coarse metadata for all others
+//! - anything else → coarse metadata only. The three arms above are not a total
+//!   match on `text`; they are a total match on the values
+//!   `ownership_partition_check` currently admits. That CHECK is a database
+//!   constraint, not a type, so the `_` arm is reachable the moment the
+//!   constraint is widened, dropped, or a row is written by a role that skips
+//!   it. Locked decision D1 ("nothing is public by absence, omission, or
+//!   default-on-error") forbids granting full content for a partition value
+//!   this code cannot classify.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -145,7 +153,19 @@ pub async fn check_content_access(
                 ContentAccess::Redacted
             }
         }
-        _ => ContentAccess::Full, // Unknown partition → safe default
+        // UNRECOGNISED PARTITION. Not a "safe default" — the previous comment
+        // claimed that while doing the opposite. A `partition_type` this match
+        // does not name is a row this code does not understand, and D1 forbids
+        // granting full content on a value we cannot classify. The arm is
+        // unreachable *today* only because `ownership_partition_check`
+        // (CHECK partition_type IN ('public','community','private')) narrows the
+        // vocabulary — a database constraint, not a type. Widen the constraint,
+        // drop it, or write through a role that bypasses it, and this arm
+        // decides. It decides closed.
+        //
+        // Covered by `tenant_isolation.rs::unknown_partition_type_is_redacted`,
+        // which drops the CHECK inside a throwaway `#[sqlx::test]` database.
+        _ => ContentAccess::Redacted,
     }
 }
 

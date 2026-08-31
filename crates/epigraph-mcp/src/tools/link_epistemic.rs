@@ -103,9 +103,10 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 pub async fn link_epistemic(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: LinkEpistemicParams,
 ) -> Result<CallToolResult, McpError> {
-    do_link_epistemic(server, params).await
+    do_link_epistemic(server, viewer, params).await
 }
 
 /// Core logic factored out so integration tests can call it directly without
@@ -113,6 +114,7 @@ pub async fn link_epistemic(
 /// `do_link_hierarchical`).
 pub async fn do_link_epistemic(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: LinkEpistemicParams,
 ) -> Result<CallToolResult, McpError> {
     let source_id = parse_uuid(&params.source_claim_id)?;
@@ -144,7 +146,7 @@ pub async fn do_link_epistemic(
 
     // Verify both claims exist via the repo layer (SQL stays in epigraph-db).
     // Disambiguate which side is missing.
-    if ClaimRepository::get_by_id(pool, ClaimId::from_uuid(source_id))
+    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(source_id))
         .await
         .map_err(internal_error)?
         .is_none()
@@ -153,7 +155,7 @@ pub async fn do_link_epistemic(
             "source_claim_id {source_id} not found"
         )));
     }
-    if ClaimRepository::get_by_id(pool, ClaimId::from_uuid(target_id))
+    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(target_id))
         .await
         .map_err(internal_error)?
         .is_none()
@@ -207,6 +209,7 @@ pub async fn do_link_epistemic(
         // move no belief, so we honestly report `belief_wired=false`.
         let outcome = auto_wire_edge_if_epistemic(
             pool,
+            viewer,
             was_created,
             edge_row.id,
             source_id,
@@ -247,30 +250,33 @@ pub async fn do_link_epistemic(
     // recompute wrote (belief / plausibility / pignistic_prob). NOT the unframed
     // `belief_query::get_belief`, which reads `truth_value` and so would NOT
     // reflect the wire.
-    let target_belief =
-        match ClaimRepository::get_belief_columns(pool, ClaimId::from_uuid(target_id)).await {
-            Ok(Some(cols)) => match (cols.belief, cols.plausibility, cols.pignistic_prob) {
-                (Some(belief), Some(plausibility), Some(pignistic_prob)) => {
-                    Some(LinkEpistemicBelief {
-                        belief,
-                        plausibility,
-                        pignistic_prob,
-                    })
-                }
-                // Claim with no BBA yet → NULL DS columns → belief not reportable.
-                _ => None,
-            },
-            // Missing row: belief not reportable.
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(
-                    target = %target_id,
-                    error = ?e,
-                    "link_epistemic: target belief readback failed (non-fatal)"
-                );
-                None
-            }
-        };
+    let target_belief = match ClaimRepository::get_belief_columns(
+        pool,
+        viewer,
+        ClaimId::from_uuid(target_id),
+    )
+    .await
+    {
+        Ok(Some(cols)) => match (cols.belief, cols.plausibility, cols.pignistic_prob) {
+            (Some(belief), Some(plausibility), Some(pignistic_prob)) => Some(LinkEpistemicBelief {
+                belief,
+                plausibility,
+                pignistic_prob,
+            }),
+            // Claim with no BBA yet → NULL DS columns → belief not reportable.
+            _ => None,
+        },
+        // Missing row: belief not reportable.
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                target = %target_id,
+                error = ?e,
+                "link_epistemic: target belief readback failed (non-fatal)"
+            );
+            None
+        }
+    };
 
     success_json(&LinkEpistemicResponse {
         edge_id: edge_row.id.to_string(),

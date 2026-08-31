@@ -26,6 +26,9 @@
 //! returns a claim ANN alone would never find, not just that the param is
 //! accepted without crashing.
 
+#[path = "viewer_fixture.rs"]
+mod viewerfx;
+
 #[rustfmt::skip]
 use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 use epigraph_mcp::tools::link_epistemic::do_link_epistemic;
@@ -226,6 +229,7 @@ fn parse_response(result: rmcp::model::CallToolResult) -> RecallResponseStruct {
 async fn build_two_hop_fixture(
     pool: PgPool,
 ) -> (epigraph_mcp::EpiGraphMcpFull, String, Uuid, Uuid, Uuid) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     let agent = fixture::seed_agent(&pool).await;
     let paper = fixture::seed_paper(&pool, "10.1/graph-expansion", "Graph expansion test").await;
 
@@ -283,7 +287,7 @@ async fn build_two_hop_fixture(
     let server = build_test_server(pool.clone());
 
     do_link_epistemic(
-        &server,
+        &server, &viewer,
         LinkEpistemicParams {
             source_claim_id: a.to_string(),
             target_claim_id: mid.to_string(),
@@ -295,7 +299,7 @@ async fn build_two_hop_fixture(
     .expect("A supports MID");
 
     do_link_epistemic(
-        &server,
+        &server, &viewer,
         LinkEpistemicParams {
             source_claim_id: mid.to_string(),
             target_claim_id: b.to_string(),
@@ -315,6 +319,7 @@ async fn build_two_hop_fixture(
 /// surfaces something flat ANN would miss entirely.
 #[sqlx::test(migrations = "../../migrations")]
 async fn graph_expansion_depth_2_surfaces_two_hop_claim(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     let (server, query_pgvec, a, _mid, b) = build_two_hop_fixture(pool).await;
 
     // limit=3: ANN seed pool is deterministically {A, decoy, decoy} (see
@@ -322,7 +327,7 @@ async fn graph_expansion_depth_2_surfaces_two_hop_claim(pool: PgPool) {
     // expansion-assigned score (`seed_similarity * 0.7^hops`, positive)
     // gives it a real shot at the 3rd result slot on its own merit.
     let params = base_params(Some(2), 3);
-    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
         .await
         .expect("recall with graph_expansion_depth=2 succeeds");
     let resp = parse_response(result);
@@ -346,10 +351,11 @@ async fn graph_expansion_depth_2_surfaces_two_hop_claim(pool: PgPool) {
 /// unset case reproduces today's flat-ANN-only behaviour.
 #[sqlx::test(migrations = "../../migrations")]
 async fn graph_expansion_unset_does_not_surface_two_hop_claim(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     let (server, query_pgvec, a, mid, b) = build_two_hop_fixture(pool).await;
 
     let params = base_params(None, 2);
-    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
         .await
         .expect("recall with graph_expansion_depth unset succeeds");
     let resp = parse_response(result);
@@ -379,10 +385,11 @@ async fn graph_expansion_unset_does_not_surface_two_hop_claim(pool: PgPool) {
 /// "on vs off").
 #[sqlx::test(migrations = "../../migrations")]
 async fn graph_expansion_depth_1_does_not_reach_two_hop_claim(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     let (server, query_pgvec, a, _mid, b) = build_two_hop_fixture(pool).await;
 
     let params = base_params(Some(1), 2);
-    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
         .await
         .expect("recall with graph_expansion_depth=1 succeeds");
     let resp = parse_response(result);

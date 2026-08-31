@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, agent_id, tool, query_text, query_embedding_hash,\n                   params, returned_claim_ids, created_at\n            FROM recall_events\n            WHERE ($1::uuid   IS NULL OR agent_id = $1)\n              AND ($2::uuid[] IS NULL OR returned_claim_ids @> $2)\n              AND ($3::timestamptz IS NULL OR created_at >= $3)\n              AND ($4::timestamptz IS NULL OR created_at <= $4)\n              AND ($7::bool OR visibility = 'public' OR owner_group_id = ANY($8::uuid[]))\n            ORDER BY created_at DESC\n            LIMIT $5 OFFSET $6\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "agent_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "tool",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "query_text",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "query_embedding_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 5,
+        "name": "params",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "returned_claim_ids",
+        "type_info": "UuidArray"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray",
+        "Timestamptz",
+        "Timestamptz",
+        "Int8",
+        "Int8",
+        "Bool",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "625467dc15dfbbced87d4ec90d6d16688c5de34b8a5f3b7b11f3431f3358ff44"
+}

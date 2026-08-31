@@ -14,6 +14,9 @@
 //! deterministic spine carries the `section_follows` edge between the two
 //! sections.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
@@ -35,6 +38,7 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn structure_then_ingest_yields_verbatim_spine(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let src = "# Intro\n\nAlpha is a fact.\n\n## Body\n\nBeta follows alpha.";
 
@@ -65,7 +69,7 @@ async fn structure_then_ingest_yields_verbatim_spine(pool: PgPool) {
     // 3) ingest inline; the writer re-verifies the threaded source_text + spans.
     //    ingest_document_inline is fire-and-forget: it spawns the write as a
     //    detached Tokio task and returns {"status":"queued"} immediately.
-    let result = ingest_document_inline(&server, IngestDocumentInlineParams { extraction })
+    let result = ingest_document_inline(&server, &viewer, IngestDocumentInlineParams { extraction })
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();

@@ -128,6 +128,13 @@ impl EdgeRepository {
 
         let existing = sqlx::query!(
             r#"
+            -- VISIBILITY-EXEMPT: dedup probe inside a WRITE path
+            -- (`create_or_get`). It must see an existing edge regardless of who
+            -- is asking, or the "get" half silently becomes "create" and the
+            -- table grows a duplicate every time a caller without read access
+            -- re-asserts a link that is already there. PR-16 owns the
+            -- write-side authorization that decides whether the caller may
+            -- create the edge at all.
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE source_id = $1 AND target_id = $2 AND relationship = $3
@@ -290,7 +297,9 @@ impl EdgeRepository {
 
         // Dedup hit — surface the id of the existing symmetric edge.
         let existing: Uuid = sqlx::query_scalar(
-            "SELECT id FROM edges
+            "-- VISIBILITY-EXEMPT: symmetric-dedup probe inside a WRITE path;
+             -- same reasoning as `create_or_get`'s.
+             SELECT id FROM edges
              WHERE ((source_id = $1 AND target_id = $2)
                  OR (source_id = $2 AND target_id = $1))
                AND relationship = $3
@@ -309,21 +318,29 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_by_source(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         source_id: Uuid,
         source_type: &str,
     ) -> Result<Vec<EdgeRow>, DbError> {
+        // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
+        // spliced. `edges` uses the plain predicate, NOT an edge-specific
+        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
+        // and does not exist yet (see `visibility.rs`'s module docs).
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE source_id = $1 AND source_type = $2
+              AND ($3::bool OR visibility = 'public' OR owner_group_id = ANY($4::uuid[]))
             ORDER BY created_at DESC
             "#,
             source_id,
-            source_type
+            source_type,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -368,12 +385,13 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn list_current_claim_targets(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         source_id: Uuid,
     ) -> Result<Vec<(Uuid, Uuid, String)>, DbError> {
-        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT e.id, e.target_id, e.relationship
             FROM edges e
@@ -382,12 +400,16 @@ impl EdgeRepository {
               AND e.source_type = 'claim'
               AND e.target_type = 'claim'
               AND e.relationship <> 'supersedes'
+              /* {VISIBILITY:e} */ /* {VISIBILITY:c} */
             ORDER BY e.id
             "#,
-        )
-        .bind(source_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, String)>(&sql).bind(source_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid, Uuid, String)> = q.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -396,21 +418,29 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_by_target(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         target_id: Uuid,
         target_type: &str,
     ) -> Result<Vec<EdgeRow>, DbError> {
+        // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
+        // spliced. `edges` uses the plain predicate, NOT an edge-specific
+        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
+        // and does not exist yet (see `visibility.rs`'s module docs).
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE target_id = $1 AND target_type = $2
+              AND ($3::bool OR visibility = 'public' OR owner_group_id = ANY($4::uuid[]))
             ORDER BY created_at DESC
             "#,
             target_id,
-            target_type
+            target_type,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -435,19 +465,27 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_by_relationship(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         relationship: &str,
     ) -> Result<Vec<EdgeRow>, DbError> {
+        // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
+        // spliced. `edges` uses the plain predicate, NOT an edge-specific
+        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
+        // and does not exist yet (see `visibility.rs`'s module docs).
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE relationship = $1
+              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
             ORDER BY created_at DESC
             "#,
-            relationship
+            relationship,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -472,26 +510,34 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_between(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         source_id: Uuid,
         source_type: &str,
         target_id: Uuid,
         target_type: &str,
     ) -> Result<Vec<EdgeRow>, DbError> {
+        // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
+        // spliced. `edges` uses the plain predicate, NOT an edge-specific
+        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
+        // and does not exist yet (see `visibility.rs`'s module docs).
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE source_id = $1 AND source_type = $2
               AND target_id = $3 AND target_type = $4
+              AND ($5::bool OR visibility = 'public' OR owner_group_id = ANY($6::uuid[]))
             ORDER BY created_at DESC
             "#,
             source_id,
             source_type,
             target_id,
-            target_type
+            target_type,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -526,9 +572,11 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_filtered(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         source_id: Option<Uuid>,
         target_id: Option<Uuid>,
         relationship: Option<&str>,
@@ -545,6 +593,7 @@ impl EdgeRepository {
               AND ($3::text IS NULL OR relationship = $3)
               AND ($4::text IS NULL OR source_type = $4)
               AND ($5::text IS NULL OR target_type = $5)
+              AND ($7::bool OR visibility = 'public' OR owner_group_id = ANY($8::uuid[]))
             ORDER BY valid_from DESC NULLS LAST, id
             LIMIT $6
             "#,
@@ -554,6 +603,8 @@ impl EdgeRepository {
             source_type,
             target_type,
             limit,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -578,16 +629,27 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn list_all(pool: &PgPool, limit: i64) -> Result<Vec<EdgeRow>, DbError> {
+    #[instrument(skip(pool, viewer))]
+    pub async fn list_all(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        limit: i64,
+    ) -> Result<Vec<EdgeRow>, DbError> {
+        // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
+        // spliced. `edges` uses the plain predicate, NOT an edge-specific
+        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
+        // and does not exist yet (see `visibility.rs`'s module docs).
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
+            WHERE ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
             ORDER BY created_at DESC
             LIMIT $1
             "#,
-            limit
+            limit,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -610,12 +672,17 @@ impl EdgeRepository {
 
     /// Get currently-valid edges for an entity with a specific relationship.
     /// Returns edges where valid_to IS NULL (ongoing or atemporal).
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_current_edges(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         entity_id: Uuid,
         relationship: &str,
     ) -> Result<Vec<EdgeRow>, DbError> {
+        // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
+        // spliced. `edges` uses the plain predicate, NOT an edge-specific
+        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
+        // and does not exist yet (see `visibility.rs`'s module docs).
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
@@ -623,10 +690,13 @@ impl EdgeRepository {
             WHERE (source_id = $1 OR target_id = $1)
               AND relationship = $2
               AND valid_to IS NULL
+              AND ($3::bool OR visibility = 'public' OR owner_group_id = ANY($4::uuid[]))
             ORDER BY valid_from DESC NULLS LAST
             "#,
             entity_id,
-            relationship
+            relationship,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -759,21 +829,28 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn count_for_entity(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         entity_id: Uuid,
         entity_type: &str,
     ) -> Result<i64, DbError> {
+        // MACRO SITE. PARENTHESES: the pre-existing predicate is an OR chain,
+        // and AND binds tighter, so the visibility term is ANDed to the whole
+        // disjunction rather than to its last arm.
         let row = sqlx::query!(
             r#"
             SELECT COUNT(*) as count
             FROM edges
-            WHERE (source_id = $1 AND source_type = $2)
-               OR (target_id = $1 AND target_type = $2)
+            WHERE ((source_id = $1 AND source_type = $2)
+                OR (target_id = $1 AND target_type = $2))
+              AND ($3::bool OR visibility = 'public' OR owner_group_id = ANY($4::uuid[]))
             "#,
             entity_id,
-            entity_type
+            entity_type,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_one(pool)
         .await?;
@@ -801,15 +878,16 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_claims_attributed_to(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
         min_truth: f64,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<AttributedClaimRow>, DbError> {
-        let rows = sqlx::query_as::<_, AttributedClaimRow>(
+        let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id,
                    c.trace_id, c.created_at, c.updated_at,
@@ -821,16 +899,21 @@ impl EdgeRepository {
               AND e.source_type = 'claim'
               AND e.relationship IN ('attributed_to', 'ATTRIBUTED_TO')
               AND c.truth_value >= $2
+              /* {VISIBILITY:e} */ /* {VISIBILITY:c} */
             ORDER BY c.created_at DESC
             LIMIT $3 OFFSET $4
             "#,
-        )
-        .bind(agent_id)
-        .bind(min_truth)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+            5,
+        );
+        let mut q = sqlx::query_as::<_, AttributedClaimRow>(&sql)
+            .bind(agent_id)
+            .bind(min_truth)
+            .bind(limit)
+            .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -839,13 +922,14 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn count_claims_attributed_to(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
         min_truth: f64,
     ) -> Result<i64, DbError> {
-        let row: (i64,) = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT COUNT(*)
             FROM edges e
@@ -855,12 +939,17 @@ impl EdgeRepository {
               AND e.source_type = 'claim'
               AND e.relationship IN ('attributed_to', 'ATTRIBUTED_TO')
               AND c.truth_value >= $2
+              /* {VISIBILITY:e} */ /* {VISIBILITY:c} */
             "#,
-        )
-        .bind(agent_id)
-        .bind(min_truth)
-        .fetch_one(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (i64,)>(&sql)
+            .bind(agent_id)
+            .bind(min_truth);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: (i64,) = q.fetch_one(pool).await?;
 
         Ok(row.0)
     }

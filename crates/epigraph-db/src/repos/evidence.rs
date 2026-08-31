@@ -122,18 +122,27 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: EvidenceId) -> Result<Option<Evidence>, DbError> {
+    #[instrument(skip(pool, viewer))]
+    pub async fn get_by_id(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        id: EvidenceId,
+    ) -> Result<Option<Evidence>, DbError> {
         let uuid: Uuid = id.into();
 
+        // MACRO SITE — static three-bind spelling. `evidence` carries its own
+        // tenancy columns (migration 062), so the predicate is on the row.
         let row = sqlx::query!(
             r#"
             SELECT id, content_hash, evidence_type, raw_content, claim_id,
                    signature, signer_id, properties, created_at
             FROM evidence
             WHERE id = $1
+              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
             "#,
-            uuid
+            uuid,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_optional(pool)
         .await?;
@@ -184,19 +193,30 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_claim(pool: &PgPool, claim_id: ClaimId) -> Result<Vec<Evidence>, DbError> {
+    #[instrument(skip(pool, viewer))]
+    pub async fn get_by_claim(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: ClaimId,
+    ) -> Result<Vec<Evidence>, DbError> {
         let uuid: Uuid = claim_id.into();
 
+        // MACRO SITE — static three-bind spelling. The change inventory
+        // expected a joined `claims` alias here; the query reads `evidence`
+        // alone, and the claim-side check belongs to the caller that already
+        // resolved the claim id.
         let rows = sqlx::query!(
             r#"
             SELECT id, content_hash, evidence_type, raw_content, claim_id,
                    signature, signer_id, properties, created_at
             FROM evidence
             WHERE claim_id = $1
+              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
             ORDER BY created_at DESC
             "#,
-            uuid
+            uuid,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
         .fetch_all(pool)
         .await?;
@@ -251,8 +271,15 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn delete(pool: &PgPool, id: EvidenceId) -> Result<bool, DbError> {
+    /// Takes a viewer it does not yet use: WRITE path, PR-16 owns the
+    /// write-side predicate. The parameter exists so the hook is already at
+    /// every call site.
+    #[instrument(skip(pool, _viewer))]
+    pub async fn delete(
+        pool: &PgPool,
+        _viewer: &crate::visibility::Viewer,
+        id: EvidenceId,
+    ) -> Result<bool, DbError> {
         let uuid: Uuid = id.into();
 
         let result = sqlx::query!(
@@ -316,13 +343,14 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, query_embedding_pgvector))]
+    #[instrument(skip(pool, viewer, query_embedding_pgvector))]
     pub async fn search_by_embedding(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
     ) -> Result<Vec<EvidenceSearchResult>, DbError> {
-        let rows = sqlx::query_as::<_, EvidenceSearchResult>(
+        let sql = viewer.splice(
             r#"
             SELECT
                 e.id,
@@ -335,15 +363,21 @@ impl EvidenceRepository {
                   SELECT 1 FROM claims c
                   WHERE c.id = e.claim_id
                     AND COALESCE(c.is_current, true) = true
+                    /* {VISIBILITY:c} */
               )
+              /* {VISIBILITY:e} */
             ORDER BY e.embedding <=> $1::vector
             LIMIT $2
             "#,
-        )
-        .bind(query_embedding_pgvector)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, EvidenceSearchResult>(&sql)
+            .bind(query_embedding_pgvector)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(pool).await?;
 
         Ok(rows)
     }

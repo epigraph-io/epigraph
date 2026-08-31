@@ -2,6 +2,9 @@
 //! introduced in S1 of the noun-claims-and-verb-edges architecture
 //! (see docs/architecture/noun-claims-and-verb-edges.md).
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::{AgentId, Claim, TruthValue};
 use epigraph_crypto::ContentHasher;
 use epigraph_db::ClaimRepository;
@@ -172,6 +175,7 @@ fn make_claim(content: &str, agent_id: Uuid) -> Claim {
 #[tokio::test]
 async fn find_by_content_hash_and_agent_returns_none_when_no_row() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     let agent_id = Uuid::new_v4();
     insert_test_agent(&pool, agent_id).await;
 
@@ -180,7 +184,7 @@ async fn find_by_content_hash_and_agent_returns_none_when_no_row() {
     let hash = ContentHasher::hash(content.as_bytes());
 
     let found =
-        ClaimRepository::find_by_content_hash_and_agent(&mut conn, hash.as_slice(), agent_id)
+        ClaimRepository::find_by_content_hash_and_agent(&mut conn, &viewer, hash.as_slice(), agent_id)
             .await
             .expect("find call");
 
@@ -190,6 +194,7 @@ async fn find_by_content_hash_and_agent_returns_none_when_no_row() {
 #[tokio::test]
 async fn find_by_content_hash_and_agent_returns_some_when_matching() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     let agent_id = Uuid::new_v4();
     insert_test_agent(&pool, agent_id).await;
 
@@ -202,7 +207,7 @@ async fn find_by_content_hash_and_agent_returns_some_when_matching() {
     let hash = ContentHasher::hash(claim.content.as_bytes());
 
     let found =
-        ClaimRepository::find_by_content_hash_and_agent(&mut conn, hash.as_slice(), agent_id)
+        ClaimRepository::find_by_content_hash_and_agent(&mut conn, &viewer, hash.as_slice(), agent_id)
             .await
             .expect("find call");
 
@@ -293,6 +298,7 @@ async fn create_strict_returns_duplicate_key_post_107() {
 #[tokio::test]
 async fn create_or_get_inserts_when_no_existing() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -301,7 +307,7 @@ async fn create_or_get_inserts_when_no_existing() {
     let claim = make_claim(&format!("cog insert {}", Uuid::new_v4()), agent_id);
     let mut conn = pool.acquire().await.expect("acquire conn");
 
-    let (returned, was_created) = ClaimRepository::create_or_get(&mut conn, &claim)
+    let (returned, was_created) = ClaimRepository::create_or_get(&mut conn, &viewer, &claim)
         .await
         .expect("create_or_get");
 
@@ -312,6 +318,7 @@ async fn create_or_get_inserts_when_no_existing() {
 #[tokio::test]
 async fn create_or_get_returns_existing_when_present() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -319,13 +326,13 @@ async fn create_or_get_returns_existing_when_present() {
 
     let claim = make_claim(&format!("cog existing {}", Uuid::new_v4()), agent_id);
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let (first, first_created) = ClaimRepository::create_or_get(&mut conn, &claim)
+    let (first, first_created) = ClaimRepository::create_or_get(&mut conn, &viewer, &claim)
         .await
         .expect("first call");
     drop(conn);
 
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let (second, second_created) = ClaimRepository::create_or_get(&mut conn, &claim)
+    let (second, second_created) = ClaimRepository::create_or_get(&mut conn, &viewer, &claim)
         .await
         .expect("second call");
 
@@ -357,6 +364,7 @@ async fn create_or_get_returns_existing_when_present() {
 #[tokio::test]
 async fn create_or_get_is_idempotent_post_107() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     add_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -365,13 +373,13 @@ async fn create_or_get_is_idempotent_post_107() {
     let claim = make_claim(&format!("cog post107 {}", Uuid::new_v4()), agent_id);
 
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let (first, first_created) = ClaimRepository::create_or_get(&mut conn, &claim)
+    let (first, first_created) = ClaimRepository::create_or_get(&mut conn, &viewer, &claim)
         .await
         .expect("first call");
     drop(conn);
 
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let (second, second_created) = ClaimRepository::create_or_get(&mut conn, &claim)
+    let (second, second_created) = ClaimRepository::create_or_get(&mut conn, &viewer, &claim)
         .await
         .expect("second call");
 

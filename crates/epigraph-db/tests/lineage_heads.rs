@@ -6,6 +6,9 @@
 //! claim has a `supersedes` edge pointing AT it. `revises` edges do
 //! not remove head status — they mark concurrent branches.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -60,6 +63,7 @@ async fn seed_edge(pool: &PgPool, src: Uuid, tgt: Uuid, rel: &str) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn linear_supersedes_chain_has_one_head(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let lineage = Uuid::new_v4();
 
@@ -70,7 +74,7 @@ async fn linear_supersedes_chain_has_one_head(pool: PgPool) {
     seed_edge(&pool, v2, v1, "supersedes").await;
     seed_edge(&pool, v3, v2, "supersedes").await;
 
-    let heads = ClaimRepository::latest_in_lineage(&pool, lineage)
+    let heads = ClaimRepository::latest_in_lineage(&pool, &viewer, lineage)
         .await
         .unwrap();
     let head_ids: Vec<Uuid> = heads.iter().map(|h| h.id).collect();
@@ -83,6 +87,7 @@ async fn linear_supersedes_chain_has_one_head(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn revises_branches_produce_multiple_heads(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let lineage = Uuid::new_v4();
 
@@ -93,7 +98,7 @@ async fn revises_branches_produce_multiple_heads(pool: PgPool) {
     seed_edge(&pool, a_v2, v1, "revises").await;
     seed_edge(&pool, b_v2, v1, "revises").await;
 
-    let heads = ClaimRepository::latest_in_lineage(&pool, lineage)
+    let heads = ClaimRepository::latest_in_lineage(&pool, &viewer, lineage)
         .await
         .unwrap();
     let head_ids: std::collections::HashSet<Uuid> = heads.iter().map(|h| h.id).collect();
@@ -114,7 +119,8 @@ async fn revises_branches_produce_multiple_heads(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn empty_when_lineage_has_no_claims(pool: PgPool) {
-    let heads = ClaimRepository::latest_in_lineage(&pool, Uuid::new_v4())
+    let viewer = fixture::public_viewer(&pool).await;
+    let heads = ClaimRepository::latest_in_lineage(&pool, &viewer, Uuid::new_v4())
         .await
         .unwrap();
     assert!(heads.is_empty());

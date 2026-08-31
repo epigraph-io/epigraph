@@ -143,24 +143,28 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_for_claim_frame(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         frame_id: Uuid,
     ) -> Result<Vec<MassFunctionRow>, DbError> {
-        let rows: Vec<MassFunctionRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2
+              /* {VISIBILITY:mass_functions} */
             ORDER BY created_at ASC
             "#,
-        )
-        .bind(claim_id)
-        .bind(frame_id)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut vq = sqlx::query_as(&sql).bind(claim_id).bind(frame_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows: Vec<MassFunctionRow> = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -169,19 +173,26 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<MassFunctionRow>, DbError> {
-        let row: Option<MassFunctionRow> = sqlx::query_as(
+    #[instrument(skip(pool, viewer))]
+    pub async fn get_by_id(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<MassFunctionRow>, DbError> {
+        let sql = viewer.splice(
             r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE id = $1
+              /* {VISIBILITY:mass_functions} */
             "#,
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .map_err(DbError::from)?;
+            2,
+        );
+        let mut vq = sqlx::query_as(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let row: Option<MassFunctionRow> = vq.fetch_optional(pool).await.map_err(DbError::from)?;
 
         Ok(row)
     }
@@ -190,22 +201,27 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_for_claim(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<MassFunctionRow>, DbError> {
-        let rows: Vec<MassFunctionRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1
+              /* {VISIBILITY:mass_functions} */
             ORDER BY frame_id, created_at ASC
             "#,
-        )
-        .bind(claim_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut vq = sqlx::query_as(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows: Vec<MassFunctionRow> = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -221,12 +237,13 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_for_claim_binary_frames(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<MassFunctionRow>, DbError> {
-        let rows: Vec<MassFunctionRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT mf.id, mf.claim_id, mf.frame_id, mf.source_agent_id, mf.perspective_id,
                    mf.masses, mf.conflict_k, mf.combination_method, mf.source_strength,
@@ -234,12 +251,16 @@ impl MassFunctionRepository {
             FROM mass_functions mf
             JOIN frames f ON mf.frame_id = f.id
             WHERE mf.claim_id = $1 AND array_length(f.hypotheses, 1) = 2
+              /* {VISIBILITY:mf} */ /* {VISIBILITY:f} */
             ORDER BY mf.frame_id, mf.created_at ASC
             "#,
-        )
-        .bind(claim_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut vq = sqlx::query_as(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows: Vec<MassFunctionRow> = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -248,26 +269,32 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_for_claim_frame_perspective(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         frame_id: Uuid,
         perspective_id: Uuid,
     ) -> Result<Vec<MassFunctionRow>, DbError> {
-        let rows: Vec<MassFunctionRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2 AND perspective_id = $3
+              /* {VISIBILITY:mass_functions} */
             ORDER BY created_at ASC
             "#,
-        )
-        .bind(claim_id)
-        .bind(frame_id)
-        .bind(perspective_id)
-        .fetch_all(pool)
-        .await?;
+            4,
+        );
+        let mut vq = sqlx::query_as(&sql)
+            .bind(claim_id)
+            .bind(frame_id)
+            .bind(perspective_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows: Vec<MassFunctionRow> = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -276,26 +303,32 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, perspective_ids))]
+    #[instrument(skip(pool, perspective_ids, viewer))]
     pub async fn get_for_claim_frame_perspectives(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         frame_id: Uuid,
         perspective_ids: &[Uuid],
     ) -> Result<Vec<MassFunctionRow>, DbError> {
-        let rows: Vec<MassFunctionRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2 AND perspective_id = ANY($3)
+              /* {VISIBILITY:mass_functions} */
             ORDER BY created_at ASC
             "#,
-        )
-        .bind(claim_id)
-        .bind(frame_id)
-        .bind(perspective_ids)
-        .fetch_all(pool)
-        .await?;
+            4,
+        );
+        let mut vq = sqlx::query_as(&sql)
+            .bind(claim_id)
+            .bind(frame_id)
+            .bind(perspective_ids);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows: Vec<MassFunctionRow> = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -313,21 +346,25 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn exists_for_perspective(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         perspective_id: Uuid,
     ) -> Result<bool, DbError> {
-        let exists: bool = sqlx::query_scalar(
+        let sql = viewer.splice(
             r#"
             SELECT EXISTS (
-                SELECT 1 FROM mass_functions WHERE perspective_id = $1
+                SELECT 1 FROM mass_functions WHERE perspective_id = $1 /* {VISIBILITY:mass_functions} */
             )
             "#,
-        )
-        .bind(perspective_id)
-        .fetch_one(pool)
-        .await?;
+            2,
+        );
+        let mut vq = sqlx::query_scalar(&sql).bind(perspective_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let exists: bool = vq.fetch_one(pool).await?;
 
         Ok(exists)
     }
@@ -532,19 +569,22 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn count_for_claim_frame(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         frame_id: Uuid,
     ) -> Result<i64, DbError> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 AND frame_id = $2",
-        )
-        .bind(claim_id)
-        .bind(frame_id)
-        .fetch_one(pool)
-        .await?;
+        let sql = viewer.splice(
+            "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 AND frame_id = $2 /* {VISIBILITY:mass_functions} */",
+            3,
+        );
+        let mut vq = sqlx::query_as(&sql).bind(claim_id).bind(frame_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let row: (i64,) = vq.fetch_one(pool).await?;
 
         Ok(row.0)
     }
@@ -555,22 +595,27 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_all_for_frame(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         frame_id: Uuid,
     ) -> Result<Vec<MassFunctionRow>, DbError> {
-        let rows: Vec<MassFunctionRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE frame_id = $1
+              /* {VISIBILITY:mass_functions} */
             ORDER BY claim_id, created_at ASC
             "#,
-        )
-        .bind(frame_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut vq = sqlx::query_as(&sql).bind(frame_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows: Vec<MassFunctionRow> = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -579,24 +624,29 @@ impl MassFunctionRepository {
     ///
     /// Returns all mass function rows for the given claim IDs,
     /// ordered by claim_id then created_at. The caller groups by claim_id.
-    #[instrument(skip(pool, claim_ids))]
+    #[instrument(skip(pool, claim_ids, viewer))]
     pub async fn get_for_claims(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_ids: &[Uuid],
     ) -> Result<Vec<MassFunctionRow>, DbError> {
-        let rows: Vec<MassFunctionRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id,
                    masses, conflict_k, combination_method,
                    source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = ANY($1)
+              /* {VISIBILITY:mass_functions} */
             ORDER BY claim_id, created_at ASC
             "#,
-        )
-        .bind(claim_ids)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut vq = sqlx::query_as(&sql).bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows: Vec<MassFunctionRow> = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -610,23 +660,28 @@ impl MassFunctionRepository {
     /// for two runs to converge to the same cached value. Frame-name order is
     /// that canonical order — it matches the `epigraph-recompute-belief`
     /// operator binary.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn list_frames_for_claim(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<(Uuid, String)>, DbError> {
-        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT DISTINCT mf.frame_id, f.name
             FROM mass_functions mf
             JOIN frames f ON f.id = mf.frame_id
             WHERE mf.claim_id = $1
+              /* {VISIBILITY:mf} */ /* {VISIBILITY:f} */
             ORDER BY f.name
             "#,
-        )
-        .bind(claim_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut vq = sqlx::query_as(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows: Vec<(Uuid, String)> = vq.fetch_all(pool).await?;
 
         Ok(rows)
     }
@@ -643,14 +698,27 @@ impl MassFunctionRepository {
     /// labels-target path (`list_by_labels(.., current_only = true, ..)`).
     /// `recompute_beliefs`' explicit `claim_ids` target bypasses this method,
     /// so a caller can still deliberately recompute a non-current claim by id.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn list_claim_ids(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Uuid>, DbError> {
+        debug_assert!(
+            viewer.is_bypass(),
+            "list_claim_ids is the belief-recompute enumerator; a Scoped viewer \
+             here would leave every other tenant's cached beliefs stale forever"
+        );
+        // No splice: this query is EXEMPT, and `Viewer::splice` panics on a
+        // marker-free literal by design.
         let rows: Vec<Uuid> = sqlx::query_scalar(
             r#"
+            -- VISIBILITY-EXEMPT: belief-recompute enumerator. Runs under
+            -- SystemReason::BeliefRecomputation on a maintenance connection; a
+            -- per-tenant view of the work queue would leave every other tenant's
+            -- cached beliefs permanently stale. The `_viewer` parameter exists
+            -- so the exemption is visible at every call site, not only here.
             SELECT DISTINCT mf.claim_id
             FROM mass_functions mf
             JOIN claims c ON c.id = mf.claim_id
@@ -724,7 +792,7 @@ mod tests {
         .await
         .unwrap();
 
-        let all = MassFunctionRepository::get_all_for_frame(&pool, frame_id)
+        let all = MassFunctionRepository::get_all_for_frame(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), frame_id)
             .await
             .unwrap();
         assert_eq!(all.len(), 2);
@@ -815,7 +883,7 @@ mod tests {
         .await
         .unwrap();
 
-        let frames = MassFunctionRepository::list_frames_for_claim(&pool, claim_id)
+        let frames = MassFunctionRepository::list_frames_for_claim(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), claim_id)
             .await
             .unwrap();
         assert_eq!(frames.len(), 2, "two distinct frames despite 3 BBAs");
@@ -869,7 +937,7 @@ mod tests {
         }
 
         // Ephemeral sqlx::test DB → only our 3 distinct claims have BBAs.
-        let all = MassFunctionRepository::list_claim_ids(&pool, 100, 0)
+        let all = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), 100, 0)
             .await
             .unwrap();
         assert_eq!(
@@ -883,10 +951,10 @@ mod tests {
         assert_eq!(all, expected, "ascending claim_id order");
 
         // Paging: page 1 (limit 2) + page 2 (offset 2) partition the set, disjoint.
-        let page1 = MassFunctionRepository::list_claim_ids(&pool, 2, 0)
+        let page1 = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), 2, 0)
             .await
             .unwrap();
-        let page2 = MassFunctionRepository::list_claim_ids(&pool, 2, 2)
+        let page2 = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), 2, 2)
             .await
             .unwrap();
         assert_eq!(page1, expected[..2].to_vec());
@@ -932,7 +1000,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ids = MassFunctionRepository::list_claim_ids(&pool, 100, 0)
+        let ids = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), 100, 0)
             .await
             .unwrap();
         assert_eq!(
@@ -1016,7 +1084,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rows = MassFunctionRepository::get_for_claim_frame(&pool, claim_id, frame_id)
+        let rows = MassFunctionRepository::get_for_claim_frame(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), claim_id, frame_id)
             .await
             .unwrap();
         assert_eq!(

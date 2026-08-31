@@ -4,6 +4,9 @@
 //! with the Wilson lower-bound gate, and returns whether the variant is
 //! promotable WITHOUT acting on it.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_db::{BehavioralExecutionRepository, BehavioralExecutionRow};
 use epigraph_mcp::types::EvaluateWorkflowPromotionParams;
@@ -83,6 +86,7 @@ async fn seed_runs(pool: &PgPool, wf: Uuid, successes: usize, failures: usize) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn promotes_confident_variant_over_weaker_parent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "ewp-agent").await;
     let parent = insert_claim(&pool, agent, "ewp-parent").await;
@@ -103,7 +107,7 @@ async fn promotes_confident_variant_over_weaker_parent(pool: PgPool) {
 
     let json = result_json(
         tools::workflows::evaluate_workflow_promotion(
-            &server,
+            &server, &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: variant.to_string(),
                 window: Some(50),
@@ -123,6 +127,7 @@ async fn promotes_confident_variant_over_weaker_parent(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn does_not_promote_small_sample_variant(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "ewp-agent2").await;
     let parent = insert_claim(&pool, agent, "ewp-parent2").await;
@@ -143,7 +148,7 @@ async fn does_not_promote_small_sample_variant(pool: PgPool) {
 
     let json = result_json(
         tools::workflows::evaluate_workflow_promotion(
-            &server,
+            &server, &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: variant.to_string(),
                 window: None,
@@ -160,13 +165,14 @@ async fn does_not_promote_small_sample_variant(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn lineage_root_has_nothing_to_promote_over(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "ewp-agent3").await;
     let root = insert_claim(&pool, agent, "ewp-root").await; // no variant_of edge
 
     let json = result_json(
         tools::workflows::evaluate_workflow_promotion(
-            &server,
+            &server, &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: root.to_string(),
                 window: None,

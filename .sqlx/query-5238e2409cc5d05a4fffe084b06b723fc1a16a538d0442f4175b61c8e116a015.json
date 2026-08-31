@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            -- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.\n            SELECT id, source_id, target_id, source_type, target_type,\n                   relationship, created_at\n            FROM edges\n            WHERE relationship != 'supersedes'\n              AND ( (source_id = ANY($1) AND source_type = 'claim')\n                 OR (target_id = ANY($1) AND target_type = 'claim') )\n            ORDER BY created_at, id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "source_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "source_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "target_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "relationship",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5238e2409cc5d05a4fffe084b06b723fc1a16a538d0442f4175b61c8e116a015"
+}

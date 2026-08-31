@@ -9,6 +9,7 @@
 //! - `GET /api/v1/skills` — list workflow skills
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -240,6 +241,7 @@ pub async fn learn_convention(
 ///
 /// `DELETE /api/v1/conventions/:id`
 pub async fn forget_convention(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
@@ -254,7 +256,7 @@ pub async fn forget_convention(
     let pool = &state.db_pool;
     let claim_id_typed = epigraph_core::ClaimId::from_uuid(claim_id);
 
-    let claim = epigraph_db::ClaimRepository::get_by_id(pool, claim_id_typed)
+    let claim = epigraph_db::ClaimRepository::get_by_id(pool, &viewer, claim_id_typed)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "convention".to_string(),
@@ -349,6 +351,7 @@ pub async fn forget_convention(
 ///
 /// `GET /api/v1/skills`
 pub async fn list_skills(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListSkillsQuery>,
 ) -> Result<Json<Vec<SkillResponse>>, ApiError> {
@@ -356,6 +359,7 @@ pub async fn list_skills(
 
     let rows = epigraph_db::WorkflowRepository::list(
         pool,
+        &viewer,
         params.min_truth,
         params.category.as_deref(),
         params.limit,
@@ -382,13 +386,14 @@ pub async fn list_skills(
 ///
 /// `POST /api/v1/skills/share`
 pub async fn share_skill(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<ShareSkillRequest>,
 ) -> Result<(StatusCode, Json<ShareSkillResponse>), ApiError> {
     let pool = &state.db_pool;
     let claim_id_typed = epigraph_core::ClaimId::from_uuid(request.workflow_id);
 
-    let claim = epigraph_db::ClaimRepository::get_by_id(pool, claim_id_typed)
+    let claim = epigraph_db::ClaimRepository::get_by_id(pool, &viewer, claim_id_typed)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "workflow".to_string(),

@@ -27,6 +27,9 @@
 //!   the typed frame. Faithful typed-frame full-BBA ingestion still needs the
 //!   repo tier (today) or a kernel feature (the filed request).
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 use common::*;
 
@@ -41,6 +44,7 @@ use uuid::Uuid;
 
 async fn add_evidence(
     server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     claim: Uuid,
     evidence_type: &str,
     supports: bool,
@@ -48,7 +52,7 @@ async fn add_evidence(
     note: &str,
 ) {
     update_with_evidence(
-        server,
+        server, &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,
@@ -67,6 +71,7 @@ async fn add_evidence(
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     // ── 4 observer lenses, reliability keyed on the CANONICAL vocabulary ──
@@ -128,15 +133,18 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
         persp.push(((*name).to_string(), row.id));
     }
 
-    let frame = ensure_binary_frame(&pool).await.expect("binary frame");
+    let frame = ensure_binary_frame(&pool, &viewer).await.expect("binary frame");
 
     let read = |claim: Uuid| {
         let pool = pool.clone();
         let persp = persp.clone();
+        // `async move` would otherwise move the single `viewer` binding into the
+        // first call, making `read` FnOnce and poisoning every later `&viewer`.
+        let viewer = viewer.clone();
         async move {
             let mut out: Vec<(String, f64)> = Vec::new();
             for (k, id) in &persp {
-                let b = get_perspective_belief(&pool, claim, frame, *id)
+                let b = get_perspective_belief(&pool, &viewer, claim, frame, *id)
                     .await
                     .expect("belief");
                 out.push((k.clone(), b.pignistic_prob));
@@ -156,18 +164,14 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
     let c_novel = seed_claim(&pool, "treatment-a is efficacious for symptom-6.", 0.5).await;
 
     // ── prior (discovery) evidence, mapped to canonical types ──
-    add_evidence(
-        &server,
-        c_eff,
+    add_evidence(&server, &viewer, c_eff,
         "empirical",
         true,
         0.55,
         "source_clinical: modest RCT signal",
     )
     .await; // source_clinical→empirical
-    add_evidence(
-        &server,
-        c_saf,
+    add_evidence(&server, &viewer, c_saf,
         "statistical",
         true,
         0.60,
@@ -181,9 +185,7 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
     let before_novel = read(c_novel).await;
 
     // ── the INTERVIEW, ingested via the real path as canonical `testimonial` ──
-    add_evidence(
-        &server,
-        c_eff,
+    add_evidence(&server, &viewer, c_eff,
         "testimonial",
         true,
         0.82,
@@ -191,18 +193,14 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
     )
     .await;
     // treatment-d: two-sided {safe 0.20, harmful 0.55} → can only be one-sided refutation
-    add_evidence(
-        &server,
-        c_saf,
+    add_evidence(&server, &viewer, c_saf,
         "testimonial",
         false,
         0.55,
         "practitioner: caution in chronic use of the condition cluster",
     )
     .await;
-    add_evidence(
-        &server,
-        c_novel,
+    add_evidence(&server, &viewer, c_novel,
         "testimonial",
         true,
         0.80,

@@ -19,6 +19,7 @@ use crate::state::AppState;
 #[cfg(feature = "db")]
 use epigraph_db::ClaimRepository;
 
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use std::collections::HashSet;
 
@@ -177,6 +178,7 @@ pub struct ClaimListResponse {
 /// Queries the claims table with filtering, sorting, and pagination.
 #[cfg(feature = "db")]
 pub async fn list_claims_query(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ClaimQueryParams>,
 ) -> Result<Json<ClaimListResponse>, ApiError> {
@@ -271,7 +273,7 @@ pub async fn list_claims_query(
     // ---- Pre-fetch methodology / evidence_type claim ID sets ----
     let methodology_ids: Option<HashSet<uuid::Uuid>> = match params.methodology {
         Some(ref m) => {
-            let ids = ClaimRepository::claim_ids_by_methodology(&state.db_pool, m)
+            let ids = ClaimRepository::claim_ids_by_methodology(&state.db_pool, &viewer, m)
                 .await
                 .map_err(|e| ApiError::InternalError {
                     message: format!("Methodology filter query failed: {}", e),
@@ -283,7 +285,7 @@ pub async fn list_claims_query(
 
     let evidence_type_ids: Option<HashSet<uuid::Uuid>> = match params.evidence_type {
         Some(ref et) => {
-            let ids = ClaimRepository::claim_ids_by_evidence_type(&state.db_pool, et)
+            let ids = ClaimRepository::claim_ids_by_evidence_type(&state.db_pool, &viewer, et)
                 .await
                 .map_err(|e| ApiError::InternalError {
                     message: format!("Evidence type filter query failed: {}", e),
@@ -312,14 +314,16 @@ pub async fn list_claims_query(
         || sort_order != "desc";
 
     if !needs_in_memory_filters {
-        let total = ClaimRepository::count(&state.db_pool, params.content_contains.as_deref())
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Database count failed: {}", e),
-            })? as usize;
+        let total =
+            ClaimRepository::count(&state.db_pool, &viewer, params.content_contains.as_deref())
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("Database count failed: {}", e),
+                })? as usize;
 
         let rows = ClaimRepository::list(
             &state.db_pool,
+            &viewer,
             limit as i64,
             offset as i64,
             params.content_contains.as_deref(),
@@ -355,6 +359,7 @@ pub async fn list_claims_query(
     // Capped at 10_000 rows; the reported `total` reflects the filtered slice.
     let all_claims = ClaimRepository::list(
         &state.db_pool,
+        &viewer,
         10_000,
         0,
         params.content_contains.as_deref(),

@@ -10,6 +10,9 @@
 //! covered by `ClaimRepository::store_embedding` /
 //! `find_claims_needing_embeddings` unit tests in epigraph-db.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_mcp::tools;
 use epigraph_mcp::tools::embeddings::BackfillEmbeddingsParams;
@@ -69,6 +72,7 @@ fn parse(out: CallToolResult) -> serde_json::Value {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn dry_run_counts_candidates_without_writing(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     for _ in 0..3 {
@@ -76,7 +80,7 @@ async fn dry_run_counts_candidates_without_writing(pool: PgPool) {
     }
 
     let out = tools::embeddings::backfill_embeddings(
-        &server,
+        &server, &viewer,
         BackfillEmbeddingsParams {
             limit: Some(100),
             dry_run: Some(true),
@@ -105,6 +109,7 @@ async fn dry_run_counts_candidates_without_writing(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn limit_is_respected_and_clamped(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     for _ in 0..5 {
@@ -112,7 +117,7 @@ async fn limit_is_respected_and_clamped(pool: PgPool) {
     }
 
     let out = tools::embeddings::backfill_embeddings(
-        &server,
+        &server, &viewer,
         BackfillEmbeddingsParams {
             limit: Some(2),
             dry_run: Some(true),
@@ -128,7 +133,7 @@ async fn limit_is_respected_and_clamped(pool: PgPool) {
 
     // limit below 1 clamps up to 1 rather than returning everything/nothing.
     let out = tools::embeddings::backfill_embeddings(
-        &server,
+        &server, &viewer,
         BackfillEmbeddingsParams {
             limit: Some(0),
             dry_run: Some(true),
@@ -141,12 +146,13 @@ async fn limit_is_respected_and_clamped(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn non_dry_run_with_mock_embedder_fails_loudly(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     insert_unembedded_claim(&pool, agent).await;
 
     let err = tools::embeddings::backfill_embeddings(
-        &server,
+        &server, &viewer,
         BackfillEmbeddingsParams {
             limit: Some(100),
             dry_run: Some(false),
@@ -164,13 +170,14 @@ async fn non_dry_run_with_mock_embedder_fails_loudly(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn zero_candidates_succeeds_even_without_a_key(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // No unembedded claims at all => candidates==0 short-circuits BEFORE the
     // mock-embedder guard, so a scheduled run on a drained backlog is a clean
     // no-op rather than a config error.
     let server = build_server(pool.clone(), false).await;
 
     let out = tools::embeddings::backfill_embeddings(
-        &server,
+        &server, &viewer,
         BackfillEmbeddingsParams {
             limit: Some(100),
             dry_run: Some(false),

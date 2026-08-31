@@ -85,6 +85,7 @@ pub async fn find_similar_themes_at_dim(
 /// See the repo method for column-interpolation safety notes.
 pub async fn candidates_in_themes_at_dim(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     theme_ids: &[Uuid],
     query_pgvec: &str,
     limit: i32,
@@ -93,6 +94,7 @@ pub async fn candidates_in_themes_at_dim(
 ) -> Result<Vec<(Uuid, String, f64)>, sqlx::Error> {
     candidates_in_themes_at_dim_since(
         pool,
+        viewer,
         theme_ids,
         query_pgvec,
         limit,
@@ -112,6 +114,7 @@ pub async fn candidates_in_themes_at_dim(
 #[allow(clippy::too_many_arguments)]
 pub async fn candidates_in_themes_at_dim_since(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     theme_ids: &[Uuid],
     query_pgvec: &str,
     limit: i32,
@@ -121,6 +124,7 @@ pub async fn candidates_in_themes_at_dim_since(
 ) -> Result<Vec<(Uuid, String, f64)>, sqlx::Error> {
     ClaimThemeRepository::claims_in_themes_at_dim_since(
         pool,
+        viewer,
         theme_ids,
         query_pgvec,
         limit,
@@ -238,6 +242,7 @@ pub struct DiverseRetrievalConfig {
 /// query fails.
 pub async fn run_diverse_pipeline(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     query_pgvec: &str,
     config: DiverseRetrievalConfig,
 ) -> Result<Vec<(Uuid, String, f64)>, sqlx::Error> {
@@ -252,6 +257,7 @@ pub async fn run_diverse_pipeline(
     let theme_ids: Vec<Uuid> = themes.iter().map(|(id, _, _)| *id).collect();
     let candidates = candidates_in_themes_at_dim_since(
         pool,
+        viewer,
         &theme_ids,
         query_pgvec,
         config.candidate_pool,

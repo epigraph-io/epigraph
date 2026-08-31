@@ -60,6 +60,9 @@
 //! - Provides a connection pool
 //! - Cleans up after tests complete
 
+#[path = "../viewer_fixture.rs"]
+mod fixture;
+
 use chrono::Utc;
 use epigraph_core::{
     Agent, AgentId, Claim, ClaimId, Evidence, EvidenceType, Methodology, ReasoningTrace, TraceId,
@@ -241,6 +244,7 @@ async fn test_create_claim_persists_to_db(pool: PgPool) {
 /// - Retrieved data must match persisted data exactly
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_retrieve_claim_by_id_returns_correct_data(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create dependencies and claim
     let agent = create_test_agent(Some("Retrieval Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -255,7 +259,7 @@ async fn test_retrieve_claim_by_id_returns_correct_data(pool: PgPool) {
     let original_content = created_claim.content.clone();
 
     // Act: Retrieve by ID
-    let retrieved_claim = ClaimRepository::get_by_id(&pool, created_claim.id)
+    let retrieved_claim = ClaimRepository::get_by_id(&pool, &viewer, created_claim.id)
         .await
         .expect("Query should succeed");
 
@@ -272,9 +276,10 @@ async fn test_retrieve_claim_by_id_returns_correct_data(pool: PgPool) {
 /// Validates that get_by_id returns None for non-existent claims
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_retrieve_nonexistent_claim_returns_none(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Act: Try to retrieve a claim that doesn't exist
     let non_existent_id = ClaimId::new();
-    let result = ClaimRepository::get_by_id(&pool, non_existent_id)
+    let result = ClaimRepository::get_by_id(&pool, &viewer, non_existent_id)
         .await
         .expect("Query should succeed even for non-existent ID");
 
@@ -295,6 +300,7 @@ async fn test_retrieve_nonexistent_claim_returns_none(pool: PgPool) {
 /// - Total count is accurate
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_list_claims_with_pagination(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent and multiple claims
     let agent = create_test_agent(Some("Pagination Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -316,25 +322,25 @@ async fn test_list_claims_with_pagination(pool: PgPool) {
     // Act & Assert: Test pagination
 
     // First page (limit 2, offset 0)
-    let page1 = ClaimRepository::list(&pool, 2, 0, None)
+    let page1 = ClaimRepository::list(&pool, &viewer, 2, 0, None)
         .await
         .expect("List should succeed");
     assert_eq!(page1.len(), 2, "First page should have 2 claims");
 
     // Second page (limit 2, offset 2)
-    let page2 = ClaimRepository::list(&pool, 2, 2, None)
+    let page2 = ClaimRepository::list(&pool, &viewer, 2, 2, None)
         .await
         .expect("List should succeed");
     assert_eq!(page2.len(), 2, "Second page should have 2 claims");
 
     // Third page (limit 2, offset 4)
-    let page3 = ClaimRepository::list(&pool, 2, 4, None)
+    let page3 = ClaimRepository::list(&pool, &viewer, 2, 4, None)
         .await
         .expect("List should succeed");
     assert_eq!(page3.len(), 1, "Third page should have 1 claim");
 
     // Verify total count
-    let total = ClaimRepository::count(&pool, None)
+    let total = ClaimRepository::count(&pool, &viewer, None)
         .await
         .expect("Count should succeed");
     assert_eq!(total, 5, "Total should be 5 claims");
@@ -397,6 +403,7 @@ async fn test_create_evidence_linked_to_claim(pool: PgPool) {
 /// - Empty result for claims with no evidence
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_retrieve_evidence_by_claim_id(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent, trace, claim
     let agent = create_test_agent(Some("Evidence Retrieval Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -432,7 +439,7 @@ async fn test_retrieve_evidence_by_claim_id(pool: PgPool) {
     }
 
     // Act: Retrieve evidence by claim
-    let evidence_list = EvidenceRepository::get_by_claim(&pool, created_claim.id)
+    let evidence_list = EvidenceRepository::get_by_claim(&pool, &viewer, created_claim.id)
         .await
         .expect("Retrieval should succeed");
 
@@ -447,7 +454,7 @@ async fn test_retrieve_evidence_by_claim_id(pool: PgPool) {
     let other_created = ClaimRepository::create(&pool, &other_claim)
         .await
         .expect("Claim creation should succeed");
-    let empty_evidence = EvidenceRepository::get_by_claim(&pool, other_created.id)
+    let empty_evidence = EvidenceRepository::get_by_claim(&pool, &viewer, other_created.id)
         .await
         .expect("Retrieval should succeed");
     assert!(
@@ -544,6 +551,7 @@ async fn test_duplicate_public_key_rejected(pool: PgPool) {
 /// - Self-references are rejected (no cycles)
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_create_reasoning_trace_with_dag_structure(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("DAG Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -597,14 +605,14 @@ async fn test_create_reasoning_trace_with_dag_structure(pool: PgPool) {
         .expect("Adding parent should succeed");
 
     // Assert: Verify parent relationship
-    let parents = ReasoningTraceRepository::get_parents(&pool, created_child.id)
+    let parents = ReasoningTraceRepository::get_parents(&pool, &viewer, created_child.id)
         .await
         .expect("Get parents should succeed");
     assert_eq!(parents.len(), 1, "Child should have 1 parent");
     assert_eq!(parents[0].id, created_parent.id);
 
     // Assert: Verify child relationship
-    let children = ReasoningTraceRepository::get_children(&pool, created_parent.id)
+    let children = ReasoningTraceRepository::get_children(&pool, &viewer, created_parent.id)
         .await
         .expect("Get children should succeed");
     assert_eq!(children.len(), 1, "Parent should have 1 child");
@@ -614,6 +622,7 @@ async fn test_create_reasoning_trace_with_dag_structure(pool: PgPool) {
 /// Validates that reasoning traces properly store inputs and methodology
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_reasoning_trace_methodology_and_confidence(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange
     let agent = create_test_agent(Some("Methodology Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -646,7 +655,7 @@ async fn test_reasoning_trace_methodology_and_confidence(pool: PgPool) {
     assert_eq!(created.explanation, "Bayesian update based on new evidence");
 
     // Retrieve and verify
-    let retrieved = ReasoningTraceRepository::get_by_id(&pool, created.id)
+    let retrieved = ReasoningTraceRepository::get_by_id(&pool, &viewer, created.id)
         .await
         .expect("Retrieval should succeed")
         .expect("Trace should exist");
@@ -735,6 +744,7 @@ async fn test_update_claim_invalid_truth_rejected(pool: PgPool) {
 /// - Count is accurate after concurrent inserts
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_concurrent_claim_creation_no_conflicts(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create shared agent
     let agent = create_test_agent(Some("Concurrency Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -742,7 +752,7 @@ async fn test_concurrent_claim_creation_no_conflicts(pool: PgPool) {
         .expect("Agent creation should succeed");
 
     let pool = Arc::new(pool);
-    let initial_count = ClaimRepository::count(&pool, None).await.unwrap();
+    let initial_count = ClaimRepository::count(&pool, &viewer, None).await.unwrap();
 
     // Act: Create claims concurrently (without traces for simplicity - testing concurrency)
     let num_concurrent = 10;
@@ -790,7 +800,7 @@ async fn test_concurrent_claim_creation_no_conflicts(pool: PgPool) {
     );
 
     // Verify final count
-    let final_count = ClaimRepository::count(&pool, None).await.unwrap();
+    let final_count = ClaimRepository::count(&pool, &viewer, None).await.unwrap();
     assert_eq!(
         final_count,
         initial_count + num_concurrent,
@@ -842,6 +852,7 @@ async fn test_foreign_key_constraints_enforced(pool: PgPool) {
 /// Validates CASCADE delete behavior for evidence when claim is deleted
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_delete_claim_cascades_to_evidence(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create full chain
     let agent = create_test_agent(Some("Cascade Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -860,7 +871,7 @@ async fn test_delete_claim_cascades_to_evidence(pool: PgPool) {
         .expect("Evidence creation should succeed");
 
     // Verify evidence exists
-    let evidence_before = EvidenceRepository::get_by_id(&pool, created_evidence.id)
+    let evidence_before = EvidenceRepository::get_by_id(&pool, &viewer, created_evidence.id)
         .await
         .expect("Query should succeed");
     assert!(
@@ -875,7 +886,7 @@ async fn test_delete_claim_cascades_to_evidence(pool: PgPool) {
     assert!(deleted, "Claim should be deleted");
 
     // Assert: Evidence should be cascade deleted
-    let evidence_after = EvidenceRepository::get_by_id(&pool, created_evidence.id)
+    let evidence_after = EvidenceRepository::get_by_id(&pool, &viewer, created_evidence.id)
         .await
         .expect("Query should succeed");
     assert!(
@@ -1078,6 +1089,7 @@ async fn test_delete_operations(pool: PgPool) {
 /// Validates that deleting evidence works correctly
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_delete_evidence(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange
     let agent = create_test_agent(Some("Evidence Delete Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -1095,19 +1107,19 @@ async fn test_delete_evidence(pool: PgPool) {
         .expect("Evidence creation should succeed");
 
     // Act: Delete evidence
-    let deleted = EvidenceRepository::delete(&pool, created_evidence.id)
+    let deleted = EvidenceRepository::delete(&pool, &viewer, created_evidence.id)
         .await
         .expect("Delete should succeed");
     assert!(deleted);
 
     // Assert: Evidence is gone
-    let retrieved = EvidenceRepository::get_by_id(&pool, created_evidence.id)
+    let retrieved = EvidenceRepository::get_by_id(&pool, &viewer, created_evidence.id)
         .await
         .expect("Query should succeed");
     assert!(retrieved.is_none());
 
     // Claim should still exist
-    let claim_still_exists = ClaimRepository::get_by_id(&pool, created_claim.id)
+    let claim_still_exists = ClaimRepository::get_by_id(&pool, &viewer, created_claim.id)
         .await
         .expect("Query should succeed");
     assert!(claim_still_exists.is_some());
@@ -1129,6 +1141,7 @@ async fn test_delete_evidence(pool: PgPool) {
 /// Rust-side validation, not actual DB transaction rollback behavior.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_transaction_rollback_on_partial_failure(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create a valid agent first
     let agent = create_test_agent(Some("Transaction Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -1136,7 +1149,7 @@ async fn test_transaction_rollback_on_partial_failure(pool: PgPool) {
         .expect("Agent creation should succeed");
 
     // Record initial state
-    let initial_claim_count = ClaimRepository::count(&pool, None)
+    let initial_claim_count = ClaimRepository::count(&pool, &viewer, None)
         .await
         .expect("Count should succeed");
 
@@ -1195,7 +1208,7 @@ async fn test_transaction_rollback_on_partial_failure(pool: PgPool) {
     drop(tx);
 
     // Assert: Verify database state is unchanged - first claim should NOT exist
-    let final_claim_count = ClaimRepository::count(&pool, None)
+    let final_claim_count = ClaimRepository::count(&pool, &viewer, None)
         .await
         .expect("Count should succeed");
 
@@ -1223,6 +1236,7 @@ async fn test_transaction_rollback_on_partial_failure(pool: PgPool) {
 /// only tested deleting an agent WITHOUT claims.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_delete_agent_with_claims_fails(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent with a claim
     let agent = create_test_agent(Some("Agent With Claims"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -1265,7 +1279,7 @@ async fn test_delete_agent_with_claims_fails(pool: PgPool) {
     );
 
     // Verify claim still exists
-    let claim_still_exists = ClaimRepository::get_by_id(&pool, created_claim.id)
+    let claim_still_exists = ClaimRepository::get_by_id(&pool, &viewer, created_claim.id)
         .await
         .expect("Query should succeed");
     assert!(
@@ -1293,6 +1307,7 @@ async fn test_delete_agent_with_claims_fails(pool: PgPool) {
 /// per migration 005 comment. This test validates the DB-level self-reference check.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_dag_cycle_detection_self_reference_rejected(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent and a reasoning trace
     let agent = create_test_agent(Some("DAG Cycle Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -1329,7 +1344,7 @@ async fn test_dag_cycle_detection_self_reference_rejected(pool: PgPool) {
     );
 
     // Verify no parent relationship was created
-    let parents = ReasoningTraceRepository::get_parents(&pool, created_trace.id)
+    let parents = ReasoningTraceRepository::get_parents(&pool, &viewer, created_trace.id)
         .await
         .expect("Get parents should succeed");
     assert!(
@@ -1350,6 +1365,7 @@ async fn test_dag_cycle_detection_self_reference_rejected(pool: PgPool) {
 /// the edges CAN be inserted, but the data violates the DAG invariant.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_dag_multi_hop_cycle_detection(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent and three traces (each needs its own claim)
     let agent = create_test_agent(Some("Multi-Hop Cycle Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -1418,12 +1434,12 @@ async fn test_dag_multi_hop_cycle_detection(pool: PgPool) {
         .expect("C depends on B should succeed");
 
     // Verify linear DAG is valid
-    let b_parents = ReasoningTraceRepository::get_parents(&pool, created_b.id)
+    let b_parents = ReasoningTraceRepository::get_parents(&pool, &viewer, created_b.id)
         .await
         .expect("Get parents should succeed");
     assert_eq!(b_parents.len(), 1, "B should have 1 parent (A)");
 
-    let c_parents = ReasoningTraceRepository::get_parents(&pool, created_c.id)
+    let c_parents = ReasoningTraceRepository::get_parents(&pool, &viewer, created_c.id)
         .await
         .expect("Get parents should succeed");
     assert_eq!(c_parents.len(), 1, "C should have 1 parent (B)");

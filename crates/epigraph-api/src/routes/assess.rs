@@ -6,6 +6,7 @@
 //! and returns the full belief update in one response.
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 #[cfg(feature = "db")]
@@ -82,6 +83,7 @@ pub struct AssessClaimResponse {
 /// `POST /api/v1/claims/:id/assess`
 #[cfg(feature = "db")]
 pub async fn assess_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Json(request): Json<AssessClaimRequest>,
@@ -148,7 +150,7 @@ pub async fn assess_claim(
     // ── 6. Find or create frame ──────────────────────────────────────────
     let frame_id = if let Some(fid) = request.frame_id {
         // Verify it exists
-        let _ = epigraph_db::FrameRepository::get_by_id(pool, fid)
+        let _ = epigraph_db::FrameRepository::get_by_id(pool, &viewer, fid)
             .await?
             .ok_or(ApiError::NotFound {
                 entity: "frame".to_string(),
@@ -169,7 +171,7 @@ pub async fn assess_claim(
             "research_validity".to_string()
         };
 
-        match epigraph_db::FrameRepository::get_by_name(pool, &frame_name).await? {
+        match epigraph_db::FrameRepository::get_by_name(pool, &viewer, &frame_name).await? {
             Some(existing) => existing.id,
             None => {
                 let hypotheses = vec!["supported".to_string(), "unsupported".to_string()];
@@ -189,7 +191,7 @@ pub async fn assess_claim(
     };
 
     // Load the frame row for DS operations
-    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -249,7 +251,8 @@ pub async fn assess_claim(
 
     // Retrieve all user-submitted BBAs for this (claim, frame)
     let all_rows =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id).await?;
+        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, &viewer, claim_id, frame_id)
+            .await?;
 
     let mut indexed_rows: Vec<(Uuid, Option<Uuid>, MassFunction)> = all_rows
         .iter()
@@ -268,7 +271,7 @@ pub async fn assess_claim(
             indexed_rows.iter().map(|(_, _, m)| m.clone()).collect(),
         )
     } else {
-        super::independence::analyze_independence(pool, &indexed_rows, 5).await?
+        super::independence::analyze_independence(pool, &viewer, &indexed_rows, 5).await?
     };
 
     // Cautious-combine within each dependent group
@@ -313,7 +316,8 @@ pub async fn assess_claim(
 
     // Compute belief/plausibility for the claim's hypothesis
     let claim_assignment =
-        epigraph_db::FrameRepository::get_claim_assignment(pool, claim_id, frame_id).await?;
+        epigraph_db::FrameRepository::get_claim_assignment(pool, &viewer, claim_id, frame_id)
+            .await?;
     let h_idx = claim_assignment.and_then(|ca| ca.hypothesis_index);
 
     let (final_bel, final_pl, final_betp, m_missing) =

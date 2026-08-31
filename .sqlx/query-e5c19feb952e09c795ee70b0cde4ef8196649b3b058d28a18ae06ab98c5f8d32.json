@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(\n                   SELECT 1 FROM triples\n                   WHERE claim_id = $1\n                     AND ($2::bool OR visibility = 'public'\n                          OR owner_group_id = ANY($3::uuid[]))\n               ) AS \"exists!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bool",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "e5c19feb952e09c795ee70b0cde4ef8196649b3b058d28a18ae06ab98c5f8d32"
+}

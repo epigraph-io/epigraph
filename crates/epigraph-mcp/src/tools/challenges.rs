@@ -74,11 +74,12 @@ pub async fn challenge_claim(
 /// List challenges for a claim.
 pub async fn list_challenges(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ListChallengesParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
 
-    let challenges = ChallengeRepository::list_for_claim(&server.pool, claim_id)
+    let challenges = ChallengeRepository::list_for_claim(&server.pool, viewer, claim_id)
         .await
         .map_err(internal_error)?;
 

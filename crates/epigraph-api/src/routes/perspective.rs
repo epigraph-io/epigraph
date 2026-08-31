@@ -9,6 +9,7 @@
 //! - `POST /api/v1/perspectives` — create a perspective
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 #[cfg(feature = "db")]
@@ -184,11 +185,13 @@ pub async fn set_source_reliability(
 /// `GET /api/v1/perspectives`
 #[cfg(feature = "db")]
 pub async fn list_perspectives(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListPerspectivesQuery>,
 ) -> Result<Json<Vec<PerspectiveResponse>>, ApiError> {
     let pool = &state.db_pool;
-    let rows = epigraph_db::PerspectiveRepository::list(pool, params.limit, params.offset).await?;
+    let rows = epigraph_db::PerspectiveRepository::list(pool, &viewer, params.limit, params.offset)
+        .await?;
 
     Ok(Json(
         rows.into_iter().map(perspective_to_response).collect(),
@@ -200,11 +203,12 @@ pub async fn list_perspectives(
 /// `GET /api/v1/perspectives/:id`
 #[cfg(feature = "db")]
 pub async fn get_perspective(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PerspectiveResponse>, ApiError> {
     let pool = &state.db_pool;
-    let row = epigraph_db::PerspectiveRepository::get_by_id(pool, id)
+    let row = epigraph_db::PerspectiveRepository::get_by_id(pool, &viewer, id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "perspective".to_string(),
@@ -219,6 +223,7 @@ pub async fn get_perspective(
 /// `GET /api/v1/agents/:id/perspectives`
 #[cfg(feature = "db")]
 pub async fn agent_perspectives(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(agent_id): Path<Uuid>,
     Query(params): Query<ListPerspectivesQuery>,
@@ -226,6 +231,7 @@ pub async fn agent_perspectives(
     let pool = &state.db_pool;
     let rows = epigraph_db::PerspectiveRepository::list_by_agent(
         pool,
+        &viewer,
         agent_id,
         params.limit,
         params.offset,

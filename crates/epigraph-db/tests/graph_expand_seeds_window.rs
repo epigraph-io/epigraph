@@ -15,6 +15,9 @@
 //! orders `created_at DESC` — which is how the fixture below controls the
 //! order in which the BFS meets its neighbours.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use chrono::{DateTime, TimeZone, Utc};
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
@@ -104,6 +107,7 @@ async fn seed_edge_at(pool: &PgPool, from: Uuid, to: Uuid, edge_created_at: Date
 /// BCH-J01's inversion reproduced on the graph surface.
 #[sqlx::test(migrations = "../../migrations")]
 async fn in_window_destination_survives_a_pre_window_fanout(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let seed = seed_claim_at(&pool, agent, "grendlewick seed", epoch_recent()).await;
 
@@ -122,7 +126,7 @@ async fn in_window_destination_survives_a_pre_window_fanout(pool: PgPool) {
     // Control: unwindowed, the emission cap still binds at 200 and the
     // fresh claim is (legitimately) crowded out. This is the pre-existing
     // relevance-free truncation, and the fix must NOT change it.
-    let unwindowed = ClaimRepository::graph_expand_seeds(&pool, &[seed], 2)
+    let unwindowed = ClaimRepository::graph_expand_seeds(&pool, &viewer, &[seed], 2)
         .await
         .expect("unwindowed expansion");
     assert_eq!(
@@ -135,7 +139,7 @@ async fn in_window_destination_survives_a_pre_window_fanout(pool: PgPool) {
     // The criterion: with a window set, the 200-slot emission budget belongs
     // to in-window claims. The 250 pre-window bridges are walked through, not
     // counted.
-    let windowed = ClaimRepository::graph_expand_seeds_since(&pool, &[seed], 2, Some(epoch_cut()))
+    let windowed = ClaimRepository::graph_expand_seeds_since(&pool, &viewer, &[seed], 2, Some(epoch_cut()))
         .await
         .expect("windowed expansion");
     let ids: Vec<Uuid> = windowed.iter().map(|h| h.claim_id).collect();
@@ -161,6 +165,7 @@ async fn in_window_destination_survives_a_pre_window_fanout(pool: PgPool) {
 /// silently sever reachability the unwindowed call has.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_out_of_window_claim_still_bridges_to_an_in_window_one(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let seed = seed_claim_at(&pool, agent, "grendlewick seed", epoch_recent()).await;
     let bridge = seed_claim_at(&pool, agent, "grendlewick bridge", epoch_old()).await;
@@ -170,7 +175,7 @@ async fn an_out_of_window_claim_still_bridges_to_an_in_window_one(pool: PgPool) 
     seed_edge_at(&pool, seed, bridge, e).await;
     seed_edge_at(&pool, bridge, far, e).await;
 
-    let windowed = ClaimRepository::graph_expand_seeds_since(&pool, &[seed], 2, Some(epoch_cut()))
+    let windowed = ClaimRepository::graph_expand_seeds_since(&pool, &viewer, &[seed], 2, Some(epoch_cut()))
         .await
         .expect("windowed expansion");
     let ids: Vec<Uuid> = windowed.iter().map(|h| h.claim_id).collect();

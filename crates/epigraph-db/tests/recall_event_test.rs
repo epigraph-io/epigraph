@@ -5,6 +5,9 @@
 //! These tests pin that discrimination, plus the GIN-backed reverse lookup and
 //! retention pruning.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::{NewRecallEvent, RecallEventRepository};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -42,6 +45,7 @@ fn event(
 /// these two cases would be indistinguishable and the table would be useless.
 #[sqlx::test(migrations = "../../migrations")]
 async fn embedding_hash_discriminates_corpus_change_from_embedder_change(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
 
@@ -84,7 +88,7 @@ async fn embedding_hash_discriminates_corpus_change_from_embedder_change(pool: P
     .await
     .unwrap();
 
-    let rows = RecallEventRepository::list(&pool, Some(agent), None, None, None, 50, 0)
+    let rows = RecallEventRepository::list(&pool, &viewer, Some(agent), None, None, None, 50, 0)
         .await
         .unwrap();
     let get = |id: Uuid| {
@@ -112,6 +116,7 @@ async fn embedding_hash_discriminates_corpus_change_from_embedder_change(pool: P
 /// would still pass a "row was written" test.
 #[sqlx::test(migrations = "../../migrations")]
 async fn raw_vector_is_not_stored(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let pgvec = "[0.12345,0.67890]";
     RecallEventRepository::log(
@@ -121,7 +126,7 @@ async fn raw_vector_is_not_stored(pool: PgPool) {
     .await
     .unwrap();
 
-    let rows = RecallEventRepository::list(&pool, Some(agent), None, None, None, 10, 0)
+    let rows = RecallEventRepository::list(&pool, &viewer, Some(agent), None, None, None, 10, 0)
         .await
         .unwrap();
     let hash = rows[0].query_embedding_hash.clone().expect("hash present");
@@ -140,6 +145,7 @@ async fn raw_vector_is_not_stored(pool: PgPool) {
 /// — the degraded path is itself audit-relevant.
 #[sqlx::test(migrations = "../../migrations")]
 async fn absent_embedding_logs_null_hash(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     RecallEventRepository::log(
         &pool,
@@ -147,7 +153,7 @@ async fn absent_embedding_logs_null_hash(pool: PgPool) {
     )
     .await
     .unwrap();
-    let rows = RecallEventRepository::list(&pool, Some(agent), None, None, None, 10, 0)
+    let rows = RecallEventRepository::list(&pool, &viewer, Some(agent), None, None, None, 10, 0)
         .await
         .unwrap();
     assert!(rows[0].query_embedding_hash.is_none());
@@ -157,6 +163,7 @@ async fn absent_embedding_logs_null_hash(pool: PgPool) {
 /// the read this table's index layout exists to serve.
 #[sqlx::test(migrations = "../../migrations")]
 async fn claim_filter_finds_queries_that_returned_a_claim(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let (wanted, other) = (Uuid::new_v4(), Uuid::new_v4());
 
@@ -179,7 +186,7 @@ async fn claim_filter_finds_queries_that_returned_a_claim(pool: PgPool) {
     .await
     .unwrap();
 
-    let found = RecallEventRepository::list(&pool, None, Some(wanted), None, None, 50, 0)
+    let found = RecallEventRepository::list(&pool, &viewer, None, Some(wanted), None, None, 50, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -194,10 +201,11 @@ async fn claim_filter_finds_queries_that_returned_a_claim(pool: PgPool) {
 /// than being dropped.
 #[sqlx::test(migrations = "../../migrations")]
 async fn agentless_event_is_accepted(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let id = RecallEventRepository::log(&pool, event(None, "recall", "anon", Some("[1]"), vec![]))
         .await
         .expect("agentless log must be accepted");
-    let rows = RecallEventRepository::list(&pool, None, None, None, None, 50, 0)
+    let rows = RecallEventRepository::list(&pool, &viewer, None, None, None, None, 50, 0)
         .await
         .unwrap();
     assert!(rows.iter().any(|r| r.id == id && r.agent_id.is_none()));
@@ -206,6 +214,7 @@ async fn agentless_event_is_accepted(pool: PgPool) {
 /// Retention prunes old rows and spares fresh ones.
 #[sqlx::test(migrations = "../../migrations")]
 async fn prune_removes_only_rows_past_retention(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let fresh = RecallEventRepository::log(
         &pool,
@@ -231,7 +240,7 @@ async fn prune_removes_only_rows_past_retention(pool: PgPool) {
         .unwrap();
     assert_eq!(deleted, 1, "exactly the row past the 90-day window");
 
-    let rows = RecallEventRepository::list(&pool, Some(agent), None, None, None, 50, 0)
+    let rows = RecallEventRepository::list(&pool, &viewer, Some(agent), None, None, None, 50, 0)
         .await
         .unwrap();
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();

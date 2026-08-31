@@ -5,12 +5,16 @@
 //! agent_id = NULL, which is what migration 058's nullable column is for.
 //! Without this the audit log would silently omit every episcience retrieval.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_embeddings::{config::EmbeddingConfig, providers::MockProvider};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn engine_recall_writes_an_audit_row_with_null_agent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO agents (public_key, display_name, agent_type, labels)
          VALUES (sha256(gen_random_uuid()::text::bytea), 'test-engine-audit', 'system', ARRAY['test'])
@@ -25,7 +29,7 @@ async fn engine_recall_writes_an_audit_row_with_null_agent(pool: PgPool) {
     .bind(agent).execute(&pool).await.expect("seed claim");
 
     let provider = MockProvider::new(EmbeddingConfig::local(64));
-    let results = epigraph_engine::recall::recall(&pool, &provider, "grendlewick", 10, 0.0)
+    let results = epigraph_engine::recall::recall(&pool, &viewer, &provider, "grendlewick", 10, 0.0)
         .await
         .expect("engine recall ok");
 

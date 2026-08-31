@@ -26,6 +26,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 pub async fn memorize(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: MemorizeParams,
 ) -> Result<CallToolResult, McpError> {
     let agent_id = server.agent_id().await?;
@@ -48,7 +49,7 @@ pub async fn memorize(
     // exact resubmit is unaffected; gate only runs on genuinely new content).
     let is_exact_resubmit = {
         let mut conn = server.pool.acquire().await.map_err(internal_error)?;
-        ClaimRepository::find_by_content_hash_and_agent(&mut conn, &content_hash, agent_id)
+        ClaimRepository::find_by_content_hash_and_agent(&mut conn, viewer, &content_hash, agent_id)
             .await
             .map_err(internal_error)?
             .is_some()
@@ -60,6 +61,7 @@ pub async fn memorize(
             .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
         if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
             &server.pool,
+            viewer,
             server.embedder.as_ref(),
             &params.content,
             novelty_threshold,
@@ -74,15 +76,18 @@ pub async fn memorize(
                 // — with the same epistemic-corroboration-loss consequence
                 // for memorize's caller — and this submission's `tags`
                 // being dropped since nothing is inserted.
-                let existing =
-                    ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(existing_id))
-                        .await
-                        .map_err(internal_error)?
-                        .ok_or_else(|| {
-                            internal_error(format!(
-                            "novelty gate: nearest claim {existing_id} vanished before read-back"
-                        ))
-                        })?;
+                let existing = ClaimRepository::get_by_id(
+                    &server.pool,
+                    viewer,
+                    ClaimId::from_uuid(existing_id),
+                )
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    internal_error(format!(
+                        "novelty gate: nearest claim {existing_id} vanished before read-back"
+                    ))
+                })?;
                 return success_json(&MemorizeResponse {
                     claim_id: existing_id.to_string(),
                     truth_value: existing.truth_value.value(),
@@ -106,7 +111,8 @@ pub async fn memorize(
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "memorize").await?;
+        crate::claim_helper::create_claim_idempotent(&server.pool, viewer, &claim, "memorize")
+            .await?;
     let claim_uuid = claim.id.as_uuid();
 
     // Persist tags as claim labels so `query_claims_by_label` can surface them.
@@ -160,6 +166,7 @@ pub async fn memorize(
 
         let ds = match ds_auto::auto_wire_ds_for_claim(
             &server.pool,
+            viewer,
             claim_uuid,
             agent_id,
             confidence,
@@ -226,6 +233,7 @@ fn parse_agent_filter(raw: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
 
 pub async fn recall(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: RecallParams,
 ) -> Result<CallToolResult, McpError> {
     // Generate the query embedding ONCE up front. Reused for both the claims
@@ -246,7 +254,7 @@ pub async fn recall(
         }
     };
 
-    recall_post_embed(server, params, pgvec_opt).await
+    recall_post_embed(server, viewer, params, pgvec_opt).await
 }
 
 /// Post-embedding pipeline: shared by `recall` and the
@@ -258,6 +266,7 @@ pub async fn recall(
 /// extraction sites cannot drift.
 async fn recall_post_embed(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: RecallParams,
     pgvec_opt: Option<String>,
 ) -> Result<CallToolResult, McpError> {
@@ -276,7 +285,8 @@ async fn recall_post_embed(
         params.perspective_id.as_deref(),
     )?;
     if let Some((frame_id, perspective_id)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
+        crate::tools::lens::validate_lens_exists(&server.pool, viewer, frame_id, perspective_id)
+            .await?;
     }
 
     // Hybrid retrieval: dense (claims.embedding) + lexical (content_tsv), RRF-fused.
@@ -289,6 +299,7 @@ async fn recall_post_embed(
     let hits: Vec<HybridHit> = match pgvec_opt.as_deref() {
         Some(pgvec) => ClaimRepository::search_hybrid_scoped_since(
             &server.pool,
+            viewer,
             pgvec,
             &params.query,
             HYBRID_CANDIDATE_POOL,
@@ -302,6 +313,7 @@ async fn recall_post_embed(
         .map_err(internal_error)?,
         None => ClaimRepository::search_lexical_scoped_since(
             &server.pool,
+            viewer,
             &params.query,
             HYBRID_RRF_K,
             limit,
@@ -373,8 +385,12 @@ async fn recall_post_embed(
     for (merged_rrf_score, merged_hit) in merged {
         match merged_hit {
             MergedHit::Claim(hit) => {
-                if let Ok(Some(claim)) =
-                    ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(hit.claim_id)).await
+                if let Ok(Some(claim)) = ClaimRepository::get_by_id(
+                    &server.pool,
+                    viewer,
+                    ClaimId::from_uuid(hit.claim_id),
+                )
+                .await
                 {
                     let tv = claim.truth_value.value();
                     if tv >= min_truth {
@@ -469,6 +485,7 @@ async fn recall_post_embed(
             .collect();
         match epigraph_engine::belief_query::get_perspective_belief_batch(
             &server.pool,
+            viewer,
             &claim_ids,
             frame_id,
             perspective_id,
@@ -526,7 +543,7 @@ async fn recall_post_embed(
             .filter(|r| r.result_type.is_none()) // workflows aren't claims
             .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
             .collect();
-        match ClaimRepository::dispute_batch(&server.pool, &claim_ids).await {
+        match ClaimRepository::dispute_batch(&server.pool, viewer, &claim_ids).await {
             Ok(mut by_claim) => {
                 for r in &mut results {
                     let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
@@ -634,10 +651,11 @@ pub mod __test_only {
     /// `__test_only::find_workflow_with_pgvec`.
     pub async fn recall_with_pgvec(
         server: &EpiGraphMcpFull,
+        viewer: &epigraph_db::visibility::Viewer,
         params: RecallParams,
         pgvec: Option<String>,
     ) -> Result<CallToolResult, McpError> {
-        recall_post_embed(server, params, pgvec).await
+        recall_post_embed(server, viewer, params, pgvec).await
     }
 }
 

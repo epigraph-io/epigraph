@@ -14,6 +14,9 @@
 //!     `recall_with_context` design (spec §3.6); `relationship` is
 //!     `varchar(100)` so the value is just a string literal.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -47,6 +50,7 @@ fn distinct_hash(tag: u8) -> Vec<u8> {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn search_by_embedding_returns_only_level_2(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     let p1 = Uuid::new_v4();
@@ -71,7 +75,7 @@ async fn search_by_embedding_returns_only_level_2(pool: PgPool) {
         .expect("insert claim");
     }
 
-    let results = ClaimRepository::search_by_embedding(&pool, &pgvec, 1536, 5, None)
+    let results = ClaimRepository::search_by_embedding(&pool, &viewer, &pgvec, 1536, 5, None)
         .await
         .expect("search_by_embedding");
 
@@ -83,6 +87,7 @@ async fn search_by_embedding_returns_only_level_2(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn search_by_embedding_filters_by_paper_doi(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     let paper_a = Uuid::new_v4();
@@ -126,7 +131,7 @@ async fn search_by_embedding_filters_by_paper_doi(pool: PgPool) {
         .expect("insert asserts edge");
     }
 
-    let results = ClaimRepository::search_by_embedding(&pool, &pgvec, 1536, 5, Some("10.1/A"))
+    let results = ClaimRepository::search_by_embedding(&pool, &viewer, &pgvec, 1536, 5, Some("10.1/A"))
         .await
         .expect("search_by_embedding with doi filter");
 
@@ -137,8 +142,9 @@ async fn search_by_embedding_filters_by_paper_doi(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn search_by_embedding_rejects_unsupported_dim(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let pgvec = build_query_vec();
-    let result = ClaimRepository::search_by_embedding(&pool, &pgvec, 2048, 5, None).await;
+    let result = ClaimRepository::search_by_embedding(&pool, &viewer, &pgvec, 2048, 5, None).await;
     assert!(
         matches!(result, Err(epigraph_db::DbError::InvalidData { .. })),
         "expected InvalidData for unsupported dim, got {:?}",

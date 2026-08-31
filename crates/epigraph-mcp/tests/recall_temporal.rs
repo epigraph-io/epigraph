@@ -34,6 +34,9 @@
 //! existing `paper_doi_filter`-on-diverse `TODO(diverse-recall)` already
 //! exhibits, which this feature must not repeat.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 #[rustfmt::skip]
 use epigraph_mcp::tools::memory::__test_only::recall_with_pgvec;
 #[rustfmt::skip]
@@ -419,6 +422,7 @@ fn merge(base: &mut Value, extra: Value) {
 /// not on compilation, which is what makes it evidence rather than noise.
 #[sqlx::test(migrations = "../../migrations")]
 async fn since_excludes_older_claims_and_reports_created_at(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let old = seed_claim_at(
         &pool,
@@ -456,7 +460,7 @@ async fn since_excludes_older_claims_and_reports_created_at(pool: PgPool) {
 
     let server = build_test_server(pool);
     let out = recall_with_pgvec(
-        &server,
+        &server, &viewer,
         recall_params(json!({ "since": epoch_cut().to_rfc3339() })),
         Some(cluster_pgvec(0)),
     )
@@ -500,6 +504,7 @@ async fn since_excludes_older_claims_and_reports_created_at(pool: PgPool) {
 /// re-derivation of the new implementation.
 #[sqlx::test(migrations = "../../migrations")]
 async fn since_absent_is_baseline_behaviour(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     // Distinct drifts ⇒ strictly decreasing cosine ⇒ no rrf ties.
     let a = seed_claim_at(
@@ -531,7 +536,7 @@ async fn since_absent_is_baseline_behaviour(pool: PgPool) {
     .await;
 
     let server = build_test_server(pool);
-    let out = recall_with_pgvec(&server, recall_params(json!({})), Some(cluster_pgvec(0)))
+    let out = recall_with_pgvec(&server, &viewer, recall_params(json!({})), Some(cluster_pgvec(0)))
         .await
         .expect("recall ok");
     let hits = results_of(&out);
@@ -572,6 +577,7 @@ async fn since_absent_is_baseline_behaviour(pool: PgPool) {
 /// filters on `updated_at` would report the whole corpus as newly created.
 #[sqlx::test(migrations = "../../migrations")]
 async fn created_at_is_creation_not_update(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     use epigraph_core::{ClaimId, TruthValue};
 
     let agent = seed_agent(&pool).await;
@@ -608,7 +614,7 @@ async fn created_at_is_creation_not_update(pool: PgPool) {
     let server = build_test_server(pool);
 
     // (a) The reported timestamp is still the creation instant.
-    let out = recall_with_pgvec(&server, recall_params(json!({})), Some(cluster_pgvec(0)))
+    let out = recall_with_pgvec(&server, &viewer, recall_params(json!({})), Some(cluster_pgvec(0)))
         .await
         .expect("recall ok");
     let hits = results_of(&out);
@@ -638,7 +644,7 @@ async fn created_at_is_creation_not_update(pool: PgPool) {
          discriminate the two columns"
     );
     let out = recall_with_pgvec(
-        &server,
+        &server, &viewer,
         recall_params(json!({ "since": cut.to_rfc3339() })),
         Some(cluster_pgvec(0)),
     )
@@ -669,6 +675,7 @@ async fn created_at_is_creation_not_update(pool: PgPool) {
 /// is why this is the deciding test rather than a nice-to-have.
 #[sqlx::test(migrations = "../../migrations")]
 async fn since_survives_candidate_pool_saturation(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     // 60 > HYBRID_CANDIDATE_POOL (50), so each leg saturates on old rows.
@@ -700,7 +707,7 @@ async fn since_survives_candidate_pool_saturation(pool: PgPool) {
 
     let server = build_test_server(pool);
     let out = recall_with_pgvec(
-        &server,
+        &server, &viewer,
         recall_params(json!({ "since": epoch_cut().to_rfc3339(), "limit": 10 })),
         Some(cluster_pgvec(0)),
     )
@@ -724,6 +731,7 @@ async fn since_survives_candidate_pool_saturation(pool: PgPool) {
 /// S1 (dense CTE) + S2 (lex CTE) of `search_hybrid_scoped`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_leak_s1_s2_hybrid_dense_and_lexical(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     // Dense-only match (no query term in content): reachable via S1 alone.
     let old_dense = seed_claim_at(
@@ -764,7 +772,7 @@ async fn no_leak_s1_s2_hybrid_dense_and_lexical(pool: PgPool) {
     let server = build_test_server(pool);
     let o = outcome(
         recall_with_pgvec(
-            &server,
+            &server, &viewer,
             recall_params(json!({ "since": epoch_cut().to_rfc3339() })),
             Some(cluster_pgvec(0)),
         )
@@ -782,6 +790,7 @@ async fn no_leak_s1_s2_hybrid_dense_and_lexical(pool: PgPool) {
 /// `embedder.generate` fails.
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_leak_s3_lexical_when_embedder_down(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let old = seed_claim_at(
         &pool,
@@ -805,7 +814,7 @@ async fn no_leak_s3_lexical_when_embedder_down(pool: PgPool) {
     let server = build_test_server(pool);
     let o = outcome(
         recall_with_pgvec(
-            &server,
+            &server, &viewer,
             recall_params(json!({ "since": epoch_cut().to_rfc3339() })),
             None, // embedder down ⇒ lexical-only
         )
@@ -824,6 +833,7 @@ async fn no_leak_s3_lexical_when_embedder_down(pool: PgPool) {
 /// and requires the window to apply to that leg too.
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_leak_s4_workflows(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let claim = seed_claim_at(
         &pool,
@@ -841,7 +851,7 @@ async fn no_leak_s4_workflows(pool: PgPool) {
     let server = build_test_server(pool);
     let o = outcome(
         recall_with_pgvec(
-            &server,
+            &server, &viewer,
             recall_params(json!({
                 "since": epoch_cut().to_rfc3339(),
                 "include_workflows": true,
@@ -878,6 +888,7 @@ async fn no_leak_s4_workflows(pool: PgPool) {
 /// S5: `recall_with_context`'s flat level=2 ANN (`search_by_embedding`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_leak_s5_context_flat_ann(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let paper = seed_paper(&pool, "10.temporal/s5").await;
     let old = seed_paragraph_at(
@@ -906,7 +917,7 @@ async fn no_leak_s5_context_flat_ann(pool: PgPool) {
     let server = build_test_server(pool);
     let o = outcome(
         recall_with_context_with_pgvec(
-            &server,
+            &server, &viewer,
             context_params(json!({ "since": epoch_cut().to_rfc3339() })),
             1536,
             &cluster_pgvec(0),
@@ -924,6 +935,7 @@ async fn no_leak_s5_context_flat_ann(pool: PgPool) {
 /// surface a "just filter the ANN SELECT" fix silently misses.
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_leak_s6_diverse_themes(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let paper = seed_paper(&pool, "10.temporal/s6").await;
     let theme = seed_theme(&pool, "temporal-theme", &cluster_pgvec(0)).await;
@@ -954,7 +966,7 @@ async fn no_leak_s6_diverse_themes(pool: PgPool) {
     let server = build_test_server(pool);
     let o = outcome(
         recall_with_context_with_pgvec(
-            &server,
+            &server, &viewer,
             context_params(json!({
                 "since": epoch_cut().to_rfc3339(),
                 "diverse": true,
@@ -976,6 +988,7 @@ async fn no_leak_s6_diverse_themes(pool: PgPool) {
 /// `supports` edge from an in-window seed must NOT surface as a hit.
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_leak_s7_graph_expansion(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let paper = seed_paper(&pool, "10.temporal/s7").await;
 
@@ -1013,7 +1026,7 @@ async fn no_leak_s7_graph_expansion(pool: PgPool) {
     // otherwise the assertion below would pass for the wrong reason.
     let baseline = outcome(
         recall_with_context_with_pgvec(
-            &server,
+            &server, &viewer,
             context_params(json!({ "graph_expansion_depth": 2, "limit": 10 })),
             1536,
             &cluster_pgvec(0),
@@ -1050,7 +1063,7 @@ async fn no_leak_s7_graph_expansion(pool: PgPool) {
 
     let o = outcome(
         recall_with_context_with_pgvec(
-            &server,
+            &server, &viewer,
             context_params(json!({
                 "since": epoch_cut().to_rfc3339(),
                 "graph_expansion_depth": 2,
@@ -1080,6 +1093,7 @@ async fn no_leak_s7_graph_expansion(pool: PgPool) {
 /// rather than offer it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn context_is_exempt_from_since(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let paper = seed_paper(&pool, "10.temporal/g7").await;
 
@@ -1125,7 +1139,7 @@ async fn context_is_exempt_from_since(pool: PgPool) {
 
     let server = build_test_server(pool);
     let out = recall_with_context_with_pgvec(
-        &server,
+        &server, &viewer,
         context_params(json!({ "since": epoch_cut().to_rfc3339() })),
         1536,
         &cluster_pgvec(0),

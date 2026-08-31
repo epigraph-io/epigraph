@@ -6,6 +6,9 @@
 //! chain survives serialization, and that topological order is preserved in
 //! the JSON a caller receives.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_mcp::tools::provenance_chain::get_provenance_chain;
 use epigraph_mcp::types::GetProvenanceChainParams;
 use sqlx::PgPool;
@@ -59,6 +62,7 @@ async fn seed_edge(pool: &PgPool, source: Uuid, target: Uuid, rel: &str) {
 /// This is the shape that breaks if the frontier is wired single-direction.
 #[sqlx::test(migrations = "../../migrations")]
 async fn tool_returns_mixed_direction_chain_in_topological_order(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let root = seed_claim(&pool, agent, "final conclusion").await;
     let evidence = seed_claim(&pool, agent, "supporting evidence").await;
@@ -69,7 +73,7 @@ async fn tool_returns_mixed_direction_chain_in_topological_order(pool: PgPool) {
 
     let server = build_test_server(pool);
     let out = get_provenance_chain(
-        &server,
+        &server, &viewer,
         GetProvenanceChainParams {
             claim_id: root.to_string(),
             max_depth: Some(4),
@@ -117,6 +121,7 @@ async fn tool_returns_mixed_direction_chain_in_topological_order(pool: PgPool) {
 /// must drop the supersedes ancestor.
 #[sqlx::test(migrations = "../../migrations")]
 async fn relationships_filter_narrows_the_walk(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let root = seed_claim(&pool, agent, "conclusion b").await;
     let evidence = seed_claim(&pool, agent, "evidence b").await;
@@ -126,7 +131,7 @@ async fn relationships_filter_narrows_the_walk(pool: PgPool) {
 
     let server = build_test_server(pool);
     let out = get_provenance_chain(
-        &server,
+        &server, &viewer,
         GetProvenanceChainParams {
             claim_id: root.to_string(),
             max_depth: Some(4),
@@ -162,9 +167,10 @@ async fn relationships_filter_narrows_the_walk(pool: PgPool) {
 /// A bad UUID is a parameter error, not a 500.
 #[sqlx::test(migrations = "../../migrations")]
 async fn invalid_uuid_is_rejected(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool);
     let err = get_provenance_chain(
-        &server,
+        &server, &viewer,
         GetProvenanceChainParams {
             claim_id: "not-a-uuid".to_string(),
             max_depth: None,

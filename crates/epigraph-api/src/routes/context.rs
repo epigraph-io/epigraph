@@ -10,6 +10,7 @@
 //! - `POST /api/v1/contexts` — create a context
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 #[cfg(feature = "db")]
@@ -176,11 +177,13 @@ pub async fn create_context(
 /// `GET /api/v1/contexts`
 #[cfg(feature = "db")]
 pub async fn list_contexts(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListContextsQuery>,
 ) -> Result<Json<Vec<ContextResponse>>, ApiError> {
     let pool = &state.db_pool;
-    let rows = epigraph_db::ContextRepository::list(pool, params.limit, params.offset).await?;
+    let rows =
+        epigraph_db::ContextRepository::list(pool, &viewer, params.limit, params.offset).await?;
     Ok(Json(rows.into_iter().map(context_to_response).collect()))
 }
 
@@ -189,11 +192,12 @@ pub async fn list_contexts(
 /// `GET /api/v1/contexts/:id`
 #[cfg(feature = "db")]
 pub async fn get_context(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ContextResponse>, ApiError> {
     let pool = &state.db_pool;
-    let row = epigraph_db::ContextRepository::get_by_id(pool, id)
+    let row = epigraph_db::ContextRepository::get_by_id(pool, &viewer, id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "context".to_string(),
@@ -207,10 +211,11 @@ pub async fn get_context(
 /// `GET /api/v1/contexts/active`
 #[cfg(feature = "db")]
 pub async fn list_active_contexts(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ContextResponse>>, ApiError> {
     let pool = &state.db_pool;
-    let rows = epigraph_db::ContextRepository::list_active(pool).await?;
+    let rows = epigraph_db::ContextRepository::list_active(pool, &viewer).await?;
     Ok(Json(rows.into_iter().map(context_to_response).collect()))
 }
 
@@ -219,11 +224,12 @@ pub async fn list_active_contexts(
 /// `GET /api/v1/frames/:id/contexts`
 #[cfg(feature = "db")]
 pub async fn frame_contexts(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
 ) -> Result<Json<Vec<ContextResponse>>, ApiError> {
     let pool = &state.db_pool;
-    let rows = epigraph_db::ContextRepository::list_for_frame(pool, frame_id).await?;
+    let rows = epigraph_db::ContextRepository::list_for_frame(pool, &viewer, frame_id).await?;
     Ok(Json(rows.into_iter().map(context_to_response).collect()))
 }
 

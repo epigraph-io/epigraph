@@ -12,6 +12,9 @@
 //! Schema notes (mirrors `claim_search_by_embedding.rs`): `agents` row must
 //! exist before claims (FK); `content_hash` is NOT NULL and unique per agent.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -92,6 +95,7 @@ async fn seed_claim(
 /// non-current claims — unlike the level-2-only `search_by_embedding`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn search_current_returns_all_levels_excludes_non_current(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool, "a1").await;
     let pgvec = build_query_vec();
 
@@ -99,7 +103,7 @@ async fn search_current_returns_all_levels_excludes_non_current(pool: PgPool) {
     let para = seed_claim(&pool, agent, 2, Some(2), true, &[], &pgvec).await; // level 2, current
     let retired = seed_claim(&pool, agent, 3, None, false, &[], &pgvec).await; // current=false
 
-    let hits = ClaimRepository::search_by_embedding_current(&pool, &pgvec, 10)
+    let hits = ClaimRepository::search_by_embedding_current(&pool, &viewer, &pgvec, 10)
         .await
         .expect("search_by_embedding_current");
     let ids: Vec<Uuid> = hits.iter().map(|h| h.claim_id).collect();
@@ -120,7 +124,7 @@ async fn search_current_returns_all_levels_excludes_non_current(pool: PgPool) {
     // Contrast: the existing level-2-only method would MISS the memory and the
     // level<none> retired claim, returning only the level-2 paragraph. This is
     // exactly why recall needs the new method.
-    let level2_only = ClaimRepository::search_by_embedding(&pool, &pgvec, 1536, 10, None)
+    let level2_only = ClaimRepository::search_by_embedding(&pool, &viewer, &pgvec, 1536, 10, None)
         .await
         .expect("legacy search_by_embedding");
     let l2_ids: Vec<Uuid> = level2_only.iter().map(|h| h.claim_id).collect();
@@ -139,6 +143,7 @@ async fn search_current_returns_all_levels_excludes_non_current(pool: PgPool) {
 /// filter must restrict, and the two combine (AND).
 #[sqlx::test(migrations = "../../migrations")]
 async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent_a = seed_agent(&pool, "a1").await;
     let agent_b = seed_agent(&pool, "b2").await;
     let pgvec = build_query_vec();
@@ -152,7 +157,7 @@ async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
     };
 
     // No scope → all three.
-    let all = ClaimRepository::search_by_embedding_scoped(&pool, &pgvec, 10, None, None)
+    let all = ClaimRepository::search_by_embedding_scoped(&pool, &viewer, &pgvec, 10, None, None)
         .await
         .expect("scoped none");
     let all_ids = ids(&all);
@@ -163,7 +168,7 @@ async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
 
     // Tag scope → only the two carrying topic-x, across agents.
     let tagged = ClaimRepository::search_by_embedding_scoped(
-        &pool,
+        &pool, &viewer,
         &pgvec,
         10,
         Some(&["topic-x".to_string()]),
@@ -183,7 +188,7 @@ async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
 
     // Agent scope → only agent_a's claims, regardless of tag.
     let by_agent =
-        ClaimRepository::search_by_embedding_scoped(&pool, &pgvec, 10, None, Some(agent_a))
+        ClaimRepository::search_by_embedding_scoped(&pool, &viewer, &pgvec, 10, None, Some(agent_a))
             .await
             .expect("scoped agent");
     let agent_ids = ids(&by_agent);
@@ -195,7 +200,7 @@ async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
 
     // Both → intersection: agent_a AND topic-x = only a_x.
     let both = ClaimRepository::search_by_embedding_scoped(
-        &pool,
+        &pool, &viewer,
         &pgvec,
         10,
         Some(&["topic-x".to_string()]),

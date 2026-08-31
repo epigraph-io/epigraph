@@ -77,6 +77,7 @@ fn format_pgvector(vec: &[f32]) -> String {
 /// Embedding errors cause silent fallback, not a returned error.
 pub async fn recall(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     embedder: &dyn EmbeddingService,
     query: &str,
     limit: usize,
@@ -93,12 +94,13 @@ pub async fn recall(
         // `evidence.embedding`, which is a permanently-empty column: searching
         // it made this semantic leg always return nothing and silently starved
         // downstream callers (episcience synthesis stage-1 seeding).
-        match ClaimRepository::search_by_embedding_current(pool, &pgvec, limit_i64).await {
+        match ClaimRepository::search_by_embedding_current(pool, viewer, &pgvec, limit_i64).await {
             Ok(hits) => {
                 let mut results = Vec::new();
                 for hit in hits {
                     if let Ok(Some(claim)) =
-                        ClaimRepository::get_by_id(pool, ClaimId::from_uuid(hit.claim_id)).await
+                        ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(hit.claim_id))
+                            .await
                     {
                         let tv = claim.truth_value.value();
                         if tv >= min_truth {
@@ -120,17 +122,17 @@ pub async fn recall(
             }
             Err(e) => {
                 tracing::warn!("embedding search failed, falling back to text search: {e}");
-                text_search_fallback(pool, query, limit_i64, min_truth).await?
+                text_search_fallback(pool, viewer, query, limit_i64, min_truth).await?
             }
         }
     } else {
         // Embedding generation failed (no API key, mock mode, etc.) — fall back
         // to text search. This matches the existing MCP behaviour.
-        text_search_fallback(pool, query, limit_i64, min_truth).await?
+        text_search_fallback(pool, viewer, query, limit_i64, min_truth).await?
     };
 
     let mut results = results;
-    annotate_disputes(pool, &mut results).await;
+    annotate_disputes(pool, viewer, &mut results).await;
 
     // Recall audit log (backlog 8cbffa0e). This is the LIBRARY path — episcience
     // synthesis calls it directly, with no MCP request and therefore no auth
@@ -187,12 +189,16 @@ async fn log_recall_event(
 /// Best-effort by design: a dispute-lookup failure warns and serves the page
 /// unannotated rather than failing a recall that already has its results. The
 /// signal informs the caller; it never re-ranks and never gates retrieval.
-async fn annotate_disputes(pool: &PgPool, results: &mut [RecallResult]) {
+async fn annotate_disputes(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    results: &mut [RecallResult],
+) {
     let claim_ids: Vec<uuid::Uuid> = results
         .iter()
         .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
         .collect();
-    match ClaimRepository::dispute_batch(pool, &claim_ids).await {
+    match ClaimRepository::dispute_batch(pool, viewer, &claim_ids).await {
         Ok(mut by_claim) => {
             for r in results.iter_mut() {
                 let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
@@ -218,11 +224,12 @@ async fn annotate_disputes(pool: &PgPool, results: &mut [RecallResult]) {
 /// Text-search fallback via `ClaimRepository::list` with `ILIKE` filter.
 async fn text_search_fallback(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     query: &str,
     limit: i64,
     min_truth: f64,
 ) -> Result<Vec<RecallResult>, RecallError> {
-    let claims = ClaimRepository::list(pool, limit, 0, Some(query)).await?;
+    let claims = ClaimRepository::list(pool, viewer, limit, 0, Some(query)).await?;
     Ok(claims
         .into_iter()
         .filter(|c| c.truth_value.value() >= min_truth)

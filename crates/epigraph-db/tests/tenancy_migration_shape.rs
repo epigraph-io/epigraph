@@ -145,11 +145,12 @@ async fn the_three_partial_tenancy_indexes_share_one_predicate_spelling(pool: Pg
         "idx_evidence_owner_group",
         "idx_edges_owner_group",
     ] {
-        let def: String = sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE indexname = $1")
-            .bind(index)
-            .fetch_one(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("{index} must exist: {e}"));
+        let def: String =
+            sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE indexname = $1")
+                .bind(index)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{index} must exist: {e}"));
         assert!(
             def.contains("WHERE ((visibility)::text <> 'public'::text)"),
             "{index} must predicate on `visibility <> 'public'`, the spelling that \

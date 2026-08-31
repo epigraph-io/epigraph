@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 use epigraph_core::challenge::{Challenge, ChallengeType};
 
@@ -287,16 +288,18 @@ pub async fn submit_challenge(
 ///
 /// Returns 200 OK with an empty list if no challenges exist for the claim.
 pub async fn list_challenges(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<ListChallengesResponse>, ApiError> {
     #[cfg(feature = "db")]
     let challenge_responses = {
-        let rows = epigraph_db::ChallengeRepository::list_for_claim(&state.db_pool, claim_id)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to list challenges: {e}"),
-            })?;
+        let rows =
+            epigraph_db::ChallengeRepository::list_for_claim(&state.db_pool, &viewer, claim_id)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("Failed to list challenges: {e}"),
+                })?;
         rows.into_iter()
             .map(|r| ChallengeResponse {
                 id: r.id,

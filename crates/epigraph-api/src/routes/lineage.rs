@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
 
+use crate::middleware::bearer::ViewerExtractor;
 use crate::{errors::ApiError, state::AppState};
 
 // ============================================================================
@@ -177,6 +178,7 @@ pub struct TraceNode {
 /// - 200: LineageResponse with nodes and edges
 /// - 404: Claim not found
 pub async fn get_lineage(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<LineageParams>,
@@ -191,18 +193,20 @@ pub async fn get_lineage(
     let include_traces = params.include_traces.unwrap_or(true);
 
     // First, check if the claim exists (for 404)
-    let _root_claim = ClaimRepository::get_by_id(&state.db_pool, ClaimId::from_uuid(claim_id))
-        .await?
-        .ok_or_else(|| ApiError::NotFound {
-            entity: "Claim".to_string(),
-            id: claim_id.to_string(),
-        })?;
+    let _root_claim =
+        ClaimRepository::get_by_id(&state.db_pool, &viewer, ClaimId::from_uuid(claim_id))
+            .await?
+            .ok_or_else(|| ApiError::NotFound {
+                entity: "Claim".to_string(),
+                id: claim_id.to_string(),
+            })?;
 
     // Get lineage based on direction
     let (nodes, edges, max_depth_reached) = match direction {
         LineageDirection::Ancestors => {
             get_ancestor_lineage(
                 &state,
+                &viewer,
                 claim_id,
                 max_depth,
                 include_evidence,
@@ -213,6 +217,7 @@ pub async fn get_lineage(
         LineageDirection::Descendants => {
             get_descendant_lineage(
                 &state,
+                &viewer,
                 claim_id,
                 max_depth,
                 include_evidence,
@@ -224,6 +229,7 @@ pub async fn get_lineage(
             // Get both ancestors and descendants, then merge
             let (ancestor_nodes, ancestor_edges, ancestor_depth) = get_ancestor_lineage(
                 &state,
+                &viewer,
                 claim_id,
                 max_depth,
                 include_evidence,
@@ -232,6 +238,7 @@ pub async fn get_lineage(
             .await?;
             let (descendant_nodes, descendant_edges, descendant_depth) = get_descendant_lineage(
                 &state,
+                &viewer,
                 claim_id,
                 max_depth,
                 include_evidence,
@@ -290,6 +297,7 @@ pub async fn get_lineage(
 /// Get ancestor lineage (claims this claim depends on)
 async fn get_ancestor_lineage(
     state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     max_depth: i32,
     include_evidence: bool,
@@ -297,17 +305,18 @@ async fn get_ancestor_lineage(
 ) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32), ApiError> {
     // Use LineageRepository for ancestor traversal
     let lineage_result =
-        LineageRepository::get_lineage(&state.db_pool, claim_id, Some(max_depth)).await?;
+        LineageRepository::get_lineage(&state.db_pool, viewer, claim_id, Some(max_depth)).await?;
 
     // If no claims found (empty result), return just the root claim
     if lineage_result.claims.is_empty() {
         // Get the root claim info
-        let claim = ClaimRepository::get_by_id(&state.db_pool, ClaimId::from_uuid(claim_id))
-            .await?
-            .ok_or_else(|| ApiError::NotFound {
-                entity: "Claim".to_string(),
-                id: claim_id.to_string(),
-            })?;
+        let claim =
+            ClaimRepository::get_by_id(&state.db_pool, viewer, ClaimId::from_uuid(claim_id))
+                .await?
+                .ok_or_else(|| ApiError::NotFound {
+                    entity: "Claim".to_string(),
+                    id: claim_id.to_string(),
+                })?;
 
         let node = LineageNode {
             claim_id,
@@ -329,7 +338,7 @@ async fn get_ancestor_lineage(
 
     for (id, lineage_claim) in &lineage_result.claims {
         // Get full claim data to include agent_id and created_at
-        let claim = ClaimRepository::get_by_id(&state.db_pool, ClaimId::from_uuid(*id))
+        let claim = ClaimRepository::get_by_id(&state.db_pool, viewer, ClaimId::from_uuid(*id))
             .await?
             .ok_or_else(|| ApiError::NotFound {
                 entity: "Claim".to_string(),
@@ -408,6 +417,7 @@ async fn get_ancestor_lineage(
 /// then transforms the result to the API response format.
 async fn get_descendant_lineage(
     state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     max_depth: i32,
     include_evidence: bool,
@@ -415,17 +425,19 @@ async fn get_descendant_lineage(
 ) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32), ApiError> {
     // Use LineageRepository for descendant traversal
     let lineage_result =
-        LineageRepository::get_descendants(&state.db_pool, claim_id, Some(max_depth)).await?;
+        LineageRepository::get_descendants(&state.db_pool, viewer, claim_id, Some(max_depth))
+            .await?;
 
     // If no claims found (empty result), return just the root claim
     if lineage_result.claims.is_empty() {
         // Get the root claim info
-        let claim = ClaimRepository::get_by_id(&state.db_pool, ClaimId::from_uuid(claim_id))
-            .await?
-            .ok_or_else(|| ApiError::NotFound {
-                entity: "Claim".to_string(),
-                id: claim_id.to_string(),
-            })?;
+        let claim =
+            ClaimRepository::get_by_id(&state.db_pool, viewer, ClaimId::from_uuid(claim_id))
+                .await?
+                .ok_or_else(|| ApiError::NotFound {
+                    entity: "Claim".to_string(),
+                    id: claim_id.to_string(),
+                })?;
 
         let node = LineageNode {
             claim_id,
@@ -447,7 +459,7 @@ async fn get_descendant_lineage(
 
     for (id, lineage_claim) in &lineage_result.claims {
         // Get full claim data to include agent_id and created_at
-        let claim = ClaimRepository::get_by_id(&state.db_pool, ClaimId::from_uuid(*id))
+        let claim = ClaimRepository::get_by_id(&state.db_pool, viewer, ClaimId::from_uuid(*id))
             .await?
             .ok_or_else(|| ApiError::NotFound {
                 entity: "Claim".to_string(),

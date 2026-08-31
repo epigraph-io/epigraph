@@ -36,6 +36,7 @@ use epigraph_engine::diverse_retrieval::{
     MAX_CANDIDATE_POOL,
 };
 
+use crate::middleware::bearer::ViewerExtractor;
 use crate::{errors::ApiError, state::AppState};
 
 // ============================================================================
@@ -428,6 +429,7 @@ fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
 /// - Query is parameterized to prevent SQL injection
 /// - Special characters are safely handled by sqlx
 pub async fn semantic_search(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     #[allow(unused_variables)] State(state): State<AppState>,
     Json(request): Json<SemanticSearchRequest>,
 ) -> Result<Json<SemanticSearchResponse>, ApiError> {
@@ -630,6 +632,7 @@ pub async fn semantic_search(
                 // pre-helper behaviour.
                 let candidates = candidates_in_themes_at_dim(
                     &state.db_pool,
+                    &viewer,
                     &theme_ids,
                     &embedding_str,
                     candidate_pool,
@@ -1303,6 +1306,9 @@ mod db_integration_tests {
         pool: sqlx::PgPool,
         centroid_dim: Option<u32>,
     ) -> Result<SemanticSearchResponse, ApiError> {
+        let viewer = epigraph_db::Viewer::resolve(&pool, uuid::Uuid::nil())
+            .await
+            .expect("resolve viewer");
         let state = AppState::with_db(pool, ApiConfig::default());
         let request = SemanticSearchRequest {
             query: "test query for diverse search".to_string(),
@@ -1318,7 +1324,12 @@ mod db_integration_tests {
             centroid_dim,
             candidate_pool: None,
         };
-        let response = semantic_search(axum::extract::State(state), axum::Json(request)).await?;
+        let response = semantic_search(
+            crate::middleware::bearer::ViewerExtractor(viewer),
+            axum::extract::State(state),
+            axum::Json(request),
+        )
+        .await?;
         Ok(response.0)
     }
 

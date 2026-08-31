@@ -13,6 +13,9 @@
 //! Leaves its rows in the dev DB for inspection (frames/claims/perspectives
 //! suffixed with a per-run id so re-runs don't collide).
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
@@ -116,7 +119,8 @@ async fn make_perspective(pool: &PgPool, name: &str, rel: &[(&str, f64)]) -> Uui
 }
 
 async fn betp(pool: &PgPool, claim: Uuid, frame: Uuid, persp: Uuid) -> f64 {
-    epigraph_engine::belief_query::get_perspective_belief(pool, claim, frame, persp)
+    let viewer = fixture::public_viewer(pool).await;
+    epigraph_engine::belief_query::get_perspective_belief(pool, &viewer, claim, frame, persp)
         .await
         .expect("get_perspective_belief")
         .pignistic_prob

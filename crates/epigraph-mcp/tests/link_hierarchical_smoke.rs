@@ -4,6 +4,9 @@
 //! happy / idempotent / validation / 404-equivalent paths all exercise the
 //! same repo layer the production rmcp dispatcher uses.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
@@ -88,13 +91,14 @@ fn parse_response(result: &rmcp::model::CallToolResult) -> LinkHierarchicalRespo
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn happy_path_creates_edge_and_is_idempotent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let source = seed_claim(&pool, "chapter 1 thesis").await;
     let target = seed_claim(&pool, "book thesis").await;
 
     // First call — fresh insert.
     let first = do_link_hierarchical(
-        &server,
+        &server, &viewer,
         LinkHierarchicalParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -123,7 +127,7 @@ async fn happy_path_creates_edge_and_is_idempotent(pool: PgPool) {
 
     // Second call with the same args — dedup hit, no new edge row.
     let second = do_link_hierarchical(
-        &server,
+        &server, &viewer,
         LinkHierarchicalParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -157,12 +161,13 @@ async fn happy_path_creates_edge_and_is_idempotent(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn invalid_relationship_is_rejected(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let source = seed_claim(&pool, "atomA").await;
     let target = seed_claim(&pool, "atomB").await;
 
     let err = do_link_hierarchical(
-        &server,
+        &server, &viewer,
         LinkHierarchicalParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -195,12 +200,13 @@ async fn invalid_relationship_is_rejected(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_source_claim_returns_404_equivalent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let target = seed_claim(&pool, "real target").await;
     let bogus = Uuid::new_v4();
 
     let err = do_link_hierarchical(
-        &server,
+        &server, &viewer,
         LinkHierarchicalParams {
             source_claim_id: bogus.to_string(),
             target_claim_id: target.to_string(),
@@ -219,12 +225,13 @@ async fn missing_source_claim_returns_404_equivalent(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_target_claim_returns_404_equivalent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let source = seed_claim(&pool, "real source").await;
     let bogus = Uuid::new_v4();
 
     let err = do_link_hierarchical(
-        &server,
+        &server, &viewer,
         LinkHierarchicalParams {
             source_claim_id: source.to_string(),
             target_claim_id: bogus.to_string(),
@@ -243,11 +250,12 @@ async fn missing_target_claim_returns_404_equivalent(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn self_loop_is_rejected(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let claim = seed_claim(&pool, "loop").await;
 
     let err = do_link_hierarchical(
-        &server,
+        &server, &viewer,
         LinkHierarchicalParams {
             source_claim_id: claim.to_string(),
             target_claim_id: claim.to_string(),

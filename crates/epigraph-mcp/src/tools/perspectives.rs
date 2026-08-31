@@ -115,11 +115,12 @@ pub async fn set_source_reliability(
 /// List all perspectives with optional pagination.
 pub async fn list_perspectives(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ListPerspectivesParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
-    let rows = PerspectiveRepository::list(&server.pool, limit, 0)
+    let rows = PerspectiveRepository::list(&server.pool, viewer, limit, 0)
         .await
         .map_err(internal_error)?;
 
@@ -150,11 +151,12 @@ pub async fn list_perspectives(
 /// Get a single perspective by ID.
 pub async fn get_perspective(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetPerspectiveParams,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.perspective_id)?;
 
-    let row = PerspectiveRepository::get_by_id(&server.pool, id)
+    let row = PerspectiveRepository::get_by_id(&server.pool, viewer, id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("perspective {id} not found")))?;
