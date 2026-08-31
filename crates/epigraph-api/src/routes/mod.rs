@@ -168,15 +168,15 @@ pub fn create_router(state: AppState) -> Router {
         .route("/agents", post(agents::create_agent))
         .route("/api/v1/agents", post(agents::create_agent))
         .route("/api/v1/agents/:id", put(agents::update_agent))
-        .route(
-            "/api/v1/claims/:id",
-            put(claims::update_claim).delete(claims::delete_claim),
-        )
+        // NO claim-deletion route. `DELETE /api/v1/claims/:id` and
+        // `POST /api/v1/claims/:id/confirm-delete` were removed: EpiGraph retires
+        // claims by supersession and edges by retraction, so a production path that
+        // destroys a claim and hard-deletes every edge touching it contradicted the
+        // policy it sat next to. Test cleanup moved to
+        // `tests/integration/test_claim_cleanup.rs::hard_delete_test_claims`, which
+        // is unreachable over HTTP and guards against non-disposable databases.
+        .route("/api/v1/claims/:id", put(claims::update_claim))
         .route("/api/v1/claims/:id", patch(claims::patch_claim))
-        .route(
-            "/api/v1/claims/:id/confirm-delete",
-            post(claims::confirm_delete_claim),
-        )
         .route(
             "/api/v1/edges/:id",
             delete(edges::delete_edge).patch(edges::patch_edge),
@@ -873,15 +873,15 @@ pub fn create_router(state: AppState) -> Router {
 pub fn create_router(state: AppState) -> Router {
     // Protected write operations
     let protected = Router::new()
-        .route(
-            "/api/v1/claims/:id",
-            put(claims::update_claim).delete(claims::delete_claim),
-        )
+        // NO claim-deletion route. `DELETE /api/v1/claims/:id` and
+        // `POST /api/v1/claims/:id/confirm-delete` were removed: EpiGraph retires
+        // claims by supersession and edges by retraction, so a production path that
+        // destroys a claim and hard-deletes every edge touching it contradicted the
+        // policy it sat next to. Test cleanup moved to
+        // `tests/integration/test_claim_cleanup.rs::hard_delete_test_claims`, which
+        // is unreachable over HTTP and guards against non-disposable databases.
+        .route("/api/v1/claims/:id", put(claims::update_claim))
         .route("/api/v1/claims/:id", patch(claims::patch_claim))
-        .route(
-            "/api/v1/claims/:id/confirm-delete",
-            post(claims::confirm_delete_claim),
-        )
         .route(
             "/api/v1/edges/:id",
             delete(edges::delete_edge).patch(edges::patch_edge),
