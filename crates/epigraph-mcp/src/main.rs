@@ -148,6 +148,50 @@ struct Cli {
 struct SelectedSigner {
     signer: AgentSigner,
     llm_identity: Option<(String, String)>,
+    key_trust: KeyTrust,
+}
+
+/// How much a signature made by this process's key is actually worth.
+///
+/// This exists because the answer is not uniform and the difference is not
+/// cosmetic. `keypair_from_seed` sets the Ed25519 **secret** key to
+/// `BLAKE3(seed)`, and for the LLM-agent paths that seed is built from public
+/// inputs — a model identifier and a prompt digest. Anyone who can guess those
+/// reconstructs the secret key and can forge signatures under this agent's
+/// identity.
+///
+/// Nothing signs claims today, so this is latent rather than exploited. It is
+/// recorded now, before a signing write path exists, because a signature over a
+/// publicly derivable key is **worse than no signature**: it converts an honest
+/// "unsigned" into a confident green that a third party can manufacture. Any
+/// future verdict that reports a signature as trustworthy must consult this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyTrust {
+    /// Operator-supplied 32-byte key that never leaves their control. The only
+    /// tier where a signature attributes to a party that holds a secret.
+    OutOfBand,
+    /// Derived by BLAKE3 over public inputs (model + prompt hash). Reproducible
+    /// by anyone who knows the configuration; **forgeable by construction**.
+    DerivedPublicSeed,
+    /// Randomly generated at boot and printed once. Unforgeable but ephemeral —
+    /// nothing outside this process run can attest to it.
+    EphemeralSelfRegistered,
+}
+
+impl KeyTrust {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OutOfBand => "OUT_OF_BAND",
+            Self::DerivedPublicSeed => "DERIVED_PUBLIC_SEED",
+            Self::EphemeralSelfRegistered => "EPHEMERAL_SELF_REGISTERED",
+        }
+    }
+
+    /// Whether a signature made with this key could be forged by a third party
+    /// who knows only public information.
+    pub(crate) fn is_forgeable(self) -> bool {
+        matches!(self, Self::DerivedPublicSeed)
+    }
 }
 
 /// Select the agent signer from CLI/env inputs, returning the signer paired with
@@ -172,34 +216,27 @@ fn select_signer(
     prompt_hash: Option<&str>,
     agent_key: Option<&str>,
 ) -> Result<SelectedSigner, String> {
-    if let Some(model) = model {
-        // (1) model + explicit hash -> prehashed path (hash used verbatim).
+    // An LLM identity is descriptive metadata about WHICH agent this process
+    // represents. It is recorded whenever a model is supplied, independent of
+    // where the key came from — suppressing it would lose provenance — but it
+    // no longer determines the key when an explicit one is available.
+    let llm_identity = model.map(|model| {
         if let Some(hash) = prompt_hash {
-            let signer = epigraph_crypto::keypair_from_llm_agent_prehashed(model, hash);
-            return Ok(SelectedSigner {
-                signer,
-                llm_identity: Some((model.trim().to_string(), hash.to_string())),
-            });
+            (model.trim().to_string(), hash.to_string())
+        } else {
+            let prompt = raw_prompt.unwrap_or("");
+            let hash = epigraph_crypto::ContentHasher::to_hex(
+                &epigraph_crypto::ContentHasher::hash(prompt.as_bytes()),
+            );
+            (model.trim().to_string(), hash)
         }
-        // (2) model + raw prompt (or empty) -> raw path, which hashes the
-        // prompt. Store that SAME digest so key and recorded hash cannot drift.
-        let prompt = raw_prompt.unwrap_or("");
-        // Lowercase-hex BLAKE3 digest — byte-identical to what
-        // `keypair_from_llm_agent` computes internally (both wrap
-        // `blake3::hash`), so the stored `llm_prompt_hash` always corresponds to
-        // the derived key. Using `ContentHasher` (a regular dep) rather than
-        // `blake3` directly, which is only a dev-dependency of this crate.
-        let hash = epigraph_crypto::ContentHasher::to_hex(&epigraph_crypto::ContentHasher::hash(
-            prompt.as_bytes(),
-        ));
-        let signer = epigraph_crypto::keypair_from_llm_agent(model, prompt);
-        return Ok(SelectedSigner {
-            signer,
-            llm_identity: Some((model.trim().to_string(), hash)),
-        });
-    }
+    });
 
-    // (3) explicit 32-byte key, no LLM identity.
+    // (1) Explicit 32-byte key WINS. Inverted 2026-08-29: this branch used to
+    // sit below the model branches, so a key derived by BLAKE3 over public
+    // inputs silently outranked a secret the operator actually controls. An
+    // operator who takes the trouble to supply a key must not be quietly
+    // downgraded to a forgeable one.
     if let Some(key_hex) = agent_key {
         let bytes = (0..key_hex.len())
             .step_by(2)
@@ -212,7 +249,30 @@ fn select_signer(
         let signer = AgentSigner::from_bytes(&key).map_err(|e| format!("agent-key: {e}"))?;
         return Ok(SelectedSigner {
             signer,
-            llm_identity: None,
+            llm_identity,
+            key_trust: KeyTrust::OutOfBand,
+        });
+    }
+
+    if let Some(model) = model {
+        // (2) model + explicit hash -> prehashed path (hash used verbatim).
+        if let Some(hash) = prompt_hash {
+            let signer = epigraph_crypto::keypair_from_llm_agent_prehashed(model, hash);
+            return Ok(SelectedSigner {
+                signer,
+                llm_identity,
+                key_trust: KeyTrust::DerivedPublicSeed,
+            });
+        }
+        // (3) model + raw prompt (or empty) -> raw path, which hashes the
+        // prompt. `llm_identity` above already computed the byte-identical
+        // digest, so the key and the recorded hash cannot drift.
+        let prompt = raw_prompt.unwrap_or("");
+        let signer = epigraph_crypto::keypair_from_llm_agent(model, prompt);
+        return Ok(SelectedSigner {
+            signer,
+            llm_identity,
+            key_trust: KeyTrust::DerivedPublicSeed,
         });
     }
 
@@ -220,6 +280,7 @@ fn select_signer(
     Ok(SelectedSigner {
         signer: AgentSigner::generate(),
         llm_identity: None,
+        key_trust: KeyTrust::EphemeralSelfRegistered,
     })
 }
 
@@ -323,12 +384,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let SelectedSigner {
         signer,
         llm_identity,
+        key_trust,
     } = select_signer(
         cli.agent_model.as_deref(),
         cli.agent_system_prompt.as_deref(),
         cli.agent_system_prompt_hash.as_deref(),
         cli.agent_key.as_deref(),
     )?;
+
+    tracing::info!(key_trust = key_trust.as_str(), "Agent signer selected");
+    if key_trust.is_forgeable() {
+        tracing::warn!(
+            key_trust = key_trust.as_str(),
+            "This agent's Ed25519 SECRET key is BLAKE3 over public inputs (model identifier + \
+             prompt digest), so anyone who knows this process's configuration can reconstruct \
+             it and sign as this agent. Harmless today because no write path persists a claim \
+             signature — but supply --agent-key with a secret you control before relying on \
+             any signature made under this identity."
+        );
+    }
 
     if is_generate_fallback {
         eprintln!("Generated new agent keypair");
@@ -604,17 +678,24 @@ mod listen_auth_gate_tests {
 
 #[cfg(test)]
 mod signer_selection_tests {
-    use super::{select_signer, SelectedSigner};
+    use super::{select_signer, KeyTrust, SelectedSigner};
 
     const KEY_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 
-    /// Precedence rung 1 must win even when a raw prompt AND an agent-key are
-    /// ALSO supplied: model + explicit hash routes to the PREHASHED path, which
-    /// uses the hash verbatim. This guards the ORDER, not an isolated branch —
-    /// the derived key must match `keypair_from_llm_agent_prehashed(model, hash)`
-    /// and NOT the raw-prompt path (which would blake3(prompt) instead).
+    /// Among the DERIVATION paths, an explicit hash still beats a raw prompt and
+    /// is used verbatim.
+    ///
+    /// CONTRACT CHANGED 2026-08-29. This test previously also asserted that the
+    /// prehashed path beat `--agent-key`, and it passed — which is precisely the
+    /// defect. `keypair_from_seed` makes the Ed25519 SECRET key `BLAKE3(seed)`
+    /// over a model identifier and a prompt digest, both public, so that ordering
+    /// silently preferred a forgeable key over a secret the operator controls.
+    /// The explicit-key case now lives in
+    /// `explicit_agent_key_outranks_model_derivation`; this test keeps the part
+    /// of the old contract that was always right — hash beats raw prompt, and the
+    /// hash is used verbatim rather than re-digested.
     #[test]
-    fn model_plus_hash_wins_and_uses_hash_verbatim() {
+    fn model_plus_hash_beats_raw_prompt_and_uses_hash_verbatim() {
         let model = "claude-opus-4-8";
         let hash = "abc123def456";
         let raw_prompt = "some other prompt whose blake3 is NOT the hash above";
@@ -622,21 +703,21 @@ mod signer_selection_tests {
         let SelectedSigner {
             signer,
             llm_identity,
-        } = select_signer(Some(model), Some(raw_prompt), Some(hash), Some(KEY_HEX)).unwrap();
+            key_trust,
+        } = select_signer(Some(model), Some(raw_prompt), Some(hash), None).unwrap();
 
         // Key is the verbatim-hash derivation, proving the prehashed rung ran
-        // and neither the raw-prompt path nor the agent-key path was taken.
+        // and the raw-prompt path was not taken.
         let expected = epigraph_crypto::keypair_from_llm_agent_prehashed(model, hash);
         assert_eq!(signer.public_key(), expected.public_key());
         assert_eq!(llm_identity, Some((model.to_string(), hash.to_string())));
 
-        // Cross-check: it is DISTINCT from the raw-prompt derivation and from the
-        // agent-key. If precedence were wrong these would collide.
         let raw_path = epigraph_crypto::keypair_from_llm_agent(model, raw_prompt);
         assert_ne!(signer.public_key(), raw_path.public_key());
-        let key: [u8; 32] = [0x01; 32];
-        let key_path = epigraph_crypto::AgentSigner::from_bytes(&key).unwrap();
-        assert_ne!(signer.public_key(), key_path.public_key());
+
+        // Both derivation rungs are forgeable and must say so.
+        assert_eq!(key_trust, KeyTrust::DerivedPublicSeed);
+        assert!(key_trust.is_forgeable());
     }
 
     /// Rung 2: model + raw prompt (no hash) routes to `keypair_from_llm_agent`,
@@ -651,6 +732,7 @@ mod signer_selection_tests {
         let SelectedSigner {
             signer,
             llm_identity,
+            ..
         } = select_signer(Some(model), Some(prompt), None, None).unwrap();
 
         let expected_signer = epigraph_crypto::keypair_from_llm_agent(model, prompt);
@@ -676,6 +758,7 @@ mod signer_selection_tests {
         let SelectedSigner {
             signer,
             llm_identity,
+            ..
         } = select_signer(Some(model), None, None, None).unwrap();
 
         let expected = epigraph_crypto::keypair_from_llm_agent(model, "");
@@ -691,6 +774,7 @@ mod signer_selection_tests {
         let SelectedSigner {
             signer,
             llm_identity,
+            ..
         } = select_signer(None, None, None, Some(KEY_HEX)).unwrap();
 
         let key: [u8; 32] = [0x01; 32];
@@ -722,5 +806,101 @@ mod signer_selection_tests {
     #[test]
     fn malformed_agent_key_is_an_error() {
         assert!(select_signer(None, None, None, Some("zz")).is_err());
+    }
+
+    /// THE INVERSION, and the reason this change exists. Before 2026-08-29 the
+    /// model branches sat above the explicit-key branch, so supplying BOTH gave
+    /// you a key derived by BLAKE3 over public inputs — forgeable by anyone who
+    /// knows the model and prompt — while silently ignoring the secret the
+    /// operator actually controls. This test fails against that ordering.
+    #[test]
+    fn explicit_agent_key_outranks_model_derivation() {
+        let model = "claude-opus-4-8";
+        let prompt = "You are a careful analyst.";
+
+        let selected = select_signer(Some(model), Some(prompt), None, Some(KEY_HEX)).unwrap();
+
+        let explicit = epigraph_crypto::AgentSigner::from_bytes(&[0x01; 32]).unwrap();
+        let derived = epigraph_crypto::keypair_from_llm_agent(model, prompt);
+
+        assert_eq!(
+            selected.signer.public_key(),
+            explicit.public_key(),
+            "an explicitly supplied key must win over a publicly derivable one"
+        );
+        assert_ne!(
+            selected.signer.public_key(),
+            derived.public_key(),
+            "the model-derived key must NOT be selected when --agent-key is present"
+        );
+        assert_eq!(selected.key_trust, KeyTrust::OutOfBand);
+        assert!(!selected.key_trust.is_forgeable());
+    }
+
+    /// The LLM identity is descriptive metadata about which agent this process
+    /// represents, so it survives the inversion — losing it would discard
+    /// provenance. It just no longer decides the key.
+    #[test]
+    fn llm_identity_is_still_recorded_when_an_explicit_key_wins() {
+        let model = "gpt-5";
+        let prompt = "You are a careful reviewer.";
+        let selected = select_signer(Some(model), Some(prompt), None, Some(KEY_HEX)).unwrap();
+
+        let expected_hash = blake3::hash(prompt.as_bytes()).to_hex().to_string();
+        assert_eq!(
+            selected.llm_identity,
+            Some((model.to_string(), expected_hash)),
+            "the model/prompt annotation describes the agent and must be preserved"
+        );
+    }
+
+    /// Every branch must report a trust tier, and exactly one of them may be
+    /// forgeable. If a future edit adds a derivation path without marking it,
+    /// this catches it.
+    #[test]
+    fn every_branch_reports_its_key_trust() {
+        assert_eq!(
+            select_signer(Some("m"), Some("p"), None, None)
+                .unwrap()
+                .key_trust,
+            KeyTrust::DerivedPublicSeed
+        );
+        assert_eq!(
+            select_signer(Some("m"), None, Some(&"ab".repeat(32)), None)
+                .unwrap()
+                .key_trust,
+            KeyTrust::DerivedPublicSeed
+        );
+        assert_eq!(
+            select_signer(None, None, None, Some(KEY_HEX))
+                .unwrap()
+                .key_trust,
+            KeyTrust::OutOfBand
+        );
+        assert_eq!(
+            select_signer(None, None, None, None).unwrap().key_trust,
+            KeyTrust::EphemeralSelfRegistered
+        );
+    }
+
+    /// A derived key is forgeable BY CONSTRUCTION, and this proves it rather
+    /// than asserting it: reconstructing the seed from public inputs alone
+    /// reproduces the same secret. If this ever stops holding, the
+    /// DerivedPublicSeed tier is being over-stated and should be revisited.
+    #[test]
+    fn derived_key_is_reproducible_from_public_inputs_alone() {
+        let model = "claude-opus-4-8";
+        let prompt = "You are a careful analyst.";
+        let selected = select_signer(Some(model), Some(prompt), None, None).unwrap();
+
+        // A third party who knows only the model and the prompt:
+        let attacker = epigraph_crypto::keypair_from_llm_agent(model, prompt);
+
+        assert_eq!(
+            selected.signer.public_key(),
+            attacker.public_key(),
+            "this is the forgeability the DerivedPublicSeed tier warns about"
+        );
+        assert!(selected.key_trust.is_forgeable());
     }
 }
