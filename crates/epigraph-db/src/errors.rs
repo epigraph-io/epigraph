@@ -58,8 +58,15 @@ impl From<sqlx::Error> for DbError {
     fn from(err: sqlx::Error) -> Self {
         match err {
             // Check for unique constraint violations
+            // Carry the violated constraint through. The previous literal
+            // "entity" made every unique violation in the workspace
+            // indistinguishable — diagnosing one meant reproducing it by hand in
+            // psql, because the error named neither the index nor the table.
             sqlx::Error::Database(db_err) if db_err.is_unique_violation() => Self::DuplicateKey {
-                entity: "entity".to_string(),
+                entity: db_err
+                    .constraint()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| db_err.message().to_string()),
             },
             // All other database errors become QueryFailed
             other => Self::QueryFailed { source: other },
