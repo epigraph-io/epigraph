@@ -90,7 +90,7 @@ The graph's semantic-search entry point, exposed via the `recall_with_context` M
 
 ## signature
 
-An Ed25519 signature attached to a claim or edge by its signer agent, with `signer_id` identifying the key. Signatures give every assertion in the graph an audit guarantee independent of the database; edge signing is schema-supported (migration 073) and writer-realised per S3 plans. [see 02-concepts.md §2 (Agents and signing)](02-concepts.md#2--agents-and-signing)
+An Ed25519 signature attached to a claim or edge by its signer agent, with `signer_id` identifying the key. The schema supports this on both `claims` and `edges`, but **no writer populates either column today** — see [02-concepts.md §2](02-concepts.md#2--agents-and-signing) for what this means for the audit guarantee. Signed Merkle roots in the `manifests` table are currently the only genuine signatures in the graph.
 
 ## supports
 

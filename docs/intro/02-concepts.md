@@ -39,7 +39,8 @@ A row in `edges` is a **verb event**: a timestamped occurrence or
 relationship involving one or more noun-claims. The edge carries
 `relationship` (the verb), `created_at` (the event time), optional
 `valid_from`/`valid_to`, a `properties` JSONB blob with event
-metadata, and a `signature` / `signer_id` pair. Re-occurrence of the
+metadata, and a `signature` / `signer_id` pair (schema-supported but
+unpopulated today — see [§2](#2--agents-and-signing)). Re-occurrence of the
 same event creates a new edge, never a duplicated noun. Examples:
 
 - `host_agent --[spawned @ T1, props={group:"..."}]--> container_claim`
@@ -126,7 +127,11 @@ did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK
 
 The `z` is base58btc multibase, the leading bytes inside the base58 payload are the multicodec prefix `0xed01` for Ed25519, and the rest is the 32-byte public key. Resolving a DID requires no network call — the public key is in the URI, so signature verification is purely local.
 
-Claim signatures and edge signatures use the same audit guarantee: the schema carries `signature` and `signer_id` columns on both `claims` and `edges` (edge signing was added in migration 073). Today claim signatures are universally populated; edge signing is realised per writer in the S3 plans documented in the noun/verb architecture doc — see "Edge signing" there for the current state of which writers sign. The `provenance_log` table records every create or patch independently of the row-level signature, so even an unsigned edge has a tamper-evident audit trail keyed by the requesting principal.
+Claim signatures and edge signatures are **not populated today**, and this is the single most important caveat on the audit story. The schema carries `signature` and `signer_id` columns on both `claims` and `edges`, with a both-or-neither CHECK and a 64-byte length CHECK, but **no writer anywhere in the workspace inserts them**: every `INSERT INTO claims` and `INSERT INTO edges` omits the columns, and the MCP write path computes an Ed25519 signature (`tools/claims.rs`, `claim.signature = Some(server.signer.sign(&content_hash))`) that is then discarded at the database boundary. `verify_claim` therefore reports `UNSIGNED` for every row.
+
+The `provenance_log` fallback is narrower than it looks and should not be relied on as a substitute. It is written only by `epigraph-api` handlers that carry an authenticated `AuthContext`, so MCP-originated writes — the dominant path — produce no row at all; and its `provenance_sig` column, while `NOT NULL`, has no length CHECK and is passed an empty slice at every call site, so provenance entries are unsigned in practice.
+
+The one place genuine cryptographic signatures do exist is the `manifests` table: Merkle roots are signed and carry a stored `signer_public_key`. Set-level integrity is therefore real where row-level integrity is not. Making row-level verification meaningful is tracked as backlog `49c17386`; the sequenced plan is in `docs/superpowers/reports/` alongside this sweep's other records.
 
 Two flows mint different tokens, and it is easy to confuse them:
 
