@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE edges SET valid_to = now() WHERE id = ANY($1) AND valid_to IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bfb602dbeca5f5b4d2925baf957ba68f1bc84a6663fac0b0b49b8fcbc700a08a"
+}

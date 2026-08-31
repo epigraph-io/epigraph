@@ -3104,10 +3104,11 @@ impl ClaimRepository {
         // `target_id` — have to be deleted with them, so the ids must be
         // captured before the DELETE commits.
         let mut deleted_edges: Vec<(Uuid, Uuid)> = sqlx::query_as(
-            "DELETE FROM edges AS e \
+            "UPDATE edges AS e SET valid_to = now() \
              WHERE e.target_id = $2 AND e.target_type = 'claim' \
                AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
                AND e.source_type = 'claim' AND e.source_id != $1 \
+               AND e.valid_to IS NULL \
                AND EXISTS ( \
                    SELECT 1 FROM edges e2 \
                    WHERE e2.source_id = e.source_id \
@@ -3115,6 +3116,7 @@ impl ClaimRepository {
                      AND e2.target_id = $1 \
                      AND e2.target_type = 'claim' \
                      AND e2.relationship = e.relationship \
+                     AND (e2.valid_to IS NULL OR e2.valid_to > now()) \
                ) \
              RETURNING e.id, e.target_id",
         )
@@ -3128,10 +3130,11 @@ impl ClaimRepository {
         // must refer to the outer (being-deleted) row, not the subquery table.
         deleted_edges.extend(
             sqlx::query_as::<_, (Uuid, Uuid)>(
-                "DELETE FROM edges AS e \
+                "UPDATE edges AS e SET valid_to = now() \
                  WHERE e.source_id = $2 AND e.source_type = 'claim' \
                    AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
                    AND e.target_type = 'claim' AND e.target_id != $1 \
+                   AND e.valid_to IS NULL \
                    AND EXISTS ( \
                        SELECT 1 FROM edges e2 \
                        WHERE e2.source_id = $1 \
@@ -3139,6 +3142,7 @@ impl ClaimRepository {
                          AND e2.target_id = e.target_id \
                          AND e2.target_type = e.target_type \
                          AND e2.relationship = e.relationship \
+                         AND (e2.valid_to IS NULL OR e2.valid_to > now()) \
                    ) \
                  RETURNING e.id, e.target_id",
             )
@@ -3168,8 +3172,9 @@ impl ClaimRepository {
         // left for the self-loop guards in the migration UPDATEs below.
         deleted_edges.extend(
             sqlx::query_as::<_, (Uuid, Uuid)>(
-                "DELETE FROM edges AS e \
+                "UPDATE edges AS e SET valid_to = now() \
                  WHERE e.relationship = 'alternative_of' \
+                   AND e.valid_to IS NULL \
                    AND e.source_type = 'claim' AND e.target_type = 'claim' \
                    AND (e.source_id = $2 OR e.target_id = $2) \
                    AND e.source_id != $1 AND e.target_id != $1 \
@@ -3178,6 +3183,7 @@ impl ClaimRepository {
                        WHERE e2.relationship = 'alternative_of' \
                          AND e2.source_type = 'claim' AND e2.target_type = 'claim' \
                          AND e2.id <> e.id \
+                         AND (e2.valid_to IS NULL OR e2.valid_to > now()) \
                          AND LEAST(e2.source_id, e2.target_id) = \
                              LEAST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
                          AND GREATEST(e2.source_id, e2.target_id) = \
@@ -3210,6 +3216,11 @@ impl ClaimRepository {
         let retargeted: Vec<(Uuid,)> = sqlx::query_as(
             "UPDATE edges SET target_id = $1 \
              WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
+               AND valid_to IS NULL \
+               -- Retracted edges do NOT migrate. A withdrawn assertion was made
+               -- ABOUT the duplicate; re-pointing it at the canonical claim would
+               -- rewrite history, and it would also leave two rows for the same
+               -- pair (one live, one retracted) where callers expect one.
                AND NOT (source_type = 'claim' AND source_id = $1) \
              RETURNING id",
         )
@@ -3283,6 +3294,11 @@ impl ClaimRepository {
         let resourced_rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
             "UPDATE edges SET source_id = $1 \
              WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes' \
+               AND valid_to IS NULL \
+               -- Retracted edges do NOT migrate. A withdrawn assertion was made
+               -- ABOUT the duplicate; re-pointing it at the canonical claim would
+               -- rewrite history, and it would also leave two rows for the same
+               -- pair (one live, one retracted) where callers expect one.
                AND NOT (target_type = 'claim' AND target_id = $1) \
              RETURNING id, target_id, relationship, target_type",
         )
@@ -4732,10 +4748,18 @@ impl ClaimRepository {
 
         let mut edges_deduped = 0_u64;
         if !to_delete.is_empty() {
-            edges_deduped = sqlx::query!("DELETE FROM edges WHERE id = ANY($1)", &to_delete[..])
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
+            // `survivors` keeps the earliest edge per slot and `to_delete` holds only
+            // the redundant later copies, so retracting them leaves the assertion in
+            // force on the survivor. Retraction rather than deletion keeps the
+            // duplicates auditable — you can still see that the graph once carried
+            // two copies and when the redundancy was resolved.
+            edges_deduped = sqlx::query!(
+                "UPDATE edges SET valid_to = now() WHERE id = ANY($1) AND valid_to IS NULL",
+                &to_delete[..]
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         }
 
         let mut edges_migrated = 0_u64;
