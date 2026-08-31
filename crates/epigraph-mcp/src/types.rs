@@ -1129,8 +1129,21 @@ pub struct SubmitClaimResponse {
 #[derive(Debug, Serialize)]
 pub struct VerifyResponse {
     pub claim_id: String,
-    pub signature_valid: bool,
-    pub hash_matches: bool,
+    /// Tri-state, never a bare bool. `MATCHES` means the persisted digest
+    /// reproduces from the stored text; `DIVERGENT` means it provably does not
+    /// (the row was altered after write, or written with a mismatched digest);
+    /// `FOREIGN_DIGEST` means the stored digest is not a BLAKE3-256 of this
+    /// text AND the row carries no `canonical_hash` to disambiguate, so the
+    /// kernel cannot self-check it. Do not collapse the last two: only
+    /// `DIVERGENT` is evidence of a problem.
+    pub content_integrity: &'static str,
+    /// `UNSIGNED` for every row today — no writer in the workspace populates
+    /// `claims.signature`. `VALID` / `INVALID` become reachable only once a
+    /// signing write path exists. `UNSIGNED` is NOT a failure and must never
+    /// be rendered as one.
+    pub signature_status: &'static str,
+    /// Why `signature_status` is what it is, in words a caller can act on.
+    pub signature_detail: String,
     pub truth_value: f64,
 }
 

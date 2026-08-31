@@ -227,6 +227,33 @@ fn claim_from_row(
     )
 }
 
+/// The columns an integrity check needs, read straight from `claims` with no
+/// derivation. Returned by [`ClaimRepository::get_integrity_row`].
+///
+/// Every field here is what the database actually holds. Nothing on this struct
+/// is recomputed from another field — that property is the whole point of it,
+/// and any future edit that derives one field from another reintroduces the
+/// tautology this type exists to remove.
+#[derive(Debug, Clone)]
+pub struct ClaimIntegrityRow {
+    /// The claim text exactly as stored.
+    pub content: String,
+    /// The persisted digest. NOT recomputed from `content`.
+    pub content_hash: Vec<u8>,
+    /// The canonicalized-input digest added by migration 078. `None` for rows
+    /// written before it, and for rows the backfill has not yet reached.
+    pub canonical_hash: Option<Vec<u8>>,
+    /// The asserting agent.
+    pub agent_id: Uuid,
+    /// Ed25519 signature over the claim, if one was ever persisted. As of
+    /// 2026-08-29 no writer in the workspace populates this column.
+    pub signature: Option<Vec<u8>>,
+    /// The signing agent, paired with `signature` by a both-or-neither CHECK.
+    pub signer_id: Option<Uuid>,
+    /// Row creation time.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl ClaimRepository {
     /// Create a new claim in the database (LEGACY — implicit content-hash dedup)
     ///
@@ -609,7 +636,7 @@ impl ClaimRepository {
 
         let row = sqlx::query!(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id,
+            SELECT id, content, content_hash, truth_value, agent_id, trace_id,
                    created_at, updated_at, is_current, supersedes
             FROM claims
             WHERE id = $1
@@ -638,10 +665,62 @@ impl ClaimRepository {
                 // a DEFAULT — the macro trusts the NOT NULL annotation.
                 claim.is_current = row.is_current;
                 claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+                // Post-fix the digest for the same reason. `claim_from_row`
+                // RECOMPUTES content_hash from `content`, so without this the
+                // returned Claim reports a digest derived from the very text
+                // any integrity check would compare it against — a tautology.
+                // A stored digest of the wrong length is left as the recomputed
+                // value rather than silently truncated; `verify_claim` uses
+                // `get_integrity_row` and reports that case explicitly.
+                if row.content_hash.len() == 32 {
+                    claim.content_hash.copy_from_slice(&row.content_hash);
+                }
                 Ok(Some(claim))
             }
             None => Ok(None),
         }
+    }
+
+    /// Fetch exactly the columns an integrity check needs, without going
+    /// through [`claim_from_row`] — which fabricates `content_hash`,
+    /// `public_key` and `signature` and therefore cannot be used to verify
+    /// anything.
+    ///
+    /// Deliberately a narrow SELECT returning a purpose-built row rather than
+    /// a `Claim`: `CLAUDE.md` forbids widening `claim_from_row`'s signature
+    /// (29 call sites), and the domain `Claim` has nowhere to carry
+    /// `canonical_hash` or `signer_id`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_integrity_row(
+        pool: &PgPool,
+        id: ClaimId,
+    ) -> Result<Option<ClaimIntegrityRow>, DbError> {
+        let uuid: Uuid = id.into();
+
+        let row = sqlx::query!(
+            r#"
+            SELECT content, content_hash, canonical_hash, agent_id,
+                   signature, signer_id, created_at
+            FROM claims
+            WHERE id = $1
+            "#,
+            uuid
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row.map(|r| ClaimIntegrityRow {
+            content: r.content,
+            content_hash: r.content_hash,
+            canonical_hash: r.canonical_hash,
+            agent_id: r.agent_id,
+            signature: r.signature,
+            signer_id: r.signer_id,
+            created_at: r.created_at,
+        }))
     }
 
     /// Fetch only the labels for a single claim. Used by MCP `get_claim` to

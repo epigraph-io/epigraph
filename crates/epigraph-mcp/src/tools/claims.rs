@@ -811,29 +811,116 @@ pub async fn verify_claim(
     params: VerifyClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
-    let claim = ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(id))
+
+    // Read the PERSISTED columns, not a reconstructed `Claim`. `claim_from_row`
+    // recomputes content_hash from content and hardcodes public_key/signature,
+    // so verifying against it compares a value to itself — the defect this
+    // function carried until 2026-08-29 (backlog 49c17386).
+    let row = ClaimRepository::get_integrity_row(&server.pool, ClaimId::from_uuid(id))
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
 
-    // Verify content hash
-    let computed_hash = ContentHasher::hash(claim.content.as_bytes());
-    let hash_matches = computed_hash == claim.content_hash;
+    let computed = ContentHasher::hash(row.content.as_bytes());
 
-    // Verify signature
-    let signature_valid = match claim.signature {
-        Some(sig) => {
-            epigraph_crypto::SignatureVerifier::verify(&claim.public_key, &claim.content_hash, &sig)
-                .unwrap_or(false)
-        }
-        None => false,
+    // Tri-state, because "the stored digest is not BLAKE3(content)" has two
+    // very different causes and conflating them is how a verifier starts
+    // lying in the other direction. A row whose canonical_hash is populated
+    // is one this kernel wrote under the current scheme, so a mismatch there
+    // is real divergence. A row without it may predate migration 078 or carry
+    // a namespaced digest (compound atom ids, imported fixtures), and the
+    // kernel genuinely cannot adjudicate it.
+    let content_integrity = if row.content_hash.as_slice() == computed.as_slice() {
+        "MATCHES"
+    } else if row.canonical_hash.is_some() {
+        "DIVERGENT"
+    } else {
+        "FOREIGN_DIGEST"
     };
+
+    // No writer in this workspace inserts claims.signature — every
+    // `INSERT INTO claims` omits the column, including the production path
+    // (create_or_get -> create_strict). UNSIGNED is therefore the honest and
+    // universal answer today, and it is NOT a failure.
+    let (signature_status, signature_detail) = match (&row.signature, row.signer_id) {
+        (None, _) => (
+            "UNSIGNED",
+            "No signature is persisted for this claim. As of 2026-08-29 no write path in \
+             EpiGraph populates claims.signature, so this is expected for every row and is \
+             not evidence of tampering."
+                .to_string(),
+        ),
+        (Some(sig), None) => (
+            "MALFORMED",
+            format!(
+                "A {}-byte signature is present with no signer_id, which the \
+                 claims_signature_requires_signer CHECK should have prevented.",
+                sig.len()
+            ),
+        ),
+        (Some(sig), Some(signer)) => {
+            match epigraph_db::AgentRepository::get_by_id(
+                &server.pool,
+                epigraph_core::AgentId::from_uuid(signer),
+            )
+            .await
+            .map_err(internal_error)?
+            {
+                None => (
+                    "UNVERIFIABLE",
+                    format!("signer_id {signer} does not resolve to an agent row."),
+                ),
+                Some(agent) => {
+                    let key: Result<[u8; 32], _> = agent.public_key.as_slice().try_into();
+                    match key {
+                        Err(_) => (
+                            "UNVERIFIABLE",
+                            format!(
+                                "signer {signer} has a {}-byte public key; Ed25519 needs 32.",
+                                agent.public_key.len()
+                            ),
+                        ),
+                        Ok(pk) => {
+                            // Verify against the STORED digest, never the
+                            // recomputed one — otherwise a tampered row whose
+                            // signature covers the tampered text would pass.
+                            let sig_arr: Result<[u8; 64], _> = sig.as_slice().try_into();
+                            let ok = sig_arr.is_ok_and(|s| {
+                                epigraph_crypto::SignatureVerifier::verify(
+                                    &pk,
+                                    &row.content_hash,
+                                    &s,
+                                )
+                                .unwrap_or(false)
+                            });
+                            if ok {
+                                ("VALID", format!("Verified against agent {signer}."))
+                            } else {
+                                (
+                                    "INVALID",
+                                    format!(
+                                        "Signature does not verify under agent {signer}'s key."
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let truth_value = ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(id))
+        .await
+        .map_err(internal_error)?
+        .map_or(0.0, |c| c.truth_value.value());
 
     success_json(&VerifyResponse {
         claim_id: id.to_string(),
-        signature_valid,
-        hash_matches,
-        truth_value: claim.truth_value.value(),
+        content_integrity,
+        signature_status,
+        signature_detail,
+        truth_value,
     })
 }
 

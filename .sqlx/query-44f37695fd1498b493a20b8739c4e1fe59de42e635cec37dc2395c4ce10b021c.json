@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, content, truth_value, agent_id, trace_id,\n                   created_at, updated_at, is_current, supersedes\n            FROM claims\n            WHERE id = $1\n            ",
+  "query": "\n            SELECT id, content, content_hash, truth_value, agent_id, trace_id,\n                   created_at, updated_at, is_current, supersedes\n            FROM claims\n            WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -15,36 +15,41 @@
       },
       {
         "ordinal": 2,
+        "name": "content_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
         "name": "truth_value",
         "type_info": "Float8"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "agent_id",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "trace_id",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "updated_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "is_current",
         "type_info": "Bool"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "supersedes",
         "type_info": "Uuid"
       }
@@ -59,6 +64,7 @@
       false,
       false,
       false,
+      false,
       true,
       false,
       false,
@@ -66,5 +72,5 @@
       true
     ]
   },
-  "hash": "2b7318d9026b0dd4107bde6f4cdc172b9ccbea0536b449293b38db87de1fa95d"
+  "hash": "44f37695fd1498b493a20b8739c4e1fe59de42e635cec37dc2395c4ce10b021c"
 }

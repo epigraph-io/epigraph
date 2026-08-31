@@ -160,35 +160,30 @@ async fn whitespace_variant_of_existing_claim_dedups(pool: PgPool) {
     assert_eq!(rows, 1, "agent must own exactly one row for this text");
 }
 
-/// KNOWN-FAILING, AND DELIBERATELY NOT FIXED HERE — a SEPARATE defect that
-/// happens to be provable with this fixture. `#[ignore]`d so it does not fail
-/// the suite; run it with `--ignored` to watch it fail.
+/// REGRESSION GUARD for backlog 49c17386 — was `#[ignore]`d as a known-failing
+/// reproduction, un-ignored 2026-08-29 when the defect it documents was fixed.
 ///
 /// It began life refuting the round-1 blocker "verify_claim asserts computed ==
 /// stored, so changing the hash input flips every existing claim to
-/// hash_matches=false". That blocker is false, and this is why: MCP
-/// `verify_claim` compares `ContentHasher::hash(claim.content)` against
-/// `claim.content_hash`, but `ClaimRepository::get_by_id` never SELECTs
-/// `content_hash` — its `SELECT` lists id, content, truth_value, agent_id,
-/// trace_id, created_at, updated_at, is_current, supersedes — and
-/// `claim_from_row` then fills `Claim.content_hash` by RECOMPUTING
-/// `ContentHasher::hash(content)`. The comparison is a value against itself.
-/// The persisted digest is never read, so the check is a tautology that can
-/// never observe a divergence, and a hash-input change cannot break it.
+/// hash_matches=false". That blocker was false, and the reason was worse than
+/// the blocker: `ClaimRepository::get_by_id` never SELECTed `content_hash`, and
+/// `claim_from_row` filled `Claim.content_hash` by RECOMPUTING
+/// `ContentHasher::hash(content)`. The comparison was a value against itself —
+/// a tautology that could never observe a divergence.
 ///
-/// That tautology is its own bug with its own blast radius: fixing it means
-/// `get_by_id` selecting the stored digest, which would start reporting
-/// `hash_matches = false` for every row written through the
-/// `POST /api/v1/claims` client-supplied `content_hash` override. It needs its
-/// own change, its own review, and its own commit. (`signature_valid` is
-/// likewise unconditionally false, since `claim_from_row` hardcodes
-/// `public_key = [0u8; 32]` and `signature = None`.)
+/// `get_by_id` now post-fixes the persisted digest, so this test passes. Keep
+/// it: if anyone reverts that post-fix, or reintroduces a derivation of
+/// content_hash from content on a read path, this fails and says why.
+///
+/// The blast radius the original note worried about is handled, not avoided:
+/// rows written through `POST /api/v1/claims` with a client-supplied
+/// `content_hash` override no longer silently report a match, but they land in
+/// `verify_claim`'s `FOREIGN_DIGEST` tier rather than `DIVERGENT`, because they
+/// carry no `canonical_hash` for the kernel to adjudicate against. Only
+/// `DIVERGENT` asserts a problem.
 ///
 /// The test persists a row whose stored `content_hash` is deliberately wrong
 /// and asserts the check catches it.
-#[ignore = "separate defect: verify_claim's hash check is a tautology because \
-            claim_from_row recomputes the digest instead of get_by_id \
-            selecting it — needs its own commit"]
 #[sqlx::test(migrations = "../../migrations")]
 async fn verify_claim_hash_check_reads_the_persisted_digest(pool: PgPool) {
     let agent = seed_agent(&pool).await;

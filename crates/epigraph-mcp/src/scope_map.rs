@@ -52,6 +52,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("list_mcp_tools", "claims:read"),
     ("list_perspectives", "claims:read"),
     ("query_claims", "claims:read"),
+    ("verify_claim", "claims:read"),
     ("query_claims_by_evidence", "claims:read"),
     ("query_claims_by_label", "claims:read"),
     ("query_claims_by_methodology", "claims:read"),
@@ -105,7 +106,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("theme_cluster", "claims:write"),
     ("update_labels", "claims:write"),
     ("update_with_evidence", "claims:write"),
-    ("verify_claim", "claims:write"),
     // ─── claims:admin ──────────────────────────────────────────────────
     ("mark_duplicate", "claims:admin"),
     ("supersede_claim", "claims:admin"),
