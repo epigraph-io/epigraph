@@ -204,7 +204,7 @@ pub async fn do_delete_edge(
 
     // `EdgeRepository::delete` reports absence as `Ok(false)`, not
     // `DbError::NotFound`, so the 404-equivalent is raised here.
-    let deleted = EdgeRepository::delete(pool, edge_id)
+    let deleted = EdgeRepository::retract_by_id(pool, edge_id)
         .await
         .map_err(map_edge_err)?;
     if !deleted {

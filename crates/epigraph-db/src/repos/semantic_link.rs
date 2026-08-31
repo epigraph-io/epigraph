@@ -330,23 +330,30 @@ impl SemanticLinkRepository {
         Ok(links)
     }
 
-    /// Delete a semantic link by ID
+    /// Retract a semantic link by ID.
+    ///
+    /// A semantic link IS a claim-to-claim edge, so this is the evidential case:
+    /// removal is a RETRACTION, never a delete. The row survives with `valid_to`
+    /// closed and stays queryable. See `EdgeRepository::retract_by_id`.
     ///
     /// # Returns
-    /// Returns `true` if the link was deleted, `false` if it didn't exist.
+    /// `true` if this call took the link out of force; `false` if it did not
+    /// exist or was already retracted.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
-    pub async fn delete(pool: &PgPool, id: SemanticLinkId) -> Result<bool, DbError> {
+    pub async fn retract(pool: &PgPool, id: SemanticLinkId) -> Result<bool, DbError> {
         let uuid: Uuid = id.into();
 
         let result = sqlx::query(
             r#"
-            DELETE FROM edges
+            UPDATE edges
+               SET valid_to = now()
             WHERE id = $1
               AND source_type = 'claim'
               AND target_type = 'claim'
+              AND valid_to IS NULL
             "#,
         )
         .bind(uuid)

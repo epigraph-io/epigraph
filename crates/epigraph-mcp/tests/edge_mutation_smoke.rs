@@ -301,9 +301,15 @@ async fn delete_removes_only_the_targeted_edge(pool: PgPool) {
     assert_eq!(json["deleted"], true);
     assert_eq!(json["edge_id"], doomed.to_string());
 
+    // The row must SURVIVE and be out of force. Under the previous hard delete this
+    // asserted `is_none()`; edge removal is now a retraction, so destroying the row
+    // would destroy its provenance along with it.
+    let (_props, closed_at) = read_edge(&pool, doomed)
+        .await
+        .expect("the targeted edge row must survive retraction");
     assert!(
-        read_edge(&pool, doomed).await.is_none(),
-        "the targeted edge row must be gone"
+        closed_at.is_some(),
+        "the targeted edge must be out of force (valid_to set)"
     );
     assert!(
         read_edge(&pool, sibling).await.is_some(),

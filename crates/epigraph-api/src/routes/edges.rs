@@ -810,7 +810,7 @@ pub async fn delete_edge(
         crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
     }
 
-    let deleted = EdgeRepository::delete(&state.db_pool, id).await?;
+    let deleted = EdgeRepository::retract_by_id(&state.db_pool, id).await?;
 
     if !deleted {
         return Err(ApiError::NotFound {

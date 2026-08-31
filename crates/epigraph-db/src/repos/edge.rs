@@ -797,11 +797,24 @@ impl EdgeRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
-    pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, DbError> {
+    /// Take a single edge out of force.
+    ///
+    /// Named `retract_by_id` rather than `delete` because it no longer deletes:
+    /// edge removal is a RETRACTION throughout this codebase. The row survives
+    /// with `valid_to` closed, so `properties.decided_by`, the signature and the
+    /// content hash stay queryable and the act is reversible.
+    ///
+    /// Returns `true` when this call closed the row, `false` when the edge does
+    /// not exist OR was already retracted. Callers that raise a 404 on `false`
+    /// therefore also 404 a double-retract, which matches the previous
+    /// delete-twice behaviour.
+    pub async fn retract_by_id(pool: &PgPool, id: Uuid) -> Result<bool, DbError> {
         let result = sqlx::query!(
             r#"
-            DELETE FROM edges
-            WHERE id = $1
+            UPDATE edges
+               SET valid_to = now()
+             WHERE id = $1
+               AND valid_to IS NULL
             "#,
             id
         )
@@ -819,7 +832,12 @@ impl EdgeRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
-    pub async fn delete_between(
+    /// Take every edge between two entities out of force.
+    ///
+    /// Retraction, not deletion — see [`Self::retract_by_id`]. Currently has no
+    /// callers in the workspace; converted anyway so a future caller cannot reach
+    /// for a hard-delete primitive that should not exist.
+    pub async fn retract_between(
         pool: &PgPool,
         source_id: Uuid,
         source_type: &str,
@@ -828,9 +846,11 @@ impl EdgeRepository {
     ) -> Result<u64, DbError> {
         let result = sqlx::query!(
             r#"
-            DELETE FROM edges
+            UPDATE edges
+               SET valid_to = now()
             WHERE source_id = $1 AND source_type = $2
               AND target_id = $3 AND target_type = $4
+              AND valid_to IS NULL
             "#,
             source_id,
             source_type,

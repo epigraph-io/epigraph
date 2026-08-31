@@ -303,7 +303,10 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         factors_deleted += r.rows_affected();
 
-        let r = sqlx::query("DELETE FROM edges WHERE id = $1")
+        // Retraction, matching the online path (`MatchCandidateRepo::retire`).
+        // This operator binary performs the same act, so it must not be the one
+        // place that still destroys the edge and its `properties.decided_by`.
+        let r = sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1 AND valid_to IS NULL")
             .bind(e.edge_id)
             .execute(&mut *tx)
             .await?;
