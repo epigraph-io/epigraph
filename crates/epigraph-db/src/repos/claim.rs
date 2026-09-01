@@ -26,6 +26,8 @@ pub struct ClaimBeliefColumns {
     pub belief: Option<f64>,
     pub plausibility: Option<f64>,
     pub pignistic_prob: Option<f64>,
+    pub mass_on_empty: Option<f64>,
+    pub mass_on_missing: Option<f64>,
 }
 
 /// Result row for [`ClaimRepository::search_by_embedding`].
@@ -324,7 +326,8 @@ impl ClaimRepository {
     }
 
     /// Read a claim's cached Dempster–Shafer belief columns
-    /// (`belief`, `plausibility`, `pignistic_prob`).
+    /// (`belief`, `plausibility`, `pignistic_prob`, `mass_on_empty`,
+    /// `mass_on_missing`).
     ///
     /// These are the columns the edge-wiring recompute path
     /// (`MassFunctionRepository::update_claim_belief`) writes — distinct from
@@ -332,7 +335,9 @@ impl ClaimRepository {
     /// the *post-wire* combined belief (e.g. the MCP `link_epistemic` readback)
     /// must read these columns, NOT `truth_value`; the unframed
     /// `belief_query::get_belief` path reads `truth_value` and so does not
-    /// reflect a recompute.
+    /// reflect a recompute. `mass_on_empty` and `mass_on_missing` round out the
+    /// set needed to fully reconstruct a claim's cached DS interval
+    /// (mass_on_conflict == mass_on_empty, mass_on_missing).
     ///
     /// Returns `Ok(None)` when the claim does not exist; the columns inside
     /// [`ClaimBeliefColumns`] are individually `Option` (NULL when the claim
@@ -346,11 +351,12 @@ impl ClaimRepository {
         claim_id: ClaimId,
     ) -> Result<Option<ClaimBeliefColumns>, DbError> {
         let id: Uuid = claim_id.into();
-        let row: Option<ClaimBeliefColumns> =
-            sqlx::query_as("SELECT belief, plausibility, pignistic_prob FROM claims WHERE id = $1")
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
+        let row: Option<ClaimBeliefColumns> = sqlx::query_as(
+            "SELECT belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing FROM claims WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
         Ok(row)
     }
 
