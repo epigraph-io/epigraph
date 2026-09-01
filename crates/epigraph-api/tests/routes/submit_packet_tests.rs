@@ -247,13 +247,14 @@ fn create_test_app_no_sig() -> axum::Router {
 fn test_bearer_token() -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
+    let principal = Uuid::new_v4();
     let (token, _) = jwt_config
         .issue_access_token(
-            Uuid::new_v4(),
+            principal,
             vec!["epigraph:write".to_string(), "epigraph:read".to_string()],
             "service",
-            None,
-            None,
+            Some(principal),
+            Some(principal),
             chrono::Duration::seconds(300),
         )
         .expect("issue_access_token must succeed for tests");

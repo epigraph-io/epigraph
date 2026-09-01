@@ -937,7 +937,7 @@ mod tests {
         }
 
         // Ephemeral sqlx::test DB → only our 3 distinct claims have BBAs.
-        let all = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), 100, 0)
+        let all = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_bypass(crate::visibility::SystemReason::BeliefRecomputation), 100, 0)
             .await
             .unwrap();
         assert_eq!(
@@ -951,10 +951,10 @@ mod tests {
         assert_eq!(all, expected, "ascending claim_id order");
 
         // Paging: page 1 (limit 2) + page 2 (offset 2) partition the set, disjoint.
-        let page1 = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), 2, 0)
+        let page1 = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_bypass(crate::visibility::SystemReason::BeliefRecomputation), 2, 0)
             .await
             .unwrap();
-        let page2 = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), 2, 2)
+        let page2 = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_bypass(crate::visibility::SystemReason::BeliefRecomputation), 2, 2)
             .await
             .unwrap();
         assert_eq!(page1, expected[..2].to_vec());
@@ -1000,7 +1000,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ids = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), 100, 0)
+        let ids = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_bypass(crate::visibility::SystemReason::BeliefRecomputation), 100, 0)
             .await
             .unwrap();
         assert_eq!(

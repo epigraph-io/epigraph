@@ -39,6 +39,28 @@ fn app(pool: PgPool) -> Router {
             "/api/v1/claims",
             get(routes::claims_query::list_claims_query),
         )
+        // PR-06: these handlers take `ViewerExtractor`, which requires an
+        // `AuthContext` on the request. In production the bearer middleware
+        // installs it; a bare test router carries none, so every request 401s
+        // before reaching the handler.
+        .layer(axum::Extension({
+            let principal = Uuid::new_v4();
+            epigraph_api::middleware::bearer::AuthContext {
+                client_id: principal,
+                agent_id: Some(principal),
+                owner_id: Some(principal),
+                client_type: epigraph_api::middleware::bearer::ClientType::Service,
+                scopes: vec![
+                    "epigraph:write".to_string(),
+                    "epigraph:read".to_string(),
+                    "claims:read".to_string(),
+                    "claims:write".to_string(),
+                    "edges:write".to_string(),
+                    "graph:read".to_string(),
+                ],
+                jti: Uuid::new_v4(),
+            }
+        }))
         .with_state(state)
 }
 

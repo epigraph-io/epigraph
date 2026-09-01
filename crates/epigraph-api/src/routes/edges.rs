@@ -2888,7 +2888,7 @@ mod db_tests {
         let target_id = seed_claim(&pool, agent_id, "edge-test target").await;
 
         let state = test_state(pool.clone()).await;
-        let router = edges_router(state);
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
 
         // First POST creates the edge.
         let resp1 = router
@@ -2983,7 +2983,7 @@ mod db_tests {
                 .unwrap();
 
         let state = test_state(pool.clone()).await;
-        let router = edges_router(state);
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
 
         let response = router
             .oneshot(
@@ -3024,7 +3024,7 @@ mod db_tests {
         .unwrap();
 
         let state = test_state(pool.clone()).await;
-        let router = edges_router(state);
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
 
         let cutoff = chrono::Utc::now();
         let response = router
@@ -3082,7 +3082,7 @@ mod db_tests {
         .unwrap();
 
         let state = test_state(pool.clone()).await;
-        let router = edges_router(state);
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
 
         let response = router
             .oneshot(
@@ -3138,7 +3138,7 @@ mod db_tests {
         .unwrap();
 
         let state = test_state(pool.clone()).await;
-        let router = edges_router(state);
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
 
         let response = router
             .oneshot(
@@ -3219,7 +3219,7 @@ mod db_tests {
         let target_id = seed_claim(&pool, agent_id, "stored-row target").await;
 
         let state = test_state(pool.clone()).await;
-        let router = edges_router(state);
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
 
         // First POST stores properties = {"weight": 0.7, "from": "first"}.
         let first_body = Body::from(
@@ -3390,7 +3390,7 @@ mod db_tests {
         .unwrap();
 
         let state = test_state(pool.clone()).await;
-        let router = edges_router(state);
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
 
         let response = router
             .oneshot(
@@ -3562,7 +3562,7 @@ mod db_tests {
         .unwrap();
 
         let state = test_state(pool.clone()).await;
-        let router = edges_router(state);
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
 
         let resp = router
             .oneshot(
@@ -3639,7 +3639,7 @@ mod db_tests {
         .unwrap();
 
         let state = test_state(pool.clone()).await;
-        let router = edges_router(state);
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
 
         let cutoff = chrono::Utc::now();
         let resp = router
@@ -3789,7 +3789,7 @@ mod db_tests {
             ("analysis", analysis),
             ("experiment_result", exp_result),
         ] {
-            let router = edges_router(state.clone());
+            let router = edges_router_with_auth(state.clone(), auth_ctx(agent_id));
             let body = Body::from(
                 serde_json::to_vec(&serde_json::json!({
                     "source_id": claim,
@@ -3940,7 +3940,7 @@ mod db_tests {
 
         // Load the cache AFTER syntheses exists.
         let state = test_state(pool.clone()).await;
-        let router = edges_router(state);
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
 
         let body = Body::from(
             serde_json::to_vec(&serde_json::json!({

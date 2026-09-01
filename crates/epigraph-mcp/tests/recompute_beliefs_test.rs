@@ -97,7 +97,10 @@ async fn pignistic(pool: &PgPool, claim_id: Uuid) -> f64 {
 /// correct combine result and reports accurate counts.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-stale").await;
     let claim = insert_claim(&pool, agent, &format!("recompute-stale-{}", Uuid::new_v4())).await;
@@ -145,7 +148,10 @@ async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
 /// A claim with no BBAs is counted as skipped, not recomputed, and is not an error.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_skips_claim_without_bbas(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-nobba").await;
     let bare = insert_claim(&pool, agent, &format!("recompute-nobba-{}", Uuid::new_v4())).await;
@@ -174,7 +180,10 @@ async fn recompute_skips_claim_without_bbas(pool: PgPool) {
 /// `truncated=true` when `limit` is smaller than the population.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-bulk").await;
     // Two claims with BBAs; ephemeral DB so the bulk population is exactly 2.
@@ -227,7 +236,10 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
 /// claims exist and none remain (the bug the limit+1 fetch fixes).
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_labels_truncation_is_exact(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-lbl").await;
     let label = format!("rb-lbl-{}", Uuid::new_v4());

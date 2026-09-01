@@ -2159,6 +2159,7 @@ mod event_tests {
         let state = AppState::new(ApiConfig::default());
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         let request = Request::builder()
@@ -2184,6 +2185,7 @@ mod event_tests {
         let state = AppState::new(ApiConfig::default());
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         // Valid JSON, but missing required fields (no reasoning_trace, no signature)
@@ -2219,6 +2221,7 @@ mod event_tests {
 
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         let raw_content = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk";
@@ -2269,6 +2272,28 @@ mod event_tests {
 
 #[cfg(all(test, feature = "db"))]
 mod signature_verification_tests {
+
+    /// PR-06: `ViewerExtractor` requires an `AuthContext` on the request, which
+    /// the bearer middleware installs in production. Test routers built from a
+    /// bare `Router::new()` carry none, so they 401 before reaching the handler.
+    fn test_auth() -> crate::middleware::bearer::AuthContext {
+        let id = uuid::Uuid::new_v4();
+        crate::middleware::bearer::AuthContext {
+            client_id: id,
+            agent_id: Some(id),
+            owner_id: Some(id),
+            client_type: crate::middleware::bearer::ClientType::Service,
+            scopes: vec![
+                "claims:read".to_string(),
+                "claims:write".to_string(),
+                "edges:read".to_string(),
+                "edges:write".to_string(),
+                "workflows:read".to_string(),
+                "workflows:write".to_string(),
+            ],
+            jti: uuid::Uuid::new_v4(),
+        }
+    }
     use super::*;
     use crate::state::{ApiConfig, AppState};
     use axum::body::Body;
@@ -2335,6 +2360,7 @@ mod signature_verification_tests {
     ) -> axum::response::Response {
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         let body = serde_json::to_string(&packet).unwrap();

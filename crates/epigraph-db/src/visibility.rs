@@ -513,6 +513,28 @@ impl Viewer {
             },
         }
     }
+
+    /// Test-only `Bypass` viewer.
+    ///
+    /// Maintenance enumerators (`find_claims_needing_embeddings`,
+    /// `MassFunctionRepository::list_claim_ids`, …) `debug_assert!(viewer.is_bypass())`
+    /// precisely because a `Scoped` viewer there would silently skip every other
+    /// tenant's rows — leaving them unembedded, or their beliefs stale, forever.
+    /// Their tests therefore need a real `Bypass`, not a permissive `Scoped`.
+    ///
+    /// Production builds one only via `ScopedPool::unscoped_for_maintenance`,
+    /// which hands back a [`MaintenanceLease`] proving the connection is a
+    /// maintenance connection. That is deliberately heavy for an in-crate unit
+    /// test, so this mirrors [`Self::test_scoped`] — including `#[cfg(test)]` on
+    /// the DEFINITION, so no dependent crate's feature graph can make it
+    /// reachable in production.
+    #[cfg(test)]
+    #[must_use]
+    pub fn test_bypass(reason: SystemReason) -> Self {
+        Viewer {
+            shape: ViewerShape::Bypass { reason },
+        }
+    }
 }
 
 #[cfg(test)]

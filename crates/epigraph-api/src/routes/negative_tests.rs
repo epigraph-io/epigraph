@@ -1381,8 +1381,24 @@ mod wrong_scope_with_malformed_body_tests {
     // reassign_claim: claims:admin required → wrong-scope must 403
     // ------------------------------------------------------------------
 
+    /// PR-06 moved identity resolution ahead of the scope gate: `reassign_claim`
+    /// takes `ViewerExtractor` as its first extractor, and an `AuthContext` whose
+    /// `agent_id` is `None` cannot be resolved to a principal. The rejection is
+    /// therefore **401 before 403**, which is the correct order — scopes are a
+    /// property of a principal, and there is no principal to evaluate them for.
+    ///
+    /// `read_only_auth()` models a token shape that PR-02 made impossible for
+    /// real clients (every authenticated principal now carries an `agents.id`),
+    /// so this test now pins the agentless-token path rather than the scope path.
+    ///
+    /// **Coverage note:** the original property — a *wrong-scope* token with a
+    /// malformed body returns 403, not 422, i.e. the scope gate fires before
+    /// `Json` extraction — is no longer exercised here, because proving it needs
+    /// a token with a real `agent_id`, and `ViewerExtractor` would then resolve
+    /// against `lazy_pool()`, which deliberately never connects. That property
+    /// belongs in a `#[sqlx::test]` integration test with a live pool.
     #[tokio::test]
-    async fn reassign_claim_wrong_scope_with_malformed_body_returns_403_not_422() {
+    async fn reassign_claim_agentless_token_returns_401_before_the_scope_gate() {
         let router = Router::new()
             .route("/api/v1/themes/reassign", post(reassign_claim))
             .layer(Extension(read_only_auth()))
@@ -1394,8 +1410,9 @@ mod wrong_scope_with_malformed_body_tests {
             .unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::FORBIDDEN,
-            "wrong-scope token + malformed body must return 403, not 422"
+            StatusCode::UNAUTHORIZED,
+            "a token with no agent_id must 401 at ViewerExtractor, before the \
+             scope gate and before Json extraction"
         );
     }
 

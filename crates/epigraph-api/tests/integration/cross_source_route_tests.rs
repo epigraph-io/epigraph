@@ -294,34 +294,56 @@ async fn decided_by_of(pool: &PgPool, candidate: Uuid) -> Option<Uuid> {
         .unwrap()
 }
 
-/// The bug: a service client carries `agent_id = None`, so the decision used to
-/// land with `decided_by = NULL`. It must fall back to the client identity.
+/// Originally: a service client carried `agent_id = None`, the decision landed
+/// with `decided_by = NULL`, and `cross_source.rs:296`
+/// (`auth.agent_id.or(Some(auth.client_id))`) was added to fall back to the
+/// client identity.
+///
+/// **PR-06 makes that fallback unreachable.** `decide_candidate` takes
+/// `ViewerExtractor` as its first extractor, and the extractor rejects an
+/// `agent_id`-less token with 401 before the handler body runs — so
+/// `auth.agent_id` is always `Some` at line 296 and the `.or(...)` arm is dead
+/// code. The `decided_by = NULL` bug class is now prevented structurally rather
+/// than handled defensively.
+///
+/// This test pins both halves: the agentless token is refused, and a service
+/// client that *does* carry a principal (which PR-02 guarantees for every real
+/// client) decides successfully and records a non-null decider.
 #[sqlx::test(migrations = "../../migrations")]
-async fn decide_by_service_client_records_client_id_not_null(pool: PgPool) {
+async fn decide_by_service_client_records_a_non_null_decider(pool: PgPool) {
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
     let b = insert_claim(&pool, agent).await;
     let candidate = insert_pending_candidate(&pool, a, b).await;
 
-    // A bridge-bot-shaped principal: service client, no linked agent.
+    // 1. The pre-PR-02 shape — service client with no linked agent — is now
+    //    refused at ViewerExtractor, before the handler can run at all.
     let client_id = Uuid::new_v4();
-    let token = decide_bearer_token(client_id, None, "service");
+    let agentless = decide_bearer_token(client_id, None, "service");
+    let refused = post_decide(pool.clone(), candidate, &agentless, "promote").await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::UNAUTHORIZED,
+        "a service token carrying no agent_id must be refused before the handler"
+    );
 
+    // 2. The shape PR-02 guarantees: the service client carries a principal.
+    let token = decide_bearer_token(client_id, Some(agent), "service");
     let resp = post_decide(pool.clone(), candidate, &token, "promote").await;
     let status = resp.status();
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(
         status,
         StatusCode::OK,
-        "decide must succeed for a service client (body: {})",
+        "decide must succeed for a service client bound to a principal (body: {})",
         String::from_utf8_lossy(&body)
     );
 
     // Assert on the persisted row, not the response.
     assert_eq!(
         decided_by_of(&pool, candidate).await,
-        Some(client_id),
-        "decided_by must record the authenticated client when no agent is linked"
+        Some(agent),
+        "decided_by must record the authenticated principal"
     );
 
     // The CORROBORATES edge written by the same handler carries the decision
@@ -336,7 +358,7 @@ async fn decide_by_service_client_records_client_id_not_null(pool: PgPool) {
     .unwrap();
     assert_eq!(
         edge_decided_by,
-        Some(serde_json::json!(client_id)),
+        Some(serde_json::json!(agent)),
         "CORROBORATES edge properties.decided_by must match the persisted decider"
     );
 }

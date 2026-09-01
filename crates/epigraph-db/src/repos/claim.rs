@@ -4104,7 +4104,7 @@ mod tests {
         .await
         .unwrap();
 
-        let missing = ClaimRepository::find_claims_needing_embeddings(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), 1000)
+        let missing = ClaimRepository::find_claims_needing_embeddings(&pool, &crate::visibility::Viewer::test_bypass(crate::visibility::SystemReason::EmbeddingBackfill), 1000)
             .await
             .unwrap();
         assert!(

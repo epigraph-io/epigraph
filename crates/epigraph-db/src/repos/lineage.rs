@@ -150,6 +150,7 @@ struct TraceParentRow {
 ///
 /// ```rust,no_run
 /// use epigraph_db::{LineageRepository, create_pool};
+/// use epigraph_db::visibility::Viewer;
 /// use uuid::Uuid;
 ///
 /// #[tokio::main]
@@ -157,8 +158,13 @@ struct TraceParentRow {
 ///     let pool = create_pool("postgres://...").await?;
 ///     let claim_id = Uuid::new_v4();
 ///
+///     // PR-06: reads carry a `Viewer`, and the predicate it emits is applied
+///     // inside the recursive CTE — a claim the viewer cannot see is absent from
+///     // the lineage rather than present with its content blanked.
+///     let viewer = Viewer::resolve(&pool, Uuid::nil()).await?;
+///
 ///     // Get lineage with max depth of 10
-///     let lineage = LineageRepository::get_lineage(&pool, claim_id, Some(10)).await?;
+///     let lineage = LineageRepository::get_lineage(&pool, &viewer, claim_id, Some(10)).await?;
 ///
 ///     // Process claims in topological order (ancestors first)
 ///     for claim_id in &lineage.topological_order {

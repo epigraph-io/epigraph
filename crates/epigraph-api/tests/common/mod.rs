@@ -77,13 +77,16 @@ pub fn test_bearer_token() -> String {
     let secret = std::env::var("EPIGRAPH_JWT_SECRET")
         .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
     let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    // PR-02 binds every authenticated principal to an `agents.id`; PR-06's
+    // `ViewerExtractor` refuses an agentless token with 401 before the handler.
+    let principal = uuid::Uuid::new_v4();
     let (token, _jti) = cfg
         .issue_access_token(
-            uuid::Uuid::new_v4(),
+            principal,
             vec!["graph:read".into()],
             "service",
-            None,
-            None,
+            Some(principal),
+            Some(principal),
             chrono::Duration::minutes(60),
         )
         .expect("test JWT issued");
@@ -176,13 +179,20 @@ pub fn test_bearer_token_with_scopes(scopes: &[&str]) -> String {
     let secret = std::env::var("EPIGRAPH_JWT_SECRET")
         .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
     let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    // PR-02 made every authenticated principal carry an `agents.id`, and PR-06's
+    // `ViewerExtractor` rejects an agentless token with 401 before any scope gate
+    // runs. Minting with `agent_id: None` therefore produced a token shape no real
+    // client can hold any more, and every scope test using it asserted 403 while
+    // receiving 401. Bind the token to a principal, mirroring what
+    // `AgentRepository::ensure_for_client` does in production.
+    let principal = Uuid::new_v4();
     let (token, _jti) = cfg
         .issue_access_token(
-            Uuid::new_v4(),
+            principal,
             scopes.iter().map(|s| (*s).to_string()).collect(),
             "service",
-            None,
-            None,
+            Some(principal),
+            Some(principal),
             chrono::Duration::minutes(60),
         )
         .expect("test JWT issued");
@@ -389,6 +399,15 @@ pub async fn test_bearer_token_with_seeded_client(
 ) -> (String, Uuid) {
     let client_id = Uuid::new_v4();
     seed_oauth_client(pool, client_id).await;
+    // PR-02 links every oauth client to an `agents` row, and PR-06's
+    // `ViewerExtractor` 401s a token whose `agent_id` is absent. Production mints
+    // through `AgentRepository::ensure_for_client`; mirror it here so the fixture
+    // reflects a post-PR-02 client rather than a shape no real client can hold.
+    let mut conn = pool.acquire().await.expect("acquire conn");
+    let agent_id = epigraph_db::AgentRepository::ensure_for_client(&mut conn, client_id)
+        .await
+        .expect("ensure agent for seeded client");
+    drop(conn);
     let secret = std::env::var("EPIGRAPH_JWT_SECRET")
         .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
     let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
@@ -397,8 +416,8 @@ pub async fn test_bearer_token_with_seeded_client(
             client_id,
             scopes.iter().map(|s| (*s).to_string()).collect(),
             "service",
-            None,
-            None,
+            Some(client_id),
+            Some(agent_id.as_uuid()),
             chrono::Duration::minutes(60),
         )
         .expect("test JWT issued");

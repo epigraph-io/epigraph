@@ -1714,11 +1714,34 @@ mod tests {
         )
     }
 
+    /// PR-06: `ViewerExtractor` requires an `AuthContext` on the request, which
+    /// the bearer middleware installs in production. Test routers built from a
+    /// bare `Router::new()` carry none, so they 401 before reaching the handler.
+    fn test_auth() -> crate::middleware::bearer::AuthContext {
+        let id = uuid::Uuid::new_v4();
+        crate::middleware::bearer::AuthContext {
+            client_id: id,
+            agent_id: Some(id),
+            owner_id: Some(id),
+            client_type: crate::middleware::bearer::ClientType::Service,
+            scopes: vec![
+                "claims:read".to_string(),
+                "claims:write".to_string(),
+                "edges:read".to_string(),
+                "edges:write".to_string(),
+                "workflows:read".to_string(),
+                "workflows:write".to_string(),
+            ],
+            jti: uuid::Uuid::new_v4(),
+        }
+    }
+
     fn test_router(pool: sqlx::PgPool) -> axum::Router {
         use axum::routing::post;
         let state = AppState::with_db(pool, ApiConfig::default());
         axum::Router::new()
             .route("/api/v1/workflows/ingest", post(ingest_workflow))
+            .layer(axum::Extension(test_auth()))
             .with_state(state)
     }
 
@@ -1977,6 +2000,7 @@ mod tests {
                 "/api/v1/workflows/hierarchical/search",
                 axum::routing::get(find_workflow_hierarchical),
             )
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         let response = app

@@ -92,13 +92,18 @@ fn create_test_router(pool: PgPool) -> Router {
 fn agents_write_bearer_token() -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
+    // PR-02 binds every authenticated principal to an `agents.id`, and PR-06's
+    // `ViewerExtractor` refuses an agentless token with 401 before the handler
+    // runs. Bind the token to a principal so this fixture reflects a shape a
+    // real client can actually hold.
+    let principal = uuid::Uuid::new_v4();
     let (token, _) = jwt_config
         .issue_access_token(
-            uuid::Uuid::new_v4(),
+            principal,
             vec!["agents:write".to_string(), "agents:read".to_string()],
             "service",
-            None,
-            None,
+            Some(principal),
+            Some(principal),
             chrono::Duration::seconds(300),
         )
         .expect("issue_access_token must succeed for tests");
@@ -192,13 +197,18 @@ async fn create_agent_is_idempotent_on_public_key(pool: PgPool) {
 fn submit_bearer_token() -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
+    // PR-02 binds every authenticated principal to an `agents.id`, and PR-06's
+    // `ViewerExtractor` refuses an agentless token with 401 before the handler
+    // runs. Bind the token to a principal so this fixture reflects a shape a
+    // real client can actually hold.
+    let principal = Uuid::new_v4();
     let (token, _) = jwt_config
         .issue_access_token(
-            Uuid::new_v4(),
+            principal,
             vec!["epigraph:write".to_string(), "epigraph:read".to_string()],
             "service",
-            None,
-            None,
+            Some(principal),
+            Some(principal),
             chrono::Duration::seconds(300),
         )
         .expect("issue_access_token must succeed for tests");

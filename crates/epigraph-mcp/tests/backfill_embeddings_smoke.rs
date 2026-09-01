@@ -72,7 +72,10 @@ fn parse(out: CallToolResult) -> serde_json::Value {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn dry_run_counts_candidates_without_writing(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
+    // backfill_embeddings is a maintenance enumerator: `find_claims_needing_embeddings`
+    // debug_asserts a Bypass viewer, because a Scoped one would leave every other
+    // tenant unembedded. Hold the ScopedPool — dropping it closes the pool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     for _ in 0..3 {
@@ -109,7 +112,10 @@ async fn dry_run_counts_candidates_without_writing(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn limit_is_respected_and_clamped(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
+    // backfill_embeddings is a maintenance enumerator: `find_claims_needing_embeddings`
+    // debug_asserts a Bypass viewer, because a Scoped one would leave every other
+    // tenant unembedded. Hold the ScopedPool — dropping it closes the pool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     for _ in 0..5 {
@@ -146,7 +152,10 @@ async fn limit_is_respected_and_clamped(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn non_dry_run_with_mock_embedder_fails_loudly(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
+    // backfill_embeddings is a maintenance enumerator: `find_claims_needing_embeddings`
+    // debug_asserts a Bypass viewer, because a Scoped one would leave every other
+    // tenant unembedded. Hold the ScopedPool — dropping it closes the pool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     insert_unembedded_claim(&pool, agent).await;
@@ -170,7 +179,10 @@ async fn non_dry_run_with_mock_embedder_fails_loudly(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn zero_candidates_succeeds_even_without_a_key(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
+    // backfill_embeddings is a maintenance enumerator: `find_claims_needing_embeddings`
+    // debug_asserts a Bypass viewer, because a Scoped one would leave every other
+    // tenant unembedded. Hold the ScopedPool — dropping it closes the pool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     // No unembedded claims at all => candidates==0 short-circuits BEFORE the
     // mock-embedder guard, so a scheduled run on a drained backlog is a clean
     // no-op rather than a config error.
