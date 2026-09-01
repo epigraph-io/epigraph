@@ -88,6 +88,11 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("link_hierarchical", "claims:write"),
     ("memorize", "claims:write"),
     ("patch_claim", "claims:write"),
+    // Non-destructive edge correction: closes the lifecycle window and/or
+    // merges properties, leaving the row and its audit trail intact. Same
+    // tier as `patch_claim`. Its destructive sibling `delete_edge` is
+    // admin-gated below.
+    ("patch_edge", "claims:write"),
     ("refresh_workflow_promotion", "claims:write"),
     ("publish_event", "claims:write"),
     ("recompute_beliefs", "claims:write"),
@@ -109,6 +114,24 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // of act as supersession, hence admin rather than the claims:write that
     // covers promote/reject on `decide_match_candidate`.
     ("retire_match_candidate", "claims:admin"),
+    // Hard-deletes the edge row: irreversible and audit-destroying, so it
+    // sits with the other irreversible graph mutations rather than with
+    // `patch_edge`. Note this is STRICTER than the HTTP route it wraps
+    // (DELETE /api/v1/edges/:id only requires `edges:write`); the MCP scope
+    // vocabulary has no `edges:*` tier, and the conservative mapping is the
+    // right default for a tool handed to autonomous agents.
+    //
+    // These two arrived on separate branches and pull in opposite directions:
+    // `retire_match_candidate` exists precisely to STOP removing edges by
+    // deletion (it retracts via `valid_to` so the act stays auditable), while
+    // `delete_edge` hands an agent the hard delete this integration otherwise
+    // removed from every internal call site. Both are admin-gated, so neither
+    // is reachable without an explicit grant, but the divergence is deliberate
+    // and unresolved: `delete_edge` is the escape hatch for genuinely bad rows
+    // (test fixtures, mis-typed edges with no audit value), not the ordinary
+    // way to remove an edge. If retraction proves sufficient in practice,
+    // `delete_edge` should be withdrawn rather than left as the easier path.
+    ("delete_edge", "claims:admin"),
     ("mark_duplicate", "claims:admin"),
     ("supersede_claim", "claims:admin"),
     ("update_partition", "claims:admin"),
