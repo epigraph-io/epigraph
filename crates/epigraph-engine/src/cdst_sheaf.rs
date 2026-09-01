@@ -509,17 +509,19 @@ mod tests {
     #[test]
     fn test_cdst_section_propagates_open_world() {
         // A neighbor with high open_world via Positive restriction should appear
-        // in the expected interval's open_world.
+        // in the expected interval's open_world — discounted by the edge's
+        // transmission factor, like every other mass component.
         let node_id = Uuid::new_v4();
         let local = EpistemicInterval::new(0.5, 0.8, 0.1);
         let neighbor_interval = EpistemicInterval::new(0.6, 0.9, 0.25);
         let neighbors = vec![(neighbor_interval, RestrictionKind::Positive(0.8))];
         let section = compute_cdst_section(node_id, local, &neighbors);
 
-        // restrict_epistemic_positive passes open_world through unchanged
+        // restrict_epistemic_positive Shafer-discounts open_world by the
+        // factor: 0.25 * 0.8 = 0.20.
         assert!(
-            (section.expected_interval.open_world - 0.25).abs() < 1e-9,
-            "expected_interval.open_world should equal neighbor's ow (0.25), got {}",
+            (section.expected_interval.open_world - 0.20).abs() < 1e-9,
+            "expected_interval.open_world should be neighbor ow * factor (0.20), got {}",
             section.expected_interval.open_world
         );
         assert!(section.open_world_expected > 0.0);
