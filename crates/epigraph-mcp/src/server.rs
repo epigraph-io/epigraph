@@ -1336,13 +1336,23 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Decide a pending match candidate: 'promote' marks the row promoted and writes the edge its verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts, and refused for distinct (no truthful edge exists; reject it instead); 'reject' marks it rejected. Honours read-only mode."
+        description = "Decide a match candidate: 'promote' marks the row promoted and writes the edge its verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts, and refused for distinct (no truthful edge exists; reject it instead); 'reject' marks it rejected. To undo a promotion use retire_match_candidate (claims:admin). Honours read-only mode."
     )]
     async fn decide_match_candidate(
         &self,
         Parameters(params): Parameters<DecideMatchCandidateParams>,
     ) -> Result<CallToolResult, McpError> {
         tools::matching::decide_match_candidate(self, params).await
+    }
+
+    #[tool(
+        description = "Retire a promoted match candidate: RETRACTS the matcher edge (closes valid_to — the row and its properties.decided_by survive, so the original promoter stays recoverable), deletes the factors/bp_messages/BBAs derived from it, and flips the candidate to stale. Requires claims:admin, unlike promote/reject on decide_match_candidate: retirement withdraws an assertion another principal made, which is the same class of act as supersession. Honours read-only mode."
+    )]
+    async fn retire_match_candidate(
+        &self,
+        Parameters(params): Parameters<RetireMatchCandidateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::matching::retire_match_candidate(self, params).await
     }
 
     // ── Meta (1 tool) ──

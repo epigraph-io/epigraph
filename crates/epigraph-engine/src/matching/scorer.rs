@@ -200,7 +200,11 @@ pub async fn score_pair(
             -- Cluster IDs per claim (at most 1 row each)
             cca AS (SELECT cluster_id FROM claim_clusters WHERE claim_id = $1),
             ccb AS (SELECT cluster_id FROM claim_clusters WHERE claim_id = $2),
-            -- Citation targets per claim
+            -- Citation targets per claim. Deliberately NOT filtered on
+            -- `valid_to`: `cites` is bibliographic, and nothing in the codebase
+            -- retracts a citation. Filtering here would be inert today and would
+            -- wrongly couple bibliographic overlap to evidential retraction if a
+            -- retraction path for `cites` is ever added.
             cita AS (
                 SELECT target_id FROM edges
                 WHERE source_id = $1 AND relationship = 'cites'
@@ -265,19 +269,29 @@ pub async fn score_pair(
     // ------------------------------------------------------------------
     let row3 = sqlx::query(
         r#"
+        -- Every leg filters retracted edges. Without this the matcher has a
+        -- feedback loop: retiring a promoted match retracts its edge, but the
+        -- retracted edge still counts as a shared neighbour, so `graph_overlap`
+        -- stays inflated for the pair that was just retired and can push it back
+        -- above threshold to be re-proposed. The retirement would silently undo
+        -- itself on the next sweep.
         WITH na AS (
             SELECT target_id AS nbr FROM edges
                 WHERE source_id = $1 AND source_type = 'claim' AND target_type = 'claim'
+                  AND (valid_to IS NULL OR valid_to > now())
             UNION
             SELECT source_id FROM edges
                 WHERE target_id = $1 AND source_type = 'claim' AND target_type = 'claim'
+                  AND (valid_to IS NULL OR valid_to > now())
         ),
         nb AS (
             SELECT target_id AS nbr FROM edges
                 WHERE source_id = $2 AND source_type = 'claim' AND target_type = 'claim'
+                  AND (valid_to IS NULL OR valid_to > now())
             UNION
             SELECT source_id FROM edges
                 WHERE target_id = $2 AND source_type = 'claim' AND target_type = 'claim'
+                  AND (valid_to IS NULL OR valid_to > now())
         ),
         common AS (
             SELECT na.nbr FROM na JOIN nb USING (nbr)
@@ -288,6 +302,7 @@ pub async fn score_pair(
                 SELECT COUNT(*) FROM edges
                 WHERE (source_id = c.nbr OR target_id = c.nbr)
                   AND source_type = 'claim' AND target_type = 'claim'
+                  AND (valid_to IS NULL OR valid_to > now())
             ) AS d FROM common c
         )
         SELECT

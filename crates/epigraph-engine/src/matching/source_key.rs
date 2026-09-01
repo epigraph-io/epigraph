@@ -60,6 +60,13 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
     // never written anywhere in the repo, so reading it always yielded None,
     // making the same-source filter a silent no-op on real data. Resolve the
     // asserting paper's DOI via the edge instead.
+    // DELIBERATELY NOT filtered on `valid_to`. This resolves the asserting
+    // paper's DOI through a structural `paper --asserts--> claim` edge. Edge
+    // retraction (see `EdgeRepository::retract`) is an EVIDENTIAL mechanism —
+    // it withdraws a claim-to-claim assertion. Applying it to structural
+    // provenance would make a claim's own source unresolvable, which is a
+    // different and much worse failure than the one retraction exists to fix.
+    // No code path retracts an `asserts` edge.
     let paper_doi = sqlx::query_scalar::<_, Option<String>>(
         "SELECT p.doi FROM edges e JOIN papers p ON p.id = e.source_id \
          WHERE e.target_id = $1 AND e.source_type = 'paper' \
@@ -83,6 +90,8 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
         if depth >= 32 {
             break Some(current);
         }
+        // Also deliberately unfiltered: `derived_from` is lineage, not evidence.
+        // Retracting an evidential edge must not sever a decomposition chain.
         let parent: Option<(Uuid,)> = sqlx::query_as(
             "SELECT target_id FROM edges
              WHERE source_id = $1 AND relationship = 'derived_from'
