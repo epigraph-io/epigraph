@@ -20,7 +20,6 @@ use epigraph_crypto::{keypair_from_llm_agent, AgentSigner};
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::EpiGraphMcpFull;
 use sqlx::PgPool;
-use std::sync::Arc;
 use uuid::Uuid;
 
 const MODEL: &str = "claude-opus-4-8";
@@ -38,7 +37,7 @@ fn llm_server(pool: PgPool) -> EpiGraphMcpFull {
         signer,
         embedder,
         /* read_only */ false,
-        Arc::new(epigraph_mcp::federation::FederationRegistry::empty()),
+        epigraph_mcp::federation::SharedFederation::empty(),
         Some((MODEL.to_string(), prompt_hash)),
     )
 }

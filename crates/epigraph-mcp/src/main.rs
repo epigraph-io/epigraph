@@ -382,7 +382,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              and likely fail; extensions will mount unhealthy"
         );
     }
-    let federation = Arc::new(
+    let federation = epigraph_mcp::federation::SharedFederation::new(
         epigraph_mcp::federation::FederationRegistry::build(ext_configs, &discovery_token)
             .await
             .map_err(|e| format!("federation gateway build failed: {e}"))?,
@@ -398,6 +398,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Federation gateway: mounted {} federated tool(s) across configured extension(s)",
             federated_tool_count
         );
+        // An extension that lost the boot race (dialled before it had bound its
+        // port) mounts unhealthy and, without this timer, stays unroutable for
+        // the whole process lifetime — only a gateway restart would pick it up.
+        // Systemd ordering cannot close that window: `After=` orders *start*,
+        // not readiness, and a `Type=simple` extension counts as started the
+        // instant it execs, before it listens. So the gateway re-dials instead.
+        let reconnect_interval = std::env::var("EPIGRAPH_MCP_RECONNECT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .map_or(
+                epigraph_mcp::federation::DEFAULT_RECONNECT_INTERVAL,
+                std::time::Duration::from_secs,
+            );
+        tracing::info!(
+            reconnect_interval_secs = reconnect_interval.as_secs(),
+            "Federation gateway: reconnect timer started for unhealthy extensions"
+        );
+        federation.spawn_reconnect_loop(reconnect_interval);
     }
 
     let tool_count = EpiGraphMcpFull::all_tools_json()
