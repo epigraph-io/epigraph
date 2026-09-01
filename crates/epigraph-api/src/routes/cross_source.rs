@@ -29,6 +29,7 @@ use crate::{errors::ApiError, state::AppState};
 // Cross-source matches reads two tables (edges, match_candidates) via raw
 // sqlx. Local helpers fold sqlx errors into ApiError::DatabaseError so the
 // existing DbError → ApiError bridge isn't bypassed silently.
+#[cfg(feature = "db")]
 fn map_sqlx<T>(r: Result<T, sqlx::Error>) -> Result<T, ApiError> {
     r.map_err(|e| ApiError::DatabaseError {
         message: e.to_string(),

@@ -2,6 +2,7 @@
 //! (the shared repo layer used by both HTTP routes and MCP tools, per the
 //! repo CLAUDE.md "all SQL stays in crates/epigraph-db/src/repos"). This shim
 //! preserves the `crate::access_control::*` import path for the HTTP routes.
+#[cfg(feature = "db")]
 pub use epigraph_db::access_control::{
     batch_check_content_access, check_content_access, ContentAccess, COARSE_EDGE_TYPES,
 };
