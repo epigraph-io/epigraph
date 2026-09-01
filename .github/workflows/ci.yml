@@ -154,6 +154,21 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Format check
         run: cargo fmt --check
+      - name: No-db build check
+        # epigraph-api's `db` feature is default-on and nothing else in this
+        # file builds the crate without it. That blind spot is exactly how the
+        # no-db variant silently stopped compiling: 28 name-resolution errors
+        # accumulated between 2026-05-08 and 2026-08-20 with no signal, and the
+        # first proposed fix was to delete the variant because "nothing depends
+        # on it". This step is the missing signal. It is cheap (check, not
+        # build) and fails the moment a db-only item lands without its
+        # `#[cfg(not(feature = "db"))]` counterpart.
+        #
+        # Scope is deliberately lib+bins, NOT --all-targets: the crate's
+        # [dev-dependencies] on epigraph-db and sqlx are non-optional, so the
+        # test targets link Postgres regardless of the feature flag and cannot
+        # pass under --no-default-features today.
+        run: cargo check -p epigraph-api --no-default-features --locked
 
   # Advisory, NOT a merge gate. cargo audit checks Cargo.lock against the
   # RustSec DB fetched at run time, so a blocking gate would red-light every

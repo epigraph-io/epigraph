@@ -29,12 +29,40 @@ use crate::routes::submit::{
 use crate::routes::versioning::{
     DedupRequest, DedupResponse, SupersedeRequest, SupersessionResponse,
 };
+#[cfg(feature = "db")]
 use crate::routes::workflows::{
     EvolveStepRequest, EvolveStepResponse, HierarchicalSearchResponse, HierarchicalWorkflowResult,
     LineageHeadResult, ReportOutcomeRequest, ResolvedStepResult, StepExecution,
 };
+// Without `db` the `routes::workflows` module is compiled out, but the
+// `#[derive(OpenApi)]` schema list below cannot itself carry a cfg. Empty
+// stand-ins keep the derive resolvable; the db build never sees them.
+#[cfg(not(feature = "db"))]
+mod workflow_schema_stubs {
+    #[derive(utoipa::ToSchema)]
+    pub struct EvolveStepRequest {}
+    #[derive(utoipa::ToSchema)]
+    pub struct EvolveStepResponse {}
+    #[derive(utoipa::ToSchema)]
+    pub struct HierarchicalSearchResponse {}
+    #[derive(utoipa::ToSchema)]
+    pub struct HierarchicalWorkflowResult {}
+    #[derive(utoipa::ToSchema)]
+    pub struct LineageHeadResult {}
+    #[derive(utoipa::ToSchema)]
+    pub struct ReportOutcomeRequest {}
+    #[derive(utoipa::ToSchema)]
+    pub struct ResolvedStepResult {}
+    #[derive(utoipa::ToSchema)]
+    pub struct StepExecution {}
+}
 use epigraph_ingest::common::schema::{AuthorEntry, ClaimRelationship, ThesisDerivation};
 use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowExtraction, WorkflowSource};
+#[cfg(not(feature = "db"))]
+use workflow_schema_stubs::{
+    EvolveStepRequest, EvolveStepResponse, HierarchicalSearchResponse, HierarchicalWorkflowResult,
+    LineageHeadResult, ReportOutcomeRequest, ResolvedStepResult, StepExecution,
+};
 
 /// EpiGraph API OpenAPI specification
 ///

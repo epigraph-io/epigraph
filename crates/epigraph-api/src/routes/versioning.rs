@@ -15,12 +15,14 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "db")]
 use sqlx;
 use uuid::Uuid;
 
 use crate::errors::ApiError;
 use crate::state::AppState;
 use epigraph_core::{AgentId, ClaimId, TruthValue};
+#[cfg(feature = "db")]
 use epigraph_db::ClaimRepository;
 use epigraph_events::EpiGraphEvent;
 
@@ -153,6 +155,7 @@ pub struct VersionHistoryResponse {
 /// - 400 Bad Request: Validation failures or claim already superseded
 /// - 404 Not Found: Claim does not exist
 /// - 201 Created: New claim created successfully
+#[cfg(feature = "db")]
 #[utoipa::path(
     post,
     path = "/api/v1/claims/{id}/supersede",
@@ -385,6 +388,19 @@ pub async fn supersede_claim(
     ))
 }
 
+/// Supersession requires a database; without the `db` feature this reports 503.
+#[cfg(not(feature = "db"))]
+pub async fn supersede_claim(
+    State(_state): State<AppState>,
+    _auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(_claim_id): Path<Uuid>,
+    Json(_request): Json<SupersedeRequest>,
+) -> Result<(StatusCode, Json<SupersessionResponse>), ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Claim supersession requires database".to_string(),
+    })
+}
+
 /// Mark a claim as a duplicate of a canonical claim without creating a new claim.
 ///
 /// POST /api/v1/claims/:id/dedup
@@ -509,6 +525,7 @@ pub async fn mark_duplicate(
 ///
 /// - 404 Not Found: Claim does not exist
 /// - 200 OK: Version history returned
+#[cfg(feature = "db")]
 pub async fn claim_history(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
@@ -595,6 +612,17 @@ pub async fn claim_history(
         total_versions,
         current_version,
     }))
+}
+
+/// Version history requires a database; without the `db` feature this reports 503.
+#[cfg(not(feature = "db"))]
+pub async fn claim_history(
+    State(_state): State<AppState>,
+    Path(_claim_id): Path<Uuid>,
+) -> Result<Json<VersionHistoryResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Claim history requires database".to_string(),
+    })
 }
 
 // =============================================================================

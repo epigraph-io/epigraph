@@ -91,6 +91,7 @@ pub struct ListSpansQuery {
 // HELPERS
 // =============================================================================
 
+#[cfg(feature = "db")]
 fn span_row_to_response(row: epigraph_db::repos::SpanRow) -> SpanResponse {
     SpanResponse {
         id: row.id,
