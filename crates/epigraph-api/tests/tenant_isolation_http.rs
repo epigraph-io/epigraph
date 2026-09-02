@@ -32,8 +32,13 @@
 //! Naming `viewer` proves the extractor is present; it proves nothing about
 //! whether the read filters on it.
 //!
-//! Two things were added rather than arguing the point:
+//! Three things were added rather than arguing the point:
 //!
+//! * The two `#[tokio::test]` cases at the bottom of *this* file — real HTTP
+//!   round trips for `GET /api/v1/claims/by-belief` and
+//!   `GET /api/v1/frames/:id/claims`, the two handlers that held a `Viewer` and
+//!   did not filter on it. They are the regression guard a repo-level test
+//!   could not be, for the reason given in the comment above them.
 //! * `tests/viewer_route_table_lint.rs` — a source lint asserting that no
 //!   `sqlx::query*` in `src/routes/` selects claim content, with a dated
 //!   exemption list. That is what actually catches the `frame_claims_sorted`
@@ -557,6 +562,308 @@ async fn neighborhood_atomic_nodes_hides_a_group_private_member_from_a_stranger(
             .any(|n| n.label.contains("nbhd private content")),
         "private claim content leaked through the neighborhood node label"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// HTTP round trips for the two handlers that held a Viewer and did not
+// filter on it:
+//   GET /api/v1/claims/by-belief   →  ClaimRepository::list_by_belief_bounds
+//   GET /api/v1/frames/:id/claims  →  ClaimRepository::frame_claims_sorted
+// ─────────────────────────────────────────────────────────────────────────
+//
+// # Why these two are HTTP-level when everything above is repo-level
+//
+// A repo-level test could NOT have caught the defect these guard. Before the
+// conversion neither repo function existed: `frame_claims_sorted` was built in
+// the handler with `format!` + `sqlx::query_as` (no marker, no `splice`), and
+// `claims_by_belief` ran an inline corpus scan with no viewer at all. A test
+// naming `ClaimRepository::frame_claims_sorted` would not have compiled against
+// the broken tree, so it cannot be the regression guard for it.
+//
+// What survives a rewrite of where the SQL lives is the *response body*: a
+// stranger's token must not receive another group's `content` from these two
+// URLs. That is asserted here, through `spawn_app` → `create_router`, so the
+// bearer middleware, the `ViewerExtractor` and the handler wiring are all in
+// the path. Delete the `{VISIBILITY:c}` marker from either repo function, or
+// re-inline the statement into the handler, and these go red.
+//
+// They use the ambient `DATABASE_URL` rather than `#[sqlx::test]`'s throwaway
+// database, matching `versioning_belief_cascade_test.rs` and
+// `pr07_acceptance_http.rs`: `spawn_app` builds its own pool from a URL, and
+// every assertion below is keyed on freshly-minted claim ids, so a shared
+// database cannot make them pass or fail spuriously.
+
+mod common;
+
+/// One frame holding three claims that separate the two visibility markers
+/// both statements carry, plus a bearer token for the owning principal and for
+/// an unrelated one.
+///
+/// Both `list_by_belief_bounds` and `frame_claims_sorted` splice **two**
+/// predicates — `{VISIBILITY:c}` on `claims` and `{VISIBILITY:cf}` on
+/// `claim_frames` — and a corpus with only one kind of private row leaves the
+/// second marker inert: deleting it would change no assertion. So the frame
+/// holds one member that only `{VISIBILITY:c}` can hide, one that only
+/// `{VISIBILITY:cf}` can hide, and one public control.
+struct BeliefHttpCorpus {
+    /// `visibility = 'group'` claim, PUBLIC `claim_frames` row. Only the
+    /// `claims` predicate withholds it.
+    private_claim: Uuid,
+    /// `visibility = 'public'` claim, `visibility = 'group'` `claim_frames`
+    /// row. Only the `claim_frames` predicate withholds it — the content is
+    /// world-readable, but *that this claim is in this frame* is not, and an
+    /// unfiltered subquery turns the endpoint into a membership oracle for
+    /// rows the caller cannot otherwise enumerate.
+    frame_private_member: Uuid,
+    /// Public claim, public membership. The non-vacuity control.
+    public_claim: Uuid,
+    frame: Uuid,
+    owner_token: String,
+    stranger_token: String,
+}
+
+/// Seed the corpus above.
+///
+/// The `UPDATE ... SET belief` is load-bearing, not cosmetic.
+/// `list_by_belief_bounds` filters `c.belief >= $1 AND c.plausibility <= $2`,
+/// and `frame_claims_sorted` orders on the same columns. `seed_group_claim`
+/// leaves both NULL, so without this the OWNER's result set is empty too and
+/// every "the stranger sees nothing" assertion below would pass vacuously
+/// against a completely unfiltered query.
+///
+/// Every read below is scoped to the freshly-minted `frame`, which also bounds
+/// the result set to these three rows on the shared, never-truncated test
+/// database — otherwise each run would add two more `belief = 0.9` claims to an
+/// unscoped corpus scan and the assertions would eventually page out.
+async fn belief_http_corpus(pool: &PgPool, label: &str) -> BeliefHttpCorpus {
+    let (owner_agent, group) = fixture::seed_agent_with_group(pool, label).await;
+    let (stranger_agent, _stranger_group) =
+        fixture::seed_agent_with_group(pool, &format!("{label}-stranger")).await;
+
+    let private_claim = fixture::seed_group_claim(
+        pool,
+        owner_agent,
+        group,
+        &format!("{label} private content"),
+    )
+    .await;
+    let frame_private_member = fixture::seed_public_claim(
+        pool,
+        owner_agent,
+        &format!("{label} frame-private member content"),
+    )
+    .await;
+    let public_claim =
+        fixture::seed_public_claim(pool, owner_agent, &format!("{label} public content")).await;
+
+    for claim in [private_claim, frame_private_member, public_claim] {
+        sqlx::query("UPDATE claims SET belief = 0.9, plausibility = 0.95 WHERE id = $1")
+            .bind(claim)
+            .execute(pool)
+            .await
+            .expect("populate belief columns");
+    }
+
+    let frame = common::seed_frame_with_claim(pool, private_claim).await;
+    for claim in [frame_private_member, public_claim] {
+        sqlx::query("INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2)")
+            .bind(claim)
+            .bind(frame)
+            .execute(pool)
+            .await
+            .expect("assign claim to the fixture frame");
+    }
+
+    // Migration 062 lists `claim_frames` in `tier_a`, so the row carries its
+    // own tenancy columns and defaults to `public`. This is the shape PR-12's
+    // backfill will produce for a membership that belongs to one group.
+    sqlx::query(
+        "UPDATE claim_frames SET visibility = 'group', owner_group_id = $1 \
+         WHERE claim_id = $2 AND frame_id = $3",
+    )
+    .bind(group)
+    .bind(frame_private_member)
+    .bind(frame)
+    .execute(pool)
+    .await
+    .expect("make the membership row group-private");
+
+    BeliefHttpCorpus {
+        private_claim,
+        frame_private_member,
+        public_claim,
+        frame,
+        owner_token: common::mint_token_with_agent(&["claims:read", "graph:read"], owner_agent),
+        stranger_token: common::mint_token_with_agent(
+            &["claims:read", "graph:read"],
+            stranger_agent,
+        ),
+    }
+}
+
+/// GET `path` with `token` and return `(claim ids under id_key, raw body)`.
+///
+/// The body comes back too so the content assertions can be made on the text
+/// rather than on a field name — a rename of `content` must not be able to turn
+/// a leak into a pass.
+async fn get_claim_ids(
+    addr: std::net::SocketAddr,
+    path: &str,
+    token: &str,
+    who: &str,
+    id_key: &str,
+) -> (Vec<Uuid>, String) {
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}{path}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET {path} as {who}: {e}"));
+    let status = resp.status();
+    let body = resp.text().await.expect("response body");
+    assert!(
+        status.is_success(),
+        "GET {path} as {who} must succeed; got {status}: {body}"
+    );
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("GET {path} as {who}: {e}: {body}"));
+    let ids = rows
+        .iter()
+        .map(|row| {
+            let raw = row
+                .get(id_key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("row has no string `{id_key}`: {row}"));
+            Uuid::parse_str(raw).expect("row id is a uuid")
+        })
+        .collect();
+    (ids, body)
+}
+
+/// `GET /api/v1/claims/by-belief` is an unbounded, caller-paginated scan that
+/// projects `claims.content`. A stranger's token must not receive another
+/// group's claim from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_by_belief_http_hides_a_group_private_claim_from_a_stranger() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("connect test pool");
+    let corpus = belief_http_corpus(&pool, "by-belief-http").await;
+    let (addr, shutdown) = common::spawn_app(&url).await;
+
+    // `frame_id` is passed so the `claim_frames` arm of the statement actually
+    // executes: without it `$3::uuid IS NULL` short-circuits the whole
+    // subquery and `{VISIBILITY:cf}` is never evaluated. It also bounds the
+    // result set to this frame's three members.
+    let frame = corpus.frame;
+    let path = format!(
+        "/api/v1/claims/by-belief?min_belief=0.5&max_plausibility=1.0&frame_id={frame}&limit=1000"
+    );
+
+    // Non-vacuity: the owner really does get all three rows back, so an absent
+    // row below is the filter working rather than the query matching nothing.
+    let (owner_ids, _) = get_claim_ids(addr, &path, &corpus.owner_token, "owner", "id").await;
+    for expected in [
+        corpus.private_claim,
+        corpus.frame_private_member,
+        corpus.public_claim,
+    ] {
+        assert!(
+            owner_ids.contains(&expected),
+            "the owner must see {expected} — every member of its own frame; got {owner_ids:?}"
+        );
+    }
+
+    let (stranger_ids, stranger_body) =
+        get_claim_ids(addr, &path, &corpus.stranger_token, "stranger", "id").await;
+    assert!(
+        stranger_ids.contains(&corpus.public_claim),
+        "the stranger's request must still return the public control claim — \
+         otherwise this test cannot distinguish a working filter from a broken \
+         endpoint; got {stranger_ids:?}"
+    );
+    assert!(
+        !stranger_ids.contains(&corpus.private_claim),
+        "a stranger must not receive another group's claim from \
+         /api/v1/claims/by-belief ({{VISIBILITY:c}}); got {stranger_ids:?}"
+    );
+    assert!(
+        !stranger_ids.contains(&corpus.frame_private_member),
+        "a stranger must not learn that {} is a member of this frame through a \
+         private claim_frames row ({{VISIBILITY:cf}}); got {stranger_ids:?}",
+        corpus.frame_private_member
+    );
+    assert!(
+        !stranger_body.contains("by-belief-http private content"),
+        "another group's claim content leaked in the by-belief body: {stranger_body}"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// `GET /api/v1/frames/:id/claims` is the handler that held a `Viewer`, spent
+/// it on the frame-existence check, and then built its content query with
+/// `format!` — the fail-open `Viewer::splice`'s missing-marker panic could not
+/// see because `splice` was never called.
+///
+/// The frame itself is `visibility = 'public'`, so the stranger passes the
+/// existence check and receives a page. That is the sharp case: the endpoint
+/// must return the frame's public members and withhold the private one, not
+/// 404 the whole frame.
+#[tokio::test(flavor = "multi_thread")]
+async fn frame_claims_sorted_http_hides_a_group_private_claim_from_a_stranger() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("connect test pool");
+    let corpus = belief_http_corpus(&pool, "frame-claims-http").await;
+
+    let (addr, shutdown) = common::spawn_app(&url).await;
+    let frame = corpus.frame;
+    let path = format!("/api/v1/frames/{frame}/claims?limit=1000");
+
+    let (owner_ids, _) = get_claim_ids(addr, &path, &corpus.owner_token, "owner", "claim_id").await;
+    for expected in [
+        corpus.private_claim,
+        corpus.frame_private_member,
+        corpus.public_claim,
+    ] {
+        assert!(
+            owner_ids.contains(&expected),
+            "the owner must see {expected} — every member of its own frame; got {owner_ids:?}"
+        );
+    }
+
+    let (stranger_ids, stranger_body) =
+        get_claim_ids(addr, &path, &corpus.stranger_token, "stranger", "claim_id").await;
+    assert!(
+        stranger_ids.contains(&corpus.public_claim),
+        "the stranger must still receive the frame's public member — otherwise \
+         this test cannot distinguish a working filter from a 404ed frame; \
+         got {stranger_ids:?}"
+    );
+    assert!(
+        !stranger_ids.contains(&corpus.private_claim),
+        "a stranger must not receive another group's claim from \
+         /api/v1/frames/:id/claims ({{VISIBILITY:c}}); got {stranger_ids:?}"
+    );
+    assert!(
+        !stranger_ids.contains(&corpus.frame_private_member),
+        "a stranger must not learn that {} is a member of this frame through a \
+         private claim_frames row ({{VISIBILITY:cf}}); got {stranger_ids:?}",
+        corpus.frame_private_member
+    );
+    assert!(
+        !stranger_body.contains("frame-claims-http private content"),
+        "another group's claim content leaked in the frame-claims body: {stranger_body}"
+    );
+
+    let _ = shutdown.send(());
 }
 
 /// A 1536-dimension pgvector literal with every component set to `v`.
