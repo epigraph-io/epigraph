@@ -30,6 +30,7 @@ pub mod experiment;
 pub mod factor;
 pub mod frame;
 pub mod gap;
+pub mod graph_view;
 pub mod group;
 pub mod group_key_epoch;
 pub mod group_membership;
@@ -68,11 +69,11 @@ pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimNeighbor, ClaimPairDistance,
-    ClaimRepository, ConsolidateMode, ConsolidateResult, DedupRepair, EvolveStepResult,
-    GraphExpansionHit, HybridHit, LabelQuery, LineageHead, NearestClaimHit, PatchClaimDiff,
-    PatchClaimInput, SweepCandidate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
-    EXPANSION_RELATIONSHIPS,
+    BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
+    ClaimNeighbor, ClaimPairDistance, ClaimRepository, ConsolidateMode, ConsolidateResult,
+    DedupRepair, EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, HybridHit, LabelQuery,
+    LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection, SweepCandidate,
+    CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
@@ -94,6 +95,10 @@ pub use experiment::{
 pub use factor::FactorRepository;
 pub use frame::FrameRepository;
 pub use gap::{GapAnalysisResult, GapRecord, GapRepository};
+pub use graph_view::{
+    AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GraphNodeRow,
+    GraphViewRepository, SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow,
+};
 pub use learning_event::{LearningEventRepository, LearningEventRow};
 pub use lineage::LineageRepository;
 pub use mass_function::MassFunctionRepository;

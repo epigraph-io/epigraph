@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::middleware::bearer::ViewerExtractor;
 use crate::AppState;
 
 /// Claim-level edge relationships exposed to the graph view.
@@ -239,7 +240,16 @@ pub async fn overview(
     }))
 }
 
+/// Expand one cluster into its member claims.
+///
+/// The node projection is read as the caller's `Viewer`. `label` here is
+/// `claims.content` verbatim, so before PR-07 this endpoint returned other
+/// tenants' claim text to any authenticated principal that knew (or guessed,
+/// from `/graph/overview`) a cluster id. The surrounding run/cluster metadata
+/// is not viewer-filtered — those tables carry no tenancy columns; see
+/// `GraphViewRepository`'s module docs.
 pub async fn expand(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(cluster_id): Path<Uuid>,
     Query(params): Query<ExpandParams>,
@@ -277,42 +287,44 @@ pub async fn expand(
             .map(|s| (*s).to_string())
             .collect(),
     };
-    let nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
-        "WITH degree AS (
-            SELECT m.claim_id, COUNT(e.*) AS deg
-            FROM claim_cluster_membership m
-            LEFT JOIN edges e ON (e.source_id = m.claim_id OR e.target_id = m.claim_id)
-                              AND e.relationship = ANY($3)
-            WHERE m.cluster_id = $1 AND m.run_id = $2
-            GROUP BY m.claim_id
-        )
-        SELECT c.id,
-               COALESCE(c.content, c.id::text) AS label,
-               'claim'::text AS entity_type,
-               c.pignistic_prob,
-               (SELECT cf.frame_id FROM claim_frames cf WHERE cf.claim_id = c.id LIMIT 1) AS frame_id,
-               $1::uuid AS cluster_id,
-               NULL::float8 AS conflict_k
-        FROM degree d
-        JOIN claims c ON c.id = d.claim_id
-        ORDER BY d.deg DESC NULLS LAST, c.pignistic_prob DESC NULLS LAST
-        LIMIT $4",
+    let nodes: Vec<NodeOut> = epigraph_db::GraphViewRepository::expand_cluster_nodes(
+        pool,
+        &viewer,
+        cluster_id,
+        run_id,
+        &degree_list,
+        budget,
     )
-    .bind(cluster_id)
-    .bind(run_id)
-    .bind(degree_list)
-    .bind(budget)
-    .fetch_all(pool)
     .await
-    .map_err(internal)?;
+    .map_err(internal_db)?
+    .into_iter()
+    .map(|r| NodeOut {
+        id: r.id,
+        label: r.label,
+        entity_type: r.entity_type,
+        pignistic_prob: r.pignistic_prob,
+        frame_id: r.frame_id,
+        cluster_id: r.cluster_id,
+        conflict_k: r.conflict_k,
+    })
+    .collect();
 
     let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
     let (edges, filtered_edge_count) =
         fetch_subgraph_edges(pool, &node_ids, allowlist.as_deref()).await?;
 
+    // PR-07: `truncated` means "the budget cut this response short", so it is
+    // derived from the budget, not from `graph_clusters.size`.
+    //
+    // `total_size` is raw cluster metadata (`graph_clusters` carries no tenancy
+    // columns), while `nodes` is now viewer-filtered. `total_size > nodes.len()`
+    // therefore reports `true` for a response that is complete *for this
+    // viewer*, and a client paging on the flag would page forever without ever
+    // seeing another row. The difference `total_size - nodes.len()` was also an
+    // exact count of how many claims in the cluster the caller cannot see.
     Ok(Json(ExpandResponse {
         cluster_id,
-        truncated: total_size > nodes.len() as i64,
+        truncated: nodes.len() as i64 >= budget,
         total_size,
         nodes,
         edges,
@@ -517,6 +529,12 @@ fn synthesize_pre_run_response(theme_id: Uuid) -> ThemeExpandResponse {
 }
 
 fn internal(e: sqlx::Error) -> (axum::http::StatusCode, String) {
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+/// `internal` for the repo layer, which surfaces `DbError` rather than a raw
+/// `sqlx::Error`.
+fn internal_db(e: epigraph_db::DbError) -> (axum::http::StatusCode, String) {
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 

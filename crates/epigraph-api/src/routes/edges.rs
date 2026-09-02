@@ -1938,7 +1938,7 @@ pub async fn graph_full(
         }));
     }
 
-    let mut resp = super::graph_query_utils::load_subgraph(pool, node_ids).await?;
+    let mut resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
     // Redact claim labels for nodes the requester cannot access
     for node in &mut resp.nodes {
         if node.entity_type == "claim" {

@@ -589,6 +589,41 @@ impl MassFunctionRepository {
         Ok(row.0)
     }
 
+    /// Count the mass functions attached to `claim_id` across ALL frames.
+    ///
+    /// The unframed counterpart to [`Self::count_for_claim_frame`], used by
+    /// `GET /api/v1/claims/:id/belief` to report how many BBAs contribute to a
+    /// claim's cached belief interval.
+    ///
+    /// The count is the reader's count, not the corpus count: a mass function
+    /// the viewer cannot see does not contribute to the number it is told. A
+    /// bare `COUNT(*)` here would be a cardinality oracle — it reveals how much
+    /// evidence exists against a claim without disclosing any of it, which is
+    /// exactly the kind of "returns more, not less" leak `Viewer::splice`
+    /// exists to make impossible to write by accident.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, viewer))]
+    pub async fn count_for_claim(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<i64, DbError> {
+        let sql = viewer.splice(
+            "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 \
+             /* {VISIBILITY:mass_functions} */",
+            2,
+        );
+        let mut vq = sqlx::query_as(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let row: (i64,) = vq.fetch_one(pool).await?;
+
+        Ok(row.0)
+    }
+
     /// Get all mass functions for a frame (across all claims and agents).
     ///
     /// Used for frame-level combination and conflict computation.

@@ -285,8 +285,11 @@ pub async fn submit_challenge(
 /// changed: transparency is owed to participants in the corpus, not to the
 /// unauthenticated internet, because `challenges.explanation` quotes the claim
 /// it disputes and so leaks content the reader may not be entitled to.
-/// Filtering the query by the reader's `Viewer` is PR-07 (plan §2.4 / §4.9
-/// #23); until then the token requirement is the whole control.
+///
+/// The `Viewer` predicate is now applied: this handler takes a
+/// `ViewerExtractor` and calls `ChallengeRepository::list_for_claim`, whose SQL
+/// carries `/* {VISIBILITY:challenges} */`. The token requirement is no longer
+/// the whole control.
 ///
 /// # Errors
 ///
@@ -321,6 +324,13 @@ pub async fn list_challenges(
 
     #[cfg(not(feature = "db"))]
     let challenge_responses = {
+        // The viewer is still REQUIRED to reach this handler — `ViewerExtractor`
+        // enforces the same two 401 branches in both builds — but there is no
+        // visibility predicate to apply to `challenge_service`, which is an
+        // in-memory store with no tenancy columns. Bind it away explicitly
+        // rather than renaming the parameter `_viewer`, so the `db` arm below
+        // keeps the name it actually filters on.
+        let _ = &viewer;
         let challenges = state
             .challenge_service
             .list_by_claim(ClaimId::from_uuid(claim_id));

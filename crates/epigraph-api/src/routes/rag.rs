@@ -22,9 +22,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[cfg(feature = "db")]
-use sqlx::Row;
-
+// Not `#[cfg(feature = "db")]`: `rag_context` is a single cfg-free handler
+// with a cfg'd body, so it names `ViewerExtractor` in both configurations.
+// The `not(db)` shim in `middleware::bearer` exists precisely so that the
+// authentication precondition — and the handler signature — stay identical
+// across the two builds.
+use crate::middleware::bearer::ViewerExtractor;
 use crate::{errors::ApiError, state::AppState};
 
 // ============================================================================
@@ -254,6 +257,7 @@ fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
 /// - Query length bounded to prevent memory exhaustion
 /// - Result count bounded to prevent large response payloads
 pub async fn rag_context(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     #[allow(unused_variables)] State(state): State<AppState>,
     Query(params): Query<RagQueryParams>,
 ) -> Result<Json<RagContextResponse>, ApiError> {
@@ -336,59 +340,21 @@ pub async fn rag_context(
         let embedding_str = format_embedding_for_pgvector(&query_embedding);
         let embedding_mode = if is_real_embedding { "real" } else { "mock" }.to_string();
 
-        // Step 2: Execute hybrid search combining vector similarity, truth, and connectivity
+        // Step 2: Execute hybrid search combining vector similarity, truth, and
+        // connectivity, filtered by the caller's Viewer.
         //
-        // Hybrid scoring formula:
-        //   hybrid_score = similarity * 0.6 + truth_value * 0.2 + connectivity * 0.2
-        //
-        // Where:
-        //   - similarity: cosine similarity between query and claim embedding
-        //   - truth_value: epistemic quality gate (already filtered by min_truth)
-        //   - connectivity: min(edge_count / 10.0, 1.0) — well-connected claims ranked higher
-        //
-        // The truth_value >= $2 clause is the epistemic quality gate that
-        // distinguishes this from general semantic search.
-        let rows = sqlx::query(
-            r#"
-            WITH query_vec AS (
-                SELECT $1::vector AS vec
-            ),
-            base AS (
-                SELECT
-                    c.id as claim_id,
-                    c.content,
-                    c.truth_value,
-                    1 - (c.embedding <=> q.vec) as similarity,
-                    c.labels[1] as domain,
-                    c.trace_id,
-                    c.agent_id,
-                    c.created_at,
-                    COALESCE((
-                        SELECT COUNT(*)
-                        FROM edges e
-                        WHERE e.source_id = c.id OR e.target_id = c.id
-                    ), 0) as edge_count
-                FROM claims c, query_vec q
-                WHERE c.embedding IS NOT NULL
-                  AND c.truth_value >= $2
-                  AND 1 - (c.embedding <=> q.vec) >= 0.0
-                  AND ($3::text IS NULL OR $3 = ANY(c.labels))
-            )
-            SELECT *,
-                similarity * 0.6
-                    + truth_value * 0.2
-                    + LEAST(edge_count::float / 10.0, 1.0) * 0.2
-                as hybrid_score
-            FROM base
-            ORDER BY hybrid_score DESC
-            LIMIT $4
-            "#,
+        // The statement itself now lives in
+        // `ClaimRepository::rag_hybrid_context`; see that function for the
+        // scoring formula and for why an unfiltered version of this read was
+        // the single highest-value exfiltration primitive in the API.
+        let rows = epigraph_db::ClaimRepository::rag_hybrid_context(
+            &state.db_pool,
+            &viewer,
+            &embedding_str,
+            min_truth,
+            params.domain.as_deref(),
+            limit as i64,
         )
-        .bind(&embedding_str)
-        .bind(min_truth)
-        .bind(params.domain.as_deref())
-        .bind(limit as i64)
-        .fetch_all(&state.db_pool)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("Database query failed: {}", e),
@@ -396,18 +362,18 @@ pub async fn rag_context(
 
         // Step 3: Convert rows to response DTOs
         let results: Vec<RagContextResult> = rows
-            .iter()
+            .into_iter()
             .map(|row| RagContextResult {
-                claim_id: row.get("claim_id"),
-                content: row.get("content"),
-                truth_value: row.get("truth_value"),
-                similarity: row.get("similarity"),
-                domain: row.get("domain"),
-                trace_id: row.get("trace_id"),
-                agent_id: row.get("agent_id"),
-                created_at: row.get("created_at"),
-                edge_count: row.get("edge_count"),
-                hybrid_score: row.get("hybrid_score"),
+                claim_id: row.claim_id,
+                content: row.content,
+                truth_value: row.truth_value,
+                similarity: row.similarity,
+                domain: row.domain,
+                trace_id: row.trace_id,
+                agent_id: row.agent_id,
+                created_at: Some(row.created_at),
+                edge_count: Some(row.edge_count),
+                hybrid_score: Some(row.hybrid_score),
             })
             .collect();
 
@@ -423,9 +389,12 @@ pub async fn rag_context(
         }))
     }
 
-    // Fallback when db feature is disabled
+    // Fallback when db feature is disabled. The viewer is still REQUIRED to
+    // reach this handler — `ViewerExtractor` enforces the same two 401
+    // branches in both builds — but there is no corpus to retrieve from.
     #[cfg(not(feature = "db"))]
     {
+        let _ = &viewer;
         let results: Vec<RagContextResult> = Vec::new();
         let count = 0;
         let query_time_ms = start_time.elapsed().as_millis() as u64;
@@ -578,9 +547,15 @@ pub struct EvidenceEmbeddingResponse {
 ///
 /// Requires a Bearer token. PR-03 revoked this endpoint's public-access
 /// guarantee: corpus-wide semantic search over evidence is the highest-value
-/// anonymous read the API had.
+/// anonymous read the API had. PR-07 finishes the job: a token alone bounded
+/// *who* could run the search but not *what* it returned, so any authenticated
+/// principal could rank the entire evidence corpus — including other tenants'
+/// `raw_content` — by similarity to an arbitrary probe. The search now runs
+/// through `EvidenceRepository::search_by_embedding`, which filters both the
+/// evidence row and its parent claim by the caller's `Viewer`.
 #[cfg(feature = "db")]
 pub async fn search_evidence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<EvidenceSearchParams>,
 ) -> Result<Json<EvidenceSearchResponse>, ApiError> {
@@ -619,23 +594,12 @@ pub async fn search_evidence(
     let (query_embedding, _is_real) = generate_query_embedding(&state, query).await;
     let embedding_str = format_embedding_for_pgvector(&query_embedding);
 
-    let rows = sqlx::query_as::<_, EvidenceSearchRow>(
-        r#"
-        SELECT
-            e.id as evidence_id,
-            e.claim_id,
-            e.raw_content,
-            e.evidence_type,
-            1 - (e.embedding <=> $1::vector) AS similarity
-        FROM evidence e
-        WHERE e.embedding IS NOT NULL
-        ORDER BY e.embedding <=> $1::vector
-        LIMIT $2
-        "#,
+    let rows = epigraph_db::EvidenceRepository::search_by_embedding(
+        &state.db_pool,
+        &viewer,
+        &embedding_str,
+        limit,
     )
-    .bind(&embedding_str)
-    .bind(limit)
-    .fetch_all(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Database query failed: {}", e),
@@ -644,7 +608,7 @@ pub async fn search_evidence(
     let results: Vec<EvidenceSearchResultDto> = rows
         .into_iter()
         .map(|row| EvidenceSearchResultDto {
-            evidence_id: row.evidence_id,
+            evidence_id: row.id,
             claim_id: row.claim_id,
             raw_content: row.raw_content,
             evidence_type: row.evidence_type,
@@ -706,16 +670,11 @@ pub struct EvidenceSearchResponse {
     pub count: usize,
 }
 
-/// Row struct for evidence search query results
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct EvidenceSearchRow {
-    evidence_id: Uuid,
-    claim_id: Uuid,
-    raw_content: Option<String>,
-    evidence_type: String,
-    similarity: f64,
-}
+// `EvidenceSearchRow` was the row type for the inline, unfiltered evidence
+// search this module ran before PR-07. `search_evidence` now reads through
+// `EvidenceRepository::search_by_embedding`, which returns
+// `epigraph_db::EvidenceSearchResult` with the visibility predicate already
+// spliced on, so the local row struct has no remaining use.
 
 /// Non-DB stub for embedding generation
 #[cfg(not(feature = "db"))]

@@ -6,7 +6,24 @@
     "Q2_epigraph_seed": "keep for rollout, delete in follow-up (plan recommendation)",
     "Q3_community_acl": "proceed; POST /communities/:id/members performs no authorization today",
     "Q4_allow_all_identities": "fail closed; allow_all_identities defaults false, explicit opt-in required",
-    "Q5_pad_to": "256 (plan recommendation)"
+    "Q5_pad_to": "256 (plan recommendation)",
+    "Q6_check_content_access_retention": {
+      "decision": "DIVERGE from conformance section F5. PR-07 retains all 30 check_content_access call sites instead of substituting them for Viewer.",
+      "rationale": "Migration 062 adds `visibility varchar(16) NOT NULL DEFAULT 'public'` to every tier_a table and backfills nothing. No PR before PR-12 transcribes ownership.partition_type into claims.visibility. So TODAY every spliced viewer predicate matches every row, and check_content_access is the only control with live effect on the handlers that have one. Deleting the sites now would take a fixture-private claim from redacted to fully readable by a stranger's token - the removal, not the retention, would be the fail-open. Two filters compose strictly narrower than either.",
+      "gated_on": "PR-12 transcription completing (claims.visibility populated from ownership.partition_type)",
+      "removal_owner": "PR-14 (refactor(api,mcp): delete redaction), which already plans to delete check_content_access and redact_claim_content",
+      "hazard_if_ignored": "PR-14 deletes the compensating control. Every site on open_findings F-inline-claim-content-reads becomes a live leak on that day unless PR-12 has landed first. PR-14 MUST NOT land before PR-12.",
+      "sites": "api: belief.rs 2, claims.rs 3, edges.rs 11, graph_query.rs 2; mcp: tools/claims.rs 5, tools/paper_queries.rs 5, tools/redaction.rs 1"
+    },
+    "Q7_failopen_scope_site_ownership": {
+      "decision": "The remaining 37 fail-open `if let Some(axum::Extension(ref auth)) = auth_ctx { check_scopes(..) }` sites are RESCOPED out of PR-07.",
+      "rationale": "The plan's *Files:* line assigns 'all 39 fail-open sites' to PR-07, but PR-07's charter is READ paths. The overwhelming majority of these sites gate writes (crud.rs 11, edges.rs 9, tasks.rs 6, agent_keys.rs 3). Converting a write path needs `viewer.writable_bind()` - member-with-write-role, not merely member-who-can-read - which is PR-16's mechanism and does not exist yet.",
+      "assignments": {
+        "PR-16 (write-path gate)": "agent_keys.rs 3, agents.rs 2, audit.rs 1, claims.rs 2, crud.rs 11, edges.rs 9, papers.rs 1, tasks.rs 6 = 35",
+        "PR-10 (webhook fan-out)": "webhooks.rs 2 - contested between PR-07 section 4.12 and PR-10; assigned to PR-10 because PR-10 already rewrites both webhook handlers and adds their auth extractors"
+      },
+      "ratchet": "crates/epigraph-api/tests/viewer_route_table_lint.rs::fail_open_scope_check_sites_do_not_increase asserts the per-file counts EXACTLY, so neither PR can silently grow the set, and lowering it requires editing the list."
+    }
   },
   "blocked_measurements": {
     "M1": "ownership row census - needs prod DB",
@@ -37,7 +54,7 @@
         "sha": "8c70e5a",
         "verified_by": "main-agent",
         "tests": "3669 passed / 0 failed / 69 ignored",
-        "notes": "anonymous surface = /health + /api/v1/openapi.json only, locked by source lint; /metrics -> internal listener EPIGRAPH_METRICS_ADDR 127.0.0.1:9090 (Q1 option a)"
+        "notes": "anonymous surface = /health + /api/v1/openapi.json only, locked by source lint; /metrics -> internal listener EPIGRAPH_METRICS_ADDR 127.0.0.1:9090 (Q1 option a). NOTE: this discharged the plan's 'move 104 non-allowlisted registrations to protected' item, which the PR-07 *Files:* line is sometimes misread as re-owning."
       },
       {
         "pr": "PR-04",
@@ -57,24 +74,76 @@
         "pr": "chore",
         "sha": "b58dc09",
         "notes": "dropped 2 orphaned .sqlx entries left by PR-05"
+      },
+      {
+        "pr": "PR-06",
+        "sha": "61cab26a (merged into the branch; not a standalone commit)",
+        "verified_by": "reconstructed from the tree during PR-07 review",
+        "notes": "LEDGER BACKFILL. PR-06's work is demonstrably present at 61cab26a but was never recorded: ViewerExtractor across 30 route files, ChallengeRepository::list_for_claim with /* {VISIBILITY:challenges} */, and the repo read functions taking &Viewer. It also resolved F-failopen-catchall (access_control.rs:168 now reads `_ => ContentAccess::Redacted` with an explanatory comment). CREDIT CORRECTION: PR-07 acceptance criterion #3 (challenge.rs takes a ViewerExtractor and calls list_for_claim) was delivered HERE, not by PR-07 - `git show 61cab26a:crates/epigraph-api/src/routes/challenge.rs` shows both already present. PR-07's only change to that file is a doc rewrite plus `let _ = &viewer;` in the not(db) arm."
+      },
+      {
+        "pr": "PR-07",
+        "branch": "tenancy/pr-07-viewer-http-reads",
+        "verified_by": "implement -> verify -> critic -> revise cycle",
+        "tests": "3803 passed / 33 failed / 70 ignored across 354 binaries (cargo test --workspace --locked --no-fail-fast). All 33 failures are the environmental name guard described in gate.test_prescribed - NOT this PR. Verified exhaustively: the log contains exactly 33 `panicked at` lines and all 33 carry the `refusing to run destructive claim fixtures` message, at exactly two locations (claim_repo_helpers.rs:58 x7, epigraph-mcp/tests/common/mod.rs:56 x26). Zero failures are attributable to PR-07.",
+        "gate": {
+          "fmt": "cargo fmt --all -- --check -> 0",
+          "clippy": "cargo clippy --workspace --all-targets --locked -- -D warnings -> 0",
+          "test_prescribed": "cargo test --workspace --locked -> 101. NOT a PR-07 failure. The command is fail-fast and aborts at epigraph-db --test claim_repo_helpers on the NAME-based assert_disposable_db guard, because the briefed throwaway is named `epigraph_tenancy_pr07` and the guard accepts only `_sqlx_test*` or `*_test`. Reproduced in isolation: 7 of 8 fail in 0.30s, panicking at claim_repo_helpers.rs:58 BEFORE any test logic. Both guard files are untouched by this PR.",
+          "test_no_fail_fast": "cargo test --workspace --locked --no-fail-fast -> 101. Run because the prescribed fail-fast command aborts after 170 binaries and would have hidden any real failure behind the guard. 354 binaries, 3803 passed / 33 failed / 70 ignored; the 9 failing binaries are claim_repo_helpers plus 8 epigraph-mcp binaries, all guard panics.",
+          "sqlx": ".sqlx/ clean. Zero query!/query_as!/query_scalar! macros were added - all new SQL is runtime-checked sqlx::query, because the viewer predicate is spliced in as a string fragment and a macro needs a compile-time literal. `cargo sqlx prepare` was therefore not required.",
+          "not_run": "cargo check -p epigraph-api --no-default-features --locked. Different feature resolution = full dependency re-check; disk was at 95% (7.9G free with a 37G target dir) and an ENOSPC mid-build was the larger risk. Tracked as open finding F-not-db-build-unverified."
+        },
+        "inherited_by_pr08": "Do NOT read this entry as 'PR-07 was green' and then re-diagnose the same 33 guard failures. They are environmental and pre-existing. Give PR-08 a database whose name ends in `_test` - see env.pr07_throwaway_db.",
+        "acceptance": {
+          "1_no_content_handler_lacks_a_viewer": "MET, and now actually verified. The plan cites a 'route-table test' that did not exist - public_router_allowlist.rs asserts public-vs-protected ROUTER MEMBERSHIP and says nothing about extractors. New tests/viewer_route_table_lint.rs implements it, checking the sharper structural property: no sqlx::query* in src/routes/ may select claim content. That catches the real defect shape, which mentioning `ViewerExtractor` does not - frame_claims_sorted took an extractor AND leaked.",
+          "2_theme_embeddings_no_raw_vectors": "MET. Was wholly unimplemented in the first pass (crud.rs was not even in the diff). get_theme_embeddings now returns {id, projection:[x,y]} from a deterministic 2-D PCA (routes/projection.rs, 6 unit tests) and gates on claims:admin, not claims:read. Its fail-open `if let Some(auth)` scope check became `ok_or`. create_theme_with_centroid's `centroid` is now optional so scripts/maintain_themes.py can still split themes without raw vectors (server averages the claim embeddings). Locked by tests/pr07_acceptance_http.rs, which deep-scans the response for any numeric array longer than 2, at three different limits.",
+          "3_challenges_no_foreign_explanation": "MET, but INHERITED FROM PR-06 (see the PR-06 entry). PR-07's contribution is the coverage: it had none. tests/pr07_acceptance_http.rs now exercises the endpoint over HTTP."
+        },
+        "files_line_reconciliation": {
+          "note": "The plan's PR-07 *Files:* line names four items. Reconciled honestly rather than claimed.",
+          "1_all_39_fail_open_sites_to_ViewerExtractor": "PARTIAL + RESCOPED. Measured 38 at the merge base by the plan's verbatim idiom, not 39. PR-07 converted crud.rs::get_theme_embeddings (-1 => 37) and additionally gave ViewerExtractor to graph_query.rs::execute_graph_query and belief.rs::claims_by_belief (which had none at all). The remaining 37 are write paths and are rescoped per decision Q7.",
+          "2_the_32_check_content_access_sites_to_Viewer": "NOT DONE, DELIBERATELY. See decision Q6. The plan's own line enumerates only 21 line numbers against a stated 32 - an arithmetic gap in the plan that neither the implementer nor the verifier caught. Actual tree count is 30 (api 18, mcp 11 + redaction.rs 1).",
+          "3_crud.rs_ids_plus_2d_projection_at_claims_admin": "DONE. See acceptance #2.",
+          "4_challenge.rs_gains_the_predicate": "ALREADY TRUE at the merge base; delivered by PR-06. PR-07 added the missing test."
+        },
+        "scope_substitution": {
+          "note": "PR-07 also did work the *Files:* line does not name. Recorded so it is not read as unowned creep.",
+          "new_repos_graph_view.rs": "9 viewer-filtered read functions backing routes/graph.rs, graph_neighborhood.rs and graph_query_utils.rs. Justified by CLAUDE.md ('All SQL stays in crates/epigraph-db/src/repos/'): the {VISIBILITY:...} marker convention is a repo-layer convention and a handler cannot splice a predicate into SQL it does not own.",
+          "search.rs_semantic_search": "The DEFAULT path of POST /api/v1/search/semantic returned claims.content for the whole corpus ranked against a caller-supplied probe vector, unfiltered, with no check_content_access behind it. Same exfiltration primitive ClaimRepository::rag_hybrid_context documents as 'the single highest-value exfiltration primitive in the API'. Fixed in rag.rs in the first pass and missed here because the self-audit was scoped to touched files. Now ClaimRepository::semantic_search_flat + semantic_graph_neighbors.",
+          "graph_query_utils.rs_load_subgraph": "Shared helper reached from 3 handlers, took no Viewer, projected claims.content into every node label. Now takes &Viewer; claims/evidence/edges all filtered via GraphViewRepository::subgraph_*.",
+          "assess.rs_assess_claim": "Held a Viewer and loaded its subject claim with a bare keyed read - an existence-and-content oracle, and the reason an authenticated stranger could attach evidence to another tenant's claim. Now ClaimRepository::get_by_id.",
+          "membership_table_filters": "claim_cluster_membership and claim_neighborhood_membership ARE in migration 062's tier_a array. All 4 join sites in graph_view.rs now splice /* {VISIBILITY:m} */. The module doc previously discussed only the non-tenancy-bearing graph_* metadata tables and was silent on these two.",
+          "node_edge_consistency": "graph_neighborhood.rs's node projections became viewer-filtered while its 4 edge projections did not, so responses could name ids absent from `nodes` - an id-enumeration oracle. Edges and compound_groups.member_atom_ids are now constrained to the surviving node set.",
+          "version_history_correctness": "ORDER BY depth is not a total order and superseded_by was derived from row POSITION, which is wrong at a fork (mark_duplicate points every duplicate at the same canonical claim). Now ORDER BY depth, id with superseded_by read from claims.supersedes, plus a depth-100 cap on both recursive terms (a supersession cycle A->B->A is accepted by mark_duplicate's guard and previously spun a backend forever; the request pool sets no statement_timeout).",
+          "graph.rs_expand_truncated": "`truncated` was `total_size > nodes.len()` where total_size is unfiltered graph_clusters.size and nodes is now filtered - it reported true for a complete response and its difference was an exact count of hidden claims. Now derived from the budget."
+        },
+        "counts_reconciled": {
+          "104_non_allowlisted_registrations": "discharged by PR-03, not PR-07",
+          "39_fail_open_sites": "38 in tree at merge base by the plan's verbatim idiom; 37 after PR-07; 35 -> PR-16, 2 -> PR-10 (Q7)",
+          "32_check_content_access_sites": "30 in tree; plan's line enumerates only 21 line numbers; 0 converted by design (Q6)"
+        },
+        "locked_decisions": "crates/epigraph-db/tests/locked_decisions.rs is untouched and its rejection trigger is not met: PR-07 changes no RLS policy, no route split, and no tenancy column. Its status heading was bumped to PR-07 so the one-screen contract does not silently drift."
       }
     ],
-    "current": "PR-06 (running, resumed from cached analyze phase)",
+    "current": null,
     "failed": [],
-    "halted": "Loop halted after PR-04 by user request 2026-08-27. PR-05 not started. 18 PRs remain.",
-    "blocked_reason": {
-      "what": "TRANSIENT, CLEARED. A weekly usage limit killed 5 of PR-06's 7 agents on 2026-08-29.",
-      "resolution": "Quota refreshed; PR-06 relaunched via resumeFromRunId wf_433cf05a-9cc so the two completed analyze agents replay from cache.",
-      "lesson": "Do not infer a quota block's duration from the reset string plus a clock reading. If the session is executing, capacity exists - just retry.",
-      "partial_work": "stash@{0} PR-06 partial (228 files, UNVERIFIED, superseded by the relaunch). stash@{1} older PR-04 partial. Both droppable."
-    }
+    "halted": null,
+    "next": "PR-08 - security(api): authenticate, scope, and viewer-filter the structural-features endpoint"
   },
   "env": {
     "postgres": "16.2 @127.0.0.1:55432",
     "pg_trgm": "1.6 (real, built from upstream source)",
     "uuid-ossp": "1.1 SHIM (functions only)",
     "pgvector": "0.8.6 (upgraded from 0.6.2; matches prod 0.8 series; hnsw.iterative_scan verified)",
-    "migrations": "apply with `sqlx migrate run`, never psql"
+    "migrations": "apply with `sqlx migrate run`, never psql",
+    "pr07_throwaway_db": {
+      "name": "epigraph_tenancy_pr07",
+      "caveat": "This database's NAME does not satisfy the `db_is_disposable` guard in crates/epigraph-db/tests/claim_repo_helpers.rs and crates/epigraph-mcp/tests/common/mod.rs, which is purely name-based (starts_with '_sqlx_test' || ends_with '_test'). 33 tests across those two files therefore panic in assert_disposable_db BEFORE any test logic runs - verified empirically: the epigraph-db binary fails 7/8 in 0.32s with the guard's message, and both files are untouched by PR-07.",
+      "recommendation": "Give PR-08+ a database whose name ENDS IN `_test` (e.g. epigraph_tenancy_pr08_test) so the guard passes on its own. Do NOT reach for EPIGRAPH_TEST_DESTRUCTIVE_DB=1 as the default: those fixtures DROP uq_claims_content_hash_agent and run a table-wide DELETE on claims, and that mutation is inherited by every later PR that reuses the database.",
+      "mutation_status": "PR-07 did NOT set the destructive opt-in. epigraph_tenancy_pr07 has not been truncated and still carries uq_claims_content_hash_agent.",
+      "test_isolation": "PR-07's own tenancy tests use #[sqlx::test], which provisions a per-test scratch database, so their results are independent of the shared DB's state either way."
+    }
   },
   "deferred_obligations": [],
   "resolved_measurements": {
@@ -82,11 +151,48 @@
   },
   "open_findings": [
     {
+      "id": "F-access-control-none-full",
+      "where": "crates/epigraph-db/src/access_control.rs:100",
+      "what": "`None => return ContentAccess::Full, // No ownership -> public` is FAIL-OPEN",
+      "detail": "Any claim with no `ownership` row returns FULL content to any authenticated caller. Ownership rows are written only by explicit assignment, so for the majority of the corpus this backward-compat branch makes the whole check_content_access pass a no-op. This is why several PR-07 findings are 'live today for un-owned claims' rather than purely latent.",
+      "status": "open",
+      "assigned": "PR-12 (the backfill that gives every claim an ownership/tenancy row is what makes the branch unreachable), removal in PR-14"
+    },
+    {
+      "id": "F-edges-unfiltered",
+      "where": "crates/epigraph-db/src/repos/graph_view.rs (all traversals), crates/epigraph-db/src/repos/claim.rs::rag_hybrid_context (edge_count)",
+      "what": "`edges` carries tenancy columns but is not viewer-filtered inside the graph projections",
+      "detail": "Bounded: the returned rows are claims-filtered, so this discloses STRUCTURE (which ids relate to which) and a degree scalar, never content. rag_hybrid_context's edge_count IS returned to the caller - an earlier doc comment claimed it 'never reaches the response', which was false and has been corrected in place.",
+      "status": "open, documented in the graph_view module docs",
+      "assigned": "PR-13 (feat(db): edge co-ownership), which creates edges.co_owner_group_id and Viewer::edge_predicate_fragment"
+    },
+    {
+      "id": "F-inline-claim-content-reads",
+      "where": "crates/epigraph-api/src/routes/",
+      "what": "23 sqlx::query* calls in the route layer still select claim content and so cannot carry a {VISIBILITY:...} marker",
+      "detail": "claims.rs 2, conflicts.rs 1, conventions.rs 1, cross_source.rs 1, edges.rs 1, experiments.rs 1, gaps.rs 1, hypothesis.rs 3, policies.rs 1, reasoning.rs 2, versioning.rs 1, voids.rs 3, workflows.rs 5. Measured 2026-09-02 at the close of PR-07. Latent, not live, for the tenancy dimension (migration 062 defaults visibility to 'public'); live for un-owned claims via F-access-control-none-full where no check_content_access pass covers them.",
+      "status": "open, ratcheted",
+      "ratchet": "crates/epigraph-api/tests/viewer_route_table_lint.rs asserts these counts EXACTLY. Adding a site fails the build; removing one fails it until the list is lowered.",
+      "assigned": "PR-09 for the MCP mirror; the API remainder is unassigned and MUST be triaged before PR-14 deletes check_content_access",
+      "deadline": "PR-14"
+    },
+    {
+      "id": "F-not-db-build-unverified",
+      "where": "crates/epigraph-api/src/middleware/bearer.rs (the #[cfg(not(feature = \"db\"))] ViewerExtractor)",
+      "what": "The not(db) parity shim has been verified only by inspection",
+      "detail": "The prescribed gate never compiles this configuration - epigraph-api's default features include `db`. Both 401 branches match in order, condition and tracing target by reading, and the shim is fail-closed, but no executed exit code for `cargo check -p epigraph-api --no-default-features --locked` exists in the record. Per public_router_allowlist.rs's own doc comment, not(db) test modules are built in no current CI configuration either.",
+      "status": "open",
+      "assigned": "run before merge; consider a not(db) CI job"
+    }
+  ],
+  "closed_findings": [
+    {
       "id": "F-failopen-catchall",
-      "where": "crates/epigraph-db/src/access_control.rs:148",
-      "what": "`_ => ContentAccess::Full // Unknown partition -> safe default` is FAIL-OPEN and mislabeled",
-      "status": "unreachable today (CHECK restricts vocabulary) but contradicts D1 'no public by default-on-error'; untested",
-      "assigned": "PR-06 via operator note"
+      "where": "crates/epigraph-db/src/access_control.rs (was :148, now :168)",
+      "what": "`_ => ContentAccess::Full // Unknown partition -> safe default` was FAIL-OPEN and mislabeled",
+      "resolution": "FIXED by PR-06. The arm now reads `_ => ContentAccess::Redacted` with a comment explaining the inversion. Verified in the tree during PR-07 review; the finding had been left open long after it was resolved.",
+      "closed_by": "PR-06",
+      "closed_on": "2026-09-02 (ledger backfill)"
     }
   ]
 }

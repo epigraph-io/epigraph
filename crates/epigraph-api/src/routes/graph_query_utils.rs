@@ -1,32 +1,13 @@
 use crate::errors::ApiError;
 use crate::routes::edges::{FullGraphEdge, FullGraphNode, FullGraphResponse};
 use axum::Json;
-use serde_json::Value;
 use uuid::Uuid;
 
 // Row types for sqlx::query_as
 #[derive(sqlx::FromRow)]
-struct ClaimGraphRow {
-    id: Uuid,
-    content: String,
-    truth_value: f64,
-    confidence: Option<f64>,
-    methodology: Option<String>,
-    belief: Option<f64>,
-    plausibility: Option<f64>,
-    pignistic_prob: Option<f64>,
-    mass_on_missing: Option<f64>,
-}
-#[derive(sqlx::FromRow)]
 struct AgentGraphRow {
     id: Uuid,
     display_name: Option<String>,
-}
-#[derive(sqlx::FromRow)]
-struct EvidenceGraphRow {
-    id: Uuid,
-    source_url: Option<String>,
-    properties: Value,
 }
 #[derive(sqlx::FromRow)]
 struct TraceGraphRow {
@@ -34,50 +15,49 @@ struct TraceGraphRow {
     methodology: String,
     confidence: f64,
 }
-#[derive(sqlx::FromRow)]
-struct EdgeGraphRow {
-    id: Uuid,
-    source_id: Uuid,
-    target_id: Uuid,
-    source_type: String,
-    target_type: String,
-    relationship: String,
-    properties: Value,
-}
 
+/// Build a subgraph response for an arbitrary node id set.
+///
+/// # Viewer
+///
+/// PR-07 gave this helper a `&Viewer`. It previously took none and ran
+/// `SELECT id, content, ... FROM claims WHERE id = ANY($1)` unfiltered,
+/// building each node's `label` from `content` — so all three call sites
+/// (`graph_query.rs` twice, `edges.rs` once) looked filtered and none was.
+/// Because the signature carried no viewer, there was nothing at the call site
+/// for a reviewer to notice; that is why it is fixed in the signature rather
+/// than at the callers.
+///
+/// `claims`, `evidence` and `edges` are all `tier_a` roots in migration 062 and
+/// are filtered on their own predicates. `agents` and `reasoning_traces` are
+/// NOT in `tier_a` — they have no `owner_group_id` to filter on — so those two
+/// projections stay unfiltered, deliberately. They carry no claim content:
+/// `agents` contributes a display name and `reasoning_traces` a methodology
+/// label and a confidence number.
 #[cfg(feature = "db")]
 pub async fn load_subgraph(
     pool: &epigraph_db::PgPool,
+    viewer: &epigraph_db::Viewer,
     node_ids: Vec<Uuid>,
 ) -> Result<Json<FullGraphResponse>, ApiError> {
     // 1. Fetch all edges WHERE both source and target are in our node_ids set
-    let edge_rows: Vec<EdgeGraphRow> = sqlx::query_as(
-        r#"
-        SELECT id, source_id, target_id, source_type, target_type, relationship, properties
-        FROM edges 
-        WHERE source_id = ANY($1) AND target_id = ANY($1)
-        "#,
-    )
-    .bind(&node_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Fetch subgraph edges: {e}"),
-    })?;
+    let edge_rows = epigraph_db::GraphViewRepository::subgraph_edges(pool, viewer, &node_ids)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Fetch subgraph edges: {e}"),
+        })?;
 
     // 2. We need to figure out which nodes belong to which table to do efficient batch fetches
     // A small side effect is we don't strictly know the entity_type of every node_id passed in unless
     // we query each table, BUT realistically we just try to fetch the known set from each table
     let mut nodes: Vec<FullGraphNode> = Vec::new();
 
-    // 3. Fetch claims
-    let claim_rows: Vec<ClaimGraphRow> = sqlx::query_as(
-        "SELECT id, content, truth_value, (properties->>'confidence')::float8 as confidence, properties->>'methodology' as methodology, belief, plausibility, pignistic_prob, mass_on_missing FROM claims WHERE id = ANY($1)"
-    )
-    .bind(&node_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::InternalError { message: format!("Fetch claims: {e}") })?;
+    // 3. Fetch claims (viewer-filtered)
+    let claim_rows = epigraph_db::GraphViewRepository::subgraph_claims(pool, viewer, &node_ids)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Fetch claims: {e}"),
+        })?;
 
     for row in claim_rows {
         let label = if row.content.chars().count() > 60 {
@@ -133,11 +113,9 @@ pub async fn load_subgraph(
         });
     }
 
-    // 5. Fetch evidence
-    let evidence_rows: Vec<EvidenceGraphRow> =
-        sqlx::query_as("SELECT id, source_url, properties FROM evidence WHERE id = ANY($1)")
-            .bind(&node_ids)
-            .fetch_all(pool)
+    // 5. Fetch evidence (viewer-filtered)
+    let evidence_rows =
+        epigraph_db::GraphViewRepository::subgraph_evidence(pool, viewer, &node_ids)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Fetch evidence: {e}"),

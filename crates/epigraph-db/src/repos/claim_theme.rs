@@ -108,6 +108,54 @@ impl ClaimThemeRepository {
         Ok(())
     }
 
+    /// Set a theme's centroid to the mean of the given claims' 1536-d
+    /// embeddings, computed in the database.
+    ///
+    /// # Why this exists
+    ///
+    /// `scripts/maintain_themes.py` used to compute sub-theme centroids
+    /// client-side from the raw vectors `GET /themes/:id/embeddings` handed
+    /// back. PR-07 stops that endpoint disclosing raw vectors (plan §4.9 row
+    /// 4), so the averaging moves here — the server already holds the vectors,
+    /// and this is the only remaining reason a caller needed them.
+    ///
+    /// The read is viewer-filtered: a centroid is an aggregate *of claim
+    /// content*, so averaging rows the caller cannot see would leak their
+    /// position in embedding space. `Bypass` viewers average everything, which
+    /// is what a maintenance job wants.
+    ///
+    /// Returns the number of claims that contributed. Zero means no visible
+    /// claim in `claim_ids` had an embedding, and the centroid is left unset
+    /// rather than written as NULL.
+    pub async fn set_centroid_from_claims(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        theme_id: Uuid,
+        claim_ids: &[Uuid],
+    ) -> Result<i64, DbError> {
+        let sql = viewer.splice(
+            "UPDATE claim_themes t \
+             SET centroid = agg.centroid, updated_at = NOW() \
+             FROM ( \
+                 SELECT AVG(c.embedding)::vector AS centroid, COUNT(*) AS n \
+                 FROM claims c \
+                 WHERE c.id = ANY($2) AND c.embedding IS NOT NULL \
+                   /* {VISIBILITY:c} */ \
+             ) agg \
+             WHERE t.id = $1 AND agg.n > 0 \
+             RETURNING agg.n",
+            3,
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql)
+            .bind(theme_id)
+            .bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let n = q.fetch_optional(pool).await.map_err(DbError::from)?;
+        Ok(n.unwrap_or(0))
+    }
+
     /// Assign a single claim to a theme
     pub async fn assign_claim(
         pool: &PgPool,

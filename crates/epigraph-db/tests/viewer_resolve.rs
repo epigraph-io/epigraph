@@ -5,10 +5,10 @@
 //! `GroupMembershipRepository::list_live_for_agent` — the one query PR-03 adds
 //! — uses runtime `sqlx::query_as` rather than the `query_as!` macro (it
 //! returns an untyped tuple, matching every other query in that file), so
-//! **nothing checks it at compile time**. `ViewerExtractor` is attached to no
-//! handler until PR-07, and its two unit tests in
+//! **nothing checks it at compile time**. `ViewerExtractor` is now attached to
+//! the read handlers (PR-06/PR-07), but its two unit tests in
 //! `epigraph-api/src/middleware/bearer.rs` both return before `resolve` is
-//! reached. Without this file the query is executed by nothing, and a column
+//! reached. Without this file the query is executed by no *unit* test, and a column
 //! rename in PR-04/05 would land as a runtime 500 on every authenticated
 //! request with no test failing first.
 //!

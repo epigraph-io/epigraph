@@ -356,6 +356,7 @@ impl EvidenceRepository {
                 e.id,
                 e.claim_id,
                 e.raw_content,
+                e.evidence_type,
                 1 - (e.embedding <=> $1::vector) AS similarity
             FROM evidence e
             WHERE e.embedding IS NOT NULL
@@ -535,6 +536,10 @@ pub struct EvidenceSearchResult {
     pub id: Uuid,
     pub claim_id: Uuid,
     pub raw_content: Option<String>,
+    /// Carried so `GET /api/v1/search/evidence` can render its result rows from
+    /// this (viewer-filtered) repo read instead of the unfiltered inline query
+    /// it used before PR-07.
+    pub evidence_type: String,
     pub similarity: f64,
 }
 

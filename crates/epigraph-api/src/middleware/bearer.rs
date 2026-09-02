@@ -205,8 +205,8 @@ require_scope_extractor!(RequireScopeGroupsAdmin, "groups:admin");
 ///
 /// One indexed round trip per request (`Viewer::resolve` →
 /// `GroupMembershipRepository::list_live_for_agent`, served index-only by
-/// `idx_group_memberships_agent_live`). PR-03 defines the extractor but
-/// attaches it to no handler; PR-07 wires it to the read paths.
+/// `idx_group_memberships_agent_live`). PR-03 defined the extractor; PR-06 and
+/// PR-07 wired it to the read paths.
 #[cfg(feature = "db")]
 pub struct ViewerExtractor(pub epigraph_db::Viewer);
 
@@ -267,6 +267,82 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
             })?;
 
         Ok(Self(viewer))
+    }
+}
+
+/// The `not(feature = "db")` stand-in for [`Viewer`](epigraph_db::Viewer).
+///
+/// Without the `db` feature there is no `epigraph_db`, hence no `Viewer`, no
+/// pool to resolve group membership against, and no corpus to filter — the
+/// in-memory services that back the `not(db)` router hold no tenancy state at
+/// all. This type exists so that the *shape* of a read handler is identical in
+/// both configurations: one `ViewerExtractor` parameter, one authentication
+/// precondition, no `#[cfg]` fork in the signature.
+///
+/// It deliberately carries no authority and exposes no accessor. Anything that
+/// would consume a real `Viewer` is inside a `#[cfg(feature = "db")]` block by
+/// construction, because the repo layer it would call only exists there.
+#[cfg(not(feature = "db"))]
+#[derive(Debug, Clone, Copy)]
+pub struct NoDbViewer;
+
+/// The ONLY way an HTTP handler obtains a viewer under `not(feature = "db")`.
+///
+/// See the `db` variant above for the full contract. This one enforces the
+/// **same two 401 branches in the same order** — no `AuthContext`, then
+/// `agent_id == None` — and emits the same `visibility.viewer.rejected`
+/// tracing events, so a handler fails closed identically in both builds. The
+/// only step it omits is `Viewer::resolve`, which has no meaning without a
+/// pool.
+///
+/// Keeping the authentication precondition here rather than degrading to an
+/// infallible extractor is the point: if the two builds disagreed about when a
+/// read is refused, the `not(db)` configuration would be a strictly weaker
+/// second implementation of the same route table, and CI checks it
+/// (`.github/workflows/ci.yml`, `cargo check -p epigraph-api
+/// --no-default-features --locked`).
+#[cfg(not(feature = "db"))]
+pub struct ViewerExtractor(pub NoDbViewer);
+
+#[cfg(not(feature = "db"))]
+#[axum::async_trait]
+impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let route = parts.uri.path().to_string();
+
+        let Some(auth) = parts.extensions.get::<AuthContext>().cloned() else {
+            tracing::warn!(
+                target: "visibility.viewer.rejected",
+                reason = "no_auth_context",
+                route = %route,
+                "viewer rejected: request carried no AuthContext"
+            );
+            return Err(ApiError::Unauthorized {
+                reason: "authentication required".into(),
+            });
+        };
+
+        if auth.agent_id.is_none() {
+            tracing::warn!(
+                target: "visibility.viewer.rejected",
+                reason = "no_agent_id",
+                route = %route,
+                client_id = %auth.client_id,
+                "viewer rejected: token carries no agent_id; re-mint the token"
+            );
+            return Err(ApiError::Unauthorized {
+                reason: "token carries no agent_id; re-authenticate to obtain \
+                         a token bound to a principal"
+                    .into(),
+            });
+        }
+
+        Ok(Self(NoDbViewer))
     }
 }
 

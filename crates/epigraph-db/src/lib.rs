@@ -68,17 +68,18 @@ pub use pool::{
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentPublicProfile, AgentRepository,
     AnalysisRecord, AnalysisRepository, BehavioralExecutionRepository, BehavioralExecutionRow,
-    ChallengeRepository, ChallengeRow, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
-    ClaimEncryptionRepository, ClaimEncryptionRow, ClaimNeighbor, ClaimNeighborBetpRow,
-    ClaimRepository, ClaimSummary, ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository,
-    ClaimVersionRow, CommunityRepository, ConsolidateMode, ConsolidateResult, ContextRepository,
-    CounterfactualRepository, CounterfactualRow, DedupRepair, DivergenceRepository,
-    EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository, EntityRepository, EntityRow,
-    EntityTypeEntry, EntityTypeRepository, EpistemicEdgePairRow, EventRepository, EventRow,
-    EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceRepository, EvidenceSearchResult,
-    EvolveStepResult, ExperimentRepository, ExperimentResultRepository, ExperimentResultRow,
-    ExperimentRow, FactorRepository, FrameRepository, GapAnalysisResult, GapChallengeRow,
-    GapRecord, GapRepository, GraphExpansionHit, GroupKeyEpochRepository,
+    BeliefBoundedClaimHit, BeliefSort, ChallengeRepository, ChallengeRow, ClaimBeliefColumns,
+    ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow, ClaimNeighbor,
+    ClaimNeighborBetpRow, ClaimRepository, ClaimSummary, ClaimThemeRepository, ClaimThemeRow,
+    ClaimVersionRepository, ClaimVersionRow, CommunityRepository, ConsolidateMode,
+    ConsolidateResult, ContextRepository, CounterfactualRepository, CounterfactualRow, DedupRepair,
+    DivergenceRepository, EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository,
+    EntityRepository, EntityRow, EntityTypeEntry, EntityTypeRepository, EpistemicEdgePairRow,
+    EventRepository, EventRow, EvidenceEncryptionRepository, EvidenceEncryptionRow,
+    EvidenceRepository, EvidenceSearchResult, EvolveStepResult, ExperimentRepository,
+    ExperimentResultRepository, ExperimentResultRow, ExperimentRow, FactorRepository,
+    FrameClaimBeliefHit, FrameRepository, GapAnalysisResult, GapChallengeRow, GapRecord,
+    GapRepository, GraphExpansionHit, GraphViewRepository, GroupKeyEpochRepository,
     GroupMembershipRepository, GroupRepository, GroupRow, HierarchicalWorkflowRow, HybridHit,
     IndexCounts, KeyEpochRow, LabelQuery, LearningEventRepository, LearningEventRow, LineageHead,
     LineageRepository, MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow,
@@ -90,10 +91,10 @@ pub use repos::{
     ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
     ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
     RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RevokeOutcome, ScopedBeliefRepository,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, SweepCandidate, TaskRepository,
-    TaskRow, TenancyPrecondition, TripleRepository, TripleRow, WorkflowExecutionRepository,
-    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
-    WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    SecurityEventRepository, SecurityEventRow, SheafRepository, SortDirection, SweepCandidate,
+    TaskRepository, TaskRow, TenancyPrecondition, TripleRepository, TripleRow,
+    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
+    WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 pub use visibility::{MaintenanceLease, SystemReason, Viewer};
 
@@ -108,6 +109,10 @@ pub use repos::divergence::DivergenceRow;
 pub use repos::edge::{AttributedClaimRow, EdgeRow, EPISTEMIC_RELATIONSHIPS};
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
+pub use repos::graph_view::{
+    AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GraphNodeRow,
+    SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow,
+};
 pub use repos::mass_function::MassFunctionRow;
 pub use repos::ownership::OwnershipRow;
 pub use repos::perspective::PerspectiveRow;
