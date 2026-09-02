@@ -1,5 +1,5 @@
 //! Schema contract for the group-tenancy tables created by
-//! `migrations/060_group_tenancy_tables.sql`.
+//! `migrations/061_group_tenancy_tables.sql`.
 //!
 //! **Why this file exists.** Every repository that reads these eight tables —
 //! `claim_encryption`, `claim_version_encryption`, `edge_encryption`,
@@ -35,14 +35,14 @@
 use sqlx::{PgPool, Row};
 
 /// The migration file itself, embedded so replay tests cannot drift from it.
-const MIGRATION_060: &str = include_str!("../../../migrations/060_group_tenancy_tables.sql");
-const MIGRATION_061: &str = include_str!("../../../migrations/061_agents_key_kind.sql");
+const MIGRATION_061: &str = include_str!("../../../migrations/061_group_tenancy_tables.sql");
+const MIGRATION_062: &str = include_str!("../../../migrations/062_agents_key_kind.sql");
 /// PR-04. The four `-- no-transaction` index migrations (063-066) are
 /// deliberately NOT embedded for replay: `CREATE INDEX CONCURRENTLY` raises
 /// 25001 inside the transaction these replay tests use. Their idempotence is
 /// asserted as `pg_index.indisvalid` in `tenancy_migration_shape.rs` instead.
-const MIGRATION_062: &str = include_str!("../../../migrations/062_tenancy_columns.sql");
-const MIGRATION_067: &str = include_str!("../../../migrations/067_session_functions.sql");
+const MIGRATION_063: &str = include_str!("../../../migrations/063_tenancy_columns.sql");
+const MIGRATION_068: &str = include_str!("../../../migrations/068_session_functions.sql");
 
 /// `(column_name, data_type, is_nullable)` triples for one table, sorted by
 /// column name — the exact shape `information_schema.columns` reports.
@@ -182,7 +182,7 @@ async fn schema_contract_group_tenancy_tables(pool: PgPool) {
         let observed = observed_columns(&pool, table).await;
         assert!(
             !observed.is_empty(),
-            "table `{table}` does not exist — migration 060 did not apply"
+            "table `{table}` does not exist — migration 061 did not apply"
         );
 
         let expected_owned: Vec<(String, String, String)> = expected
@@ -262,10 +262,10 @@ async fn delete_from_groups_raises(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_060_is_idempotent(pool: PgPool) {
     let mut tx = pool.begin().await.expect("begin");
-    sqlx::raw_sql(MIGRATION_060)
+    sqlx::raw_sql(MIGRATION_061)
         .execute(&mut *tx)
         .await
-        .expect("re-applying migration 060 must succeed");
+        .expect("re-applying migration 061 must succeed");
     tx.commit().await.expect("commit");
 }
 
@@ -287,7 +287,7 @@ async fn drift_guard_rejects_a_pre_060_table_shape(pool: PgPool) {
         .await
         .expect("drop sentinel constraint");
 
-    let err = sqlx::raw_sql(MIGRATION_060)
+    let err = sqlx::raw_sql(MIGRATION_061)
         .execute(&mut *tx)
         .await
         .expect_err("060 must refuse to run against a pre-060 `groups`");
@@ -332,13 +332,13 @@ async fn tenancy_roles_are_nologin(pool: PgPool) {
         let can_login: bool = row.get("rolcanlogin");
         assert!(
             !can_login,
-            "role `{name}` must be NOLOGIN — migration 060 creates it that way"
+            "role `{name}` must be NOLOGIN — migration 061 creates it that way"
         );
     }
 }
 
 // =============================================================================
-// PR-02 — agents.key_kind (migration 061)
+// PR-02 — agents.key_kind (migration 062)
 // =============================================================================
 
 /// `agents` is deliberately NOT covered by a full `ColumnContract` above: it is
@@ -363,7 +363,7 @@ async fn agents_key_kind_discriminator_is_intact(pool: PgPool) {
     .fetch_optional(&pool)
     .await
     .expect("information_schema lookup")
-    .expect("agents.key_kind must exist (migration 061)");
+    .expect("agents.key_kind must exist (migration 062)");
 
     let data_type: String = row.get("data_type");
     let is_nullable: String = row.get("is_nullable");
@@ -447,10 +447,10 @@ async fn agents_key_kind_discriminator_is_intact(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_061_is_idempotent(pool: PgPool) {
     let mut tx = pool.begin().await.expect("begin");
-    sqlx::raw_sql(MIGRATION_061)
+    sqlx::raw_sql(MIGRATION_062)
         .execute(&mut *tx)
         .await
-        .expect("re-applying migration 061 must succeed");
+        .expect("re-applying migration 062 must succeed");
 
     // Exactly one constraint, still valid — a second ADD CONSTRAINT would have
     // been rejected outright, but a guard that silently created a differently
@@ -488,7 +488,7 @@ async fn migration_061_refuses_a_nullable_key_kind(pool: PgPool) {
         .await
         .expect("make key_kind nullable");
 
-    let err = sqlx::raw_sql(MIGRATION_061)
+    let err = sqlx::raw_sql(MIGRATION_062)
         .execute(&mut *tx)
         .await
         .expect_err("061 must refuse a nullable agents.key_kind");
@@ -545,7 +545,7 @@ async fn schema_contract_tenancy_bookkeeping_tables(pool: PgPool) {
         let observed = observed_columns(&pool, table).await;
         assert!(
             !observed.is_empty(),
-            "table `{table}` does not exist — migration 062 did not apply"
+            "table `{table}` does not exist — migration 063 did not apply"
         );
         let observed_refs: Vec<(&str, &str, &str)> = observed
             .iter()
@@ -553,7 +553,7 @@ async fn schema_contract_tenancy_bookkeeping_tables(pool: PgPool) {
             .collect();
         assert_eq!(
             observed_refs, *expected,
-            "column contract drift on `{table}` (migration 062)"
+            "column contract drift on `{table}` (migration 063)"
         );
     }
 }
@@ -670,9 +670,9 @@ async fn agents_tenancy_columns_are_intact(pool: PgPool) {
     );
 }
 
-/// The five functions migration 067 creates.
+/// The five functions migration 068 creates.
 ///
-/// `ScopedPool` writes the GUCs these read, and migration 077's policies call
+/// `ScopedPool` writes the GUCs these read, and migration 078's policies call
 /// them. Nothing in Rust references them by name at compile time, so a rename in
 /// a later migration would be invisible until RLS silently stopped filtering.
 ///
@@ -704,7 +704,7 @@ async fn the_five_session_functions_exist(pool: PgPool) {
         .fetch_optional(&pool)
         .await
         .expect("pg_proc lookup")
-        .unwrap_or_else(|| panic!("public.{name}() must exist (migration 067)"));
+        .unwrap_or_else(|| panic!("public.{name}() must exist (migration 068)"));
 
         assert_eq!(
             row.get::<String, _>("rettype"),
@@ -763,7 +763,7 @@ async fn the_five_session_functions_exist(pool: PgPool) {
     );
 
     // And the counterpart: `epigraph_bypass` IS callable by PUBLIC, since every
-    // RLS policy in migration 077 calls it on the app role's behalf. Revoking
+    // RLS policy in migration 078 calls it on the app role's behalf. Revoking
     // this one would make every policy-bearing query fail with 42501.
     let (public_can_bypass,): (bool,) = sqlx::query_as(
         "SELECT has_function_privilege('public', 'public.epigraph_bypass()', 'EXECUTE')",
@@ -787,10 +787,10 @@ async fn the_five_session_functions_exist(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_067_is_idempotent(pool: PgPool) {
     let mut tx = pool.begin().await.expect("begin");
-    sqlx::raw_sql(MIGRATION_067)
+    sqlx::raw_sql(MIGRATION_068)
         .execute(&mut *tx)
         .await
-        .expect("re-applying migration 067 must succeed");
+        .expect("re-applying migration 068 must succeed");
     tx.commit().await.expect("commit");
 }
 
@@ -811,7 +811,7 @@ async fn migration_062_refuses_a_nullable_visibility(pool: PgPool) {
         .await
         .expect("make claims.visibility nullable");
 
-    let err = sqlx::raw_sql(MIGRATION_062)
+    let err = sqlx::raw_sql(MIGRATION_063)
         .execute(&mut *tx)
         .await
         .expect_err("062 must refuse a nullable claims.visibility");

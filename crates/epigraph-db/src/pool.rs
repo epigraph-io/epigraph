@@ -118,7 +118,7 @@ pub async fn create_pool_from_options(
 // ScopedPool — plan §0.5
 // =============================================================================
 
-/// The three session GUCs the RLS policies (migration 077) read, and the one
+/// The three session GUCs the RLS policies (migration 078) read, and the one
 /// statement that stamps them. Kept as a `const` so the scrub and both stamping
 /// paths are provably the *same* statement.
 const SET_SESSION_GUCS: &str = "SELECT set_config('epigraph.group_ids',          $1, $4), \

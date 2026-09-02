@@ -1,4 +1,4 @@
--- 068_communities_to_groups.sql
+-- 069_communities_to_groups.sql
 -- PR-05 of the multi-user tenancy series. Plan §3/064, shipped as 068 (see
 -- migrations/README.md — THAT table is authoritative, not the plan's §3.1).
 --
@@ -203,7 +203,7 @@ SELECT DISTINCT ON (cm.community_id, p.owner_agent_id)
 ON CONFLICT DO NOTHING;
 
 COMMENT ON COLUMN public.ownership.encryption_key_id IS
-  'DEPRECATED. Held stringified community UUIDs until migration 068, which '
+  'DEPRECATED. Held stringified community UUIDs until migration 069, which '
   'drained them into ownership.community_id AND CLEARED THE SOURCE. Written by '
   'nothing after PR-05, read by nothing after PR-05. A NON-NULL value here is '
   'therefore a value that did not resolve to a live communities.id: see '

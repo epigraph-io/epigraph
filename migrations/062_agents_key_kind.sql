@@ -1,4 +1,4 @@
--- 061_agents_key_kind.sql
+-- 062_agents_key_kind.sql
 --
 -- PR-02 of the multi-user tenancy series.
 --

@@ -131,7 +131,7 @@ impl EvidenceRepository {
         let uuid: Uuid = id.into();
 
         // MACRO SITE — static three-bind spelling. `evidence` carries its own
-        // tenancy columns (migration 062), so the predicate is on the row.
+        // tenancy columns (migration 063), so the predicate is on the row.
         let row = sqlx::query!(
             r#"
             SELECT id, content_hash, evidence_type, raw_content, claim_id,

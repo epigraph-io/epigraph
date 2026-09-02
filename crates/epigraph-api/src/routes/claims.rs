@@ -225,7 +225,7 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
     let tier = req.privacy_tier.as_deref().unwrap_or("public");
 
     match tier {
-        // Narrowed to match migration 060's
+        // Narrowed to match migration 061's
         // `claim_encryption_privacy_tier_check CHECK (privacy_tier = 'fully_private')`.
         // Accepting `encrypted_content` here would bind straight through to
         // `ClaimEncryptionRepository::insert_conn` and surface as a 23514 → 500.

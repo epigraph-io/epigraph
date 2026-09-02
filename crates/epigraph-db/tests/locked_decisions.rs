@@ -17,7 +17,7 @@
 //!
 //! * **D3 — no anonymous read authority.** Asserted below, in full.
 //! * **D1 — tenancy is declared, never defaulted.** *Half asserted.* PR-05's
-//!   migration 069 adds `entity_types.tenancy_tier`, and — unusually for this
+//!   migration 070 adds `entity_types.tenancy_tier`, and — unusually for this
 //!   series — drops its DEFAULT **in the same migration**, because a type that
 //!   does not exist yet has no live table to widen metadata-only and therefore
 //!   needs no transition DEFAULT at all. That makes one column, today, the first
@@ -25,8 +25,8 @@
 //!   `d1_tenancy_tier_is_declared_never_defaulted` below.
 //!
 //!   The OTHER half — the tier-A `visibility` / `owner_group_id` DEFAULTs
-//!   migration 062 ships on purpose — is still not assertable, and stays a
-//!   comment in the D1 section until migration 074 drops them in PR-16.
+//!   migration 063 ships on purpose — is still not assertable, and stays a
+//!   comment in the D1 section until migration 075 drops them in PR-16.
 //! * **D4 — privatization is an explicit, audited administrative act.** Nothing
 //!   to assert until the D4 surface exists. See the placeholder in the D4
 //!   section.
@@ -285,7 +285,7 @@ fn route_literals(chain: &str) -> Vec<&str> {
 //
 // STILL A PLACEHOLDER, for the tier-A columns only:
 //
-// PR-16: after migration 074 drops the DEFAULTs, assert here that no tier-A
+// PR-16: after migration 075 drops the DEFAULTs, assert here that no tier-A
 // table has a `column_default` on `visibility` or `owner_group_id`, and that
 // `count(*) FROM claims WHERE owner_group_id = <world>` is 0.
 //
@@ -299,7 +299,7 @@ fn route_literals(chain: &str) -> Vec<&str> {
 
 /// D1, the half that is live: **a tenancy column with no absence value.**
 ///
-/// PR-05's migration 069 adds `entity_types.tenancy_tier` and drops its DEFAULT
+/// PR-05's migration 070 adds `entity_types.tenancy_tier` and drops its DEFAULT
 /// in the same file. It can, where 062 could not: `entity_types` holds 23 rows,
 /// not a live `claims` table, so there is no metadata-only widening to protect
 /// and no two-stage rollout to sequence. The 23 existing rows are classified by

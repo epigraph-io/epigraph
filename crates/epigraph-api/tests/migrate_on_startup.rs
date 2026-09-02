@@ -60,7 +60,7 @@ async fn run_migrations_applies_all_from_empty(pool: PgPool) {
     // CONCURRENTLY), which is what keeps
     // `tenancy_migration_shape.rs::no_transaction_files_contain_exactly_one_statement`
     // passing without extending its INDEX_MIGRATIONS list.
-    const MIGRATION_HEAD: i64 = 69;
+    const MIGRATION_HEAD: i64 = 70;
     let head_ok: Option<bool> =
         sqlx::query_scalar("SELECT success FROM _sqlx_migrations WHERE version = $1")
             .bind(MIGRATION_HEAD)
@@ -76,7 +76,7 @@ async fn run_migrations_applies_all_from_empty(pool: PgPool) {
     // And every migration between 060 and the head, so a gap cannot hide behind
     // the head being present.
     let tenancy_applied: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM _sqlx_migrations WHERE success AND version BETWEEN 60 AND $1",
+        "SELECT COUNT(*)::bigint FROM _sqlx_migrations WHERE success AND version BETWEEN 61 AND $1",
     )
     .bind(MIGRATION_HEAD)
     .fetch_one(&pool)
@@ -84,8 +84,8 @@ async fn run_migrations_applies_all_from_empty(pool: PgPool) {
     .expect("tenancy-range count should succeed");
     assert_eq!(
         tenancy_applied,
-        MIGRATION_HEAD - 60 + 1,
-        "every tenancy migration 060..={MIGRATION_HEAD} must have applied"
+        MIGRATION_HEAD - 61 + 1,
+        "every tenancy migration 061..={MIGRATION_HEAD} must have applied"
     );
 
     // Spot-check a known table from a recent migration.

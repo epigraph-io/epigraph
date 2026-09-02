@@ -576,7 +576,7 @@ pub async fn seed_private_ownership(pool: &PgPool, node_id: Uuid, owner_id: Uuid
 /// `community_members`), and Redacted to everyone else including an anonymous
 /// requester. Pass `None` for `community_id` to reach the owner-only fallback.
 ///
-/// Writes `community_id`, NEVER `encryption_key_id`. Before migration 068 the
+/// Writes `community_id`, NEVER `encryption_key_id`. Before migration 069 the
 /// gating community lived stringified in `encryption_key_id`, a `text` column
 /// whose name meant something else entirely; a fixture that still wrote it
 /// would keep passing while the production writer had moved on. Migration 068's

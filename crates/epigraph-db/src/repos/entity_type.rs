@@ -36,7 +36,7 @@ pub struct EntityTypeEntry {
     /// Whether the backing table currently resolves via `to_regclass` at load
     /// time. Always `false` when `table` is `None`.
     pub table_present: bool,
-    /// How this type carries tenancy (migration 069). One of `columns`,
+    /// How this type carries tenancy (migration 070). One of `columns`,
     /// `derived`, `identity`. `unclassified` is forbidden by the
     /// `entity_types_no_unclassified` CHECK, and the column has no DEFAULT —
     /// a registration that omits it is a 23502, not a silent `public`.
@@ -55,7 +55,7 @@ struct EntityTypeRow {
     tenancy_tier: String,
 }
 
-/// What migration 077/079 will need to be true of a table before an entity type
+/// What migration 078/079 will need to be true of a table before an entity type
 /// may claim the `columns` tenancy tier (plan §2.5).
 ///
 /// Reported as data, not as a boolean: the handler turns each individual
@@ -196,7 +196,7 @@ impl EntityTypeRepository {
     /// guard). `is_core` is forced `false` and `registered_by` records the
     /// caller's oauth client_id.
     ///
-    /// `tenancy_tier` is REQUIRED, not defaulted: migration 069 drops the
+    /// `tenancy_tier` is REQUIRED, not defaulted: migration 070 drops the
     /// column's DEFAULT, so an INSERT that omits it raises 23502. The handler
     /// validates the vocabulary and (for the `columns` tier) the §2.5
     /// precondition via [`EntityTypeRepository::tenancy_precondition`] before

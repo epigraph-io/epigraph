@@ -30,7 +30,7 @@
         "sha": "6429097",
         "verified_by": "main-agent",
         "tests": "3634 passed / 0 failed / 69 ignored (baseline ignores unchanged)",
-        "notes": "migration 061; DCR agent path -> pending+zero scopes; IdP allowlist fail-closed; group_authz admin-only"
+        "notes": "migration 062; DCR agent path -> pending+zero scopes; IdP allowlist fail-closed; group_authz admin-only"
       },
       {
         "pr": "PR-03",

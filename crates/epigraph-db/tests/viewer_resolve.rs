@@ -17,7 +17,7 @@
 //! * the query runs at all against the migrated schema (column names, types);
 //! * `revoked_at IS NOT NULL` rows are excluded — the whole point of "live";
 //! * the `writable` split is `admin`/`writer` and excludes `reader`, matching
-//!   `group_memberships_role_check` (migration 060:245);
+//!   `group_memberships_role_check` (migration 061:245);
 //! * an agent with no memberships resolves to a `Scoped` viewer over zero
 //!   groups rather than an error — an empty group set is a correct answer.
 

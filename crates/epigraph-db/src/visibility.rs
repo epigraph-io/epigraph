@@ -30,7 +30,7 @@
 //! # The splice mechanism (PR-06)
 //!
 //! [`Viewer::predicate_fragment`] landed in PR-04, alongside the tenancy columns
-//! it references (`claims.visibility`, `claims.owner_group_id`, migration 062).
+//! it references (`claims.visibility`, `claims.owner_group_id`, migration 063).
 //! It is a *template*: `{alias}` and `$V` are placeholders, and PR-04 shipped no
 //! way to fill them in. PR-06 adds that way, and makes it the only one.
 //!
@@ -252,7 +252,7 @@ impl Viewer {
     /// ```
     ///
     /// served index-only by `idx_group_memberships_agent_live`
-    /// (`migrations/060_group_tenancy_tables.sql:268`), whose in-file comment
+    /// (`migrations/061_group_tenancy_tables.sql:268`), whose in-file comment
     /// already names this as the hot path.
     ///
     /// The SQL itself lives in
@@ -273,7 +273,7 @@ impl Viewer {
         let mut writable: Vec<Uuid> = Vec::new();
         for (group_id, role) in memberships {
             // `admin` and `writer` are the two write-capable roles in
-            // `group_memberships_role_check` (migration 060:245). `reader` is
+            // `group_memberships_role_check` (migration 061:245). `reader` is
             // the third and only other legal value; anything else is a row that
             // should not exist, and we treat it as read-only.
             if matches!(role.as_str(), "admin" | "writer") {
@@ -369,7 +369,7 @@ impl Viewer {
     ///   and would add one more `SECURITY DEFINER`-adjacent surface to `REVOKE`.
     /// * **`visibility = 'public'` comes FIRST.** Cheap-first for the executor,
     ///   and it syntactically matches the leading disjunct of the RLS `USING`
-    ///   clause in migration 077 — the property that lets RLS never reject a row
+    ///   clause in migration 078 — the property that lets RLS never reject a row
     ///   the app-emitted qual already returned.
     /// * **`Bypass` emits a single space, not an empty string.** The fragment is
     ///   spliced between other SQL tokens; an empty string would join them.
@@ -602,7 +602,7 @@ mod tests {
     /// Every shape, and every bypass reason, must map onto EXACTLY TWO distinct
     /// fragments. A third string would mean the predicate had grown a case, and
     /// a case is where a leak lives: the qual would no longer be a syntactic
-    /// match for migration 077's `USING` clause on every path.
+    /// match for migration 078's `USING` clause on every path.
     #[test]
     fn predicate_fragment_has_exactly_two_distinct_values() {
         let lease = MaintenanceLease::new();
@@ -663,7 +663,7 @@ mod tests {
         );
 
         // ORDERING. `visibility = 'public'` must lead — cheap-first for the
-        // executor, and it is the leading disjunct of migration 077's USING.
+        // executor, and it is the leading disjunct of migration 078's USING.
         let public_at = frag
             .find("visibility = 'public'")
             .expect("the public disjunct must be present verbatim");

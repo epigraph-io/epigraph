@@ -139,7 +139,7 @@ type ClaimSignatureRow = (Option<Vec<u8>>, Option<Uuid>, Option<Vec<u8>>);
 ///    guard (409 on mismatch), verifies the optional superseded_by target
 ///    (400 if missing), INSERTs an audit row into claim_signature_revocations,
 ///    then UPDATEs the claim to NULL both signature and signer_id (satisfies
-///    the migration 073 CHECK constraint).
+///    the migration 074 CHECK constraint).
 ///
 /// # Errors
 ///
@@ -250,12 +250,12 @@ pub async fn revoke_claim_signature(
         });
     };
 
-    // Signature is NOT NULL, so migration 073's CHECK guarantees signer_id is
+    // Signature is NOT NULL, so migration 074's CHECK guarantees signer_id is
     // NOT NULL and the byte length is 64. Content_hash is also stored. Assert
     // defensively to surface any future schema drift loudly.
     let current_signer_id = current_signer_id.ok_or_else(|| ApiError::IntegrityError {
         field: "signer_id".to_string(),
-        expected: "NOT NULL when signature is NOT NULL (migration 073 CHECK)".to_string(),
+        expected: "NOT NULL when signature is NOT NULL (migration 074 CHECK)".to_string(),
         actual: "NULL".to_string(),
     })?;
     let current_content_hash = current_content_hash.ok_or_else(|| ApiError::IntegrityError {
@@ -313,7 +313,7 @@ pub async fn revoke_claim_signature(
         message: format!("revocation audit insert failed: {e}"),
     })?;
 
-    // Null the signature + signer_id. The migration 073 CHECK requires both
+    // Null the signature + signer_id. The migration 074 CHECK requires both
     // change together; doing both in one UPDATE keeps the constraint satisfied.
     let affected = sqlx::query(
         "UPDATE claims SET signature = NULL, signer_id = NULL, updated_at = NOW() \

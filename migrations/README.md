@@ -108,7 +108,7 @@ Current reservation:
   afterwards, so 084's pre-flight would pass over exactly the value it exists to
   catch. It is created `WITH (security_invoker = true)` — a view without that
   option executes as its OWNER and bypasses the invoker's policies once
-  migration 079 FORCEs RLS, which is the open finding migration 069 files
+  migration 080 FORCEs RLS, which is the open finding migration 070 files
   against `alternative_set` and `alt_set_decisions`. **Any VIEW added in this
   range must set it.** Both properties are pinned by
   `crates/epigraph-db/tests/tenancy_coverage.rs::ownership_key_id_quarantine_is_a_view`.
@@ -116,7 +116,7 @@ Current reservation:
   Two comments in migrations already applied to a database still carry
   pre-shift numbers and **cannot be corrected**: editing an applied file changes
   its checksum and `sqlx migrate run` then refuses to start. They are
-  `060_group_tenancy_tables.sql:110` ("070's seed arm" — now **074**) and
+  `061_group_tenancy_tables.sql:110` ("070's seed arm" — now **074**) and
   nothing else. Read them against this table.
 
   **Why 060–085 became 060–090.** PR-04's index migration could not be one file
@@ -148,7 +148,7 @@ will panic the api binary on restart.
 
 ## `-- no-transaction` migrations
 
-Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`
+Migration `064_idx_claims_group_current.sql` is the **first `-- no-transaction`
 migration in this repo's history**. Before it, `013_code_review_hardening.sql:8-10`
 and `030_atom_embedding_partial_index.sql:11` documented a manual DBA pre-step
 for `CREATE INDEX CONCURRENTLY` because the team believed it impossible inside a
@@ -235,7 +235,7 @@ material.
 
 ## Provisioning lineage
 
-Migration `060_group_tenancy_tables.sql` opens with a **drift guard**: it
+Migration `061_group_tenancy_tables.sql` opens with a **drift guard**: it
 `RAISE`s if any of seven group-tenancy tables already exists in a shape it did
 not create (`pattern_templates`, the eighth, is identical in both lineages and
 carries no sentinel). This is deliberate. Seven of its eight tables also exist in the

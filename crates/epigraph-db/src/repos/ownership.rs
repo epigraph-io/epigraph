@@ -16,12 +16,12 @@ pub struct OwnershipRow {
     pub node_type: String,
     pub partition_type: String,
     pub owner_id: Uuid,
-    /// DEPRECATED. Held a stringified community UUID until migration 068
+    /// DEPRECATED. Held a stringified community UUID until migration 069
     /// drained it into `community_id`. Nothing writes it any more; it is still
     /// SELECTed so the quarantine/report path can see a legacy value, and is
     /// dropped with the table in migration 084.
     pub encryption_key_id: Option<String>,
-    /// The gating community for `partition_type = 'community'` (migration 068).
+    /// The gating community for `partition_type = 'community'` (migration 069).
     /// `NULL` for every other partition, and for a community row whose legacy
     /// `encryption_key_id` did not resolve to a live `communities.id`.
     pub community_id: Option<Uuid>,
@@ -77,7 +77,7 @@ impl OwnershipRepository {
     /// Assign ownership with an optional community_id for community-partitioned nodes.
     ///
     /// `community_id` is written to the typed `ownership.community_id` column
-    /// (migration 068). `encryption_key_id` — which held a stringified copy of
+    /// (migration 069). `encryption_key_id` — which held a stringified copy of
     /// this UUID before 068 — is bound explicitly to `NULL` on BOTH the insert
     /// and the conflict arm. Omitting it on the conflict arm would strand a
     /// stale string while `community_id` went `NULL`, which would populate
@@ -86,7 +86,7 @@ impl OwnershipRepository {
     /// A `community_id` on a NON-community partition is refused here with
     /// [`DbError::InvalidData`] (a 400, not the database's 23514 as a 500). The
     /// database enforces the same rule structurally via
-    /// `ownership_community_needs_community_partition` (migration 068); this
+    /// `ownership_community_needs_community_partition` (migration 069); this
     /// arm exists so the caller gets a reason instead of a constraint name.
     #[instrument(skip(pool))]
     pub async fn assign_with_community(

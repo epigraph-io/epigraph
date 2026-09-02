@@ -3,7 +3,7 @@
 -- Evidence: There is no way to express "this claim's signature is no longer
 --   trustworthy" without re-signing. Re-signing drifted content would forge
 --   the original author's consent; deleting the row loses provenance. The
---   claims_signature_requires_signer CHECK (migration 073) forces either
+--   claims_signature_requires_signer CHECK (migration 074) forces either
 --   (signature NULL AND signer_id NULL) or both NOT NULL, so "zero the bytes
 --   but keep signer_id" is not a legal state.
 --

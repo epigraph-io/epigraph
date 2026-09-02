@@ -298,7 +298,7 @@ async fn create_group_accepts_the_legacy_creator_public_key_field_name(pool: PgP
 #[sqlx::test(migrations = "../../migrations")]
 async fn role_omitted_defaults_to_reader_and_does_not_500(pool: PgPool) {
     // NOTE: `reader`, not `writer`. PR-01 shipped `default_role() -> "reader"`
-    // and migration 060 sets the column DEFAULT to 'reader', both with an
+    // and migration 061 sets the column DEFAULT to 'reader', both with an
     // explicit least-privilege rationale. The plan text says `writer`; the code
     // is the authority.
     let creator = seed_agent(&pool, "role-creator").await;

@@ -3,7 +3,7 @@
 //! # Why this file exists
 //!
 //! `tenancy_migration_shape.rs` pins an ENUMERATED list: the 25 tables
-//! migration 062 chose to widen. An enumerated list can only ever prove that
+//! migration 063 chose to widen. An enumerated list can only ever prove that
 //! 062 did what 062 said. It structurally cannot notice the failure the plan's
 //! §12 summary names as the whole risk of this series — *"a derived table
 //! nobody listed keeps the plaintext public after privatization"* — because a
@@ -17,7 +17,7 @@
 //! * **Generator B** — every relation with a FOREIGN KEY referencing `claims`.
 //!
 //! Plus two **manual additions**, `harvester_fragments` and `edges`, which
-//! migration 062 registered by hand. MEASURED: neither is found by either
+//! migration 063 registered by hand. MEASURED: neither is found by either
 //! generator — `edges` has no `claim_id` column and no FK to `claims`, and
 //! `harvester_fragments` has neither. The manual arm is therefore
 //! LOAD-BEARING, not belt-and-braces: it is the entire arithmetic difference
@@ -50,10 +50,10 @@
 use sqlx::{PgPool, Row};
 
 /// Migration files embedded so the replay test cannot drift from them.
-const MIGRATION_068: &str = include_str!("../../../migrations/068_communities_to_groups.sql");
-const MIGRATION_069: &str = include_str!("../../../migrations/069_entity_types_tenancy_tier.sql");
+const MIGRATION_069: &str = include_str!("../../../migrations/069_communities_to_groups.sql");
+const MIGRATION_070: &str = include_str!("../../../migrations/070_entity_types_tenancy_tier.sql");
 
-/// Registered by migration 062's tier-A list by hand; neither generator's
+/// Registered by migration 063's tier-A list by hand; neither generator's
 /// definition names them, so the union states them explicitly.
 const MANUAL_ADDITIONS: &[&str] = &["harvester_fragments", "edges"];
 
@@ -119,7 +119,7 @@ async fn exempt_tables(pool: &PgPool) -> Vec<String> {
     sqlx::query_scalar::<_, String>("SELECT table_name FROM tenancy_exempt")
         .fetch_all(pool)
         .await
-        .expect("tenancy_exempt must exist after migration 069")
+        .expect("tenancy_exempt must exist after migration 070")
 }
 
 // ===========================================================================
@@ -130,7 +130,7 @@ async fn exempt_tables(pool: &PgPool) -> Vec<String> {
 /// is the only thing that makes the claim true rather than decorative.
 ///
 /// Passes today: the six `columns` types are claim/evidence/frame/context/
-/// perspective/community, and migration 062 gave all six backing tables both
+/// perspective/community, and migration 063 gave all six backing tables both
 /// columns `NOT NULL`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_columns_tier_registry_row_has_both_not_null_columns(pool: PgPool) {
@@ -348,7 +348,7 @@ async fn tenancy_exempt_rows_state_a_residual(pool: PgPool) {
     // A DOWNWARD RATCHET ON THE UNREVIEWED COUNT.
     //
     // The assertion above is satisfied by the literal string 'PENDING', and
-    // migration 069 seeds all twelve rows with it — so on its own it certifies
+    // migration 070 seeds all twelve rows with it — so on its own it certifies
     // nothing about review having happened. Nothing in PR-05 can cause a review,
     // and inventing a reviewer name here would be worse than admitting that.
     // What CAN be enforced is that the backlog only shrinks: a review lowers
@@ -411,7 +411,7 @@ async fn the_generated_exemptions_are_exactly_the_nine_measured(pool: PgPool) {
 /// never carry a `NOT NULL` column. They are kept in the generated set on
 /// purpose rather than filtered out by `relkind = 'r'`: both have
 /// `security_invoker` UNSET and will therefore execute as the view OWNER and
-/// BYPASS the invoker's RLS once migration 079 FORCEs it. A relkind filter would
+/// BYPASS the invoker's RLS once migration 080 FORCEs it. A relkind filter would
 /// have erased that finding. **Migration 077 owes both of them
 /// `security_invoker = true` (or a DROP).**
 #[sqlx::test(migrations = "../../migrations")]
@@ -482,7 +482,7 @@ async fn unclassified_is_unregisterable(pool: PgPool) {
     );
 }
 
-/// The hard coupling between migration 069 and the Rust: `DROP DEFAULT` is what
+/// The hard coupling between migration 070 and the Rust: `DROP DEFAULT` is what
 /// makes `EntityTypeRepository::upsert_non_core`'s new `tenancy_tier` parameter
 /// LOAD-BEARING rather than cosmetic. If this ever stops raising 23502, the
 /// handler's required-field gate has become bypassable by a direct writer.
@@ -526,7 +526,7 @@ async fn all_23_core_types_are_classified(pool: PgPool) {
     .expect("count");
     assert_eq!(
         unclassified, 0,
-        "migration 069 must leave nothing unclassified"
+        "migration 070 must leave nothing unclassified"
     );
 
     // `WHERE is_core = true` IS NOT COSMETIC. The assertion is about the 23
@@ -597,14 +597,14 @@ async fn all_23_core_types_are_classified(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_068_and_069_apply_twice(pool: PgPool) {
     let mut tx = pool.begin().await.expect("begin");
-    sqlx::raw_sql(MIGRATION_068)
-        .execute(&mut *tx)
-        .await
-        .expect("re-applying migration 068 must succeed");
     sqlx::raw_sql(MIGRATION_069)
         .execute(&mut *tx)
         .await
         .expect("re-applying migration 069 must succeed");
+    sqlx::raw_sql(MIGRATION_070)
+        .execute(&mut *tx)
+        .await
+        .expect("re-applying migration 070 must succeed");
 
     // "Did not error" is not enough: a guard that created a differently-named
     // duplicate would also not error. CONRELID-qualified, matching the
@@ -674,14 +674,14 @@ async fn ownership_key_id_quarantine_is_a_view(pool: PgPool) {
         kind.as_deref(),
         Some("v"),
         "ownership_key_id_quarantine must be a VIEW ('v'); a table ('r') would be a \
-         snapshot that cannot see a value that goes bad after migration 068"
+         snapshot that cannot see a value that goes bad after migration 069"
     );
 
     // AND `security_invoker = true`. `relkind = 'v'` alone is exactly what
     // `alternative_set` / `alt_set_decisions` satisfy, and those two are in
     // `tenancy_exempt` labelled "THIS IS AN OPEN RLS BYPASS" for the option
     // this one sets. A view that exposes ownership metadata and executes as its
-    // OWNER after migration 079's FORCE would be the same finding, filed by the
+    // OWNER after migration 080's FORCE would be the same finding, filed by the
     // same PR that filed the finding.
     let invoker: Option<bool> = sqlx::query_scalar(
         "SELECT 'security_invoker=true' = ANY(c.reloptions) FROM pg_class c \
@@ -696,7 +696,7 @@ async fn ownership_key_id_quarantine_is_a_view(pool: PgPool) {
         Some(true),
         "ownership_key_id_quarantine must be created WITH (security_invoker = true); \
          without it the view runs as its owner and bypasses the invoker's RLS once \
-         migration 079 FORCEs it"
+         migration 080 FORCEs it"
     );
 
     // Empty on a fresh database, which is what makes case 9 below discriminating.
@@ -770,7 +770,7 @@ async fn quarantine_reports_a_dangling_community_uuid(pool: PgPool) {
 /// Draining without clearing would leave the same UUID in two columns — the
 /// two-sources-of-truth this whole migration exists to remove — and would arm
 /// two later failures: the row enters the quarantine the moment `community_id`
-/// goes NULL (blocking migration 084's pre-flight with a value that DID
+/// goes NULL (blocking migration 085's pre-flight with a value that DID
 /// resolve), and every subsequent UPDATE of it re-checks the `NOT VALID`
 /// `ownership_key_id_is_uuid` against a string nobody maintains.
 #[sqlx::test(migrations = "../../migrations")]
@@ -798,7 +798,7 @@ async fn the_drain_clears_the_source_column(pool: PgPool) {
     .expect("seed legacy row");
 
     let mut tx = pool.begin().await.expect("begin");
-    sqlx::raw_sql(MIGRATION_068)
+    sqlx::raw_sql(MIGRATION_069)
         .execute(&mut *tx)
         .await
         .expect("replay 068");
@@ -835,7 +835,7 @@ async fn the_drain_clears_the_source_column(pool: PgPool) {
 /// and is inherited by a later promotion to `community` — the exact hazard
 /// `OwnershipRepository::update_partition` argues against when it nulls
 /// `community_id` on demotion. One writer enforcing an invariant the other can
-/// pre-load is not an invariant; migration 068 enforces it structurally for
+/// pre-load is not an invariant; migration 069 enforces it structurally for
 /// every writer, in-tree or not.
 #[sqlx::test(migrations = "../../migrations")]
 async fn community_id_requires_the_community_partition(pool: PgPool) {
@@ -879,7 +879,7 @@ async fn community_id_requires_the_community_partition(pool: PgPool) {
 /// Both are trivially 0 on a fresh database, so this seeds a community first —
 /// otherwise the assertion is "0 = 0" and proves nothing.
 ///
-/// **WHAT THIS DOES NOT ASSERT.** It seeds, then REPLAYS migration 068, then
+/// **WHAT THIS DOES NOT ASSERT.** It seeds, then REPLAYS migration 069, then
 /// checks. It is therefore a test of the MIGRATION's output, not of a standing
 /// invariant, and it is structurally incapable of noticing projection drift:
 /// `CommunityRepository::create` / `add_member` / `remove_member`
@@ -926,7 +926,7 @@ async fn every_community_projects_onto_a_group_and_its_members_onto_memberships(
 
     // Replay 068 so the projection sees the rows seeded above.
     let mut tx = pool.begin().await.expect("begin");
-    sqlx::raw_sql(MIGRATION_068)
+    sqlx::raw_sql(MIGRATION_069)
         .execute(&mut *tx)
         .await
         .expect("replay 068");

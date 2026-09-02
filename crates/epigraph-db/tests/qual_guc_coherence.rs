@@ -4,7 +4,7 @@
 //! # Why this property, and why it needs a test rather than a comment
 //!
 //! The in-query predicate (`Viewer::predicate_fragment`) and the RLS policy
-//! (migration 077) are two independent filters over the same rows, populated by
+//! (migration 078) are two independent filters over the same rows, populated by
 //! two different code paths: `Viewer::resolve` → the `$V` bind, and `ScopedPool`
 //! → `set_config`. If they drift, RLS silently drops rows the index already
 //! returned. That failure is **fail-closed and invisible** — indistinguishable
@@ -248,7 +248,7 @@ async fn writable_gucs_match_the_viewers_writable_set(
         sorted(writable.clone()),
         sorted(vec![writer, admin]),
         "a `reader` membership grants read authority and NOT write authority; \
-         every WITH CHECK in migration 077 reads the second array"
+         every WITH CHECK in migration 078 reads the second array"
     );
     assert!(
         !writable.contains(&reader),
@@ -427,11 +427,11 @@ async fn unscoped_for_maintenance_mints_a_lease_and_a_bypass_viewer(
 
 /// `epigraph_bypass()` is TOTAL: it answers, it never raises.
 ///
-/// This is the `EXISTS (SELECT 1 FROM pg_roles …)` guard in migration 067.
+/// This is the `EXISTS (SELECT 1 FROM pg_roles …)` guard in migration 068.
 /// Migration 060 creates `epigraph_maintenance` under a guard that swallows
 /// `insufficient_privilege`, so on managed Postgres the role may not exist at
 /// all. Without the `EXISTS`, `pg_has_role` raises **42704** — and every RLS
-/// policy in migration 077 calls this function, so every query against a
+/// policy in migration 078 calls this function, so every query against a
 /// policy-bearing table would error instead of filtering. That is a
 /// whole-database outage wearing a permissions bug's clothes.
 ///

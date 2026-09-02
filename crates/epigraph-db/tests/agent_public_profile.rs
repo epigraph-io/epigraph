@@ -13,7 +13,7 @@
 //! # What it pins
 //!
 //! `agents` is deliberately NOT tenancy-partitioned: authorship must render on a
-//! public claim, so migration 077's row policy on it is `USING (true)` with an
+//! public claim, so migration 078's row policy on it is `USING (true)` with an
 //! explicit `-- VISIBILITY-EXEMPT:` marker. The PII narrowing is therefore a
 //! **repo-layer column projection**, because PostgreSQL has no column-level RLS —
 //! which means nothing but this test stands between `agents.properties`

@@ -256,7 +256,7 @@ async fn every_principal_has_a_personal_group_from_its_first_token(pool: PgPool)
         "the deterministic did_key is what makes ensure_personal_group idempotent"
     );
     assert_eq!(g.1, "personal");
-    // groups_public_key_shape (migration 060) requires a 0-byte key for any
+    // groups_public_key_shape (migration 061) requires a 0-byte key for any
     // kind <> 'team'. A personal group holds no key material at all...
     assert_eq!(g.2, 0);
     // ...so it also has no key epoch.

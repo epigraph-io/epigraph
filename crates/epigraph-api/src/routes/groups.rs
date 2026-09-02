@@ -75,7 +75,7 @@ pub struct AddMemberRequest {
     /// Role: "admin", "writer", or "reader".
     ///
     /// BREAKING (PR-01): "member" is no longer accepted. It was never storable
-    /// — `group_memberships_role_check` (migration 060) admits only
+    /// — `group_memberships_role_check` (migration 061) admits only
     /// admin|writer|reader — so a request that omitted `role`, or sent
     /// "member", passed route validation and then raised 23514, which
     /// `add_member` maps to HTTP 500. The default is the least-privileged role,
@@ -273,7 +273,7 @@ pub async fn add_member(
         })?;
 
     // Validate role. MUST stay in lockstep with group_memberships_role_check
-    // (migrations/060_group_tenancy_tables.sql); anything this list admits and
+    // (migrations/061_group_tenancy_tables.sql); anything this list admits and
     // the CHECK rejects becomes a 23514 -> HTTP 500 instead of a 400.
     // The vocabulary also lives in group_authz.rs (which accepts exactly
     // "admin") and in the column DEFAULT.
@@ -528,6 +528,6 @@ pub async fn get_group(
 
 // No rotate_key handler exists in this workspace. Rotation must retire epoch N
 // and create epoch N+1 in ONE transaction (retire first) — the
-// `group_key_epochs_one_active` partial unique index from migration 060 makes a
+// `group_key_epochs_one_active` partial unique index from migration 061 makes a
 // second active epoch a 23505 — and must re-wrap every live member's share. See
-// migration 060's ROTATION CONTRACT comments.
+// migration 061's ROTATION CONTRACT comments.

@@ -1,5 +1,5 @@
--- 067_session_functions.sql
--- The GUC/bypass functions the RLS policies (migration 077) and ScopedPool read.
+-- 068_session_functions.sql
+-- The GUC/bypass functions the RLS policies (migration 068) and ScopedPool read.
 -- epigraph_visible() is NOT created -- it bought readability at the cost of an
 -- inlining assumption and one more SECURITY DEFINER-adjacent surface to REVOKE.
 -- epigraph_groups_for() is NOT created -- it is folded into Viewer::resolve's
@@ -19,7 +19,7 @@ LANGUAGE sql STABLE PARALLEL SAFE AS $$
 $$;
 
 -- The WRITABLE subset (group_memberships.role IN ('admin','writer')). Used by
--- every WITH CHECK in migration 077.
+-- every WITH CHECK in migration 068.
 CREATE OR REPLACE FUNCTION public.epigraph_writable_groups() RETURNS uuid[]
 LANGUAGE sql STABLE PARALLEL SAFE AS $$
     SELECT COALESCE(
@@ -40,7 +40,7 @@ $$;
 -- session_user, NOT current_user: inside a SECURITY DEFINER frame current_user
 -- resolves to the FUNCTION OWNER, which is exactly the escalation the security
 -- review flagged. The EXISTS guard means this is safe to call before the roles
--- exist (managed Postgres -- migration 060's CREATE ROLE only NOTICEs on
+-- exist (managed Postgres -- migration 061's CREATE ROLE only NOTICEs on
 -- insufficient_privilege).
 CREATE OR REPLACE FUNCTION public.epigraph_bypass() RETURNS boolean
 LANGUAGE sql STABLE PARALLEL SAFE AS $$
@@ -53,7 +53,7 @@ $$;
 -- THE current_user VARIANT (sec F10). Used ONLY inside the two trigger bodies
 -- that must write through their own tables' policies while running as the
 -- function owner: epigraph_propagate_tenancy and epigraph_inherit_tenancy
--- (migration 070). Safe because it is REVOKE EXECUTE ... FROM PUBLIC and
+-- (migration 061). Safe because it is REVOKE EXECUTE ... FROM PUBLIC and
 -- neither trigger is callable from SQL the app can emit.
 CREATE OR REPLACE FUNCTION public.epigraph_definer_bypass() RETURNS boolean
 LANGUAGE sql STABLE PARALLEL SAFE AS $$

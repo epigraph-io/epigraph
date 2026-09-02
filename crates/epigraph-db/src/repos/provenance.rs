@@ -26,7 +26,7 @@ pub struct ProvenanceLogRow {
     pub created_at: DateTime<Utc>,
 }
 
-/// Auto-policy authorizer UUID (seeded in migration 062).
+/// Auto-policy authorizer UUID (seeded in migration 063).
 pub const AUTO_POLICY_AUTHORIZER_ID: Uuid =
     Uuid::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
 

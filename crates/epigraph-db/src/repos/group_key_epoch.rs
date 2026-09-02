@@ -47,7 +47,7 @@ impl GroupKeyEpochRepository {
     /// `GroupRepository::create_with_admin` inlined an equivalent INSERT that
     /// additionally pinned `status = 'active'`, which left this function with
     /// zero callers workspace-wide and two statements free to drift apart —
-    /// exactly the pair migration 060's ROTATION CONTRACT comment addresses by
+    /// exactly the pair migration 061's ROTATION CONTRACT comment addresses by
     /// name. `status` is therefore an explicit parameter rather than relying on
     /// the column DEFAULT: an epoch row's status is the rotation state machine,
     /// and a caller must say which state it is writing.

@@ -1,4 +1,4 @@
--- 060_group_tenancy_tables.sql
+-- 061_group_tenancy_tables.sql
 --
 -- LIVE INCIDENT FIXED HERE: crates/epigraph-api/src/routes/claims.rs:841
 -- (get_claim) and :1000 (list_claims) call
@@ -84,7 +84,7 @@ BEGIN
                   AND conname  = rec.sentinel)
         THEN
             RAISE EXCEPTION
-                'migration 060: table public.% already exists in a pre-060 shape (constraint % is absent)',
+                'migration 061: table public.% already exists in a pre-060 shape (constraint % is absent)',
                 rec.tbl, rec.sentinel
               USING HINT =
                 'This database was provisioned outside the public migration series '

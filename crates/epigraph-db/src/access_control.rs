@@ -64,7 +64,7 @@ pub async fn check_content_access(
 ) -> ContentAccess {
     // 1. Look up ownership (partition_type, owner_id, community_id).
     // `community_id` is the TYPED gate for community partitions. Before
-    // migration 068 this value lived stringified in `encryption_key_id`, a
+    // migration 069 this value lived stringified in `encryption_key_id`, a
     // column whose name meant something else entirely; 068 drained it into a
     // real `uuid` column with an FK to `communities`. Nothing reads
     // `encryption_key_id` any more — it is dropped with the table in 084.
@@ -74,7 +74,7 @@ pub async fn check_content_access(
     // means *public* — so a pool timeout, a reset connection or a schema that
     // predates `community_id` returned FULL CONTENT for a private or
     // community-gated claim. `EPIGRAPH_MIGRATE_ON_BOOT` is default-off, so a
-    // binary rolled ahead of migration 068 is an operator-reachable state, and
+    // binary rolled ahead of migration 069 is an operator-reachable state, and
     // the MCP server has no startup probe that would catch it. Fail closed and
     // say so in the log.
     let ownership: Option<(String, Uuid, Option<Uuid>)> = match sqlx::query_as(
@@ -108,7 +108,7 @@ pub async fn check_content_access(
         },
         "community" => {
             // For community-partition nodes, `community_id` names the gating
-            // community directly (migration 068 made it a real `uuid` column;
+            // community directly (migration 069 made it a real `uuid` column;
             // there is no string to parse and no parse failure to handle). We
             // check whether the requester's agent owns any perspective that is
             // a member of that community.

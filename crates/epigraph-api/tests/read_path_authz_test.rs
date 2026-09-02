@@ -43,7 +43,7 @@ async fn pool_and_app() -> (
     // migrator run would restart from 001 and die.
     //
     // The claim_encryption stand-in that `common::ensure_claim_encryption_table`
-    // used to create is deleted in this PR (migration 060 creates the real
+    // used to create is deleted in this PR (migration 061 creates the real
     // table), which removes the self-healing that hid an unmigrated database.
     // Fail LOUDLY on the precondition instead: without 060 every case below
     // fails as an unexplained 500 from get_claim's unconditional
@@ -55,7 +55,7 @@ async fn pool_and_app() -> (
             .expect("regclass lookup");
     assert!(
         has_060.is_some(),
-        "DATABASE_URL points at a database without migration 060 \
+        "DATABASE_URL points at a database without migration 061 \
          (public.claim_encryption is missing). Apply migrations first: \
          `cargo run -p epigraph-api --bin epigraph-migrate`."
     );
@@ -180,7 +180,7 @@ async fn get_claim_owner_token_ignores_wire_param_and_sees_full() {
 /// crate's read path had never exercised the third, so the whole two-hop
 /// `community_members ⋈ perspectives` branch of `check_content_access` was
 /// reached by no `epigraph-api` test at all. PR-05 rewrites that branch
-/// (migration 068 moves the gate from the overloaded `encryption_key_id` text
+/// (migration 069 moves the gate from the overloaded `encryption_key_id` text
 /// column into a typed `ownership.community_id`), and
 /// `crates/epigraph-mcp/tests/community_partition.rs` covers it at the MCP
 /// surface. This is the HTTP half: same decision function, different handler,

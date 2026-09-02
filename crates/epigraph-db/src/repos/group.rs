@@ -77,7 +77,7 @@ impl GroupRepository {
 
         // Via the repo helper, not an inlined INSERT: the inlined copy left
         // `GroupKeyEpochRepository::create_epoch` with zero callers and the two
-        // statements free to drift (migration 060's ROTATION CONTRACT names
+        // statements free to drift (migration 061's ROTATION CONTRACT names
         // that pair).
         crate::repos::group_key_epoch::GroupKeyEpochRepository::create_epoch_conn(
             &mut tx, row.0, 0, None, "active",

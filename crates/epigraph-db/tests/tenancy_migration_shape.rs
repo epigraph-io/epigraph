@@ -6,7 +6,7 @@
 //!
 //! * `-- no-transaction` is honoured, and no index is left INVALID;
 //! * `idx_claims_embedding_hnsw_public` does not exist;
-//! * migration 062 applies twice.
+//! * migration 063 applies twice.
 //!
 //! The fourth is a **source lint** with no counterpart anywhere else: a
 //! `-- no-transaction` migration must contain exactly one statement. That is not
@@ -23,23 +23,23 @@ use sqlx::{PgPool, Row};
 use std::collections::BTreeSet;
 
 /// The migration file itself, embedded so the replay test cannot drift from it.
-const MIGRATION_062: &str = include_str!("../../../migrations/062_tenancy_columns.sql");
+const MIGRATION_063: &str = include_str!("../../../migrations/063_tenancy_columns.sql");
 
 /// The `-- no-transaction` index migrations, and the index each creates.
 const INDEX_MIGRATIONS: &[(&str, &str)] = &[
     (
-        "063_idx_claims_group_current.sql",
+        "064_idx_claims_group_current.sql",
         "idx_claims_group_current",
     ),
     (
-        "064_idx_evidence_owner_group.sql",
+        "065_idx_evidence_owner_group.sql",
         "idx_evidence_owner_group",
     ),
-    ("065_idx_edges_owner_group.sql", "idx_edges_owner_group"),
-    ("066_idx_claims_world_owned.sql", "idx_claims_world_owned"),
+    ("066_idx_edges_owner_group.sql", "idx_edges_owner_group"),
+    ("067_idx_claims_world_owned.sql", "idx_claims_world_owned"),
 ];
 
-/// The tier-A set migration 062 widens. Duplicated here on purpose: a test that
+/// The tier-A set migration 063 widens. Duplicated here on purpose: a test that
 /// re-derived the list from the migration file would pass whatever the migration
 /// did.
 const TIER_A: &[&str] = &[
@@ -82,7 +82,7 @@ fn migrations_dir() -> std::path::PathBuf {
 // ===========================================================================
 
 /// That this test's database exists at all is the proof that `-- no-transaction`
-/// was honoured: without it, migration 063 raises
+/// was honoured: without it, migration 064 raises
 /// `CREATE INDEX CONCURRENTLY cannot run inside a transaction block` and every
 /// `#[sqlx::test]` in the workspace fails at setup. The assertions below add the
 /// part that a mere "it applied" does not cover — a CIC can succeed as a
@@ -422,7 +422,7 @@ async fn no_public_hnsw_index_exists(pool: PgPool) {
 }
 
 // ===========================================================================
-// 4 — migration 062 is idempotent
+// 4 — migration 063 is idempotent
 // ===========================================================================
 
 /// A `lock_timeout` abort inside 062 leaves no `_sqlx_migrations` row, so the
@@ -438,10 +438,10 @@ async fn no_public_hnsw_index_exists(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_062_is_idempotent(pool: PgPool) {
     let mut tx = pool.begin().await.expect("begin");
-    sqlx::raw_sql(MIGRATION_062)
+    sqlx::raw_sql(MIGRATION_063)
         .execute(&mut *tx)
         .await
-        .expect("re-applying migration 062 must succeed");
+        .expect("re-applying migration 063 must succeed");
 
     // A guard that silently created a differently named duplicate would not be
     // caught by "the statement did not error".
@@ -491,7 +491,7 @@ async fn migration_062_is_idempotent(pool: PgPool) {
 // 5 — the world and seed groups
 // ===========================================================================
 
-/// `world` is a SHAPE CONSTANT, not an owner. `seed` exists so migration 074's
+/// `world` is a SHAPE CONSTANT, not an owner. `seed` exists so migration 075's
 /// backfill has something real to stamp: plan §8.2 A4 requires
 /// `count(*) FROM claims WHERE owner_group_id = <world>` to reach zero, which is
 /// unachievable if the backfill stamps world.
@@ -549,7 +549,7 @@ async fn world_and_seed_groups_exist_with_the_right_shape(pool: PgPool) {
 /// BOTH arms, and the CONSTRAINT NAME, not just the SQLSTATE.
 ///
 /// The seed group is the same black hole as the world group and is the likelier
-/// one to be hit: it has no `group_memberships` rows either, and migration 074
+/// one to be hit: it has no `group_memberships` rows either, and migration 075
 /// arm 4 deliberately stamps it as the owner of legacy rows. An earlier draft
 /// excluded only `world`, and nothing here caught it.
 ///
@@ -562,7 +562,7 @@ async fn world_and_seed_groups_exist_with_the_right_shape(pool: PgPool) {
 ///   SQLSTATE 23514, so asserting the code alone made the whole test vacuous.
 ///   It now asserts `constraint()`.
 /// * A CHECK that rejects everything would also have passed. The final INSERT
-///   is the control: `('public', seed)` is precisely the pairing migration 074
+///   is the control: `('public', seed)` is precisely the pairing migration 075
 ///   creates and must remain legal.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_group_visible_row_cannot_be_owned_by_a_memberless_group(pool: PgPool) {
@@ -603,7 +603,7 @@ async fn a_group_visible_row_cannot_be_owned_by_a_memberless_group(pool: PgPool)
     }
 
     // The control. Without it a CHECK that rejected every row would pass above.
-    // `('public', seed)` is exactly what migration 074 arm 4 writes.
+    // `('public', seed)` is exactly what migration 075 arm 4 writes.
     sqlx::query(
         "INSERT INTO frames (name, description, hypotheses, visibility, owner_group_id) \
          VALUES ('seed-owns-public', 'x', ARRAY['h1','h2'], 'public', $1::uuid)",
@@ -611,7 +611,7 @@ async fn a_group_visible_row_cannot_be_owned_by_a_memberless_group(pool: PgPool)
     .bind(SEED_GROUP)
     .execute(&pool)
     .await
-    .expect("a PUBLIC row owned by seed is exactly what migration 074 creates");
+    .expect("a PUBLIC row owned by seed is exactly what migration 075 creates");
 }
 
 // ===========================================================================
@@ -702,7 +702,7 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
                 !validated,
                 "{name} is VALIDATED at PR-04. It must ship NOT VALID: validation \
                  is a full scan under ACCESS EXCLUSIVE, and it belongs after the \
-                 backfill (migration 075)."
+                 backfill (migration 076)."
             );
         }
 

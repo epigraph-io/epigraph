@@ -80,11 +80,11 @@ pub struct AgentPublicProfile {
     pub id: Uuid,
     pub display_name: Option<String>,
     pub public_key: Vec<u8>,
-    /// `ed25519` or `derived` (migration 061). Always returned: a caller that
+    /// `ed25519` or `derived` (migration 062). Always returned: a caller that
     /// cannot tell a real verifier from the BLAKE3 placeholder will feed the
     /// placeholder to a signature check.
     pub key_kind: String,
-    /// `public` or `group` (migration 062). Always returned so a caller can say
+    /// `public` or `group` (migration 063). Always returned so a caller can say
     /// *why* the detail fields are empty without a second query.
     pub profile_visibility: String,
     /// `agents.properties` — `full_name`, `affiliations`, `email`. `None` when
@@ -1033,7 +1033,7 @@ impl AgentRepository {
     //
     // Every one of the queries below uses the RUNTIME `sqlx::query`/`query_as`
     // API rather than the `query!` macros. That is deliberate: they read and
-    // write `agents.key_kind`, which only exists once migration 061 has been
+    // write `agents.key_kind`, which only exists once migration 062 has been
     // applied, and a macro would demand a `.sqlx/` cache entry describing a
     // column that a not-yet-migrated checkout cannot produce.
     // =========================================================================
@@ -1204,7 +1204,7 @@ impl AgentRepository {
     /// remember it.
     ///
     /// `public_key = ''::bytea` is mandatory, not a shortcut:
-    /// `groups_public_key_shape` (migration 060) requires
+    /// `groups_public_key_shape` (migration 061) requires
     /// `octet_length(public_key) = 0` for every `kind <> 'team'`. A personal
     /// group carries no key material at all, so no `group_key_epochs` row is
     /// created either — `group_memberships` has no FK to it, and the
@@ -1261,7 +1261,7 @@ impl AgentRepository {
     ///
     /// `agents` is deliberately **not** a tenancy-partitioned table: authorship
     /// must render on a public claim, so the row itself stays readable and
-    /// migration 077's policy on it is `USING (true)` with an explicit
+    /// migration 078's policy on it is `USING (true)` with an explicit
     /// `-- VISIBILITY-EXEMPT:` marker. What is *not* universally readable is the
     /// PII the row carries — `agents.properties` holds `full_name`, `orcid`,
     /// `affiliations` and `email` (migration 001).
@@ -1271,7 +1271,7 @@ impl AgentRepository {
     /// always returned; [`AgentPublicProfile::properties`], `orcid` and `ror_id`
     /// are `None` unless one of three things holds —
     ///
-    /// 1. `profile_visibility = 'public'` (migration 062's default), or
+    /// 1. `profile_visibility = 'public'` (migration 063's default), or
     /// 2. the viewer **is** this agent, or
     /// 3. the viewer shares a live group with it.
     ///

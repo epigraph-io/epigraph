@@ -9,7 +9,7 @@ use crate::middleware::bearer::AuthContext;
 ///
 /// Uses `GroupMembershipRepository::get_member_role`, whose `LIMIT 1` is made
 /// deterministic by the `group_memberships_one_live` partial unique index
-/// (migration 060).
+/// (migration 061).
 ///
 /// This is a MEMBERSHIP check, not a scope check. The routes that call it
 /// require `groups:admin` at extractor time as well: scope AND membership.
@@ -39,7 +39,7 @@ pub async fn require_group_admin(
     // ONE role vocabulary: admin | writer | reader.
     //
     // This used to also accept a fourth role that
-    // `group_memberships_role_check` (migration 060) has never permitted — the
+    // `group_memberships_role_check` (migration 061) has never permitted — the
     // branch was unreachable, and it implied a role a reader might try to grant.
     // The group creator is stored as role=admin by
     // `GroupRepository::create_with_admin`.

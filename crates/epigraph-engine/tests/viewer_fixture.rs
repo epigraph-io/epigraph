@@ -106,7 +106,7 @@ pub async fn bypass(pool: &PgPool) -> (ScopedPool, Viewer) {
 ///
 /// This is the right default for the ~45 pre-existing integration tests PR-06
 /// had to touch. Their fixtures write claims through `ClaimRepository::create`,
-/// which takes migration 062's `visibility` DEFAULT of `'public'`, so a
+/// which takes migration 063's `visibility` DEFAULT of `'public'`, so a
 /// public-only viewer returns exactly what those tests asserted before the
 /// predicate existed — which is the "nothing changes" property the conversion
 /// is supposed to have. A bypass viewer would also pass, and would prove less:
@@ -174,13 +174,13 @@ pub async fn seed_group_claim(pool: &PgPool, agent: Uuid, group: Uuid, content: 
     seed_claim(pool, agent, content, "group", group).await
 }
 
-/// The seeded world group (migration 060/062), which is the `owner_group_id`
+/// The seeded world group (migration 061/062), which is the `owner_group_id`
 /// DEFAULT every pre-existing row carries.
 pub async fn world_group(pool: &PgPool) -> Uuid {
     sqlx::query_scalar("SELECT id FROM groups WHERE kind = 'world' LIMIT 1")
         .fetch_one(pool)
         .await
-        .expect("the world group is seeded by migration 060")
+        .expect("the world group is seeded by migration 061")
 }
 
 async fn seed_claim(

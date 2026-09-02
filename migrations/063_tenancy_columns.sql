@@ -1,7 +1,7 @@
--- 062_tenancy_columns.sql -- no table rewrite. Does NOT rewrite claims.
+-- 063_tenancy_columns.sql -- no table rewrite. Does NOT rewrite claims.
 -- PR-04 of the multi-user tenancy series. Plan §3/061, shipped as 062.
 -- STAGE 1 OF TWO. Every DEFAULT below is a transition artifact and is DROPped
--- by migration 074 (plan's 071). Idempotent so a lock_timeout abort is retried
+-- by migration 065 (plan's 071). Idempotent so a lock_timeout abort is retried
 -- by re-running the file (sqlx records no row for a failed migration).
 --
 -- LOCK PROFILE -- READ THIS BEFORE RUNNING IT ON A LIVE CLUSTER.
@@ -41,9 +41,9 @@ END $$;
 
 -- The world group. Nil UUID so it is unmistakable in a psql dump. It is a
 -- SHAPE CONSTANT and nothing more -- it is NOT the owner of public content
--- (plan §2.3), and after migration 074 nothing may own anything with it. It has
+-- (plan §2.3), and after migration 065 nothing may own anything with it. It has
 -- no group_memberships rows, by design. kind<>'team' => groups_public_key_shape
--- (migration 060:164) requires octet_length(public_key)=0, hence ''::bytea.
+-- (migration 061:164) requires octet_length(public_key)=0, hence ''::bytea.
 -- ON CONFLICT DO NOTHING (not ON CONFLICT (id)): groups_did_key_key is a second
 -- unique constraint and a pre-existing row under either one must be tolerated.
 INSERT INTO public.groups (id, display_name, did_key, public_key, kind)
@@ -78,7 +78,7 @@ ON CONFLICT DO NOTHING;
 -- indexes leading on owner_group_id (063-065) predicate on `visibility`, so
 -- none can serve it: a DELETE FROM groups would be 25 sequential scans, one on
 -- `claims`, inside the deleting transaction with row locks held throughout.
--- That is acceptable ONLY because migration 060's trigger blocks
+-- That is acceptable ONLY because migration 061's trigger blocks
 -- DELETE FROM groups outright. Taking its documented escape hatch
 -- (`SET LOCAL epigraph.allow_group_delete = 'yes'`) is therefore a
 -- MAINTENANCE-WINDOW operation with a stated table-scan cost -- see
@@ -145,7 +145,7 @@ BEGIN
         -- THE SEED GROUP IS EXCLUDED FOR THE IDENTICAL REASON. It has no
         -- group_memberships rows either, by design (see its INSERT above), so
         -- ('group', seed) is the same black hole -- and it is the *likelier*
-        -- one, because migration 074 arm 4 deliberately stamps seed as the owner
+        -- one, because migration 065 arm 4 deliberately stamps seed as the owner
         -- of legacy rows. Those rows are and stay `visibility = 'public'`, which
         -- this CHECK permits; what it forbids is ever pairing seed with 'group'.
         -- If a future PR wants group-visible content owned by seed, it must
@@ -206,7 +206,7 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_agents_default_group
     ON public.agents (default_group_id) WHERE default_group_id IS NOT NULL;
 
--- Resumable backfill progress. DEMOTED TO OBSERVABILITY: migration 075's guard
+-- Resumable backfill progress. DEMOTED TO OBSERVABILITY: migration 066's guard
 -- is LIVE COUNTS, not this table's boolean, because a boolean `complete` flag is
 -- hand-flippable by an on-call trying to unblock a deploy at 2 a.m.
 CREATE TABLE IF NOT EXISTS public.tenancy_backfill_progress (
@@ -235,7 +235,7 @@ END $$;
 
 -- The undeclared-write counter (ops F10). Migration 070's transition trigger
 -- bumps this instead of silently inheriting, and plan §9.2's deploy gate
--- requires it FLAT FOR 24 HOURS before migration 074 runs.
+-- requires it FLAT FOR 24 HOURS before migration 065 runs.
 CREATE TABLE IF NOT EXISTS public.tenancy_undeclared_writes (
     table_name text NOT NULL,
     day        date NOT NULL DEFAULT current_date,
@@ -279,6 +279,6 @@ BEGIN
 END $$;
 
 COMMENT ON COLUMN public.claims.visibility IS
-  'public|group. DEFAULT ''public'' is a TRANSITION ARTIFACT dropped by migration 074.';
+  'public|group. DEFAULT ''public'' is a TRANSITION ARTIFACT dropped by migration 065.';
 COMMENT ON COLUMN public.claims.owner_group_id IS
-  'FK groups(id). DEFAULT = the world group, a SHAPE CONSTANT, not an owner. Dropped by migration 074.';
+  'FK groups(id). DEFAULT = the world group, a SHAPE CONSTANT, not an owner. Dropped by migration 065.';

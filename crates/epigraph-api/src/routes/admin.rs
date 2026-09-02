@@ -259,7 +259,7 @@ pub async fn approve_client(
 /// `id`, `is_optional` to `false`. `table_name` may be omitted for a table-less
 /// type. All identifier fields are validated with `is_pg_ident`.
 ///
-/// `tenancy_tier` is REQUIRED and has NO `#[serde(default)]` (migration 069
+/// `tenancy_tier` is REQUIRED and has NO `#[serde(default)]` (migration 070
 /// dropped the column's DEFAULT — see D1, "tenancy is declared, never
 /// defaulted"). It is typed `Option<String>` rather than `String` on purpose:
 /// axum's `Json` extractor turns a missing non-`Option` field into a 422
@@ -277,7 +277,7 @@ pub struct RegisterEntityTypeRequest {
 }
 
 /// The tenancy tiers a registration may claim. `unclassified` is deliberately
-/// absent: migration 069's `entity_types_no_unclassified` CHECK forbids it at
+/// absent: migration 070's `entity_types_no_unclassified` CHECK forbids it at
 /// rest, and letting it reach the database would surface as a 500 from a CHECK
 /// violation instead of a 400 naming the constraint.
 const REGISTRABLE_TENANCY_TIERS: &[&str] = &["columns", "derived", "identity"];
@@ -292,7 +292,7 @@ pub struct RegisterEntityTypeResponse {
     pub is_core: bool,
     /// Whether the backing table currently resolves (via `to_regclass`).
     pub table_present: bool,
-    /// The tier as persisted (migration 069).
+    /// The tier as persisted (migration 070).
     pub tenancy_tier: String,
 }
 
@@ -370,7 +370,7 @@ pub async fn register_entity_type(
     }
 
     // -----------------------------------------------------------------
-    // TENANCY TIER (migration 069). Two gates, in this order.
+    // TENANCY TIER (migration 070). Two gates, in this order.
     // -----------------------------------------------------------------
     //
     // GATE 1 — vocabulary. The field is required (D1: declared, never
@@ -381,7 +381,7 @@ pub async fn register_entity_type(
             field: "tenancy_tier".to_string(),
             reason: format!(
                 "tenancy_tier is required and must be one of: {}. \
-                 entity_types.tenancy_tier has no DEFAULT (migration 069) — a \
+                 entity_types.tenancy_tier has no DEFAULT (migration 070) — a \
                  type must declare how its backing table carries tenancy.",
                 REGISTRABLE_TENANCY_TIERS.join(", ")
             ),
@@ -699,7 +699,7 @@ mod db_tests {
         assert_eq!(count, 0, "no sensitive/cross-schema type may persist");
     }
 
-    /// PR-05 / migration 069. `tenancy_tier` is REQUIRED. The field is typed
+    /// PR-05 / migration 070. `tenancy_tier` is REQUIRED. The field is typed
     /// `Option<String>` precisely so a missing field is a 400 naming the field,
     /// not axum's 422 deserialization error — this asserts the 400 the
     /// acceptance criterion demands, and that the body still DESERIALIZES (so

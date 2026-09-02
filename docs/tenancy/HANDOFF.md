@@ -42,7 +42,7 @@ Group-scoped encryption (`seal`) is last and deliberately optional.
 
 | PR | Title | State |
 |----|-------|-------|
-| PR-01 | create the group tenancy tables (migration 060) | **landed** `4f32408` — 3453 pass / 0 fail |
+| PR-01 | create the group tenancy tables (migration 061) | **landed** `4f32408` — 3453 pass / 0 fail |
 | PR-02 | agents.id for every principal; close both registration gates (061) | **landed** `6429097` — 3634 pass / 0 fail |
 | PR-03 | anonymous allowlist, RFC 6750 challenge, unforgeable Viewer (D3) | **landed** `8c70e5a` — 3669 pass / 0 fail |
 | PR-04 | tenancy columns, world/seed groups, ScopedPool, resolvable Viewer (062–067) | **landed** `1e310bc` — 3723 pass / 0 fail; discharged PR-03's ignore obligation |
@@ -115,11 +115,11 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   `after_release` tenancy scrub (keeping its `after_connect` statement_timeout
   hook). Both are commented at their call sites and in `docs/deploy.md` §1c.
 - **PR-16 owes** `REINDEX INDEX CONCURRENTLY idx_claims_world_owned;` after the
-  backfill. That index is corpus-sized when migration 066 builds it, because
+  backfill. That index is corpus-sized when migration 067 builds it, because
   `owner_group_id` defaults to the world group; the backfill empties it without
   reclaiming pages.
 - **PR-17 owes** `security_invoker = true` on `public.alternative_set` and
-  `public.alt_set_decisions` in migration 077 — or a `DROP VIEW`. Both are
+  `public.alt_set_decisions` in migration 078 — or a `DROP VIEW`. Both are
   `relkind = 'v'` with the option UNSET, so after 079's `FORCE ROW LEVEL
   SECURITY` they execute as the view OWNER and bypass the invoker's policies
   entirely: `alt_set_decisions` returns `belief`, `plausibility` and

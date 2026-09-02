@@ -297,13 +297,13 @@ impl GroupMembershipRepository {
     /// (`crates/epigraph-db/src/visibility.rs`) and therefore sits on the hot
     /// path of every authenticated request once PR-07 attaches the extractor.
     /// It is served index-only by `idx_group_memberships_agent_live`
-    /// (`migrations/060_group_tenancy_tables.sql:266-268`), whose columns are
+    /// (`migrations/061_group_tenancy_tables.sql:266-268`), whose columns are
     /// `(agent_id, group_id, role) WHERE revoked_at IS NULL` — exactly this
     /// predicate and exactly this projection, in that order.
     ///
     /// Rows are returned unordered. The partial unique index
     /// `group_memberships_one_live (group_id, agent_id) WHERE revoked_at IS
-    /// NULL` (`migrations/060_group_tenancy_tables.sql:263-264`) guarantees at
+    /// NULL` (`migrations/061_group_tenancy_tables.sql:263-264`) guarantees at
     /// most one live row per `(group_id, agent_id)`, so a duplicate `group_id`
     /// is not reachable through the schema; `Viewer::resolve` still sorts and
     /// dedups defensively, because the bind it produces is fed to a `= ANY($V)`

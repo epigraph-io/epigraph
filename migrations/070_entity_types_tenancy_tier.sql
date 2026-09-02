@@ -1,4 +1,4 @@
--- 069_entity_types_tenancy_tier.sql
+-- 070_entity_types_tenancy_tier.sql
 -- PR-05. Plan §3/065, shipped as 069 (migrations/README.md is authoritative).
 -- D1 for types that do not exist yet: a type registered after this migration
 -- must SAY what tenancy shape its backing table has, and cannot be silent.
@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS public.tenancy_exempt (
     reviewed_at timestamptz NOT NULL DEFAULT now()
 );
 
--- DRIFT GUARD, the pattern migration 060 established at its head: `CREATE TABLE
+-- DRIFT GUARD, the pattern migration 061 established at its head: `CREATE TABLE
 -- IF NOT EXISTS` is SILENT about a table that already exists in a DIFFERENT
 -- shape. On such a database the seed INSERT below would fail on an unknown
 -- column — a 42703 with no explanation of what actually went wrong. Fail loudly
@@ -114,7 +114,7 @@ INSERT INTO public.tenancy_exempt (table_name, reason, residual, reviewed_by) VA
  ('agents',
   'Identity must render authorship on a public claim (tier B).',
   'display_name and public_key are always readable; agents.profile_visibility '
-  '(migration 062) governs properties/orcid/ror_id only.',
+  '(migration 063) governs properties/orcid/ror_id only.',
   'PENDING'),
  ('jobs',
   'Queue metadata; carries no claim content.',
@@ -122,13 +122,13 @@ INSERT INTO public.tenancy_exempt (table_name, reason, residual, reviewed_by) VA
   're-validation in §6.5.5, not by columns.',
   'PENDING'),
  ('claim_encryption',
-  'Created by migration 060 and already keyed on group_id + epoch; a second '
+  'Created by migration 061 and already keyed on group_id + epoch; a second '
   'owner_group_id would be a redundant second source of truth.',
   'Row presence discloses THAT a claim is sealed and to which group, without '
   'disclosing content. Closed by the 077 policy on group_id.',
   'PENDING'),
  ('claim_version_encryption',
-  'As claim_encryption: keyed on group_id + epoch by migration 060.',
+  'As claim_encryption: keyed on group_id + epoch by migration 061.',
   'Row presence discloses that a claim VERSION is sealed. Closed by the 077 '
   'policy on group_id.',
   'PENDING'),
@@ -165,7 +165,7 @@ INSERT INTO public.tenancy_exempt (table_name, reason, residual, reviewed_by) VA
  ('alternative_set',
   'A VIEW over edges, not a table — there is no row to carry a column. Found by '
   'Generator A because information_schema.columns does not distinguish relkind.',
-  'relkind=''v'' with security_invoker UNSET: after migration 079''s FORCE it '
+  'relkind=''v'' with security_invoker UNSET: after migration 070''s FORCE it '
   'executes as the view OWNER and BYPASSES the invoker''s RLS on edges. '
   'Migration 077 MUST set security_invoker=true on it or drop it. '
   'THIS IS AN OPEN RLS BYPASS, RECORDED HERE SO PR-17 CANNOT MISS IT.',

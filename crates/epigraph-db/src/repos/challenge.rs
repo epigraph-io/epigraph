@@ -65,7 +65,7 @@ impl ChallengeRepository {
     /// `challenges.explanation` is free prose about a claim's weaknesses and is
     /// the surface plan §2.4 / §4.9 #23 flags: it leaks the substance of a claim
     /// the caller may not be able to read. `challenges` carries its own tenancy
-    /// columns (migration 062), so the predicate applies to the row directly.
+    /// columns (migration 063), so the predicate applies to the row directly.
     pub async fn get(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,

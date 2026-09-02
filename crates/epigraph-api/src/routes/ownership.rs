@@ -58,10 +58,10 @@ pub struct OwnershipResponse {
     pub partition_type: String,
     pub owner_id: Uuid,
     /// DEPRECATED. Always `None` for anything this handler writes after
-    /// migration 068; retained on the wire until the column is dropped in 084
+    /// migration 069; retained on the wire until the column is dropped in 084
     /// so an existing client's deserializer does not break.
     pub encryption_key_id: Option<String>,
-    /// The gating community for `partition_type = "community"` (migration 068).
+    /// The gating community for `partition_type = "community"` (migration 069).
     pub community_id: Option<Uuid>,
     pub created_at: String,
     pub updated_at: String,
