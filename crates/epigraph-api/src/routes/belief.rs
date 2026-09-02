@@ -44,6 +44,25 @@ pub struct BeliefResponse {
     /// Frame incompleteness: m((Omega, true)) — frame may be missing propositions
     pub mass_on_missing: Option<f64>,
     pub pignistic_prob: Option<f64>,
+    /// How many mass functions **this reader can see** contribute to the claim.
+    ///
+    /// # This is deliberately NOT the denominator of the interval above
+    ///
+    /// `belief`/`plausibility`/`pignistic_prob` are precomputed aggregate
+    /// columns on `claims`, recomputed from *every* BBA in the corpus. No
+    /// visibility predicate can narrow them — they are a single stored number,
+    /// not a query over `mass_functions`. This count, by contrast, is
+    /// viewer-filtered (PR-07). So whenever a contributing BBA is group-private,
+    /// `mass_function_count` is strictly less than the number of mass functions
+    /// the interval actually rests on.
+    ///
+    /// The asymmetry is the intended trade, not an oversight: the alternative —
+    /// counting mass functions the reader cannot see — turns this field into a
+    /// cardinality oracle over another tenant's evidence. Read it as "how much
+    /// of the supporting evidence is available to me", never as "how many
+    /// sources produced this interval". Do not recompute ignorance from it;
+    /// `ignorance` is returned directly and is derived from the same corpus-wide
+    /// columns as the interval.
     pub mass_function_count: i64,
 }
 
@@ -428,55 +447,58 @@ pub(crate) fn compute_hypothesis_belief(
 /// Get belief interval for a claim
 ///
 /// `GET /api/v1/claims/:id/belief`
+///
+/// Both reads are filtered by the caller's [`Viewer`](epigraph_db::Viewer).
+/// Before PR-07 this handler ran two bare statements against `claims` and
+/// `mass_functions` inline, keyed only on the path id, which made it a precise
+/// oracle over the whole corpus: a 200 proved a claim id existed and disclosed
+/// its belief interval, a 404 proved it did not. Neither fact is public.
+/// A claim the viewer cannot see is now indistinguishable from one that does
+/// not exist — both are 404 — which is the intended shape.
 #[cfg(feature = "db")]
 pub async fn get_claim_belief(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<BeliefResponse>, ApiError> {
     let pool = &state.db_pool;
 
-    // Read the stored belief/plausibility/pignistic from the claims table
-    #[allow(clippy::type_complexity)]
-    let row: Option<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> = sqlx::query_as(
-        "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing FROM claims WHERE id = $1",
+    let cols = epigraph_db::ClaimRepository::get_belief_columns(
+        pool,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(claim_id),
     )
-    .bind(claim_id)
-    .fetch_optional(pool)
     .await
     .map_err(|e| ApiError::DatabaseError {
         message: e.to_string(),
+    })?
+    .ok_or(ApiError::NotFound {
+        entity: "claim".to_string(),
+        id: claim_id.to_string(),
     })?;
 
-    let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing) =
-        row.ok_or(ApiError::NotFound {
-            entity: "claim".to_string(),
-            id: claim_id.to_string(),
-        })?;
-
-    // Count mass functions across all frames for this claim
-    let count_row: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1")
-            .bind(claim_id)
-            .fetch_one(pool)
+    // Count mass functions across all frames for this claim, as the viewer.
+    let mass_function_count =
+        epigraph_db::MassFunctionRepository::count_for_claim(pool, &viewer, claim_id)
             .await
             .map_err(|e| ApiError::DatabaseError {
                 message: e.to_string(),
             })?;
 
-    let ignorance = match (belief, plausibility) {
+    let ignorance = match (cols.belief, cols.plausibility) {
         (Some(b), Some(p)) => Some(p - b),
         _ => None,
     };
 
     Ok(Json(BeliefResponse {
         claim_id,
-        belief,
-        plausibility,
+        belief: cols.belief,
+        plausibility: cols.plausibility,
         ignorance,
-        mass_on_conflict: mass_on_empty,
-        mass_on_missing,
-        pignistic_prob,
-        mass_function_count: count_row.0,
+        mass_on_conflict: cols.mass_on_empty,
+        mass_on_missing: cols.mass_on_missing,
+        pignistic_prob: cols.pignistic_prob,
+        mass_function_count,
     }))
 }
 
@@ -1855,6 +1877,7 @@ pub async fn submit_evidence(
 #[cfg(feature = "db")]
 #[allow(clippy::type_complexity)]
 pub async fn claims_by_belief(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<BeliefFilterQuery>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -1863,48 +1886,31 @@ pub async fn claims_by_belief(
     let min_bel = params.min_belief.unwrap_or(0.0);
     let max_pl = params.max_plausibility.unwrap_or(1.0);
 
-    let rows: Vec<(
-        Uuid,
-        String,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-    )> = sqlx::query_as(
-        r#"
-        SELECT c.id, c.content, c.belief, c.plausibility, c.mass_on_empty, c.mass_on_missing
-        FROM claims c
-        WHERE c.belief >= $1 AND c.plausibility <= $2
-          AND ($3::uuid IS NULL OR c.id IN (
-              SELECT claim_id FROM claim_frames WHERE frame_id = $3
-          ))
-        ORDER BY c.belief DESC
-        LIMIT $4 OFFSET $5
-        "#,
+    // PR-07: this was an unfiltered, caller-paginated corpus scan projecting
+    // `c.content` with no `ViewerExtractor` at all. The statement now lives in
+    // `ClaimRepository::list_by_belief_bounds` with the visibility predicate on
+    // both `claims` and the `claim_frames` subquery.
+    let rows = epigraph_db::ClaimRepository::list_by_belief_bounds(
+        pool,
+        &viewer,
+        min_bel,
+        max_pl,
+        params.frame_id,
+        params.limit,
+        params.offset,
     )
-    .bind(min_bel)
-    .bind(max_pl)
-    .bind(params.frame_id)
-    .bind(params.limit)
-    .bind(params.offset)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::DatabaseError {
-        message: e.to_string(),
-    })?;
+    .await?;
 
     let mut result: Vec<BeliefClaimRow> = rows
         .into_iter()
-        .map(
-            |(id, content, belief, plausibility, mass_on_empty, mass_on_missing)| BeliefClaimRow {
-                id,
-                content,
-                belief,
-                plausibility,
-                mass_on_conflict: mass_on_empty,
-                mass_on_missing,
-            },
-        )
+        .map(|hit| BeliefClaimRow {
+            id: hit.id,
+            content: hit.content,
+            belief: hit.belief,
+            plausibility: hit.plausibility,
+            mass_on_conflict: hit.mass_on_empty,
+            mass_on_missing: hit.mass_on_missing,
+        })
         .collect();
 
     // SECURITY (A3): use the authenticated requester, not params.agent_id.
@@ -1943,78 +1949,53 @@ pub async fn frame_claims_sorted(
             id: frame_id.to_string(),
         })?;
 
-    // Validate sort_by
-    let order_col = match params.sort_by.as_str() {
-        "belief" => "c.belief",
-        "plausibility" => "c.plausibility",
-        "ignorance" => "(c.plausibility - c.belief)",
-        _ => {
-            return Err(ApiError::ValidationError {
-                field: "sort_by".to_string(),
-                reason: "Must be one of: belief, plausibility, ignorance".to_string(),
-            });
-        }
-    };
+    // Validate sort_by / order. `from_wire` returning `None` is a 400; the
+    // repo takes enums, so no caller-supplied string reaches the `ORDER BY`.
+    let sort = epigraph_db::BeliefSort::from_wire(params.sort_by.as_str()).ok_or(
+        ApiError::ValidationError {
+            field: "sort_by".to_string(),
+            reason: "Must be one of: belief, plausibility, ignorance".to_string(),
+        },
+    )?;
 
-    let order_dir = match params.order.as_str() {
-        "asc" => "ASC",
-        "desc" => "DESC",
-        _ => {
-            return Err(ApiError::ValidationError {
-                field: "order".to_string(),
-                reason: "Must be 'asc' or 'desc'".to_string(),
-            });
-        }
-    };
+    let direction = epigraph_db::SortDirection::from_wire(params.order.as_str()).ok_or(
+        ApiError::ValidationError {
+            field: "order".to_string(),
+            reason: "Must be 'asc' or 'desc'".to_string(),
+        },
+    )?;
 
-    // Build query with validated sort column and direction.
-    // These values come from match arms above, not user input, so this is safe.
-    let query = format!(
-        r#"
-        SELECT cf.claim_id, c.content, cf.hypothesis_index, c.belief, c.plausibility, c.mass_on_missing
-        FROM claim_frames cf
-        JOIN claims c ON c.id = cf.claim_id
-        WHERE cf.frame_id = $1
-        ORDER BY {order_col} {order_dir} NULLS LAST
-        LIMIT $2 OFFSET $3
-        "#,
-    );
-
-    let rows: Vec<(
-        Uuid,
-        String,
-        Option<i32>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-    )> = sqlx::query_as(&query)
-        .bind(frame_id)
-        .bind(params.limit)
-        .bind(params.offset)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: e.to_string(),
-        })?;
+    // PR-07: this statement used to be built here with `format!` +
+    // `sqlx::query_as` and NO visibility predicate, even though the handler was
+    // already holding a `Viewer` (spent above on the frame-existence check).
+    // Holding a viewer and not filtering on it is the plan's own definition of
+    // a fail-open, and it escaped `Viewer::splice`'s missing-marker panic only
+    // because `splice` was never called.
+    let rows = epigraph_db::ClaimRepository::frame_claims_sorted(
+        pool,
+        &viewer,
+        frame_id,
+        sort,
+        direction,
+        params.limit,
+        params.offset,
+    )
+    .await?;
 
     let mut result: Vec<FrameClaimBeliefRow> = rows
         .into_iter()
-        .map(
-            |(claim_id, content, hypothesis_index, belief, plausibility, mass_on_missing)| {
-                FrameClaimBeliefRow {
-                    claim_id,
-                    content,
-                    hypothesis_index,
-                    belief,
-                    plausibility,
-                    ignorance: match (belief, plausibility) {
-                        (Some(b), Some(p)) => Some(p - b),
-                        _ => None,
-                    },
-                    mass_on_missing,
-                }
+        .map(|hit| FrameClaimBeliefRow {
+            claim_id: hit.claim_id,
+            content: hit.content,
+            hypothesis_index: hit.hypothesis_index,
+            belief: hit.belief,
+            plausibility: hit.plausibility,
+            ignorance: match (hit.belief, hit.plausibility) {
+                (Some(b), Some(p)) => Some(p - b),
+                _ => None,
             },
-        )
+            mass_on_missing: hit.mass_on_missing,
+        })
         .collect();
 
     // SECURITY (A3): use the authenticated requester, not params.agent_id.

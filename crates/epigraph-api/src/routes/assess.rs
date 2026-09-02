@@ -96,19 +96,32 @@ pub async fn assess_claim(
     let pool = &state.db_pool;
 
     // ── 1. Load claim ────────────────────────────────────────────────────
-    let claim_row: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT id, content FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: e.to_string(),
-            })?;
-
-    let (_, claim_content) = claim_row.ok_or(ApiError::NotFound {
-        entity: "claim".to_string(),
-        id: claim_id.to_string(),
-    })?;
+    //
+    // PR-07: this was a bare `SELECT id, content FROM claims WHERE id = $1`
+    // even though the handler holds a `Viewer` and threads it through every
+    // downstream repo call. Two things were wrong with that. It made the
+    // endpoint an existence-and-content oracle over arbitrary claim ids — the
+    // 404 branch distinguished "does not exist" from "exists but is another
+    // tenant's", and `claim_content` feeds the BBA build, so the response's
+    // belief numbers were derived from content the caller may not read. And
+    // because nothing between the path id and the write checked visibility, an
+    // authenticated stranger could attach evidence to and mutate the belief of
+    // another tenant's claim.
+    //
+    // `get_by_id` is viewer-filtered, so an invisible claim now takes the same
+    // `None` branch as a nonexistent one and both render as 404.
+    //
+    // This is the READ half only. Gating the subsequent write on
+    // `viewer.writable_bind()` (member-with-write-role, not merely
+    // member-who-can-read) is PR-16's scope; the read fix belongs here because
+    // the viewer was already in hand.
+    let claim = epigraph_db::ClaimRepository::get_by_id(pool, &viewer, claim_id.into())
+        .await?
+        .ok_or(ApiError::NotFound {
+            entity: "claim".to_string(),
+            id: claim_id.to_string(),
+        })?;
+    let claim_content = claim.content;
 
     // ── 2. Load calibration config ───────────────────────────────────────
     let calibration_config = CalibrationConfig::load(std::path::Path::new("calibration.toml"))

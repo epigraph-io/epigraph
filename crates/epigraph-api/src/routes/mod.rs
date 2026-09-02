@@ -84,6 +84,9 @@ pub mod perspective;
 #[cfg(feature = "db")]
 pub mod policies;
 pub mod political;
+/// Deterministic 2-D PCA used by `/themes/:id/embeddings` so that endpoint can
+/// serve theme-splitting clients without disclosing raw embedding vectors.
+pub mod projection;
 #[cfg(feature = "db")]
 pub mod provenance;
 pub mod rag;

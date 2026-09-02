@@ -532,84 +532,60 @@ pub async fn mark_duplicate(
 ///
 /// - 404 Not Found: Claim does not exist
 /// - 200 OK: Version history returned
+///
+/// The whole chain is read as the caller's `Viewer`
+/// (`ClaimRepository::version_history`). A claim the viewer cannot see is
+/// reported as 404, identically to one that does not exist: before PR-07 this
+/// handler walked `claims` with three unfiltered inline statements and returned
+/// every revision's `content`, so it disclosed not only other tenants' claim
+/// text but the full edit history behind it.
 #[cfg(feature = "db")]
 pub async fn claim_history(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<VersionHistoryResponse>, ApiError> {
-    // Walk the supersession chain using database queries
-    // First, walk backwards to find the root
-    let mut root_id = claim_id;
-    loop {
-        let row: Option<(Option<Uuid>,)> =
-            sqlx::query_as("SELECT supersedes FROM claims WHERE id = $1")
-                .bind(root_id)
-                .fetch_optional(&state.db_pool)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("DB error: {e}"),
-                })?;
-
-        match row {
-            None => {
-                return Err(ApiError::NotFound {
-                    entity: "Claim".to_string(),
-                    id: claim_id.to_string(),
-                });
-            }
-            Some((Some(prev_id),)) => root_id = prev_id,
-            Some((None,)) => break,
-        }
-    }
-
-    // Walk forward from root to build version list
-    let mut versions = Vec::new();
-    let mut current_id = Some(root_id);
-    let mut version_number: u32 = 1;
-    let mut current_version: u32 = 1;
-
-    while let Some(id) = current_id {
-        let row: Option<(Uuid, String, f64, bool, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT id, content, truth_value, COALESCE(is_current, true), created_at FROM claims WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&state.db_pool)
+    let hits = epigraph_db::ClaimRepository::version_history(&state.db_pool, &viewer, claim_id)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("DB error: {e}"),
         })?;
 
-        if let Some((cid, content, truth_value, is_current, created_at)) = row {
-            // Find forward link: which claim supersedes this one?
-            let superseded_by: Option<Uuid> =
-                sqlx::query_scalar("SELECT id FROM claims WHERE supersedes = $1")
-                    .bind(cid)
-                    .fetch_optional(&state.db_pool)
-                    .await
-                    .map_err(|e| ApiError::InternalError {
-                        message: format!("DB error: {e}"),
-                    })?;
-
-            versions.push(ClaimVersion {
-                claim_id: cid,
-                content,
-                truth_value,
-                version: version_number,
-                is_current,
-                created_at,
-                superseded_by,
-            });
-
-            if is_current {
-                current_version = version_number;
-            }
-
-            current_id = superseded_by;
-            version_number += 1;
-        } else {
-            break;
-        }
+    if hits.is_empty() {
+        return Err(ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: claim_id.to_string(),
+        });
     }
+
+    // `superseded_by` comes from `claims.supersedes` (see
+    // `ClaimVersionHit::superseded_by`), NOT from the position of the next row.
+    // Positional inference is wrong on a forked chain — `mark_duplicate` points
+    // every duplicate at the same canonical claim, so a claim with two marked
+    // duplicates has two successors and "the next row" names an arbitrary one
+    // of them. `version` is still positional, but the repo's
+    // `ORDER BY depth, id` is a total order, so it is at least stable across
+    // identical requests.
+    let mut current_version: u32 = 1;
+    let versions: Vec<ClaimVersion> = hits
+        .iter()
+        .enumerate()
+        .map(|(idx, hit)| {
+            let version = (idx as u32) + 1;
+            if hit.is_current {
+                current_version = version;
+            }
+            ClaimVersion {
+                claim_id: hit.id,
+                content: hit.content.clone(),
+                truth_value: hit.truth_value,
+                version,
+                is_current: hit.is_current,
+                created_at: hit.created_at,
+                superseded_by: hit.superseded_by,
+            }
+        })
+        .collect();
 
     let total_versions = versions.len();
 

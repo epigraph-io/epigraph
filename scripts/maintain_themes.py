@@ -225,7 +225,12 @@ def auto_split_theme(theme_id, theme_label, n_clusters=3, min_claims=500):
         return []
 
     ids = [c["id"] for c in claims]
-    embeddings = np.array([c["embedding"] for c in claims])
+    # PR-07: the endpoint returns a deterministic 2-D PCA projection, not raw
+    # 1536-d vectors (plan section 4.9 row 4 -- embeddings are approximately
+    # invertible to claim content, and this endpoint returned 5000 of them at
+    # claims:read). The projection preserves the dominant separating axis, which
+    # is all k-means needs to decide which claim goes in which half.
+    embeddings = np.array([c["projection"] for c in claims])
 
     km = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=min(1000, len(claims)))
     labels = km.fit_predict(embeddings)
@@ -237,14 +242,15 @@ def auto_split_theme(theme_id, theme_label, n_clusters=3, min_claims=500):
         if count < 50:
             continue
 
-        centroid = km.cluster_centers_[c].tolist()
         cluster_ids = [ids[i] for i in np.where(mask)[0]]
         sub_label = f"{theme_label} (sub-{c + 1})"
 
+        # `centroid` is omitted deliberately. km.cluster_centers_ is now a 2-D
+        # point in projection space, which is NOT a valid 1536-d theme centroid.
+        # The server averages the real embeddings of `claim_ids` instead.
         result = api_post("/api/v1/themes/create-with-centroid", {
             "label": sub_label,
             "description": f"Auto-split from '{theme_label}'.",
-            "centroid": centroid,
             "claim_ids": cluster_ids,
         })
 

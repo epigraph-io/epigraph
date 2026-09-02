@@ -666,6 +666,16 @@ pub async fn semantic_search(
                 let selected_claim_ids: Vec<Uuid> =
                     selected_rows.iter().map(|(id, _, _)| *id).collect();
 
+                // NOTE (PR-07): this statement is deliberately NOT viewer-
+                // spliced, and that is safe by derivation rather than by
+                // oversight. It is bounded by `WHERE c.id = ANY($2)` over
+                // `selected_claim_ids`, every element of which came out of
+                // `candidates_in_themes_at_dim` — which IS viewer-filtered. A
+                // second predicate here would be redundant. Do not "harden" it
+                // by adding a marker without also re-checking that derivation:
+                // if the source of `selected_claim_ids` ever changes, this
+                // needs a real predicate, not a marker.
+                //
                 // Fetch full claim data for the selected IDs (including CDST
                 // columns + theme_id and the latest cluster_id from
                 // claim_cluster_membership). #49: surface the partition
@@ -699,56 +709,45 @@ pub async fn semantic_search(
                         message: format!("Claim fetch failed: {e}"),
                     })?;
 
-                // Fetch graph neighbors for all selected claims
-                let neighbor_sql = format!(
-                    r#"
-                    SELECT
-                        e.source_id, e.target_id, e.relationship,
-                        c.id as neighbor_id, left(c.content, 200) as content,
-                        c.truth_value, c.belief as nb_belief, c.plausibility as nb_plausibility,
-                        (1 - (c.{claim_embedding_col} <=> $1::vector))::float8 as similarity,
-                        CASE WHEN e.source_id = ANY($2) THEN 'outbound' ELSE 'inbound' END as direction
-                    FROM edges e
-                    JOIN claims c ON c.id = CASE WHEN e.source_id = ANY($2) THEN e.target_id ELSE e.source_id END
-                    WHERE (e.source_id = ANY($2) OR e.target_id = ANY($2))
-                      AND e.source_type = 'claim' AND e.target_type = 'claim'
-                      AND e.relationship IN ('CORROBORATES', 'supports', 'refines', 'continues_argument', 'contradicts')
-                    ORDER BY c.{claim_embedding_col} <=> $1::vector
-                    LIMIT 50
-                    "#
-                );
-                let neighbor_rows = sqlx::query(&neighbor_sql)
-                    .bind(&embedding_str)
-                    .bind(&selected_claim_ids)
-                    .fetch_all(&state.db_pool)
-                    .await
-                    .unwrap_or_default();
+                // Fetch graph neighbors for all selected claims.
+                //
+                // PR-07: this ran unfiltered inline. The neighbour ids are the
+                // FAR side of each edge — they are not in `selected_claim_ids`
+                // and were never viewer-checked — so 200 characters of
+                // arbitrary out-of-tenant claim content rode out attached to
+                // every result. The repo now splices the predicate onto the
+                // joined `claims`, dropping invisible neighbours entirely.
+                let neighbor_rows = epigraph_db::ClaimRepository::semantic_graph_neighbors(
+                    &state.db_pool,
+                    &viewer,
+                    claim_embedding_col,
+                    &embedding_str,
+                    &selected_claim_ids,
+                )
+                .await
+                .unwrap_or_default();
 
                 // Group neighbors by the selected claim they connect to
                 let mut neighbor_map: HashMap<Uuid, Vec<GraphNeighbor>> = HashMap::new();
-                for row in &neighbor_rows {
-                    let source_id: Uuid = row.get("source_id");
-                    let target_id: Uuid = row.get("target_id");
-                    let direction: String = row.get("direction");
-
+                for row in neighbor_rows {
                     // Determine which selected claim this neighbor connects to
-                    let parent_id = if selected_claim_ids.contains(&source_id) {
-                        source_id
+                    let parent_id = if selected_claim_ids.contains(&row.source_id) {
+                        row.source_id
                     } else {
-                        target_id
+                        row.target_id
                     };
 
                     let neighbor = GraphNeighbor {
-                        claim_id: row.get("neighbor_id"),
-                        statement: row.get::<String, _>("content"),
-                        similarity: row.get("similarity"),
+                        claim_id: row.neighbor_id,
+                        statement: row.content,
+                        similarity: row.similarity,
                         epistemic: EpistemicState::from_row(
-                            row.get("truth_value"),
-                            row.get("nb_belief"),
-                            row.get("nb_plausibility"),
+                            row.truth_value,
+                            row.nb_belief,
+                            row.nb_plausibility,
                         ),
-                        edge_type: row.get("relationship"),
-                        direction,
+                        edge_type: row.relationship,
+                        direction: row.direction,
                     };
 
                     neighbor_map.entry(parent_id).or_default().push(neighbor);
@@ -808,65 +807,43 @@ pub async fn semantic_search(
         let query_embedding = generate_query_embedding(&state, query).await;
         let embedding_str = format_embedding_for_pgvector(&query_embedding);
 
-        // Step 2b: Flat pgvector similarity search (default path)
-        // Uses parameterized query to prevent SQL injection.
-        // The <=> operator computes cosine distance; we subtract from 1 to get similarity.
-        let rows = sqlx::query(
-            r#"
-            WITH query_vec AS (
-                SELECT $1::vector AS vec
-            )
-            SELECT
-                c.id as claim_id,
-                c.content as statement,
-                1 - (c.embedding <=> q.vec) as similarity,
-                c.truth_value,
-                c.belief,
-                c.plausibility,
-                c.agent_id,
-                c.trace_id,
-                c.labels[1] as claim_type,
-                c.created_at
-            FROM claims c, query_vec q
-            WHERE c.embedding IS NOT NULL
-              AND 1 - (c.embedding <=> q.vec) >= $2
-              AND ($3::text IS NULL OR $3 = ANY(c.labels))
-              AND ($4::timestamptz IS NULL OR c.created_at >= $4)
-              AND ($5::timestamptz IS NULL OR c.created_at <= $5)
-              AND ($6::uuid IS NULL OR c.agent_id = $6)
-            ORDER BY similarity DESC
-            LIMIT $7
-            "#,
+        // Step 2b: Flat pgvector similarity search (DEFAULT path)
+        //
+        // PR-07: this is reached whenever `diverse` is absent — i.e. the
+        // default request shape — and whenever `diverse=true` but the corpus
+        // has no themes. It ran unfiltered and returned `claims.content`, with
+        // no `check_content_access` pass behind it: an authenticated principal
+        // could submit an arbitrary probe vector and get other tenants' claim
+        // text back, ranked by relevance. The statement now lives in
+        // `ClaimRepository::semantic_search_flat` with the predicate spliced in.
+        let rows = epigraph_db::ClaimRepository::semantic_search_flat(
+            &state.db_pool,
+            &viewer,
+            &embedding_str,
+            min_similarity,
+            request.claim_type.as_deref(),
+            request.created_after,
+            request.created_before,
+            request.agent_id,
+            limit as i64,
         )
-        .bind(&embedding_str)
-        .bind(min_similarity)
-        .bind(request.claim_type.as_deref())
-        .bind(request.created_after)
-        .bind(request.created_before)
-        .bind(request.agent_id)
-        .bind(limit as i64)
-        .fetch_all(&state.db_pool)
         .await
         .map_err(|e| ApiError::InternalError {
-            message: format!("Database query failed: {}", e),
+            message: format!("Database query failed: {e}"),
         })?;
 
         // Step 3: Convert rows to response DTOs
         let results: Vec<SemanticSearchResult> = rows
-            .iter()
+            .into_iter()
             .map(|row| SemanticSearchResult {
-                claim_id: row.get("claim_id"),
-                statement: row.get("statement"),
-                similarity: row.get("similarity"),
-                epistemic: EpistemicState::from_row(
-                    row.get("truth_value"),
-                    row.get("belief"),
-                    row.get("plausibility"),
-                ),
-                agent_id: row.get("agent_id"),
-                trace_id: row.get("trace_id"),
-                claim_type: row.get("claim_type"),
-                created_at: row.get("created_at"),
+                claim_id: row.claim_id,
+                statement: row.statement,
+                similarity: row.similarity,
+                epistemic: EpistemicState::from_row(row.truth_value, row.belief, row.plausibility),
+                agent_id: row.agent_id,
+                trace_id: row.trace_id,
+                claim_type: row.claim_type,
+                created_at: row.created_at,
                 graph_neighbors: None,
                 theme_id: None,
                 cluster_id: None,

@@ -813,17 +813,21 @@ pub async fn belief_at_time(
             id: claim_id.to_string(),
         })?;
 
-    // Fetch all evidence up to the given timestamp
-    let evidence_rows: Vec<EvidenceAtRow> = sqlx::query_as(
-        "SELECT e.id, e.evidence_type, e.properties, e.created_at \
-         FROM evidence e \
-         JOIN edges ed ON ed.source_id = e.id AND ed.target_type = 'claim' AND ed.target_id = $1 \
-         WHERE e.created_at <= $2 \
-         ORDER BY e.created_at ASC",
+    // Fetch all evidence up to the given timestamp.
+    //
+    // PR-07 follow-up: this ran inline and unfiltered while the handler held a
+    // Viewer it had already spent on the existence check above. `evidence` and
+    // `edges` are both tier_a in migration 062, so both are filterable; the
+    // repo function now splices a predicate onto each. The exposure was an
+    // inference oracle rather than raw text — `evidence_count` plus a truth
+    // value replayed from `properties->confidence` — but it was gated only by
+    // the parent claim's visibility, not the evidence's own.
+    let evidence_rows = epigraph_db::EvidenceRepository::provided_for_claim_as_of(
+        &state.db_pool,
+        &viewer,
+        claim_id,
+        params.as_of,
     )
-    .bind(claim_id)
-    .bind(params.as_of)
-    .fetch_all(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to fetch evidence: {e}"),
@@ -887,17 +891,9 @@ struct FactorRow {
     description: Option<String>,
 }
 
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct EvidenceAtRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    #[allow(dead_code)]
-    evidence_type: String,
-    properties: Option<serde_json::Value>,
-    #[allow(dead_code)]
-    created_at: chrono::DateTime<chrono::Utc>,
-}
+// `EvidenceAtRow` was deleted with the inline evidence read in
+// `belief_at_time`; its replacement is `epigraph_db::EvidenceAtTimeRow`, whose
+// query carries `/* {VISIBILITY:e} */` and `/* {VISIBILITY:ed} */`.
 
 // ── Internal helpers ──
 

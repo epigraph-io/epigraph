@@ -1563,9 +1563,42 @@ pub struct ThemeEmbeddingsQuery {
     pub limit: Option<i64>,
 }
 
-/// Get claim IDs and embeddings for a theme (for client-side k-means).
+/// Get claim IDs and a 2-D projection of their embeddings for a theme.
 ///
 /// GET /api/v1/themes/:id/embeddings
+///
+/// # Why this returns a projection and not the vectors (plan §4.9 row 4)
+///
+/// This handler used to serialise the complete raw 1536-d `claims.embedding`
+/// for up to 5000 claims, gated on `claims:read`. `PENDING_SERVICE_SCOPES`
+/// grants `claims:read`, so every registrant could bulk-download the embedding
+/// corpus — and embeddings are approximately invertible to the content they
+/// encode. Tenancy filtering (`ClaimThemeRepository::get_theme_embeddings`
+/// takes a `&Viewer`) bounds that to *within* a tenant; it does not make bulk
+/// embedding export acceptable, which is why the plan rates it a blocker in all
+/// three columns and assigns the fix here.
+///
+/// Two changes discharge it:
+///
+/// * The response carries `projection: [x, y]` — two floats — instead of
+///   `embedding: [...1536 floats...]`. The projection is a deterministic 2-D
+///   PCA (see [`crate::routes::projection`]) that preserves the dominant
+///   separating axis k-means needs to split an oversized theme.
+/// * The gate moves from `claims:read` to `claims:admin`, matching its sibling
+///   `create_theme_with_centroid`. Theme maintenance is an operator activity.
+///
+/// The one real consumer, `scripts/maintain_themes.py::split_oversized_theme`,
+/// used the raw vectors for two things: k-means labels (served by the
+/// projection) and the resulting sub-theme centroids (now computed server-side
+/// — `CreateThemeWithCentroidRequest::centroid` is optional, and omitting it
+/// averages the claims' real embeddings in the database).
+///
+/// The scope check is deliberately **not** written as
+/// `if let Some(auth) = auth_ctx { check_scopes(...) }`. That idiom performs no
+/// authorization at all when `AuthContext` is absent, and is neutralized only
+/// by `ViewerExtractor` running first and 401-ing — which makes an authz
+/// control load-bearing on axum parameter order. It is `ok_or` here so the
+/// control stands on its own.
 #[cfg(feature = "db")]
 pub async fn get_theme_embeddings(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -1574,9 +1607,12 @@ pub async fn get_theme_embeddings(
     Path(theme_id): Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<ThemeEmbeddingsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "theme embeddings require authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1584,25 +1620,36 @@ pub async fn get_theme_embeddings(
     let rows = ClaimThemeRepository::get_theme_embeddings(&state.db_pool, &viewer, theme_id, limit)
         .await?;
 
-    let claims: Vec<serde_json::Value> = rows
+    // Parse pgvector text "[0.1,0.2,...]" into vectors for the projection.
+    // These never leave this function: only the 2-D result is serialised.
+    let vectors: Vec<Vec<f64>> = rows
         .iter()
-        .map(|(id, emb_str)| {
-            // Parse pgvector text "[0.1,0.2,...]" to JSON array
-            let nums: Vec<f64> = emb_str
+        .map(|(_, emb_str)| {
+            emb_str
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .split(',')
                 .filter_map(|s| s.trim().parse::<f64>().ok())
-                .collect();
+                .collect()
+        })
+        .collect();
+
+    let projected = crate::routes::projection::project_to_2d(&vectors);
+
+    let claims: Vec<serde_json::Value> = rows
+        .iter()
+        .zip(projected.iter())
+        .map(|((id, _), xy)| {
             serde_json::json!({
                 "id": id,
-                "embedding": nums,
+                "projection": [xy[0], xy[1]],
             })
         })
         .collect();
 
     Ok(Json(serde_json::json!({
         "count": claims.len(),
+        "dimensions": 2,
         "claims": claims,
     })))
 }
@@ -1628,7 +1675,15 @@ pub async fn get_theme_embeddings(
 pub struct CreateThemeWithCentroidRequest {
     pub label: String,
     pub description: String,
-    pub centroid: Vec<f64>,
+    /// Optional explicit centroid.
+    ///
+    /// Omit it (or send an empty array) to have the server average the
+    /// `claim_ids`' own embeddings instead. That is now the preferred form:
+    /// PR-07 stopped `GET /themes/:id/embeddings` returning raw vectors, so a
+    /// theme-splitting client has nothing to average client-side, and the
+    /// server has the real vectors anyway.
+    #[serde(default)]
+    pub centroid: Option<Vec<f64>>,
     pub claim_ids: Vec<Uuid>,
 }
 
@@ -1639,6 +1694,7 @@ pub struct CreateThemeWithCentroidRequest {
 /// Used by auto-split to persist k-means results.
 #[cfg(feature = "db")]
 pub async fn create_theme_with_centroid(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateThemeWithCentroidRequest>,
@@ -1656,17 +1712,32 @@ pub async fn create_theme_with_centroid(
     let theme =
         ClaimThemeRepository::create(&state.db_pool, &request.label, &request.description).await?;
 
-    // Set centroid (convert Vec<f64> to pgvector string)
-    let centroid_str = format!(
-        "[{}]",
-        request
-            .centroid
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    ClaimThemeRepository::set_centroid(&state.db_pool, theme.id, &centroid_str).await?;
+    // Centroid: use the caller's vector when supplied, otherwise average the
+    // claims' own embeddings server-side. The latter is the path a theme-split
+    // client takes now that `/themes/:id/embeddings` no longer returns raw
+    // vectors for it to average itself.
+    match request.centroid.as_ref().filter(|c| !c.is_empty()) {
+        Some(centroid) => {
+            let centroid_str = format!(
+                "[{}]",
+                centroid
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            ClaimThemeRepository::set_centroid(&state.db_pool, theme.id, &centroid_str).await?;
+        }
+        None => {
+            ClaimThemeRepository::set_centroid_from_claims(
+                &state.db_pool,
+                &viewer,
+                theme.id,
+                &request.claim_ids,
+            )
+            .await?;
+        }
+    }
 
     // Bulk assign claims
     let assigned =

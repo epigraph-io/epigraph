@@ -382,6 +382,9 @@ impl SemanticLinkRepository {
         _viewer: &crate::visibility::Viewer,
         id: SemanticLinkId,
     ) -> Result<bool, DbError> {
+        // VISIBILITY-EXEMPT: PR-16 owns the write-side predicate.
+        // Recognised by `crates/epigraph-db/tests/visibility_lint.rs`; see the
+        // matching note in `EvidenceRepository::delete`.
         let uuid: Uuid = id.into();
 
         let result = sqlx::query(

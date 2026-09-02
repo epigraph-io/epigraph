@@ -6,7 +6,24 @@
     "Q2_epigraph_seed": "keep for rollout, delete in follow-up (plan recommendation)",
     "Q3_community_acl": "proceed; POST /communities/:id/members performs no authorization today",
     "Q4_allow_all_identities": "fail closed; allow_all_identities defaults false, explicit opt-in required",
-    "Q5_pad_to": "256 (plan recommendation)"
+    "Q5_pad_to": "256 (plan recommendation)",
+    "Q6_check_content_access_retention": {
+      "decision": "DIVERGE from conformance section F5. PR-07 retains all 30 check_content_access call sites instead of substituting them for Viewer.",
+      "rationale": "Migration 062 adds `visibility varchar(16) NOT NULL DEFAULT 'public'` to every tier_a table and backfills nothing. No PR before PR-12 transcribes ownership.partition_type into claims.visibility. So TODAY every spliced viewer predicate matches every row, and check_content_access is the only control with live effect on the handlers that have one. Deleting the sites now would take a fixture-private claim from redacted to fully readable by a stranger's token - the removal, not the retention, would be the fail-open. Two filters compose strictly narrower than either.",
+      "gated_on": "PR-12 transcription completing (claims.visibility populated from ownership.partition_type)",
+      "removal_owner": "PR-14 (refactor(api,mcp): delete redaction), which already plans to delete check_content_access and redact_claim_content",
+      "hazard_if_ignored": "PR-14 deletes the compensating control. Every site on open_findings F-inline-claim-content-reads becomes a live leak on that day unless PR-12 has landed first. PR-14 MUST NOT land before PR-12.",
+      "sites": "api: belief.rs 2, claims.rs 3, edges.rs 11, graph_query.rs 2; mcp: tools/claims.rs 5, tools/paper_queries.rs 5, tools/redaction.rs 1"
+    },
+    "Q7_failopen_scope_site_ownership": {
+      "decision": "The remaining 37 fail-open `if let Some(axum::Extension(ref auth)) = auth_ctx { check_scopes(..) }` sites are RESCOPED out of PR-07.",
+      "rationale": "The plan's *Files:* line assigns 'all 39 fail-open sites' to PR-07, but PR-07's charter is READ paths. The overwhelming majority of these sites gate writes (crud.rs 11, edges.rs 9, tasks.rs 6, agent_keys.rs 3). Converting a write path needs `viewer.writable_bind()` - member-with-write-role, not merely member-who-can-read - which is PR-16's mechanism and does not exist yet.",
+      "assignments": {
+        "PR-16 (write-path gate)": "agent_keys.rs 3, agents.rs 2, audit.rs 1, claims.rs 2, crud.rs 11, edges.rs 9, papers.rs 1, tasks.rs 6 = 35",
+        "PR-10 (webhook fan-out)": "webhooks.rs 2 - contested between PR-07 section 4.12 and PR-10; assigned to PR-10 because PR-10 already rewrites both webhook handlers and adds their auth extractors"
+      },
+      "ratchet": "crates/epigraph-api/tests/viewer_route_table_lint.rs::fail_open_scope_check_sites_do_not_increase asserts the per-file counts EXACTLY, so neither PR can silently grow the set, and lowering it requires editing the list."
+    }
   },
   "blocked_measurements": {
     "M1": "ownership row census - needs prod DB",
@@ -37,7 +54,7 @@
         "sha": "8c70e5a",
         "verified_by": "main-agent",
         "tests": "3669 passed / 0 failed / 69 ignored",
-        "notes": "anonymous surface = /health + /api/v1/openapi.json only, locked by source lint; /metrics -> internal listener EPIGRAPH_METRICS_ADDR 127.0.0.1:9090 (Q1 option a)"
+        "notes": "anonymous surface = /health + /api/v1/openapi.json only, locked by source lint; /metrics -> internal listener EPIGRAPH_METRICS_ADDR 127.0.0.1:9090 (Q1 option a). NOTE: this discharged the plan's 'move 104 non-allowlisted registrations to protected' item, which the PR-07 *Files:* line is sometimes misread as re-owning."
       },
       {
         "pr": "PR-04",
@@ -57,24 +74,94 @@
         "pr": "chore",
         "sha": "b58dc09",
         "notes": "dropped 2 orphaned .sqlx entries left by PR-05"
+      },
+      {
+        "pr": "PR-06",
+        "sha": "61cab26a (merged into the branch; not a standalone commit)",
+        "verified_by": "reconstructed from the tree during PR-07 review",
+        "notes": "LEDGER BACKFILL. PR-06's work is demonstrably present at 61cab26a but was never recorded: ViewerExtractor across 30 route files, ChallengeRepository::list_for_claim with /* {VISIBILITY:challenges} */, and the repo read functions taking &Viewer. It also resolved F-failopen-catchall (access_control.rs:168 now reads `_ => ContentAccess::Redacted` with an explanatory comment). CREDIT CORRECTION: PR-07 acceptance criterion #3 (challenge.rs takes a ViewerExtractor and calls list_for_claim) was delivered HERE, not by PR-07 - `git show 61cab26a:crates/epigraph-api/src/routes/challenge.rs` shows both already present. PR-07's only change to that file is a doc rewrite plus `let _ = &viewer;` in the not(db) arm."
+      },
+      {
+        "pr": "PR-07",
+        "branch": "tenancy/pr-07-viewer-http-reads",
+        "verified_by": "implement -> verify -> critic -> revise cycle",
+        "tests": "3803 passed / 33 failed / 70 ignored across 354 binaries (cargo test --workspace --locked --no-fail-fast). All 33 failures are the environmental name guard described in gate.test_prescribed - NOT this PR. Verified exhaustively: the log contains exactly 33 `panicked at` lines and all 33 carry the `refusing to run destructive claim fixtures` message, at exactly two locations (claim_repo_helpers.rs:58 x7, epigraph-mcp/tests/common/mod.rs:56 x26). Zero failures are attributable to PR-07.",
+        "gate": {
+          "fmt": "cargo fmt --all -- --check -> 0",
+          "clippy": "cargo clippy --workspace --all-targets --locked -- -D warnings -> 0",
+          "test_prescribed": "cargo test --workspace --locked -> 101. NOT a PR-07 failure. The command is fail-fast and aborts at epigraph-db --test claim_repo_helpers on the NAME-based assert_disposable_db guard, because the briefed throwaway is named `epigraph_tenancy_pr07` and the guard accepts only `_sqlx_test*` or `*_test`. Reproduced in isolation: 7 of 8 fail in 0.30s, panicking at claim_repo_helpers.rs:58 BEFORE any test logic. Both guard files are untouched by this PR.",
+          "test_no_fail_fast": "cargo test --workspace --locked --no-fail-fast -> 101. Run because the prescribed fail-fast command aborts after 170 binaries and would have hidden any real failure behind the guard. 354 binaries, 3803 passed / 33 failed / 70 ignored; the 9 failing binaries are claim_repo_helpers plus 8 epigraph-mcp binaries, all guard panics.",
+          "sqlx": ".sqlx/ clean. Zero query!/query_as!/query_scalar! macros were added - all new SQL is runtime-checked sqlx::query, because the viewer predicate is spliced in as a string fragment and a macro needs a compile-time literal. `cargo sqlx prepare` was therefore not required.",
+          "not_run": "cargo check -p epigraph-api --no-default-features --locked. Different feature resolution = full dependency re-check; disk was at 95% (7.9G free with a 37G target dir) and an ENOSPC mid-build was the larger risk. Tracked as open finding F-not-db-build-unverified."
+        },
+        "inherited_by_pr08": "Do NOT read this entry as 'PR-07 was green' and then re-diagnose the same 33 guard failures. They are environmental and pre-existing. Give PR-08 a database whose name ends in `_test` - see env.pr07_throwaway_db.",
+        "acceptance": {
+          "1_no_content_handler_lacks_a_viewer": "MET, and the verification is now itself verified. The plan cited a 'route-table test' that did not exist; tests/viewer_route_table_lint.rs implements it. FOLLOW-UP CORRECTION: the first revision of that lint could not have caught frame_claims_sorted either, and the entry that claimed otherwise was wrong. Two independent holes, both closed: (a) it scanned only FORWARD from the sqlx::query token, so a `let sql = format!(..); sqlx::query(&sql)` statement - frame_claims_sorted's exact shape - was invisible; replayed against origin/integration/tenancy the old algorithm scores belief.rs:1, missing the motivating defect, and it measured search.rs:0 on a live format!-built claim-content read in PR-07's own tree. (b) reads_claim_content recognised one table and one column (claims + content), so it could not see evidence, challenges.explanation, claim_versions.content, claims.properties or claims.embedding - all of which PR-07's own acceptance criteria cover. The lint now resolves the let-binding and recognises the tier_a projections, and the fixed 2500-byte window is replaced by the call's balanced-paren argument region (the window ALSO over-counted: conventions.rs was charged for a `SELECT labels FROM claims` because a `content:` response field sat 11 lines below). a_format_built_statement_is_counted pins all of it against synthetic fixtures, so the blind spot cannot reopen silently.",
+          "2_theme_embeddings_no_raw_vectors": "MET. Was wholly unimplemented in the first pass (crud.rs was not even in the diff). get_theme_embeddings now returns {id, projection:[x,y]} from a deterministic 2-D PCA (routes/projection.rs, 6 unit tests) and gates on claims:admin, not claims:read. Its fail-open `if let Some(auth)` scope check became `ok_or`. create_theme_with_centroid's `centroid` is now optional so scripts/maintain_themes.py can still split themes without raw vectors (server averages the claim embeddings). Locked by tests/pr07_acceptance_http.rs, which deep-scans the response for any numeric array longer than 2, at three different limits.",
+          "3_challenges_no_foreign_explanation": "MET. INHERITED FROM PR-06 (see the PR-06 entry); PR-07's contribution is the coverage. FOLLOW-UP CORRECTION: the coverage PR-07 first added did not test the property. challenges_list_is_reachable_and_carries_no_foreign_explanation seeds a challenge on an UNRELATED claim and asserts it is absent from the subject claim's listing - that passes on any correctly-keyed `WHERE claim_id = $1` with no visibility predicate at all. Its excuse ('every fixture row is public until PR-12') was false by this PR's own technique: tenant_isolation_http.rs::belief_http_corpus hand-sets visibility='group' on a claim_frames row to make {VISIBILITY:cf} load-bearing today, and challenges is in migration 062's tier_a exactly as claim_frames is. challenges_list_hides_a_group_private_explanation_from_a_stranger now seeds TWO challenges on the SAME claim, privatises one, and asserts a stranger's 200 omits its id and explanation while still carrying the public one. Falsified under mutation: with Viewer::predicate_fragment's Scoped arm emptied, the new test fails and the old one still PASSES - which is the finding, demonstrated."
+        },
+        "files_line_reconciliation": {
+          "note": "The plan's PR-07 *Files:* line names four items. Reconciled honestly rather than claimed.",
+          "1_all_39_fail_open_sites_to_ViewerExtractor": "PARTIAL + RESCOPED. Measured 38 at the merge base by the plan's verbatim idiom, not 39. PR-07 converted crud.rs::get_theme_embeddings (-1 => 37) and additionally gave ViewerExtractor to graph_query.rs::execute_graph_query and belief.rs::claims_by_belief (which had none at all). The remaining 37 are write paths and are rescoped per decision Q7.",
+          "2_the_32_check_content_access_sites_to_Viewer": "NOT DONE, DELIBERATELY. See decision Q6. The plan's own line enumerates only 21 line numbers against a stated 32 - an arithmetic gap in the plan that neither the implementer nor the verifier caught. Actual tree count is 30 (api 18, mcp 11 + redaction.rs 1).",
+          "3_crud.rs_ids_plus_2d_projection_at_claims_admin": "DONE. See acceptance #2.",
+          "4_challenge.rs_gains_the_predicate": "ALREADY TRUE at the merge base; delivered by PR-06. PR-07 added the missing test."
+        },
+        "scope_substitution": {
+          "note": "PR-07 also did work the *Files:* line does not name. Recorded so it is not read as unowned creep.",
+          "new_repos_graph_view.rs": "9 viewer-filtered read functions backing routes/graph.rs, graph_neighborhood.rs and graph_query_utils.rs. Justified by CLAUDE.md ('All SQL stays in crates/epigraph-db/src/repos/'): the {VISIBILITY:...} marker convention is a repo-layer convention and a handler cannot splice a predicate into SQL it does not own.",
+          "search.rs_semantic_search": "The DEFAULT path of POST /api/v1/search/semantic returned claims.content for the whole corpus ranked against a caller-supplied probe vector, unfiltered, with no check_content_access behind it. Same exfiltration primitive ClaimRepository::rag_hybrid_context documents as 'the single highest-value exfiltration primitive in the API'. Fixed in rag.rs in the first pass and missed here because the self-audit was scoped to touched files. Now ClaimRepository::semantic_search_flat + semantic_graph_neighbors.",
+          "graph_query_utils.rs_load_subgraph": "Shared helper reached from 3 handlers, took no Viewer, projected claims.content into every node label. Now takes &Viewer; claims/evidence/edges all filtered via GraphViewRepository::subgraph_*.",
+          "assess.rs_assess_claim": "Held a Viewer and loaded its subject claim with a bare keyed read - an existence-and-content oracle, and the reason an authenticated stranger could attach evidence to another tenant's claim. Now ClaimRepository::get_by_id.",
+          "membership_table_filters": "claim_cluster_membership and claim_neighborhood_membership ARE in migration 062's tier_a array. All 4 join sites in graph_view.rs now splice /* {VISIBILITY:m} */. The module doc previously discussed only the non-tenancy-bearing graph_* metadata tables and was silent on these two.",
+          "node_edge_consistency": "graph_neighborhood.rs's node projections became viewer-filtered while its 4 edge projections did not, so responses could name ids absent from `nodes` - an id-enumeration oracle. Edges and compound_groups.member_atom_ids are now constrained to the surviving node set.",
+          "version_history_correctness": "ORDER BY depth is not a total order and superseded_by was derived from row POSITION, which is wrong at a fork (mark_duplicate points every duplicate at the same canonical claim). Now ORDER BY depth, id with superseded_by read from claims.supersedes, plus a depth-100 cap on both recursive terms (a supersession cycle A->B->A is accepted by mark_duplicate's guard and previously spun a backend forever; the request pool sets no statement_timeout).",
+          "graph.rs_expand_truncated": "`truncated` was `total_size > nodes.len()` where total_size is unfiltered graph_clusters.size and nodes is now filtered - it reported true for a complete response and its difference was an exact count of hidden claims. Now derived from the budget.",
+          "crud.rs_create_theme_with_centroid": "DISCLOSURE (was missing from this ledger). POST /themes/create-with-centroid is a WRITE handler and PR-07 modified it: it gained a ViewerExtractor, `centroid` became Option<Vec<f64>>, and a new ClaimThemeRepository::set_centroid_from_claims runs `UPDATE claim_themes ... FROM (SELECT AVG(c.embedding) ... WHERE c.id = ANY($2) /* {VISIBILITY:c} */)`. This is NOT PR-16's write-side predicate: the marker scopes which claims get AVERAGED (a read), not who may write claim_themes, and viewer.writable_bind() is not used. It is defensible fallout from acceptance #2, but a reviewer auditing 'does PR-07 touch write paths?' against this block previously got a No. NOT COVERED BY A TEST: create_theme_with_centroid_averages_the_claims_when_no_centroid_is_sent uses a claims:admin token over an all-public fixture, so nothing asserts that a scoped caller's server-derived centroid excludes claims it cannot see. Tracked as F-centroid-scoping-untested."
+        },
+        "counts_reconciled": {
+          "104_non_allowlisted_registrations": "discharged by PR-03, not PR-07",
+          "39_fail_open_sites": "38 in tree at merge base by the plan's verbatim idiom; 37 after PR-07; 35 -> PR-16, 2 -> PR-10 (Q7)",
+          "32_check_content_access_sites": "30 in tree; plan's line enumerates only 21 line numbers; 0 converted by design (Q6)"
+        },
+        "locked_decisions": "crates/epigraph-db/tests/locked_decisions.rs is untouched and its rejection trigger is not met: PR-07 changes no RLS policy, no route split, and no tenancy column. Its status heading was bumped to PR-07 so the one-screen contract does not silently drift.",
+        "followup_2026_09_02": {
+          "note": "An adversarial review of the first pass raised 17 findings, 10 of them blocker/major. ALL TEN WERE FIXED - none was rejected. This block records what each was and how it was closed, because the previous pass's failure mode was committing with known fail-opens unfixed.",
+          "B1_hypothesis_status_leak": "FIXED. routes/hypothesis.rs::hypothesis_status destructured a ViewerExtractor and then read content, truth_value, belief, plausibility, labels and properties for an arbitrary claim id with a raw pool query; the viewer was spent only on two scalar reads. The same Viewer-held-but-never-spent shape as frame_claims_sorted, and hypothesis.rs contains ZERO check_content_access calls, so the register's stated compensating control did not exist here. Now ClaimRepository::content_and_properties (spliced). ClaimRow deleted. Guarded by hypothesis_status_http_hides_a_group_private_claim_from_a_stranger, which asserts 404-for-a-stranger with a public-claim non-vacuity control.",
+          "B2_register_justification_false": "FIXED. The register's claim that 'the compensating control is the per-row check_content_access pass, which PR-14 deletes - that is the deadline' was false for most entries. Only claims.rs and edges.rs contain check_content_access at all. The register is now split into COMPENSATED_INLINE_READS (claims.rs, edges.rs) and UNCOMPENSATED_INLINE_READS (nine files), with the deadline restated as PR-12 for the uncompensated set, and the doc now explicitly declines to assert that the compensating call sits on the return path of the specific counted statement - which is the over-claim that produced the original error.",
+          "B3_lint_forward_scan_blind": "FIXED. See acceptance #1 above. Falsified under mutation: forcing resolved_region back to forward-only makes both a_format_built_statement_is_counted and the register assertion fail, the latter reporting `search.rs: expected 1, found 0`.",
+          "M4_semantic_probe_siblings": "FIXED. PR-07's headline find - a caller-supplied probe vector ranked against the whole corpus returning content, unfiltered - was fixed in search.rs and rag.rs and left standing in FOUR siblings: voids.rs::detect_voids, voids.rs::embedding_density (two sites), gaps.rs::gap_analysis and experiments.rs::hypothesize. None took a ViewerExtractor; none took an auth argument at all, so there was not even a scope check to be fail-open about. All now route through ClaimRepository::semantic_search_flat / embedding_density_stats / neighborhood_embeddings. A FIFTH site the finding did not name was fixed too: hypothesize's clustering branch pulled raw embedding::real[] vectors for the 200 nearest claims, and PR-07's own acceptance criteria treat a raw embedding as approximately invertible to content.",
+          "M5_belief_at_time_evidence": "FIXED. computation.rs::belief_at_time held a Viewer, spent it on ClaimRepository::get_by_id, and then read the evidence it replays with an inline unfiltered statement. evidence and edges are BOTH tier_a, so both were filterable and neither was filtered. Now EvidenceRepository::provided_for_claim_as_of with /* {VISIBILITY:e} */ and /* {VISIBILITY:ed} */ (the edges marker in the JOIN's ON clause, matching count_all_evidence_for_claim). The test seeds one group-private evidence row AND one public evidence row behind a group-private edge, so deleting EITHER marker turns it red.",
+          "M6_lint_predicate_too_narrow": "FIXED. See acceptance #1.",
+          "M7_visibility_lint_missing": "FIXED. crates/epigraph-db/tests/visibility_lint.rs did not exist, despite being cited three times in visibility.rs, seven times in repos/lineage.rs, twice in repos/claim.rs and once in FINAL-PLAN.md as PR-06's gate - the same cited-but-unwritten defect PR-07's own commit message indicts. It now exists: every fn under src/repos/ taking a &Viewer and running SQL must call .splice(, carry the literal static predicate `visibility = 'public'`, or carry a VISIBILITY-EXEMPT: marker. 193 viewer-taking fns scanned, 0 violations. NOTE: group_bind()/bypass_bind() are deliberately NOT accepted as evidence of spending - binding an array proves a parameter was supplied, not that the SQL reads it, and a frame_claims_sorted-shaped fail-open would pass a lint keyed on the accessor. Falsified under mutation: stripping viewer.splice from ChallengeRepository::list_for_claim makes it fail, naming challenge.rs:88.",
+          "M8_subgraph_edges_false_doc": "FIXED. subgraph_edges' doc asserted 'the caller additionally narrows node_ids to the ids that survived the node projections'. No caller did: load_subgraph fetched edges FIRST, before any node projection ran. Because edges.visibility defaults to 'public', the response's edges array enumerated claim ids the nodes projection had withheld - the id-enumeration oracle PR-07 says it closed in graph_neighborhood.rs. load_subgraph now runs the four node projections first and passes the surviving ids; the doc states the obligation as a precondition instead of asserting a property it cannot enforce. Falsified under mutation: restoring the raw node_ids call makes load_subgraph_never_returns_an_edge_naming_a_withheld_node fail with the exact edge id.",
+          "M9_reasoning_traces_wrong_justification": "FIXED. load_subgraph's doc left reasoning_traces unfiltered on the stated grounds that it 'is NOT in tier_a ... has no owner_group_id to filter on'. It IS in migration 062's tier_a array, beside challenges and experiment_triples, and does carry the tenancy columns. The disclosure was small (a methodology label and a confidence float); the wrong justification was the defect, because the next reader re-derives 'nothing to filter' from it and never revisits the site. Now filtered through GraphViewRepository::subgraph_traces. The `agents` half of the same sentence was re-checked and is correct - agents genuinely is not tier_a.",
+          "M10_challenges_acceptance_untested": "FIXED. See acceptance #3.",
+          "rejections": "NONE. Every blocker and major was reproduced by direct inspection before being fixed. The seven minor/nit findings are recorded in open_findings rather than fixed, because each is a scope question (PR-12/PR-13/PR-16) rather than a defect in this PR's own work; they are listed individually so PR-08 does not have to re-derive them.",
+          "mutation_testing": "Four mutations, each reverted and each falsifying a distinct guard. (A) Viewer::predicate_fragment's Scoped arm emptied to a single space - all six new tenancy guards fail plus the new challenges test; the OLD challenges test still passes, which is finding M10 demonstrated rather than argued. (B) load_subgraph's edge fetch restored to the raw node_ids, run first - load_subgraph_never_returns_an_edge_naming_a_withheld_node fails naming the leaked edge. (C) resolved_region forced forward-only - a_format_built_statement_is_counted fails AND the register reports search.rs expected 1 found 0. (D) viewer.splice stripped from ChallengeRepository::list_for_claim - visibility_lint names challenge.rs:88.",
+          "behaviour_change_401": "FOUR endpoints now 401 where they previously 200'd: POST /api/v1/voids/detect, GET /api/v1/voids/density, POST /api/v1/gaps/analysis, POST /api/v1/experiments/hypothesize. All four previously took NO auth argument at all - the only gate was the router's bearer_auth_middleware - and all four now take a ViewerExtractor, which 401s a bearer token that resolves to no agents.id. This is the intended fix for M4, not a side effect, but it is a live behaviour change on an integration branch and is recorded here rather than only in the handlers' doc comments. `grep -rn 'voids/detect|voids/density|gaps/analysis|experiments/hypothesize' --include=*.py --include=*.sh --include=*.ts --include=*.js` over the repo returns nothing: no in-repo client calls these paths. The only hits are prose in docs/superpowers/plans/ and docs/tenancy/FINAL-PLAN.md.",
+          "coverage_gap_four_handlers": "The four M4 handlers have NO direct test. They require state.embedding_service(), which the test harness does not configure, so an HTTP round trip is not available. The six new tenancy guards cover the REPO functions (semantic_search_flat, embedding_density_stats, neighborhood_embeddings); what is guarded by the lint rather than by a test is that these four handlers CALL them. Reverting any of the route changes re-adds an inline tier_a read and no_new_inline_claim_content_reads_in_the_route_layer asserts exact counts, so it goes red - but that is a source-shape guard, not a behavioural one. Stated explicitly so it is not mistaken for coverage."
+        }
       }
     ],
-    "current": "PR-06 (running, resumed from cached analyze phase)",
+    "current": null,
     "failed": [],
-    "halted": "Loop halted after PR-04 by user request 2026-08-27. PR-05 not started. 18 PRs remain.",
-    "blocked_reason": {
-      "what": "TRANSIENT, CLEARED. A weekly usage limit killed 5 of PR-06's 7 agents on 2026-08-29.",
-      "resolution": "Quota refreshed; PR-06 relaunched via resumeFromRunId wf_433cf05a-9cc so the two completed analyze agents replay from cache.",
-      "lesson": "Do not infer a quota block's duration from the reset string plus a clock reading. If the session is executing, capacity exists - just retry.",
-      "partial_work": "stash@{0} PR-06 partial (228 files, UNVERIFIED, superseded by the relaunch). stash@{1} older PR-04 partial. Both droppable."
-    }
+    "halted": null,
+    "next": "PR-08 - security(api): authenticate, scope, and viewer-filter the structural-features endpoint"
   },
   "env": {
     "postgres": "16.2 @127.0.0.1:55432",
     "pg_trgm": "1.6 (real, built from upstream source)",
     "uuid-ossp": "1.1 SHIM (functions only)",
     "pgvector": "0.8.6 (upgraded from 0.6.2; matches prod 0.8 series; hnsw.iterative_scan verified)",
-    "migrations": "apply with `sqlx migrate run`, never psql"
+    "migrations": "apply with `sqlx migrate run`, never psql",
+    "pr07_throwaway_db": {
+      "name": "epigraph_tenancy_pr07",
+      "caveat": "This database's NAME does not satisfy the `db_is_disposable` guard in crates/epigraph-db/tests/claim_repo_helpers.rs and crates/epigraph-mcp/tests/common/mod.rs, which is purely name-based (starts_with '_sqlx_test' || ends_with '_test'). 33 tests across those two files therefore panic in assert_disposable_db BEFORE any test logic runs - verified empirically: the epigraph-db binary fails 7/8 in 0.32s with the guard's message, and both files are untouched by PR-07.",
+      "recommendation": "Give PR-08+ a database whose name ENDS IN `_test` (e.g. epigraph_tenancy_pr08_test) so the guard passes on its own. Do NOT reach for EPIGRAPH_TEST_DESTRUCTIVE_DB=1 as the default: those fixtures DROP uq_claims_content_hash_agent and run a table-wide DELETE on claims, and that mutation is inherited by every later PR that reuses the database.",
+      "mutation_status": "PR-07 did NOT set the destructive opt-in. epigraph_tenancy_pr07 has not been truncated and still carries uq_claims_content_hash_agent.",
+      "test_isolation": "PR-07's own tenancy tests use #[sqlx::test], which provisions a per-test scratch database, so their results are independent of the shared DB's state either way."
+    }
   },
   "deferred_obligations": [],
   "resolved_measurements": {
@@ -82,11 +169,96 @@
   },
   "open_findings": [
     {
+      "id": "F-access-control-none-full",
+      "where": "crates/epigraph-db/src/access_control.rs:100",
+      "what": "`None => return ContentAccess::Full, // No ownership -> public` is FAIL-OPEN",
+      "detail": "Any claim with no `ownership` row returns FULL content to any authenticated caller. Ownership rows are written only by explicit assignment, so for the majority of the corpus this backward-compat branch makes the whole check_content_access pass a no-op. This is why several PR-07 findings are 'live today for un-owned claims' rather than purely latent.",
+      "status": "open",
+      "assigned": "PR-12 (the backfill that gives every claim an ownership/tenancy row is what makes the branch unreachable), removal in PR-14"
+    },
+    {
+      "id": "F-edges-unfiltered",
+      "where": "crates/epigraph-db/src/repos/graph_view.rs (all traversals), crates/epigraph-db/src/repos/claim.rs::rag_hybrid_context (edge_count)",
+      "what": "`edges` carries tenancy columns but is not viewer-filtered inside the graph projections",
+      "detail": "Bounded: the returned rows are claims-filtered, so this discloses STRUCTURE (which ids relate to which) and a degree scalar, never content. rag_hybrid_context's edge_count IS returned to the caller - an earlier doc comment claimed it 'never reaches the response', which was false and has been corrected in place.",
+      "status": "open, documented in the graph_view module docs",
+      "assigned": "PR-13 (feat(db): edge co-ownership), which creates edges.co_owner_group_id and Viewer::edge_predicate_fragment"
+    },
+    {
+      "id": "F-inline-claim-content-reads",
+      "where": "crates/epigraph-api/src/routes/",
+      "what": "21 sqlx::query* calls in the route layer still select tier_a content and so cannot carry a {VISIBILITY:...} marker",
+      "detail": "RE-MEASURED 2026-09-02 under a corrected lint (balanced-paren argument region + let-binding resolution + the tier_a column set; see acceptance #1). COMPENSATED (the file contains check_content_access calls, though NOT verified to sit on the return path of the counted statement): claims.rs 3, edges.rs 4. UNCOMPENSATED (the file contains ZERO check_content_access): clusters.rs 2, conflicts.rs 1, cross_source.rs 1, embeddings.rs 1, hypothesis.rs 1, policies.rs 2, political.rs 1, search.rs 1, workflows.rs 4. The previous figure of 23 across 13 files is NOT comparable: it was measured by a scan that both missed format!-built statements and charged false positives from a fixed forward window. Latent, not live, for the tenancy dimension; live for un-owned claims via F-access-control-none-full.",
+      "status": "open, ratcheted",
+      "ratchet": "crates/epigraph-api/tests/viewer_route_table_lint.rs asserts COMPENSATED_INLINE_READS and UNCOMPENSATED_INLINE_READS EXACTLY, plus the_two_registers_are_disjoint and a_format_built_statement_is_counted (a self-test against synthetic fixtures, so the measurement's own blind spots cannot reopen).",
+      "assigned": "PR-09 for the MCP mirror; the API remainder is unassigned and MUST be triaged before PR-14 deletes check_content_access",
+      "deadline": "PR-12 for the UNCOMPENSATED set - they have no second line of defence today and become live disclosure the moment ownership lands in the tenancy columns. PR-14 for the compensated two, when check_content_access is deleted. The single 'PR-14' deadline previously recorded here was wrong for nine of the eleven files."
+    },
+    {
+      "id": "F-not-db-build-unverified",
+      "where": "crates/epigraph-api/src/middleware/bearer.rs (the #[cfg(not(feature = \"db\"))] ViewerExtractor)",
+      "what": "RESOLVED-ON-BRANCH. The not(db) parity shim is now both CI-gated and executed locally.",
+      "detail": "The previous entry said 'the prescribed gate never compiles this configuration' while bearer.rs's own doc and public_router_allowlist.rs's header both asserted that .github/workflows/ci.yml gates `cargo check -p epigraph-api --no-default-features --locked`. The ledger and the code were asserting opposite things. The code is right: ci.yml line 171 runs exactly that step, deliberately scoped lib+bins rather than --all-targets because epigraph-api's [dev-dependencies] on epigraph-db and sqlx are non-optional. It has also now been executed locally in a SEPARATE target dir (/home/jeremy/.cargo-target-nodb) - a warm shared dir holding default-feature artifacts returns exit 0 on a tree that fails cold, which produced a false green twice on this project.",
+      "status": "closed on this branch; kept in open_findings until merge so the reconciliation is not lost",
+      "assigned": "none - ci.yml is the standing gate"
+    },
+    {
+      "id": "F-aggregate-existence-oracles",
+      "where": "routes/belief.rs::frame_conflict, routes/political.rs::claim_genealogy, routes/graph_neighborhood.rs::claim_compound_neighborhood",
+      "what": "Aggregate and existence oracles run unfiltered in handlers that are already holding a Viewer",
+      "detail": "`SELECT COUNT(*), AVG(conflict_k), MAX(conflict_k) FROM mass_functions WHERE frame_id = $1`; `SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)` deciding 404-vs-200; two `SELECT COUNT(*) FROM edges ... relationship = 'decomposes_to'` deciding center_kind. mass_functions, claims and edges are all tier_a, so all three are filterable and the fix is a parameter rather than a redesign. These disclose existence and cardinality, never text. NOT FIXED IN PR-07: they are outside the inline-content-read class the lint polices and outside this PR's charter, and bundling them would have made the diff harder to review than the leaks it is about. Raised by the adversarial review as minor.",
+      "status": "open",
+      "assigned": "PR-13 (edges) / PR-16, triage before PR-14"
+    },
+    {
+      "id": "F-write-authz-reads-unfiltered",
+      "where": "routes/versioning.rs::supersede_claim, routes/workflows.rs::deprecate_workflow",
+      "what": "Write-path authorization reads run unfiltered while the handler holds a Viewer",
+      "detail": "`SELECT agent_id FROM claims WHERE id = $1` is the ownership check the supersede decision rests on; `SELECT id FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)` is deprecate_workflow's only existence gate. They let a principal act on a claim it cannot read. Consistent with the deliberate PR-16 deferral documented in repos/evidence.rs::delete, but unlike the repo-layer deferrals these carry no such comment at the site and no ratchet tracks them.",
+      "status": "open",
+      "assigned": "PR-16 (write-side predicate)"
+    },
+    {
+      "id": "F-fail-open-ratchet-single-spelling",
+      "where": "crates/epigraph-api/tests/viewer_route_table_lint.rs::measure_fail_open_scope_sites",
+      "what": "The fail-open ratchet counts ONE literal spelling of the idiom, so a variant spelling raises no error",
+      "detail": "The needle is `if let Some(axum::Extension(ref auth)) = auth_ctx`. agents.rs::create_agent uses the same idiom in two forms the needle misses: `= &auth_ctx` (trailing &) and `Some(axum::Extension(auth))` (no ref). The ratchet is therefore monotone only against one transcription. Separately, the register's rationale ('harmless only because a ViewerExtractor earlier in the same signature 401s first') does not hold for create_agent, which has no ViewerExtractor and no other auth extractor - nothing in that handler 401s and the agents:write scope is simply unchecked when AuthContext is absent. NOT FIXED IN PR-07: re-baselining that ratchet in the same PR that re-baselines the content-read register would have meant two simultaneous redefinitions, and the second would have hidden the first.",
+      "status": "open",
+      "assigned": "PR-16, which owns the write-path fail-opens the ratchet tracks"
+    },
+    {
+      "id": "F-atom-count-cardinality",
+      "where": "crates/epigraph-db/src/repos/graph_view.rs::neighborhood_compound_nodes",
+      "what": "atom_count is derived from an `atoms` CTE filtered only on claim_neighborhood_membership, not on claims",
+      "detail": "The CTE carries /* {VISIBILITY:m} */ only; the returned atom_count therefore tells a stranger how many atoms a compound decomposes into, including atoms whose claims rows it cannot read. No invisible content escapes - the final SELECT filters the compound's own claims row. Inert today because claim_neighborhood_membership.visibility defaults to 'public'. Reportable because MassFunctionRepository::count_for_claim's doc, added by this same PR, spends a paragraph forbidding exactly this shape ('a bare COUNT(*) here would be a cardinality oracle'), and applying that standard in one file and not two files away is an inconsistency worth recording.",
+      "status": "open",
+      "assigned": "PR-13, alongside F-edges-unfiltered"
+    },
+    {
+      "id": "F-single-spend-handlers-unreviewed",
+      "where": "crates/epigraph-api/src/routes/ (97 ViewerExtractor handlers, 62 of which reference `viewer` exactly once)",
+      "what": "No mechanical check distinguishes a handler that spends its Viewer on the content read from one that spends it on an unrelated scalar",
+      "detail": "All 97 handlers reference `viewer` at least once, so there are no literally-unused Viewers; the live defect class is SINGLE-SPEND. Both hypothesis_status (B1) and belief_at_time (M5) were single-spend handlers, and both were found by opening the file rather than by any scan. The adversarial review hand-read roughly a dozen of the 62; the remaining ~50 are unreviewed by any mechanism. The widened viewer_route_table_lint now catches the subset whose second read is an inline tier_a projection - which is what caught the belief_at_time shape - but a handler whose leak is in a repo function it calls with the wrong argument is still invisible.",
+      "status": "open",
+      "assigned": "unassigned; triage before PR-14"
+    },
+    {
+      "id": "F-centroid-scoping-untested",
+      "where": "crates/epigraph-db/src/repos/claim_theme.rs::set_centroid_from_claims",
+      "what": "No test asserts that a scoped caller's server-derived theme centroid excludes claims it cannot see",
+      "detail": "The statement carries /* {VISIBILITY:c} */ on the averaged SELECT, so the predicate is present and visibility_lint.rs now enforces that it stays. But create_theme_with_centroid_averages_the_claims_when_no_centroid_is_sent uses a claims:admin token over an all-public fixture, so the tenancy half is unasserted. See the crud.rs_create_theme_with_centroid entry in PR-07's scope_substitution.",
+      "status": "open",
+      "assigned": "PR-12 or PR-16, whichever first makes a non-admin caller reach this path"
+    }
+  ],
+  "closed_findings": [
+    {
       "id": "F-failopen-catchall",
-      "where": "crates/epigraph-db/src/access_control.rs:148",
-      "what": "`_ => ContentAccess::Full // Unknown partition -> safe default` is FAIL-OPEN and mislabeled",
-      "status": "unreachable today (CHECK restricts vocabulary) but contradicts D1 'no public by default-on-error'; untested",
-      "assigned": "PR-06 via operator note"
+      "where": "crates/epigraph-db/src/access_control.rs (was :148, now :168)",
+      "what": "`_ => ContentAccess::Full // Unknown partition -> safe default` was FAIL-OPEN and mislabeled",
+      "resolution": "FIXED by PR-06. The arm now reads `_ => ContentAccess::Redacted` with a comment explaining the inversion. Verified in the tree during PR-07 review; the finding had been left open long after it was resolved.",
+      "closed_by": "PR-06",
+      "closed_on": "2026-09-02 (ledger backfill)"
     }
   ]
 }

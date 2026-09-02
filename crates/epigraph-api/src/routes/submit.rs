@@ -1610,10 +1610,15 @@ pub async fn submit_packet(
         }
     };
     // Without the db feature there is no persistence step; the response simply
-    // echoes the pre-generated ids and is never a duplicate.
+    // echoes the pre-generated ids and is never a duplicate. The viewer is
+    // still REQUIRED to reach this handler (`ViewerExtractor` enforces the same
+    // two 401 branches in both builds); there is simply no repo read to thread
+    // it into here.
     #[cfg(not(feature = "db"))]
-    let (was_duplicate, response_trace_id, response_evidence_ids) =
-        (false, Some(trace_id), evidence_ids.clone());
+    let (was_duplicate, response_trace_id, response_evidence_ids) = {
+        let _ = &viewer;
+        (false, Some(trace_id), evidence_ids.clone())
+    };
 
     // 6. Create the claim object and register it for propagation
     //

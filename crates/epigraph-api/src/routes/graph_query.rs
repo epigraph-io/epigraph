@@ -18,6 +18,10 @@ pub struct GraphQueryRequest {
 
 #[cfg(feature = "db")]
 pub async fn execute_graph_query(
+    // PR-07: added. `load_subgraph` now requires a `Viewer`; this handler
+    // previously had only the fail-open `auth_ctx` and passed no viewer at all,
+    // so both of its subgraph loads returned unfiltered claim content.
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<GraphQueryRequest>,
@@ -235,7 +239,7 @@ pub async fn execute_graph_query(
             }));
         }
 
-        let mut resp = super::graph_query_utils::load_subgraph(pool, node_ids).await?;
+        let mut resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
         apply_partition_filter(pool, &mut resp, requester).await;
         Ok(resp)
     } else {
@@ -278,7 +282,7 @@ pub async fn execute_graph_query(
             }));
         }
 
-        let mut resp = super::graph_query_utils::load_subgraph(pool, node_ids).await?;
+        let mut resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
         apply_partition_filter(pool, &mut resp, requester).await;
         Ok(resp)
     }

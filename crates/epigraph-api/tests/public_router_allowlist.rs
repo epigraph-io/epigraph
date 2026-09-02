@@ -40,10 +40,14 @@
 //!
 //! Nine `OK → UNAUTHORIZED` assertion flips made in PR-03 live in
 //! `#[cfg(not(feature = "db"))]` test modules inside `src/routes/` (`rag.rs`,
-//! `admin.rs`, `versioning.rs`, `challenge.rs`, `negative_tests.rs`). That
-//! configuration has never compiled — `admin.rs`'s `ApiConfig` literal alone
-//! omits a field that exists — so those edits are documentation, not coverage,
-//! and `cargo test -p epigraph-api --lib -- --list` does not name them. The
+//! `admin.rs`, `versioning.rs`, `challenge.rs`, `negative_tests.rs`). The
+//! `not(db)` LIBRARY does compile — `.github/workflows/ci.yml` gates it with
+//! `cargo check -p epigraph-api --no-default-features --locked`, and PR-07
+//! repaired it after PR-06 broke it with 17 errors — but these `cfg(all(test,
+//! not(feature = "db")))` MODULES are still built in no CI configuration
+//! (`epigraph-api`'s default features include `db`), so those edits remain
+//! documentation, not coverage, and
+//! `cargo test -p epigraph-api --lib -- --list` does not name them. The
 //! classes they claimed to cover (RAG, evidence search, history, challenges,
 //! admin stats) are covered here instead, and now exhaustively.
 

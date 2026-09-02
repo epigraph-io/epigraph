@@ -181,14 +181,23 @@ pub async fn hypothesis_status(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Get claim
-    let claim: ClaimRow = sqlx::query_as(
-        "SELECT id, content, truth_value, belief, plausibility, labels, properties FROM claims WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_one(&state.db_pool)
-    .await
-    .map_err(|_| ApiError::NotFound { entity: "hypothesis".into(), id: id.to_string() })?;
+    // Get claim.
+    //
+    // PR-07 follow-up: this ran `SELECT id, content, truth_value, belief,
+    // plausibility, labels, properties FROM claims WHERE id = $1` inline, with
+    // no viewer — while the handler held one and spent it only on two scalar
+    // reads below. A viewer-invisible claim now 404s here instead of having its
+    // content, belief and properties returned.
+    let (claim_content, claim_properties) =
+        epigraph_db::ClaimRepository::content_and_properties(&state.db_pool, &viewer, id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to fetch hypothesis: {e}"),
+            })?
+            .ok_or(ApiError::NotFound {
+                entity: "hypothesis".into(),
+                id: id.to_string(),
+            })?;
 
     // Get experiments
     let experiments = epigraph_db::ExperimentRepository::get_for_hypothesis(&state.db_pool, id)
@@ -275,8 +284,8 @@ pub async fn hypothesis_status(
 
     Ok(Json(serde_json::json!({
         "hypothesis_id": id,
-        "content": claim.content,
-        "status": claim.properties.get("hypothesis_status"),
+        "content": claim_content,
+        "status": claim_properties.get("hypothesis_status"),
         "belief": {
             "supported": bel_supported,
             "unsupported": bel_unsupported,
@@ -446,19 +455,7 @@ struct NeighborRow {
     similarity: Option<f64>,
 }
 
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct ClaimRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    content: String,
-    #[allow(dead_code)]
-    truth_value: Option<f64>,
-    #[allow(dead_code)]
-    belief: Option<f64>,
-    #[allow(dead_code)]
-    plausibility: Option<f64>,
-    #[allow(dead_code)]
-    labels: Option<Vec<String>>,
-    properties: serde_json::Value,
-}
+// `ClaimRow` was deleted with the inline claim-content read in
+// `hypothesis_status`. Its replacement is
+// `ClaimRepository::content_and_properties`, whose row type lives in the repo
+// layer where the `/* {VISIBILITY:c} */` marker convention applies.

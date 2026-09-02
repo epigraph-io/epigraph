@@ -13,7 +13,15 @@
 //! the four decisions, say so in the commit body; do not leave the reviewer to
 //! infer it from an untouched test file.
 //!
-//! ## Status at PR-05
+//! ## Status at PR-07
+//!
+//! PR-06 and PR-07 leave every assertion below unchanged, and that is the
+//! correct outcome rather than an omission: neither changes an RLS policy, a
+//! route split, or a tenancy column. PR-07 is a read-path refactor — it moves
+//! statements from `crates/epigraph-api/src/routes/` into
+//! `crates/epigraph-db/src/repos/` and splices `Viewer` predicates into them —
+//! and it adds no migration. Recorded here explicitly because the rejection
+//! trigger above asks for it to be said, not inferred.
 //!
 //! * **D3 — no anonymous read authority.** Asserted below, in full.
 //! * **D1 — tenancy is declared, never defaulted.** *Half asserted.* PR-05's
