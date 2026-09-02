@@ -109,6 +109,10 @@ impl SheafRepository {
             WHERE e.source_type = 'claim'
             AND e.target_type = 'claim'
             AND e.relationship IN ('supports', 'refutes', 'contradicts', 'corroborates', 'elaborates', 'specializes', 'generalizes', 'frame_validates')
+            -- A retracted edge must not manufacture a sheaf obstruction: the
+            -- assertion has been withdrawn, so the inconsistency it implied is
+            -- no longer claimed by anyone.
+            AND (e.valid_to IS NULL OR e.valid_to > now())
             AND src.pignistic_prob IS NOT NULL
             AND tgt.pignistic_prob IS NOT NULL
             "#,

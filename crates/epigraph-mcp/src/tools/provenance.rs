@@ -14,7 +14,7 @@ pub async fn get_provenance(
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
 
-    let lineage = LineageRepository::get_lineage(&server.pool, claim_id, Some(5))
+    let lineage = LineageRepository::get_lineage(&server.pool, claim_id, Some(5), None)
         .await
         .map_err(internal_error)?;
 

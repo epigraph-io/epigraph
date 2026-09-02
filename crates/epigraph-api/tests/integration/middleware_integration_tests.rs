@@ -87,7 +87,11 @@ pub enum SignatureError {
 
 impl IntoResponse for SignatureError {
     fn into_response(self) -> Response {
-        let error_name = format!("{:?}", &self);
+        // `&self` here is a useless borrow: `format!` already takes its args by
+        // reference. Pre-existing since the initial public release; it only became
+        // visible once a cold build re-linted this target. PR #394 added
+        // `--all-targets` to CI for exactly this class of miss.
+        let error_name = format!("{self:?}");
 
         let (status, message) = match self {
             SignatureError::MissingHeader(h) => {

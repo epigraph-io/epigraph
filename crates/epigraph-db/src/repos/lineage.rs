@@ -15,7 +15,7 @@
 
 use crate::errors::DbError;
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -55,6 +55,11 @@ pub struct LineageResult {
     pub cycle_detected: bool,
     /// Maximum depth reached
     pub max_depth_reached: i32,
+    /// Whether this result was truncated, either because the recursive walk
+    /// hit `max_depth` before exhausting all ancestors, or because a
+    /// caller-supplied `max_nodes` cap cut the topological order down to
+    /// fewer entries than were actually reachable. Defaults to `false`.
+    pub truncated: bool,
 }
 
 /// Claim data in lineage result
@@ -157,8 +162,8 @@ struct TraceParentRow {
 ///     let pool = create_pool("postgres://...").await?;
 ///     let claim_id = Uuid::new_v4();
 ///
-///     // Get lineage with max depth of 10
-///     let lineage = LineageRepository::get_lineage(&pool, claim_id, Some(10)).await?;
+///     // Get lineage with max depth of 10, no node cap
+///     let lineage = LineageRepository::get_lineage(&pool, claim_id, Some(10), None).await?;
 ///
 ///     // Process claims in topological order (ancestors first)
 ///     for claim_id in &lineage.topological_order {
@@ -181,9 +186,24 @@ impl LineageRepository {
     /// * `pool` - Database connection pool
     /// * `claim_id` - The claim to trace lineage from
     /// * `max_depth` - Maximum depth to traverse (None for default of 100)
+    /// * `max_nodes` - Optional cap on the number of nodes kept in the
+    ///   result. `topological_order` is ancestors-first / target-last, so
+    ///   naively keeping the first `n` entries would keep the *furthest*
+    ///   ancestors while discarding the target claim itself. Instead, when
+    ///   the full result exceeds `max_nodes`, this keeps the target claim
+    ///   plus its `max_nodes - 1` nearest ancestors — i.e. the last `n`
+    ///   entries of `topological_order` — and drops `claims`/`evidence`/
+    ///   `traces` entries whose associated claim id falls outside that
+    ///   trimmed set. `None` disables the cap entirely.
     ///
     /// # Returns
-    /// * `LineageResult` containing all claims, evidence, and traces in the lineage
+    /// * `LineageResult` containing all claims, evidence, and traces in the
+    ///   lineage. `LineageResult::truncated` is `true` when either the
+    ///   recursive walk was cut short by `max_depth` (inferred whenever
+    ///   `max_depth_reached == max_depth`, since the CTE only recurses past
+    ///   a row when that row's depth is strictly less than `max_depth`, so
+    ///   reaching exactly `max_depth` means further ancestors may exist but
+    ///   were never explored) or `max_nodes` trimmed the result.
     ///
     /// # SQL Pattern
     /// Uses PostgreSQL recursive CTE with cycle detection and deduplication:
@@ -208,6 +228,7 @@ impl LineageRepository {
         pool: &PgPool,
         claim_id: Uuid,
         max_depth: Option<i32>,
+        max_nodes: Option<usize>,
     ) -> Result<LineageResult, DbError> {
         let max_depth = max_depth.unwrap_or(100);
 
@@ -396,8 +417,32 @@ impl LineageRepository {
         let mut topological_order: Vec<(Uuid, i32)> =
             lineage_rows.iter().map(|r| (r.id, r.depth)).collect();
         topological_order.sort_by_key(|b| std::cmp::Reverse(b.1)); // Descending depth
-        let topological_order: Vec<Uuid> =
+        let mut topological_order: Vec<Uuid> =
             topological_order.into_iter().map(|(id, _)| id).collect();
+
+        // Infer depth-based truncation: the recursive CTE only expands a row
+        // when its depth is strictly less than max_depth, so a row landing
+        // exactly at max_depth means further ancestors may exist beyond the
+        // cutoff that were never explored.
+        let mut truncated = max_depth_reached == max_depth;
+
+        // Apply the optional node cap. topological_order is ancestors-first /
+        // target-last, so keeping the *first* n entries would keep the
+        // furthest ancestors while dropping the target claim itself. Instead
+        // we keep the LAST n entries: the target claim plus its (n - 1)
+        // nearest ancestors.
+        if let Some(n) = max_nodes {
+            if topological_order.len() > n {
+                let start = topological_order.len() - n;
+                topological_order = topological_order.split_off(start);
+                truncated = true;
+            }
+        }
+
+        let kept_ids: HashSet<Uuid> = topological_order.iter().copied().collect();
+        claims_map.retain(|id, _| kept_ids.contains(id));
+        evidence_map.retain(|_, evidence| kept_ids.contains(&evidence.claim_id));
+        trace_map.retain(|_, trace| kept_ids.contains(&trace.claim_id));
 
         Ok(LineageResult {
             claims: claims_map,
@@ -406,6 +451,7 @@ impl LineageRepository {
             topological_order,
             cycle_detected,
             max_depth_reached,
+            truncated,
         })
     }
 
@@ -796,6 +842,7 @@ impl LineageRepository {
             topological_order,
             cycle_detected,
             max_depth_reached,
+            truncated: false,
         })
     }
 

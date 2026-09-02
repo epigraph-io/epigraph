@@ -1,8 +1,18 @@
-// NOTE: There are 124 `#[cfg(not(feature = "db"))]` stubs across 29 route
-// files. These provide compile-time fallback handlers that return 501 Not
-// Implemented when the `db` feature is disabled, allowing the API crate to
-// build (and run lightweight/mock modes) without a PostgreSQL dependency.
-// Audited 2026-03-28.
+// NOTE: 160 `#[cfg(not(feature = "db"))]` stubs across 34 files in this
+// directory provide the no-db half of the crate's two-build design, so that
+// `cargo check -p epigraph-api --no-default-features` compiles. CI runs that
+// check (.github/workflows/ci.yml); when you add a db-only handler, add its
+// `cfg(not(feature = "db"))` counterpart in the same commit or CI fails.
+//
+// Their behaviour is NOT uniform. The previous version of this note claimed
+// they "return 501 Not Implemented"; that was false. Eight sites return 501
+// (spans.rs, entities.rs) and a few return 503 (clusters.rs, versioning.rs),
+// but many FABRICATE placeholder data -- e.g. `claims::get_claim` returns
+// "Placeholder claim content" with an invented truth_value and a random
+// agent_id. A no-db binary therefore serves synthetic epistemic data through
+// the same response shapes as real data. Treat the no-db configuration as a
+// compile-time target, not a runnable mode, until that is resolved.
+// Re-audited 2026-09-01.
 
 pub mod activities;
 pub mod admin;
@@ -158,15 +168,15 @@ pub fn create_router(state: AppState) -> Router {
         .route("/agents", post(agents::create_agent))
         .route("/api/v1/agents", post(agents::create_agent))
         .route("/api/v1/agents/:id", put(agents::update_agent))
-        .route(
-            "/api/v1/claims/:id",
-            put(claims::update_claim).delete(claims::delete_claim),
-        )
+        // NO claim-deletion route. `DELETE /api/v1/claims/:id` and
+        // `POST /api/v1/claims/:id/confirm-delete` were removed: EpiGraph retires
+        // claims by supersession and edges by retraction, so a production path that
+        // destroys a claim and hard-deletes every edge touching it contradicted the
+        // policy it sat next to. Test cleanup moved to
+        // `tests/integration/test_claim_cleanup.rs::hard_delete_test_claims`, which
+        // is unreachable over HTTP and guards against non-disposable databases.
+        .route("/api/v1/claims/:id", put(claims::update_claim))
         .route("/api/v1/claims/:id", patch(claims::patch_claim))
-        .route(
-            "/api/v1/claims/:id/confirm-delete",
-            post(claims::confirm_delete_claim),
-        )
         .route(
             "/api/v1/edges/:id",
             delete(edges::delete_edge).patch(edges::patch_edge),
@@ -863,15 +873,15 @@ pub fn create_router(state: AppState) -> Router {
 pub fn create_router(state: AppState) -> Router {
     // Protected write operations
     let protected = Router::new()
-        .route(
-            "/api/v1/claims/:id",
-            put(claims::update_claim).delete(claims::delete_claim),
-        )
+        // NO claim-deletion route. `DELETE /api/v1/claims/:id` and
+        // `POST /api/v1/claims/:id/confirm-delete` were removed: EpiGraph retires
+        // claims by supersession and edges by retraction, so a production path that
+        // destroys a claim and hard-deletes every edge touching it contradicted the
+        // policy it sat next to. Test cleanup moved to
+        // `tests/integration/test_claim_cleanup.rs::hard_delete_test_claims`, which
+        // is unreachable over HTTP and guards against non-disposable databases.
+        .route("/api/v1/claims/:id", put(claims::update_claim))
         .route("/api/v1/claims/:id", patch(claims::patch_claim))
-        .route(
-            "/api/v1/claims/:id/confirm-delete",
-            post(claims::confirm_delete_claim),
-        )
         .route(
             "/api/v1/edges/:id",
             delete(edges::delete_edge).patch(edges::patch_edge),
@@ -1054,10 +1064,6 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/claims/:id/neighborhood",
             get(edges::claim_neighborhood),
-        )
-        .route(
-            "/api/v1/claims/:id/compound_neighborhood",
-            get(graph_neighborhood::claim_compound_neighborhood),
         )
         .route("/api/v1/admin/stats", get(admin::system_stats))
         .route(

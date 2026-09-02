@@ -145,23 +145,44 @@ impl std::fmt::Display for EpistemicInterval {
 
 // ── Restriction Maps ──
 
-/// Positive restriction (supports/corroborates): Bel/Pl transform,
-/// open-world mass propagates at full strength.
+/// Positive restriction (supports/corroborates): the source's opinion about
+/// the target, Shafer-discounted by the edge's transmission `factor`.
+///
+/// Every mass component — including the CDST `missing` (complement) focal that
+/// carries `open_world` — is attenuated by `factor`, with the freed mass
+/// `1 − factor` going to closed-world ignorance `m(Θ)`. That is exactly
+/// [`epigraph_ds::combination::discount`] applied to
+/// [`EpistemicInterval::to_mass_function`], so the two agree focal-for-focal:
+///
+/// ```text
+/// restrict_epistemic_positive(iv, f).to_mass_function(frame)
+///     == discount(iv.to_mass_function(frame), f)
+/// ```
+///
+/// Consequences of discounting `open_world` along with the rest: the map
+/// converges to the combination-neutral BBA `m(Θ) = 1` as `factor → 0` (a
+/// zero-strength edge cannot move the target), and a frame-incomplete source
+/// no longer transplants its *full* frame doubt onto the target through a
+/// belief-strengthening edge.
 pub fn restrict_epistemic_positive(source: &EpistemicInterval, factor: f64) -> EpistemicInterval {
     EpistemicInterval {
         bel: source.bel * factor,
         pl: (1.0 - source.pl).mul_add(-factor, 1.0),
-        open_world: source.open_world,
+        open_world: source.open_world * factor,
     }
 }
 
-/// Negative restriction (contradicts/refutes): flip interval,
-/// open-world mass propagates unchanged.
+/// Negative restriction (contradicts/refutes): the polarity-flipped source
+/// opinion, Shafer-discounted by the edge's transmission `factor`.
+///
+/// Same discount law as [`restrict_epistemic_positive`] (see its doc comment):
+/// `open_world` is attenuated by `factor` so the map is `discount` composed
+/// with the `TRUE`/`FALSE` swap, and reduces to the neutral BBA at `factor = 0`.
 pub fn restrict_epistemic_negative(source: &EpistemicInterval, factor: f64) -> EpistemicInterval {
     EpistemicInterval {
         bel: (1.0 - source.pl) * factor,
         pl: source.bel.mul_add(-factor, 1.0),
-        open_world: source.open_world,
+        open_world: source.open_world * factor,
     }
 }
 
@@ -228,27 +249,98 @@ mod tests {
     }
 
     #[test]
-    fn test_restrict_positive_propagates_open_world() {
+    fn test_restrict_positive_attenuates_open_world() {
         let src = EpistemicInterval::new(0.6, 0.9, 0.15);
         let restricted = restrict_epistemic_positive(&src, 0.8);
         // bel = 0.6 * 0.8 = 0.48
         assert!((restricted.bel - 0.48).abs() < 1e-10);
         // pl = 1 - (1-0.9)*0.8 = 1 - 0.08 = 0.92
         assert!((restricted.pl - 0.92).abs() < 1e-10);
-        // open_world passes through unchanged
-        assert!((restricted.open_world - 0.15).abs() < 1e-10);
+        // open_world is discounted by the transmission factor too: 0.15 * 0.8
+        assert!((restricted.open_world - 0.12).abs() < 1e-10);
     }
 
     #[test]
-    fn test_restrict_negative_flips_and_propagates_ow() {
+    fn test_restrict_negative_flips_and_attenuates_ow() {
         let src = EpistemicInterval::new(0.7, 0.9, 0.1);
         let restricted = restrict_epistemic_negative(&src, 0.8);
         // bel = (1-0.9)*0.8 = 0.08
         assert!((restricted.bel - 0.08).abs() < 1e-10);
         // pl = 1 - 0.7*0.8 = 0.44
         assert!((restricted.pl - 0.44).abs() < 1e-10);
-        // open_world unchanged
-        assert!((restricted.open_world - 0.1).abs() < 1e-10);
+        // open_world discounted: 0.1 * 0.8
+        assert!((restricted.open_world - 0.08).abs() < 1e-10);
+    }
+
+    /// The load-bearing invariant behind discounting `open_world`:
+    /// `restrict_epistemic_positive` must BE the Shafer reliability discount.
+    ///
+    /// `bel' = bel·f` and `pl' = 1 − (1−pl)·f` were already derived from
+    /// `combination::discount`; leaving `open_world` undiscounted made the
+    /// map disagree with `discount` on exactly the `Θ` / `missing` split.
+    /// Comparing focal-for-focal against the independent `epigraph-ds`
+    /// implementation is what pins that down.
+    #[test]
+    fn restrict_positive_equals_shafer_discount_focal_for_focal() {
+        let frame = binary_frame();
+        for &(bel, pl, ow) in &[
+            (0.20, 0.95, 0.60),
+            (0.60, 0.90, 0.30),
+            (0.10, 0.40, 0.20),
+            (0.00, 1.00, 0.50),
+            (0.85, 0.85, 0.00),
+        ] {
+            for &f in &[0.0, 0.1, 0.5, 0.8, 0.95, 1.0] {
+                let iv = EpistemicInterval::new(bel, pl, ow);
+                let via_restrict = restrict_epistemic_positive(&iv, f)
+                    .to_mass_function(&frame)
+                    .expect("restricted mass");
+                let via_discount = epigraph_ds::combination::discount(
+                    &iv.to_mass_function(&frame).expect("source mass"),
+                    f,
+                )
+                .expect("discount");
+
+                for focal in [
+                    FocalElement::positive(BTreeSet::from([0_usize])),
+                    FocalElement::positive(BTreeSet::from([1_usize])),
+                    FocalElement::theta(&frame),
+                    FocalElement::missing(&frame),
+                ] {
+                    let a = via_restrict.mass_of(&focal);
+                    let b = via_discount.mass_of(&focal);
+                    assert!(
+                        (a - b).abs() < 1e-9,
+                        "iv={iv} f={f} focal={focal:?}: restrict={a} discount={b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A zero-strength edge must be a no-op: the restricted BBA has to be the
+    /// neutral element of conjunctive combination, `m(Θ) = 1`.
+    ///
+    /// Before the discount fix this produced `m(Θ) = 1 − ow`, `m(~Ω) = ow`,
+    /// and `missing` conflicts with every positive focal under
+    /// `cdst_intersect`, so an `f = 0` edge still contracted the target's Bel.
+    #[test]
+    fn restrict_at_zero_factor_is_the_combination_neutral() {
+        let frame = binary_frame();
+        let src = EpistemicInterval::new(0.20, 0.95, 0.60);
+        for restricted in [
+            restrict_epistemic_positive(&src, 0.0),
+            restrict_epistemic_negative(&src, 0.0),
+        ] {
+            assert!((restricted.open_world - 0.0).abs() < 1e-12);
+            let mf = restricted.to_mass_function(&frame).expect("mass");
+            assert!(
+                (mf.mass_of(&FocalElement::theta(&frame)) - 1.0).abs() < 1e-12,
+                "f=0 must give m(Theta)=1, got {:?}",
+                mf.masses()
+            );
+            assert!((mf.mass_of(&FocalElement::missing(&frame)) - 0.0).abs() < 1e-12);
+        }
     }
 
     #[test]

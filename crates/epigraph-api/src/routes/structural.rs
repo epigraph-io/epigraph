@@ -639,6 +639,9 @@ mod tests {
         assert!(json.contains("conflict_stats"));
     }
 
+    // COARSE_EDGE_TYPES is re-exported from epigraph-db, which only exists
+    // under the `db` feature; this test cannot be built without it.
+    #[cfg(feature = "db")]
     #[test]
     fn coarse_edge_types_used_in_filter() {
         use crate::access_control::COARSE_EDGE_TYPES;

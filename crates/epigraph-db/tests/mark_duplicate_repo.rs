@@ -113,13 +113,23 @@ async fn seed_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str
     .unwrap();
 }
 
+/// Counts edges IN FORCE between two claims.
+///
+/// The `valid_to IS NULL` filter is load-bearing since `mark_duplicate_with_repair`
+/// switched from deleting redundant edges to retracting them: the superseded copy
+/// survives as a row, so an unfiltered `COUNT(*)` returns 2 where the invariant
+/// under test is "exactly one live edge". Counting rows would make this assert the
+/// wrong thing.
 async fn edge_count(pool: &PgPool, source: Uuid, target: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM edges WHERE source_id = $1 AND target_id = $2")
-        .bind(source)
-        .bind(target)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges
+          WHERE source_id = $1 AND target_id = $2 AND valid_to IS NULL",
+    )
+    .bind(source)
+    .bind(target)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -321,12 +331,16 @@ async fn mark_duplicate_with_shared_alternative_of_edge_succeeds(pool: PgPool) {
         .unwrap();
     assert!(canon_current, "canonical must remain is_current");
 
-    // Exactly one alternative_of edge survives — the canonical↔third pair.
-    let total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM edges WHERE relationship = 'alternative_of'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    // Exactly one alternative_of edge remains IN FORCE — the canonical↔third pair.
+    // The redundant dup-side edge is retracted, not deleted, so it is still a row;
+    // counting rows here would assert the old delete semantics.
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges
+              WHERE relationship = 'alternative_of' AND valid_to IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         total, 1,
         "the redundant dup-side alternative_of edge should be gone"
@@ -335,7 +349,7 @@ async fn mark_duplicate_with_shared_alternative_of_edge_succeeds(pool: PgPool) {
     // No alternative_of edge may remain on the retired dup.
     let touching_dup: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM edges WHERE relationship = 'alternative_of' \
-         AND (source_id = $1 OR target_id = $1)",
+         AND (source_id = $1 OR target_id = $1) AND valid_to IS NULL",
     )
     .bind(dup)
     .fetch_one(&pool)

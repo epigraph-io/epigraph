@@ -810,7 +810,7 @@ pub async fn delete_edge(
         crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
     }
 
-    let deleted = EdgeRepository::delete(&state.db_pool, id).await?;
+    let deleted = EdgeRepository::retract_by_id(&state.db_pool, id).await?;
 
     if !deleted {
         return Err(ApiError::NotFound {
@@ -1974,6 +1974,7 @@ pub struct EvidenceDetailResponse {
 }
 
 // Row types for evidence and provenance queries
+#[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]
 struct EvidenceDetailRow {
     id: Uuid,
@@ -1983,26 +1984,31 @@ struct EvidenceDetailRow {
     properties: serde_json::Value,
     created_at: chrono::DateTime<chrono::Utc>,
 }
+#[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]
 struct SourceIdRow {
     source_id: Uuid,
 }
+#[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]
 struct TargetIdRow {
     target_id: Uuid,
 }
+#[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]
 struct ClaimProvRow {
     id: Uuid,
     content: String,
     trace_id: Option<Uuid>,
 }
+#[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]
 struct TraceProvRow {
     id: Uuid,
     methodology: String,
     confidence: f64,
 }
+#[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]
 struct EvidenceProvRow {
     id: Uuid,
@@ -2379,6 +2385,7 @@ pub struct ClaimEvidenceListResponse {
     pub total: usize,
 }
 
+#[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]
 struct EvidenceEdgeRow {
     edge_id: Uuid,
