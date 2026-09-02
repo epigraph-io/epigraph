@@ -13,7 +13,7 @@
 //! its owner-only fallback, was unexecuted by any test.
 //!
 //! That matters more in PR-05 than it would have before, because PR-05 rewrites
-//! that arm: migration 068 moves the gating community out of
+//! that arm: migration 069 moves the gating community out of
 //! `ownership.encryption_key_id` (a `text` column whose NAME meant something
 //! else entirely, holding a stringified UUID) into a typed
 //! `ownership.community_id` with an FK to `communities`. A rewrite of an
@@ -470,7 +470,7 @@ async fn a_community_id_on_a_private_partition_is_refused(pool: PgPool) {
 // `check_content_access` used to end its lookup with `.unwrap_or(None)`, and
 // `None` is the sentinel for "no ownership row -> public". Every transient
 // database failure — pool exhaustion, a statement timeout, a reset connection,
-// or a binary rolled ahead of migration 068 so `ownership.community_id` does
+// or a binary rolled ahead of migration 069 so `ownership.community_id` does
 // not exist yet — therefore returned FULL CONTENT for a private or
 // community-gated claim. `EPIGRAPH_MIGRATE_ON_BOOT` is default-off, so the
 // schema-skew case is operator-reachable rather than theoretical, and the MCP
@@ -568,7 +568,7 @@ async fn get_claim_as(
     requester: Option<Uuid>,
 ) -> Value {
     let result = get_claim(
-        server, &viewer,
+        server, viewer,
         GetClaimParams {
             claim_id: claim_id.as_uuid().to_string(),
             frame_id: None,

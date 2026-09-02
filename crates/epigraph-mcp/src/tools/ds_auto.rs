@@ -249,6 +249,11 @@ fn parse_stored_bba(
 ///
 /// Creates a BBA, assigns the claim to the binary frame, computes Bel/Pl/BetP,
 /// and updates the claim's DS columns.
+// PR-06's `viewer` parameter took this past clippy's 7-argument limit. Bundling
+// the remaining arguments into a struct would ripple through every caller for no
+// behavioural gain; the repo layer already carries this allow on `counterfactual.rs`
+// and `agent_key.rs` for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_ds_for_claim(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
@@ -630,6 +635,11 @@ pub async fn auto_wire_ds_batch(
 /// binary frame, or the declared label's index on an axis (issue #222). It is
 /// both the BBA's focal element and the `claim_frames.hypothesis_index` the
 /// belief readers target.
+// PR-06's `viewer` parameter took this past clippy's 7-argument limit. Bundling
+// the remaining arguments into a struct would ripple through every caller for no
+// behavioural gain; the repo layer already carries this allow on `counterfactual.rs`
+// and `agent_key.rs` for the same reason.
+#[allow(clippy::too_many_arguments)]
 async fn wire_single_batch_entry(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,

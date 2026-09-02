@@ -83,6 +83,11 @@ pub async fn find_similar_themes_at_dim(
 ///
 /// Thin async wrapper over [`ClaimThemeRepository::claims_in_themes_at_dim`].
 /// See the repo method for column-interpolation safety notes.
+// PR-06's `viewer` parameter took this past clippy's 7-argument limit. Bundling
+// the remaining arguments into a struct would ripple through every caller for no
+// behavioural gain; the repo layer already carries this allow on `counterfactual.rs`
+// and `agent_key.rs` for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub async fn candidates_in_themes_at_dim(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,

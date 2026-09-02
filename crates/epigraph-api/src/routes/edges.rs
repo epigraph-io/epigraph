@@ -63,7 +63,7 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "COORDINATED_WITH", // Two claims flagged as potentially coordinated
     "USES_TECHNIQUE",   // Claim employs a propaganda technique
     "MIRROR_NARRATIVE", // Two coalitions are structural mirrors
-    // PROV-O agent relationship types (migration 060)
+    // PROV-O agent relationship types (migration 061)
     "AFFILIATED_WITH", // person → organization (temporal)
     "EMPLOYED_BY",     // person → organization (temporal)
     "OPERATED_BY",     // software_agent/instrument → person (prov:actedOnBehalfOf)
@@ -2811,13 +2811,6 @@ mod db_tests {
         state
     }
 
-    /// Router exposing the edges write/read routes under test.
-    fn edges_router(state: AppState) -> Router {
-        Router::new()
-            .route("/api/v1/edges", post(create_edge).get(list_edges))
-            .route("/api/v1/edges/:id", axum::routing::patch(patch_edge))
-            .with_state(state)
-    }
 
     async fn parse_body(response: axum::response::Response) -> serde_json::Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();

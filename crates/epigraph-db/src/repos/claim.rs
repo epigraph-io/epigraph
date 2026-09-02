@@ -726,6 +726,11 @@ impl ClaimRepository {
     /// [`Self::search_hybrid_scoped_since`] for why that distinction decides
     /// correctness rather than performance).
     #[instrument(skip(pool, viewer, query_embedding_pgvector))]
+    // PR-06's `viewer` parameter took this past clippy's 7-argument limit. Bundling
+    // the remaining arguments into a struct would ripple through every caller for no
+    // behavioural gain; the repo layer already carries this allow on `counterfactual.rs`
+    // and `agent_key.rs` for the same reason.
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_by_embedding_since(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,
@@ -1078,6 +1083,11 @@ impl ClaimRepository {
     /// Retained at its original arity as a delegating wrapper over
     /// [`Self::search_lexical_scoped_since`]; `None` = no window = today's
     /// behaviour.
+    // PR-06's `viewer` parameter took this past clippy's 7-argument limit. Bundling
+    // the remaining arguments into a struct would ripple through every caller for no
+    // behavioural gain; the repo layer already carries this allow on `counterfactual.rs`
+    // and `agent_key.rs` for the same reason.
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_lexical_scoped(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,
@@ -1800,6 +1810,11 @@ impl ClaimRepository {
     /// `claim_from_row`'s signature — its other ~20 callers don't care about
     /// retirement state.
     #[instrument(skip(pool, viewer))]
+    // PR-06 added `viewer`, taking this from 7 parameters to 8. Bundling the
+    // filter arguments into a struct would ripple through every caller for no
+    // behavioural gain, and the repo layer already carries this allow on
+    // `counterfactual.rs` and `agent_key.rs` for the same reason.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_by_labels(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,

@@ -258,6 +258,11 @@ impl ClaimThemeRepository {
     /// `/api/v1/search/semantic?diverse=true` route (which reaches this
     /// through `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`)
     /// keeps the call it already has.
+    // PR-06's `viewer` parameter took this past clippy's 7-argument limit. Bundling
+    // the remaining arguments into a struct would ripple through every caller for no
+    // behavioural gain; the repo layer already carries this allow on `counterfactual.rs`
+    // and `agent_key.rs` for the same reason.
+    #[allow(clippy::too_many_arguments)]
     pub async fn claims_in_themes_at_dim(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,

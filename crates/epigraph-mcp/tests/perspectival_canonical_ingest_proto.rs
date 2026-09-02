@@ -52,7 +52,7 @@ async fn add_evidence(
     note: &str,
 ) {
     update_with_evidence(
-        server, &viewer,
+        server, viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,

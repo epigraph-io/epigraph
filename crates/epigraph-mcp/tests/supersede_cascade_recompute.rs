@@ -113,7 +113,7 @@ async fn supersede(
     old: Uuid,
 ) -> Result<rmcp::model::CallToolResult, epigraph_mcp::errors::McpError> {
     supersede_claim(
-        server, &viewer,
+        server, viewer,
         SupersedeClaimParams {
             claim_id: old.to_string(),
             content: format!("replacement for {old}"),

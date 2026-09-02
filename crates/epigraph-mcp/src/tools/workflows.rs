@@ -581,6 +581,11 @@ async fn find_workflow_post_embed(
 /// Returns `None` when the claim fails the truth-value floor or has neither
 /// a goal nor steps. Used by both the semantic and text-fallback loops in
 /// `find_workflow` to keep enrichment behavior identical.
+// PR-06's `viewer` parameter took this past clippy's 7-argument limit. Bundling
+// the remaining arguments into a struct would ripple through every caller for no
+// behavioural gain; the repo layer already carries this allow on `counterfactual.rs`
+// and `agent_key.rs` for the same reason.
+#[allow(clippy::too_many_arguments)]
 async fn enrich_workflow_result(
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,

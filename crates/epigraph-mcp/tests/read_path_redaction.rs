@@ -240,7 +240,7 @@ async fn get_claim_as(
     requester: Option<Uuid>,
 ) -> Value {
     let result = get_claim(
-        server, &viewer,
+        server, viewer,
         GetClaimParams {
             claim_id: claim_id.as_uuid().to_string(),
             frame_id: None,

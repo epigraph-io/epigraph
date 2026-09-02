@@ -53,6 +53,11 @@ pub enum EdgeFactorOutcome {
 /// retry later once the source acquires a BBA. Returns `NonEpistemic` if the
 /// relationship maps to a `RestrictionKind::Neutral` (cheap short-circuit
 /// before any DB query).
+// PR-06's `viewer` parameter took this past clippy's 7-argument limit. Bundling
+// the remaining arguments into a struct would ripple through every caller for no
+// behavioural gain; the repo layer already carries this allow on `counterfactual.rs`
+// and `agent_key.rs` for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_ds_for_edge(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
