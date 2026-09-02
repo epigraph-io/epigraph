@@ -94,11 +94,13 @@ when the static `tool_router` does not own the requested name.
     `tool_name → extension` routing map. Built at startup from config; collision →
     startup failure.
   - Persistent **discovery** client session per extension, established at startup.
-    `reconnect_tick(&mut self)` and the `SharedRegistry = Arc<RwLock<…>>` alias exist for
-    a lazy-reconnect timer, but that timer is **defined-but-unwired in v1** (the field is
-    a plain `Arc<FederationRegistry>`, no reconnect loop is spawned). Intentional: a
-    reviving downstream is a fast-follow; v1 mounts unreachable extensions unhealthy at
-    boot and leaves them so until the next process restart.
+    `SharedFederation` (an `Arc<std::sync::RwLock<FederationRegistry>>` newtype) owns the
+    lock and drives `reconnect_tick`; `main` spawns `spawn_reconnect_loop` whenever at
+    least one extension is configured, every `EPIGRAPH_MCP_RECONNECT_SECS` (default 30s).
+    An extension unreachable at boot mounts unhealthy and is revived by the next tick —
+    no process restart. The lock is `std`, not tokio, so its `!Send` guards make
+    "no lock held across an `.await`" a compile-time guarantee: every dial, `tools/list`,
+    and downstream proxy call runs unlocked, and one hung extension cannot stall readers.
 - **Config parsing:** `EPIGRAPH_MCP_EXTENSIONS` (env). **As shipped (v1, loopback TCP):**
   `episcience=tcp:127.0.0.1:8093;scope=episcience:tools[;prefix=episcience__]`,
   semicolon-separated fields, comma-separated extensions. (The UDS form
@@ -232,5 +234,11 @@ responsibility).
 - **Per-transport `auth_header`** (new, resolved) — there is no per-call token slot, which
   is why discovery (service token, persistent) and invocation (caller token, ephemeral)
   are split. See **Session model**.
-- **Reconnect timer unwired in v1** — an extension unreachable at boot stays unhealthy
-  until the next `epigraph-mcp` restart. `reconnect_tick` is implemented but not spawned.
+- **Reconnect timer unwired in v1** — RESOLVED. This bit in production on 2026-09-01:
+  epigraph-mcp crash-looped on Postgres, won its pool at 18:04:43.455, dialled episcience
+  at 18:04:43.582 (ECONNREFUSED), and episcience-mcp bound :8093 at 18:04:45.089 — 1.5s
+  late. The gateway then served `83 kernel + 0 federated tools` for hours while the
+  extension was healthy the whole time. Systemd ordering cannot fix this (`After=` orders
+  *start*, not readiness; a `Type=simple` unit counts as started at exec, before it
+  binds), so the gateway re-dials instead: `SharedFederation::spawn_reconnect_loop` is now
+  spawned from `main`. Covered by `reconnect_tick_revives_an_extension_that_was_down_at_boot`.

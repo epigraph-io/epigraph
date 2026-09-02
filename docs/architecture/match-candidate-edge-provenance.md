@@ -106,3 +106,37 @@ Either option should ship together with the query/retraction path that
 needs it (e.g. "find all edges for candidate X" used by a reject-time
 cleanup), rather than as schema-only groundwork, so the index is validated
 against a real access pattern instead of speculative future use.
+
+---
+
+## (d) Update: the retraction path shipped without either option
+
+`MatchCandidateRepo::retire` (exposed as the `retire` verdict on
+`POST /api/v1/match_candidates/:id/decide` and on the `decide_match_candidate`
+MCP tool) is the "retraction path" section (c) said either schema option should
+ship with. It shipped with **neither**, because it does not need the
+`candidate_id` link at all: it finds the edges to delete by
+**claim pair + `properties->>'source' = 'cross_source_matcher'`**, which is
+served by the ordinary `(source_id, target_id)` indexes and needs no sequential
+scan over `properties`.
+
+That scoping is not a workaround, it is more correct than the `candidate_id`
+join would have been:
+
+- reversed-duplicate candidates share a single edge stamped with only one of
+  their two ids, so a `candidate_id` lookup misses the edge for the other;
+- `promote` writes `contradicts` as well as `CORROBORATES`, and both are
+  equally retirable, so keying on `relationship` is wrong too;
+- every matcher-written edge between a pair being retired is in scope by
+  definition.
+
+Section (a)'s "no way to cheaply find and retract the edge" therefore remains
+true only for a lookup **keyed on `candidate_id`**. The statement in (a) that
+`decide_match_candidate("reject")` cannot retract a promoted edge is still
+accurate — `reject` deliberately does not retract; `retire` is the verdict that
+does, and it also removes the `factors` / `bp_messages` the `edges_auto_factor`
+trigger derived from the edge, which a bare edge delete would have orphaned.
+
+A typed `candidate_id` column is still the right shape if a future caller needs
+"which edges did *this candidate* write" as a first-class question. Nothing
+does today.

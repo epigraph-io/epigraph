@@ -155,6 +155,10 @@ name = "cross_source_route_tests"
 path = "tests/integration/cross_source_route_tests.rs"
 
 [[test]]
+name = "test_claim_cleanup"
+path = "tests/integration/test_claim_cleanup.rs"
+
+[[test]]
 name = "security_tests"
 path = "tests/security_tests.rs"
 

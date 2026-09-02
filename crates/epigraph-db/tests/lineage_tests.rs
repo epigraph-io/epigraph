@@ -101,7 +101,7 @@ async fn test_lineage_no_ancestors_returns_only_itself(pool: PgPool) {
     let claim_id = create_test_claim(&pool, "Standalone claim with no ancestors", 0.75).await;
 
     // Execute: Query lineage
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, claim_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, claim_id, None, None)
         .await
         .expect("Failed to query lineage");
 
@@ -145,7 +145,7 @@ async fn test_lineage_single_parent_returns_both(pool: PgPool) {
     create_claim_edge(&pool, parent_id, child_id, "supports").await;
 
     // Execute: Query lineage from child
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, child_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, child_id, None, None)
         .await
         .expect("Failed to query lineage");
 
@@ -188,7 +188,7 @@ async fn test_lineage_deep_ancestry_returns_all(pool: PgPool) {
 
     // Execute: Query lineage from the leaf (last) claim
     let leaf_id = *chain.last().unwrap();
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None, None)
         .await
         .expect("Failed to query lineage");
 
@@ -279,7 +279,7 @@ async fn test_lineage_includes_all_evidence_at_each_level(pool: PgPool) {
     let evidence_leaf: Uuid = ev_leaf.id.as_uuid();
 
     // Execute: Query lineage from leaf
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None, None)
         .await
         .expect("Failed to query lineage");
 
@@ -378,7 +378,7 @@ async fn test_lineage_includes_all_reasoning_traces(pool: PgPool) {
         .unwrap();
 
     // Execute: Query lineage from child
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, child_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, child_id, None, None)
         .await
         .expect("Failed to query lineage");
 
@@ -422,7 +422,7 @@ async fn test_lineage_respects_max_depth_parameter(pool: PgPool) {
 
     // Execute: Query lineage with max_depth=2
     let leaf_id = *chain.last().unwrap();
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, Some(2))
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, Some(2), None)
         .await
         .expect("Failed to query lineage");
 
@@ -468,7 +468,7 @@ async fn test_lineage_handles_diamond_dependencies(pool: PgPool) {
     create_claim_edge(&pool, c_id, d_id, "supports").await;
 
     // Execute: Query lineage from D
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, d_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, d_id, None, None)
         .await
         .expect("Failed to query lineage");
 
@@ -579,7 +579,7 @@ async fn test_lineage_performance_with_large_graph(pool: PgPool) {
 
     // Execute: Query lineage and measure time
     let start = Instant::now();
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None, None)
         .await
         .expect("Failed to query lineage");
     let elapsed = start.elapsed();
@@ -629,7 +629,7 @@ async fn test_lineage_detects_and_reports_cycles(pool: PgPool) {
     assert!(has_cycle, "Cycle should be detected in A -> B -> C -> A");
 
     // Query lineage should still work (with cycle detection)
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, a_id, Some(10))
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, a_id, Some(10), None)
         .await
         .expect("Failed to query lineage");
 
@@ -673,7 +673,7 @@ async fn test_lineage_returns_topological_order(pool: PgPool) {
     create_claim_edge(&pool, e_id, f_id, "supports").await;
 
     // Execute: Query lineage from F
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, f_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, f_id, None, None)
         .await
         .expect("Failed to query lineage");
 
@@ -724,7 +724,7 @@ async fn test_lineage_handles_multiple_roots(pool: PgPool) {
     create_claim_edge(&pool, root2_id, leaf_id, "supports").await;
 
     // Execute
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None, None)
         .await
         .expect("Failed to query lineage");
 
@@ -771,7 +771,7 @@ async fn test_lineage_handles_wide_graph(pool: PgPool) {
     }
 
     // Execute
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None, None)
         .await
         .expect("Failed to query lineage");
 
@@ -792,7 +792,7 @@ async fn test_lineage_nonexistent_claim_returns_empty(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     // Execute: Query lineage for a UUID that doesn't exist
     let nonexistent_id = Uuid::new_v4();
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, nonexistent_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, nonexistent_id, None, None)
         .await
         .expect("Failed to query lineage");
 
@@ -828,7 +828,7 @@ async fn test_lineage_with_mixed_relationship_types(pool: PgPool) {
     create_claim_edge(&pool, refined_id, final_id, "supports").await;
 
     // Execute
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, final_id, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, final_id, None, None)
         .await
         .expect("Failed to query lineage");
 
@@ -838,4 +838,166 @@ async fn test_lineage_with_mixed_relationship_types(pool: PgPool) {
     assert!(lineage.claims.contains_key(&derived_id));
     assert!(lineage.claims.contains_key(&refined_id));
     assert!(lineage.claims.contains_key(&final_id));
+}
+
+/// Test: `max_nodes` trims to the target claim plus its nearest ancestors
+///
+/// **Evidence**: Chain of 5 claims queried with `max_nodes = 3` should keep
+/// only the leaf (target) and its 2 nearest ancestors, dropping the 2
+/// furthest ancestors.
+/// **Reasoning**: `topological_order` is ancestors-first / target-last, so
+/// trimming from the front would discard the very claim being queried;
+/// `get_lineage` instead keeps the tail of the list.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_lineage_max_nodes_keeps_target_and_nearest_ancestors(pool: PgPool) {
+    // #397's max_nodes tests predate the tenancy Viewer; these claims are
+    // seeded public, so the public viewer is the one that sees them.
+    let viewer = fixture::public_viewer(&pool).await;
+    // Setup: chain[0] -> chain[1] -> chain[2] -> chain[3] -> chain[4] (leaf)
+    let chain = create_claim_chain(&pool, 5).await;
+    let leaf_id = *chain.last().unwrap();
+
+    // Execute: cap the result at 3 nodes
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None, Some(3))
+        .await
+        .expect("Failed to query lineage");
+
+    // Verify: only the leaf (depth 0) plus its 2 nearest ancestors remain
+    assert_eq!(
+        lineage.topological_order.len(),
+        3,
+        "topological_order should be trimmed to max_nodes entries"
+    );
+    assert_eq!(lineage.claims.len(), 3, "claims map should match the cap");
+    assert!(lineage.claims.contains_key(&chain[4]), "leaf (target) kept");
+    assert!(
+        lineage.claims.contains_key(&chain[3]),
+        "nearest ancestor kept"
+    );
+    assert!(
+        lineage.claims.contains_key(&chain[2]),
+        "2nd-nearest ancestor kept"
+    );
+    assert!(
+        !lineage.claims.contains_key(&chain[1]),
+        "distant ancestor dropped"
+    );
+    assert!(
+        !lineage.claims.contains_key(&chain[0]),
+        "furthest ancestor dropped"
+    );
+
+    // Verify: the target claim is last, ancestors-first order preserved
+    assert_eq!(lineage.topological_order[2], leaf_id);
+
+    // Verify: truncation is flagged
+    assert!(
+        lineage.truncated,
+        "truncated should be true when max_nodes cuts the result"
+    );
+}
+
+/// Test: `max_nodes` set to `None` never truncates and leaves `truncated` false
+///
+/// **Evidence**: Same 5-claim chain queried without a node cap returns all
+/// claims and reports `truncated == false` (max_depth default of 100 is
+/// nowhere near being hit either).
+/// **Reasoning**: Omitting `max_nodes` must be behavior-preserving for
+/// existing callers.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_lineage_max_nodes_none_does_not_truncate(pool: PgPool) {
+    // #397's max_nodes tests predate the tenancy Viewer; these claims are
+    // seeded public, so the public viewer is the one that sees them.
+    let viewer = fixture::public_viewer(&pool).await;
+    let chain = create_claim_chain(&pool, 5).await;
+    let leaf_id = *chain.last().unwrap();
+
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None, None)
+        .await
+        .expect("Failed to query lineage");
+
+    assert_eq!(lineage.claims.len(), 5);
+    assert_eq!(lineage.topological_order.len(), 5);
+    assert!(
+        !lineage.truncated,
+        "truncated should be false when nothing was cut"
+    );
+}
+
+/// Test: `max_nodes` larger than the full lineage is a no-op
+///
+/// **Evidence**: Requesting `max_nodes` greater than the number of ancestors
+/// returns the full, untruncated lineage.
+/// **Reasoning**: The cap should only trim when the result actually exceeds
+/// it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_lineage_max_nodes_larger_than_result_is_noop(pool: PgPool) {
+    // #397's max_nodes tests predate the tenancy Viewer; these claims are
+    // seeded public, so the public viewer is the one that sees them.
+    let viewer = fixture::public_viewer(&pool).await;
+    let chain = create_claim_chain(&pool, 5).await;
+    let leaf_id = *chain.last().unwrap();
+
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None, Some(100))
+        .await
+        .expect("Failed to query lineage");
+
+    assert_eq!(lineage.claims.len(), 5);
+    assert_eq!(lineage.topological_order.len(), 5);
+    assert!(
+        !lineage.truncated,
+        "truncated should be false when max_nodes exceeds the actual result size"
+    );
+}
+
+/// Test: depth-based truncation sets `truncated = true` even without `max_nodes`
+///
+/// **Evidence**: Reusing the existing max_depth=2 scenario over a 5-claim
+/// chain, `max_depth_reached` lands exactly on the requested `max_depth`,
+/// which is the documented signal that further ancestors may exist beyond
+/// the cutoff.
+/// **Reasoning**: `truncated` must reflect depth-capping, not just node
+/// capping, per the spec.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_lineage_truncated_flag_set_by_max_depth(pool: PgPool) {
+    // #397's max_nodes tests predate the tenancy Viewer; these claims are
+    // seeded public, so the public viewer is the one that sees them.
+    let viewer = fixture::public_viewer(&pool).await;
+    let chain = create_claim_chain(&pool, 5).await;
+    let leaf_id = *chain.last().unwrap();
+
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, Some(2), None)
+        .await
+        .expect("Failed to query lineage");
+
+    assert_eq!(lineage.max_depth_reached, 2);
+    assert!(
+        lineage.truncated,
+        "truncated should be true when max_depth_reached == max_depth"
+    );
+}
+
+/// Test: a lineage that fits entirely within `max_depth` is not flagged truncated
+///
+/// **Evidence**: A 3-claim chain queried with `max_depth = 100` (default)
+/// never reaches the cutoff, so `truncated` stays false.
+/// **Reasoning**: Guards against a naive "any depth reached" check that
+/// would incorrectly flag small, complete lineages as truncated.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_lineage_not_truncated_when_depth_cutoff_not_reached(pool: PgPool) {
+    // #397's max_nodes tests predate the tenancy Viewer; these claims are
+    // seeded public, so the public viewer is the one that sees them.
+    let viewer = fixture::public_viewer(&pool).await;
+    let chain = create_claim_chain(&pool, 3).await;
+    let leaf_id = *chain.last().unwrap();
+
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None, None)
+        .await
+        .expect("Failed to query lineage");
+
+    assert_eq!(lineage.max_depth_reached, 2);
+    assert!(
+        !lineage.truncated,
+        "truncated should be false when the full chain fit within max_depth"
+    );
 }

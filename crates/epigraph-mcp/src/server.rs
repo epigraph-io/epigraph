@@ -42,12 +42,15 @@ pub struct EpiGraphMcpFull {
     /// The federation gateway's routing table over downstream extension MCPs.
     /// Built once in `main` (from `EPIGRAPH_MCP_EXTENSIONS`) and injected into
     /// both transport paths. When no extensions are configured this is an empty
-    /// registry ([`crate::federation::FederationRegistry::empty`]) and the server
+    /// registry ([`crate::federation::SharedFederation::empty`]) and the server
     /// behaves exactly as it did pre-federation. The plain `new`/`new_shared`
     /// constructors default to empty (mirroring the `claim_from_row` house rule
     /// of not widening a ~30-caller signature); `main` and any caller that has a
     /// registry use `new_with_federation`/`new_shared_with_federation`.
-    pub(crate) federation: Arc<crate::federation::FederationRegistry>,
+    ///
+    /// Shared behind an `RwLock` so `main`'s reconnect timer can revive an
+    /// extension that was unreachable at boot without restarting the process.
+    pub(crate) federation: crate::federation::SharedFederation,
     /// `(llm_model, llm_prompt_hash)` when this server's agent identity was
     /// derived deterministically from an LLM config (see `main::select_signer`),
     /// else `None`. When `Some`, `agent_id()`'s CREATE branch records these on
@@ -55,6 +58,22 @@ pub struct EpiGraphMcpFull {
     /// `None` (the default for every unconfigured process) preserves the legacy
     /// behavior exactly — no properties are written.
     pub(crate) llm_identity: Option<(String, String)>,
+    /// Whether this server's signer identity was DECLARED by the operator
+    /// (`--agent-key` / `--agent-model`) rather than freshly generated per
+    /// process (`main::select_signer` rung 4).
+    ///
+    /// Read only by [`crate::tools::claims::require_owner_or_admin`], whose
+    /// no-`AuthContext` fallback compares a claim's author against
+    /// [`Self::agent_id`]. That comparison is a meaningful ownership policy
+    /// only when the signer is stable across restarts. With a per-process
+    /// random keypair the server's agent UUID is a throwaway that authored
+    /// nothing, so the comparison is undecidable rather than failed.
+    ///
+    /// Defaults to `true` (the strict, pre-existing behavior) in every
+    /// constructor; `main` opts out via
+    /// [`Self::with_generated_signer_identity`] on rung 4. Defaulting strict
+    /// means no embedding caller can widen the gate by omission.
+    pub(crate) signer_identity_declared: bool,
     /// Per-session memoization of auth-lineage principals already linked via an
     /// `OPERATED_BY` edge, so `call_tool` writes that edge at most once per
     /// distinct `auth.agent_id` per session (a fast in-memory short-circuit; the
@@ -332,7 +351,7 @@ impl EpiGraphMcpFull {
             signer,
             embedder,
             read_only,
-            Arc::new(crate::federation::FederationRegistry::empty()),
+            crate::federation::SharedFederation::empty(),
             None,
         )
     }
@@ -347,7 +366,7 @@ impl EpiGraphMcpFull {
         signer: AgentSigner,
         embedder: McpEmbedder,
         read_only: bool,
-        federation: Arc<crate::federation::FederationRegistry>,
+        federation: crate::federation::SharedFederation,
         llm_identity: Option<(String, String)>,
     ) -> Self {
         Self {
@@ -360,6 +379,7 @@ impl EpiGraphMcpFull {
             read_only,
             federation,
             llm_identity,
+            signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -397,22 +417,23 @@ impl EpiGraphMcpFull {
             signer,
             embedder,
             read_only,
-            Arc::new(crate::federation::FederationRegistry::empty()),
+            crate::federation::SharedFederation::empty(),
             None,
         )
     }
 
     /// Like [`new_shared`](Self::new_shared) but with a caller-supplied
     /// federation registry. The HTTP transport factory closure in `main` clones
-    /// the one `Arc<FederationRegistry>` built at boot into every per-session
-    /// server via this constructor.
+    /// the one `SharedFederation` built at boot into every per-session server
+    /// via this constructor, so a reconnect on the shared registry is visible to
+    /// every session immediately.
     #[must_use]
     pub fn new_shared_with_federation(
         pool: PgPool,
         signer: Arc<AgentSigner>,
         embedder: Arc<McpEmbedder>,
         read_only: bool,
-        federation: Arc<crate::federation::FederationRegistry>,
+        federation: crate::federation::SharedFederation,
         llm_identity: Option<(String, String)>,
     ) -> Self {
         Self {
@@ -425,8 +446,31 @@ impl EpiGraphMcpFull {
             read_only,
             federation,
             llm_identity,
+            signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Mark this server's signer identity as GENERATED — i.e. the operator
+    /// declared neither `--agent-key` nor `--agent-model`, so
+    /// `main::select_signer` fell through to `AgentSigner::generate()` and the
+    /// signer is a fresh random keypair that exists only for this process.
+    ///
+    /// The single consumer is
+    /// [`crate::tools::claims::require_owner_or_admin`]. Its no-`AuthContext`
+    /// fallback (stdio) asks "is this claim authored by *this server's* agent?"
+    /// — a question whose answer is structurally `no` for every pre-existing
+    /// claim once the signer is random per process. Flagging the condition lets
+    /// that fallback distinguish "not the owner" (a real denial) from "there is
+    /// no stable owner to compare against" (undecidable).
+    ///
+    /// Consumed-self builder rather than a constructor parameter: both
+    /// `new_*_with_federation` signatures already carry six arguments and every
+    /// caller except `main` wants the strict default.
+    #[must_use]
+    pub fn with_generated_signer_identity(mut self) -> Self {
+        self.signer_identity_declared = false;
+        self
     }
 
     // ── Claims (11 tools) ──
@@ -847,6 +891,28 @@ impl EpiGraphMcpFull {
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
         tools::link_epistemic::link_epistemic(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Update an existing edge in place: retire it by closing its lifecycle window (valid_to) and/or shallow-merge a JSON object into its properties. MCP-native wrapper for PATCH /api/v1/edges/:id — before this tool the only way to act on a mislabeled edge from MCP was raw OAuth + curl. At least one of valid_to / properties is required; properties must be a JSON object (a non-object would silently convert the JSONB column to an array via Postgres `||`). valid_to accepts an RFC3339 timestamp or the literal \"now\" (resolved server-side, since an MCP client has no wall clock). Retiring is the NON-DESTRUCTIVE correction: the row and its audit history survive. Emits edge.updated, plus edge.retired when valid_to is set. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retired edge."
+    )]
+    async fn patch_edge(
+        &self,
+        Parameters(params): Parameters<crate::types::PatchEdgeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::edge_mutation::patch_edge(self, params).await
+    }
+
+    #[tool(
+        description = "Hard-delete an edge by id. MCP-native wrapper for DELETE /api/v1/edges/:id. IRREVERSIBLE and audit-destroying — use patch_edge with valid_to to retire an edge that merely stopped holding; delete is for edges that should never have existed (e.g. a mislabeled contradicts edge). Errors if the edge id does not exist. Emits edge.deleted. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the deleted edge."
+    )]
+    async fn delete_edge(
+        &self,
+        Parameters(params): Parameters<crate::types::DeleteEdgeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        tools::edge_mutation::delete_edge(self, params).await
     }
 
     // ── Paper Queries (3 tools) ──
@@ -1530,7 +1596,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Decide a pending match candidate: 'promote' marks the row promoted and writes the edge its verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts, and refused for distinct (no truthful edge exists; reject it instead); 'reject' marks it rejected. Honours read-only mode."
+        description = "Decide a match candidate: 'promote' marks the row promoted and writes the edge its verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts, and refused for distinct (no truthful edge exists; reject it instead); 'reject' marks it rejected. To undo a promotion use retire_match_candidate (claims:admin). Honours read-only mode."
     )]
     async fn decide_match_candidate(
         &self,
@@ -1540,6 +1606,16 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         tools::matching::decide_match_candidate(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Retire a promoted match candidate: RETRACTS the matcher edge (closes valid_to — the row and its properties.decided_by survive, so the original promoter stays recoverable), deletes the factors/bp_messages/BBAs derived from it, and flips the candidate to stale. Requires claims:admin, unlike promote/reject on decide_match_candidate: retirement withdraws an assertion another principal made, which is the same class of act as supersession. Honours read-only mode."
+    )]
+    async fn retire_match_candidate(
+        &self,
+        Parameters(params): Parameters<RetireMatchCandidateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::matching::retire_match_candidate(self, params).await
     }
 
     // ── Meta (1 tool) ──
@@ -1654,9 +1730,12 @@ impl ServerHandler for EpiGraphMcpFull {
         // static nor federated) still falls through to the static path and its
         // fail-closed gate, exactly as before.
         if self.tool_router.get(&request.name).is_none() {
-            if let Some(ext) = self.federation.route(&request.name) {
-                let ext_name = ext.name.clone();
-                let ext_scope = ext.scope.clone();
+            // `route_config` returns an OWNED config and releases the registry
+            // lock before returning, so nothing below holds a guard across the
+            // downstream `invoke` await.
+            if let Some(ext) = self.federation.route_config(&request.name) {
+                let ext_name = ext.name;
+                let ext_scope = ext.scope;
                 // (a) enforce the extension's configured scope against the caller.
                 if let Err(err) =
                     Self::enforce_federated_scope(auth_owned.as_ref(), &request.name, &ext_scope)

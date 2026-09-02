@@ -1304,6 +1304,68 @@ pub struct LinkHierarchicalResponse {
     pub created: bool,
 }
 
+/// Parameters for the `patch_edge` MCP tool.
+///
+/// Mirrors the body of `PATCH /api/v1/edges/:id`: at least one of `valid_to`
+/// or `properties` must be supplied. `properties` shallow-merges into the
+/// existing JSONB object and must itself be an object.
+///
+/// `valid_to` is a string rather than a timestamp type because of the one
+/// deliberate divergence from the HTTP contract: the literal `"now"` resolves
+/// server-side to the current instant, since an LLM-driven MCP client has no
+/// wall clock and would otherwise have to guess it.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PatchEdgeParams {
+    #[schemars(description = "UUID of the edge to patch")]
+    pub edge_id: String,
+
+    #[schemars(
+        description = "Close the edge's lifecycle window (retire it without losing audit history). Either an RFC3339 timestamp or the literal \"now\"."
+    )]
+    #[serde(default)]
+    pub valid_to: Option<String>,
+
+    #[schemars(
+        with = "Option<std::collections::BTreeMap<String, serde_json::Value>>",
+        description = "JSON object shallow-merged into the edge's existing properties: overlapping keys are overwritten, absent keys are preserved. Must be an object."
+    )]
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
+}
+
+/// Response for the `patch_edge` MCP tool — the edge row as it stands after
+/// the merge, plus `retired` (true when this call set `valid_to`).
+#[derive(Debug, Serialize)]
+pub struct PatchEdgeResponse {
+    pub edge_id: String,
+    pub source_id: String,
+    pub source_type: String,
+    pub target_id: String,
+    pub target_type: String,
+    pub relationship: String,
+    pub properties: serde_json::Value,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
+    pub retired: bool,
+}
+
+/// Parameters for the `delete_edge` MCP tool — mirrors
+/// `DELETE /api/v1/edges/:id`, which hard-deletes the row.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteEdgeParams {
+    #[schemars(description = "UUID of the edge to hard-delete")]
+    pub edge_id: String,
+}
+
+/// Response for the `delete_edge` MCP tool. `deleted` is always `true` on
+/// success — a missing edge is an error, not `deleted=false`, mirroring the
+/// route's 404.
+#[derive(Debug, Serialize)]
+pub struct DeleteEdgeResponse {
+    pub edge_id: String,
+    pub deleted: bool,
+}
+
 /// Parameters for the `link_alternative` MCP tool.
 ///
 /// Promotes two existing claims into a mutually-exclusive alternative pair by
@@ -2223,9 +2285,23 @@ pub struct DecideMatchCandidateParams {
     #[schemars(description = "Match-candidate UUID to decide on")]
     pub candidate_id: String,
     #[schemars(
-        description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct) or 'reject'"
+        description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct) or 'reject'. To undo a promotion use the separate `retire_match_candidate` tool — it requires claims:admin because it withdraws another principal's assertion."
     )]
     pub verdict: String,
+}
+
+/// Params for `retire_match_candidate`.
+///
+/// Deliberately a SEPARATE tool from `decide_match_candidate` rather than a third
+/// verdict on it. `SCOPE_MAP` is one scope per tool, and retirement is a different
+/// class of act from promote/reject: those are additive (`claims:write`, the scope
+/// that files a challenge), whereas retirement withdraws an assertion another
+/// principal made (`claims:admin`, the scope that supersedes). Folding it back into
+/// `decide_match_candidate` would force one of the two to hold the wrong scope.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RetireMatchCandidateParams {
+    #[schemars(description = "Match-candidate UUID to retire")]
+    pub candidate_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

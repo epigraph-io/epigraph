@@ -779,7 +779,46 @@ pub async fn update_with_evidence(
 /// - **stdio (`auth = None`):** the MCP server has no per-request
 ///   identity, so degrade to comparing the claim's author against the
 ///   server's own signer agent. Preserves the legacy behavior for
-///   non-HTTP callers without re-opening the cross-agent abuse vector.
+///   non-HTTP callers without re-opening the cross-agent abuse vector —
+///   *provided* that signer agent is a stable identity. When it is not,
+///   see the `signer_identity_declared` arm below.
+///
+/// ## The undeclared-signer arm
+///
+/// The stdio comparison presumes the server HAS an identity worth
+/// comparing against. `main::select_signer` rung 4 (`--agent-key` and
+/// `--agent-model` both absent) hands back `AgentSigner::generate()` — a
+/// fresh random keypair per process, which `agent_id()` then registers as
+/// a brand-new `agents` row that has authored nothing. Against such a
+/// signer `caller_agent == target_agent_id` cannot hold for any claim not
+/// written during this same process lifetime: the check is not "owner
+/// only", it is deny-always, and the message it emitted pointed at a
+/// remedy (`claims:admin` over HTTP) the caller had no way to reach.
+///
+/// This is the configuration epiclaw agent containers run — the
+/// agent-runner spawns `epigraph-mcp --database-url <url>` over stdio with
+/// no key — so cross-agent supersede/retire was permanently unreachable
+/// for every agent in the fleet.
+///
+/// Granting the operation there does not widen the trust boundary:
+///
+/// - A stdio server is spoken to only by the process that spawned it, and
+///   that process supplied `--database-url`, so it already holds
+///   unmediated write access to every row this gate protects.
+/// - `patch_claim` and `update_labels` (`crate::tools::claims`) take no
+///   `AuthContext` and perform no ownership check at all, so arbitrary
+///   cross-agent label/property mutation is already available on this
+///   transport.
+/// - The strictly *looser* deployment already permits it: a
+///   `--listen unix:… --allow-unauthenticated-http` listener gets
+///   `auth::unauthenticated_context()`, which carries every scope in
+///   `SCOPE_MAP` including `claims:admin`. Refusing stdio while allowing
+///   an unauthenticated socket inverts the two postures.
+/// - No remotely reachable path arrives here with `auth = None`:
+///   `main::check_listen_auth_mode` refuses a TCP listener that has
+///   neither `--jwt-secret` nor (unix-only) `--allow-unauthenticated-http`.
+///
+/// A server WITH a declared signer keeps the strict behavior unchanged.
 pub(crate) async fn require_owner_or_admin(
     server: &EpiGraphMcpFull,
     auth: Option<&epigraph_auth::AuthContext>,
@@ -809,12 +848,32 @@ pub(crate) async fn require_owner_or_admin(
     if caller_agent == target_agent_id {
         return Ok(());
     }
+
+    if !server.signer_identity_declared {
+        // Undecidable, not denied — see the doc comment. Warned rather than
+        // silent: this is the one arm that mutates another agent's claim with
+        // no credential presented, so the journal must be able to show which
+        // pairs it covered.
+        tracing::warn!(
+            target_agent = %target_agent_id,
+            caller_agent = %caller_agent,
+            "cross-agent claim mutation allowed on an unauthenticated transport: this server \
+             has no declared signer identity (--agent-key / --agent-model absent), so the \
+             owner-equality fallback is undecidable. Pass --agent-key to restore strict \
+             ownership enforcement."
+        );
+        return Ok(());
+    }
+
     Err(McpError {
         code: rmcp::model::ErrorCode::INVALID_PARAMS,
         message: format!(
             "claim is owned by agent {target_agent_id}; \
-             caller agent {caller_agent} cannot retire it \
-             (no AuthContext on this transport — claims:admin scope only honored over HTTP)"
+             caller agent {caller_agent} cannot retire it. This transport carries no \
+             AuthContext, and {caller_agent} is this server's declared signer identity \
+             (--agent-key / --agent-model), so ownership is enforced against it. Use an \
+             authenticated HTTP listener with a claims:admin token, or run this server \
+             under the owning agent's key."
         )
         .into(),
         data: None,

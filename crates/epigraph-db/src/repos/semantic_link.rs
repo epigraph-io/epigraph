@@ -356,19 +356,28 @@ impl SemanticLinkRepository {
         Ok(links)
     }
 
-    /// Delete a semantic link by ID
+    /// Retract a semantic link by ID.
+    ///
+    /// A semantic link IS a claim-to-claim edge, so this is the evidential case:
+    /// removal is a RETRACTION, never a delete. The row survives with `valid_to`
+    /// closed and stays queryable. See `EdgeRepository::retract_by_id`.
     ///
     /// # Returns
-    /// Returns `true` if the link was deleted, `false` if it didn't exist.
+    /// `true` if this call took the link out of force; `false` if it did not
+    /// exist or was already retracted.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
+    /// Renamed from `delete` when edge removal became retraction: the body is
+    /// an `UPDATE ... SET valid_to = now()`, so the old name described an
+    /// operation this no longer performs.
+    ///
     /// Takes a viewer it does not yet use in SQL: this is a WRITE path, and
     /// PR-16 owns the write-side predicate. The parameter is here so the hook
     /// exists at every call site before then, and so a reviewer can see which
     /// writes are still unfiltered.
     #[instrument(skip(pool, _viewer))]
-    pub async fn delete(
+    pub async fn retract(
         pool: &PgPool,
         _viewer: &crate::visibility::Viewer,
         id: SemanticLinkId,
@@ -377,10 +386,12 @@ impl SemanticLinkRepository {
 
         let result = sqlx::query(
             r#"
-            DELETE FROM edges
+            UPDATE edges
+               SET valid_to = now()
             WHERE id = $1
               AND source_type = 'claim'
               AND target_type = 'claim'
+              AND valid_to IS NULL
             "#,
         )
         .bind(uuid)

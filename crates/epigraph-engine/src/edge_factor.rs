@@ -19,7 +19,7 @@ use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
 use epigraph_db::{
-    FrameRepository, MassFunctionRepository, MassFunctionRow, PerspectiveRepository,
+    EdgeRepository, FrameRepository, MassFunctionRepository, MassFunctionRow, PerspectiveRepository,
 };
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
@@ -280,6 +280,22 @@ pub async fn auto_wire_edge_if_epistemic(
 ) -> Option<EdgeFactorOutcome> {
     if source_type != "claim" || target_type != "claim" {
         return None;
+    }
+    // A retracted edge must never be woken back into a BBA. Without this, a
+    // recompute after retirement re-derives from the closed edge and undoes the
+    // retraction silently — the failure mode that makes soft retraction useless
+    // and is why retirement resorted to DELETE. Fail CLOSED on a lookup error:
+    // re-wiring an edge we cannot prove is live is the worse outcome.
+    match EdgeRepository::is_in_force(pool, edge_id).await {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => {
+            tracing::warn!(
+                edge = %edge_id,
+                "edge auto-wire skipped: in-force check failed: {e}",
+            );
+            return None;
+        }
     }
     if !was_created {
         match MassFunctionRepository::exists_for_perspective(pool, viewer, edge_id).await {

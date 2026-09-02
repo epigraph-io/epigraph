@@ -1765,7 +1765,8 @@ pub async fn submit_evidence(
                  (SELECT COUNT(DISTINCT claim_id) FROM mass_functions WHERE frame_id = $1) AS total, \
                  (SELECT COUNT(*) FROM edges e \
                   JOIN mass_functions mf ON mf.claim_id = e.source_id AND mf.frame_id = $1 \
-                  WHERE e.relationship = 'CONTRADICTS') AS contradicts",
+                  WHERE e.relationship = 'CONTRADICTS' \
+                    AND (e.valid_to IS NULL OR e.valid_to > now())) AS contradicts",
         )
         .bind(frame_id)
         .fetch_optional(pool)

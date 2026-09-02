@@ -19,6 +19,10 @@ use crate::errors::ApiError;
 use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 use epigraph_core::challenge::{Challenge, ChallengeType};
+#[cfg(not(feature = "db"))]
+use epigraph_core::{AgentId, ClaimId};
+#[cfg(not(feature = "db"))]
+use epigraph_events::EpiGraphEvent;
 
 // =============================================================================
 // SECURITY CONSTANTS

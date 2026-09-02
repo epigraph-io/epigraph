@@ -16,8 +16,28 @@
 //! proven cull pattern of `migration 012_cull_low_similarity_corroborates`:
 //! per matcher edge, delete `bp_messages` -> `factors` -> `edges`, all keyed by
 //! `source_edge_id`, in ONE transaction. Then flip the candidates to `stale`
-//! (no API exposes a promoted->stale transition) and emit the affected claim
-//! ids so the caller can `recompute_claim_belief` on them.
+//! and emit the affected claim ids.
+//!
+//! Bulk-only as of the `retire` verdict on
+//! `POST /api/v1/match_candidates/:id/decide` and its
+//! `decide_match_candidate` MCP twin: single-candidate retirement now has an
+//! online path (`MatchCandidateRepo::retire`). What still lives only here is
+//! the batch shape — an ids file, a dry run, and the JSON undo dump.
+//!
+//! FOLLOW-UP IS **NOT** `recompute_claim_belief`. Earlier revisions printed
+//! that as the next step; it is the wrong entry point. That binary recombines
+//! `mass_functions`, and a matcher promotion writes none of those — the
+//! promote paths call `EdgeRepository::create_symmetric_if_absent`, never
+//! `edge_factor::auto_wire_edge_if_epistemic` (measured on prod 2026-08-19:
+//! 716 `cross_source_matcher` edges, 715 derived `factors`, **0**
+//! `mass_functions` with `perspective_id` = a matcher edge). Running it after
+//! a retirement therefore reproduces the pre-retirement scalars exactly. The
+//! records this tool deletes feed the *factor graph*, whose only consumer is
+//! `epigraph-api/src/routes/computation.rs::propagate_beliefs`
+//! (`POST /api/v1/bp/propagate`), which reloads `factors` from the database on
+//! every run — so the retirement takes effect there on the next pass, and only
+//! `apply_updates: true` runs can have written a now-stale
+//! `claims.pignistic_prob` needing repair.
 //!
 //! Scoping (see the design review): edges are matched by CLAIM PAIR + the
 //! `properties->>'source' = 'cross_source_matcher'` marker, NOT by
@@ -283,7 +303,10 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         factors_deleted += r.rows_affected();
 
-        let r = sqlx::query("DELETE FROM edges WHERE id = $1")
+        // Retraction, matching the online path (`MatchCandidateRepo::retire`).
+        // This operator binary performs the same act, so it must not be the one
+        // place that still destroys the edge and its `properties.decided_by`.
+        let r = sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1 AND valid_to IS NULL")
             .bind(e.edge_id)
             .execute(&mut *tx)
             .await?;
@@ -311,13 +334,20 @@ async fn main() -> anyhow::Result<()> {
     println!("  edges deleted:       {edges_deleted}");
     println!("  candidates -> stale: {candidates_staled}");
     println!(
-        "\nNext: recompute belief for the {} affected endpoints, e.g.\n  \
-         recompute_claim_belief --input {}",
+        "\nNext: the {} affected endpoint(s) are recorded in {}.\n  \
+         Do NOT run `recompute_claim_belief` on them — it recombines \
+         mass_functions,\n  of which a matcher promotion writes none, so it \
+         reproduces the pre-retirement\n  numbers exactly. The deleted factors \
+         feed the BP factor graph instead:\n  \
+         POST /api/v1/bp/propagate reloads `factors` on every run, so this \
+         retirement\n  lands there on the next pass. Only if a previous \
+         propagate ran with\n  `apply_updates: true` is a cached \
+         claims.pignistic_prob now stale.",
         affected_claims.len(),
         args.affected_out
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<affected-out file>".into())
+            .unwrap_or_else(|| "<no --affected-out given>".into())
     );
     Ok(())
 }
