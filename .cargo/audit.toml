@@ -20,8 +20,12 @@ ignore = [
     # ── No fix available — accepted risk ────────────────────────────────────
     "RUSTSEC-2023-0071", # rsa: Marvin timing side-channel. No fixed upstream
                          #   release exists (pulled by epigraph-api).
-    "RUSTSEC-2026-0097", # rand: unsound with a custom logger. Both 0.8.5 and
-                         #   0.9.2 are flagged — no patched release yet.
+    "RUSTSEC-2026-0097", # rand: unsound with a custom logger. Cargo.lock
+                         #   resolves both 0.8.5 and 0.9.2, and both are flagged.
+                         #   NOTE: the "no patched release yet" justification
+                         #   this entry used to carry is dated and was not
+                         #   re-verified when this file was last touched — check
+                         #   the advisory's patched range before renewing it.
     "RUSTSEC-2024-0384", # instant: unmaintained. Transitive via `ascent`
                          #   (Datalog engine) — not removable by us.
     "RUSTSEC-2024-0436", # paste: unmaintained. Transitive via `ascent`.
@@ -31,9 +35,30 @@ ignore = [
                          #   transport (CVSS 8.8). epigraph-mcp uses the
                          #   `transport-streamable-http-server` feature. Fix =
                          #   upgrade to rmcp >=1.4.0, which is a breaking API
-                         #   change. Exposure is mitigated: the MCP endpoint is
-                         #   only reachable via the Caddy TLS proxy (nip.io:443),
-                         #   not bound directly to a public interface.
+                         #   change.
+                         #
+                         #   MITIGATION — corrected 2026-09-02. This entry used
+                         #   to claim the endpoint was "not bound directly to a
+                         #   public interface". That is FALSE and the correction
+                         #   matters, because the false version invites someone
+                         #   to conclude the network topology is the safety
+                         #   property and relax the token check:
+                         #       $ ufw status | grep 3443
+                         #       3443/tcp  ALLOW  Anywhere   # EpiGraph MCP HTTP
+                         #       3443/tcp (v6) ALLOW Anywhere (v6)
+                         #       $ ss -lntp | grep 3443
+                         #       LISTEN *:3443  users:(("caddy",...))
+                         #   Caddy binds all interfaces and the port is open to
+                         #   the world. The ACTUAL control is bearer-token
+                         #   secrecy, enforced at Caddy before it proxies: an
+                         #   unauthenticated request gets 401 with
+                         #   `www-authenticate: Bearer resource_metadata=...`.
+                         #   DNS rebinding does not defeat that — the attacker
+                         #   still needs the token — but note a same-origin or
+                         #   CORS-preflight argument would NOT hold here, since
+                         #   defeating same-origin is the whole point of a
+                         #   rebinding attack. Do not re-justify this entry that
+                         #   way.
                          #   Track in a follow-up backlog item.
 
     # ── FIXED, not suppressed (issue #287) ──────────────────────────────────
