@@ -54,6 +54,7 @@ pub mod security_event;
 pub mod semantic_link;
 pub mod sheaf;
 pub mod span;
+pub mod structural;
 pub mod task;
 pub mod trace;
 pub mod triple;
@@ -125,6 +126,7 @@ pub use recall_event::{
 pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
+pub use structural::{BeliefIntervalRow, StructuralRepository};
 pub use trace::ReasoningTraceRepository;
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use workflow::{

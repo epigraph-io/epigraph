@@ -13,15 +13,32 @@
 //! the four decisions, say so in the commit body; do not leave the reviewer to
 //! infer it from an untouched test file.
 //!
-//! ## Status at PR-07
+//! ## Status at PR-08
 //!
-//! PR-06 and PR-07 leave every assertion below unchanged, and that is the
-//! correct outcome rather than an omission: neither changes an RLS policy, a
+//! PR-06, PR-07 and PR-08 leave every assertion below unchanged, and that is the
+//! correct outcome rather than an omission: none changes an RLS policy, a
 //! route split, or a tenancy column. PR-07 is a read-path refactor — it moves
 //! statements from `crates/epigraph-api/src/routes/` into
 //! `crates/epigraph-db/src/repos/` and splices `Viewer` predicates into them —
 //! and it adds no migration. Recorded here explicitly because the rejection
 //! trigger above asks for it to be said, not inferred.
+//!
+//! **PR-08 in particular does not move a route.** Its plan entry says
+//! `/api/v1/structural-features/:owner_id` is registered on the `public` router
+//! and must move to `protected`; it already is on `protected`, in BOTH
+//! `create_router` variants. Which PR moved it is NOT attributable from the
+//! history — an earlier revision of this comment credited PR-03, which is not
+//! evidenced: `git log -S/-G 'structural-features' -- routes/mod.rs` returns
+//! only the initial public release, because the registration line itself never
+//! changed and only the enclosing `public`/`protected` block boundary moved.
+//! `routes/mod.rs` is untouched by PR-08 and the anonymous→401 acceptance
+//! criterion is *tested*
+//! (`crates/epigraph-api/tests/structural_features_authz.rs::anonymous_is_401`)
+//! rather than implemented. The rest of PR-08 — nine statements into
+//! `repos/structural.rs` with spliced predicates, an `epsilon` default of 1.0
+//! that is also the unprivileged ceiling, and a `claims:admin` gate on exact
+//! counts — is a read path and a scope check, neither of which is one of the
+//! four decisions.
 //!
 //! * **D3 — no anonymous read authority.** Asserted below, in full.
 //! * **D1 — tenancy is declared, never defaulted.** *Half asserted.* PR-05's

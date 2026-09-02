@@ -22,24 +22,14 @@ use uuid::Uuid;
 
 /// Coarse edge types from §1.2 — the only relationship types exposed
 /// through privacy-preserving structural queries.
-pub const COARSE_EDGE_TYPES: &[&str] = &[
-    "SUPPORTS",
-    "CONTRADICTS",
-    "RELATES_TO",
-    "DERIVED_FROM",
-    "GENERATED_BY",
-    "PERSPECTIVE_OF",
-    "CONTRIBUTES_TO",
-    "MEMBER_OF",
-    "SCOPED_BY",
-    "WITHIN_FRAME",
-    // Political network monitoring edge types
-    "ORIGINATED_BY",
-    "AMPLIFIED_BY",
-    "COORDINATED_WITH",
-    "USES_TECHNIQUE",
-    "MIRROR_NARRATIVE",
-];
+///
+/// **Relocated by PR-08** to [`crate::repos::structural`], next to
+/// `StructuralRepository::edge_counts`, which is now its only consumer (plan
+/// §4.8: "the constant survives"). Re-exported here so
+/// `epigraph_db::access_control::COARSE_EDGE_TYPES`, `epigraph_db::COARSE_EDGE_TYPES`
+/// and the `epigraph_api::access_control` shim keep resolving. Its two
+/// assertions moved with it — see `repos::structural::tests`.
+pub use crate::repos::structural::COARSE_EDGE_TYPES;
 
 /// Result of a partition check for a single node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,18 +181,6 @@ pub async fn batch_check_content_access(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn coarse_edge_types_has_expected_count() {
-        assert_eq!(COARSE_EDGE_TYPES.len(), 15);
-        assert!(COARSE_EDGE_TYPES.contains(&"SUPPORTS"));
-        assert!(COARSE_EDGE_TYPES.contains(&"CONTRADICTS"));
-        assert!(COARSE_EDGE_TYPES.contains(&"SCOPED_BY"));
-        assert!(COARSE_EDGE_TYPES.contains(&"WITHIN_FRAME"));
-        assert!(COARSE_EDGE_TYPES.contains(&"ORIGINATED_BY"));
-        assert!(COARSE_EDGE_TYPES.contains(&"AMPLIFIED_BY"));
-        assert!(COARSE_EDGE_TYPES.contains(&"USES_TECHNIQUE"));
-    }
 
     #[test]
     fn content_access_eq() {
