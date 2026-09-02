@@ -16,13 +16,16 @@
 //! - two extensions exporting the SAME effective tool name make `build()` fail
 //!   with a collision, while a distinct `prefix=` on one is the escape hatch;
 //! - an unreachable address degrades gracefully (empty tools, healthy=false, no
-//!   panic) instead of taking the gateway down.
+//!   panic) instead of taking the gateway down;
+//! - a `reconnect_tick` REVIVES an extension that was down at build time — the
+//!   boot race that left episcience unroutable in production for hours — and is
+//!   a no-op against one that is still down or already healthy.
 
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use epigraph_mcp::federation::config::ExtensionConfig;
-use epigraph_mcp::federation::FederationRegistry;
+use epigraph_mcp::federation::{FederationRegistry, SharedFederation};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ListToolsResult, ServerCapabilities,
     ServerInfo, Tool,
@@ -109,6 +112,23 @@ async fn capture_auth(
 /// Returns the bound `host:port` (as the registry's `addr` form) and the auth
 /// slot the capture middleware writes into.
 async fn spawn_stub(tool_name: &str) -> (String, AuthSlot) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    (addr, serve_stub(listener, tool_name))
+}
+
+/// As [`spawn_stub`], but binds a caller-chosen `host:port`. Used by the
+/// reconnect test to bring an extension up on the exact address the gateway
+/// already failed to reach.
+async fn spawn_stub_on(addr: &str, tool_name: &str) -> AuthSlot {
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    serve_stub(listener, tool_name)
+}
+
+/// Serve the stub + capture middleware on an already-bound listener. Binding is
+/// the caller's job so a test can reserve a port, release it, and later reclaim
+/// exactly that port.
+fn serve_stub(listener: tokio::net::TcpListener, tool_name: &str) -> AuthSlot {
     let slot: AuthSlot = Arc::new(Mutex::new(None));
     let tool_name = tool_name.to_string();
 
@@ -131,13 +151,11 @@ async fn spawn_stub(tool_name: &str) -> (String, AuthSlot) {
                 capture_auth(slot, req, next)
             }));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
 
-    (format!("127.0.0.1:{}", addr.port()), slot)
+    slot
 }
 
 fn cfg(name: &str, addr: &str, prefix: Option<&str>) -> ExtensionConfig {
@@ -294,6 +312,93 @@ async fn unreachable_extension_degrades_gracefully() {
         !registry.is_empty(),
         "the extension is still mounted (unhealthy)"
     );
+}
+
+#[tokio::test]
+async fn reconnect_tick_revives_an_extension_that_was_down_at_boot() {
+    // Reproduce production's boot race deterministically: reserve a port, drop
+    // the listener so the gateway's build-time dial is refused, then bring the
+    // extension up on that exact port afterwards.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let addr = format!("127.0.0.1:{port}");
+
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+            .await
+            .expect("an unreachable extension must not fail the build"),
+    );
+
+    // Baseline: mounted, but contributing nothing.
+    assert!(!federation.is_empty(), "the extension is mounted");
+    assert!(
+        federation.list_federated_tools().is_empty(),
+        "an unhealthy mount routes no tools"
+    );
+    assert!(federation.route_config("ping").is_none());
+
+    // A tick while the extension is STILL down must be a quiet no-op — not a
+    // panic, and not a spurious promotion.
+    federation.reconnect_tick().await;
+    assert!(
+        federation.list_federated_tools().is_empty(),
+        "ticking against a dead extension must not promote it"
+    );
+
+    // The extension finally comes up, on the same address.
+    let slot = spawn_stub_on(&addr, "ping").await;
+    federation.reconnect_tick().await;
+
+    // It is now advertised...
+    let tools = federation.list_federated_tools();
+    assert_eq!(tools.len(), 1, "reconnect should route the stub's one tool");
+    assert_eq!(tools[0].name.as_ref(), "ping");
+    assert_eq!(
+        federation.route_config("ping").map(|c| c.scope),
+        Some("episcience:tools".to_string()),
+        "the revived route must carry the extension's configured scope gate"
+    );
+
+    // ...and actually callable end-to-end, with the caller's bearer forwarded.
+    // Listing alone would pass even if the routing map were updated but the
+    // session were not, so assert the round-trip.
+    let result = federation
+        .invoke("ping", "caller-after-revival", None)
+        .await
+        .expect("a revived extension must be invocable");
+    assert_eq!(
+        result.content[0].as_text().unwrap().text,
+        "stub handled `ping`"
+    );
+    assert_eq!(
+        slot.lock().unwrap().clone(),
+        Some("Bearer caller-after-revival".to_string()),
+        "the caller's bearer must reach the revived downstream"
+    );
+}
+
+#[tokio::test]
+async fn reconnect_tick_leaves_healthy_extensions_untouched() {
+    let (addr, _slot) = spawn_stub("ping").await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(federation.list_federated_tools().len(), 1);
+
+    // Ticking a fully-healthy registry must not duplicate routes or drop them.
+    federation.reconnect_tick().await;
+
+    let tools = federation.list_federated_tools();
+    assert_eq!(
+        tools.len(),
+        1,
+        "a healthy extension must not be re-mounted or duplicated by a tick"
+    );
+    assert_eq!(tools[0].name.as_ref(), "ping");
+    assert!(federation.route_config("ping").is_some());
 }
 
 #[tokio::test]

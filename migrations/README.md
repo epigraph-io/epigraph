@@ -42,23 +42,70 @@ python3 scripts/audit_claims_content_hash_agent.py     # read-only
 ## Version range coordination with epigraph-internal
 
 The private `epigraph-internal` repo also runs `sqlx::migrate!()` against the
-same `_sqlx_migrations` table, so its versions and ours share a number space.
-The next available public version must be higher than every applied version
-in prod, including any from internal.
+same `_sqlx_migrations` table, so its versions and ours **did** share a number
+space. As of 2026-09-02 that is no longer true in practice — see "The
+epigraph-internal overlap" below — but the numbers it burned are still real and
+still recorded here, because a database that ever ran internal carries them.
 
 Current reservation:
 
 - **001–034**: public
 - **035–037**: `epigraph-internal` (`claim_supersession`, `challenges_and_events`,
   `analyses`) — applied to prod 2026-05-22. Public has since renumbered these
-  same files in-tree to `036–038` (cross-source matching port); prod
-  `_sqlx_migrations` rows must be renumbered +1 on next public deploy.
+  same files in-tree to `036–038` (cross-source matching port).
 - **038**: public `corroborates_factor_strength_from_score` (PR #173)
-- **039+**: public next
+- **039–059**: public
+- **060–090**: **RESERVED** — the multi-user tenancy series on
+  `feat/multi-user-tenancy` (epigraph-io/epigraph#408). 21 migrations plus
+  headroom. **Do not allocate here**, even though the branch has not merged:
+  its numbers are fixed and its `docs/tenancy/` ledger pins them.
+- **091**: public `alternative_of_uniq_ignores_retracted` (PR #411)
+- **092+**: public next
 
-Next public migration must be `039` or later. Picking a colliding version
+Next public migration must be `092` or later. Picking a colliding version
 (checksum mismatch on a `_sqlx_migrations` row that's already applied) will
 panic the api binary on restart.
+
+### Why 091 and not 060
+
+`alternative_of_uniq_ignores_retracted` was written as `060` and merged to
+`main` in #411 while this table still ended at "039+: public next" — nothing
+recorded that #408 had already claimed `060`. Git does not catch it: the two
+files have different names, so they merge cleanly and the collision only
+appears when sqlx sees version 60 already applied under a different checksum
+and panics the api binary on startup.
+
+It was renumbered to `091` rather than renumbering #408's 21 migrations,
+because it was applied to **no** database at the time (prod `_sqlx_migrations`
+max was 59) and because #408 reserved the range first. That window existed only
+because #411 had not yet been deployed; had it shipped first, moving it would
+itself have been the panic scenario and #408 would have had to shift instead.
+
+**The lesson for this table:** a reservation that lives only on an unmerged
+branch protects nothing. Record the range here, on `main`, when the branch is
+opened — not when it lands.
+
+### The epigraph-internal overlap
+
+`epigraph-internal` allocated `060`–`112` (110 migration files, `060_prov_o_agent_typing`
+onward) long before the tenancy series reserved `060`–`090`, so the two ranges
+overlap outright. This is recorded rather than fixed, because internal no
+longer shares prod's `_sqlx_migrations`:
+
+```
+prod `epigraph` DB, max applied version            : 59   (2026-09-02)
+prod rows matching internal migration descriptions : 0
+```
+
+Verify both before assuming it still holds. If a database is ever found that
+ran internal *and* is targeted by public migrations, `060`–`112` is a minefield
+there and public must allocate above `112` for that database.
+
+Note also that `crates/epigraph-api/src/lib.rs` sets
+`migrator.set_ignore_missing(true)`, so a *gap* is tolerated but a *checksum
+mismatch* is not. Prod's missing version 35 is the benign case: there is no
+public `035_*.sql` at all, 035 belongs to internal, and prod's 036/037/038
+descriptions match the public filenames.
 
 ## Migration Order
 
