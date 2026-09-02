@@ -120,6 +120,18 @@ pub struct SemanticFlatHit {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Result row for [`ClaimRepository::neighborhood_embeddings`].
+///
+/// A named struct rather than a `(Uuid, Vec<f32>, Option<f64>)` tuple: the
+/// projection is a raw embedding, and an unlabelled `Vec<f32>` at a call site
+/// is exactly the kind of value that gets forwarded somewhere it should not go.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NeighborhoodEmbeddingRow {
+    pub id: Uuid,
+    pub embedding: Vec<f32>,
+    pub truth_value: Option<f64>,
+}
+
 /// Result row for [`ClaimRepository::semantic_graph_neighbors`].
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SemanticNeighborHit {
@@ -781,6 +793,128 @@ impl ClaimRepository {
             .bind(created_after)
             .bind(created_before)
             .bind(agent_id)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(pool).await?)
+    }
+
+    /// `claims.content` and `claims.properties` for one id, viewer-filtered.
+    ///
+    /// # Why this exists
+    ///
+    /// `routes/hypothesis.rs::hypothesis_status` destructured a
+    /// `ViewerExtractor` and then ran `SELECT id, content, truth_value, belief,
+    /// plausibility, labels, properties FROM claims WHERE id = $1` straight
+    /// against the pool. Its viewer was spent only on
+    /// `MassFunctionRepository::get_for_claim_frame` and
+    /// `ExperimentRepository::count_completed_with_analysis`, both of which
+    /// return scalars — so the handler satisfied acceptance criterion #1
+    /// *syntactically* (a `ViewerExtractor` is present) while disclosing
+    /// content, truth value, belief, plausibility, labels and properties for an
+    /// arbitrary claim id to any bearer principal. That is the same
+    /// Viewer-held-but-never-spent shape as `frame_claims_sorted`, which is the
+    /// defect PR-07 exists to eliminate, and it had no `check_content_access`
+    /// pass behind it (`hypothesis.rs` contains zero calls to it).
+    ///
+    /// [`Self::get_by_id`] is not reusable here: it returns a `Claim`, which
+    /// carries no `properties`, and CLAUDE.md forbids widening
+    /// `claim_from_row`'s signature to add one.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, viewer))]
+    pub async fn content_and_properties(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<(String, serde_json::Value)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.content, c.properties \
+             FROM claims c \
+             WHERE c.id = $1 \
+               /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (String, serde_json::Value)>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(pool).await?)
+    }
+
+    /// Corpus-wide embedding-neighbourhood cardinality and mean similarity.
+    ///
+    /// Backs `GET /api/v1/voids/density`, which ran this aggregate inline and
+    /// unfiltered over the whole corpus against a caller-supplied probe vector.
+    /// A bare `COUNT(*)` there is a cardinality oracle in the sense
+    /// [`MassFunctionRepository::count_for_claim`] documents: it reports how
+    /// much of the corpus sits near an arbitrary point in embedding space
+    /// without disclosing any of it. Filtered, the count is the reader's count.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, viewer, embedding))]
+    pub async fn embedding_density_stats(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        embedding: &str,
+        radius: f64,
+    ) -> Result<(i64, Option<f64>), DbError> {
+        let sql = viewer.splice(
+            "SELECT COUNT(*), AVG(1 - (c.embedding <=> $1::vector)) \
+             FROM claims c \
+             WHERE c.embedding IS NOT NULL \
+               AND 1 - (c.embedding <=> $1::vector) >= $2 \
+               /* {VISIBILITY:c} */",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(&sql)
+            .bind(embedding)
+            .bind(radius);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(pool).await?)
+    }
+
+    /// Raw `claims.embedding` vectors for a probe neighbourhood, viewer-filtered.
+    ///
+    /// Backs the optional clustering branch of `POST /api/v1/experiments/hypothesize`.
+    ///
+    /// A raw embedding is not a weaker disclosure than the text it encodes —
+    /// PR-07's own acceptance criteria treat embeddings as approximately
+    /// invertible to content, which is why `/themes/:id/embeddings` returns
+    /// none. This projection handed back full 1536-d vectors for the 200 claims
+    /// nearest a caller-supplied probe, unfiltered.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, viewer, embedding))]
+    pub async fn neighborhood_embeddings(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        embedding: &str,
+        min_similarity: f64,
+        limit: i64,
+    ) -> Result<Vec<NeighborhoodEmbeddingRow>, DbError> {
+        // `embedding::real[]` rather than `embedding::text::float4[]`: pgvector's
+        // text form `[a,b,c]` is not a valid Postgres array literal.
+        let sql = viewer.splice(
+            "SELECT c.id, c.embedding::real[], c.truth_value \
+             FROM claims c \
+             WHERE c.embedding IS NOT NULL \
+               AND c.is_current = true \
+               AND 1 - (c.embedding <=> $1::vector) >= $2 \
+               /* {VISIBILITY:c} */ \
+             ORDER BY c.embedding <=> $1::vector \
+             LIMIT $3",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, NeighborhoodEmbeddingRow>(&sql)
+            .bind(embedding)
+            .bind(min_similarity)
             .bind(limit);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);

@@ -23,6 +23,9 @@
 
 mod common;
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
@@ -289,12 +292,21 @@ async fn challenges_list_is_reachable_and_carries_no_foreign_explanation() {
     // coverage; the eight cases in `tenant_isolation_http.rs` never touch
     // challenges. This closes the gap at the HTTP boundary.
     //
-    // Today every fixture row is `visibility = 'public'` (migration 062's
-    // default; nothing transcribes ownership until PR-12), so this asserts the
-    // reachable half — the endpoint authenticates, the handler resolves a
-    // viewer, and a challenge for an unrelated claim never appears in another
-    // claim's listing. The cross-tenant half arms when PR-12 populates the
-    // tenancy columns.
+    // SCOPE OF THIS TEST: it asserts the KEYING half only — that a challenge
+    // for an unrelated claim never appears in another claim's listing — plus
+    // reachability and the 401. It would pass against any correctly-keyed
+    // `WHERE claim_id = $1` with no visibility predicate at all.
+    //
+    // An earlier version of this comment excused that with "today every fixture
+    // row is `visibility = 'public'`, so the cross-tenant half arms when PR-12
+    // populates the tenancy columns". That is false by this PR's own technique:
+    // `tenant_isolation_http.rs::belief_http_corpus` hand-sets
+    // `UPDATE claim_frames SET visibility = 'group', owner_group_id = $1` to
+    // make `{VISIBILITY:cf}` load-bearing today, and `challenges` is in
+    // migration 062's `tier_a` array exactly as `claim_frames` is. The tenancy
+    // half is therefore tested — in
+    // `challenges_list_hides_a_group_private_explanation_from_a_stranger`
+    // below, which is what actually verifies acceptance #3.
     let (pool, addr, shutdown) = pool_and_app().await;
     let client = reqwest::Client::new();
 
@@ -339,6 +351,111 @@ async fn challenges_list_is_reachable_and_carries_no_foreign_explanation() {
         anon.status(),
         401,
         "challenge listing must not be anonymously readable"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// Acceptance #3, the half that needed a foreign-tenant corpus.
+///
+/// `ChallengeRepository::list_for_claim` carries `/* {VISIBILITY:challenges} */`.
+/// Deleting that marker does NOT turn the reachability test above red — it
+/// would still return only the subject claim's challenges — so that test cannot
+/// be the verification of the criterion. This one can: it seeds two challenges
+/// on the SAME claim, makes one `visibility = 'group'` the way PR-12's backfill
+/// will, and asserts a stranger's 200 omits its id and its explanation while
+/// still carrying the public one.
+///
+/// The subject claim itself is public on purpose. That is the sharp case: the
+/// endpoint must return the claim's public challenges and withhold the private
+/// one, not 404 or empty the whole listing.
+#[tokio::test]
+async fn challenges_list_hides_a_group_private_explanation_from_a_stranger() {
+    let (pool, addr, shutdown) = pool_and_app().await;
+    let client = reqwest::Client::new();
+
+    let (owner_agent, group) = fixture::seed_agent_with_group(&pool, "chal-tenancy").await;
+    let (stranger_agent, _sg) =
+        fixture::seed_agent_with_group(&pool, "chal-tenancy-stranger").await;
+    let subject = fixture::seed_public_claim(&pool, owner_agent, "pr07 challenge subject").await;
+
+    let private_id = Uuid::new_v4();
+    let private_explanation = format!("pr07-private-explanation-{private_id}");
+    let public_id = Uuid::new_v4();
+    let public_explanation = format!("pr07-public-explanation-{public_id}");
+
+    for (id, explanation) in [
+        (private_id, &private_explanation),
+        (public_id, &public_explanation),
+    ] {
+        sqlx::query(
+            "INSERT INTO challenges (id, claim_id, challenger_id, challenge_type, explanation) \
+             VALUES ($1, $2, $3, 'methodology', $4)",
+        )
+        .bind(id)
+        .bind(subject)
+        .bind(owner_agent)
+        .bind(explanation)
+        .execute(&pool)
+        .await
+        .expect("seed challenge on the subject claim");
+    }
+
+    // `challenges` is in migration 062's `tier_a`, so the row carries its own
+    // tenancy columns and defaults to `public`. This is the shape PR-12's
+    // backfill will produce for a challenge that belongs to one group.
+    sqlx::query("UPDATE challenges SET visibility = 'group', owner_group_id = $1 WHERE id = $2")
+        .bind(group)
+        .bind(private_id)
+        .execute(&pool)
+        .await
+        .expect("make the challenge group-private");
+
+    let path = format!("http://{addr}/api/v1/claims/{subject}/challenges");
+    let fetch = |token: String| {
+        let client = client.clone();
+        let path = path.clone();
+        async move {
+            let resp = client
+                .get(path)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("challenges request");
+            let status = resp.status();
+            let body = resp.text().await.expect("body text");
+            (status, body)
+        }
+    };
+
+    // Non-vacuity: the owner really does receive BOTH challenges, so an absent
+    // one below is the filter working rather than the listing being empty.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner_agent);
+    let (owner_status, owner_body) = fetch(owner_token).await;
+    assert_eq!(owner_status, 200, "owner listing: {owner_body}");
+    assert!(
+        owner_body.contains(&private_explanation) && owner_body.contains(&public_explanation),
+        "the owner must see both of its own claim's challenges.\nbody: {owner_body}"
+    );
+
+    let stranger_token = common::mint_token_with_agent(&["claims:read"], stranger_agent);
+    let (stranger_status, stranger_body) = fetch(stranger_token).await;
+    assert_eq!(stranger_status, 200, "stranger listing: {stranger_body}");
+    assert!(
+        stranger_body.contains(&public_explanation),
+        "the stranger must still receive the PUBLIC challenge on this claim — \
+         otherwise this test cannot distinguish a working filter from an \
+         endpoint that returns nothing.\nbody: {stranger_body}"
+    );
+    assert!(
+        !stranger_body.contains(&private_explanation),
+        "a group-private challenge's explanation leaked to a stranger — \
+         acceptance #3.\nbody: {stranger_body}"
+    );
+    assert!(
+        !stranger_body.contains(&private_id.to_string()),
+        "a group-private challenge's id leaked to a stranger, which is an \
+         enumeration oracle even with the explanation stripped.\nbody: {stranger_body}"
     );
 
     let _ = shutdown.send(());

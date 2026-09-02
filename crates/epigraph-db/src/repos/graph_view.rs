@@ -133,6 +133,14 @@ pub struct SubgraphEdgeRow {
 }
 
 /// A parent compound and the neighborhood atoms it decomposes to.
+/// Result row for [`GraphViewRepository::subgraph_traces`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SubgraphTraceRow {
+    pub id: Uuid,
+    pub methodology: String,
+    pub confidence: f64,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CompoundGroupRow {
     pub compound_id: Uuid,
@@ -505,9 +513,25 @@ impl GraphViewRepository {
     ///
     /// `edges` is a `tier_a` root and carries tenancy columns, so unlike the
     /// structural traversals elsewhere in this module this one CAN be filtered
-    /// on its own predicate today, and is. The caller additionally narrows
-    /// `node_ids` to the ids that survived the node projections, so an edge
-    /// cannot reference a node absent from the response.
+    /// on its own predicate today, and is.
+    ///
+    /// # The caller must pass SURVIVING ids
+    ///
+    /// This doc previously asserted that "the caller additionally narrows
+    /// `node_ids` to the ids that survived the node projections". No caller
+    /// did: `load_subgraph` fetched edges FIRST, before any node projection had
+    /// run, and never recomputed the set — so the response's `edges` array
+    /// enumerated ids the `nodes` projection had withheld (an id-enumeration
+    /// oracle, since `edges.visibility` defaults to `'public'` under migration
+    /// 062 and the edge predicate therefore matches every row today). PR-07's
+    /// follow-up reordered `load_subgraph` so the narrowing the doc described
+    /// actually happens.
+    ///
+    /// The obligation is on the caller and cannot be enforced by a signature,
+    /// so it is stated here as a precondition rather than implied: pass the ids
+    /// that survived the node projections, not the caller's raw request set.
+    /// Both endpoints must be in the set for an edge to be returned, so an edge
+    /// survives exactly when both of its endpoints did.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -526,6 +550,36 @@ impl GraphViewRepository {
             2,
         );
         let mut q = sqlx::query_as::<_, SubgraphEdgeRow>(&sql).bind(node_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(pool).await?)
+    }
+
+    /// Reasoning-trace nodes of an arbitrary id set, for `load_subgraph`.
+    ///
+    /// `reasoning_traces` IS in migration 062's `tier_a` array — it is listed
+    /// beside `challenges` and `experiment_triples` — and therefore carries
+    /// `owner_group_id` and `visibility` like every other `tier_a` table. The
+    /// projection was left inline and unfiltered in `graph_query_utils.rs` on
+    /// the recorded grounds that the table "has no `owner_group_id` to filter
+    /// on", which is false. The disclosure is small (a methodology label and a
+    /// confidence float) but the justification was wrong, and a wrong
+    /// justification is what stops a site from ever being revisited.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, viewer, node_ids))]
+    pub async fn subgraph_traces(
+        pool: &PgPool,
+        viewer: &Viewer,
+        node_ids: &[Uuid],
+    ) -> Result<Vec<SubgraphTraceRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT id, reasoning_type AS methodology, confidence              FROM reasoning_traces              WHERE id = ANY($1) /* {VISIBILITY:reasoning_traces} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, SubgraphTraceRow>(&sql).bind(node_ids);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

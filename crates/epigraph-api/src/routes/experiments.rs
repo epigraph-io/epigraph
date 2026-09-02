@@ -79,8 +79,20 @@ pub struct DesignExperimentRequest {
 /// POST /api/v1/experiments/hypothesize - Evaluate a scientific hypothesis.
 ///
 /// Searches for similar claims, computes prior belief from neighborhood.
+///
+/// # Viewer
+///
+/// Two unfiltered corpus scans against a caller-supplied probe vector lived
+/// here: the `similar` projection (which returns 200 characters of each
+/// matching claim) and the clustering branch's raw `embedding::real[]` pull.
+/// Both are the primitive PR-07 fixed in `search.rs::semantic_search` and left
+/// standing in its siblings; raw embeddings are treated as approximately
+/// invertible to content by PR-07's own acceptance criteria. The handler took
+/// no auth argument at all, so adding the `ViewerExtractor` is a deliberate
+/// behaviour change: a bearer token that resolves to no `agents.id` now 401s.
 #[cfg(feature = "db")]
 pub async fn hypothesize(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<HypothesizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -99,19 +111,19 @@ pub async fn hypothesize(
                 message: format!("Failed to embed hypothesis: {e}"),
             })?;
 
-    // Find similar claims
-    let similar: Vec<SimilarClaimRow> = sqlx::query_as(
-        "SELECT id, content, truth_value, belief, plausibility, \
-                1 - (embedding <=> $1::vector) AS similarity \
-         FROM claims \
-         WHERE embedding IS NOT NULL \
-           AND 1 - (embedding <=> $1::vector) >= $2 \
-         ORDER BY similarity DESC \
-         LIMIT 50",
+    // Find similar VISIBLE claims. Same predicate, ordering and limit as the
+    // inline statement this replaces.
+    let similar = epigraph_db::ClaimRepository::semantic_search_flat(
+        &state.db_pool,
+        &viewer,
+        &format_embedding(&embedding),
+        search_radius,
+        None,
+        None,
+        None,
+        None,
+        50,
     )
-    .bind(format_embedding(&embedding))
-    .bind(search_radius)
-    .fetch_all(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to search similar claims: {e}"),
@@ -119,8 +131,8 @@ pub async fn hypothesize(
 
     // Compute prior belief from neighborhood (similarity-weighted average)
     let (weighted_sum, weight_total) = similar.iter().fold((0.0, 0.0), |(ws, wt), row| {
-        let truth = row.truth_value.unwrap_or(0.5);
-        let sim = row.similarity.unwrap_or(0.0);
+        let truth = row.truth_value;
+        let sim = row.similarity;
         (ws + truth * sim, wt + sim)
     });
     let prior_belief = if weight_total > 0.0 {
@@ -134,10 +146,10 @@ pub async fn hypothesize(
         "understudied"
     } else if similar.len() >= 10 && prior_belief > 0.7 {
         "established"
-    } else if similar.iter().any(|s| {
-        let t = s.truth_value.unwrap_or(0.5);
-        (t - prior_belief).abs() > 0.3
-    }) {
+    } else if similar
+        .iter()
+        .any(|s| (s.truth_value - prior_belief).abs() > 0.3)
+    {
         "contested"
     } else {
         "moderate_evidence"
@@ -148,8 +160,8 @@ pub async fn hypothesize(
         .take(20)
         .map(|s| {
             serde_json::json!({
-                "id": s.id,
-                "content": s.content.chars().take(200).collect::<String>(),
+                "id": s.claim_id,
+                "content": s.statement.chars().take(200).collect::<String>(),
                 "similarity": s.similarity,
                 "truth_value": s.truth_value,
                 "belief": s.belief,
@@ -165,34 +177,27 @@ pub async fn hypothesize(
         } else {
             // Pull embeddings for the same neighborhood — re-query because the
             // initial `similar` projection doesn't include the vector column.
-            // Cast pgvector -> real[] for sqlx Vec<f32> decoding. Note:
-            // `embedding::text::float4[]` does NOT work — pgvector's text
-            // form `[a,b,c]` is not a valid Postgres array literal (which
-            // requires `{a,b,c}`). Casting via `vector::real[]` is the
-            // pgvector-native path.
-            let neighborhood: Vec<(uuid::Uuid, Vec<f32>, Option<f64>)> = sqlx::query_as(
-                "SELECT id, embedding::real[], truth_value \
-                 FROM claims \
-                 WHERE embedding IS NOT NULL \
-                   AND is_current = true \
-                   AND 1 - (embedding <=> $1::vector) >= $2 \
-                 ORDER BY embedding <=> $1::vector \
-                 LIMIT 200",
+            // This ran inline and unfiltered, handing back full raw vectors for
+            // the 200 nearest claims; the pgvector cast rationale now lives with
+            // the statement in `ClaimRepository::neighborhood_embeddings`.
+            let neighborhood = epigraph_db::ClaimRepository::neighborhood_embeddings(
+                &state.db_pool,
+                &viewer,
+                &format_embedding(&embedding),
+                search_radius,
+                200,
             )
-            .bind(format_embedding(&embedding))
-            .bind(search_radius)
-            .fetch_all(&state.db_pool)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to fetch neighborhood embeddings: {e}"),
             })?;
 
             let embeddings: Vec<Vec<f32>> =
-                neighborhood.iter().map(|(_, e, _)| e.clone()).collect();
-            let ids: Vec<uuid::Uuid> = neighborhood.iter().map(|(id, _, _)| *id).collect();
+                neighborhood.iter().map(|r| r.embedding.clone()).collect();
+            let ids: Vec<uuid::Uuid> = neighborhood.iter().map(|r| r.id).collect();
             let truths: Vec<f64> = neighborhood
                 .iter()
-                .map(|(_, _, t)| t.unwrap_or(0.5))
+                .map(|r| r.truth_value.unwrap_or(0.5))
                 .collect();
 
             let cluster_result =
@@ -233,8 +238,8 @@ pub async fn hypothesize(
                 let nearest_id = ids[nearest_idx];
                 let summary = similar
                     .iter()
-                    .find(|s| s.id == nearest_id)
-                    .map(|s| s.content.chars().take(80).collect::<String>())
+                    .find(|s| s.claim_id == nearest_id)
+                    .map(|s| s.statement.chars().take(80).collect::<String>())
                     .unwrap_or_else(|| format!("cluster-{c}"));
 
                 clusters.push(serde_json::json!({
@@ -587,13 +592,6 @@ fn format_embedding(embedding: &[f32]) -> String {
 
 // ── Internal types ──
 
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct SimilarClaimRow {
-    id: Uuid,
-    content: String,
-    truth_value: Option<f64>,
-    belief: Option<f64>,
-    plausibility: Option<f64>,
-    similarity: Option<f64>,
-}
+// `SimilarClaimRow` was deleted with the inline corpus scan it decoded. Its
+// replacement is `epigraph_db::SemanticFlatHit`, returned by the
+// viewer-spliced `ClaimRepository::semantic_search_flat`.

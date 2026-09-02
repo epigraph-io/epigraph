@@ -9,12 +9,6 @@ struct AgentGraphRow {
     id: Uuid,
     display_name: Option<String>,
 }
-#[derive(sqlx::FromRow)]
-struct TraceGraphRow {
-    id: Uuid,
-    methodology: String,
-    confidence: f64,
-}
 
 /// Build a subgraph response for an arbitrary node id set.
 ///
@@ -29,30 +23,41 @@ struct TraceGraphRow {
 /// than at the callers.
 ///
 /// `claims`, `evidence` and `edges` are all `tier_a` roots in migration 062 and
-/// are filtered on their own predicates. `agents` and `reasoning_traces` are
-/// NOT in `tier_a` — they have no `owner_group_id` to filter on — so those two
-/// projections stay unfiltered, deliberately. They carry no claim content:
-/// `agents` contributes a display name and `reasoning_traces` a methodology
-/// label and a confidence number.
+/// are filtered on their own predicates. `agents` is NOT in `tier_a` — it has
+/// no `owner_group_id` to filter on — so that projection stays unfiltered,
+/// deliberately; it contributes a display name and no claim content.
+///
+/// `reasoning_traces` IS in `tier_a` (migration 062 lists it beside
+/// `challenges` and `experiment_triples`) and does carry the tenancy columns.
+/// An earlier revision of this comment asserted the opposite and used that as
+/// the reason to leave the projection unfiltered. It is now filtered through
+/// [`epigraph_db::GraphViewRepository::subgraph_traces`]. The disclosure was
+/// small — a methodology label and a confidence float — but a factually wrong
+/// justification is worse than an unjustified gap, because the next reader
+/// re-derives "nothing to filter" from it and never revisits the site.
+///
+/// # Node/edge consistency
+///
+/// The edge fetch runs LAST, over the ids that actually survived the four node
+/// projections, not over the caller's raw `node_ids`. Running it first — which
+/// is what this function used to do — let the response's `edges` array name
+/// claim ids the `nodes` array had withheld, which is the id-enumeration oracle
+/// PR-07 closed in `graph_neighborhood.rs` and left standing here behind a doc
+/// comment on `subgraph_edges` claiming the caller narrowed the set. It did
+/// not. `subgraph_edges` requires BOTH endpoints to be in the set, so an edge
+/// survives exactly when both of its endpoints did.
 #[cfg(feature = "db")]
 pub async fn load_subgraph(
     pool: &epigraph_db::PgPool,
     viewer: &epigraph_db::Viewer,
     node_ids: Vec<Uuid>,
 ) -> Result<Json<FullGraphResponse>, ApiError> {
-    // 1. Fetch all edges WHERE both source and target are in our node_ids set
-    let edge_rows = epigraph_db::GraphViewRepository::subgraph_edges(pool, viewer, &node_ids)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Fetch subgraph edges: {e}"),
-        })?;
-
-    // 2. We need to figure out which nodes belong to which table to do efficient batch fetches
+    // 1. We need to figure out which nodes belong to which table to do efficient batch fetches
     // A small side effect is we don't strictly know the entity_type of every node_id passed in unless
     // we query each table, BUT realistically we just try to fetch the known set from each table
     let mut nodes: Vec<FullGraphNode> = Vec::new();
 
-    // 3. Fetch claims (viewer-filtered)
+    // 2. Fetch claims (viewer-filtered)
     let claim_rows = epigraph_db::GraphViewRepository::subgraph_claims(pool, viewer, &node_ids)
         .await
         .map_err(|e| ApiError::InternalError {
@@ -82,7 +87,7 @@ pub async fn load_subgraph(
         });
     }
 
-    // 4. Fetch agents
+    // 3. Fetch agents
     let agent_rows: Vec<AgentGraphRow> =
         sqlx::query_as("SELECT id, display_name FROM agents WHERE id = ANY($1)")
             .bind(&node_ids)
@@ -113,7 +118,7 @@ pub async fn load_subgraph(
         });
     }
 
-    // 5. Fetch evidence (viewer-filtered)
+    // 4. Fetch evidence (viewer-filtered)
     let evidence_rows =
         epigraph_db::GraphViewRepository::subgraph_evidence(pool, viewer, &node_ids)
             .await
@@ -161,14 +166,12 @@ pub async fn load_subgraph(
         });
     }
 
-    // 6. Fetch reasoning traces
-    let trace_rows: Vec<TraceGraphRow> = sqlx::query_as(
-        "SELECT id, reasoning_type as methodology, confidence FROM reasoning_traces WHERE id = ANY($1)"
-    )
-    .bind(&node_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::InternalError { message: format!("Fetch traces: {e}") })?;
+    // 5. Fetch reasoning traces (viewer-filtered — `reasoning_traces` is tier_a)
+    let trace_rows = epigraph_db::GraphViewRepository::subgraph_traces(pool, viewer, &node_ids)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Fetch traces: {e}"),
+        })?;
 
     for row in trace_rows {
         let label = format!("{} ({:.2})", row.methodology, row.confidence);
@@ -188,7 +191,16 @@ pub async fn load_subgraph(
         });
     }
 
-    // 8. Build edges
+    // 6. Fetch edges LAST, narrowed to the ids that survived the node
+    //    projections above — so the response cannot name a node it withheld.
+    let surviving_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
+    let edge_rows = epigraph_db::GraphViewRepository::subgraph_edges(pool, viewer, &surviving_ids)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Fetch subgraph edges: {e}"),
+        })?;
+
+    // 7. Build edges
     let edges: Vec<FullGraphEdge> = edge_rows
         .into_iter()
         .map(|r| {

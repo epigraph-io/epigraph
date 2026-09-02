@@ -88,7 +88,7 @@ pub use edge::EdgeRepository;
 pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
 pub use event::{EventRepository, EventRow};
-pub use evidence::{EvidenceRepository, EvidenceSearchResult};
+pub use evidence::{EvidenceAtTimeRow, EvidenceRepository, EvidenceSearchResult};
 pub use experiment::{
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
 };
@@ -97,7 +97,7 @@ pub use frame::FrameRepository;
 pub use gap::{GapAnalysisResult, GapRecord, GapRepository};
 pub use graph_view::{
     AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GraphNodeRow,
-    GraphViewRepository, SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow,
+    GraphViewRepository, SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
 };
 pub use learning_event::{LearningEventRepository, LearningEventRow};
 pub use lineage::LineageRepository;

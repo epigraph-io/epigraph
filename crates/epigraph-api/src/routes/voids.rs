@@ -40,8 +40,24 @@ pub struct DensityQuery {
 ///
 /// For each concept, finds the nearest claim embedding and classifies
 /// as void (< 0.50), sparse (0.50-threshold), or covered (>= threshold).
+///
+/// # Viewer
+///
+/// PR-07's headline find was a caller-supplied probe vector ranked against the
+/// whole corpus, returning content, unfiltered. It was fixed in
+/// `search.rs::semantic_search` and left standing in four siblings running a
+/// near-identical statement, of which this is one: it returned
+/// `content.chars().take(200)` — a 200-character excerpt of the corpus claim
+/// nearest an arbitrary caller-supplied point in embedding space.
+///
+/// The handler previously took **no auth argument at all**, so unlike the
+/// `if let Some(auth_ctx)` sites there was not even a scope check to be
+/// fail-open about; the only gate was the router's `bearer_auth_middleware`.
+/// The `ViewerExtractor` is therefore a deliberate behaviour change: a bearer
+/// token that resolves to no `agents.id` now 401s here.
 #[cfg(feature = "db")]
 pub async fn detect_voids(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<DetectVoidsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -64,26 +80,30 @@ pub async fn detect_voids(
                 message: format!("Failed to embed concept '{concept}': {e}"),
             })?;
 
-        // Find nearest claim
-        let nearest: Option<NearestClaimRow> = sqlx::query_as(
-            "SELECT id, content, \
-                    1 - (embedding <=> $1::vector) AS similarity \
-             FROM claims \
-             WHERE embedding IS NOT NULL \
-             ORDER BY embedding <=> $1::vector \
-             LIMIT 1",
+        // Find nearest VISIBLE claim. `min_similarity = NO_SIMILARITY_FLOOR`
+        // reproduces the old unbounded `ORDER BY embedding <=> $1 LIMIT 1`:
+        // cosine similarity is bounded below by -1, so the floor excludes
+        // nothing, and `ORDER BY similarity DESC` is `ORDER BY distance ASC`.
+        let nearest = epigraph_db::ClaimRepository::semantic_search_flat(
+            &state.db_pool,
+            &viewer,
+            &format_embedding(&embedding),
+            NO_SIMILARITY_FLOOR,
+            None,
+            None,
+            None,
+            None,
+            1,
         )
-        .bind(format_embedding(&embedding))
-        .fetch_optional(&state.db_pool)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("Failed to search embeddings: {e}"),
         })?;
 
-        let (sim, nearest_claim) = match nearest {
-            Some(ref row) => (
-                row.similarity.unwrap_or(0.0),
-                Some(row.content.chars().take(200).collect::<String>()),
+        let (sim, nearest_claim) = match nearest.first() {
+            Some(row) => (
+                row.similarity,
+                Some(row.statement.chars().take(200).collect::<String>()),
             ),
             None => (0.0, None),
         };
@@ -114,8 +134,17 @@ pub async fn detect_voids(
 /// GET /api/v1/voids/density - Measure embedding neighborhood density.
 ///
 /// Counts how many claims fall within a cosine similarity radius of the query.
+///
+/// # Viewer
+///
+/// Two unfiltered corpus scans lived here: a `COUNT(*)`/`AVG(similarity)`
+/// cardinality oracle over an arbitrary probe neighbourhood, and the same
+/// nearest-claim 200-character excerpt as [`detect_voids`]. Both are now
+/// viewer-scoped, so `claim_count` is the reader's count. Same deliberate
+/// behaviour change as [`detect_voids`]: this handler took no auth argument.
 #[cfg(feature = "db")]
 pub async fn embedding_density(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<DensityQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -133,49 +162,56 @@ pub async fn embedding_density(
                 message: format!("Failed to embed query: {e}"),
             })?;
 
-    // Count claims within radius and get stats
-    let stats: Option<DensityStatsRow> = sqlx::query_as(
-        "SELECT COUNT(*) AS claim_count, \
-                AVG(1 - (embedding <=> $1::vector)) AS avg_similarity \
-         FROM claims \
-         WHERE embedding IS NOT NULL \
-           AND 1 - (embedding <=> $1::vector) >= $2",
+    // Count visible claims within radius and get stats
+    let (claim_count, avg_similarity) = epigraph_db::ClaimRepository::embedding_density_stats(
+        &state.db_pool,
+        &viewer,
+        &format_embedding(&embedding),
+        radius,
     )
-    .bind(format_embedding(&embedding))
-    .bind(radius)
-    .fetch_optional(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to compute density: {e}"),
     })?;
 
-    // Get nearest claim
-    let nearest: Option<NearestClaimRow> = sqlx::query_as(
-        "SELECT id, content, \
-                1 - (embedding <=> $1::vector) AS similarity \
-         FROM claims \
-         WHERE embedding IS NOT NULL \
-         ORDER BY embedding <=> $1::vector \
-         LIMIT 1",
+    // Get nearest visible claim
+    let nearest = epigraph_db::ClaimRepository::semantic_search_flat(
+        &state.db_pool,
+        &viewer,
+        &format_embedding(&embedding),
+        NO_SIMILARITY_FLOOR,
+        None,
+        None,
+        None,
+        None,
+        1,
     )
-    .bind(format_embedding(&embedding))
-    .fetch_optional(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to find nearest: {e}"),
     })?;
+    let nearest = nearest.first();
 
     Ok(Json(serde_json::json!({
         "query": params.query,
         "radius": radius,
-        "claim_count": stats.as_ref().and_then(|s| s.claim_count).unwrap_or(0),
-        "avg_similarity": stats.as_ref().and_then(|s| s.avg_similarity).unwrap_or(0.0),
-        "nearest_claim": nearest.as_ref().map(|n| n.content.chars().take(200).collect::<String>()),
-        "nearest_similarity": nearest.as_ref().and_then(|n| n.similarity).unwrap_or(0.0),
+        "claim_count": claim_count,
+        "avg_similarity": avg_similarity.unwrap_or(0.0),
+        "nearest_claim": nearest.map(|n| n.statement.chars().take(200).collect::<String>()),
+        "nearest_similarity": nearest.map_or(0.0, |n| n.similarity),
     })))
 }
 
 // ── Internal helpers ──
+
+/// A `min_similarity` that excludes nothing.
+///
+/// Cosine similarity `1 - (a <=> b)` is bounded below by `-1`, so passing this
+/// to `semantic_search_flat` reproduces the unbounded `ORDER BY ... LIMIT 1`
+/// nearest-neighbour lookup these handlers used to run inline. Named rather
+/// than written as a bare `-1.0` so the reason is at the call site.
+#[cfg(feature = "db")]
+const NO_SIMILARITY_FLOOR: f64 = -1.0;
 
 #[cfg(feature = "db")]
 fn format_embedding(embedding: &[f32]) -> String {
@@ -190,19 +226,10 @@ fn format_embedding(embedding: &[f32]) -> String {
 }
 
 // ── Internal types ──
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct NearestClaimRow {
-    #[allow(dead_code)]
-    id: uuid::Uuid,
-    content: String,
-    similarity: Option<f64>,
-}
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct DensityStatsRow {
-    claim_count: Option<i64>,
-    avg_similarity: Option<f64>,
-}
+//
+// `NearestClaimRow` and `DensityStatsRow` were deleted with the inline scans
+// they decoded. Both statements now live in `crates/epigraph-db/src/repos/`
+// (`ClaimRepository::semantic_search_flat` and
+// `ClaimRepository::embedding_density_stats`), where the
+// `/* {VISIBILITY:c} */` marker convention applies and `Viewer::splice`'s
+// missing-marker panic can enforce it.

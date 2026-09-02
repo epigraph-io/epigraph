@@ -9,6 +9,20 @@ use uuid::Uuid;
 /// Repository for Evidence operations
 pub struct EvidenceRepository;
 
+/// Result row for [`EvidenceRepository::provided_for_claim_as_of`].
+///
+/// `evidence_type` and `created_at` are projected even though today's only
+/// caller replays `properties` alone: a row type that silently drops columns
+/// invites the next caller to add an inline statement beside this one rather
+/// than extending it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct EvidenceAtTimeRow {
+    pub id: Uuid,
+    pub evidence_type: String,
+    pub properties: Option<serde_json::Value>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Build Evidence from database row data.
 ///
 /// This helper function handles the crypto fields that may not exist in
@@ -264,6 +278,60 @@ impl EvidenceRepository {
         Ok(evidence_list)
     }
 
+    /// Evidence linked to a claim by a `provides_evidence`-shaped edge, as of a
+    /// point in time — viewer-filtered on BOTH `evidence` and `edges`.
+    ///
+    /// # Why this exists
+    ///
+    /// `routes/computation.rs::belief_at_time` held a `ViewerExtractor`, spent
+    /// it on an existence check (`ClaimRepository::get_by_id`), and then read
+    /// the evidence it actually replays with an inline unfiltered statement.
+    /// Both `evidence` and `edges` are `tier_a` in migration 062 and both carry
+    /// `visibility`/`owner_group_id`, so both were filterable and neither was
+    /// filtered. The handler returns `evidence_count` plus a truth value
+    /// replayed from `properties->confidence`, i.e. an inference oracle over
+    /// evidence rows the viewer may not own, gated only by the visibility of the
+    /// parent claim.
+    ///
+    /// It was also invisible to `viewer_route_table_lint.rs` as that lint was
+    /// originally written: `reads_claim_content` required `from claims` /
+    /// `join claims`, and this statement names neither. PR-07's follow-up
+    /// widened the predicate to the `tier_a` projections for exactly this
+    /// reason.
+    ///
+    /// The `edges` marker sits in the JOIN's ON clause, matching
+    /// [`crate::ClaimRepository::count_all_evidence_for_claim`].
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, viewer))]
+    pub async fn provided_for_claim_as_of(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        as_of: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<EvidenceAtTimeRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.id, e.evidence_type, e.properties, e.created_at \
+             FROM evidence e \
+             JOIN edges ed ON ed.source_id = e.id \
+                AND ed.target_type = 'claim' \
+                AND ed.target_id = $1 \
+                /* {VISIBILITY:ed} */ \
+             WHERE e.created_at <= $2 \
+               /* {VISIBILITY:e} */ \
+             ORDER BY e.created_at ASC",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, EvidenceAtTimeRow>(&sql)
+            .bind(claim_id)
+            .bind(as_of);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(pool).await?)
+    }
+
     /// Delete evidence by ID
     ///
     /// # Returns
@@ -280,6 +348,11 @@ impl EvidenceRepository {
         _viewer: &crate::visibility::Viewer,
         id: EvidenceId,
     ) -> Result<bool, DbError> {
+        // VISIBILITY-EXEMPT: PR-16 owns the write-side predicate.
+        // Recognised by `crates/epigraph-db/tests/visibility_lint.rs`, which
+        // otherwise fails any fn taking a `&Viewer` and running SQL without
+        // splicing or binding it. The exemption count is itself a ratchet
+        // there, so adding a third one is a visible diff.
         let uuid: Uuid = id.into();
 
         let result = sqlx::query!(

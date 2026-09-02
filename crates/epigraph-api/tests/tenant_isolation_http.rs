@@ -879,3 +879,447 @@ fn pgvector_literal(v: f32) -> String {
     s.push(']');
     s
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// PR-07 FOLLOW-UP — the sites the first pass fixed in one place and left
+// standing in their siblings, plus the two handlers that held a Viewer and
+// spent it on something other than the read that returned data.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `POST /api/v1/voids/detect`, `GET /api/v1/voids/density`,
+/// `POST /api/v1/gaps/analysis` and `POST /api/v1/experiments/hypothesize` all
+/// now route their probe-vector corpus scan through
+/// `ClaimRepository::semantic_search_flat`.
+///
+/// This is the exfiltration primitive PR-07's own repo docs call "the single
+/// highest-value" one in the API: an authenticated principal submits an
+/// arbitrary vector and gets other tenants' claim text back, ranked by
+/// relevance. The first pass closed it in `search.rs` and `rag.rs` and left
+/// four siblings running a near-identical statement.
+#[sqlx::test(migrations = "../../migrations")]
+async fn semantic_search_flat_does_not_rank_a_group_private_claim_for_a_stranger(pool: PgPool) {
+    let (owner, stranger, claim) = private_corpus(&pool, "flat-search").await;
+    let (agent, _g) = fixture::seed_agent_with_group(&pool, "flat-search-pub").await;
+    let public = fixture::seed_public_claim(&pool, agent, "flat-search public content").await;
+
+    let vec_literal = pgvector_literal(1.0);
+    for id in [claim, public] {
+        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+            .bind(&vec_literal)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("set embedding");
+    }
+
+    let owner_hits = ClaimRepository::semantic_search_flat(
+        &pool,
+        &owner,
+        &vec_literal,
+        -1.0,
+        None,
+        None,
+        None,
+        None,
+        100,
+    )
+    .await
+    .expect("owner semantic_search_flat");
+    assert!(
+        owner_hits.iter().any(|h| h.claim_id == claim),
+        "the owner must retrieve its own claim; got {} hits",
+        owner_hits.len()
+    );
+
+    let stranger_hits = ClaimRepository::semantic_search_flat(
+        &pool,
+        &stranger,
+        &vec_literal,
+        -1.0,
+        None,
+        None,
+        None,
+        None,
+        100,
+    )
+    .await
+    .expect("stranger semantic_search_flat");
+    assert!(
+        stranger_hits.iter().any(|h| h.claim_id == public),
+        "the stranger must still retrieve the public control claim — otherwise \
+         this test cannot distinguish a working filter from an empty corpus"
+    );
+    assert!(
+        !stranger_hits.iter().any(|h| h.claim_id == claim),
+        "a stranger must not rank a group-private claim into its results"
+    );
+    assert!(
+        !stranger_hits
+            .iter()
+            .any(|h| h.statement.contains("tenant-private content")),
+        "another group's claim content came back in the statement field"
+    );
+}
+
+/// `GET /api/v1/voids/density` returns `claim_count` — how much of the corpus
+/// sits within a similarity radius of an arbitrary caller-supplied point.
+///
+/// A bare `COUNT(*)` there is a cardinality oracle in the sense
+/// `MassFunctionRepository::count_for_claim`'s doc forbids: it reports how much
+/// exists without disclosing any of it. The count must be the reader's count.
+#[sqlx::test(migrations = "../../migrations")]
+async fn embedding_density_stats_does_not_count_a_group_private_claim_for_a_stranger(pool: PgPool) {
+    let (owner, stranger, claim) = private_corpus(&pool, "density").await;
+    let (agent, _g) = fixture::seed_agent_with_group(&pool, "density-pub").await;
+    let public = fixture::seed_public_claim(&pool, agent, "density public content").await;
+
+    let vec_literal = pgvector_literal(1.0);
+    for id in [claim, public] {
+        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+            .bind(&vec_literal)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("set embedding");
+    }
+
+    let (owner_count, _) =
+        ClaimRepository::embedding_density_stats(&pool, &owner, &vec_literal, 0.99)
+            .await
+            .expect("owner density");
+    let (stranger_count, _) =
+        ClaimRepository::embedding_density_stats(&pool, &stranger, &vec_literal, 0.99)
+            .await
+            .expect("stranger density");
+
+    assert_eq!(
+        owner_count, 2,
+        "the owner sees both its private claim and the public one"
+    );
+    assert_eq!(
+        stranger_count, 1,
+        "the stranger's count must exclude the group-private claim — a count \
+         that includes it is a cardinality oracle even though no text is returned"
+    );
+}
+
+/// The clustering branch of `POST /api/v1/experiments/hypothesize` pulled raw
+/// `embedding::real[]` vectors for the 200 nearest claims.
+///
+/// PR-07's own acceptance criteria treat an embedding as approximately
+/// invertible to the content it encodes — that is why `/themes/:id/embeddings`
+/// returns none — so this is a content read, not a metadata read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhood_embeddings_does_not_return_a_group_private_vector(pool: PgPool) {
+    let (owner, stranger, claim) = private_corpus(&pool, "nbhd-vec").await;
+    let (agent, _g) = fixture::seed_agent_with_group(&pool, "nbhd-vec-pub").await;
+    let public = fixture::seed_public_claim(&pool, agent, "nbhd-vec public content").await;
+
+    let vec_literal = pgvector_literal(1.0);
+    for id in [claim, public] {
+        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
+            .bind(&vec_literal)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("set embedding");
+    }
+
+    let owner_rows =
+        ClaimRepository::neighborhood_embeddings(&pool, &owner, &vec_literal, -1.0, 200)
+            .await
+            .expect("owner neighborhood_embeddings");
+    assert!(
+        owner_rows
+            .iter()
+            .any(|r| r.id == claim && !r.embedding.is_empty()),
+        "the owner must get its own claim's vector back"
+    );
+
+    let stranger_rows =
+        ClaimRepository::neighborhood_embeddings(&pool, &stranger, &vec_literal, -1.0, 200)
+            .await
+            .expect("stranger neighborhood_embeddings");
+    assert!(
+        stranger_rows.iter().any(|r| r.id == public),
+        "the stranger must still get the public control vector"
+    );
+    assert!(
+        !stranger_rows.iter().any(|r| r.id == claim),
+        "a stranger must not receive a group-private claim's raw embedding"
+    );
+}
+
+/// `GET /api/v1/claims/:id/belief-at` replays evidence through a Bayesian
+/// updater and returns `evidence_count` plus the replayed truth value.
+///
+/// The handler held a `Viewer`, spent it on `ClaimRepository::get_by_id`, and
+/// then read the evidence it actually replays with an inline unfiltered
+/// statement. Both markers are exercised here: `{VISIBILITY:e}` on `evidence`
+/// and `{VISIBILITY:ed}` on the joined `edges` row. Two separate private rows
+/// are seeded so deleting EITHER marker turns this red — a corpus with only one
+/// kind of private row would leave the other marker inert.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evidence_as_of_hides_private_evidence_and_private_edges_from_a_stranger(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "belief-at").await;
+    // The CLAIM is public: a stranger passes the existence check and gets a
+    // 200, which is the sharp case — the endpoint must withhold the evidence,
+    // not 404 the whole claim.
+    let claim = fixture::seed_public_claim(&pool, agent, "belief-at public claim").await;
+    let owner = Viewer::resolve(&pool, agent).await.expect("owner viewer");
+    let stranger = fixture::public_viewer(&pool).await;
+    let as_of = chrono::Utc::now() + chrono::Duration::days(1);
+
+    // Three evidence rows, one per case.
+    let private_evidence = seed_belief_at_evidence(&pool, claim, "private-evidence").await;
+    let private_edge_evidence = seed_belief_at_evidence(&pool, claim, "private-edge").await;
+    let public_evidence = seed_belief_at_evidence(&pool, claim, "public-control").await;
+
+    // `{VISIBILITY:e}` alone withholds this one.
+    sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $1 WHERE id = $2")
+        .bind(group)
+        .bind(private_evidence)
+        .execute(&pool)
+        .await
+        .expect("privatise evidence row");
+
+    // `{VISIBILITY:ed}` alone withholds this one: the evidence itself is
+    // world-readable, but the fact that it bears on this claim is not.
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $1 \
+         WHERE source_id = $2 AND target_id = $3",
+    )
+    .bind(group)
+    .bind(private_edge_evidence)
+    .bind(claim)
+    .execute(&pool)
+    .await
+    .expect("privatise edge row");
+
+    let owner_rows = EvidenceRepository::provided_for_claim_as_of(&pool, &owner, claim, as_of)
+        .await
+        .expect("owner evidence as-of");
+    let owner_ids: Vec<Uuid> = owner_rows.iter().map(|r| r.id).collect();
+    for expected in [private_evidence, private_edge_evidence, public_evidence] {
+        assert!(
+            owner_ids.contains(&expected),
+            "the owner must replay every evidence row on its own claim; got {owner_ids:?}"
+        );
+    }
+
+    let stranger_rows =
+        EvidenceRepository::provided_for_claim_as_of(&pool, &stranger, claim, as_of)
+            .await
+            .expect("stranger evidence as-of");
+    let stranger_ids: Vec<Uuid> = stranger_rows.iter().map(|r| r.id).collect();
+    assert!(
+        stranger_ids.contains(&public_evidence),
+        "the stranger must still replay the public control row — otherwise this \
+         test cannot distinguish a working filter from a broken join; got {stranger_ids:?}"
+    );
+    assert!(
+        !stranger_ids.contains(&private_evidence),
+        "a stranger must not replay group-private evidence ({{VISIBILITY:e}}); \
+         got {stranger_ids:?}"
+    );
+    assert!(
+        !stranger_ids.contains(&private_edge_evidence),
+        "a stranger must not learn that {private_edge_evidence} bears on this \
+         claim through a group-private edge ({{VISIBILITY:ed}}); got {stranger_ids:?}"
+    );
+}
+
+/// One evidence row plus the `provides_evidence` edge `belief_at_time` walks.
+async fn seed_belief_at_evidence(pool: &PgPool, claim: Uuid, tag: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO evidence (id, claim_id, evidence_type, raw_content, content_hash, properties) \
+         VALUES ($1, $2, 'observation', $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(claim)
+    .bind(format!("{tag} body"))
+    .bind(id.as_bytes().iter().copied().cycle().take(32).collect::<Vec<u8>>())
+    .bind(serde_json::json!({ "confidence": 0.7, "supports": true }))
+    .execute(pool)
+    .await
+    .expect("seed evidence");
+
+    sqlx::query(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship) \
+         VALUES ($1, $2, 'evidence', 'claim', 'provides_evidence')",
+    )
+    .bind(id)
+    .bind(claim)
+    .execute(pool)
+    .await
+    .expect("seed evidence edge");
+
+    id
+}
+
+/// `load_subgraph` must never return an edge naming a node it withheld.
+///
+/// It used to fetch edges FIRST, over the caller's raw id set, and never
+/// recompute the set from the ids that survived the node projections — so the
+/// `edges` array enumerated claim ids the `nodes` array had withheld. That is
+/// the id-enumeration oracle PR-07 closed in `graph_neighborhood.rs` and left
+/// standing here behind a `subgraph_edges` doc comment asserting the caller
+/// narrowed the set. No caller did.
+///
+/// `edges.visibility` defaults to `'public'` under migration 062, so the edge
+/// predicate matches every row today and the edge-side filter alone does not
+/// close this. The ordering is what closes it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn load_subgraph_never_returns_an_edge_naming_a_withheld_node(pool: PgPool) {
+    let (owner, stranger, private_claim) = private_corpus(&pool, "subgraph").await;
+    let (agent, _g) = fixture::seed_agent_with_group(&pool, "subgraph-pub").await;
+    let public_claim = fixture::seed_public_claim(&pool, agent, "subgraph public content").await;
+
+    sqlx::query(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship) \
+         VALUES ($1, $2, 'claim', 'claim', 'supports')",
+    )
+    .bind(private_claim)
+    .bind(public_claim)
+    .execute(&pool)
+    .await
+    .expect("seed claim-to-claim edge");
+
+    let node_ids = vec![private_claim, public_claim];
+
+    // Non-vacuity: the owner sees both nodes AND the edge between them.
+    let owner_resp =
+        epigraph_api::routes::graph_query_utils::load_subgraph(&pool, &owner, node_ids.clone())
+            .await
+            .expect("owner load_subgraph");
+    assert!(
+        owner_resp.0.nodes.iter().any(|n| n.id == private_claim),
+        "the owner must see its own claim as a node"
+    );
+    assert_eq!(
+        owner_resp.0.edges.len(),
+        1,
+        "the owner must see the edge between the two claims"
+    );
+
+    let stranger_resp =
+        epigraph_api::routes::graph_query_utils::load_subgraph(&pool, &stranger, node_ids)
+            .await
+            .expect("stranger load_subgraph");
+    assert!(
+        stranger_resp.0.nodes.iter().any(|n| n.id == public_claim),
+        "the stranger must still see the public node — otherwise this test \
+         cannot distinguish a working filter from an empty response"
+    );
+    assert!(
+        !stranger_resp.0.nodes.iter().any(|n| n.id == private_claim),
+        "a stranger must not receive a group-private claim as a node"
+    );
+
+    let returned_node_ids: Vec<Uuid> = stranger_resp.0.nodes.iter().map(|n| n.id).collect();
+    for edge in &stranger_resp.0.edges {
+        assert!(
+            returned_node_ids.contains(&edge.source_id)
+                && returned_node_ids.contains(&edge.target_id),
+            "edge {} names {} -> {}, and at least one of those is absent from \
+             `nodes` — an id-enumeration oracle; nodes were {returned_node_ids:?}",
+            edge.id,
+            edge.source_id,
+            edge.target_id
+        );
+    }
+}
+
+/// `GET /api/v1/hypothesis/:id/status` destructured a `ViewerExtractor` and
+/// then read `content, truth_value, belief, plausibility, labels, properties`
+/// for an arbitrary claim id with a raw pool query. The viewer was spent only
+/// on two scalar reads (`MassFunctionRepository::get_for_claim_frame`,
+/// `ExperimentRepository::count_completed_with_analysis`).
+///
+/// That satisfied acceptance criterion #1 *syntactically* — the extractor is
+/// present — while leaking, which is the exact `frame_claims_sorted` shape the
+/// criterion's own lint says it exists to catch. `hypothesis.rs` contains zero
+/// `check_content_access` calls, so the register's stated compensating control
+/// did not exist here either.
+///
+/// This is HTTP-level rather than repo-level for the same reason as the two
+/// guards above: the defect lived in the handler, not in a repo function, so a
+/// test naming a repo function could not have caught it.
+#[tokio::test(flavor = "multi_thread")]
+async fn hypothesis_status_http_hides_a_group_private_claim_from_a_stranger() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("connect test pool");
+
+    let (owner_agent, group) = fixture::seed_agent_with_group(&pool, "hyp-status").await;
+    let (stranger_agent, _sg) = fixture::seed_agent_with_group(&pool, "hyp-status-stranger").await;
+    let private_claim = fixture::seed_group_claim(
+        &pool,
+        owner_agent,
+        group,
+        "hyp-status private hypothesis content",
+    )
+    .await;
+    let public_claim =
+        fixture::seed_public_claim(&pool, owner_agent, "hyp-status public hypothesis content")
+            .await;
+
+    let owner_token = common::mint_token_with_agent(&["claims:read", "graph:read"], owner_agent);
+    let stranger_token =
+        common::mint_token_with_agent(&["claims:read", "graph:read"], stranger_agent);
+    let (addr, shutdown) = common::spawn_app(&url).await;
+    let client = reqwest::Client::new();
+
+    let get = |id: Uuid, token: String| {
+        let client = client.clone();
+        async move {
+            let resp = client
+                .get(format!("http://{addr}/api/v1/hypothesis/{id}/status"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("hypothesis status request");
+            let status = resp.status();
+            let body = resp.text().await.expect("body");
+            (status, body)
+        }
+    };
+
+    // Non-vacuity: the owner really does get its own hypothesis back, content
+    // and all — so a 404 below is the filter working, not a broken endpoint.
+    let (owner_status, owner_body) = get(private_claim, owner_token.clone()).await;
+    assert!(
+        owner_status.is_success(),
+        "the owner must be able to read its own hypothesis; got {owner_status}: {owner_body}"
+    );
+    assert!(
+        owner_body.contains("hyp-status private hypothesis content"),
+        "the owner's response must carry the content: {owner_body}"
+    );
+
+    // Non-vacuity, second half: the stranger CAN read a public hypothesis, so
+    // the 404 below is about visibility rather than about the endpoint.
+    let (public_status, public_body) = get(public_claim, stranger_token.clone()).await;
+    assert!(
+        public_status.is_success(),
+        "a stranger must still read a public hypothesis; got {public_status}: {public_body}"
+    );
+
+    let (stranger_status, stranger_body) = get(private_claim, stranger_token).await;
+    assert_eq!(
+        stranger_status.as_u16(),
+        404,
+        "a stranger must not receive another group's hypothesis; got \
+         {stranger_status}: {stranger_body}"
+    );
+    assert!(
+        !stranger_body.contains("hyp-status private hypothesis content"),
+        "another group's claim content leaked in the hypothesis-status body: {stranger_body}"
+    );
+
+    let _ = shutdown.send(());
+}
