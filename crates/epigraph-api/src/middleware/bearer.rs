@@ -210,6 +210,46 @@ require_scope_extractor!(RequireScopeGroupsAdmin, "groups:admin");
 #[cfg(feature = "db")]
 pub struct ViewerExtractor(pub epigraph_db::Viewer);
 
+/// No-db counterpart. `epigraph-db` is `optional = true`, so under
+/// `--no-default-features` the `Viewer` type does not exist and the payload
+/// above cannot be named — but the handlers that destructure
+/// `ViewerExtractor(viewer)` are NOT themselves cfg-gated (their *bodies*
+/// branch on the feature, per this crate's convention), so the extractor must
+/// still exist as a type or the whole no-db build fails to resolve.
+///
+/// The payload is `()`: every no-db handler body is a stub that never reads the
+/// viewer. Authentication is still required — the extraction below refuses a
+/// request with no `AuthContext` exactly as the db variant does, so the no-db
+/// build cannot be turned into an anonymous-read backdoor by omitting a feature
+/// flag. It simply has no groups to resolve against.
+#[cfg(not(feature = "db"))]
+pub struct ViewerExtractor(pub ());
+
+#[cfg(not(feature = "db"))]
+#[axum::async_trait]
+impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // Same fail-closed contract as the db variant: no AuthContext, no read.
+        if parts.extensions.get::<AuthContext>().is_none() {
+            tracing::warn!(
+                target: "visibility.viewer.rejected",
+                reason = "no_auth_context",
+                route = %parts.uri.path(),
+                "viewer rejected: request carried no AuthContext (no-db build)"
+            );
+            return Err(ApiError::Unauthorized {
+                reason: "authentication required".into(),
+            });
+        }
+        Ok(Self(()))
+    }
+}
+
 #[cfg(feature = "db")]
 #[axum::async_trait]
 impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
