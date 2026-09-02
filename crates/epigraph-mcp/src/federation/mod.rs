@@ -16,7 +16,7 @@
 //!   ephemeral per-call invocation session (caller token).
 //! - `registry` — [`config::ExtensionConfig`] → mounted extensions with cached
 //!   tool lists, a `tool_name -> extension` routing map, collision detection,
-//!   health, and a reconnect timer.
+//!   health, and a reconnect timer ([`SharedFederation::spawn_reconnect_loop`]).
 //!
 //! ## Transport (v1)
 //!
@@ -28,10 +28,10 @@ pub mod client;
 pub mod config;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
 
 use rmcp::model::{CallToolResult, Tool};
-use tokio::sync::RwLock;
 
 use crate::federation::client::{ExtensionClient, FederationError};
 use crate::federation::config::ExtensionConfig;
@@ -63,7 +63,7 @@ pub enum RegistryError {
 /// discovery session (service-token authenticated), the cached tool list, and a
 /// health flag. `client` is `None` when the extension was unreachable at build
 /// time (or its discovery session later dropped) — it holds no cached tools and
-/// routes nothing until a [`reconnect_tick`](FederationRegistry::reconnect_tick)
+/// routes nothing until a [`reconnect_tick`](SharedFederation::reconnect_tick)
 /// re-establishes it.
 pub struct MountedExtension {
     /// Parsed config for this extension (name, addr, scope, optional prefix).
@@ -92,10 +92,11 @@ impl MountedExtension {
 ///
 /// Holds each [`MountedExtension`] and a `effective_tool_name -> extension_index`
 /// map. Lookups ([`route`](Self::route), [`required_scope`](Self::required_scope))
-/// are O(1). The registry is wrapped in the server behind an `Arc`; interior
-/// mutability (for [`reconnect_tick`](Self::reconnect_tick)) is confined to the
-/// per-extension session via the registry being reconstructed or refreshed —
-/// v1 exposes reconnect as a method that mutates in place under `&mut`.
+/// are O(1).
+///
+/// This type is the plain, single-threaded data model; it performs no locking of
+/// its own. The server holds it inside a [`SharedFederation`], which owns the
+/// lock and drives [`reconnect_tick`](SharedFederation::reconnect_tick).
 pub struct FederationRegistry {
     /// Mounted extensions, indexed by position. The routing map's values are
     /// indices into this vector.
@@ -103,8 +104,8 @@ pub struct FederationRegistry {
     /// `effective_tool_name -> index into `extensions``.
     routes: HashMap<String, usize>,
     /// Discovery token used to (re)establish discovery sessions. Kept so
-    /// [`reconnect_tick`](Self::reconnect_tick) can re-dial dropped extensions
-    /// without the caller threading the token back through.
+    /// [`reconnect_tick`](SharedFederation::reconnect_tick) can re-dial dropped
+    /// extensions without the caller threading the token back through.
     discovery_token: String,
 }
 
@@ -131,7 +132,8 @@ impl FederationRegistry {
     /// its tools is logged and mounted **unhealthy** (no client, no tools, no
     /// routes) rather than aborting the whole gateway — a down backend must not
     /// take the kernel's own tools offline. A later
-    /// [`reconnect_tick`](Self::reconnect_tick) can bring it up.
+    /// [`reconnect_tick`](SharedFederation::reconnect_tick) brings it up without
+    /// a gateway restart.
     ///
     /// # Errors
     /// [`RegistryError::Collision`] if two *reachable* extensions export the
@@ -295,71 +297,211 @@ impl FederationRegistry {
         client::invoke_once(&config.addr, caller_token, downstream_name, arguments).await
     }
 
-    /// Re-establish discovery sessions for any extension currently mounted
-    /// unhealthy, refreshing its cached tool list and routing entries. Healthy
-    /// extensions are left untouched.
+    /// Every extension currently mounted unhealthy, as `(index, config)` pairs,
+    /// paired with the discovery token needed to re-dial them.
     ///
-    /// Called on a timer by the gateway. A reconnect that would introduce a
+    /// This is the **read half** of a reconnect pass. It is deliberately sync
+    /// and allocation-owning so [`SharedFederation::reconnect_tick`] can drop
+    /// the registry lock before doing any network I/O — see that method for why
+    /// holding a lock across the dial would be worse than the bug it fixes.
+    #[must_use]
+    fn unhealthy_targets(&self) -> Vec<(usize, ExtensionConfig)> {
+        self.extensions
+            .iter()
+            .enumerate()
+            .filter(|(_, ext)| !ext.healthy)
+            .map(|(index, ext)| (index, ext.config.clone()))
+            .collect()
+    }
+
+    /// The token used to (re)establish discovery sessions.
+    #[must_use]
+    fn discovery_token(&self) -> String {
+        self.discovery_token.clone()
+    }
+
+    /// Promote extension `index` to healthy with `tools` routed to it, using the
+    /// freshly-established discovery `session`.
+    ///
+    /// The **write half** of a reconnect pass: sync, no `.await`, so it runs
+    /// entirely under the write lock. A reconnect that would introduce a
     /// tool-name collision with an already-mounted extension is skipped (logged)
     /// rather than errored — reconnect must never take down the running gateway;
-    /// the collision is surfaced at the next `build`.
-    pub async fn reconnect_tick(&mut self) {
-        // Snapshot the currently-routed names owned by *other* healthy
-        // extensions so a reviving extension can't silently steal a route.
-        for index in 0..self.extensions.len() {
-            if self.extensions[index].healthy {
-                continue;
+    /// the collision is surfaced at the next `build`. Returns `true` when the
+    /// extension was actually promoted.
+    fn apply_reconnect(
+        &mut self,
+        index: usize,
+        session: ExtensionClient,
+        tools: Vec<Tool>,
+    ) -> bool {
+        // Guard against stealing a route owned by a *different* extension. The
+        // snapshot this reconnect was planned from may be stale: another tick
+        // (or a concurrent revival) could have claimed the name in between.
+        for tool in &tools {
+            let name = tool.name.as_ref();
+            if let Some(&owner) = self.routes.get(name) {
+                if owner != index {
+                    tracing::warn!(
+                        extension = %self.extensions[index].config.name,
+                        tool = %name,
+                        "federation: reconnect skipped — tool collides with a mounted extension"
+                    );
+                    return false;
+                }
             }
-            let addr = self.extensions[index].config.addr.clone();
-            let name = self.extensions[index].config.name.clone();
-            let session = match client::discovery_session(&addr, &self.discovery_token).await {
+        }
+        for tool in &tools {
+            self.routes.insert(tool.name.to_string(), index);
+        }
+        tracing::info!(
+            extension = %self.extensions[index].config.name,
+            tool_count = tools.len(),
+            "federation: reconnected extension"
+        );
+        let ext = &mut self.extensions[index];
+        ext.client = Some(session);
+        ext.tools = tools;
+        ext.healthy = true;
+        true
+    }
+}
+
+/// Default period between reconnect attempts for unhealthy extensions.
+pub const DEFAULT_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// A shareable handle to the registry. The gateway constructs one
+/// [`FederationRegistry`] at boot and clones this handle into every per-session
+/// server. The `RwLock` lets the reconnect timer mutate mounts while readers
+/// (list/route/invoke) proceed concurrently.
+///
+/// The lock is a **`std`** `RwLock`, not tokio's, on purpose. Its guards are
+/// `!Send`, so the compiler *refuses* to hold one across an `.await` — which is
+/// exactly the invariant this type depends on. Every network round-trip
+/// (discovery dial, `tools/list`, and the per-call downstream proxy) happens
+/// with no lock held; only owned snapshots cross the boundary. Holding a read
+/// guard across a downstream call would let one hung extension stall every
+/// subsequent reader and take the whole gateway down — strictly worse than the
+/// unhealthy-mount bug the reconnect timer exists to fix.
+#[derive(Clone)]
+pub struct SharedFederation(Arc<RwLock<FederationRegistry>>);
+
+impl SharedFederation {
+    /// Wrap an already-built registry in a shareable handle.
+    #[must_use]
+    pub fn new(registry: FederationRegistry) -> Self {
+        Self(Arc::new(RwLock::new(registry)))
+    }
+
+    /// A handle around an empty registry (no extensions configured).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(FederationRegistry::empty())
+    }
+
+    /// Read guard, recovering from poisoning. A panic in an unrelated reader
+    /// must not wedge the gateway's tool list for the rest of the process: the
+    /// registry is plain data behind the lock, so the inner value stays usable.
+    fn read(&self) -> RwLockReadGuard<'_, FederationRegistry> {
+        self.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Write guard, recovering from poisoning (see [`Self::read`]).
+    fn write(&self) -> RwLockWriteGuard<'_, FederationRegistry> {
+        self.0.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `true` when no extensions are mounted. See
+    /// [`FederationRegistry::is_empty`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.read().is_empty()
+    }
+
+    /// Every federated tool currently advertised. See
+    /// [`FederationRegistry::list_federated_tools`].
+    #[must_use]
+    pub fn list_federated_tools(&self) -> Vec<Tool> {
+        self.read().list_federated_tools()
+    }
+
+    /// The config of the extension owning `effective_name`, or `None` if the
+    /// name is not a federated tool.
+    ///
+    /// Returns an **owned** clone rather than a borrow: the guard is released
+    /// on return, so a reference into the registry could not outlive it.
+    #[must_use]
+    pub fn route_config(&self, effective_name: &str) -> Option<ExtensionConfig> {
+        self.read().route(effective_name).cloned()
+    }
+
+    /// Proxy a federated `tools/call` to the owning extension. See
+    /// [`FederationRegistry::invoke`].
+    ///
+    /// # Errors
+    /// As [`FederationRegistry::invoke`].
+    pub async fn invoke(
+        &self,
+        effective_name: &str,
+        caller_token: &str,
+        arguments: Option<rmcp::model::JsonObject>,
+    ) -> Result<CallToolResult, FederationError> {
+        // Resolve the route to an OWNED config, then drop the guard before the
+        // downstream round-trip (the `std` guard is `!Send`, so this is enforced
+        // rather than merely intended).
+        let Some(config) = self.route_config(effective_name) else {
+            return Err(FederationError::Request(format!(
+                "no federated route for tool `{effective_name}`"
+            )));
+        };
+        let downstream_name = match config.prefix.as_deref() {
+            Some(p) => effective_name.strip_prefix(p).unwrap_or(effective_name),
+            None => effective_name,
+        };
+        client::invoke_once(&config.addr, caller_token, downstream_name, arguments).await
+    }
+
+    /// One reconnect pass: re-dial every extension currently mounted unhealthy
+    /// and, on success, route its tools. Healthy extensions are untouched.
+    ///
+    /// Structured as snapshot → (unlocked) network I/O → apply, so no lock is
+    /// held across an `.await`.
+    pub async fn reconnect_tick(&self) {
+        let (targets, token) = {
+            let guard = self.read();
+            (guard.unhealthy_targets(), guard.discovery_token())
+        };
+        for (index, config) in targets {
+            let session = match client::discovery_session(&config.addr, &token).await {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::debug!(extension = %name, error = %e, "federation: reconnect still failing");
+                    tracing::debug!(extension = %config.name, error = %e, "federation: reconnect still failing");
                     continue;
                 }
             };
             let raw = match client::list_all_tools(&session).await {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::debug!(extension = %name, error = %e, "federation: reconnect tools/list failed");
+                    tracing::debug!(extension = %config.name, error = %e, "federation: reconnect tools/list failed");
                     continue;
                 }
             };
-            let tools = Self::prefix_tools(&self.extensions[index].config, raw);
-            // Guard against collisions with routes owned by other extensions.
-            let mut collides = false;
-            for tool in &tools {
-                let n = tool.name.as_ref();
-                if let Some(&owner) = self.routes.get(n) {
-                    if owner != index {
-                        tracing::warn!(
-                            extension = %name,
-                            tool = %n,
-                            "federation: reconnect skipped — tool collides with a mounted extension"
-                        );
-                        collides = true;
-                        break;
-                    }
-                }
-            }
-            if collides {
-                continue;
-            }
-            for tool in &tools {
-                self.routes.insert(tool.name.to_string(), index);
-            }
-            tracing::info!(extension = %name, tool_count = tools.len(), "federation: reconnected extension");
-            let ext = &mut self.extensions[index];
-            ext.client = Some(session);
-            ext.tools = tools;
-            ext.healthy = true;
+            let tools = FederationRegistry::prefix_tools(&config, raw);
+            self.write().apply_reconnect(index, session, tools);
         }
     }
-}
 
-/// A shareable handle to the registry. The gateway constructs one
-/// [`FederationRegistry`] at boot and clones this `Arc` into every per-session
-/// server. The `RwLock` allows the reconnect timer to mutate mounts while
-/// readers (list/route/invoke) proceed concurrently.
-pub type SharedRegistry = Arc<RwLock<FederationRegistry>>;
+    /// Spawn the background reconnect timer, returning its handle.
+    ///
+    /// Without this, an extension that was down at boot stays unroutable for the
+    /// lifetime of the process — the gateway would need a restart to pick it up.
+    pub fn spawn_reconnect_loop(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                this.reconnect_tick().await;
+            }
+        })
+    }
+}

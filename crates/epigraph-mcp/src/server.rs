@@ -30,12 +30,15 @@ pub struct EpiGraphMcpFull {
     /// The federation gateway's routing table over downstream extension MCPs.
     /// Built once in `main` (from `EPIGRAPH_MCP_EXTENSIONS`) and injected into
     /// both transport paths. When no extensions are configured this is an empty
-    /// registry ([`crate::federation::FederationRegistry::empty`]) and the server
+    /// registry ([`crate::federation::SharedFederation::empty`]) and the server
     /// behaves exactly as it did pre-federation. The plain `new`/`new_shared`
     /// constructors default to empty (mirroring the `claim_from_row` house rule
     /// of not widening a ~30-caller signature); `main` and any caller that has a
     /// registry use `new_with_federation`/`new_shared_with_federation`.
-    pub(crate) federation: Arc<crate::federation::FederationRegistry>,
+    ///
+    /// Shared behind an `RwLock` so `main`'s reconnect timer can revive an
+    /// extension that was unreachable at boot without restarting the process.
+    pub(crate) federation: crate::federation::SharedFederation,
     /// `(llm_model, llm_prompt_hash)` when this server's agent identity was
     /// derived deterministically from an LLM config (see `main::select_signer`),
     /// else `None`. When `Some`, `agent_id()`'s CREATE branch records these on
@@ -336,7 +339,7 @@ impl EpiGraphMcpFull {
             signer,
             embedder,
             read_only,
-            Arc::new(crate::federation::FederationRegistry::empty()),
+            crate::federation::SharedFederation::empty(),
             None,
         )
     }
@@ -351,7 +354,7 @@ impl EpiGraphMcpFull {
         signer: AgentSigner,
         embedder: McpEmbedder,
         read_only: bool,
-        federation: Arc<crate::federation::FederationRegistry>,
+        federation: crate::federation::SharedFederation,
         llm_identity: Option<(String, String)>,
     ) -> Self {
         Self {
@@ -384,22 +387,23 @@ impl EpiGraphMcpFull {
             signer,
             embedder,
             read_only,
-            Arc::new(crate::federation::FederationRegistry::empty()),
+            crate::federation::SharedFederation::empty(),
             None,
         )
     }
 
     /// Like [`new_shared`](Self::new_shared) but with a caller-supplied
     /// federation registry. The HTTP transport factory closure in `main` clones
-    /// the one `Arc<FederationRegistry>` built at boot into every per-session
-    /// server via this constructor.
+    /// the one `SharedFederation` built at boot into every per-session server
+    /// via this constructor, so a reconnect on the shared registry is visible to
+    /// every session immediately.
     #[must_use]
     pub fn new_shared_with_federation(
         pool: PgPool,
         signer: Arc<AgentSigner>,
         embedder: Arc<McpEmbedder>,
         read_only: bool,
-        federation: Arc<crate::federation::FederationRegistry>,
+        federation: crate::federation::SharedFederation,
         llm_identity: Option<(String, String)>,
     ) -> Self {
         Self {
@@ -1529,9 +1533,12 @@ impl ServerHandler for EpiGraphMcpFull {
         // static nor federated) still falls through to the static path and its
         // fail-closed gate, exactly as before.
         if self.tool_router.get(&request.name).is_none() {
-            if let Some(ext) = self.federation.route(&request.name) {
-                let ext_name = ext.name.clone();
-                let ext_scope = ext.scope.clone();
+            // `route_config` returns an OWNED config and releases the registry
+            // lock before returning, so nothing below holds a guard across the
+            // downstream `invoke` await.
+            if let Some(ext) = self.federation.route_config(&request.name) {
+                let ext_name = ext.name;
+                let ext_scope = ext.scope;
                 // (a) enforce the extension's configured scope against the caller.
                 if let Err(err) =
                     Self::enforce_federated_scope(auth_owned.as_ref(), &request.name, &ext_scope)
