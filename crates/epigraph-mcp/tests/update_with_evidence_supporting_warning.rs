@@ -28,7 +28,7 @@ async fn run_update(
     supports: bool,
 ) -> serde_json::Value {
     let result = epigraph_mcp::tools::claims::update_with_evidence(
-        server, &viewer,
+        server, viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,

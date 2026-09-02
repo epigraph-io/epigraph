@@ -42,7 +42,7 @@ fn body(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 
 async fn wire_supports(server: &epigraph_mcp::server::EpiGraphMcpFull, viewer: &epigraph_db::visibility::Viewer, s: Uuid, t: Uuid) {
     let r = do_link_epistemic(
-        server, &viewer,
+        server, viewer,
         LinkEpistemicParams {
             source_claim_id: s.to_string(),
             target_claim_id: t.to_string(),

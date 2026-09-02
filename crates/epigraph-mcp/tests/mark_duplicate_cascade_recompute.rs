@@ -40,7 +40,7 @@ async fn wire(
     relationship: &str,
 ) {
     let result = do_link_epistemic(
-        server, &viewer,
+        server, viewer,
         LinkEpistemicParams {
             source_claim_id: s.to_string(),
             target_claim_id: t.to_string(),
@@ -77,7 +77,7 @@ async fn link_only(
     relationship: &str,
 ) {
     do_link_epistemic(
-        server, &viewer,
+        server, viewer,
         LinkEpistemicParams {
             source_claim_id: s.to_string(),
             target_claim_id: t.to_string(),
@@ -108,7 +108,7 @@ async fn dedup(
     canonical: Uuid,
 ) -> serde_json::Value {
     let result = mark_duplicate(
-        server, &viewer,
+        server, viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),
