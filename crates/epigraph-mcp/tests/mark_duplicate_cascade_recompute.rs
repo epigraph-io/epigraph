@@ -40,7 +40,8 @@ async fn wire(
     relationship: &str,
 ) {
     let result = do_link_epistemic(
-        server, viewer,
+        server,
+        viewer,
         LinkEpistemicParams {
             source_claim_id: s.to_string(),
             target_claim_id: t.to_string(),
@@ -77,7 +78,8 @@ async fn link_only(
     relationship: &str,
 ) {
     do_link_epistemic(
-        server, viewer,
+        server,
+        viewer,
         LinkEpistemicParams {
             source_claim_id: s.to_string(),
             target_claim_id: t.to_string(),
@@ -108,7 +110,8 @@ async fn dedup(
     canonical: Uuid,
 ) -> serde_json::Value {
     let result = mark_duplicate(
-        server, viewer,
+        server,
+        viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),
@@ -229,7 +232,8 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
     );
 
     mark_duplicate(
-        &server, &viewer,
+        &server,
+        &viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),
@@ -270,11 +274,12 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
     let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(&pool, &viewer)
         .await
         .expect("binary frame");
-    let coherent =
-        epigraph_engine::edge_factor::preview_claim_belief_on_frame(&pool, &viewer, canonical, frame_id)
-            .await
-            .expect("preview")
-            .expect("canonical has BBAs");
+    let coherent = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+        &pool, &viewer, canonical, frame_id,
+    )
+    .await
+    .expect("preview")
+    .expect("canonical has BBAs");
     let cached: Option<f64> = sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
         .bind(canonical)
         .fetch_one(&pool)

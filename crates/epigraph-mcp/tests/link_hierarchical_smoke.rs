@@ -98,7 +98,8 @@ async fn happy_path_creates_edge_and_is_idempotent(pool: PgPool) {
 
     // First call — fresh insert.
     let first = do_link_hierarchical(
-        &server, &viewer,
+        &server,
+        &viewer,
         LinkHierarchicalParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -127,7 +128,8 @@ async fn happy_path_creates_edge_and_is_idempotent(pool: PgPool) {
 
     // Second call with the same args — dedup hit, no new edge row.
     let second = do_link_hierarchical(
-        &server, &viewer,
+        &server,
+        &viewer,
         LinkHierarchicalParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -167,7 +169,8 @@ async fn invalid_relationship_is_rejected(pool: PgPool) {
     let target = seed_claim(&pool, "atomB").await;
 
     let err = do_link_hierarchical(
-        &server, &viewer,
+        &server,
+        &viewer,
         LinkHierarchicalParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -206,7 +209,8 @@ async fn missing_source_claim_returns_404_equivalent(pool: PgPool) {
     let bogus = Uuid::new_v4();
 
     let err = do_link_hierarchical(
-        &server, &viewer,
+        &server,
+        &viewer,
         LinkHierarchicalParams {
             source_claim_id: bogus.to_string(),
             target_claim_id: target.to_string(),
@@ -231,7 +235,8 @@ async fn missing_target_claim_returns_404_equivalent(pool: PgPool) {
     let bogus = Uuid::new_v4();
 
     let err = do_link_hierarchical(
-        &server, &viewer,
+        &server,
+        &viewer,
         LinkHierarchicalParams {
             source_claim_id: source.to_string(),
             target_claim_id: bogus.to_string(),
@@ -255,7 +260,8 @@ async fn self_loop_is_rejected(pool: PgPool) {
     let claim = seed_claim(&pool, "loop").await;
 
     let err = do_link_hierarchical(
-        &server, &viewer,
+        &server,
+        &viewer,
         LinkHierarchicalParams {
             source_claim_id: claim.to_string(),
             target_claim_id: claim.to_string(),

@@ -66,9 +66,11 @@ async fn are_all_current_rejects_stale_or_missing(pool: PgPool) {
     let missing = Uuid::new_v4();
 
     // Two live claims → guard passes (a CORROBORATES edge would be allowed).
-    assert!(ClaimRepository::are_all_current(&pool, &viewer, &[live_a, live_b])
-        .await
-        .unwrap());
+    assert!(
+        ClaimRepository::are_all_current(&pool, &viewer, &[live_a, live_b])
+            .await
+            .unwrap()
+    );
 
     // Any superseded endpoint → guard fails (the bug scenario).
     assert!(
@@ -78,10 +80,14 @@ async fn are_all_current_rejects_stale_or_missing(pool: PgPool) {
     );
 
     // A missing id → guard fails.
-    assert!(!ClaimRepository::are_all_current(&pool, &viewer, &[live_a, missing])
-        .await
-        .unwrap());
+    assert!(
+        !ClaimRepository::are_all_current(&pool, &viewer, &[live_a, missing])
+            .await
+            .unwrap()
+    );
 
     // Empty set is vacuously true.
-    assert!(ClaimRepository::are_all_current(&pool, &viewer, &[]).await.unwrap());
+    assert!(ClaimRepository::are_all_current(&pool, &viewer, &[])
+        .await
+        .unwrap());
 }

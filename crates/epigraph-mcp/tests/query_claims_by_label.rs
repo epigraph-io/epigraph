@@ -34,7 +34,8 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
     // Default call (no filters): all 3 claims, with labels populated and
     // is_current/supersedes carried through.
     let result = query_claims_by_label(
-        &server, &viewer,
+        &server,
+        &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec![],
@@ -79,7 +80,8 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
 
     // exclude_labels=["resolved"]: drops the resolved one.
     let result = query_claims_by_label(
-        &server, &viewer,
+        &server,
+        &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec!["resolved".into()],
@@ -104,7 +106,8 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
 
     // current_only=true: drops the superseded one.
     let result = query_claims_by_label(
-        &server, &viewer,
+        &server,
+        &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec![],
@@ -129,7 +132,8 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
 
     // Both filters combined: only the live open backlog claim survives.
     let result = query_claims_by_label(
-        &server, &viewer,
+        &server,
+        &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec!["resolved".into()],

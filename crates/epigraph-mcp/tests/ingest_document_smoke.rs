@@ -184,7 +184,8 @@ async fn ingested_claims_carry_doi_label_for_recompute(pool: PgPool) {
     );
 
     let result = tools::cdst_maintenance::recompute_beliefs(
-        &server, &viewer,
+        &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![doi_label.to_string()]),

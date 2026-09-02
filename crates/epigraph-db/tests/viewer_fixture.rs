@@ -100,7 +100,6 @@ pub async fn bypass(pool: &PgPool) -> (ScopedPool, Viewer) {
     (scoped, viewer)
 }
 
-
 /// A `Scoped` viewer over the NIL principal: a real, resolvable viewer with an
 /// empty group set, so it reads exactly the `visibility = 'public'` corpus.
 ///

@@ -245,6 +245,26 @@ fn parse_stored_bba(
         .map_err(|e| format!("parse stored BBA: {e}"))
 }
 
+/// The evidential content of one auto-wire call.
+///
+/// Bundled rather than passed positionally because `confidence` and `weight`
+/// are adjacent bare `f64`s: `(.., confidence, 0.6, true, None)` compiles just
+/// as happily with the two transposed, and the result is a silently
+/// mis-weighted BBA rather than an error. Named fields make that a compile
+/// error. (Adding `viewer` for tenancy also pushed this to 8 arguments and
+/// tripped `clippy::too_many_arguments`, but the count is the symptom.)
+#[derive(Debug, Clone, Copy)]
+pub struct DsAutoInput<'a> {
+    /// Belief mass for the supported hypothesis, in `[0, 1]`.
+    pub confidence: f64,
+    /// Source-reliability discount applied to the BBA, in `[0, 1]`.
+    pub weight: f64,
+    /// Whether the evidence supports (`true`) or opposes (`false`) the claim.
+    pub supports: bool,
+    /// Evidence classification tag, when the caller has one.
+    pub evidence_type: Option<&'a str>,
+}
+
 /// Auto-wire DS for a **new** claim.
 ///
 /// Creates a BBA, assigns the claim to the binary frame, computes Bel/Pl/BetP,
@@ -254,11 +274,14 @@ pub async fn auto_wire_ds_for_claim(
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     agent_id: Uuid,
-    confidence: f64,
-    weight: f64,
-    supports: bool,
-    evidence_type: Option<&str>, // NEW: evidence classification tag
+    input: DsAutoInput<'_>,
 ) -> Result<DsAutoResult, String> {
+    let DsAutoInput {
+        confidence,
+        weight,
+        supports,
+        evidence_type,
+    } = input;
     let frame_id = ensure_binary_frame(pool, viewer).await?;
     let frame = binary_frame()?;
 

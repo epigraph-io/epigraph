@@ -792,9 +792,13 @@ mod tests {
         .await
         .unwrap();
 
-        let all = MassFunctionRepository::get_all_for_frame(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), frame_id)
-            .await
-            .unwrap();
+        let all = MassFunctionRepository::get_all_for_frame(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            frame_id,
+        )
+        .await
+        .unwrap();
         assert_eq!(all.len(), 2);
         assert!(all.iter().any(|r| r.claim_id == claim1_id));
         assert!(all.iter().any(|r| r.claim_id == claim2_id));
@@ -883,9 +887,13 @@ mod tests {
         .await
         .unwrap();
 
-        let frames = MassFunctionRepository::list_frames_for_claim(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), claim_id)
-            .await
-            .unwrap();
+        let frames = MassFunctionRepository::list_frames_for_claim(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            claim_id,
+        )
+        .await
+        .unwrap();
         assert_eq!(frames.len(), 2, "two distinct frames despite 3 BBAs");
         assert_eq!(frames[0].0, frame_a, "name-ordered: aaa frame first");
         assert_eq!(frames[1].0, frame_z, "name-ordered: zzz frame last");
@@ -937,9 +945,16 @@ mod tests {
         }
 
         // Ephemeral sqlx::test DB → only our 3 distinct claims have BBAs.
-        let all = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_bypass(crate::visibility::SystemReason::BeliefRecomputation), 100, 0)
-            .await
-            .unwrap();
+        let all = MassFunctionRepository::list_claim_ids(
+            &pool,
+            &crate::visibility::Viewer::test_bypass(
+                crate::visibility::SystemReason::BeliefRecomputation,
+            ),
+            100,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             all.len(),
             3,
@@ -951,12 +966,26 @@ mod tests {
         assert_eq!(all, expected, "ascending claim_id order");
 
         // Paging: page 1 (limit 2) + page 2 (offset 2) partition the set, disjoint.
-        let page1 = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_bypass(crate::visibility::SystemReason::BeliefRecomputation), 2, 0)
-            .await
-            .unwrap();
-        let page2 = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_bypass(crate::visibility::SystemReason::BeliefRecomputation), 2, 2)
-            .await
-            .unwrap();
+        let page1 = MassFunctionRepository::list_claim_ids(
+            &pool,
+            &crate::visibility::Viewer::test_bypass(
+                crate::visibility::SystemReason::BeliefRecomputation,
+            ),
+            2,
+            0,
+        )
+        .await
+        .unwrap();
+        let page2 = MassFunctionRepository::list_claim_ids(
+            &pool,
+            &crate::visibility::Viewer::test_bypass(
+                crate::visibility::SystemReason::BeliefRecomputation,
+            ),
+            2,
+            2,
+        )
+        .await
+        .unwrap();
         assert_eq!(page1, expected[..2].to_vec());
         assert_eq!(page2, vec![expected[2]]);
     }
@@ -1000,9 +1029,16 @@ mod tests {
             .await
             .unwrap();
 
-        let ids = MassFunctionRepository::list_claim_ids(&pool, &crate::visibility::Viewer::test_bypass(crate::visibility::SystemReason::BeliefRecomputation), 100, 0)
-            .await
-            .unwrap();
+        let ids = MassFunctionRepository::list_claim_ids(
+            &pool,
+            &crate::visibility::Viewer::test_bypass(
+                crate::visibility::SystemReason::BeliefRecomputation,
+            ),
+            100,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             ids,
             vec![c_current],
@@ -1084,9 +1120,14 @@ mod tests {
         .await
         .unwrap();
 
-        let rows = MassFunctionRepository::get_for_claim_frame(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), claim_id, frame_id)
-            .await
-            .unwrap();
+        let rows = MassFunctionRepository::get_for_claim_frame(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            claim_id,
+            frame_id,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             rows.len(),
             1,

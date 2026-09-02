@@ -80,7 +80,7 @@ pub use repos::{
     ExperimentRow, FactorRepository, FrameRepository, GapAnalysisResult, GapChallengeRow,
     GapRecord, GapRepository, GraphExpansionHit, GroupKeyEpochRepository,
     GroupMembershipRepository, GroupRepository, GroupRow, HierarchicalWorkflowRow, HybridHit,
-    IndexCounts, KeyEpochRow, LearningEventRepository, LearningEventRow, LineageHead,
+    IndexCounts, KeyEpochRow, LabelQuery, LearningEventRepository, LearningEventRow, LineageHead,
     LineageRepository, MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow,
     MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes,
     MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper,

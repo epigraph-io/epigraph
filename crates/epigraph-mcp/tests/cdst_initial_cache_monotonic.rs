@@ -44,7 +44,8 @@ async fn adding_supporting_evidence_does_not_drop_cached_betp(pool: sqlx::PgPool
     // 1. Write initial DS cache via the REAL ingestion batch writer, tagged with
     //    a hard-discounting evidence_type so raw-vs-discounted diverge starkly.
     let (_frame_id, wired) = auto_wire_ds_batch(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &[BatchDsEntry {
             claim_id,
             confidence: 0.9,
@@ -63,7 +64,8 @@ async fn adding_supporting_evidence_does_not_drop_cached_betp(pool: sqlx::PgPool
     // 2. Add a SUPPORTING evidence through the canonical update path.
     let server = build_test_server(pool.clone());
     let res = epigraph_mcp::tools::claims::update_with_evidence(
-        &server, &viewer,
+        &server,
+        &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,

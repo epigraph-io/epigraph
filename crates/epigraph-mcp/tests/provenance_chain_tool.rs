@@ -73,7 +73,8 @@ async fn tool_returns_mixed_direction_chain_in_topological_order(pool: PgPool) {
 
     let server = build_test_server(pool);
     let out = get_provenance_chain(
-        &server, &viewer,
+        &server,
+        &viewer,
         GetProvenanceChainParams {
             claim_id: root.to_string(),
             max_depth: Some(4),
@@ -131,7 +132,8 @@ async fn relationships_filter_narrows_the_walk(pool: PgPool) {
 
     let server = build_test_server(pool);
     let out = get_provenance_chain(
-        &server, &viewer,
+        &server,
+        &viewer,
         GetProvenanceChainParams {
             claim_id: root.to_string(),
             max_depth: Some(4),
@@ -170,7 +172,8 @@ async fn invalid_uuid_is_rejected(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool);
     let err = get_provenance_chain(
-        &server, &viewer,
+        &server,
+        &viewer,
         GetProvenanceChainParams {
             claim_id: "not-a-uuid".to_string(),
             max_depth: None,

@@ -77,7 +77,8 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
     // the partial-ingestion state under test.
 
     let result = query_paper(
-        &server, &viewer,
+        &server,
+        &viewer,
         QueryPaperParams {
             doi: doi.to_string(),
         },
@@ -102,7 +103,8 @@ async fn query_paper_reports_zero_for_unknown_doi(pool: PgPool) {
     let server = make_server(pool.clone());
 
     let result = query_paper(
-        &server, &viewer,
+        &server,
+        &viewer,
         QueryPaperParams {
             doi: "10.9999/never-ingested".to_string(),
         },

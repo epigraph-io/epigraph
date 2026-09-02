@@ -26,7 +26,8 @@ async fn mcp_deprecate_workflow_sets_is_current_false(pool: PgPool) {
     let server = build_test_server(pool.clone());
 
     epigraph_mcp::tools::workflows::deprecate_workflow(
-        &server, &viewer,
+        &server,
+        &viewer,
         epigraph_mcp::types::DeprecateWorkflowParams {
             workflow_id: id.to_string(),
             reason: "obsolete".into(),
@@ -59,7 +60,8 @@ async fn deprecate_workflow_nulls_embedding(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     epigraph_mcp::tools::workflows::deprecate_workflow(
-        &server, &viewer,
+        &server,
+        &viewer,
         epigraph_mcp::types::DeprecateWorkflowParams {
             workflow_id: id.to_string(),
             reason: "embedding test".into(),
@@ -97,7 +99,8 @@ async fn deprecate_workflow_cascade_nulls_embeddings(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     epigraph_mcp::tools::workflows::deprecate_workflow(
-        &server, &viewer,
+        &server,
+        &viewer,
         epigraph_mcp::types::DeprecateWorkflowParams {
             workflow_id: root.to_string(),
             reason: "cascade embed test".into(),
@@ -137,7 +140,8 @@ async fn deprecate_workflow_cascade_walks_supersedes_and_variant_of(pool: PgPool
 
     let server = build_test_server(pool.clone());
     epigraph_mcp::tools::workflows::deprecate_workflow(
-        &server, &viewer,
+        &server,
+        &viewer,
         epigraph_mcp::types::DeprecateWorkflowParams {
             workflow_id: root.to_string(),
             reason: "cascade test".into(),

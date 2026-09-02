@@ -105,7 +105,9 @@ async fn evolve_step_supersedes_flips_head(pool: PgPool) {
         rationale: Some("clarified wording".to_string()),
         level: Some(2),
     };
-    let _result = evolve_step(&server, &viewer, params).await.expect("evolve_step");
+    let _result = evolve_step(&server, &viewer, params)
+        .await
+        .expect("evolve_step");
 
     let heads = ClaimRepository::latest_in_lineage(&pool, &viewer, lineage)
         .await
@@ -205,7 +207,8 @@ async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
 
     // Agent A revises v1.
     evolve_step(
-        &server, &viewer,
+        &server,
+        &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -222,7 +225,8 @@ async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
 
     // Agent B revises v1 too.
     evolve_step(
-        &server, &viewer,
+        &server,
+        &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -256,7 +260,8 @@ async fn evolve_step_rejects_bad_edge_type(pool: PgPool) {
     let v1 = seed_versioned_step(&pool, agent, lineage, "v1").await;
 
     let result = evolve_step(
-        &server, &viewer,
+        &server,
+        &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -282,7 +287,8 @@ async fn evolve_step_rejects_level_0_or_1(pool: PgPool) {
 
     for bad_level in [0u32, 1, 4] {
         let result = evolve_step(
-            &server, &viewer,
+            &server,
+            &viewer,
             EvolveStepParams {
                 canonical_name: None,
                 step_index: None,
@@ -319,7 +325,8 @@ async fn find_workflow_hierarchical_frozen_by_default(pool: PgPool) {
     .unwrap();
 
     let result = find_workflow_hierarchical(
-        &server, &viewer,
+        &server,
+        &viewer,
         FindWorkflowHierarchicalParams {
             query: "versioning probe".to_string(),
             limit: Some(5),
@@ -367,7 +374,8 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     // Step 0: lineage_a, evolved via supersedes (single head).
     let s0_v1 = seed_versioned_step(&pool, agent, lineage_a, "step 0 v1").await;
     evolve_step(
-        &server, &viewer,
+        &server,
+        &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -392,7 +400,8 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     // Step 1: lineage_b, two concurrent revises (multi-head).
     let s1_v1 = seed_versioned_step(&pool, agent, lineage_b, "step 1 v1").await;
     evolve_step(
-        &server, &viewer,
+        &server,
+        &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -407,7 +416,8 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     .await
     .expect("revises s1 A");
     evolve_step(
-        &server, &viewer,
+        &server,
+        &viewer,
         EvolveStepParams {
             canonical_name: None,
             step_index: None,
@@ -439,7 +449,8 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
     }
 
     let result = find_workflow_hierarchical(
-        &server, &viewer,
+        &server,
+        &viewer,
         FindWorkflowHierarchicalParams {
             query: "resolve_to_latest target".to_string(),
             limit: Some(5),
@@ -531,7 +542,8 @@ async fn find_workflow_hierarchical_matches_canonical_name_across_diverged_goals
     // Only the hyphen-normalized `(replace(canonical_name,'-',' ') || ' '
     // || goal)` concat surfaces gen-4.
     let result = find_workflow_hierarchical(
-        &server, &viewer,
+        &server,
+        &viewer,
         FindWorkflowHierarchicalParams {
             query: "scan norcal architecture rfps".to_string(),
             limit: Some(10),
@@ -592,7 +604,8 @@ async fn find_workflow_hierarchical_filters_deprecated_via_min_truth(pool: PgPoo
 
     // Default min_truth (0.3) → only the live row.
     let default_result = find_workflow_hierarchical(
-        &server, &viewer,
+        &server,
+        &viewer,
         FindWorkflowHierarchicalParams {
             query: "rfp monitor test".to_string(),
             limit: Some(10),
@@ -620,7 +633,8 @@ async fn find_workflow_hierarchical_filters_deprecated_via_min_truth(pool: PgPoo
 
     // min_truth=0.0 → both rows (caller opts into the cemetery).
     let all_result = find_workflow_hierarchical(
-        &server, &viewer,
+        &server,
+        &viewer,
         FindWorkflowHierarchicalParams {
             query: "rfp monitor test".to_string(),
             limit: Some(10),

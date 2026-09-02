@@ -1818,12 +1818,14 @@ pub async fn list_by_labels(
     let rows = ClaimRepository::list_by_labels(
         &state.db_pool,
         &viewer,
-        &labels,
-        &exclude_labels,
-        current_only,
-        min_truth,
-        limit,
-        offset,
+        epigraph_db::LabelQuery {
+            labels: &labels,
+            exclude_labels: &exclude_labels,
+            current_only,
+            min_truth,
+            limit,
+            offset,
+        },
     )
     .await
     .map_err(|e| ApiError::InternalError {

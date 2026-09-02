@@ -32,7 +32,8 @@ async fn deprecate_workflow_diamond_dag_no_duplicates(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     let result = epigraph_mcp::tools::workflows::deprecate_workflow(
-        &server, &viewer,
+        &server,
+        &viewer,
         epigraph_mcp::types::DeprecateWorkflowParams {
             workflow_id: root.to_string(),
             reason: "diamond test".into(),

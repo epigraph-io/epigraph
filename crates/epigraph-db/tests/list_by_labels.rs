@@ -32,13 +32,13 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
 
     // Default call: returns all three with labels populated
     let rows = ClaimRepository::list_by_labels(
-        &pool, &viewer,
-        &["backlog".to_string()],
-        &[],   // exclude_labels
-        false, // current_only
-        0.0,
-        50,
-        0, // offset
+        &pool,
+        &viewer,
+        epigraph_db::LabelQuery {
+            labels: &["backlog".to_string()],
+            limit: 50,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -60,13 +60,14 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
 
     // exclude_labels=["resolved"] drops the resolved one
     let filtered = ClaimRepository::list_by_labels(
-        &pool, &viewer,
-        &["backlog".to_string()],
-        &["resolved".to_string()],
-        false,
-        0.0,
-        50,
-        0,
+        &pool,
+        &viewer,
+        epigraph_db::LabelQuery {
+            labels: &["backlog".to_string()],
+            exclude_labels: &["resolved".to_string()],
+            limit: 50,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -74,22 +75,32 @@ async fn list_by_labels_returns_labels_is_current_supersedes(pool: PgPool) {
     assert!(filtered.iter().all(|(c, _)| c.id != backlog_resolved));
 
     // current_only=true drops the superseded one
-    let current =
-        ClaimRepository::list_by_labels(&pool, &viewer, &["backlog".to_string()], &[], true, 0.0, 50, 0)
-            .await
-            .unwrap();
+    let current = ClaimRepository::list_by_labels(
+        &pool,
+        &viewer,
+        epigraph_db::LabelQuery {
+            labels: &["backlog".to_string()],
+            current_only: true,
+            limit: 50,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(current.len(), 2);
     assert!(current.iter().all(|(c, _)| c.id != backlog_superseded));
 
     // Both filters combined: only the live open backlog claim
     let open = ClaimRepository::list_by_labels(
-        &pool, &viewer,
-        &["backlog".to_string()],
-        &["resolved".to_string()],
-        true,
-        0.0,
-        50,
-        0,
+        &pool,
+        &viewer,
+        epigraph_db::LabelQuery {
+            labels: &["backlog".to_string()],
+            exclude_labels: &["resolved".to_string()],
+            current_only: true,
+            limit: 50,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -121,28 +132,51 @@ async fn list_by_labels_pagination(pool: PgPool) {
     let expected_desc: Vec<ClaimId> = seeded.into_iter().rev().collect();
 
     // Page 1: limit=2 offset=0 — first 2 newest.
-    let page1 =
-        ClaimRepository::list_by_labels(&pool, &viewer, &["page-test".to_string()], &[], false, 0.0, 2, 0)
-            .await
-            .unwrap();
+    let page1 = ClaimRepository::list_by_labels(
+        &pool,
+        &viewer,
+        epigraph_db::LabelQuery {
+            labels: &["page-test".to_string()],
+            limit: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(page1.len(), 2, "page1 len");
     let page1_ids: Vec<ClaimId> = page1.iter().map(|(c, _)| c.id).collect();
     assert_eq!(page1_ids, expected_desc[0..2]);
 
     // Page 2: limit=2 offset=2 — next 2.
-    let page2 =
-        ClaimRepository::list_by_labels(&pool, &viewer, &["page-test".to_string()], &[], false, 0.0, 2, 2)
-            .await
-            .unwrap();
+    let page2 = ClaimRepository::list_by_labels(
+        &pool,
+        &viewer,
+        epigraph_db::LabelQuery {
+            labels: &["page-test".to_string()],
+            limit: 2,
+            offset: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(page2.len(), 2, "page2 len");
     let page2_ids: Vec<ClaimId> = page2.iter().map(|(c, _)| c.id).collect();
     assert_eq!(page2_ids, expected_desc[2..4]);
 
     // Page 3: limit=2 offset=4 — only 1 remaining (5 total).
-    let page3 =
-        ClaimRepository::list_by_labels(&pool, &viewer, &["page-test".to_string()], &[], false, 0.0, 2, 4)
-            .await
-            .unwrap();
+    let page3 = ClaimRepository::list_by_labels(
+        &pool,
+        &viewer,
+        epigraph_db::LabelQuery {
+            labels: &["page-test".to_string()],
+            limit: 2,
+            offset: 4,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     assert!(
         page3.len() <= 1,
         "page3 should have <=1 row (got {})",
@@ -167,13 +201,14 @@ async fn list_by_labels_pagination(pool: PgPool) {
 
     // Negative offset must clamp to 0 (matches the implementation contract).
     let clamped = ClaimRepository::list_by_labels(
-        &pool, &viewer,
-        &["page-test".to_string()],
-        &[],
-        false,
-        0.0,
-        2,
-        -100,
+        &pool,
+        &viewer,
+        epigraph_db::LabelQuery {
+            labels: &["page-test".to_string()],
+            limit: 2,
+            offset: -100,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();

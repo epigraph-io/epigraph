@@ -29,9 +29,10 @@ async fn engine_recall_writes_an_audit_row_with_null_agent(pool: PgPool) {
     .bind(agent).execute(&pool).await.expect("seed claim");
 
     let provider = MockProvider::new(EmbeddingConfig::local(64));
-    let results = epigraph_engine::recall::recall(&pool, &viewer, &provider, "grendlewick", 10, 0.0)
-        .await
-        .expect("engine recall ok");
+    let results =
+        epigraph_engine::recall::recall(&pool, &viewer, &provider, "grendlewick", 10, 0.0)
+            .await
+            .expect("engine recall ok");
 
     let row = sqlx::query!(
         "SELECT tool, agent_id, query_text, returned_claim_ids FROM recall_events

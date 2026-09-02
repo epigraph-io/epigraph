@@ -47,11 +47,14 @@ async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
             .expect("create paper");
 
     // No edge yet → false.
-    assert!(
-        !PaperRepository::has_processed_by_edge(&pool, &viewer, paper_id, "hierarchical_extraction_v1")
-            .await
-            .expect("query has_processed_by_edge")
-    );
+    assert!(!PaperRepository::has_processed_by_edge(
+        &pool,
+        &viewer,
+        paper_id,
+        "hierarchical_extraction_v1"
+    )
+    .await
+    .expect("query has_processed_by_edge"));
 
     // Edges enforce target existence via trigger_validate_edge_refs, so we
     // create a real agent + claim to use as the edge target.
@@ -78,11 +81,14 @@ async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
     .await
     .expect("create edge");
 
-    assert!(
-        PaperRepository::has_processed_by_edge(&pool, &viewer, paper_id, "hierarchical_extraction_v1")
-            .await
-            .expect("query has_processed_by_edge")
-    );
+    assert!(PaperRepository::has_processed_by_edge(
+        &pool,
+        &viewer,
+        paper_id,
+        "hierarchical_extraction_v1"
+    )
+    .await
+    .expect("query has_processed_by_edge"));
 
     // Different pipeline string → still false.
     assert!(

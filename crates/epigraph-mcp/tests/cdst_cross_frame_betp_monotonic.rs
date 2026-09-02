@@ -100,9 +100,10 @@ async fn cross_frame_supporting_evidence_does_not_drop_betp() {
     .expect("construct legacy frame");
 
     let calibration = CalibrationConfig::default_for_phase2_fallback();
-    let legacy_rows = MassFunctionRepository::get_for_claim_frame(&pool, &viewer, claim_id, legacy_frame_id)
-        .await
-        .expect("get legacy BBAs");
+    let legacy_rows =
+        MassFunctionRepository::get_for_claim_frame(&pool, &viewer, claim_id, legacy_frame_id)
+            .await
+            .expect("get legacy BBAs");
     assert_eq!(legacy_rows.len(), 5, "should have exactly 5 legacy BBAs");
 
     let mut mass_fns = Vec::with_capacity(legacy_rows.len());
@@ -141,7 +142,8 @@ async fn cross_frame_supporting_evidence_does_not_drop_betp() {
     // 4. Add a SUPPORTING evidence via the canonical update path (writes to binary_truth).
     let server = build_test_server(pool.clone());
     let res = epigraph_mcp::tools::claims::update_with_evidence(
-        &server, &viewer,
+        &server,
+        &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,

@@ -256,7 +256,8 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     let result = query_claims(
-        &server, &viewer,
+        &server,
+        &viewer,
         QueryClaimsParams {
             min_truth: Some(0.0),
             max_truth: Some(1.0),
@@ -568,7 +569,8 @@ async fn get_claim_as(
     requester: Option<Uuid>,
 ) -> Value {
     let result = get_claim(
-        server, viewer,
+        server,
+        viewer,
         GetClaimParams {
             claim_id: claim_id.as_uuid().to_string(),
             frame_id: None,

@@ -40,9 +40,15 @@ fn body(result: &rmcp::model::CallToolResult) -> serde_json::Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("response JSON: {e}; raw={text}"))
 }
 
-async fn wire_supports(server: &epigraph_mcp::server::EpiGraphMcpFull, viewer: &epigraph_db::visibility::Viewer, s: Uuid, t: Uuid) {
+async fn wire_supports(
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    s: Uuid,
+    t: Uuid,
+) {
     let r = do_link_epistemic(
-        server, viewer,
+        server,
+        viewer,
         LinkEpistemicParams {
             source_claim_id: s.to_string(),
             target_claim_id: t.to_string(),
@@ -74,7 +80,8 @@ async fn supersede_reports_the_downstream_target_it_repaired(pool: PgPool) {
     // The enumeration the proposal sketched, run here to prove it is a trap:
     // after the commit, nothing outgoing is still sourced at the retracted id.
     let result = supersede_claim(
-        &server, &viewer,
+        &server,
+        &viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
@@ -163,7 +170,8 @@ async fn sole_supporter_retraction_is_reported_as_unbacked_not_as_nothing_to_do(
     wire_supports(&server, &viewer, a, b).await;
 
     let result = supersede_claim(
-        &server, &viewer,
+        &server,
+        &viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
@@ -224,7 +232,8 @@ async fn cascade_errors_are_reported_not_propagated(pool: PgPool) {
     .expect("corrupt surviving BBA");
 
     let result = supersede_claim(
-        &server, &viewer,
+        &server,
+        &viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
@@ -263,7 +272,8 @@ async fn mark_duplicate_keeps_its_keys_and_reports_the_cascade(pool: PgPool) {
     wire_supports(&server, &viewer, u, dup).await;
 
     let result = mark_duplicate(
-        &server, &viewer,
+        &server,
+        &viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),

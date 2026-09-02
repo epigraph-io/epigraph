@@ -10,7 +10,8 @@ async fn submit_claim_attaches_labels_when_provided(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let result = epigraph_mcp::tools::claims::submit_claim(
-        &server, &viewer,
+        &server,
+        &viewer,
         epigraph_mcp::types::SubmitClaimParams {
             content: "labeled claim".into(),
             methodology: "deductive_logic".into(),

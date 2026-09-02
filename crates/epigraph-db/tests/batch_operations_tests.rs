@@ -209,7 +209,9 @@ async fn test_batch_create_claims_atomicity(pool: PgPool) {
 
     // Verify none of the new claims were inserted
     for (i, claim) in claims.iter().take(3).enumerate() {
-        let check = ClaimRepository::get_by_id(&pool, &viewer, claim.id).await.unwrap();
+        let check = ClaimRepository::get_by_id(&pool, &viewer, claim.id)
+            .await
+            .unwrap();
         assert!(
             check.is_none(),
             "Claim {} should not exist due to atomic rollback",

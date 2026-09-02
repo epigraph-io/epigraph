@@ -40,7 +40,8 @@ async fn update_with_evidence_adds_labels_without_dropping_existing(pool: PgPool
     let server = build_test_server(pool.clone());
 
     let result = epigraph_mcp::tools::claims::update_with_evidence(
-        &server, &viewer,
+        &server,
+        &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,

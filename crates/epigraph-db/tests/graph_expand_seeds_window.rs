@@ -139,9 +139,10 @@ async fn in_window_destination_survives_a_pre_window_fanout(pool: PgPool) {
     // The criterion: with a window set, the 200-slot emission budget belongs
     // to in-window claims. The 250 pre-window bridges are walked through, not
     // counted.
-    let windowed = ClaimRepository::graph_expand_seeds_since(&pool, &viewer, &[seed], 2, Some(epoch_cut()))
-        .await
-        .expect("windowed expansion");
+    let windowed =
+        ClaimRepository::graph_expand_seeds_since(&pool, &viewer, &[seed], 2, Some(epoch_cut()))
+            .await
+            .expect("windowed expansion");
     let ids: Vec<Uuid> = windowed.iter().map(|h| h.claim_id).collect();
 
     assert!(
@@ -175,9 +176,10 @@ async fn an_out_of_window_claim_still_bridges_to_an_in_window_one(pool: PgPool) 
     seed_edge_at(&pool, seed, bridge, e).await;
     seed_edge_at(&pool, bridge, far, e).await;
 
-    let windowed = ClaimRepository::graph_expand_seeds_since(&pool, &viewer, &[seed], 2, Some(epoch_cut()))
-        .await
-        .expect("windowed expansion");
+    let windowed =
+        ClaimRepository::graph_expand_seeds_since(&pool, &viewer, &[seed], 2, Some(epoch_cut()))
+            .await
+            .expect("windowed expansion");
     let ids: Vec<Uuid> = windowed.iter().map(|h| h.claim_id).collect();
 
     assert!(

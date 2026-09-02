@@ -1432,19 +1432,33 @@ mod tests {
         let doi = "urn:test:check-gate";
 
         // Unknown DOI → not ingested.
-        assert!(paper_already_ingested(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), doi, PIPELINE_VERSION_BASE)
-            .await
-            .expect("gate query")
-            .is_none());
+        assert!(paper_already_ingested(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            doi,
+            PIPELINE_VERSION_BASE
+        )
+        .await
+        .expect("gate query")
+        .is_none());
 
         // Create the paper without a processed_by edge → still not ingested.
         let paper_id = PaperRepository::get_or_create(&pool, doi, Some("test"), None)
             .await
             .expect("create paper");
-        assert!(paper_already_ingested(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), doi, PIPELINE_VERSION_BASE)
-            .await
-            .expect("gate query")
-            .is_none());
+        assert!(paper_already_ingested(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            doi,
+            PIPELINE_VERSION_BASE
+        )
+        .await
+        .expect("gate query")
+        .is_none());
 
         // Insert a `processed_by` edge with a *different* pipeline → still not
         // ingested under PIPELINE_VERSION_BASE. Edges enforce target existence, so
@@ -1468,10 +1482,17 @@ mod tests {
         )
         .await
         .expect("create edge with other pipeline");
-        assert!(paper_already_ingested(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), doi, PIPELINE_VERSION_BASE)
-            .await
-            .expect("gate query")
-            .is_none());
+        assert!(paper_already_ingested(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            doi,
+            PIPELINE_VERSION_BASE
+        )
+        .await
+        .expect("gate query")
+        .is_none());
 
         // Insert a `processed_by` edge with the matching pipeline (different
         // target so it isn't deduped by the (source,target,relationship) key).
@@ -1494,9 +1515,16 @@ mod tests {
         )
         .await
         .expect("create edge with matching pipeline");
-        let hit = paper_already_ingested(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), doi, PIPELINE_VERSION_BASE)
-            .await
-            .expect("gate query");
+        let hit = paper_already_ingested(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            doi,
+            PIPELINE_VERSION_BASE,
+        )
+        .await
+        .expect("gate query");
         assert_eq!(hit, Some(paper_id));
     }
 

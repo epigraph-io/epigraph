@@ -110,7 +110,9 @@ async fn evidence_type_testimonial_diverges_from_no_evidence_type(pool: PgPool) 
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "ds-calibrated-testimonial").await;
-    let frame_id = ensure_binary_frame(&pool, &viewer).await.expect("binary frame");
+    let frame_id = ensure_binary_frame(&pool, &viewer)
+        .await
+        .expect("binary frame");
 
     let claim_a = insert_claim(&pool, agent, &format!("calib-a-{}", Uuid::new_v4())).await;
     let out_a = tools::ds::submit_ds_evidence(&server, &viewer, base_params(claim_a, frame_id))
@@ -156,7 +158,9 @@ async fn omitting_evidence_type_is_byte_identical_to_legacy_behavior(pool: PgPoo
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "ds-calibrated-backcompat").await;
-    let frame_id = ensure_binary_frame(&pool, &viewer).await.expect("binary frame");
+    let frame_id = ensure_binary_frame(&pool, &viewer)
+        .await
+        .expect("binary frame");
     let claim = insert_claim(&pool, agent, &format!("calib-compat-{}", Uuid::new_v4())).await;
 
     let mut params = base_params(claim, frame_id);

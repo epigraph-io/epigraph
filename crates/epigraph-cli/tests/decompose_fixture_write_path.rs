@@ -108,7 +108,10 @@ async fn fixture_provider_writes_atoms_and_decomposes_to_edges(pool: PgPool) {
     ];
 
     let pool_c = pool.clone();
-    let totals = run_decomposition_batches(&pool, &viewer, &claims,
+    let totals = run_decomposition_batches(
+        &pool,
+        &viewer,
+        &claims,
         &llm,
         10,
         None,
@@ -174,7 +177,10 @@ async fn atoms_follow_claim_text_not_batch_position(pool: PgPool) {
     ];
 
     let pool_c = pool.clone();
-    let totals = run_decomposition_batches(&pool, &viewer, &claims,
+    let totals = run_decomposition_batches(
+        &pool,
+        &viewer,
+        &claims,
         &llm,
         10,
         None,
@@ -224,7 +230,10 @@ async fn claims_missing_from_the_fixture_are_left_untouched(pool: PgPool) {
     ];
 
     let pool_c = pool.clone();
-    let totals = run_decomposition_batches(&pool, &viewer, &claims,
+    let totals = run_decomposition_batches(
+        &pool,
+        &viewer,
+        &claims,
         &llm,
         10,
         None,
@@ -263,10 +272,18 @@ async fn mock_provider_writes_nothing(pool: PgPool) {
 
     let submitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let submitted_c = submitted.clone();
-    let totals = run_decomposition_batches(&pool, &viewer, &claims, &llm, 10, None, move |_t, _g, _a| {
-        submitted_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        async move { Ok(Uuid::new_v4()) }
-    })
+    let totals = run_decomposition_batches(
+        &pool,
+        &viewer,
+        &claims,
+        &llm,
+        10,
+        None,
+        move |_t, _g, _a| {
+            submitted_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { Ok(Uuid::new_v4()) }
+        },
+    )
     .await
     .unwrap();
 

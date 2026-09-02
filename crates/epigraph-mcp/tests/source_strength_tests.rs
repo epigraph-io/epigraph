@@ -73,7 +73,8 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
     let evidence_id = seed_evidence(&pool, claim_id).await;
 
     tools::ds_auto::auto_wire_ds_update(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         claim_id,
         agent_id,
         confidence,
@@ -151,7 +152,8 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     let ev_c = seed_evidence(&pool, claim_id).await;
 
     tools::ds_auto::auto_wire_ds_update(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         claim_id,
         agent_id,
         0.9,  // confidence
@@ -164,7 +166,8 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     .expect("first update");
 
     tools::ds_auto::auto_wire_ds_update(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         claim_id,
         agent_id,
         0.9,
@@ -216,7 +219,8 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     // BBA and the two existing intra-tagged rows (we promote AFTER the
     // call too to make sure THIS row goes through the helper as intra).
     tools::ds_auto::auto_wire_ds_update(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         claim_id,
         agent_id,
         0.9,

@@ -2811,13 +2811,12 @@ mod db_tests {
         state
     }
 
-    /// Router exposing the edges write/read routes under test.
-    fn edges_router(state: AppState) -> Router {
-        Router::new()
-            .route("/api/v1/edges", post(create_edge).get(list_edges))
-            .route("/api/v1/edges/:id", axum::routing::patch(patch_edge))
-            .with_state(state)
-    }
+    // The unauthenticated `edges_router` helper that used to sit here is gone.
+    // PR-03 made the `Viewer` unforgeable and inverted the router to an
+    // anonymous allowlist, so every one of these tests now goes through
+    // `edges_router_with_auth`; a router with no `AuthContext` can no longer
+    // reach a route that touches the database. Keeping it would have meant a
+    // test helper that builds a request shape production can never serve.
 
     async fn parse_body(response: axum::response::Response) -> serde_json::Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();

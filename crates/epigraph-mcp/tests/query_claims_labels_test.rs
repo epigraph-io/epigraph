@@ -39,7 +39,8 @@ async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) 
     let server = build_test_server(pool.clone());
 
     let result = query_claims(
-        &server, &viewer,
+        &server,
+        &viewer,
         QueryClaimsParams {
             min_truth: Some(0.0),
             max_truth: Some(1.0),

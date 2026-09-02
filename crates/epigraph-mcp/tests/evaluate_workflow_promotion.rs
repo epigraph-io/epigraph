@@ -107,7 +107,8 @@ async fn promotes_confident_variant_over_weaker_parent(pool: PgPool) {
 
     let json = result_json(
         tools::workflows::evaluate_workflow_promotion(
-            &server, &viewer,
+            &server,
+            &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: variant.to_string(),
                 window: Some(50),
@@ -148,7 +149,8 @@ async fn does_not_promote_small_sample_variant(pool: PgPool) {
 
     let json = result_json(
         tools::workflows::evaluate_workflow_promotion(
-            &server, &viewer,
+            &server,
+            &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: variant.to_string(),
                 window: None,
@@ -172,7 +174,8 @@ async fn lineage_root_has_nothing_to_promote_over(pool: PgPool) {
 
     let json = result_json(
         tools::workflows::evaluate_workflow_promotion(
-            &server, &viewer,
+            &server,
+            &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: root.to_string(),
                 window: None,

@@ -31,7 +31,8 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
     let server = build_test_server(pool.clone());
 
     let result = get_claim(
-        &server, &viewer,
+        &server,
+        &viewer,
         GetClaimParams {
             claim_id: open_id.as_uuid().to_string(),
             frame_id: None,
@@ -59,7 +60,8 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
     let superseded_id = seed_claim(&pool, agent, &["backlog"], false, Some(open_id)).await;
 
     let result = get_claim(
-        &server, &viewer,
+        &server,
+        &viewer,
         GetClaimParams {
             claim_id: superseded_id.as_uuid().to_string(),
             frame_id: None,
@@ -108,7 +110,8 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
     // Owner requester → full content AND the real content_hash.
     let owner_body = parse_claim(
         &get_claim(
-            &server, &viewer,
+            &server,
+            &viewer,
             GetClaimParams {
                 claim_id: claim_id.as_uuid().to_string(),
                 frame_id: None,
@@ -137,7 +140,8 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
     let stranger = Uuid::new_v4();
     let stranger_body = parse_claim(
         &get_claim(
-            &server, &viewer,
+            &server,
+            &viewer,
             GetClaimParams {
                 claim_id: claim_id.as_uuid().to_string(),
                 frame_id: None,

@@ -69,9 +69,10 @@ async fn structure_then_ingest_yields_verbatim_spine(pool: PgPool) {
     // 3) ingest inline; the writer re-verifies the threaded source_text + spans.
     //    ingest_document_inline is fire-and-forget: it spawns the write as a
     //    detached Tokio task and returns {"status":"queued"} immediately.
-    let result = ingest_document_inline(&server, &viewer, IngestDocumentInlineParams { extraction })
-        .await
-        .unwrap();
+    let result =
+        ingest_document_inline(&server, &viewer, IngestDocumentInlineParams { extraction })
+            .await
+            .unwrap();
     let json: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
     assert_eq!(json["status"], "queued");
 

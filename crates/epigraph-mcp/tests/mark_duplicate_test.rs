@@ -14,7 +14,8 @@ async fn mark_duplicate_marks_dup_only(pool: PgPool) {
     let auth = admin_auth();
 
     epigraph_mcp::tools::supersede::mark_duplicate(
-        &server, &viewer,
+        &server,
+        &viewer,
         epigraph_mcp::types::MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),

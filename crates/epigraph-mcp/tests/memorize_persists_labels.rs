@@ -89,7 +89,8 @@ async fn memorize_resubmit_accumulates_labels() {
 
     // First call: tags = ["one"]
     tools::memory::memorize(
-        &server, &viewer,
+        &server,
+        &viewer,
         MemorizeParams {
             content: content.clone(),
             confidence: Some(0.7),
@@ -102,7 +103,8 @@ async fn memorize_resubmit_accumulates_labels() {
 
     // Second call (dedup hit): tags = ["two"]
     tools::memory::memorize(
-        &server, &viewer,
+        &server,
+        &viewer,
         MemorizeParams {
             content: content.clone(),
             confidence: Some(0.7),
@@ -142,7 +144,8 @@ async fn memorize_without_tags_leaves_labels_empty() {
 
     let content = format!("memorize-no-tags test {}", Uuid::new_v4());
     tools::memory::memorize(
-        &server, &viewer,
+        &server,
+        &viewer,
         MemorizeParams {
             content: content.clone(),
             confidence: Some(0.7),

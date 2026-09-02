@@ -65,7 +65,8 @@ async fn wire_supports(
 ) {
     let viewer = fixture::public_viewer(pool).await;
     let result = do_link_epistemic(
-        server, &viewer,
+        server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: s.to_string(),
             target_claim_id: t.to_string(),
@@ -113,7 +114,8 @@ async fn supersede(
     old: Uuid,
 ) -> Result<rmcp::model::CallToolResult, epigraph_mcp::errors::McpError> {
     supersede_claim(
-        server, viewer,
+        server,
+        viewer,
         SupersedeClaimParams {
             claim_id: old.to_string(),
             content: format!("replacement for {old}"),
@@ -371,9 +373,12 @@ async fn cyclic_support_terminates(pool: PgPool) {
             .await
             .expect("read B->A edge id");
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), supersede(&server, &viewer, a))
-        .await
-        .expect("cascade must terminate on a mutually-supporting pair, not loop");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        supersede(&server, &viewer, a),
+    )
+    .await
+    .expect("cascade must terminate on a mutually-supporting pair, not loop");
     result.expect("supersede_claim succeeds on a cyclic fixture");
 
     // One hop forward: B was repaired and its cache is coherent with the C

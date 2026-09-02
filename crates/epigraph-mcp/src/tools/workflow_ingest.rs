@@ -369,9 +369,15 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn ingest_workflow_smoke(pool: sqlx::PgPool) {
         let extraction = minimal_extraction();
-        let result = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &extraction)
-            .await
-            .expect("ingest must succeed");
+        let result = do_ingest_workflow_via_pool(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &extraction,
+        )
+        .await
+        .expect("ingest must succeed");
 
         assert!(
             !result.already_ingested,
@@ -392,14 +398,26 @@ mod tests {
         // Use a unique canonical_name so this test doesn't collide with smoke.
         extraction.source.canonical_name = "test-workflow-idempotent".to_string();
 
-        let r1 = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &extraction)
-            .await
-            .expect("first ingest");
+        let r1 = do_ingest_workflow_via_pool(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &extraction,
+        )
+        .await
+        .expect("first ingest");
         assert!(!r1.already_ingested);
 
-        let r2 = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &extraction)
-            .await
-            .expect("second ingest");
+        let r2 = do_ingest_workflow_via_pool(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &extraction,
+        )
+        .await
+        .expect("second ingest");
         assert!(r2.already_ingested, "second ingest should be a no-op");
 
         // After re-ingest, edge count should be unchanged.
@@ -492,9 +510,15 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let wf_result = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &wf_extraction)
-            .await
-            .unwrap();
+        let wf_result = do_ingest_workflow_via_pool(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &wf_extraction,
+        )
+        .await
+        .unwrap();
 
         // Exactly one row in claims with this id (no duplicate from ingest).
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = $1")
@@ -524,9 +548,15 @@ mod tests {
         let mut extraction = minimal_extraction();
         extraction.source.canonical_name = "test-workflow-executes".to_string();
 
-        let result = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &extraction)
-            .await
-            .expect("ingest must succeed");
+        let result = do_ingest_workflow_via_pool(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &extraction,
+        )
+        .await
+        .expect("ingest must succeed");
 
         // Count executes edges in DB.
         let wf_id = Uuid::parse_str(&result.workflow_id).expect("valid uuid");
@@ -595,9 +625,15 @@ mod tests {
             relationships: vec![],
         };
 
-        do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &extraction)
-            .await
-            .expect("ingest must succeed");
+        do_ingest_workflow_via_pool(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &extraction,
+        )
+        .await
+        .expect("ingest must succeed");
 
         // The two operation atoms under the "Empirical" step carry the
         // normalized canonical tag on their BBA.
@@ -663,9 +699,15 @@ mod tests {
         // 1. Seed the base workflow (generation 0).
         let mut base = minimal_extraction();
         base.source.canonical_name = "weekly-capability-audit".to_string();
-        do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &base)
-            .await
-            .expect("base workflow ingest must succeed");
+        do_ingest_workflow_via_pool(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &base,
+        )
+        .await
+        .expect("base workflow ingest must succeed");
 
         // 2. Build an improved extraction where summary is explicitly empty —
         //    this is the triggering condition from the bug report.
@@ -698,10 +740,16 @@ mod tests {
         };
 
         // 3. Must succeed without a constraint violation.
-        let result =
-            improve_workflow_hierarchy_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), "weekly-capability-audit", improved)
+        let result = improve_workflow_hierarchy_via_pool(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
-                .expect("improve must not violate claims_content_not_empty constraint");
+                .expect("resolve viewer"),
+            "weekly-capability-audit",
+            improved,
+        )
+        .await
+        .expect("improve must not violate claims_content_not_empty constraint");
 
         assert!(!result.already_ingested, "should be a fresh generation");
         assert!(

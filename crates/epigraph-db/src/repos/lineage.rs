@@ -1153,9 +1153,15 @@ mod tests {
             .await
             .unwrap();
 
-        let result = LineageRepository::get_lca(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), child_a, child_b, None)
-            .await
-            .unwrap();
+        let result = LineageRepository::get_lca(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            child_a,
+            child_b,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(result.is_some(), "Expected a common ancestor");
         let lca = result.unwrap();
@@ -1189,9 +1195,15 @@ mod tests {
             .await
             .unwrap();
 
-        let result = LineageRepository::get_lca(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), claim_a, claim_b, None)
-            .await
-            .unwrap();
+        let result = LineageRepository::get_lca(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            claim_a,
+            claim_b,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(
             result.is_none(),
@@ -1237,9 +1249,15 @@ mod tests {
                 .unwrap();
         }
 
-        let result = LineageRepository::get_lca(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), mid_a, mid_b, None)
-            .await
-            .unwrap();
+        let result = LineageRepository::get_lca(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            mid_a,
+            mid_b,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(result.is_some(), "Expected root as LCA in diamond");
         let lca = result.unwrap();
@@ -1280,9 +1298,15 @@ mod tests {
             .await
             .unwrap();
 
-        let result = LineageRepository::get_lca(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), ancestor, descendant, None)
-            .await
-            .unwrap();
+        let result = LineageRepository::get_lca(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            ancestor,
+            descendant,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(result.is_some(), "Expected ancestor as LCA");
         let lca = result.unwrap();

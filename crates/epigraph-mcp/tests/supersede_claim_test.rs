@@ -13,7 +13,8 @@ async fn supersede_claim_marks_old_and_links_new(pool: PgPool) {
     let auth = admin_auth();
 
     let result = epigraph_mcp::tools::supersede::supersede_claim(
-        &server, &viewer,
+        &server,
+        &viewer,
         epigraph_mcp::types::SupersedeClaimParams {
             claim_id: old.to_string(),
             content: "v2".into(),
@@ -101,7 +102,8 @@ async fn supersede_claim_nulls_embedding_on_superseded_claim(pool: PgPool) {
     // embedding before flipping is_current=false this will surface as a
     // chk_deprecated_no_embedding constraint violation, not an assertion error.
     let result = epigraph_mcp::tools::supersede::supersede_claim(
-        &server, &viewer,
+        &server,
+        &viewer,
         epigraph_mcp::types::SupersedeClaimParams {
             claim_id: old_id.to_string(),
             content: "mcp-supersede-embedding-test-v2".into(),

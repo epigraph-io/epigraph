@@ -62,7 +62,8 @@ async fn resolve_backlog_item_refuses_foreign_agent_claim(pool: PgPool) {
     let foreign_claim = seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;
 
     let err = resolve_backlog_item(
-        &server, &viewer,
+        &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "should be rejected".to_string(),
@@ -99,7 +100,8 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
     // Submit a backlog claim THROUGH the server (so its agent_id is the
     // server's own signer). Then retire it: must succeed.
     let result = epigraph_mcp::tools::claims::submit_claim(
-        &server, &viewer,
+        &server,
+        &viewer,
         SubmitClaimParams {
             content: "open backlog item authored by server signer".into(),
             methodology: "deductive_logic".into(),
@@ -122,7 +124,8 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
         .expect("valid UUID");
 
     let result = resolve_backlog_item(
-        &server, &viewer,
+        &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: claim_id.to_string(),
             resolution_content: "retired by own signer".to_string(),
@@ -167,7 +170,8 @@ async fn resolve_backlog_item_admin_scope_overrides_foreign_agent(pool: PgPool) 
     let admin_auth = make_auth(&["claims:admin"], Uuid::new_v4(), None);
 
     let result = resolve_backlog_item(
-        &server, &viewer,
+        &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "retired by admin token".to_string(),
@@ -206,7 +210,8 @@ async fn resolve_backlog_item_matching_principal_passes_without_admin(pool: PgPo
     let auth = make_auth(&["claims:write"], Uuid::new_v4(), Some(agent));
 
     let result = resolve_backlog_item(
-        &server, &viewer,
+        &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: claim.as_uuid().to_string(),
             resolution_content: "retired by owning principal".to_string(),
@@ -245,7 +250,8 @@ async fn resolve_backlog_item_foreign_principal_without_admin_denied(pool: PgPoo
     let auth = make_auth(&["claims:write"], Uuid::new_v4(), Some(Uuid::new_v4()));
 
     let err = resolve_backlog_item(
-        &server, &viewer,
+        &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "should be rejected".to_string(),
@@ -299,7 +305,8 @@ fn parse_json(result: &CallToolResult) -> Value {
 async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &PgPool) -> Uuid {
     let viewer = fixture::public_viewer(pool).await;
     let result = epigraph_mcp::tools::claims::submit_claim(
-        server, &viewer,
+        server,
+        &viewer,
         SubmitClaimParams {
             content: "bootstrap claim for ownership test".into(),
             methodology: "deductive_logic".into(),

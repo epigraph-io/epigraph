@@ -52,7 +52,8 @@ async fn add_evidence(
     note: &str,
 ) {
     update_with_evidence(
-        server, viewer,
+        server,
+        viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,
@@ -133,7 +134,9 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
         persp.push(((*name).to_string(), row.id));
     }
 
-    let frame = ensure_binary_frame(&pool, &viewer).await.expect("binary frame");
+    let frame = ensure_binary_frame(&pool, &viewer)
+        .await
+        .expect("binary frame");
 
     let read = |claim: Uuid| {
         let pool = pool.clone();
@@ -164,14 +167,20 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
     let c_novel = seed_claim(&pool, "treatment-a is efficacious for symptom-6.", 0.5).await;
 
     // ── prior (discovery) evidence, mapped to canonical types ──
-    add_evidence(&server, &viewer, c_eff,
+    add_evidence(
+        &server,
+        &viewer,
+        c_eff,
         "empirical",
         true,
         0.55,
         "source_clinical: modest RCT signal",
     )
     .await; // source_clinical→empirical
-    add_evidence(&server, &viewer, c_saf,
+    add_evidence(
+        &server,
+        &viewer,
+        c_saf,
         "statistical",
         true,
         0.60,
@@ -185,7 +194,10 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
     let before_novel = read(c_novel).await;
 
     // ── the INTERVIEW, ingested via the real path as canonical `testimonial` ──
-    add_evidence(&server, &viewer, c_eff,
+    add_evidence(
+        &server,
+        &viewer,
+        c_eff,
         "testimonial",
         true,
         0.82,
@@ -193,14 +205,20 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
     )
     .await;
     // treatment-d: two-sided {safe 0.20, harmful 0.55} → can only be one-sided refutation
-    add_evidence(&server, &viewer, c_saf,
+    add_evidence(
+        &server,
+        &viewer,
+        c_saf,
         "testimonial",
         false,
         0.55,
         "practitioner: caution in chronic use of the condition cluster",
     )
     .await;
-    add_evidence(&server, &viewer, c_novel,
+    add_evidence(
+        &server,
+        &viewer,
+        c_novel,
         "testimonial",
         true,
         0.80,

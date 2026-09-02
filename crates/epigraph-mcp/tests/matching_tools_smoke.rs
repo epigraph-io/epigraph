@@ -235,7 +235,8 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
     let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
 
     tools::matching::decide_match_candidate(
-        &server, &viewer,
+        &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -266,7 +267,8 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
 
     // Second decide is idempotent at the edge layer.
     tools::matching::decide_match_candidate(
-        &server, &viewer,
+        &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -301,7 +303,8 @@ async fn decide_match_candidate_reject_marks_status_and_skips_edge(pool: PgPool)
     let cand = insert_candidate(&pool, a, b, 0.6, "pending").await;
 
     tools::matching::decide_match_candidate(
-        &server, &viewer,
+        &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "reject".into(),
@@ -338,7 +341,8 @@ async fn decide_match_candidate_rejected_in_read_only_mode(pool: PgPool) {
     let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
 
     let err = tools::matching::decide_match_candidate(
-        &server, &viewer,
+        &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -368,7 +372,8 @@ async fn decide_match_candidate_promote_blocked_when_endpoint_not_current(pool: 
     let cand = insert_candidate(&pool, live, retired, 0.97, "pending").await;
 
     let err = tools::matching::decide_match_candidate(
-        &server, &viewer,
+        &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -421,7 +426,8 @@ async fn decide_match_candidate_promote_contradicts_writes_contradicts_edge(pool
     let cand = insert_candidate_with_verdict(&pool, a, b, 0.88, "pending", "contradicts").await;
 
     tools::matching::decide_match_candidate(
-        &server, &viewer,
+        &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -463,7 +469,8 @@ async fn decide_match_candidate_promote_distinct_is_refused_and_writes_no_edge(p
     let cand = insert_candidate_with_verdict(&pool, a, b, 0.31, "pending", "distinct").await;
 
     let err = tools::matching::decide_match_candidate(
-        &server, &viewer,
+        &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -504,7 +511,8 @@ async fn decide_match_candidate_promote_paraphrase_still_writes_corroborates(poo
     let cand = insert_candidate_with_verdict(&pool, a, b, 0.91, "pending", "paraphrase").await;
 
     tools::matching::decide_match_candidate(
-        &server, &viewer,
+        &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),

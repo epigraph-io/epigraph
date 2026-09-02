@@ -87,10 +87,13 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
         &format!("ds-recompute-match-{}", Uuid::new_v4()),
     )
     .await;
-    let frame_id = ensure_binary_frame(&pool, &viewer).await.expect("binary frame");
+    let frame_id = ensure_binary_frame(&pool, &viewer)
+        .await
+        .expect("binary frame");
 
     let submit_out = tools::ds::submit_ds_evidence(
-        &server, &viewer,
+        &server,
+        &viewer,
         SubmitDsEvidenceParams {
             claim_id: claim.to_string(),
             frame_id: frame_id.to_string(),
@@ -122,7 +125,8 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
     // No new evidence submitted — recompute_beliefs must reproduce the exact
     // same number from the exact same stored BBA rows.
     let recompute_out = tools::cdst_maintenance::recompute_beliefs(
-        &server, &viewer,
+        &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
@@ -174,7 +178,9 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
         &format!("ds-recompute-match-2-{}", Uuid::new_v4()),
     )
     .await;
-    let frame_id = ensure_binary_frame(&pool, &viewer).await.expect("binary frame");
+    let frame_id = ensure_binary_frame(&pool, &viewer)
+        .await
+        .expect("binary frame");
 
     let perspective = PerspectiveRepository::create(
         &pool,
@@ -203,7 +209,8 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
     let mut last_bba_count = 0i64;
     for (masses, perspective_id) in submissions {
         let out = tools::ds::submit_ds_evidence(
-            &server, &viewer,
+            &server,
+            &viewer,
             SubmitDsEvidenceParams {
                 claim_id: claim.to_string(),
                 frame_id: frame_id.to_string(),
@@ -231,7 +238,8 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
     let submit_pignistic = cached_pignistic(&pool, claim).await;
 
     let recompute_out = tools::cdst_maintenance::recompute_beliefs(
-        &server, &viewer,
+        &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,

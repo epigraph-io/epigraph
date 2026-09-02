@@ -1056,16 +1056,24 @@ mod tests {
 
         // The variant's one-hop parent is the variant_of target.
         assert_eq!(
-            WorkflowRepository::immediate_variant_parent(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), variant)
-                .await
-                .unwrap(),
+            WorkflowRepository::immediate_variant_parent(
+                &pool,
+                &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+                variant
+            )
+            .await
+            .unwrap(),
             Some(parent)
         );
         // A lineage root has no outgoing variant_of/supersedes edge → None.
         assert_eq!(
-            WorkflowRepository::immediate_variant_parent(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), parent)
-                .await
-                .unwrap(),
+            WorkflowRepository::immediate_variant_parent(
+                &pool,
+                &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+                parent
+            )
+            .await
+            .unwrap(),
             None
         );
     }

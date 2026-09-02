@@ -28,6 +28,45 @@ pub struct ClaimBeliefColumns {
     pub pignistic_prob: Option<f64>,
 }
 
+/// Filter arguments for [`ClaimRepository::list_by_labels`].
+///
+/// These six travelled as positional parameters until the tenancy work added a
+/// `viewer` argument. Grouping them is not only about the argument count: the
+/// tail was `(.., current_only, min_truth, limit, offset)`, four unnamed
+/// literals whose types (`bool`, `f64`, `i64`, `i64`) let `limit` and `offset`
+/// swap silently. As named fields that becomes a compile error.
+///
+/// [`Default`] gives the common "no exclusions, everything, first page" shape,
+/// so a caller states only what it actually constrains.
+#[derive(Debug, Clone, Copy)]
+pub struct LabelQuery<'a> {
+    /// Claims must contain ALL of these (PostgreSQL `@>` containment).
+    pub labels: &'a [String],
+    /// Drop any claim whose labels intersect these (`&&` overlap). Empty = no exclusion.
+    pub exclude_labels: &'a [String],
+    /// Restrict to `is_current = true`, dropping superseded rows.
+    pub current_only: bool,
+    /// Minimum `truth_value`.
+    pub min_truth: f64,
+    /// Max rows returned.
+    pub limit: i64,
+    /// Rows to skip, for paging `created_at DESC`.
+    pub offset: i64,
+}
+
+impl Default for LabelQuery<'_> {
+    fn default() -> Self {
+        Self {
+            labels: &[],
+            exclude_labels: &[],
+            current_only: false,
+            min_truth: 0.0,
+            limit: 100,
+            offset: 0,
+        }
+    }
+}
+
 /// Result row for [`ClaimRepository::search_by_embedding`].
 ///
 /// `similarity` is `1 - cosine_distance`, in `[0, 1]` for non-degenerate
@@ -1803,13 +1842,16 @@ impl ClaimRepository {
     pub async fn list_by_labels(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,
-        labels: &[String],
-        exclude_labels: &[String],
-        current_only: bool,
-        min_truth: f64,
-        limit: i64,
-        offset: i64,
+        query: LabelQuery<'_>,
     ) -> Result<Vec<(Claim, Vec<String>)>, DbError> {
+        let LabelQuery {
+            labels,
+            exclude_labels,
+            current_only,
+            min_truth,
+            limit,
+            offset,
+        } = query;
         #[derive(sqlx::FromRow)]
         struct Row {
             id: Uuid,
@@ -4104,9 +4146,15 @@ mod tests {
         .await
         .unwrap();
 
-        let missing = ClaimRepository::find_claims_needing_embeddings(&pool, &crate::visibility::Viewer::test_bypass(crate::visibility::SystemReason::EmbeddingBackfill), 1000)
-            .await
-            .unwrap();
+        let missing = ClaimRepository::find_claims_needing_embeddings(
+            &pool,
+            &crate::visibility::Viewer::test_bypass(
+                crate::visibility::SystemReason::EmbeddingBackfill,
+            ),
+            1000,
+        )
+        .await
+        .unwrap();
         assert!(
             missing.iter().any(|(id, _)| *id == claim_id),
             "substantive claim must be returned"
@@ -4159,9 +4207,13 @@ mod tests {
         .unwrap();
 
         let absent_id = Uuid::new_v4();
-        let map = ClaimRepository::contents_by_ids(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), &[current_id, stale_id, absent_id])
-            .await
-            .unwrap();
+        let map = ClaimRepository::contents_by_ids(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            &[current_id, stale_id, absent_id],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             map.get(&current_id).map(String::as_str),
@@ -4183,7 +4235,13 @@ mod tests {
         );
 
         // Empty input short-circuits to an empty map without touching the DB.
-        let empty = ClaimRepository::contents_by_ids(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), &[]).await.unwrap();
+        let empty = ClaimRepository::contents_by_ids(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(empty.is_empty());
     }
 
@@ -4315,9 +4373,14 @@ mod tests {
         }
 
         let (id1, id2, expected_distance) = &pairs[0];
-        let results = ClaimRepository::pairwise_cosine_distance(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), &[*id1, *id2], 1.0)
-            .await
-            .unwrap();
+        let results = ClaimRepository::pairwise_cosine_distance(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            &[*id1, *id2],
+            1.0,
+        )
+        .await
+        .unwrap();
 
         assert!(!results.is_empty());
         let first = &results[0];
@@ -4621,23 +4684,28 @@ mod label_tests {
             .await
             .unwrap();
 
-        let results =
-            ClaimRepository::list_by_labels(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), &["backlog".into()], &[], false, 0.0, 100, 0)
-                .await
-                .unwrap();
+        let results = ClaimRepository::list_by_labels(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["backlog".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(
             results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "should find claim by single label"
         );
 
         let results = ClaimRepository::list_by_labels(
-            &pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
-            &["backlog".into(), "pending".into()],
-            &[],
-            false,
-            0.0,
-            100,
-            0,
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["backlog".into(), "pending".into()],
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -4658,13 +4726,12 @@ mod label_tests {
             .unwrap();
 
         let results = ClaimRepository::list_by_labels(
-            &pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
-            &["nonexistent-label".into()],
-            &[],
-            false,
-            0.0,
-            100,
-            0,
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["nonexistent-label".into()],
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -4685,19 +4752,33 @@ mod label_tests {
             .await
             .unwrap();
 
-        let results =
-            ClaimRepository::list_by_labels(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), &["truth-test".into()], &[], false, 0.4, 100, 0)
-                .await
-                .unwrap();
+        let results = ClaimRepository::list_by_labels(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["truth-test".into()],
+                min_truth: 0.4,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(
             results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "0.5 >= 0.4 should match"
         );
 
-        let results =
-            ClaimRepository::list_by_labels(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), &["truth-test".into()], &[], false, 0.9, 100, 0)
-                .await
-                .unwrap();
+        let results = ClaimRepository::list_by_labels(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["truth-test".into()],
+                min_truth: 0.9,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(
             !results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "0.5 < 0.9 should not match"
@@ -4731,10 +4812,17 @@ mod label_tests {
         .await
         .unwrap();
 
-        let results =
-            ClaimRepository::list_by_labels(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), &["limit-test".into()], &[], false, 0.0, 1, 0)
-                .await
-                .unwrap();
+        let results = ClaimRepository::list_by_labels(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["limit-test".into()],
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(results.len(), 1, "limit=1 should return exactly 1 result");
 
         // cleanup
@@ -4778,7 +4866,13 @@ mod label_tests {
         let too_many: Vec<Uuid> = (0..=ClaimRepository::MAX_PAIRWISE_IDS)
             .map(|_| Uuid::new_v4())
             .collect();
-        let result = ClaimRepository::pairwise_cosine_distance(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), &too_many, 0.5).await;
+        let result = ClaimRepository::pairwise_cosine_distance(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            &too_many,
+            0.5,
+        )
+        .await;
         assert!(
             result.is_err(),
             "should return Err when claim_ids exceeds MAX_PAIRWISE_IDS"

@@ -324,7 +324,11 @@ async fn next_offset_advances_for_resumable_paging(pool: PgPool) {
     let server = build_server(pool.clone());
     let mut p = params(true);
     p.limit = Some(2);
-    let j = json_of(sweep_semantic_duplicates(&server, &viewer, p).await.expect("sweep"));
+    let j = json_of(
+        sweep_semantic_duplicates(&server, &viewer, p)
+            .await
+            .expect("sweep"),
+    );
 
     assert_eq!(j["scanned"], serde_json::json!(2));
     assert_eq!(
@@ -371,7 +375,8 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
 
     let server = build_server(pool.clone());
     let link = epigraph_mcp::tools::link_epistemic::do_link_epistemic(
-        &server, &viewer,
+        &server,
+        &viewer,
         epigraph_mcp::types::LinkEpistemicParams {
             source_claim_id: supporter.to_string(),
             target_claim_id: weak.to_string(),
@@ -434,11 +439,12 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
     let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(&pool, &viewer)
         .await
         .expect("binary frame");
-    let coherent =
-        epigraph_engine::edge_factor::preview_claim_belief_on_frame(&pool, &viewer, strong, frame_id)
-            .await
-            .expect("preview")
-            .expect("the survivor inherited the duplicate's supporter");
+    let coherent = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+        &pool, &viewer, strong, frame_id,
+    )
+    .await
+    .expect("preview")
+    .expect("the survivor inherited the duplicate's supporter");
     let cached: Option<f64> = sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
         .bind(strong)
         .fetch_one(&pool)

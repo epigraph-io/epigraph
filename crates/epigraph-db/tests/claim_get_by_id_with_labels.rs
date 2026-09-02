@@ -66,9 +66,10 @@ async fn get_by_id_with_labels_returns_none_when_no_row() {
     let pool = test_pool_or_skip!();
     let viewer = fixture::public_viewer(&pool).await;
 
-    let found = ClaimRepository::get_by_id_with_labels(&pool, &viewer, epigraph_core::ClaimId::new())
-        .await
-        .expect("query call");
+    let found =
+        ClaimRepository::get_by_id_with_labels(&pool, &viewer, epigraph_core::ClaimId::new())
+            .await
+            .expect("query call");
 
     assert!(found.is_none(), "expected None, got {:?}", found.is_some());
 }
@@ -94,10 +95,11 @@ async fn get_by_id_with_labels_matches_separate_calls() {
     .await
     .expect("seed labels");
 
-    let (via_new, labels_via_new) = ClaimRepository::get_by_id_with_labels(&pool, &viewer, created.id)
-        .await
-        .expect("get_by_id_with_labels")
-        .expect("claim exists");
+    let (via_new, labels_via_new) =
+        ClaimRepository::get_by_id_with_labels(&pool, &viewer, created.id)
+            .await
+            .expect("get_by_id_with_labels")
+            .expect("claim exists");
 
     let via_old = ClaimRepository::get_by_id(&pool, &viewer, created.id)
         .await

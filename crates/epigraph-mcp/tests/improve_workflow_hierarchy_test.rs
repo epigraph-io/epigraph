@@ -84,7 +84,8 @@ async fn improve_workflow_hierarchy_increments_generation(pool: sqlx::PgPool) {
 
     // Ingest parent at generation 1.
     epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &parent_extraction(canonical),
     )
     .await
@@ -92,7 +93,8 @@ async fn improve_workflow_hierarchy_increments_generation(pool: sqlx::PgPool) {
 
     // First improve: parent_max=1, new_generation=2.
     let new_gen = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         canonical,
         improved_extraction(),
     )
@@ -121,7 +123,8 @@ async fn improve_workflow_hierarchy_increments_generation(pool: sqlx::PgPool) {
     // produces a fresh variant; idempotency is on (canonical_name, generation),
     // not on the tool entrypoint.
     let new_gen2 = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         canonical,
         improved_extraction(),
     )
@@ -136,7 +139,8 @@ async fn improve_workflow_hierarchy_increments_generation(pool: sqlx::PgPool) {
 async fn improve_workflow_hierarchy_errors_when_parent_missing(pool: sqlx::PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let result = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         "nonexistent-canonical-name-xyzzy",
         improved_extraction(),
     )
@@ -163,7 +167,8 @@ async fn improve_workflow_hierarchy_empty_phase_summary_uses_title(pool: sqlx::P
     let canonical = "test-improve-hier-empty-summary";
 
     epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &parent_extraction(canonical),
     )
     .await
@@ -233,7 +238,8 @@ async fn improve_workflow_hierarchy_rejects_empty_thesis(pool: sqlx::PgPool) {
     let canonical = "test-improve-hier-empty-thesis";
 
     epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &parent_extraction(canonical),
     )
     .await
@@ -261,7 +267,8 @@ async fn improve_workflow_hierarchy_rejects_empty_thesis(pool: sqlx::PgPool) {
     };
 
     let result = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         canonical,
         bad_extraction,
     )

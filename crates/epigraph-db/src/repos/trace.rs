@@ -522,10 +522,14 @@ mod tests {
         );
 
         // Now fetch the trace by ID and verify agent_id is correct
-        let fetched_trace = ReasoningTraceRepository::get_by_id(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), created_trace.id)
-            .await
-            .expect("Failed to fetch trace")
-            .expect("Trace should exist");
+        let fetched_trace = ReasoningTraceRepository::get_by_id(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            created_trace.id,
+        )
+        .await
+        .expect("Failed to fetch trace")
+        .expect("Trace should exist");
 
         let fetched_agent_uuid: Uuid = fetched_trace.agent_id.into();
         assert_eq!(
@@ -534,10 +538,13 @@ mod tests {
         );
 
         // Verify by fetching via get_by_claim
-        let traces_for_claim =
-            ReasoningTraceRepository::get_by_claim(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), ClaimId::from_uuid(claim_id))
-                .await
-                .expect("Failed to fetch traces by claim");
+        let traces_for_claim = ReasoningTraceRepository::get_by_claim(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            ClaimId::from_uuid(claim_id),
+        )
+        .await
+        .expect("Failed to fetch traces by claim");
 
         assert_eq!(traces_for_claim.len(), 1);
         let trace_from_claim: Uuid = traces_for_claim[0].agent_id.into();
@@ -637,9 +644,13 @@ mod tests {
             .expect("Failed to add parent");
 
         // Verify get_parents returns correct agent_id for parent
-        let parents = ReasoningTraceRepository::get_parents(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), child.id)
-            .await
-            .expect("Failed to get parents");
+        let parents = ReasoningTraceRepository::get_parents(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            child.id,
+        )
+        .await
+        .expect("Failed to get parents");
         assert_eq!(parents.len(), 1);
         let parent_agent: Uuid = parents[0].agent_id.into();
         assert_eq!(
@@ -648,9 +659,13 @@ mod tests {
         );
 
         // Verify get_children returns correct agent_id for child
-        let children = ReasoningTraceRepository::get_children(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), parent.id)
-            .await
-            .expect("Failed to get children");
+        let children = ReasoningTraceRepository::get_children(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            parent.id,
+        )
+        .await
+        .expect("Failed to get children");
         assert_eq!(children.len(), 1);
         let child_agent: Uuid = children[0].agent_id.into();
         assert_eq!(

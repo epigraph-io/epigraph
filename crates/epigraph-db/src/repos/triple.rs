@@ -528,9 +528,13 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn claim_has_triples_returns_false_when_empty(pool: sqlx::PgPool) {
         let (_agent_id, claim_id) = insert_agent_and_claim(&pool).await;
-        let result = TripleRepository::claim_has_triples(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), claim_id)
-            .await
-            .unwrap();
+        let result = TripleRepository::claim_has_triples(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            claim_id,
+        )
+        .await
+        .unwrap();
         assert!(!result, "new claim should have no triples");
     }
 
@@ -555,9 +559,13 @@ mod tests {
         .await
         .unwrap();
 
-        let result = TripleRepository::claim_has_triples(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]), claim_id)
-            .await
-            .unwrap();
+        let result = TripleRepository::claim_has_triples(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            claim_id,
+        )
+        .await
+        .unwrap();
         assert!(
             result,
             "claim should have triples after batch_create_triples"
@@ -570,9 +578,12 @@ mod tests {
     /// signal stays observable and a future populate-path regression is caught.
     #[sqlx::test(migrations = "../../migrations")]
     async fn index_counts_empty_db_is_all_zero(pool: sqlx::PgPool) {
-        let counts = TripleRepository::index_counts(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]))
-            .await
-            .expect("index_counts query should succeed on an empty DB");
+        let counts = TripleRepository::index_counts(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+        )
+        .await
+        .expect("index_counts query should succeed on an empty DB");
         assert_eq!(counts.triples, 0);
         assert_eq!(counts.entities, 0);
         assert_eq!(counts.entity_mentions, 0);
@@ -604,9 +615,12 @@ mod tests {
         .await
         .expect("upsert DNA origami");
 
-        let counts = TripleRepository::index_counts(&pool, &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]))
-            .await
-            .expect("index_counts should succeed");
+        let counts = TripleRepository::index_counts(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+        )
+        .await
+        .expect("index_counts should succeed");
         assert_eq!(counts.entities, 2, "two canonical entities inserted");
         assert_eq!(counts.triples, 0, "no triples inserted");
         assert_eq!(counts.entity_mentions, 0, "no mentions inserted");

@@ -268,12 +268,14 @@ pub async fn query_claims_by_label(
     let rows = ClaimRepository::list_by_labels(
         &server.pool,
         viewer,
-        &params.labels,
-        &params.exclude_labels,
-        params.current_only,
-        min_truth,
-        limit,
-        offset,
+        epigraph_db::LabelQuery {
+            labels: &params.labels,
+            exclude_labels: &params.exclude_labels,
+            current_only: params.current_only,
+            min_truth,
+            limit,
+            offset,
+        },
     )
     .await
     .map_err(internal_error)?;

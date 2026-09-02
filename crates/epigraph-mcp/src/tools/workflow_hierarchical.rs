@@ -362,7 +362,15 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_outcome_updates_counters_and_writes_step_rows(pool: sqlx::PgPool) {
         let ext = extraction("test-outcome-counters");
-        let ingest = do_ingest_workflow_via_pool(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &ext).await.unwrap();
+        let ingest = do_ingest_workflow_via_pool(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &ext,
+        )
+        .await
+        .unwrap();
         let workflow_id = Uuid::parse_str(&ingest.workflow_id).unwrap();
 
         let steps = vec![

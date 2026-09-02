@@ -460,7 +460,8 @@ async fn since_excludes_older_claims_and_reports_created_at(pool: PgPool) {
 
     let server = build_test_server(pool);
     let out = recall_with_pgvec(
-        &server, &viewer,
+        &server,
+        &viewer,
         recall_params(json!({ "since": epoch_cut().to_rfc3339() })),
         Some(cluster_pgvec(0)),
     )
@@ -536,9 +537,14 @@ async fn since_absent_is_baseline_behaviour(pool: PgPool) {
     .await;
 
     let server = build_test_server(pool);
-    let out = recall_with_pgvec(&server, &viewer, recall_params(json!({})), Some(cluster_pgvec(0)))
-        .await
-        .expect("recall ok");
+    let out = recall_with_pgvec(
+        &server,
+        &viewer,
+        recall_params(json!({})),
+        Some(cluster_pgvec(0)),
+    )
+    .await
+    .expect("recall ok");
     let hits = results_of(&out);
     let ids: Vec<String> = hits
         .iter()
@@ -614,9 +620,14 @@ async fn created_at_is_creation_not_update(pool: PgPool) {
     let server = build_test_server(pool);
 
     // (a) The reported timestamp is still the creation instant.
-    let out = recall_with_pgvec(&server, &viewer, recall_params(json!({})), Some(cluster_pgvec(0)))
-        .await
-        .expect("recall ok");
+    let out = recall_with_pgvec(
+        &server,
+        &viewer,
+        recall_params(json!({})),
+        Some(cluster_pgvec(0)),
+    )
+    .await
+    .expect("recall ok");
     let hits = results_of(&out);
     let hit = hits
         .iter()
@@ -644,7 +655,8 @@ async fn created_at_is_creation_not_update(pool: PgPool) {
          discriminate the two columns"
     );
     let out = recall_with_pgvec(
-        &server, &viewer,
+        &server,
+        &viewer,
         recall_params(json!({ "since": cut.to_rfc3339() })),
         Some(cluster_pgvec(0)),
     )
@@ -707,7 +719,8 @@ async fn since_survives_candidate_pool_saturation(pool: PgPool) {
 
     let server = build_test_server(pool);
     let out = recall_with_pgvec(
-        &server, &viewer,
+        &server,
+        &viewer,
         recall_params(json!({ "since": epoch_cut().to_rfc3339(), "limit": 10 })),
         Some(cluster_pgvec(0)),
     )
@@ -772,7 +785,8 @@ async fn no_leak_s1_s2_hybrid_dense_and_lexical(pool: PgPool) {
     let server = build_test_server(pool);
     let o = outcome(
         recall_with_pgvec(
-            &server, &viewer,
+            &server,
+            &viewer,
             recall_params(json!({ "since": epoch_cut().to_rfc3339() })),
             Some(cluster_pgvec(0)),
         )
@@ -814,7 +828,8 @@ async fn no_leak_s3_lexical_when_embedder_down(pool: PgPool) {
     let server = build_test_server(pool);
     let o = outcome(
         recall_with_pgvec(
-            &server, &viewer,
+            &server,
+            &viewer,
             recall_params(json!({ "since": epoch_cut().to_rfc3339() })),
             None, // embedder down ⇒ lexical-only
         )
@@ -851,7 +866,8 @@ async fn no_leak_s4_workflows(pool: PgPool) {
     let server = build_test_server(pool);
     let o = outcome(
         recall_with_pgvec(
-            &server, &viewer,
+            &server,
+            &viewer,
             recall_params(json!({
                 "since": epoch_cut().to_rfc3339(),
                 "include_workflows": true,
@@ -917,7 +933,8 @@ async fn no_leak_s5_context_flat_ann(pool: PgPool) {
     let server = build_test_server(pool);
     let o = outcome(
         recall_with_context_with_pgvec(
-            &server, &viewer,
+            &server,
+            &viewer,
             context_params(json!({ "since": epoch_cut().to_rfc3339() })),
             1536,
             &cluster_pgvec(0),
@@ -966,7 +983,8 @@ async fn no_leak_s6_diverse_themes(pool: PgPool) {
     let server = build_test_server(pool);
     let o = outcome(
         recall_with_context_with_pgvec(
-            &server, &viewer,
+            &server,
+            &viewer,
             context_params(json!({
                 "since": epoch_cut().to_rfc3339(),
                 "diverse": true,
@@ -1026,7 +1044,8 @@ async fn no_leak_s7_graph_expansion(pool: PgPool) {
     // otherwise the assertion below would pass for the wrong reason.
     let baseline = outcome(
         recall_with_context_with_pgvec(
-            &server, &viewer,
+            &server,
+            &viewer,
             context_params(json!({ "graph_expansion_depth": 2, "limit": 10 })),
             1536,
             &cluster_pgvec(0),
@@ -1063,7 +1082,8 @@ async fn no_leak_s7_graph_expansion(pool: PgPool) {
 
     let o = outcome(
         recall_with_context_with_pgvec(
-            &server, &viewer,
+            &server,
+            &viewer,
             context_params(json!({
                 "since": epoch_cut().to_rfc3339(),
                 "graph_expansion_depth": 2,
@@ -1139,7 +1159,8 @@ async fn context_is_exempt_from_since(pool: PgPool) {
 
     let server = build_test_server(pool);
     let out = recall_with_context_with_pgvec(
-        &server, &viewer,
+        &server,
+        &viewer,
         context_params(json!({ "since": epoch_cut().to_rfc3339() })),
         1536,
         &cluster_pgvec(0),

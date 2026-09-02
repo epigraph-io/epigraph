@@ -45,7 +45,8 @@ async fn add_evidence(
 ) -> f64 {
     let viewer = fixture::public_viewer(pool).await;
     let res = epigraph_mcp::tools::claims::update_with_evidence(
-        server, &viewer,
+        server,
+        &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,
@@ -194,7 +195,8 @@ async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) 
     .await;
 
     let (_frame_id, wired) = auto_wire_ds_batch(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &[
             BatchDsEntry {
                 claim_id,
@@ -266,7 +268,8 @@ async fn supporting_evidence_never_lowers_betp_two_opposing(pool: PgPool) {
     let claim_id = seed_claim(&pool, "1c1360bb variant-2opp regression claim", 0.5).await;
 
     let (_frame_id, _wired) = auto_wire_ds_batch(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &[
             BatchDsEntry {
                 claim_id,

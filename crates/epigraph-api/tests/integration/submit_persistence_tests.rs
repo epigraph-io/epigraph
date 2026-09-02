@@ -389,9 +389,10 @@ async fn test_submit_creates_evidence_records(pool: PgPool) {
 
     // Verify evidence exists in database
     for evidence_id in &response.evidence_ids {
-        let evidence = EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(*evidence_id))
-            .await
-            .expect("Evidence query should succeed");
+        let evidence =
+            EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(*evidence_id))
+                .await
+                .expect("Evidence query should succeed");
 
         assert!(
             evidence.is_some(),
@@ -470,9 +471,10 @@ async fn test_submit_creates_reasoning_trace_with_parent_links(pool: PgPool) {
         serde_json::from_str(&body).expect("Failed to parse response");
 
     // Verify trace exists in database
-    let trace = ReasoningTraceRepository::get_by_id(&pool, &viewer, TraceId::from_uuid(response.trace_id))
-        .await
-        .expect("Trace query should succeed");
+    let trace =
+        ReasoningTraceRepository::get_by_id(&pool, &viewer, TraceId::from_uuid(response.trace_id))
+            .await
+            .expect("Trace query should succeed");
 
     assert!(trace.is_some(), "Trace should exist in database");
     let trace = trace.unwrap();
@@ -485,10 +487,13 @@ async fn test_submit_creates_reasoning_trace_with_parent_links(pool: PgPool) {
     );
 
     // Verify trace is linked to claim
-    let claim_traces =
-        ReasoningTraceRepository::get_by_claim(&pool, &viewer, ClaimId::from_uuid(response.claim_id))
-            .await
-            .expect("Trace query should succeed");
+    let claim_traces = ReasoningTraceRepository::get_by_claim(
+        &pool,
+        &viewer,
+        ClaimId::from_uuid(response.claim_id),
+    )
+    .await
+    .expect("Trace query should succeed");
 
     assert!(
         !claim_traces.is_empty(),
@@ -737,9 +742,10 @@ async fn test_returned_ids_match_database_records(pool: PgPool) {
     );
 
     // Assert: Verify trace_id exists
-    let trace = ReasoningTraceRepository::get_by_id(&pool, &viewer, TraceId::from_uuid(response.trace_id))
-        .await
-        .expect("Trace query should succeed");
+    let trace =
+        ReasoningTraceRepository::get_by_id(&pool, &viewer, TraceId::from_uuid(response.trace_id))
+            .await
+            .expect("Trace query should succeed");
     assert!(
         trace.is_some(),
         "Returned trace_id {} must exist in database",
@@ -750,9 +756,10 @@ async fn test_returned_ids_match_database_records(pool: PgPool) {
     assert_eq!(response.evidence_ids.len(), 3, "Should have 3 evidence IDs");
 
     for (i, evidence_id) in response.evidence_ids.iter().enumerate() {
-        let evidence = EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(*evidence_id))
-            .await
-            .expect("Evidence query should succeed");
+        let evidence =
+            EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(*evidence_id))
+                .await
+                .expect("Evidence query should succeed");
         assert!(
             evidence.is_some(),
             "Returned evidence_id[{}] {} must exist in database",
@@ -813,10 +820,11 @@ async fn test_evidence_content_hash_matches_raw_content(pool: PgPool) {
         .evidence_ids
         .first()
         .expect("Should have evidence ID");
-    let evidence = EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(*evidence_id))
-        .await
-        .expect("Evidence query should succeed")
-        .expect("Evidence should exist");
+    let evidence =
+        EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(*evidence_id))
+            .await
+            .expect("Evidence query should succeed")
+            .expect("Evidence should exist");
 
     // Verify stored hash matches expected
     assert_eq!(
@@ -1214,10 +1222,11 @@ async fn test_truth_value_calculated_by_bayesian_not_request(pool: PgPool) {
         );
 
         // Verify database matches
-        let claim = ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(response1.claim_id))
-            .await
-            .expect("Query should succeed")
-            .expect("Claim should exist");
+        let claim =
+            ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(response1.claim_id))
+                .await
+                .expect("Query should succeed")
+                .expect("Claim should exist");
 
         assert!(
             claim.truth_value.value() < 0.3,
@@ -1470,17 +1479,25 @@ async fn test_evidence_type_variants_stored_correctly(pool: PgPool) {
         serde_json::from_str(&body).expect("Failed to parse response");
 
     // Assert: Verify evidence types
-    let ev1 = EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(response.evidence_ids[0]))
-        .await
-        .expect("Query should succeed")
-        .expect("Evidence should exist");
+    let ev1 = EvidenceRepository::get_by_id(
+        &pool,
+        &viewer,
+        EvidenceId::from_uuid(response.evidence_ids[0]),
+    )
+    .await
+    .expect("Query should succeed")
+    .expect("Evidence should exist");
 
     assert_eq!(ev1.type_description(), "Observation");
 
-    let ev2 = EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(response.evidence_ids[1]))
-        .await
-        .expect("Query should succeed")
-        .expect("Evidence should exist");
+    let ev2 = EvidenceRepository::get_by_id(
+        &pool,
+        &viewer,
+        EvidenceId::from_uuid(response.evidence_ids[1]),
+    )
+    .await
+    .expect("Query should succeed")
+    .expect("Evidence should exist");
 
     assert_eq!(ev2.type_description(), "Testimony");
 }
@@ -1534,10 +1551,11 @@ async fn test_bad_actor_db_level_enforcement(pool: PgPool) {
         );
 
         // Verify database consistency
-        let claim = ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(response.claim_id))
-            .await
-            .expect("Query should succeed")
-            .expect("Claim should exist");
+        let claim =
+            ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(response.claim_id))
+                .await
+                .expect("Query should succeed")
+                .expect("Claim should exist");
 
         assert!(
             claim.truth_value.value() < 0.3,

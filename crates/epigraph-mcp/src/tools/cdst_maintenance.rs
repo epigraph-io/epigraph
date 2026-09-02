@@ -91,12 +91,13 @@ pub async fn recompute_beliefs(
             let mut rows = ClaimRepository::list_by_labels(
                 pool,
                 viewer,
-                &labels_param,
-                &[],
-                true,
-                0.0,
-                limit + 1,
-                offset,
+                epigraph_db::LabelQuery {
+                    labels: &labels_param,
+                    current_only: true,
+                    limit: limit + 1,
+                    offset,
+                    ..Default::default()
+                },
             )
             .await
             .map_err(internal_error)?;

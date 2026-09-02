@@ -269,9 +269,17 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &embedder, text, DEFAULT_NOVELTY_THRESHOLD)
-            .await
-            .expect("decide must succeed with a working mock embedder");
+        let (decision, _pgvec) = decide(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &embedder,
+            text,
+            DEFAULT_NOVELTY_THRESHOLD,
+        )
+        .await
+        .expect("decide must succeed with a working mock embedder");
 
         assert_eq!(
             decision,
@@ -311,9 +319,17 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(&pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"), &embedder, text, 0.0)
-            .await
-            .expect("decide must succeed with a working mock embedder");
+        let (decision, _pgvec) = decide(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &embedder,
+            text,
+            0.0,
+        )
+        .await
+        .expect("decide must succeed with a working mock embedder");
 
         assert_eq!(
             decision,
@@ -331,7 +347,10 @@ mod tests {
         let embedder = MockProvider::new(EmbeddingConfig::openai(1536));
 
         let (decision, _pgvec) = decide(
-            &pool, &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil()).await.expect("resolve viewer"),
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
             &embedder,
             "an utterly unrelated claim with no corpus neighbors",
             DEFAULT_NOVELTY_THRESHOLD,

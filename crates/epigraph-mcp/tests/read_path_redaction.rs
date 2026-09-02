@@ -180,7 +180,8 @@ async fn query_claims_redacts_only_unauthorized_rows(pool: PgPool) {
     // one is redacted.
     let stranger = Uuid::new_v4();
     let result = query_claims(
-        &server, &viewer,
+        &server,
+        &viewer,
         QueryClaimsParams {
             min_truth: Some(0.0),
             max_truth: Some(1.0),
@@ -240,7 +241,8 @@ async fn get_claim_as(
     requester: Option<Uuid>,
 ) -> Value {
     let result = get_claim(
-        server, viewer,
+        server,
+        viewer,
         GetClaimParams {
             claim_id: claim_id.as_uuid().to_string(),
             frame_id: None,

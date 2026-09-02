@@ -176,7 +176,8 @@ async fn batch_equals_per_hit(pool: PgPool) {
     let (frame_id, perspective_id, claim_ids) = seed_page(&pool, 5).await;
 
     let batch = epigraph_engine::belief_query::get_perspective_belief_batch(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &claim_ids,
         frame_id,
         perspective_id,
@@ -195,7 +196,8 @@ async fn batch_equals_per_hit(pool: PgPool) {
         let batch_bi = batch_res.as_ref().expect("healthy claim → Ok");
 
         let single = epigraph_engine::belief_query::get_perspective_belief(
-            &pool, &viewer,
+            &pool,
+            &viewer,
             *claim_id,
             frame_id,
             perspective_id,
@@ -212,9 +214,10 @@ async fn batch_equals_per_hit(pool: PgPool) {
 
     // Sanity: the lens actually bites — batch value differs from the global
     // (unlensed) belief, so the equivalence above is over a non-trivial lens.
-    let global = epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_ids[0], Some(frame_id))
-        .await
-        .expect("global");
+    let global =
+        epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_ids[0], Some(frame_id))
+            .await
+            .expect("global");
     let lensed = batch[0].1.as_ref().unwrap();
     assert!(
         (lensed.belief - global.belief).abs() > 1e-6,
@@ -305,7 +308,8 @@ async fn batch_resolves_perspective_once_via_snapshot(pool: PgPool) {
 
     // Baseline lensed value under the configured skeptic (resolved once).
     let baseline = epigraph_engine::belief_query::get_perspective_belief(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         claim_ids[0],
         frame_row.id,
         skeptic.id,
@@ -315,17 +319,19 @@ async fn batch_resolves_perspective_once_via_snapshot(pool: PgPool) {
     .belief;
     // And the global (what a fallen-back re-fetch would produce): must differ,
     // else the guard can't discriminate.
-    let global = epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_ids[0], Some(frame_row.id))
-        .await
-        .expect("global")
-        .belief;
+    let global =
+        epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_ids[0], Some(frame_row.id))
+            .await
+            .expect("global")
+            .belief;
     assert!(
         (baseline - global).abs() > 1e-6,
         "skeptic lens must diverge from global for the guard to bite: {baseline} vs {global}"
     );
 
     let batch = epigraph_engine::belief_query::get_perspective_belief_batch(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &claim_ids,
         frame_row.id,
         skeptic.id,

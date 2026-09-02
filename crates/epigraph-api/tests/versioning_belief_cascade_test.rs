@@ -223,11 +223,12 @@ async fn dedup_route_reports_and_applies_the_belief_cascade() {
     let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(&pool, &viewer)
         .await
         .expect("binary frame");
-    let coherent =
-        epigraph_engine::edge_factor::preview_claim_belief_on_frame(&pool, &viewer, canonical, frame_id)
-            .await
-            .expect("preview")
-            .expect("canonical inherited the supporter's BBA");
+    let coherent = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+        &pool, &viewer, canonical, frame_id,
+    )
+    .await
+    .expect("preview")
+    .expect("canonical inherited the supporter's BBA");
     let cached = betp(&pool, canonical)
         .await
         .expect("canonical must have a cached BetP");

@@ -225,10 +225,11 @@ async fn intra_source_19_supporters_betp_in_band(pool: PgPool) {
         // points use (HTTP edges, HTTP workflows, MCP ingestion,
         // MCP workflow_ingest, CLI backfill_factors).
         let edge_id = insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
-        let outcome =
-            auto_wire_ds_for_edge(&pool, &viewer, edge_id, agent, supporter, target_id, "supports")
-                .await
-                .expect("auto_wire_ds_for_edge");
+        let outcome = auto_wire_ds_for_edge(
+            &pool, &viewer, edge_id, agent, supporter, target_id, "supports",
+        )
+        .await
+        .expect("auto_wire_ds_for_edge");
         assert_eq!(
             outcome,
             EdgeFactorOutcome::Wired,
@@ -408,10 +409,11 @@ async fn cross_source_19_supporters_keeps_high_betp(pool: PgPool) {
         insert_edge(&pool, paper, supporter, "paper", "claim", "asserts").await;
 
         let edge_id = insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
-        let outcome =
-            auto_wire_ds_for_edge(&pool, &viewer, edge_id, agent, supporter, target_id, "supports")
-                .await
-                .expect("auto_wire_ds_for_edge");
+        let outcome = auto_wire_ds_for_edge(
+            &pool, &viewer, edge_id, agent, supporter, target_id, "supports",
+        )
+        .await
+        .expect("auto_wire_ds_for_edge");
         assert_eq!(
             outcome,
             EdgeFactorOutcome::Wired,
@@ -573,9 +575,17 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     .await;
     seed_doi_evidence(&pool, primer, target_doi, 0x71_0000).await;
     let primer_edge = insert_edge(&pool, primer, target_id, "claim", "claim", "supports").await;
-    auto_wire_ds_for_edge(&pool, &viewer, primer_edge, agent, primer, target_id, "supports")
-        .await
-        .expect("auto_wire primer");
+    auto_wire_ds_for_edge(
+        &pool,
+        &viewer,
+        primer_edge,
+        agent,
+        primer,
+        target_id,
+        "supports",
+    )
+    .await
+    .expect("auto_wire primer");
 
     // Capture the BetP at the default per-frame factor (calibration's
     // 0.3) — this is the Phase 2 baseline we'll later compare against.
@@ -616,9 +626,11 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     .await;
     seed_doi_evidence(&pool, supporter, target_doi, 0x72_0000).await;
     let edge_id = insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
-    let outcome = auto_wire_ds_for_edge(&pool, &viewer, edge_id, agent, supporter, target_id, "supports")
-        .await
-        .expect("auto_wire override");
+    let outcome = auto_wire_ds_for_edge(
+        &pool, &viewer, edge_id, agent, supporter, target_id, "supports",
+    )
+    .await
+    .expect("auto_wire override");
     assert_eq!(outcome, EdgeFactorOutcome::Wired);
 
     // ── Write-through cache assertion (carried forward from pre-Phase-2) ──
@@ -833,10 +845,11 @@ async fn per_frame_evidence_type_weight_override_applied(pool: PgPool) {
         .await;
         seed_doi_evidence(&pool, supporter, target_doi, 0x73_0000 + i).await;
         let edge_id = insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
-        let outcome =
-            auto_wire_ds_for_edge(&pool, &viewer, edge_id, agent, supporter, target_id, "supports")
-                .await
-                .expect("auto_wire");
+        let outcome = auto_wire_ds_for_edge(
+            &pool, &viewer, edge_id, agent, supporter, target_id, "supports",
+        )
+        .await
+        .expect("auto_wire");
         assert_eq!(outcome, EdgeFactorOutcome::Wired);
     }
 

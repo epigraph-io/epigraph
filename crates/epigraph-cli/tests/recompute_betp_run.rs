@@ -145,7 +145,9 @@ async fn dry_run_previews_without_writing_and_differs_from_stale_cache(pool: PgP
 
     // --- real run: run_claim must write the same value preview_claim
     // computed.
-    let written = run_claim(&pool, &viewer, hub_claim).await.expect("run_claim");
+    let written = run_claim(&pool, &viewer, hub_claim)
+        .await
+        .expect("run_claim");
     assert!(written > 0, "expected at least one frame write");
 
     let cached_after_write = cached_pignistic(&pool, hub_claim).await;

@@ -39,7 +39,8 @@ async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPo
     let original = seed_claim(&pool, server_agent, &["backlog"], true, None).await;
 
     let result = resolve_backlog_item(
-        &server, &viewer,
+        &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: original.as_uuid().to_string(),
             resolution_content: "Fixed by replacing the index with a GIN BTREE.".to_string(),
@@ -86,9 +87,10 @@ async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPo
         resolution.content
     );
 
-    let resolution_labels = ClaimRepository::get_labels(&pool, &viewer, ClaimId::from_uuid(resolution_id))
-        .await
-        .expect("get_labels resolution");
+    let resolution_labels =
+        ClaimRepository::get_labels(&pool, &viewer, ClaimId::from_uuid(resolution_id))
+            .await
+            .expect("get_labels resolution");
     assert!(
         resolution_labels.contains(&"resolved".to_string()),
         "resolution claim must be labeled 'resolved': {resolution_labels:?}"
@@ -138,7 +140,8 @@ fn parse_json(result: &CallToolResult) -> Value {
 async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &PgPool) -> Uuid {
     let viewer = fixture::public_viewer(pool).await;
     let result = epigraph_mcp::tools::claims::submit_claim(
-        server, &viewer,
+        server,
+        &viewer,
         epigraph_mcp::types::SubmitClaimParams {
             content: "bootstrap claim for resolve_backlog_item test".into(),
             methodology: "deductive_logic".into(),

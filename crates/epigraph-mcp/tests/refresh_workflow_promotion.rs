@@ -111,7 +111,8 @@ async fn refresh_sets_then_clears_promotable(pool: PgPool) {
     seed_runs(&pool, variant, 12, 0).await;
     let j1 = result_json(
         tools::workflows::refresh_workflow_promotion(
-            &server, &viewer,
+            &server,
+            &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: variant.to_string(),
                 window: Some(50),
@@ -135,7 +136,8 @@ async fn refresh_sets_then_clears_promotable(pool: PgPool) {
     seed_runs(&pool, variant, 0, 20).await;
     let j2 = result_json(
         tools::workflows::refresh_workflow_promotion(
-            &server, &viewer,
+            &server,
+            &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: variant.to_string(),
                 window: Some(50),
@@ -166,7 +168,8 @@ async fn refresh_skips_lineage_root(pool: PgPool) {
 
     let j = result_json(
         tools::workflows::refresh_workflow_promotion(
-            &server, &viewer,
+            &server,
+            &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: root.to_string(),
                 window: None,

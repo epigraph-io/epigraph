@@ -296,9 +296,10 @@ async fn diverse_selection_spreads_across_themes_when_flat_would_not(pool: PgPoo
 
     // Sanity check (regression guard): the flat ANN path (i.e. what
     // diverse=false in MCP would call) returns 5 hits, ALL from theme_a.
-    let flat_hits = epigraph_db::ClaimRepository::search_by_embedding(&pool, &viewer, &query, 1536, 5, None)
-        .await
-        .expect("flat ANN");
+    let flat_hits =
+        epigraph_db::ClaimRepository::search_by_embedding(&pool, &viewer, &query, 1536, 5, None)
+            .await
+            .expect("flat ANN");
     assert_eq!(flat_hits.len(), 5, "flat ANN should fill the budget");
     let flat_theme_ids: std::collections::HashSet<Uuid> = sqlx::query_scalar(
         "SELECT theme_id FROM claims WHERE id = ANY($1) AND theme_id IS NOT NULL",

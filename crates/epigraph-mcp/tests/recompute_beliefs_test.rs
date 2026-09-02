@@ -72,7 +72,8 @@ async fn insert_claim_with_label(pool: &PgPool, agent: Uuid, content: &str, labe
 async fn wire_bba(pool: &PgPool, claim_id: Uuid, agent_id: Uuid) {
     let viewer = fixture::public_viewer(pool).await;
     tools::ds_auto::auto_wire_ds_update(
-        pool, &viewer,
+        pool,
+        &viewer,
         claim_id,
         agent_id,
         0.9,  // confidence
@@ -116,7 +117,8 @@ async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
     assert!((pignistic(&pool, claim).await - 0.123).abs() < 1e-9);
 
     let out = tools::cdst_maintenance::recompute_beliefs(
-        &server, &viewer,
+        &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
@@ -157,7 +159,8 @@ async fn recompute_skips_claim_without_bbas(pool: PgPool) {
     let bare = insert_claim(&pool, agent, &format!("recompute-nobba-{}", Uuid::new_v4())).await;
 
     let out = tools::cdst_maintenance::recompute_beliefs(
-        &server, &viewer,
+        &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![bare.to_string()]),
             labels: None,
@@ -198,7 +201,8 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
     }
 
     let out = tools::cdst_maintenance::recompute_beliefs(
-        &server, &viewer,
+        &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: None,
@@ -216,7 +220,8 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
 
     // Page 2 picks up the remaining claim and is not truncated.
     let out2 = tools::cdst_maintenance::recompute_beliefs(
-        &server, &viewer,
+        &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: None,
@@ -256,7 +261,8 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
 
     // limit=1 over 2 labeled claims → one remains → truncated.
     let out = tools::cdst_maintenance::recompute_beliefs(
-        &server, &viewer,
+        &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![label.clone()]),
@@ -273,7 +279,8 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
 
     // limit=2 over exactly 2 labeled claims → none remain → NOT truncated.
     let out2 = tools::cdst_maintenance::recompute_beliefs(
-        &server, &viewer,
+        &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![label]),

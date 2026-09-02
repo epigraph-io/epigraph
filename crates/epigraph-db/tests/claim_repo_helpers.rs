@@ -183,10 +183,14 @@ async fn find_by_content_hash_and_agent_returns_none_when_no_row() {
     let content = format!("test content {}", Uuid::new_v4());
     let hash = ContentHasher::hash(content.as_bytes());
 
-    let found =
-        ClaimRepository::find_by_content_hash_and_agent(&mut conn, &viewer, hash.as_slice(), agent_id)
-            .await
-            .expect("find call");
+    let found = ClaimRepository::find_by_content_hash_and_agent(
+        &mut conn,
+        &viewer,
+        hash.as_slice(),
+        agent_id,
+    )
+    .await
+    .expect("find call");
 
     assert!(found.is_none(), "expected None, got {:?}", found);
 }
@@ -206,10 +210,14 @@ async fn find_by_content_hash_and_agent_returns_some_when_matching() {
     let mut conn = pool.acquire().await.expect("acquire conn");
     let hash = ContentHasher::hash(claim.content.as_bytes());
 
-    let found =
-        ClaimRepository::find_by_content_hash_and_agent(&mut conn, &viewer, hash.as_slice(), agent_id)
-            .await
-            .expect("find call");
+    let found = ClaimRepository::find_by_content_hash_and_agent(
+        &mut conn,
+        &viewer,
+        hash.as_slice(),
+        agent_id,
+    )
+    .await
+    .expect("find call");
 
     let found = found.expect("expected Some");
     assert_eq!(found.content, claim.content);

@@ -307,10 +307,15 @@ async fn since_is_recorded_in_recall_with_context_audit_params(pool: PgPool) {
     seed_paragraph(&pool, agent, "quorbiline context window fixture", &pgvec).await;
 
     let server = build_test_server(pool.clone());
-    let out =
-        recall_with_context_with_pgvec(&server, &viewer, context_params(since_fixture()), 1536, &pgvec)
-            .await
-            .expect("recall_with_context ok");
+    let out = recall_with_context_with_pgvec(
+        &server,
+        &viewer,
+        context_params(since_fixture()),
+        1536,
+        &pgvec,
+    )
+    .await
+    .expect("recall_with_context ok");
     let text = out
         .content
         .iter()
@@ -356,10 +361,15 @@ async fn since_is_recorded_on_the_empty_recall_with_context_audit_row(pool: PgPo
         .expect("backdate");
 
     let server = build_test_server(pool.clone());
-    let out =
-        recall_with_context_with_pgvec(&server, &viewer, context_params(since_fixture()), 1536, &pgvec)
-            .await
-            .expect("recall_with_context ok");
+    let out = recall_with_context_with_pgvec(
+        &server,
+        &viewer,
+        context_params(since_fixture()),
+        1536,
+        &pgvec,
+    )
+    .await
+    .expect("recall_with_context ok");
     let text = out
         .content
         .iter()

@@ -169,10 +169,12 @@ pub async fn memorize(
             viewer,
             claim_uuid,
             agent_id,
-            confidence,
-            0.6,
-            true,
-            None,
+            ds_auto::DsAutoInput {
+                confidence,
+                weight: 0.6,
+                supports: true,
+                evidence_type: None,
+            },
         )
         .await
         {

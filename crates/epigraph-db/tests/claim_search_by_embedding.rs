@@ -131,9 +131,10 @@ async fn search_by_embedding_filters_by_paper_doi(pool: PgPool) {
         .expect("insert asserts edge");
     }
 
-    let results = ClaimRepository::search_by_embedding(&pool, &viewer, &pgvec, 1536, 5, Some("10.1/A"))
-        .await
-        .expect("search_by_embedding with doi filter");
+    let results =
+        ClaimRepository::search_by_embedding(&pool, &viewer, &pgvec, 1536, 5, Some("10.1/A"))
+            .await
+            .expect("search_by_embedding with doi filter");
 
     let ids: Vec<Uuid> = results.iter().map(|r| r.claim_id).collect();
     assert!(ids.contains(&pa), "expected pa from paper A");

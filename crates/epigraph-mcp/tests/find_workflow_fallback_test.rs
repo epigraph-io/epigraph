@@ -33,7 +33,8 @@ async fn find_workflow_falls_back_to_text_search_when_semantic_empty(pool: PgPoo
 
     // Sanity: DB-level ILIKE on workflow-labeled claims finds it.
     let direct = ClaimRepository::search_by_label_and_text(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &["workflow".to_string()],
         &unique_phrase,
         0.0,

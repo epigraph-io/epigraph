@@ -359,10 +359,12 @@ pub async fn submit_claim(
             viewer,
             claim_uuid,
             agent_id,
-            confidence,
-            weight,
-            true,
-            Some(&params.evidence_type),
+            ds_auto::DsAutoInput {
+                confidence,
+                weight,
+                supports: true,
+                evidence_type: Some(&params.evidence_type),
+            },
         )
         .await;
         if let Err(ref e) = ds_result {

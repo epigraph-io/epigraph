@@ -133,7 +133,8 @@ async fn search_by_label_and_text_excludes_superseded_returns_replacement(pool: 
     .unwrap();
 
     let hits = ClaimRepository::search_by_label_and_text(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &["workflow".to_string()],
         "deploy widget",
         0.0,

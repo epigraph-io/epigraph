@@ -287,7 +287,8 @@ async fn build_two_hop_fixture(
     let server = build_test_server(pool.clone());
 
     do_link_epistemic(
-        &server, &viewer,
+        &server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: a.to_string(),
             target_claim_id: mid.to_string(),
@@ -299,7 +300,8 @@ async fn build_two_hop_fixture(
     .expect("A supports MID");
 
     do_link_epistemic(
-        &server, &viewer,
+        &server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: mid.to_string(),
             target_claim_id: b.to_string(),

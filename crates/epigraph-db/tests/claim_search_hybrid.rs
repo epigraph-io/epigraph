@@ -120,7 +120,8 @@ async fn hybrid_fuses_both_legs_ranking_the_overlap_first(pool: PgPool) {
     .await;
 
     let hits = ClaimRepository::search_hybrid_scoped(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &query,
         "quasinormal mechanosynthesis",
         50,
@@ -185,10 +186,19 @@ async fn hybrid_surfaces_lexical_only_hit_outside_dense_pool(pool: PgPool) {
 
     // candidate_pool=1 → dense leg yields only `dense`; `lex` can only enter via
     // the lexical leg, so dense_similarity must be NULL there.
-    let hits =
-        ClaimRepository::search_hybrid_scoped(&pool, &viewer, &query, "zubuzonium", 1, 60, 10, None, None)
-            .await
-            .expect("hybrid search");
+    let hits = ClaimRepository::search_hybrid_scoped(
+        &pool,
+        &viewer,
+        &query,
+        "zubuzonium",
+        1,
+        60,
+        10,
+        None,
+        None,
+    )
+    .await
+    .expect("hybrid search");
 
     let lex_hit = hits
         .iter()
@@ -249,7 +259,8 @@ async fn hybrid_excludes_non_current_and_honors_tag_scope(pool: PgPool) {
 
     let tags = vec!["keep".to_string()];
     let hits = ClaimRepository::search_hybrid_scoped(
-        &pool, &viewer,
+        &pool,
+        &viewer,
         &query,
         "zubuzonium",
         50,
@@ -325,10 +336,17 @@ async fn lexical_scoped_ranks_matches_and_honors_scope(pool: PgPool) {
     .await;
 
     let tags = vec!["keep".to_string()];
-    let hits =
-        ClaimRepository::search_lexical_scoped(&pool, &viewer, "zubuzonium", 60, 10, Some(&tags), None)
-            .await
-            .expect("lexical search");
+    let hits = ClaimRepository::search_lexical_scoped(
+        &pool,
+        &viewer,
+        "zubuzonium",
+        60,
+        10,
+        Some(&tags),
+        None,
+    )
+    .await
+    .expect("lexical search");
 
     let ids: Vec<Uuid> = hits.iter().map(|h| h.claim_id).collect();
     assert!(ids.contains(&hit), "lexical match in scope present");

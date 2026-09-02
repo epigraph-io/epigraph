@@ -1071,10 +1071,16 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     // Reference: direct call to the same repo function recall_with_context
     // uses in diverse=false mode. If diverse=false matches this ordering
     // verbatim, the diverse-routing change preserves the flat path.
-    let direct_hits =
-        epigraph_db::ClaimRepository::search_by_embedding(&pool, &viewer, &query_pgvec, 1536, 10, None)
-            .await
-            .expect("direct flat ANN");
+    let direct_hits = epigraph_db::ClaimRepository::search_by_embedding(
+        &pool,
+        &viewer,
+        &query_pgvec,
+        1536,
+        10,
+        None,
+    )
+    .await
+    .expect("direct flat ANN");
     let direct_order: Vec<Uuid> = direct_hits.iter().map(|h| h.claim_id).collect();
 
     let server = build_test_server(pool.clone());
@@ -1292,9 +1298,10 @@ async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
 
     // Flat baseline: hit count by theme.
     let flat_params = diverse_params(/*diverse=*/ false, None, None, 5);
-    let flat_result = recall_with_context_with_pgvec(&server, &viewer, flat_params, 1536, &query_pgvec)
-        .await
-        .expect("flat baseline");
+    let flat_result =
+        recall_with_context_with_pgvec(&server, &viewer, flat_params, 1536, &query_pgvec)
+            .await
+            .expect("flat baseline");
     let flat_resp = parse_response(flat_result);
     assert_eq!(
         flat_resp.results.len(),
@@ -1427,7 +1434,8 @@ async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     let result = recall_with_context_with_pgvec(
-        &server, &viewer,
+        &server,
+        &viewer,
         diverse_params(false, None, None, 10),
         1536,
         &pgvec,
@@ -1499,7 +1507,8 @@ async fn recall_with_context_writes_its_own_audit_row(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     let result = recall_with_context_with_pgvec(
-        &server, &viewer,
+        &server,
+        &viewer,
         diverse_params(false, None, None, 10),
         1536,
         &pgvec,

@@ -49,9 +49,11 @@ async fn insert_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
 
 async fn wire(pool: &PgPool, claim: Uuid, agent: Uuid, confidence: f64, supports: bool) {
     let viewer = fixture::public_viewer(pool).await;
-    tools::ds_auto::auto_wire_ds_update(pool, &viewer, claim, agent, confidence, 1.0, supports, None, None)
-        .await
-        .expect("auto_wire_ds_update");
+    tools::ds_auto::auto_wire_ds_update(
+        pool, &viewer, claim, agent, confidence, 1.0, supports, None, None,
+    )
+    .await
+    .expect("auto_wire_ds_update");
 }
 
 /// Recompute classifies the claim and `get_classification` reads it back.
@@ -62,7 +64,8 @@ async fn recompute_and_label(
 ) -> Option<String> {
     let viewer = fixture::public_viewer(pool).await;
     tools::cdst_maintenance::recompute_beliefs(
-        server, &viewer,
+        server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
@@ -141,7 +144,8 @@ async fn get_claim_exposes_classification(pool: PgPool) {
     let _ = recompute_and_label(&server, &pool, claim).await;
 
     let out = tools::claims::get_claim(
-        &server, &viewer,
+        &server,
+        &viewer,
         GetClaimParams {
             claim_id: claim.to_string(),
             frame_id: None,
