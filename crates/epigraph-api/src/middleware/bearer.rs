@@ -210,46 +210,6 @@ require_scope_extractor!(RequireScopeGroupsAdmin, "groups:admin");
 #[cfg(feature = "db")]
 pub struct ViewerExtractor(pub epigraph_db::Viewer);
 
-/// No-db counterpart. `epigraph-db` is `optional = true`, so under
-/// `--no-default-features` the `Viewer` type does not exist and the payload
-/// above cannot be named — but the handlers that destructure
-/// `ViewerExtractor(viewer)` are NOT themselves cfg-gated (their *bodies*
-/// branch on the feature, per this crate's convention), so the extractor must
-/// still exist as a type or the whole no-db build fails to resolve.
-///
-/// The payload is `()`: every no-db handler body is a stub that never reads the
-/// viewer. Authentication is still required — the extraction below refuses a
-/// request with no `AuthContext` exactly as the db variant does, so the no-db
-/// build cannot be turned into an anonymous-read backdoor by omitting a feature
-/// flag. It simply has no groups to resolve against.
-#[cfg(not(feature = "db"))]
-pub struct ViewerExtractor(pub ());
-
-#[cfg(not(feature = "db"))]
-#[axum::async_trait]
-impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
-    type Rejection = ApiError;
-
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        // Same fail-closed contract as the db variant: no AuthContext, no read.
-        if parts.extensions.get::<AuthContext>().is_none() {
-            tracing::warn!(
-                target: "visibility.viewer.rejected",
-                reason = "no_auth_context",
-                route = %parts.uri.path(),
-                "viewer rejected: request carried no AuthContext (no-db build)"
-            );
-            return Err(ApiError::Unauthorized {
-                reason: "authentication required".into(),
-            });
-        }
-        Ok(Self(()))
-    }
-}
-
 #[cfg(feature = "db")]
 #[axum::async_trait]
 impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
@@ -341,6 +301,29 @@ pub struct NoDbViewer;
 /// second implementation of the same route table, and CI checks it
 /// (`.github/workflows/ci.yml`, `cargo check -p epigraph-api
 /// --no-default-features --locked`).
+///
+/// # There is exactly ONE `not(db)` counterpart, and this is it
+///
+/// PR-07 briefly shipped two. An earlier commit on this branch added a
+/// `ViewerExtractor(pub ())` whose impl checked only the `AuthContext` branch;
+/// a later one added this stricter pair a hundred lines further down without
+/// deleting it, leaving `ViewerExtractor` defined twice and
+/// `FromRequestParts<AppState>` implemented twice under the same `cfg`
+/// (`E0428` + `E0119` + `E0308`). All three are invisible to `cargo clippy
+/// --workspace --all-targets`, which only ever compiles the `db`
+/// configuration — the no-db check is the only gate that sees this file's other
+/// half, and it had not been run (open finding `F-not-db-build-unverified`).
+///
+/// The weaker `()` variant was the one deleted, on the merits and not merely
+/// because it was older: it accepted a token carrying no `agent_id`, which the
+/// `db` variant refuses, so keeping it would have made the no-db build a
+/// strictly weaker second implementation — exactly what the paragraph above
+/// says must not happen.
+///
+/// The handlers themselves are NOT `#[cfg]`-gated on their signatures (only
+/// their bodies branch on the feature, per this crate's convention), so this
+/// type must exist under `not(db)` or the whole build fails to resolve — which
+/// is why "just delete the no-db counterpart" is not an available fix.
 #[cfg(not(feature = "db"))]
 pub struct ViewerExtractor(pub NoDbViewer);
 
