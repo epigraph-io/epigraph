@@ -705,3 +705,140 @@ fn walk_manifests(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     );
     out
 }
+
+// =============================================================================
+// D1 / D2 — PR-12: the stamping triggers are armed, and the transition form is
+// still the transition form.
+//
+// Plan §0.2 requires every PR that touches a locked decision to extend this
+// file. PR-12 arms the write-side stamping D1 depends on and performs the D2
+// backfill, so both are locked here.
+// =============================================================================
+
+/// D1 — plan §8.2 acceptance **A5**: every tenancy trigger is `tgenabled = 'O'`.
+///
+/// D1 is "nothing is public by absence, omission, or default-on-error", and
+/// after PR-12 the mechanism enforcing it on the write side is a set of
+/// triggers. `ALTER TABLE … DISABLE TRIGGER` is a one-line, in-band way to
+/// revert that whole decision with no diff and no migration — precisely the
+/// shape this file exists to catch. A disabled stamping trigger is
+/// indistinguishable from an absent one at the row level.
+///
+/// The count is pinned, not just the enabled-ness: an assertion that "no
+/// tenancy trigger is disabled" passes vacuously on a database that has none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT t.tgname, t.tgenabled::text FROM pg_trigger t \
+          WHERE NOT t.tgisinternal \
+            AND (t.tgname IN ('claims_require_tenancy', 'edges_tenancy', \
+                              'claims_propagate_tenancy', 'ownership_transcribe') \
+                 OR t.tgname LIKE '%\\_inherit\\_tenancy') \
+          ORDER BY t.tgname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read pg_trigger");
+
+    assert_eq!(
+        rows.len(),
+        21,
+        "expected 21 tenancy triggers — 4 named (claims_require_tenancy, \
+         edges_tenancy, claims_propagate_tenancy, ownership_transcribe) plus one \
+         *_inherit_tenancy per claim-derived tier-A table (17). Found {}: {rows:?}. \
+         A different count means migration 070 arm (c)'s table set moved, which \
+         is a D1 change and needs a decision, not a silent edit.",
+        rows.len()
+    );
+
+    let disabled: Vec<&(String, String)> = rows.iter().filter(|(_, e)| e != "O").collect();
+    assert!(
+        disabled.is_empty(),
+        "plan §8.2 A5: every tenancy trigger must be ENABLED (tgenabled = 'O'). \
+         These are not: {disabled:?}"
+    );
+}
+
+/// D1 — migration 070 must ship the TRANSITION form, not 074's final form.
+///
+/// The distinction is the whole staging strategy. 070 arm (a) **warns and
+/// counts**; migration 074 (PR-16) `CREATE OR REPLACE`s the same function with
+/// the `RAISE`-terminated version in the same migration that drops 062's
+/// DEFAULTs. Shipping the final form early turns thirteen production
+/// `INSERT INTO claims` call sites and ~160 test statements into hard `23502`s
+/// on the day PR-12 lands, months before PR-16's week-11a rollout.
+///
+/// Read from `pg_proc.prosrc` and the catalog rather than from the file, so a
+/// database that has had the function replaced out of band also fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d1_the_stamping_trigger_is_still_the_transition_form(pool: PgPool) {
+    let src: String = sqlx::query_scalar(
+        "SELECT p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_claims_require_tenancy'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("epigraph_claims_require_tenancy must exist after migration 070");
+
+    assert!(
+        src.contains("tenancy_undeclared_writes"),
+        "arm (a) must COUNT undeclared writes — that counter is plan §9.2's \
+         week-11b deploy gate, and without it PR-16 has no evidence to gate on"
+    );
+    assert!(
+        src.contains("RAISE WARNING"),
+        "arm (a) must WARN, not raise, while 062's DEFAULTs are still present"
+    );
+
+    // The transition form keys on "still equals the world default"; 074's final
+    // form keys on IS NULL, which is only reachable once the DEFAULTs are gone.
+    let default_present: bool = sqlx::query_scalar(
+        "SELECT column_default IS NOT NULL FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'claims' \
+            AND column_name = 'owner_group_id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read claims.owner_group_id default");
+    assert!(
+        default_present,
+        "claims.owner_group_id lost its DEFAULT before migration 074. The \
+         transition trigger keys on that default, so dropping it early makes arm \
+         (a) silently stop recognising undeclared writes."
+    );
+}
+
+/// D2 — the backfill's target is the author's personal group, and the seed
+/// group is NOT it.
+///
+/// Both nil-flavoured groups must exist and must remain memberless, because
+/// that is what makes `('group', world)` and `('group', seed)` black holes and
+/// what migration 062's `<table>_group_needs_real_group` CHECK is protecting.
+/// A PR that gives seed memberships changes what PR-16's migration 074 arm 4
+/// means, and this is where that is caught.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d2_world_and_seed_remain_memberless(pool: PgPool) {
+    for kind in ["world", "seed"] {
+        let group: uuid::Uuid = sqlx::query_scalar("SELECT id FROM groups WHERE kind = $1")
+            .bind(kind)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("migration 062 seeds the {kind} group: {e}"));
+
+        let members: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(group)
+        .fetch_one(&pool)
+        .await
+        .expect("count memberships");
+
+        assert_eq!(
+            members, 0,
+            "the {kind} group must stay memberless by design. It is a SHAPE \
+             CONSTANT, not an owner; giving it members would make ('group', \
+             {kind}) look readable and quietly relitigate D2's choice of the \
+             author's personal group as the backfill target."
+        );
+    }
+}

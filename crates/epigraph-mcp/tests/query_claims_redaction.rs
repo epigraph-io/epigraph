@@ -8,11 +8,16 @@
 //! non-owner, and asserts each claim gets ITS OWN decision:
 //!
 //! - the public claim → full content + real content_hash
-//! - the private claim → "[REDACTED]" content + blank content_hash
+//! - the private claim → ABSENT from the result set
 //!
-//! Under a zip/order mispairing the two decisions swap and BOTH assertions
-//! fail; under a deleted/inverted redaction branch the private assertions fail;
-//! under the content_hash oracle leak the blank-hash assertion fails.
+//! **CORRECTED FOR PR-12.** The private claim's required disposition used to be
+//! `"[REDACTED]"` content + blank content_hash. Migration 071 transcribes the
+//! `ownership` row into the tenancy columns, so the non-owner's `Viewer`
+//! excludes it outright. The per-row discrimination this file exists to test is
+//! UNCHANGED — a zip/order mispairing still swaps the two decisions and still
+//! fails — but the private half is now an absence assertion. The blank-hash
+//! oracle guard lives on the branch that still blanks:
+//! `get_claim.rs::get_claim_blanks_the_content_hash_when_it_redacts`.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -30,7 +35,6 @@ use common::build_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_claims_redacts_only_the_private_claim_per_id(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let public_owner = seed_agent(&pool).await;
     let private_owner = seed_agent(&pool).await;
 
@@ -56,7 +60,11 @@ async fn query_claims_redacts_only_the_private_claim_per_id(pool: PgPool) {
 
     // Query as a STRANGER (neither owner). Must see both claims, but only the
     // private one redacted.
+    // PR-12: resolve the Viewer for the acting principal, as production does.
     let stranger = Uuid::new_v4();
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
+        .await
+        .expect("resolve stranger viewer");
     let result = query_claims(
         &server,
         &viewer,
@@ -82,19 +90,19 @@ async fn query_claims_redacts_only_the_private_claim_per_id(pool: PgPool) {
         "public claim must show its real content_hash: {public:?}"
     );
 
-    let private = find_claim(&claims, private_id);
-    assert_eq!(
-        private["content"].as_str().unwrap(),
-        "[REDACTED]",
-        "private claim must be redacted for a stranger — fails on a zip \
-         mispairing (decision lands on the public claim) or a deleted/inverted \
-         redaction branch"
-    );
-    assert_eq!(
-        private["content_hash"].as_str().unwrap(),
-        "",
-        "private claim must NOT leak its content_hash — BLAKE3(content) is a \
-         confirmation oracle for the redacted content"
+    // PR-12 TIGHTENING: the private claim is dropped by the Viewer predicate
+    // rather than returned blanked, which subsumes both the content and the
+    // content_hash assertions this case used to make.
+    //
+    // The zip-mispairing defect it was written to catch is still caught: the
+    // public claim's assertions above are what fail if the per-id decision lands
+    // on the wrong row.
+    assert!(
+        claims
+            .iter()
+            .all(|c| c["id"].as_str() != Some(private_id.as_uuid().to_string().as_str())),
+        "a transcribed private claim must be ABSENT for a stranger, not returned \
+         blanked; got {claims:?}"
     );
 }
 
