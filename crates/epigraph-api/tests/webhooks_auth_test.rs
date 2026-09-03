@@ -1,5 +1,25 @@
+//! Auth/authz regression guards for the webhook routes.
+//!
+//! # PR-10 changed what these tests have to do to reach the handler
+//!
+//! `register_webhook` now persists to `webhook_subscriptions` (migration 085),
+//! whose `agent_id` is `NOT NULL REFERENCES agents(id)`. The two tests below
+//! that register a real webhook used `common::test_bearer_token_with_scopes`,
+//! which mints a **fresh random uuid** and uses it for `client_id`, `owner_id`
+//! and `agent_id` alike — a principal that names no `agents` row. Against the
+//! persisted handler that is a 23503 foreign-key violation and a 500, which
+//! reads exactly like a regression and is not one.
+//!
+//! They now seed real agents (`common::seed_system_agent`) and mint tokens
+//! bound to them (`common::mint_token_with_agent`). That also makes the
+//! owner-vs-stranger distinction explicit: PR-10 compares ownership on
+//! `agent_id`, and the old tokens differed in all three fields at once by
+//! accident of construction, so the test could not have told you WHICH field
+//! the handler was comparing.
 #![cfg(feature = "db")]
 mod common;
+
+use sqlx::postgres::PgPoolOptions;
 
 const VALID_SECRET: &str = "Xk9mP2qL7vN8wBjH5cT0yDrF3gU6eA1s"; // 32 chars
 
@@ -99,11 +119,23 @@ async fn register_webhook_missing_scope_returns_403() {
 async fn delete_webhook_by_different_caller_returns_403() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let (addr, _shutdown) = common::spawn_app(&url).await;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("pool");
+
+    // Two REAL agents. `webhook_subscriptions.agent_id` is a foreign key, and
+    // PR-10 compares ownership on that column, so "a different caller" must be
+    // a different AGENT, not merely a different oauth client.
+    let owner_agent = common::seed_system_agent(&pool).await;
+    let other_agent = common::seed_system_agent(&pool).await;
+    assert_ne!(owner_agent, other_agent);
 
     // Token for caller A (owner)
-    let owner_token = common::test_bearer_token_with_scopes(&["webhooks:write"]);
-    // Token for caller B (different client_id, also has webhooks:write)
-    let other_token = common::test_bearer_token_with_scopes(&["webhooks:write"]);
+    let owner_token = common::mint_token_with_agent(&["webhooks:write"], owner_agent);
+    // Token for caller B (different agent, also has webhooks:write)
+    let other_token = common::mint_token_with_agent(&["webhooks:write"], other_agent);
 
     // Register webhook as caller A
     let reg_resp = reqwest::Client::new()
@@ -151,8 +183,14 @@ async fn delete_webhook_by_different_caller_returns_403() {
 async fn delete_webhook_by_owner_returns_204() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let (addr, _shutdown) = common::spawn_app(&url).await;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("pool");
 
-    let token = common::test_bearer_token_with_scopes(&["webhooks:write"]);
+    let agent = common::seed_system_agent(&pool).await;
+    let token = common::mint_token_with_agent(&["webhooks:write"], agent);
 
     // Register
     let reg_resp = reqwest::Client::new()

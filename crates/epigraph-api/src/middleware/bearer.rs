@@ -169,6 +169,83 @@ require_scope_extractor!(RequireScopeWebhooksWrite, "webhooks:write");
 require_scope_extractor!(RequireScopeGroupsWrite, "groups:write");
 require_scope_extractor!(RequireScopeGroupsAdmin, "groups:admin");
 
+/// An authenticated caller whose token names an `agents.id`. **No scope check.**
+///
+/// PR-10. `list_webhooks` and `get_webhook` took `State` (and `Path`) and
+/// nothing else: any authenticated principal received every subscription in the
+/// process. They need two things this extractor supplies and
+/// [`ViewerExtractor`] does not: a **principal id** to compare against
+/// `WebhookSubscription.agent_id`, and availability in the
+/// `not(feature = "db")` build.
+///
+/// # Why not `ViewerExtractor`
+///
+/// The plan's *Files* line says these handlers "gain auth extractors", and the
+/// reflex is to reach for the viewer. That would be wrong here. A subscription
+/// row is not claim content and carries no `owner_group_id`; there is no
+/// visibility predicate to spend a `Viewer` on. A handler that took a `Viewer`
+/// and filtered on `agent_id` instead would be holding an unspent viewer — the
+/// exact shape `epigraph-db`'s `visibility_lint.rs` and `Viewer::splice`'s
+/// missing-marker panic exist to catch, passed off as diligence because the
+/// parameter is present. `Viewer` is genuinely used for webhooks, one level
+/// away, in `routes/webhooks.rs::deliver_event`, where there IS claim content
+/// to filter.
+///
+/// # When it 401s
+///
+/// The same two branches as [`ViewerExtractor`], in the same order and for the
+/// same reasons: no `AuthContext` in extensions, then `AuthContext.agent_id`
+/// is `None`. Deliberately **not** `Option<RequirePrincipal>` — an optional
+/// principal is the `if let Some(auth) = auth_ctx` fall-through this PR removes
+/// from `delete_webhook` two files over.
+pub struct RequirePrincipal {
+    /// The full auth context, for scope checks the handler still wants to make.
+    pub auth: AuthContext,
+    /// `auth.agent_id`, unwrapped. Present by construction.
+    pub principal: uuid::Uuid,
+}
+
+#[axum::async_trait]
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequirePrincipal {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let route = parts.uri.path().to_string();
+
+        let Some(auth) = parts.extensions.get::<AuthContext>().cloned() else {
+            tracing::warn!(
+                target: "visibility.viewer.rejected",
+                reason = "no_auth_context",
+                route = %route,
+                "principal rejected: request carried no AuthContext"
+            );
+            return Err(ApiError::Unauthorized {
+                reason: "authentication required".into(),
+            });
+        };
+
+        let Some(principal) = auth.agent_id else {
+            tracing::warn!(
+                target: "visibility.viewer.rejected",
+                reason = "no_agent_id",
+                route = %route,
+                client_id = %auth.client_id,
+                "principal rejected: token carries no agent_id; re-mint the token"
+            );
+            return Err(ApiError::Unauthorized {
+                reason: "token carries no agent_id; re-authenticate to obtain \
+                         a token bound to a principal"
+                    .into(),
+            });
+        };
+
+        Ok(Self { auth, principal })
+    }
+}
+
 /// The ONLY way an HTTP handler obtains a [`Viewer`](epigraph_db::Viewer).
 ///
 /// Handlers take `ViewerExtractor(viewer): ViewerExtractor`, never

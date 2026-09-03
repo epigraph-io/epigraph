@@ -376,8 +376,19 @@ pub async fn list_events(
 /// sides are pinned by
 /// `payload_uuid_tests::an_over_long_hex_run_yields_its_prefix_in_both_implementations`,
 /// which records the Postgres output verbatim.
-#[cfg(feature = "db")]
-fn payload_uuids(payload: &serde_json::Value) -> Vec<Uuid> {
+///
+/// # `pub(crate)` since PR-10 — and the asymmetry above is exactly why
+///
+/// `routes/webhooks.rs::deliver_event` applies the same rule to the webhook
+/// fan-out. It shares THIS scanner rather than growing its own, and the
+/// paragraph above is the reason that matters rather than being mere tidiness:
+/// the fan-out wants the SUPERSET. An extra uuid can only cost it an extra
+/// suppression, never an extra delivery, because
+/// `ClaimRepository::hidden_claim_ids` returns only ids that name a real row
+/// and are invisible. A third hand-rolled scanner would be a third thing to
+/// keep on the safe side of `rust ⊇ sql`, and the one that drifted would drift
+/// toward delivering.
+pub(crate) fn payload_uuids(payload: &serde_json::Value) -> Vec<Uuid> {
     const DASHES: [usize; 4] = [8, 13, 18, 23];
     let text = payload.to_string();
     let bytes = text.as_bytes();

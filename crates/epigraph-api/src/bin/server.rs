@@ -483,7 +483,56 @@ async fn main() {
         );
     }
 
+    // Hydrate the in-process webhook store from `webhook_subscriptions`
+    // (migration 085, PR-10). Before this table existed the store was empty on
+    // every boot, so every deploy silently unsubscribed everyone and the
+    // symptom — a webhook that stops firing — was indistinguishable from an idle
+    // corpus.
+    //
+    // A hydration failure is logged, not fatal. The server is useful without
+    // webhooks; refusing to boot because a delivery cache could not be filled
+    // would convert a degraded feature into an outage. It fails in the closed
+    // direction anyway: an empty store delivers nothing.
+    #[cfg(feature = "db")]
+    {
+        match epigraph_db::WebhookSubscriptionRepository::list_active(&state.db_pool).await {
+            Ok(rows) => {
+                let mut store = state.webhook_store.write().await;
+                for row in &rows {
+                    store.insert(
+                        row.id,
+                        epigraph_api::state::WebhookSubscription {
+                            id: row.id,
+                            url: row.url.clone(),
+                            event_types: row.event_types.clone(),
+                            created_at: row.created_at,
+                            active: row.active,
+                            secret: row.secret.clone(),
+                            agent_id: Some(row.agent_id),
+                        },
+                    );
+                }
+                tracing::info!(count = rows.len(), "webhook subscriptions hydrated");
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to hydrate webhook subscriptions; the fan-out will \
+                     deliver nothing until the next successful registration"
+                );
+            }
+        }
+    }
+
     // Start webhook dispatcher (subscribes to event bus for delivery)
+    #[cfg(feature = "db")]
+    let _webhook_sub = start_webhook_dispatcher(
+        &state.event_bus,
+        state.db_pool.clone(),
+        state.webhook_store.clone(),
+        WebhookDeliveryConfig::default(),
+    );
+    #[cfg(not(feature = "db"))]
     let _webhook_sub = start_webhook_dispatcher(
         &state.event_bus,
         state.webhook_store.clone(),

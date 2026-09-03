@@ -76,8 +76,9 @@ pub type SharedEventBus = Arc<EventBus>;
 
 /// A registered webhook subscription
 ///
-/// Stored in the in-memory webhook store. The `secret` field is excluded
-/// from JSON serialization to prevent accidental exposure in API responses.
+/// Held in [`WebhookStore`], a per-process cache of `webhook_subscriptions`
+/// (migration 085). The `secret` field is excluded from JSON serialization to
+/// prevent accidental exposure in API responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookSubscription {
     /// Unique identifier for this subscription
@@ -93,14 +94,34 @@ pub struct WebhookSubscription {
     /// HMAC-SHA256 secret for payload signing (redacted in API responses)
     #[serde(skip_serializing, default)]
     pub secret: String,
-    /// The principal that created this subscription (client_id or owner_id from auth).
-    /// Used for ownership enforcement on delete.
-    /// None only for subscriptions created before auth was enforced.
+    /// The `agents.id` that registered this subscription.
+    ///
+    /// **PR-10 re-pointed this field.** It was `owner_id`, set to
+    /// `auth.owner_id.unwrap_or(auth.client_id)` — an `oauth_clients.id`. That
+    /// value is a fine equality token for an ownership check and a useless one
+    /// for anything else: `epigraph_db::Viewer::resolve` takes an `agents.id`,
+    /// so an `oauth_clients.id` cannot be turned into reading authority, and
+    /// the fan-out had no way to ask "may this subscriber see this event?".
+    /// `AuthContext.agent_id` has been non-null on every authenticated request
+    /// since PR-02, so the correct principal was available at registration time
+    /// all along.
+    ///
+    /// `Option` only because `Deserialize` must have an answer for a row that
+    /// carries no principal. Every path that acts on it — ownership checks in
+    /// `routes/webhooks.rs`, viewer resolution in `deliver_event` — treats
+    /// `None` as REFUSE, never as "skip the check". The `agent_id` column in
+    /// migration 085 is `NOT NULL`, so no persisted row can produce one.
     #[serde(skip_serializing, default)]
-    pub owner_id: Option<Uuid>,
+    pub agent_id: Option<Uuid>,
 }
 
-/// Thread-safe in-memory webhook subscription store
+/// Thread-safe in-memory webhook subscription store.
+///
+/// A per-process cache of `public.webhook_subscriptions` (migration 085), not
+/// the system of record. `bin/server.rs` hydrates it at boot via
+/// `WebhookSubscriptionRepository::list_active`; `register_webhook` and
+/// `delete_webhook` write through to the table before touching it, so a process
+/// restart no longer silently unsubscribes everyone.
 pub type WebhookStore = Arc<RwLock<HashMap<Uuid, WebhookSubscription>>>;
 
 /// Thread-safe embedding service type alias

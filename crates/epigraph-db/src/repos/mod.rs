@@ -60,6 +60,7 @@ pub mod structural;
 pub mod task;
 pub mod trace;
 pub mod triple;
+pub mod webhook;
 pub mod workflow;
 pub mod workflow_execution;
 
@@ -134,6 +135,7 @@ pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
 pub use structural::{BeliefIntervalRow, StructuralRepository};
 pub use trace::ReasoningTraceRepository;
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
+pub use webhook::{WebhookSubscriptionRepository, WebhookSubscriptionRow};
 pub use workflow::{
     HierarchicalWorkflowRow, ResolvedStep, WorkflowGoalEmbeddingHit, WorkflowListRow,
     WorkflowRecallResult, WorkflowRepository,

@@ -66,7 +66,8 @@ Current reservation:
   | **063–066** | PR-04 | tenancy indexes. `-- no-transaction`, **one `CREATE INDEX CONCURRENTLY` per file**. See the section below; this is not style. |
   | **067** | PR-04 | session / bypass functions (`epigraph_session_groups`, `epigraph_writable_groups`, `epigraph_principal_id`, `epigraph_bypass`, `epigraph_definer_bypass`) |
   | **068–084** | PR-05 … PR-22 | the remaining plan §3.1 migrations, shifted **+4** from the plan's printed numbering after 062 (plan 064 → 068, …, plan 080 → 084) |
-  | **085–090** | — | headroom: PR-10's webhook-persistence migration and follow-ups |
+  | **085** | PR-10 | `webhook_subscriptions` — **claimed 2026-09-03**, was headroom |
+  | **086–090** | — | remaining headroom |
 
   **The post-shift numbers, pinned.** THIS TABLE IS AUTHORITATIVE; plan §3.1's
   own columns are not, and neither is `docs/tenancy/FINAL-PLAN.md`. Derive
@@ -92,6 +93,16 @@ Current reservation:
   | **082** | PR-18 | privatization audit + `security_events` hardening |
   | **083** | PR-18 | `instance_admins` |
   | **084** | PR-22 | retire `ownership` |
+  | **085** | PR-10 | `webhook_subscriptions` (durable webhook registrations, `agent_id` FK) |
+
+  **PR-10 takes 085, NOT the 081 `docs/tenancy/FINAL-PLAN.md` names.** The
+  plan's PR-10 note says its migration "takes the next unused number in the
+  reserved 060–085 range (081 if nothing else has claimed it)". 081 *is*
+  claimed — PR-18's privatization guards, two rows up. The plan was written
+  against the pre-shift numbering, before PR-04's index migration became four
+  files; that is the same staleness this table's "Derive nothing" rule exists
+  to absorb. PR-10 landed ahead of PR-12…PR-22 in wall-clock order, which is
+  exactly the case the headroom row was reserved for.
 
   **Non-table objects the reserved range introduces.** A number in the table
   above names a migration, not everything it creates. These are the objects
