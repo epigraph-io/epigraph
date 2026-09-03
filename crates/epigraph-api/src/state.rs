@@ -18,10 +18,7 @@ use epigraph_core::Claim;
 use epigraph_embeddings::EmbeddingService;
 use epigraph_engine::{DatabasePropagator, PropagationConfig, PropagationOrchestrator};
 use epigraph_events::EventBus;
-use epigraph_interfaces::{
-    EncryptionProvider, NoOpEncryptionProvider, NoOpOrchestrationBackend, NoOpPolicyGate,
-    OrchestrationBackend, PolicyGate,
-};
+use epigraph_interfaces::PolicyGate;
 use serde::{Deserialize, Serialize};
 
 /// Cached submission for idempotency
@@ -138,23 +135,12 @@ pub type SharedEmbeddingService = Arc<dyn EmbeddingService>;
 /// When absent, the endpoint returns 503 Service Unavailable.
 pub type SharedHarvesterClient = Arc<dyn HarvesterClient>;
 
-/// Thread-safe encryption provider type alias
+/// Thread-safe write-authorization gate.
 ///
-/// Defaults to [`NoOpEncryptionProvider`] (pass-through). Enterprise deployments
-/// replace this with an AES-256-GCM group-keyed implementation at startup.
-pub type SharedEncryptionProvider = Arc<dyn EncryptionProvider>;
-
-/// Thread-safe policy gate type alias
-///
-/// Defaults to [`NoOpPolicyGate`] (allow all). Enterprise deployments replace
-/// this with an RBAC/ABAC enforcement implementation at startup.
+/// Defaults to [`epigraph_authz::GroupPolicyGate`] — **fail-closed**. Before
+/// PR-11 this defaulted to an allow-all no-op that nothing ever called;
+/// `with_policy_gate` replaces it for a deployment with its own policy.
 pub type SharedPolicyGate = Arc<dyn PolicyGate>;
-
-/// Thread-safe orchestration backend type alias
-///
-/// Defaults to [`NoOpOrchestrationBackend`] (silent drop). Enterprise deployments
-/// replace this with a durable task queue implementation at startup.
-pub type SharedOrchestrationBackend = Arc<dyn OrchestrationBackend>;
 
 /// Application state shared across all request handlers
 #[derive(Clone)]
@@ -268,24 +254,15 @@ pub struct AppState {
     /// Used by the /oauth/revoke and bearer middleware.
     revoked_tokens: Arc<std::sync::RwLock<HashSet<String>>>,
 
-    /// Encryption provider for subgraph key management.
+    /// Write-authorization gate.
     ///
-    /// Defaults to [`NoOpEncryptionProvider`] (pass-through). Enterprise
-    /// deployments inject an AES-256-GCM implementation via `with_encryption_provider`.
-    /// Handlers check `is_active()` to skip metadata writes when the no-op is active.
-    pub encryption_provider: SharedEncryptionProvider,
-
-    /// Policy gate for RBAC/ABAC enforcement.
+    /// Defaults to [`epigraph_authz::GroupPolicyGate`], which denies unless the
+    /// principal owns the resource or holds `admin`/`writer` in its owning
+    /// group. `with_policy_gate` replaces it.
     ///
-    /// Defaults to [`NoOpPolicyGate`] (allow all). Enterprise deployments inject
-    /// a real enforcement implementation via `with_policy_gate`.
+    /// Unlike the pre-PR-11 field, this one is **consulted**: see
+    /// `routes/ownership.rs::assign_ownership` / `::update_partition`.
     pub policy_gate: SharedPolicyGate,
-
-    /// Orchestration backend for durable task scheduling.
-    ///
-    /// Defaults to [`NoOpOrchestrationBackend`] (silent drop). Enterprise deployments
-    /// inject a durable queue implementation via `with_orchestration_backend`.
-    pub orchestration_backend: SharedOrchestrationBackend,
 
     /// External identity provider registry. Built once at startup from `providers.toml`.
     /// Empty by default — server still works for agent/service auth and existing tokens,
@@ -381,9 +358,7 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
-            policy_gate: Arc::new(NoOpPolicyGate::new()),
-            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
     }
@@ -427,9 +402,7 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
-            policy_gate: Arc::new(NoOpPolicyGate::new()),
-            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
@@ -458,9 +431,7 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
-            policy_gate: Arc::new(NoOpPolicyGate::new()),
-            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
     }
@@ -549,9 +520,7 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
-            policy_gate: Arc::new(NoOpPolicyGate::new()),
-            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
@@ -582,9 +551,7 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
-            policy_gate: Arc::new(NoOpPolicyGate::new()),
-            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
     }
@@ -617,9 +584,7 @@ impl AppState {
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            encryption_provider: Arc::new(NoOpEncryptionProvider::new()),
-            policy_gate: Arc::new(NoOpPolicyGate::new()),
-            orchestration_backend: Arc::new(NoOpOrchestrationBackend::new()),
+            policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
@@ -753,33 +718,14 @@ impl AppState {
         self
     }
 
-    /// Inject an enterprise encryption provider (builder pattern).
+    /// Inject a deployment's own policy gate (builder pattern).
     ///
-    /// Replaces the default [`NoOpEncryptionProvider`] with a real AES-256-GCM
-    /// implementation. Must be called at startup before the router is created.
-    #[must_use]
-    pub fn with_encryption_provider(mut self, provider: SharedEncryptionProvider) -> Self {
-        self.encryption_provider = provider;
-        self
-    }
-
-    /// Inject an enterprise policy gate (builder pattern).
-    ///
-    /// Replaces the default [`NoOpPolicyGate`] with a real RBAC/ABAC implementation.
+    /// Replaces the default [`epigraph_authz::GroupPolicyGate`] with a
+    /// deployment's own implementation.
     /// Must be called at startup before the router is created.
     #[must_use]
     pub fn with_policy_gate(mut self, gate: SharedPolicyGate) -> Self {
         self.policy_gate = gate;
-        self
-    }
-
-    /// Inject an enterprise orchestration backend (builder pattern).
-    ///
-    /// Replaces the default [`NoOpOrchestrationBackend`] with a durable queue
-    /// implementation. Must be called at startup before the router is created.
-    #[must_use]
-    pub fn with_orchestration_backend(mut self, backend: SharedOrchestrationBackend) -> Self {
-        self.orchestration_backend = backend;
         self
     }
 
@@ -808,19 +754,100 @@ impl Default for ApiConfig {
     }
 }
 
+/// PR-11's second acceptance criterion: *a fresh `AppState` denies by default*.
+///
+/// Before PR-11 this module held `appstate_accepts_noop_providers`, which
+/// asserted the three `Shared*` aliases were `Send + Sync` by constructing a
+/// no-op for each. Two of the three traits are gone; the surviving one changed
+/// from a compile-only assertion to a behavioural one, because "the field
+/// accepts a trait object" was exactly the property that was true while the
+/// gate was never called.
+///
+/// # Why this does not build an `AppState`
+///
+/// Every `AppState` constructor needs a live `PgPool` (or, in the no-db arm,
+/// the whole set of embedding/event/challenge services). What is under test is
+/// the *default the constructors install*, and all six install the identical
+/// expression `Arc::new(epigraph_authz::GroupPolicyGate::new())`. Asserting
+/// against that value directly keeps this a unit test;
+/// [`the_default_gate_is_installed_at_every_constructor`] pins that the six
+/// sites and the value here have not drifted apart, by reading this file.
 #[cfg(test)]
 mod extension_wiring_tests {
-    use super::{SharedEncryptionProvider, SharedOrchestrationBackend, SharedPolicyGate};
-    use epigraph_interfaces::{NoOpEncryptionProvider, NoOpOrchestrationBackend, NoOpPolicyGate};
+    use super::SharedPolicyGate;
+    use epigraph_interfaces::{Action, Principal, ResourceKind, ResourceRef};
     use std::sync::Arc;
+    use uuid::Uuid;
 
+    /// The value every `AppState` constructor assigns to `policy_gate`.
+    fn default_gate() -> SharedPolicyGate {
+        Arc::new(epigraph_authz::GroupPolicyGate::new())
+    }
+
+    #[tokio::test]
+    async fn a_fresh_appstates_gate_denies_a_principal_with_no_writable_group() {
+        let decision = default_gate()
+            .authorize(
+                &Principal::without_groups(Uuid::new_v4()),
+                &Action::Create,
+                &ResourceRef::new(ResourceKind::Claim, Uuid::new_v4())
+                    .owned_by_group(Uuid::new_v4()),
+            )
+            .await;
+        assert!(!decision.is_allowed(), "got {decision:?}");
+    }
+
+    /// The undeclared-resource case, at the state layer: a write whose resource
+    /// names no owner at all is refused rather than waved through.
+    #[tokio::test]
+    async fn a_fresh_appstates_gate_denies_an_undeclared_resource() {
+        let group = Uuid::new_v4();
+        let decision = default_gate()
+            .authorize(
+                &Principal::new(Uuid::new_v4(), vec![group]),
+                &Action::Create,
+                &ResourceRef::new(ResourceKind::Claim, Uuid::new_v4()),
+            )
+            .await;
+        assert!(!decision.is_allowed(), "got {decision:?}");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_appstates_gate_allows_a_group_writer() {
+        let group = Uuid::new_v4();
+        let decision = default_gate()
+            .authorize(
+                &Principal::new(Uuid::new_v4(), vec![group]),
+                &Action::Create,
+                &ResourceRef::new(ResourceKind::Claim, Uuid::new_v4()).owned_by_group(group),
+            )
+            .await;
+        assert!(decision.is_allowed(), "got {decision:?}");
+    }
+
+    /// Six assignment sites cover eight public entry points: `AppState::new`
+    /// (db) and `with_scoped_pool` delegate to `with_db` rather than assigning
+    /// their own. Counting the literal is how the three tests above stay
+    /// connected to the constructors they claim to describe — a seventh
+    /// constructor that installed something else would show up here.
     #[test]
-    fn appstate_accepts_noop_providers() {
-        // Verifies the trait objects are correctly declared Send + Sync.
-        let _enc: SharedEncryptionProvider = Arc::new(NoOpEncryptionProvider::new());
-        let _pol: SharedPolicyGate = Arc::new(NoOpPolicyGate::new());
-        let _orc: SharedOrchestrationBackend = Arc::new(NoOpOrchestrationBackend::new());
-        // If this compiles, the trait objects are correctly declared Send + Sync.
+    fn the_default_gate_is_installed_at_every_constructor() {
+        let src = include_str!("state.rs");
+        // Split so the needle itself is not a seventh occurrence of the thing
+        // being counted.
+        let needle = concat!(
+            "policy_gate: Arc::new(epigraph_authz::",
+            "GroupPolicyGate::new())"
+        );
+        let installs = src.matches(needle).count();
+        assert_eq!(
+            installs, 6,
+            "expected the fail-closed default at all six `policy_gate:` \
+             assignment sites (AppState::new(no-db), with_db, \
+             with_signature_state, with_db_and_signature_state, \
+             with_propagation_config, with_db_and_propagation_config), found \
+             {installs}"
+        );
     }
 }
 

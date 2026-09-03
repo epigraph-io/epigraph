@@ -1,0 +1,44 @@
+[package]
+name = "epigraph-authz"
+description = "Fail-closed, resource-aware write authorization for the EpiGraph kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# NO SQL, NO POOL, NO `epigraph-db`. Note this is STRICTER than the plan asks
+# for: plan §2.8 says "GroupPolicyGate (no SQL, repo calls only)", which PERMITS
+# repo calls; this crate makes none and takes no pool. The divergence is
+# deliberate and is recorded in PR-11's corrections list rather than presented as
+# conformance. Two consequences are load-bearing:
+#
+#  1. `epigraph-api` can name `GroupPolicyGate` under `--no-default-features`,
+#     where `epigraph-db` is `optional = true` and therefore absent. A gate that
+#     held a `PgPool` could not be installed in the no-db `AppState::new`, and
+#     "a fresh AppState denies by default" would be untrue in exactly the arm
+#     where it is cheapest to prove.
+#  2. There is no dependency cycle to worry about. The gate necessarily runs
+#     ABOVE the repo layer (`epigraph-db` would have to depend on this crate to
+#     call it, and this crate would have to depend on `epigraph-db` to resolve
+#     memberships), which is why PR-11's call sites are in `routes/` and
+#     `tools/`.
+#
+# The principal's write-capable group set is supplied BY THE CALLER, from
+# `epigraph_db::visibility::Viewer::writable_groups()`.
+[dependencies]
+epigraph-interfaces = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# `tests/fail_closed.rs` is DB-backed on purpose: the acceptance criterion is
+# role-shaped ("a `reader`-role member cannot write to their group"), and
+# `Viewer::test_scoped`'s own doc says a test that wants to prove a reader
+# cannot write MUST build its fixture through `Viewer::resolve`. Dev-only, so
+# none of this reaches `epigraph-api`'s no-db build.
+epigraph-db = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

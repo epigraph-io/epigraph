@@ -26,6 +26,7 @@ epigraph-ds = { workspace = true }
 # the stub and rerank would be inert even with the key set.
 epigraph-engine = { workspace = true, features = ["rerank"] }
 epigraph-interfaces = { workspace = true }
+epigraph-authz = { workspace = true }  # Fail-closed write gate for the declassification tools
 epigraph-embeddings = { workspace = true }
 epigraph-ingest = { workspace = true }
 epigraph-ingest-executor = { workspace = true }

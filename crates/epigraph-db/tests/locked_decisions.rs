@@ -13,6 +13,52 @@
 //! the four decisions, say so in the commit body; do not leave the reviewer to
 //! infer it from an untouched test file.
 //!
+//! ## Status at PR-11
+//!
+//! **PR-11 DOES touch a locked decision.** It changes the kernel's *write*
+//! authorization posture from allow-all to deny-by-default, which is D1 — not a
+//! route split, not a tenancy column, not a migration (PR-11 adds none;
+//! `migrations/README.md` reserves it no number), but the first of the four,
+//! read on the write side.
+//!
+//! * **D1 (nothing is public by absence, omission, or default-on-error)** —
+//!   extended from reads to writes. Three mechanisms, all in
+//!   `crates/epigraph-interfaces/src/policy.rs` and
+//!   `crates/epigraph-authz/src/lib.rs`:
+//!   - The kernel's type-level floor is `DenyAllPolicyGate`. It replaces
+//!     `NoOpPolicyGate`, whose `check()` returned `Ok(true)` unconditionally —
+//!     *public by default*, one layer up from `access_control.rs:68`.
+//!     **Say "floor", not "the default a deployment gets":**
+//!     `DenyAllPolicyGate` has zero production install sites. All six
+//!     `AppState` constructors and both `EpiGraphMcpFull` constructors install
+//!     `epigraph_authz::GroupPolicyGate`, and the test that pins *that* is
+//!     `epigraph-api/src/state.rs::the_default_gate_is_installed_at_every_constructor`.
+//!     [`d1_the_kernel_write_gate_is_not_an_allow_all`] below is a source scan
+//!     over `policy.rs`; it proves no allow-all is reachable in a production
+//!     build, which is a weaker and different claim than "a running process
+//!     denies by default". Both are needed; neither substitutes for the other.
+//!   - `PolicyGate::authorize` maps `Err(_)` to `Decision::Deny` inside the
+//!     trait, so no call site can spell *default-on-error*. This is the direct
+//!     analogue of PR-10's three-branch `retain_visible_subscriptions`.
+//!   - `GroupPolicyGate` denies a `ResourceRef` that names neither an owning
+//!     group nor an owning agent — *absence* is a denial, not a pass.
+//!
+//!   Asserted by [`d1_the_kernel_write_gate_is_not_an_allow_all`].
+//! * **D3 (`public` means any authenticated agent; no anonymous shape)** —
+//!   unchanged. PR-11 adds no `Viewer` constructor and no `SystemReason`. Its
+//!   two HTTP call sites take `middleware::bearer::ViewerExtractor`, which is
+//!   the one production path, and its two MCP call sites take
+//!   `tools::viewer::request_viewer`, which is the other. Neither invents a
+//!   principal: a viewer with no principal is refused, not defaulted.
+//! * **No route moved** between the `public` and `protected` chains, and no
+//!   route was added or removed. `public_router_allowlist.rs` is untouched.
+//! * **No RLS policy, no `WITH CHECK`, no write-side SQL predicate.** That half
+//!   is PR-16/PR-17's and PR-11 deliberately does not pre-empt it — see the
+//!   `-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate`
+//!   markers in `repos/claim.rs`, which are unchanged.
+//! * **No `FAIL_OPEN_SCOPE_SITES` row moved.** Locked decision Q7 assigns those
+//!   35 sites to PR-16 and PR-11 spends its mechanism elsewhere.
+//!
 //! ## Status at PR-10
 //!
 //! **PR-10 adds a migration and does NOT touch any of the four.** Said
@@ -165,6 +211,14 @@ const ROUTES_MOD_RS: &str = concat!(
 const MCP_VIEWER_RS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../epigraph-mcp/src/tools/viewer.rs"
+);
+
+/// D1's write half (PR-11). `crates/epigraph-interfaces/src/policy.rs` is
+/// where the kernel decides what an unconfigured deployment permits. Same
+/// cross-crate rationale as [`ROUTES_MOD_RS`].
+const INTERFACES_POLICY_RS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../epigraph-interfaces/src/policy.rs"
 );
 
 fn read(path: &str) -> String {
@@ -539,3 +593,115 @@ async fn d1_tenancy_tier_is_declared_never_defaulted(pool: PgPool) {
 // Nothing to assert at PR-04: none of those objects exists yet. Migration 062
 // creates `tenancy_transcription_log` as an empty ledger; `tenancy_migration_shape.rs`
 // pins its shape.
+
+// ===========================================================================
+// D1 — nothing is authorized by absence, omission, or default-on-error
+// ===========================================================================
+
+/// D1, write half: the kernel's default write gate is a **denial**, and the
+/// allow-all is not compiled into a production binary.
+///
+/// Before PR-11 the default was `NoOpPolicyGate`, whose `check()` returned
+/// `Ok(true)` for every `(agent, action, resource)`. That is "public by
+/// omission" for writes — the same defect D1 names at `access_control.rs:68`,
+/// one layer up — and it went unnoticed for as long as it did precisely because
+/// nothing ever called it, so no test could observe the verdict.
+///
+/// A text scan is the right instrument for the same reason as
+/// [`d3_viewer_has_no_infallible_constructor`]: the assertions are about what
+/// must be ABSENT, and there is no type to name when the point is that a
+/// production build must not contain one.
+#[test]
+fn d1_the_kernel_write_gate_is_not_an_allow_all() {
+    let raw = read(INTERFACES_POLICY_RS);
+    let code = strip_line_comments(&raw);
+
+    assert!(
+        code.contains("pub struct DenyAllPolicyGate"),
+        "the kernel default write gate must be a deny-all; if it was renamed, \
+         update this assertion in the same commit and say in the PR body which \
+         way the default now falls"
+    );
+    assert!(
+        !code.contains("pub struct NoOpPolicyGate"),
+        "`NoOpPolicyGate` returned Ok(true) unconditionally and was the \
+         kernel default. It must not come back under that name or any other \
+         un-cfg'd allow-all."
+    );
+
+    // The allow-all survives, and is reachable only under a cfg. The assertion
+    // is on the ATTRIBUTE immediately preceding the definition, not merely on
+    // the presence of the string somewhere in the file.
+    let at = code
+        .find("pub struct AllowAllPolicyGate")
+        .expect("AllowAllPolicyGate must still exist — plan §2.7 keeps it for tests");
+    let preceding = &code[..at];
+    assert!(
+        preceding
+            .rfind("#[cfg(any(test, feature = \"insecure-allow-all\"))]")
+            .is_some_and(|c| preceding[c..].matches('\n').count() <= 3),
+        "`AllowAllPolicyGate` must be immediately preceded by \
+         #[cfg(any(test, feature = \"insecure-allow-all\"))]"
+    );
+
+    // Nothing in the workspace may turn that feature on. A cargo feature CAN be
+    // enabled from a dependent crate's build graph — the hazard
+    // `Viewer::test_scoped` avoids by using `#[cfg(test)]` on its definition —
+    // so the cfg alone is not the control; this is.
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let mut enablers = Vec::new();
+    for entry in walk_manifests(std::path::Path::new(root)) {
+        let text = read(entry.to_str().expect("utf-8 path"));
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            // The declaration in epigraph-interfaces' own [features] table is
+            // the definition, not an enablement.
+            if line.starts_with("insecure-allow-all = ") {
+                continue;
+            }
+            if line.contains("insecure-allow-all") {
+                enablers.push(format!("{}: {line}", entry.display()));
+            }
+        }
+    }
+    assert!(
+        enablers.is_empty(),
+        "\n\nA manifest in this workspace enables `insecure-allow-all`, which \
+         compiles an allow-everything write gate:\n{}\n",
+        enablers.join("\n")
+    );
+}
+
+/// Every `Cargo.toml` under the workspace root, skipping `target/`.
+fn walk_manifests(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name == "target" || name == ".git" || name.starts_with('.') {
+                    continue;
+                }
+                stack.push(path);
+            } else if name == "Cargo.toml" {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    assert!(
+        out.len() > 10,
+        "expected to find the workspace's manifests, found {}",
+        out.len()
+    );
+    out
+}

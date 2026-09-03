@@ -1230,6 +1230,7 @@ dependencies = [
  "dotenvy",
  "ed25519-dalek",
  "epigraph-auth",
+ "epigraph-authz",
  "epigraph-cli",
  "epigraph-core",
  "epigraph-crypto",
@@ -1286,6 +1287,18 @@ dependencies = [
  "chrono",
  "jsonwebtoken",
  "serde",
+ "uuid",
+]
+
+[[package]]
+name = "epigraph-authz"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "epigraph-db",
+ "epigraph-interfaces",
+ "sqlx",
+ "tokio",
  "uuid",
 ]
 
@@ -1547,6 +1560,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "epigraph-auth",
+ "epigraph-authz",
  "epigraph-core",
  "epigraph-crypto",
  "epigraph-db",

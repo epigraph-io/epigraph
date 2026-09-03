@@ -79,6 +79,21 @@ pub struct EpiGraphMcpFull {
     /// distinct `auth.agent_id` per session (a fast in-memory short-circuit; the
     /// DB `create_if_not_exists` is the actual dedup authority). Empty at boot.
     pub(crate) seen_auth_lineage: Arc<Mutex<HashSet<uuid::Uuid>>>,
+    /// Write-authorization gate — the MCP twin of `epigraph_api::AppState`'s
+    /// `policy_gate` field, and injected for the same reason.
+    ///
+    /// PR-11's first pass constructed `epigraph_authz::GroupPolicyGate::new()`
+    /// *inline* inside `tools::perspectives::require_declassify_authority`,
+    /// which made `AppState::with_policy_gate` — the documented seam for a
+    /// deployment that installs its own policy — reach the HTTP surface and
+    /// silently not the MCP one. The two surfaces would have diverged the first
+    /// time anyone exercised the override, on the transport where the divergence
+    /// matters most: `call_tool` runs `enforce_tool_scope` only for HTTP calls,
+    /// so on stdio this gate is the only authorization that runs at all.
+    ///
+    /// Defaults to `GroupPolicyGate` in every constructor;
+    /// [`Self::with_policy_gate`] replaces it.
+    pub(crate) policy_gate: Arc<dyn epigraph_interfaces::PolicyGate>,
 }
 
 impl EpiGraphMcpFull {
@@ -459,6 +474,7 @@ impl EpiGraphMcpFull {
             llm_identity,
             signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
+            policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
         }
     }
 
@@ -526,6 +542,7 @@ impl EpiGraphMcpFull {
             llm_identity,
             signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
+            policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
         }
     }
 
@@ -548,6 +565,23 @@ impl EpiGraphMcpFull {
     #[must_use]
     pub fn with_generated_signer_identity(mut self) -> Self {
         self.signer_identity_declared = false;
+        self
+    }
+
+    /// Inject a deployment's own write-authorization gate (builder pattern).
+    ///
+    /// The MCP counterpart of `epigraph_api::AppState::with_policy_gate`. Both
+    /// exist so a deployment installs **one** policy and gets it on **both**
+    /// surfaces; a gate installed on only one of them is a fail-open relative to
+    /// the configured policy on whichever surface was missed.
+    ///
+    /// Consumed-self builder rather than a seventh constructor parameter, for
+    /// the same reason as [`Self::with_generated_signer_identity`]: both
+    /// `new_*_with_federation` signatures already carry six arguments and every
+    /// caller except a deployment with its own policy wants the default.
+    #[must_use]
+    pub fn with_policy_gate(mut self, gate: Arc<dyn epigraph_interfaces::PolicyGate>) -> Self {
+        self.policy_gate = gate;
         self
     }
 
@@ -1415,9 +1449,12 @@ impl EpiGraphMcpFull {
     async fn assign_ownership(
         &self,
         Parameters(params): Parameters<AssignOwnershipParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::perspectives::assign_ownership(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::perspectives::assign_ownership(self, viewer, params).await
     }
 
     #[tool(description = "Get ownership info (partition, owner) for a graph node by UUID.")]
@@ -1434,9 +1471,12 @@ impl EpiGraphMcpFull {
     async fn update_partition(
         &self,
         Parameters(params): Parameters<UpdatePartitionParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::perspectives::update_partition(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::perspectives::update_partition(self, viewer, params).await
     }
 
     // ── DS/Belief (7 tools — 4 enhanced + 3 new) ──
