@@ -11,6 +11,8 @@ pub mod routes;
 pub mod security;
 pub mod services;
 pub mod state;
+#[cfg(feature = "db")]
+pub mod tenancy_gauge;
 pub mod tls;
 pub mod webhook_bridge;
 

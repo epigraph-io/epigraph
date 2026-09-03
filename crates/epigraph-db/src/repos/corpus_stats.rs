@@ -169,4 +169,40 @@ impl CorpusStatsRepository {
         .await?;
         Ok(count.0)
     }
+
+    /// Today's undeclared-tenancy-write counts, per table.
+    ///
+    /// Feeds `epigraph-api`'s `epigraph_tenancy_undeclared_writes` Prometheus
+    /// gauge — the instrument plan §9.2's week-11b gate reads before migration
+    /// 074 turns migration 070 arm (a)'s warning into a hard `23502`.
+    ///
+    /// # This function takes no `Viewer`, deliberately
+    ///
+    /// `tenancy_undeclared_writes` (migration 062) holds `(table_name, day, n,
+    /// last_seen)` — an operational counter of *how many* writes arrived
+    /// undeclared. It carries no claim content, no ids, and no
+    /// `owner_group_id`; it is not in 062's `tier_a` array and has no column a
+    /// visibility predicate could filter on. So this is **not** a read that
+    /// takes a `Viewer` and ignores it, and it needs no `-- VISIBILITY-EXEMPT:`
+    /// marker: `visibility_lint.rs` scans functions whose parameters mention
+    /// `Viewer`, and adding an unnecessary exemption would redden
+    /// `EXPECTED_EXEMPTIONS`, which is an exact set.
+    ///
+    /// Restricted to `current_date` because the gate is "flat at zero for 24 h",
+    /// not "has never been non-zero" — a historical row from before the write
+    /// paths were fixed must not hold the gauge above zero forever.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the query fails.
+    pub async fn undeclared_writes_today(pool: &PgPool) -> Result<Vec<(String, i64)>, DbError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT table_name, n FROM tenancy_undeclared_writes
+              WHERE day = current_date
+              ORDER BY table_name",
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
+    }
 }

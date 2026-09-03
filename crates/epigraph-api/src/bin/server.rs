@@ -542,6 +542,67 @@ async fn main() {
 
     // Build router with all routes
     let metrics = Arc::new(Metrics::new());
+
+    // ---------------------------------------------------------------------
+    // Tenancy undeclared-write sampler (PR-12).
+    //
+    // Feeds `epigraph_tenancy_undeclared_writes`, the gauge plan §9.2's
+    // week-11b gate reads before migration 074 turns migration 070 arm (a)'s
+    // `RAISE WARNING` into a hard `23502`.
+    //
+    // WHY A TASK AND NOT A COLLECTOR. `prometheus_client` does expose
+    // `Registry::register_collector`, but `Collector::encode` is SYNCHRONOUS
+    // and cannot await an sqlx query, so the value has to be pushed in. That is
+    // the whole reason this lives in `bin/server.rs` and not in `metrics.rs`.
+    //
+    // WHY NOT IN A HANDLER. `no_bypass_in_handlers.rs` and
+    // `viewer_route_table_lint.rs` both police request handlers; more to the
+    // point, `public_router_allowlist.rs::metrics_is_not_registered_on_either_router`
+    // asserts `routes/mod.rs` mentions neither `/metrics` nor `metrics_router`.
+    // This adds no route at all — it writes into the same `Arc<Metrics>` the
+    // internal listener below already serves.
+    //
+    // It needs no `Viewer`: `tenancy_undeclared_writes` is an operational
+    // counter with no content and no `owner_group_id` (see
+    // `CorpusStatsRepository::undeclared_writes_today`).
+    //
+    // A sampling failure is logged and retried, never fatal: a database blip
+    // must not take the API down, and a stale gauge is visible in the
+    // scrape's staleness rather than silently reading zero.
+    #[cfg(feature = "db")]
+    {
+        let sampler_pool = state.db_pool.clone();
+        let sampler_metrics = metrics.clone();
+        let interval_secs: u64 = std::env::var("EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        // THE SAMPLER IS STATEFUL, which is why it is a type in
+        // `epigraph_api::tenancy_gauge` and not a closure here: a pass that
+        // writes only the rows its query returned can never take a series back
+        // DOWN, and `undeclared_writes_today` filters on `current_date`, so the
+        // day after an undeclared write the gauge would keep yesterday's value
+        // for the life of the process. See that module for the whole argument.
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
+            let mut sampler = epigraph_api::tenancy_gauge::TenancyGaugeSampler::new();
+            loop {
+                ticker.tick().await;
+                if let Err(e) = sampler.sample(&sampler_pool, &sampler_metrics).await {
+                    tracing::warn!(
+                        error = %e,
+                        "tenancy undeclared-write sampler failed; gauge will go stale"
+                    );
+                }
+            }
+        });
+        tracing::info!(
+            interval_secs,
+            "Tenancy undeclared-write gauge sampler started"
+        );
+    }
+
     let app = create_router(state).layer(axum::Extension(metrics.clone()));
 
     // ---------------------------------------------------------------------
