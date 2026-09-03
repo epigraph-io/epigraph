@@ -213,7 +213,7 @@
    {
     "pr": "PR-09",
     "sha": "0da55313",
-    "pr_url": "PENDING",
+    "pr_url": "https://github.com/epigraph-io/epigraph/pull/418",
     "branch": "tenancy/pr-09-mcp-viewer-tools",
     "verified_by": "implement -> verify -> critic (33 findings, 14 blocker/major) -> revise cycle",
     "tests": "3907 passed / 0 failed / 71 ignored / 0 measured across 361 test binaries (344 `Running` + 17 `Doc-tests` = 361 = 361 `test result:` lines, so no binary aborted or was OOM-killed). cargo test --workspace --locked --no-fail-fast -> exit 0, read from the job's own `echo TEST_EXIT=$?`, never through a pipe. Run against epigraph_tenancy_pr09_test, whose name ENDS IN `_test`, so claim_repo_helpers.rs::db_is_disposable passes and the ~33 destructive fixtures actually ran. Zero matches in the full log for: `error: test failed` | `^failures:` | `panicked at` | Killed | SIGKILL | No space left | out of memory | FAILED.\nDELTA +23 passed over the pre-revision 3884, all net new, none removed: +6 tenant_isolation_mcp (list_events under-another-key, list_events uuid-names-no-claim, system_stats detailed, suggest_alternative_sets private-edge, find_cross_source_matches, embedding density+breakdown), +4 http_calls_cannot_reach_a_tool_without_an_auth_context, +3 tool_viewer_is_spent, +2 epigraph-db repo (contents_by_ids_any_version, hidden_claim_ids), +7 epigraph-api payload_uuids unit tests, +1 tenant_isolation_http (list_events both halves). DELTA +1 ignored (70 -> 71) is ONE new ```ignore doc-test fence in tools/viewer.rs's module doc, not a disabled test: `git diff HEAD | grep '^+.*ignore]'` matches nothing but text inside PR-08's own ledger entry, and no #[test]/#[sqlx::test]/#[tokio::test] attribute or test fn was removed.",
