@@ -53,7 +53,7 @@ Group-scoped encryption (`seal`) is last and deliberately optional.
 | PR-09 | derive a Viewer on every content-reading MCP tool | not started |
 | PR-10 | filter webhook fan-out and federation forwarding by tenancy | not started |
 | PR-11 | fail-closed, resource-aware write gate (replaces assign_ownership) | not started |
-| PR-12 | batched, resumable tenancy backfill with write-side stamping | not started |
+| PR-12 | batched, resumable tenancy backfill with write-side stamping | **done** (migrations 070/071, `epigraph-tenancy-backfill`) |
 | PR-13 | edge co-ownership so the endpoint meet is expressible | not started |
 | PR-14 | delete redaction — a non-visible row is absent, not blanked | not started |
 | PR-15 | maintenance DSN for every background writer, before FORCE | not started |
@@ -93,7 +93,14 @@ several gate specific PRs.
 |---|----------|-------|
 | M1 | `ownership` row census | before PR-12; blocks PR-22 |
 | M3 | prod `_sqlx_migrations` head — confirm nothing at 060+ | **PR-01's W0 gate, still unperformed** |
-| M4 | row counts across the 24 tier-A tables, to size DDL windows | before PR-04 |
+| M4 | row counts across the **25** tier-A tables, to size DDL windows | before PR-04 |
+
+> **M4 said 24; it is 25.** Migration 062's `tier_a` array has 25 entries and
+> seeds exactly 25 rows into `tenancy_backfill_progress` (verified:
+> `SELECT count(*)` = 25). An implementation built against 24 leaves one entity
+> permanently `complete = false` and `epigraph-tenancy-backfill verify` fails
+> forever. Corrected by PR-12.
+
 | M5 | session-GUC probe against the real cluster topology (pgbouncer?) | blocks PR-04, gates PR-17 |
 | M6 | OAuth client `agent_id` coverage must be 100 % | gates PR-03 |
 | M7 | partition split `f_group` | gates PR-06 acceptance and the `062b` decision |
@@ -148,6 +155,38 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   lowers it; a thirteenth unreviewed exemption fails the build). **Reviewing
   those five is the gate this bullet names.**
 - **PR-12 owes** ongoing community→group projection, in BOTH directions.
+  **DONE in PR-12** — `CommunityRepository::create` now projects the `groups`
+  row (plus its epoch-0 `group_key_epochs` row, and an `admin` membership when a
+  creator is known), `add_member` projects a `role='reader'`
+  `group_memberships` row, and `remove_member` sets `revoked_at` — guarded by a
+  `NOT EXISTS` so removing one of an agent's two perspectives does not cut
+  access the other still justifies. Covered by the NEW
+  `crates/epigraph-db/tests/community_projection.rs`, which goes through the
+  REPOSITORY rather than replaying 068, and so can actually observe the drift.
+  The `create` projection is load-bearing rather than tidy — but **not** for the
+  reason an earlier revision of this bullet gave. It said migration 071's shim
+  "resolves a `community` partition through the projected group" and implied it
+  fails if the group is absent. It does not: 071 INSERTs the group on demand,
+  replays 068's membership projection, and falls through to the owner's personal
+  group when no live membership results. The real reason is that the projection
+  is a standing invariant `tenancy_coverage.rs` structurally cannot observe
+  (it replays 068 before asserting), so without `create` projecting, the
+  invariant breaks on the first `POST /api/v1/communities` and 071 papers over
+  it with `created_by_agent_id` NULL — 068's zero-administrator dead end.
+
+  **MEMBERSHIP IS NOW CLOSED, and that is a security fix PR-12 owed because
+  PR-12 caused it.** `POST /api/v1/communities/:id/members` had no authorization
+  (`F-PR11-community-membership-is-self-service`). Before PR-12 the consequence
+  lived only in `check_content_access`'s community arm, which PR-14 deletes;
+  projecting the membership moves it into the control plane that SURVIVES PR-14
+  and that PR-17 arms, so a stranger could create a perspective, POST it into
+  any community, and read that community's private corpus. `add_member` and
+  `remove_member` now require the acting agent to hold a live membership in the
+  community's projected group (bootstrap exception when the group has none;
+  `remove_member` additionally always permits removing your own perspective),
+  and the DELETE handler — which previously extracted nothing at all — now takes
+  a `ViewerExtractor`. Full route-level authorization is still PR-16's.
+  Original description follows.
   Migration 068's projection is a **one-time snapshot**:
   - `CommunityRepository::create` and `add_member`
     (`crates/epigraph-db/src/repos/community.rs:42,110`) still write only
@@ -167,6 +206,17 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   output and is structurally incapable of observing either drift. Its doc
   comment says so; do not read it as coverage of this gap.
 - **PR-12 or PR-18 owes** an administrator for every projected community group.
+  **PARTIALLY DONE in PR-12** — `CommunityRepository::create` takes an
+  `Option<Uuid> created_by_agent_id`, sets `groups.created_by_agent_id` from it
+  and gives that agent a live `admin` membership. `POST /api/v1/communities` now takes a
+  `ViewerExtractor` and passes `Viewer::principal()`, so a community created
+  through the route has a live admin from the moment it exists. (That route is
+  already on the PROTECTED router, so the extractor changes who the creator IS,
+  not whether the route is reachable, and `community.rs` appears in neither of
+  `viewer_route_table_lint.rs`'s registers.) It is **NOT** closed for the
+  communities migration 068 already projected — `communities` has no creator
+  column to derive one from — so **still open for PR-18** for those.
+  Original description follows.
   Migration 068 projects members as `reader` and leaves
   `groups.created_by_agent_id` NULL (`communities` has no creator column to
   derive one from), so a projected group has **zero admins**: `POST
