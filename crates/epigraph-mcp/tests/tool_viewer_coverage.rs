@@ -38,15 +38,26 @@
 use std::path::{Path, PathBuf};
 
 /// Tools whose dispatch body acquires **no** viewer, as measured on
-/// **2026-09-03** after PR-09.
+/// **2026-09-03** after PR-09, minus the two PR-11 converted.
 ///
 /// Three groups:
 ///
-/// * **Write / decide paths (18).** Converting one needs
-///   `viewer.writable_bind()` — member-with-write-role, not merely
-///   member-who-can-read — which is **PR-16**'s mechanism and does not exist
-///   yet. `progress.json`'s `Q7_failopen_scope_site_ownership` assigns them.
-///   Acquiring a read viewer here would be theatre.
+/// * **Write / decide paths (15).** The count went **17 → 15**, not 18 → 15:
+///   PR-11 removed two names, and the "(18)" this doc previously carried was a
+///   pre-existing miscount — the base array held 17 write-group entries. The
+///   array length is what the test asserts, so nothing was broken by it; it is
+///   corrected here rather than silently absorbed. Converting one needs write
+///   authority —
+///   member-with-write-role, not merely member-who-can-read. That mechanism
+///   turned out to **already exist**: `Viewer::resolve` has split `writable`
+///   out by role since PR-03 and `Viewer::writable_bind()` has been public
+///   since PR-04, so this const's previous claim that it "does not exist yet"
+///   was false when it was written. What PR-16 still owns is the *SQL* half —
+///   the write-side predicate and `WITH CHECK` — and `progress.json`'s
+///   `Q7_failopen_scope_site_ownership` assigns the 35 `check_scopes` route
+///   sites there. PR-11 built the Rust half (`crates/epigraph-authz`) and spent
+///   it on the two declassification tools, which is why `assign_ownership` and
+///   `update_partition` are no longer in this list.
 /// * **Pure-CPU, no DB (2).** `stage_claims` validates strings and takes
 ///   `_server`; `list_mcp_tools` reads the compiled-in manifest. A viewer here
 ///   would be a parameter with nothing to filter.
@@ -59,7 +70,18 @@ use std::path::{Path, PathBuf};
 ///   - `get_ownership` — reads the legacy `ownership` table, which **PR-14
 ///     deletes** along with `routes/ownership.rs` and MCP `assign_ownership` /
 ///     `update_partition`. Filtering a surface that is being removed two PRs
-///     from now is churn.
+///     from now is churn. **This is an accepted residual, not a normal shape.**
+///     PR-11 gated the two WRITES on this table and deliberately left the reads
+///     open, and the consequence is worth stating plainly: `get_ownership` (MCP
+///     and HTTP) and HTTP `owned_nodes` disclose `owner_id` — the exact field the
+///     new write gate's decision turns on — to any authenticated caller, so the
+///     read side is a free oracle for the write gate's input, and `owned_nodes`
+///     enumerates which of an arbitrary agent's nodes are `private`. The
+///     available predicate is `owner_id = viewer.principal()`, which is the same
+///     predicate the gate itself uses; the reason it was not applied is
+///     sequencing (PR-14 deletes this whole surface), not that it is
+///     unavailable. Tracked as `F-PR11-ownership-reads-are-an-owner-oracle` in
+///     `docs/tenancy/progress.json`, owned by PR-14.
 ///   - `theme_cluster` — the corpus-wide `FROM claims` is in
 ///     `epigraph-engine/src/theme_kmeans.rs::run_theme_kmeans`, not in the MCP
 ///     tool, and that function has a second caller: the HTTP twin
@@ -71,9 +93,12 @@ use std::path::{Path, PathBuf};
 ///     `claim_themes` `tenancy_exempt` residual **without its stated control**;
 ///     that is the single largest thing PR-09 does not deliver.
 const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
-    // write / decide — PR-16 (and PR-11 for the authz gate)
+    // write / decide — PR-16 owns the SQL write-side predicate for these.
+    // `assign_ownership` and `update_partition` left this list in PR-11: they
+    // now acquire a viewer, spend its `writable_groups()`/principal on
+    // `epigraph_authz::GroupPolicyGate`, and refuse a caller who is neither the
+    // node's owner nor a writer in its owning group.
     "add_step",
-    "assign_ownership",
     "challenge_claim",
     "create_frame",
     "create_perspective",
@@ -88,7 +113,6 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     "set_source_reliability",
     "structure_source",
     "update_labels",
-    "update_partition",
     // pure-CPU, no DB
     "list_mcp_tools",
     "stage_claims",

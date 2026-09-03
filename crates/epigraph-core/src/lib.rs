@@ -58,9 +58,8 @@ pub use challenge::{
     ChallengeService, ChallengeState, ChallengeType,
 };
 pub use extensions::{
-    Action, EncryptionError, EncryptionProvider, InterfaceError, NoOpEncryption,
-    NoOpEncryptionProvider, NoOpOrchestration, NoOpOrchestrationBackend, NoOpPolicyGate,
-    OrchestrationBackend, OrchestrationError, PolicyError, PolicyGate, TaskStatus,
+    Action, Decision, DenyAllPolicyGate, InterfaceError, PolicyError, PolicyGate, Principal,
+    ResourceKind, ResourceRef,
 };
 
 // Re-export domain types for convenience

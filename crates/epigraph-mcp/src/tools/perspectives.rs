@@ -8,6 +8,109 @@ use crate::types::*;
 
 use epigraph_db::{EdgeRepository, OwnershipRepository, PerspectiveRepository};
 
+/// Ask the **installed** fail-closed write gate whether `viewer`'s principal
+/// may change the ownership or partition of `node_id`.
+///
+/// # Why this exists on the MCP surface specifically
+///
+/// `scope_map.rs` gates HTTP `update_partition` at `claims:admin` but MCP
+/// `assign_ownership` at **`claims:write`** — so before PR-11 a `claims:write`
+/// token could set `partition_type` on any node over MCP, obtaining a
+/// declassification power the same operation is denied over HTTP and its own
+/// sibling tool is denied over MCP. `oauth/metadata.rs`'s comment claims the
+/// admin gate covers "`mark_duplicate` / `supersede_claim` / `update_partition`"
+/// and conspicuously omits `assign_ownership`. Widening the scope entry would
+/// be the smaller change; it would also be a scope check, which cannot say
+/// *this principal, this node*.
+///
+/// The gate comes from `server.policy_gate`, **not** from a
+/// `GroupPolicyGate::new()` constructed here. PR-11's first pass built one
+/// inline, which made `AppState::with_policy_gate` reach the HTTP surface and
+/// silently not this one; `EpiGraphMcpFull::with_policy_gate` is the MCP half
+/// of that seam.
+///
+/// # What the gate does and does not constrain on each transport
+///
+/// `server.rs::call_tool` runs `enforce_tool_scope` only when `is_http_call`,
+/// so on stdio this gate is the only authorization that runs at all. That is a
+/// statement about what else is absent, **not** a claim that the gate is
+/// strong there: this gate binds a caller to the *resolved principal*, and on
+/// stdio (and on the `--allow-unauthenticated-http` unix-socket listener) that
+/// principal is the shared server agent
+/// (`tools/viewer.rs`'s per-request acquisition helper, plus
+/// `auth.rs::unauthenticated_context`). On
+/// those transports it therefore constrains callers only relative to *other*
+/// agents' nodes — every node the server itself claimed is already owned by the
+/// principal asking. On the production HTTPS transport the principal is the
+/// caller's own agent and the gate is load-bearing.
+///
+/// # The owner of record
+///
+/// `owner_of_record` is `Some` only when the `ownership` row exists, and it is
+/// then the value the **database** holds. `requested_owner` is the value the
+/// *caller* named, and it is admitted to the gate's owner slot in exactly one
+/// case: when it equals the caller's own principal, i.e. a self-claim of a node
+/// nobody has claimed. Any other combination leaves the [`ResourceRef`]
+/// undeclared, and `GroupPolicyGate` denies an undeclared resource ("nothing is
+/// authorized by absence"). Caller-supplied input can therefore never *widen*
+/// the decision.
+///
+/// No `owned_by_group`: `ownership.community_id` references `communities`, not
+/// `groups`, so there is no group here whose write roll-call
+/// `Viewer::writable_groups()` describes. See the twin note in
+/// `epigraph-api/src/routes/ownership.rs::assign_ownership`.
+async fn require_declassify_authority(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    node_id: uuid::Uuid,
+    owner_of_record: Option<uuid::Uuid>,
+    requested_owner: Option<uuid::Uuid>,
+) -> Result<(), McpError> {
+    use epigraph_interfaces::{Action, Principal, ResourceKind, ResourceRef};
+
+    let Some(id) = viewer.principal() else {
+        return Err(invalid_params(
+            "this tool requires an authenticated principal",
+        ));
+    };
+    let principal = Principal::new(id, viewer.writable_groups().to_vec());
+    let resource = ResourceRef::new(ResourceKind::Ownership, node_id);
+    let resource = match (owner_of_record, requested_owner) {
+        // A row exists: the gate decides against the owner the DATABASE holds.
+        (Some(owner), _) => resource.owned_by_agent(owner),
+        // No row, and the caller asked for the node to be theirs. A self-claim
+        // is the one request-derived value that may reach the owner slot.
+        (None, Some(requested)) if requested == id => resource.owned_by_agent(id),
+        // No row and a third-party (or absent) requested owner: the resource
+        // stays undeclared and the gate refuses it.
+        (None, _) => resource,
+    };
+
+    // `PolicyGate` is not imported: `server.policy_gate` is an
+    // `Arc<dyn PolicyGate>`, whose methods are reached through the vtable.
+    let decision = server
+        .policy_gate
+        .authorize(&principal, &Action::Declassify, &resource)
+        .await;
+
+    if decision.is_allowed() {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        target: "authz.write.denied",
+        node_id = %node_id,
+        principal = %id,
+        action = "Declassify",
+        reason = decision.denial_reason().unwrap_or("unspecified"),
+        "write gate denied an ownership change"
+    );
+    // The denial reason names the owner; the caller may not be entitled to it.
+    Err(invalid_params(
+        "you may not change the ownership or partition of this node",
+    ))
+}
+
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
@@ -175,16 +278,46 @@ pub async fn get_perspective(
 }
 
 /// Assign ownership of a node to an agent with a partition type.
+///
+/// Gated by [`require_declassify_authority`] since PR-11: a node that already
+/// has an `ownership` row may be reassigned only by the owner the database
+/// records, and a node that has none may be claimed only **to yourself**.
+///
+/// # `owner_id` defaults to the CALLER, not to the server (PR-11 fix)
+///
+/// This tool previously defaulted an omitted `owner_id` to
+/// `EpiGraphMcpFull::agent_id()` — the server's own signing-key agent row, not
+/// the requester. On stdio those are the same identity
+/// (`tools/viewer.rs`'s acquisition helper resolves `server.agent_id()` when there is
+/// no `AuthContext`), so the difference was invisible; on the HTTP transport the
+/// principal is the *caller's* agent, so "claim this node" silently meant
+/// "give this node to the server", and once the gate landed it meant "denied for
+/// everyone but the server". Defaulting to `viewer.principal()` is a provable
+/// no-op on stdio and makes the HTTP arm mean what the tool description says.
 pub async fn assign_ownership(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: AssignOwnershipParams,
 ) -> Result<CallToolResult, McpError> {
     let node_id = parse_uuid(&params.node_id)?;
     let owner_id = if let Some(ref id) = params.owner_id {
         parse_uuid(id)?
     } else {
-        server.agent_id().await?
+        viewer
+            .principal()
+            .ok_or_else(|| invalid_params("this tool requires an authenticated principal"))?
     };
+
+    // CONTROL-PLANE READ, deliberately not viewer-spliced. `OwnershipRepository::get`
+    // is an unfiltered `SELECT ... WHERE node_id = $1` and must stay that way: this
+    // read feeds the authorization decision, and filtering it would make "the row is
+    // invisible to me" indistinguishable from "there is no row", which the branch in
+    // `require_declassify_authority` resolves toward self-claim.
+    let owner_of_record = OwnershipRepository::get(&server.pool, node_id)
+        .await
+        .map_err(internal_error)?
+        .map(|row| row.owner_id);
+    require_declassify_authority(server, viewer, node_id, owner_of_record, Some(owner_id)).await?;
 
     let community_id = if let Some(ref id) = params.community_id {
         Some(parse_uuid(id)?)
@@ -242,11 +375,28 @@ pub async fn get_ownership(
 }
 
 /// Update the partition type of a node.
+///
+/// The declassification primitive, and gated as one since PR-11. The owner
+/// lookup happens before the update so the decision is made against the
+/// pre-change owner.
+///
+/// There is no self-claim case here — this tool refuses a node with no
+/// `ownership` row — so `requested_owner` is `None` and the gate's owner slot
+/// can only ever hold the database's value.
 pub async fn update_partition(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: UpdatePartitionParams,
 ) -> Result<CallToolResult, McpError> {
     let node_id = parse_uuid(&params.node_id)?;
+
+    // CONTROL-PLANE READ, deliberately not viewer-spliced — see the twin note in
+    // `assign_ownership`.
+    let existing = OwnershipRepository::get(&server.pool, node_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_params(format!("no ownership record for {node_id}")))?;
+    require_declassify_authority(server, viewer, node_id, Some(existing.owner_id), None).await?;
 
     let row = OwnershipRepository::update_partition(&server.pool, node_id, &params.partition_type)
         .await

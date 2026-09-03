@@ -5,6 +5,7 @@ exclude = [
 ]
 members = [
     "crates/epigraph-interfaces",
+    "crates/epigraph-authz",
     "crates/epigraph-core",
     "crates/epigraph-crypto",
     "crates/epigraph-ds",
@@ -65,7 +66,8 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 curve25519-dalek = "4"
 
 # Internal crates (kernel only)
-epigraph-interfaces = { path = "crates/epigraph-interfaces" }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
+epigraph-interfaces = { path = "crates/epigraph-interfaces" }  # Extension point traits (PolicyGate, LlmProvider)
+epigraph-authz = { path = "crates/epigraph-authz" }  # Fail-closed, resource-aware write gate (GroupPolicyGate)
 epigraph-auth = { path = "crates/epigraph-auth" }
 epigraph-core = { path = "crates/epigraph-core" }
 epigraph-crypto = { path = "crates/epigraph-crypto" }
