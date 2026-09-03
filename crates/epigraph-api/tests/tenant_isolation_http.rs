@@ -1453,3 +1453,98 @@ async fn list_events_http_hides_a_private_claim_from_both_the_table_and_the_ring
 
     let _ = shutdown.send(());
 }
+
+// ── GET /api/v1/match_candidates — the one regression class reachable TODAY ─
+//
+// Every other behaviour change in PR-09 is inert until PR-12 writes the first
+// `visibility = 'group'` row. This one is not: `match_candidates` rows over
+// superseded claims exist on any live corpus, because nothing prunes the queue
+// when `supersede_claim` / `mark_duplicate` flips `is_current`.
+//
+// The regression already shipped silently once INSIDE this PR. `list_candidates`
+// replaced an inline `SELECT id, content FROM claims WHERE id = ANY($1)` (no
+// `is_current` filter) with `ClaimRepository::contents_by_ids` (which has one),
+// and every superseded pair would have rendered as the literal
+// `"(claim not found)"` — for a claim that exists. The repo-layer test on
+// `contents_by_ids_any_version` pins the FUNCTION's contract; only this case
+// pins the CALL SITE. Swap the call back to `contents_by_ids` and this fails.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_candidates_http_renders_the_excerpt_of_a_superseded_claim() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("connect test pool");
+
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "candidates-http").await;
+
+    // A distinctive marker so the assertion reads the CONTENT, not a field
+    // name: a rename of `claim_a_excerpt` must not be able to turn a
+    // regression into a pass.
+    let marker = format!("supersededmarker{}", Uuid::new_v4().simple());
+    let stale = fixture::seed_public_claim(&pool, agent, &marker).await;
+    let live = fixture::seed_public_claim(
+        &pool,
+        agent,
+        &format!("candidates-http live side {}", Uuid::new_v4()),
+    )
+    .await;
+
+    // Retire one side of the pair AFTER the candidate would have been queued —
+    // the ordinary lifecycle, not a contrived state.
+    sqlx::query("UPDATE claims SET is_current = false, embedding = NULL WHERE id = $1")
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .expect("supersede one side of the pair");
+
+    let (a, b) = if stale < live {
+        (stale, live)
+    } else {
+        (live, stale)
+    };
+    sqlx::query(
+        "INSERT INTO match_candidates (claim_a, claim_b, score, status, features) \
+         VALUES ($1, $2, 0.91, 'pending', '{}'::jsonb)",
+    )
+    .bind(a)
+    .bind(b)
+    .execute(&pool)
+    .await
+    .expect("seed the candidate");
+
+    let token = common::mint_token_with_agent(&["claims:read", "graph:read"], agent);
+    let (addr, shutdown) = common::spawn_app(&url).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/match_candidates?status=pending&limit=1000"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("GET /api/v1/match_candidates");
+    let status = resp.status();
+    let body = resp.text().await.expect("response body");
+    assert!(
+        status.is_success(),
+        "GET /api/v1/match_candidates must succeed; got {status}: {body}"
+    );
+
+    assert!(
+        body.contains(&marker),
+        "the superseded claim's verbatim excerpt must be rendered. This \
+         endpoint's own doc promises \"verbatim content excerpts of both claims \
+         in each pair\", and `match_candidates` rows routinely outlive the \
+         claims they name. Body: {body}"
+    );
+    assert!(
+        !body.contains("(claim not found)"),
+        "rendering `(claim not found)` for a claim that EXISTS is actively \
+         false text, not merely a missing excerpt. Body: {body}"
+    );
+
+    let _ = shutdown.send(());
+}

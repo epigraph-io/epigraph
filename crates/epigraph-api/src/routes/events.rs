@@ -358,14 +358,36 @@ pub async fn list_events(
 /// *and* are invisible.
 ///
 /// Hand-written rather than a `regex` compile, because the shape is fixed: 36
-/// characters, hex except for `-` at offsets 8, 13, 18 and 23. The two
-/// implementations must agree; if either changes, change both.
+/// characters, hex except for `-` at offsets 8, 13, 18 and 23.
 ///
-/// `pub(crate)` since PR-10: `routes/webhooks.rs::deliver_event` applies the
-/// same rule to the webhook fan-out, and a second hand-rolled uuid scanner
-/// would be a second thing to keep in step with `EventRepository::list`'s
-/// `regexp_matches`. Two implementations were already one too many.
-#[cfg(feature = "db")]
+/// # The two implementations are not identical, and the asymmetry is the safe
+/// # one — do NOT "fix" it
+///
+/// Postgres `regexp_matches(..., 'g')` returns **non-overlapping** matches: it
+/// resumes scanning after the end of each match. This scanner slides over
+/// **every** byte offset, so on a long hex-and-dash run it collects overlapping
+/// windows that Postgres skips. The Rust set is therefore a **superset** of the
+/// SQL set, which means the in-memory half can only drop MORE events than the
+/// persisted half — fail-closed.
+///
+/// Narrowing the Rust side to match Postgres exactly would make the in-memory
+/// half the more permissive of the two, which is the direction that produces a
+/// leak. The property to preserve is `rust ⊇ sql`, not `rust == sql`. Both
+/// sides are pinned by
+/// `payload_uuid_tests::an_over_long_hex_run_yields_its_prefix_in_both_implementations`,
+/// which records the Postgres output verbatim.
+///
+/// # `pub(crate)` since PR-10 — and the asymmetry above is exactly why
+///
+/// `routes/webhooks.rs::deliver_event` applies the same rule to the webhook
+/// fan-out. It shares THIS scanner rather than growing its own, and the
+/// paragraph above is the reason that matters rather than being mere tidiness:
+/// the fan-out wants the SUPERSET. An extra uuid can only cost it an extra
+/// suppression, never an extra delivery, because
+/// `ClaimRepository::hidden_claim_ids` returns only ids that name a real row
+/// and are invisible. A third hand-rolled scanner would be a third thing to
+/// keep on the safe side of `rust ⊇ sql`, and the one that drifted would drift
+/// toward delivering.
 pub(crate) fn payload_uuids(payload: &serde_json::Value) -> Vec<Uuid> {
     const DASHES: [usize; 4] = [8, 13, 18, 23];
     let text = payload.to_string();
