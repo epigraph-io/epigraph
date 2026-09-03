@@ -14,37 +14,92 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     )]))
 }
 
-pub async fn paragraph_3072_population(pool: &sqlx::PgPool) -> Result<f64, sqlx::Error> {
+/// Fraction of level-2 paragraphs carrying a 3072-d embedding, viewer-scoped.
+///
+/// PR-09: took a bare pool. The ratio itself is not the disclosure — the
+/// denominator is: `COUNT(*) FROM claims WHERE level = 2` told any caller the
+/// exact paragraph population of the whole corpus, and the result is surfaced
+/// through `recall_with_context`'s `corpus_scope`. Scoped, both counts are the
+/// reader's own, and the auto-detect decision is made on the corpus the reader
+/// will actually search — which is also the more correct answer.
+pub async fn paragraph_3072_population(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<f64, sqlx::Error> {
     let row = sqlx::query!(
         r#"
         SELECT
-            COUNT(*) FILTER (WHERE embedding_3072 IS NOT NULL)::float8
+            COUNT(*) FILTER (WHERE c.embedding_3072 IS NOT NULL)::float8
               / NULLIF(COUNT(*), 0)::float8 AS frac_3072
-        FROM claims
-        WHERE (properties->>'level')::int = 2
-        "#
+        FROM claims c
+        WHERE (c.properties->>'level')::int = 2
+          AND ($1::bool OR c.visibility = 'public'
+               OR c.owner_group_id = ANY($2::uuid[]))
+        "#,
+        viewer.bypass_bind(),
+        viewer.group_bind().unwrap_or(&[])
     )
     .fetch_one(pool)
     .await?;
     Ok(row.frac_3072.unwrap_or(0.0))
 }
 
-async fn detect_centroid_dim(pool: &sqlx::PgPool) -> Result<u32, sqlx::Error> {
-    let frac = paragraph_3072_population(pool).await?;
+async fn detect_centroid_dim(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<u32, sqlx::Error> {
+    let frac = paragraph_3072_population(pool, viewer).await?;
     Ok(if frac >= 0.5 { 3072 } else { 1536 })
 }
 
-async fn compute_corpus_scope(pool: &sqlx::PgPool) -> Result<CorpusScope, sqlx::Error> {
+/// Corpus cardinality reported alongside every `recall_with_context` response.
+///
+/// PR-09: three of the four counts are viewer-scoped. `papers` and
+/// `claim_themes` are NOT in migration 062's `tier_a` array and have no
+/// `owner_group_id`, so there is nothing to filter on; `claim_themes` is the
+/// table plan §2.4 registers as `tenancy_exempt` with theme clustering as its
+/// control. Both are annotated in the SQL rather than left silent.
+async fn compute_corpus_scope(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<CorpusScope, sqlx::Error> {
     // Per spec §3.1 / Locked-in 5.5: corpus_scope always populated on success.
     // One round-trip with subselects to avoid four separate COUNT queries.
     let row = sqlx::query!(
         r#"
         SELECT
-          (SELECT COUNT(*) FROM claims) AS claims_total,
-          (SELECT COUNT(*) FROM claims WHERE (properties->>'level')::int = 2) AS paragraph_total,
+          (SELECT COUNT(*) FROM claims c
+             WHERE ($1::bool OR c.visibility = 'public'
+                    OR c.owner_group_id = ANY($2::uuid[]))) AS claims_total,
+          (SELECT COUNT(*) FROM claims c2
+             WHERE (c2.properties->>'level')::int = 2
+               AND ($1::bool OR c2.visibility = 'public'
+                    OR c2.owner_group_id = ANY($2::uuid[]))) AS paragraph_total,
+          -- VISIBILITY-EXEMPT: `papers` is not in migration 062's tier_a array
+          -- and carries no owner_group_id. A bibliographic-record count, not
+          -- claim content.
           (SELECT COUNT(*) FROM papers) AS paper_total,
+          -- VISIBILITY-EXEMPT: `claim_themes` is the table plan §2.4 registers
+          -- as tenancy_exempt; it has no owner_group_id either, so no predicate
+          -- can be written here.
+          --
+          -- §2.4's stated control for that residual is viewer-scoped
+          -- clustering, and PR-09 DID NOT SHIP IT. `theme_cluster` still calls
+          -- `epigraph_engine::theme_kmeans::run_theme_kmeans`, which takes no
+          -- Viewer. An earlier revision of this comment asserted the control as
+          -- if it existed; an exemption whose written reason is false is worse
+          -- than an unannotated one, because `visibility_lint.rs` trains
+          -- reviewers to read exactly these lines.
+          --
+          -- Owner of the residual: the PR that threads a Viewer through
+          -- `theme_kmeans::run_theme_kmeans` must land BOTH callers together —
+          -- this tool and `epigraph-api/src/routes/crud.rs::build_themes_from_corpus`
+          -- — or MCP hardens while HTTP stays corpus-wide. Ledgered as
+          -- D-PR16-theme-cluster-viewer-scope in docs/tenancy/progress.json.
           (SELECT COUNT(*) FROM claim_themes) AS themes_total
-        "#
+        "#,
+        viewer.bypass_bind(),
+        viewer.group_bind().unwrap_or(&[])
     )
     .fetch_one(pool)
     .await?;
@@ -389,7 +444,7 @@ pub async fn recall_with_context(
                 "centroid_dim must be 1536 or 3072 (got {d})"
             )));
         }
-        None => detect_centroid_dim(&server.pool)
+        None => detect_centroid_dim(&server.pool, viewer)
             .await
             .map_err(|e| internal_error(format!("auto-detect centroid_dim: {e}")))?,
     };
@@ -397,7 +452,7 @@ pub async fn recall_with_context(
     // Spec §3.4: explicit 3072 against an unpopulated column must error
     // (otherwise the empty kNN result is indistinguishable from "no relevant paragraphs").
     if matches!(params.centroid_dim, Some(3072)) {
-        let frac = paragraph_3072_population(&server.pool)
+        let frac = paragraph_3072_population(&server.pool, viewer)
             .await
             .map_err(|e| internal_error(format!("3072 population check: {e}")))?;
         if frac == 0.0 {
@@ -690,7 +745,7 @@ async fn recall_with_context_post_embed(
 
     if raw_hits.is_empty() {
         // Empty result still returns corpus_scope (#52 Finding 2).
-        let corpus_scope = compute_corpus_scope(&server.pool)
+        let corpus_scope = compute_corpus_scope(&server.pool, viewer)
             .await
             .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
         let event_id = Uuid::new_v4();
@@ -837,6 +892,7 @@ async fn recall_with_context_post_embed(
     let paragraph_ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
     let ctx = fetch_batched_context(
         &server.pool,
+        viewer,
         &paragraph_ids,
         siblings_limit,
         corroborates_limit,
@@ -1044,7 +1100,7 @@ async fn recall_with_context_post_embed(
         }
     }
 
-    let corpus_scope = compute_corpus_scope(&server.pool)
+    let corpus_scope = compute_corpus_scope(&server.pool, viewer)
         .await
         .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
 
@@ -1115,12 +1171,50 @@ pub struct BatchedContext {
     pub paragraphs_by_atom: std::collections::HashMap<Uuid, Vec<Uuid>>,
 }
 
+/// Batched structural context for a set of paragraph hits.
+///
+/// # Tenancy (PR-09)
+///
+/// This function is the single largest fail-open the MCP surface had. It took a
+/// bare `&sqlx::PgPool` and no `Viewer`, and it is called from
+/// `recall_with_context_post_embed` — which *does* hold a `&Viewer` and passes
+/// it to seven other calls. So a viewer-scoped seed set was enriched with
+/// unscoped neighbours: the tenancy filter applied to the hits and was then
+/// bypassed for the section text, sibling paragraphs, atom children,
+/// CORROBORATES neighbours and paper attribution returned alongside them. Four
+/// of the ten statements selected `c.content` directly.
+///
+/// Every one of the ten now carries the static three-bind visibility form
+/// (`$N::bool OR <alias>.visibility = 'public' OR <alias>.owner_group_id =
+/// ANY($M::uuid[])`) rather than `Viewer::splice`, because `sqlx::query!` needs
+/// a compile-time literal of fixed arity and cannot take a spliced string —
+/// the same reason `repos/claim.rs`'s four macro read sites use that spelling.
+/// `visibility.rs`'s module doc names it as the accepted equivalent.
+///
+/// Three of the ten (`bridge_to_paragraphs`, `continues_argument`,
+/// `atom_b -> parent paragraphs`) previously touched only `edges` and returned
+/// bare claim ids. They gained a `JOIN claims` purely so there is something to
+/// filter on: an id is a disclosure, and the neighbour ids feed
+/// `all_paragraph_ids`, which the last two statements then hydrate into content.
+///
+/// # A deliberate deviation, recorded
+///
+/// The SQL stays in `crates/epigraph-mcp/src/tools/` rather than moving to
+/// `crates/epigraph-db/src/repos/` as CLAUDE.md requires. Ten `sqlx::query!`
+/// macros, six anonymous row shapes and the `BatchedContext` type would have to
+/// move together, and `recall.rs` is the one caller. The security property —
+/// the filter — is delivered here; the relocation is recorded as outstanding in
+/// `crates/epigraph-mcp/tests/no_inline_sql_in_tools.rs`'s expected set, which
+/// is an exact-set ratchet, so it cannot quietly grow.
 pub async fn fetch_batched_context(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     paragraph_ids: &[Uuid],
     siblings_limit: u32,
     corroborates_limit: u32,
 ) -> Result<BatchedContext, sqlx::Error> {
+    let v_bypass = viewer.bypass_bind();
+    let v_groups: &[Uuid] = viewer.group_bind().unwrap_or(&[]);
     let mut paragraph_meta: std::collections::HashMap<Uuid, ParagraphCore> = Default::default();
     let mut paper_meta: std::collections::HashMap<Uuid, PaperMeta> = Default::default();
     let mut paragraph_to_section: std::collections::HashMap<Uuid, Uuid> = Default::default();
@@ -1176,8 +1270,12 @@ pub async fn fetch_batched_context(
             WHERE e.target_id = ANY($1)
               AND e.relationship = 'decomposes_to'
               AND (c.properties->>'level')::int = 1
+              AND ($2::bool OR c.visibility = 'public'
+                   OR c.owner_group_id = ANY($3::uuid[]))
             "#,
-            paragraph_ids
+            paragraph_ids,
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;
@@ -1211,6 +1309,8 @@ pub async fn fetch_batched_context(
                 WHERE e.source_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 3
+                  AND ($3::bool OR c.visibility = 'public'
+                       OR c.owner_group_id = ANY($4::uuid[]))
             )
             SELECT
                 paragraph_id AS "paragraph_id!",
@@ -1222,7 +1322,9 @@ pub async fn fetch_batched_context(
             WHERE rn <= $2
             "#,
             paragraph_ids,
-            atoms_per_paragraph_cap
+            atoms_per_paragraph_cap,
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;
@@ -1251,12 +1353,17 @@ pub async fn fetch_batched_context(
         if !atom_ids.is_empty() {
             let rows = sqlx::query!(
                 r#"
-                SELECT e.target_id AS atom_id, e.source_id AS parent_paragraph_id
+                SELECT e.target_id AS "atom_id!", e.source_id AS "parent_paragraph_id!"
                 FROM edges e
+                JOIN claims cp ON cp.id = e.source_id
                 WHERE e.target_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
+                  AND ($2::bool OR cp.visibility = 'public'
+                       OR cp.owner_group_id = ANY($3::uuid[]))
                 "#,
-                &atom_ids
+                &atom_ids,
+                v_bypass,
+                v_groups
             )
             .fetch_all(pool)
             .await?;
@@ -1297,8 +1404,12 @@ pub async fn fetch_batched_context(
                 WHERE e.source_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 2
+                  AND ($2::bool OR c.visibility = 'public'
+                       OR c.owner_group_id = ANY($3::uuid[]))
                 "#,
-                &section_ids
+                &section_ids,
+                v_bypass,
+                v_groups
             )
             .fetch_all(pool)
             .await?;
@@ -1357,7 +1468,10 @@ pub async fn fetch_batched_context(
                     c.content, c.truth_value,
                     p.doi AS paper_doi
                 FROM neighbors n
-                JOIN claims c ON c.id = n.neighbor_id
+                JOIN claims c
+                  ON c.id = n.neighbor_id
+                 AND ($3::bool OR c.visibility = 'public'
+                      OR c.owner_group_id = ANY($4::uuid[]))
                 LEFT JOIN edges asserts_e
                   ON asserts_e.target_id = c.id
                   AND asserts_e.relationship = 'asserts'
@@ -1382,7 +1496,9 @@ pub async fn fetch_batched_context(
             WHERE rn <= $2
             "#,
             paragraph_ids,
-            i64::from(corroborates_limit)
+            i64::from(corroborates_limit),
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;
@@ -1408,13 +1524,21 @@ pub async fn fetch_batched_context(
             r#"
             SELECT e.source_id AS "paragraph_id!", e.target_id AS "neighbor_id!"
             FROM edges e
+            JOIN claims cn ON cn.id = e.target_id
             WHERE e.source_id = ANY($1) AND e.relationship = 'continues_argument'
+              AND ($2::bool OR cn.visibility = 'public'
+                   OR cn.owner_group_id = ANY($3::uuid[]))
             UNION ALL
             SELECT e.target_id AS "paragraph_id!", e.source_id AS "neighbor_id!"
             FROM edges e
+            JOIN claims cn ON cn.id = e.source_id
             WHERE e.target_id = ANY($1) AND e.relationship = 'continues_argument'
+              AND ($2::bool OR cn.visibility = 'public'
+                   OR cn.owner_group_id = ANY($3::uuid[]))
             "#,
-            paragraph_ids
+            paragraph_ids,
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;
@@ -1446,6 +1570,8 @@ pub async fn fetch_batched_context(
                       AND e.relationship != 'decomposes_to'
                       AND (ca.properties->>'level')::int = 3
                       AND (cb.properties->>'level')::int = 3
+                      AND ($2::bool OR cb.visibility = 'public'
+                           OR cb.owner_group_id = ANY($3::uuid[]))
                 ),
                 backward AS (
                     SELECT e.target_id AS atom_a, e.source_id AS atom_b, e.relationship
@@ -1456,6 +1582,8 @@ pub async fn fetch_batched_context(
                       AND e.relationship != 'decomposes_to'
                       AND (ca.properties->>'level')::int = 3
                       AND (cb.properties->>'level')::int = 3
+                      AND ($2::bool OR cb.visibility = 'public'
+                           OR cb.owner_group_id = ANY($3::uuid[]))
                 )
                 SELECT atom_a AS "atom_a!", atom_b AS "atom_b!", relationship AS "relationship!"
                 FROM forward
@@ -1463,7 +1591,9 @@ pub async fn fetch_batched_context(
                 SELECT atom_a AS "atom_a!", atom_b AS "atom_b!", relationship AS "relationship!"
                 FROM backward
                 "#,
-                &our_atom_ids
+                &our_atom_ids,
+                v_bypass,
+                v_groups
             )
             .fetch_all(pool)
             .await?;
@@ -1492,8 +1622,12 @@ pub async fn fetch_batched_context(
                 WHERE e.target_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 2
+                  AND ($2::bool OR c.visibility = 'public'
+                       OR c.owner_group_id = ANY($3::uuid[]))
                 "#,
-                &atom_b_ids
+                &atom_b_ids,
+                v_bypass,
+                v_groups
             )
             .fetch_all(pool)
             .await?;
@@ -1534,8 +1668,13 @@ pub async fn fetch_batched_context(
     //    recent hit. The filtering happens on the candidate surfaces upstream.
     {
         let rows = sqlx::query!(
-            "SELECT id, content, truth_value, created_at FROM claims WHERE id = ANY($1)",
-            &all_paragraph_ids
+            "SELECT c.id, c.content, c.truth_value, c.created_at FROM claims c \
+             WHERE c.id = ANY($1) \
+               AND ($2::bool OR c.visibility = 'public' \
+                    OR c.owner_group_id = ANY($3::uuid[]))",
+            &all_paragraph_ids,
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;
@@ -1562,11 +1701,16 @@ pub async fn fetch_batched_context(
                 COALESCE(p.title, '') AS "title!"
             FROM edges e
             JOIN papers p ON p.id = e.source_id
+            JOIN claims c ON c.id = e.target_id
             WHERE e.target_id = ANY($1)
               AND e.relationship = 'asserts'
               AND e.source_type = 'paper'
+              AND ($2::bool OR c.visibility = 'public'
+                   OR c.owner_group_id = ANY($3::uuid[]))
             "#,
-            &all_paragraph_ids
+            &all_paragraph_ids,
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;

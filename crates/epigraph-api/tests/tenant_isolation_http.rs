@@ -1323,3 +1323,133 @@ async fn hypothesis_status_http_hides_a_group_private_claim_from_a_stranger() {
 
     let _ = shutdown.send(());
 }
+
+// ── GET /api/v1/events — a real round trip, both halves of the merge ────────
+//
+// This endpoint is the one place in the crate where a viewer-filtered SQL read
+// is merged with an UNFILTERED in-process source before the response is built.
+// A repo-level test proves the SQL half and cannot see the merge at all: the
+// ring buffer is a `OnceLock<Arc<EventStore>>` reached from inside the handler.
+// So this case drives the HTTP route, seeds the same private claim into BOTH
+// stores, and asserts the stranger receives neither copy.
+//
+// The db-build handlers that push into that buffer are `routes/edges.rs`
+// (`edge.added`, `claim.superseded`), `routes/belief.rs` (`frame.created`) and
+// `routes/community.rs` — so the unfiltered half was the live event stream of
+// the db build, not a no-db legacy artefact.
+
+/// `GET /api/v1/events?event_type=<ty>` with `token`; returns the raw body.
+///
+/// Scoped by `event_type` on purpose. This suite runs against the ambient
+/// `DATABASE_URL`, whose `events` table is never truncated and already holds
+/// thousands of rows; an unscoped read pages the freshly-seeded rows off the
+/// end (the endpoint sorts `created_at` ASC) and the non-vacuity control
+/// disappears, which is exactly how the first draft of this test failed.
+async fn get_events_body(
+    addr: std::net::SocketAddr,
+    token: &str,
+    who: &str,
+    event_type: &str,
+) -> String {
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/events?limit=1000&event_type={event_type}"
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET /api/v1/events as {who}: {e}"));
+    let status = resp.status();
+    let body = resp.text().await.expect("response body");
+    assert!(
+        status.is_success(),
+        "GET /api/v1/events as {who} must succeed; got {status}: {body}"
+    );
+    body
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_events_http_hides_a_private_claim_from_both_the_table_and_the_ring_buffer() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("connect test pool");
+
+    let (owner_agent, group) = fixture::seed_agent_with_group(&pool, "events-http").await;
+    let (stranger_agent, _) = fixture::seed_agent_with_group(&pool, "events-http-stranger").await;
+    let private =
+        fixture::seed_group_claim(&pool, owner_agent, group, "events-http private content").await;
+    let public = fixture::seed_public_claim(&pool, owner_agent, "events-http public control").await;
+
+    // Half 1: the persisted table. Deliberately a `conflict.resolved`-shaped
+    // payload — no `claim_id` key anywhere — because a rule keyed on
+    // `claim_id` alone passes this row straight through.
+    let persisted_type = format!("events-http.persisted.{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO events (event_type, actor_id, payload, graph_version) \
+         VALUES ($1, NULL, jsonb_build_object('claim_a_id', $2::text, \
+                                              'claim_b_id', $3::text), \
+                 nextval('events_graph_version_seq'))",
+    )
+    .bind(&persisted_type)
+    .bind(private)
+    .bind(public)
+    .execute(&pool)
+    .await
+    .expect("seed persisted event");
+
+    // Half 2: the in-process ring buffer, in the `edge.added` shape
+    // `routes/edges.rs` actually pushes — under its own unique type so this
+    // read is bounded too.
+    let in_mem_type = format!("events-http.inmem.{}", Uuid::new_v4());
+    epigraph_api::routes::events::global_event_store()
+        .push(
+            in_mem_type.clone(),
+            None,
+            serde_json::json!({
+                "source_id": private.to_string(),
+                "target_id": public.to_string(),
+                "relationship": "supports",
+            }),
+        )
+        .await;
+
+    let owner_token = common::mint_token_with_agent(&["claims:read", "graph:read"], owner_agent);
+    let stranger_token =
+        common::mint_token_with_agent(&["claims:read", "graph:read"], stranger_agent);
+    let (addr, shutdown) = common::spawn_app(&url).await;
+
+    // Each half carries BOTH the private id and the public control id, so a
+    // response that withholds the private one while still returning the event
+    // is distinguishable from a response that returns nothing.
+    for (half, ty) in [("persisted", &persisted_type), ("in-memory", &in_mem_type)] {
+        let stranger_body = get_events_body(addr, &stranger_token, "stranger", ty).await;
+        assert!(
+            !stranger_body.contains(&private.to_string()),
+            "the {half} half of GET /api/v1/events leaked the private claim's \
+             id to a stranger. Body: {stranger_body}"
+        );
+
+        let owner_body = get_events_body(addr, &owner_token, "owner", ty).await;
+        assert!(
+            owner_body.contains(&private.to_string()) && owner_body.contains(&public.to_string()),
+            "Class P for the {half} half: the owner must receive its own \
+             event, with both ids. A filter that returns nothing to anybody \
+             passes the stranger assertion and is a fail-closed regression. \
+             Body: {owner_body}"
+        );
+    }
+
+    // Non-vacuity of the fixture itself: the seeded events really are reachable
+    // through this endpoint. Asserted against the OWNER, whose view of both
+    // halves is unfiltered in practice.
+    let owner_persisted = get_events_body(addr, &owner_token, "owner", &persisted_type).await;
+    assert!(
+        owner_persisted.contains(&persisted_type),
+        "the persisted fixture event must be reachable at all: {owner_persisted}"
+    );
+
+    let _ = shutdown.send(());
+}

@@ -82,7 +82,59 @@ pub struct EpiGraphMcpFull {
 }
 
 impl EpiGraphMcpFull {
+    /// The server's own `agents.id`, for callers outside this crate's `crate::`
+    /// visibility — specifically `main.rs`, which needs it to build the
+    /// `--allow-unauthenticated-http` principal before the router is layered.
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever [`Self::agent_id`] returns.
+    pub async fn server_agent_id(&self) -> Result<uuid::Uuid, McpError> {
+        self.agent_id().await
+    }
+
     /// Ensure agent exists in DB, return cached ID.
+    ///
+    /// # Tenancy (PR-09)
+    ///
+    /// This now calls `AgentRepository::ensure_personal_group` on **both**
+    /// branches — the call sits after the if/else, not inside the create arm.
+    /// That is deliberate and it is the only placement that works: an
+    /// already-provisioned server agent (i.e. every existing deployment) takes
+    /// the *found* branch, so a create-only call would leave exactly the
+    /// installations that matter with no personal group.
+    ///
+    /// Without it this path — unlike `epigraph-api`'s `oauth/token.rs`, which has
+    /// called it since PR-02 — left the server's own agent with **no**
+    /// `group_memberships` row, so `Viewer::resolve(server_agent_id)` returned an
+    /// empty group set. Every stdio read and every `--allow-unauthenticated-http`
+    /// read was therefore public-only *by accident*, and PR-09's own acceptance
+    /// criterion ("the stdio read default becomes `Viewer::resolve(pool,
+    /// server_agent_id)`") would have been inert: the viewer would resolve, and
+    /// mean nothing. It is best-effort for the same reason `set_llm_properties`
+    /// below is: a failure here must not break agent resolution.
+    ///
+    /// ## Three properties an operator should know, stated rather than implied
+    ///
+    /// 1. **This is a write on a read path.** Resolving the agent id already
+    ///    inserted into `agents` on first call; it now also writes `groups` and
+    ///    `group_memberships`. `reject_if_read_only` is a per-tool gate, so a
+    ///    `--read-only` server performs these writes on its first tool call.
+    ///    That is pre-existing in kind (the `agents` insert) and widened in
+    ///    degree here.
+    /// 2. **It is an authority restoration, not just provisioning.**
+    ///    `ensure_personal_group`'s membership insert is
+    ///    `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at =
+    ///    NULL, role = 'admin'`, so an operator who revoked this membership sees
+    ///    it revived, at admin role, on the next process boot. The reviving form
+    ///    is used rather than a second `DO NOTHING` variant because `repos/agent.rs`
+    ///    documents at length why `DO NOTHING` was wrong (a pre-existing revoked
+    ///    epoch-0 row makes the insert a permanent silent no-op, leaving the
+    ///    agent with no live membership forever), and because this is exactly
+    ///    what every API principal already gets on every `oauth/token.rs` mint.
+    ///    One provisioning path, one behaviour.
+    /// 3. **It fails closed.** A failure warns and leaves the agent with an
+    ///    empty group set, i.e. a viewer that reads public rows only.
     pub(crate) async fn agent_id(&self) -> Result<uuid::Uuid, McpError> {
         let mut cached = self.agent_db_id.lock().await;
         if let Some(id) = *cached {
@@ -127,6 +179,32 @@ impl EpiGraphMcpFull {
             created
         };
         let id = agent.id.as_uuid();
+
+        // PR-09: the server agent needs a personal group, or the viewer it
+        // resolves to has an empty group set and reads public rows only. See
+        // the doc comment above. Idempotent (`ON CONFLICT (did_key)`), so the
+        // found branch pays one cheap upsert per process, not per call — this
+        // runs once and is then served from `cached`.
+        match self.pool.acquire().await {
+            Ok(mut conn) => {
+                if let Err(e) =
+                    epigraph_db::AgentRepository::ensure_personal_group(&mut conn, id).await
+                {
+                    tracing::warn!(
+                        agent_id = %id,
+                        error = ?e,
+                        "failed to ensure the server agent's personal group; its viewer will \
+                         resolve to an empty group set and read public rows only"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                agent_id = %id,
+                error = ?e,
+                "could not acquire a connection to ensure the server agent's personal group"
+            ),
+        }
+
         *cached = Some(id);
         drop(cached);
         Ok(id)
@@ -727,8 +805,11 @@ impl EpiGraphMcpFull {
         Parameters(params): Parameters<
             crate::tools::alternative_sets::SuggestAlternativeSetsParams,
         >,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        crate::tools::alternative_sets::suggest_alternative_sets(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::alternative_sets::suggest_alternative_sets(self, viewer, params).await
     }
 
     // ── Memory (2 tools) ──
@@ -1225,8 +1306,11 @@ impl EpiGraphMcpFull {
     async fn list_events(
         &self,
         Parameters(params): Parameters<ListEventsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::events::list_events(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::events::list_events(self, viewer, params).await
     }
 
     #[tool(
@@ -1498,8 +1582,11 @@ impl EpiGraphMcpFull {
         Parameters(params): Parameters<
             crate::tools::embeddings::EmbeddingNeighborhoodDensityParams,
         >,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        crate::tools::embeddings::embedding_neighborhood_density(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::embeddings::embedding_neighborhood_density(self, viewer, params).await
     }
 
     #[tool(
@@ -1581,8 +1668,11 @@ impl EpiGraphMcpFull {
     async fn find_cross_source_matches(
         &self,
         Parameters(params): Parameters<FindCrossSourceMatchesParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::matching::find_cross_source_matches(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::matching::find_cross_source_matches(self, viewer, params).await
     }
 
     #[tool(
@@ -1591,8 +1681,11 @@ impl EpiGraphMcpFull {
     async fn list_match_candidates(
         &self,
         Parameters(params): Parameters<ListMatchCandidatesParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::matching::list_match_candidates(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::matching::list_match_candidates(self, viewer, params).await
     }
 
     #[tool(

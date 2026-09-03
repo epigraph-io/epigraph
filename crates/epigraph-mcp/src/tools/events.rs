@@ -9,8 +9,15 @@ use crate::types::*;
 use epigraph_db::EventRepository;
 
 /// List events with optional filtering.
+///
+/// # Tenancy (PR-09)
+///
+/// Viewer-scoped via `EventRepository::list`: an event whose payload names a
+/// claim the viewer cannot read is absent. The payload is not metadata — it
+/// carries `claim_id`, `agent_id` and `initial_truth`.
 pub async fn list_events(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ListEventsParams,
 ) -> Result<CallToolResult, McpError> {
     let actor_id = params
@@ -24,9 +31,15 @@ pub async fn list_events(
 
     let limit = params.limit.unwrap_or(50).min(500);
 
-    let events = EventRepository::list(&server.pool, params.event_type.as_deref(), actor_id, limit)
-        .await
-        .map_err(internal_error)?;
+    let events = EventRepository::list(
+        &server.pool,
+        viewer,
+        params.event_type.as_deref(),
+        actor_id,
+        limit,
+    )
+    .await
+    .map_err(internal_error)?;
 
     let results: Vec<serde_json::Value> = events
         .into_iter()

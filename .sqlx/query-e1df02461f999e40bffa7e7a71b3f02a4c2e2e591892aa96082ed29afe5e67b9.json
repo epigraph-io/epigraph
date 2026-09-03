@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, content, truth_value, created_at FROM claims WHERE id = ANY($1)",
+  "query": "SELECT c.id, c.content, c.truth_value, c.created_at FROM claims c WHERE c.id = ANY($1) AND ($2::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($3::uuid[]))",
   "describe": {
     "columns": [
       {
@@ -26,6 +26,8 @@
     ],
     "parameters": {
       "Left": [
+        "UuidArray",
+        "Bool",
         "UuidArray"
       ]
     },
@@ -36,5 +38,5 @@
       false
     ]
   },
-  "hash": "2b9d0de2ed6d3d079c87670bbbe647d6ceed1ed7ecf58cb404b299d875bc5952"
+  "hash": "e1df02461f999e40bffa7e7a71b3f02a4c2e2e591892aa96082ed29afe5e67b9"
 }

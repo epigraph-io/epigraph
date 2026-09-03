@@ -64,27 +64,26 @@ fn row_to_out(r: epigraph_db::MatchCandidateRow) -> CandidateOut {
 
 pub async fn find_cross_source_matches(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: FindCrossSourceMatchesParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
     let repo = MatchCandidateRepo::new(server.pool.clone());
 
     let candidates = repo
-        .list_for_claim(claim_id)
+        .list_for_claim(viewer, claim_id)
         .await
         .map_err(internal_error)?;
     let candidates_out: Vec<CandidateOut> = candidates.into_iter().map(row_to_out).collect();
 
     // Pull CORROBORATES edges incident on the claim — already-promoted matches.
-    let edges: Vec<(uuid::Uuid, uuid::Uuid, uuid::Uuid, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, source_id, target_id, properties FROM edges
-         WHERE relationship = 'CORROBORATES'
-           AND (source_id = $1 OR target_id = $1)",
-    )
-    .bind(claim_id)
-    .fetch_all(&server.pool)
-    .await
-    .map_err(internal_error)?;
+    // The SQL moved to `MatchCandidateRepo::corroborates_edges_for_claim`
+    // (PR-09): it was inline here and byte-identical inline in
+    // `routes/cross_source.rs`, and neither copy filtered.
+    let edges = repo
+        .corroborates_edges_for_claim(viewer, claim_id)
+        .await
+        .map_err(internal_error)?;
 
     let corroborates: Vec<serde_json::Value> = edges
         .into_iter()
@@ -107,6 +106,7 @@ pub async fn find_cross_source_matches(
 
 pub async fn list_match_candidates(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ListMatchCandidatesParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
@@ -123,7 +123,10 @@ pub async fn list_match_candidates(
     };
 
     let repo = MatchCandidateRepo::new(server.pool.clone());
-    let rows = repo.list(status_ref, limit).await.map_err(internal_error)?;
+    let rows = repo
+        .list(viewer, status_ref, limit)
+        .await
+        .map_err(internal_error)?;
     let out: Vec<CandidateOut> = rows.into_iter().map(row_to_out).collect();
     success_json(&out)
 }

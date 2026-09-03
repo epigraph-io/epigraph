@@ -161,6 +161,7 @@ async fn list_match_candidates_returns_only_status_filter(pool: PgPool) {
 
     let out = tools::matching::list_match_candidates(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListMatchCandidatesParams {
             status: Some("pending".into()),
             limit: Some(10),
@@ -182,9 +183,11 @@ async fn list_match_candidates_returns_only_status_filter(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_match_candidates_rejects_invalid_status(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool, false).await;
     let err = tools::matching::list_match_candidates(
         &server,
+        &viewer,
         ListMatchCandidatesParams {
             status: Some("garbage".into()),
             limit: None,
@@ -221,6 +224,7 @@ async fn find_cross_source_matches_returns_candidates_and_edges(pool: PgPool) {
 
     let out = tools::matching::find_cross_source_matches(
         &server,
+        &fixture::public_viewer(&pool).await,
         FindCrossSourceMatchesParams {
             claim_id: a.to_string(),
         },

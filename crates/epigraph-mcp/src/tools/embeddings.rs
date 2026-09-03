@@ -23,8 +23,16 @@ pub struct EmbeddingNeighborhoodDensityParams {
     pub max_sample: Option<i64>,
 }
 
+/// # Tenancy (PR-09)
+///
+/// Both statements moved to `ClaimRepository::embedding_radius_density` /
+/// `::embedding_radius_breakdown` and are viewer-filtered. Unfiltered, the
+/// breakdown histogram was a membership oracle over the whole corpus: it
+/// answered "is there private material near this topic, and of what level and
+/// source type" for any caller-chosen probe, without returning an id.
 pub async fn embedding_neighborhood_density(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: EmbeddingNeighborhoodDensityParams,
 ) -> Result<CallToolResult, McpError> {
     let radius = params.radius.unwrap_or(0.30);
@@ -38,38 +46,24 @@ pub async fn embedding_neighborhood_density(
     let embedding_dim = embedding.len() as u32;
     let embedding_str = crate::embed::format_pgvector(&embedding);
 
-    let row: (i64, Option<f64>, Option<f64>) = sqlx::query_as(
-        "SELECT COUNT(*)::bigint, \
-                AVG(1 - (embedding <=> $1::vector))::float8, \
-                percentile_cont(0.5) WITHIN GROUP \
-                    (ORDER BY 1 - (embedding <=> $1::vector))::float8 \
-         FROM claims \
-         WHERE embedding IS NOT NULL \
-           AND is_current = true \
-           AND (embedding <=> $1::vector) <= $2",
+    let (n_claims, mean_opt, median_opt) = epigraph_db::ClaimRepository::embedding_radius_density(
+        &server.pool,
+        viewer,
+        &embedding_str,
+        radius,
     )
-    .bind(&embedding_str)
-    .bind(radius)
-    .fetch_one(&server.pool)
     .await
     .map_err(internal_error)?;
-    let n_claims = row.0;
-    let mean_similarity = row.1.unwrap_or(0.0);
-    let median_similarity = row.2.unwrap_or(0.0);
+    let mean_similarity = mean_opt.unwrap_or(0.0);
+    let median_similarity = median_opt.unwrap_or(0.0);
 
-    let breakdown_rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT properties->>'level', properties->>'source_type' \
-         FROM claims \
-         WHERE embedding IS NOT NULL \
-           AND is_current = true \
-           AND (embedding <=> $1::vector) <= $2 \
-         ORDER BY embedding <=> $1::vector \
-         LIMIT $3",
+    let breakdown_rows = epigraph_db::ClaimRepository::embedding_radius_breakdown(
+        &server.pool,
+        viewer,
+        &embedding_str,
+        radius,
+        max_sample,
     )
-    .bind(&embedding_str)
-    .bind(radius)
-    .bind(max_sample)
-    .fetch_all(&server.pool)
     .await
     .map_err(internal_error)?;
 

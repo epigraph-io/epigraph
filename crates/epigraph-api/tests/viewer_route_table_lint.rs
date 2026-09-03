@@ -112,6 +112,10 @@ use std::path::{Path, PathBuf};
 /// non-zero count for **`claims.rs` and `edges.rs` only**; `clusters.rs`,
 /// `conflicts.rs`, `cross_source.rs`, `embeddings.rs`, `hypothesis.rs`,
 /// `policies.rs`, `political.rs`, `search.rs` and `workflows.rs` each return 0.
+/// (`cross_source.rs` belongs in THIS list and not in
+/// [`UNCOMPENSATED_INLINE_READS`] below: the two registers measure different
+/// things, and PR-09 briefly deleted it from both. Its
+/// `check_content_access` count was 0 before PR-09 and is 0 after.)
 ///
 /// So the register is split. For [`UNCOMPENSATED_INLINE_READS`] there is no
 /// second line of defence at all today, and the deadline is **PR-12** (when
@@ -141,7 +145,17 @@ const COMPENSATED_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 3), ("edges.r
 const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     ("clusters.rs", 2),
     ("conflicts.rs", 1),
-    ("cross_source.rs", 1),
+    // `cross_source.rs` was 1 until PR-09 and is now 0, so it is gone from the
+    // register entirely. The site was `SELECT id, content FROM claims WHERE id
+    // = ANY($1)` in `list_candidates`, hydrating excerpts for the candidate
+    // queue; it is now
+    // `ClaimRepository::contents_by_ids(&state.db_pool, &viewer, ..)`. PR-09
+    // also removed the file's other unfiltered read — the `CORROBORATES` edge
+    // scan in `get_cross_source_matches`, which this lint never counted because
+    // it projects edge columns, not `tier_a` content — into
+    // `MatchCandidateRepo::corroborates_edges_for_claim`. Both were byte-for-byte
+    // duplicates of SQL in `epigraph-mcp/src/tools/matching.rs`; there is now
+    // one copy, in the repo layer, filtered.
     ("embeddings.rs", 1),
     ("hypothesis.rs", 1),
     ("policies.rs", 2),

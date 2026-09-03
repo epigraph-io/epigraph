@@ -252,14 +252,30 @@ pub async fn submit_ds_evidence(
         f64,
         Option<f64>,
         f64,
-    ) = sqlx::query_as(
-        "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing
-         FROM claims WHERE id = $1",
-    )
-    .bind(claim_id)
-    .fetch_one(&server.pool)
-    .await
-    .map_err(internal_error)?;
+    ) = {
+        // PR-09: this is a per-id belief oracle over a caller-supplied uuid —
+        // it returns the BetP and mass distribution of any claim in the corpus.
+        // Filtered rather than exempted: the id comes from the request, so an
+        // unfiltered read here answers "what does this private claim believe?"
+        // for anyone who can guess an id. `fetch_optional` + the not-found
+        // branch below make an invisible claim indistinguishable from a
+        // nonexistent one (plan §8.5).
+        let sql = viewer.splice(
+            "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing
+             FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(&server.pool)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                rmcp::model::ErrorData::invalid_request(format!("claim {claim_id} not found"), None)
+            })?
+    };
     let betp = pignistic_prob.unwrap_or(0.0);
     let ign = plausibility - belief;
 

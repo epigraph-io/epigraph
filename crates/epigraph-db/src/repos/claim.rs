@@ -120,6 +120,15 @@ pub struct SemanticFlatHit {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// One `(properties->>'level', properties->>'source_type')` pair from
+/// [`ClaimRepository::embedding_radius_breakdown`].
+///
+/// A named alias rather than the bare tuple only because
+/// `clippy::type_complexity` rejects `Vec<(Option<String>, Option<String>)>` in
+/// a return position; both fields are genuinely optional (the JSON keys are not
+/// guaranteed present) and the caller histograms them.
+pub type LevelAndSourceType = (Option<String>, Option<String>);
+
 /// Result row for [`ClaimRepository::neighborhood_embeddings`].
 ///
 /// A named struct rather than a `(Uuid, Vec<f32>, Option<f64>)` tuple: the
@@ -915,6 +924,89 @@ impl ClaimRepository {
         let mut q = sqlx::query_as::<_, NeighborhoodEmbeddingRow>(&sql)
             .bind(embedding)
             .bind(min_similarity)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(pool).await?)
+    }
+
+    /// Count / mean / median cosine similarity inside a distance radius of a
+    /// probe vector, viewer-filtered.
+    ///
+    /// Backs MCP `embedding_neighborhood_density` (PR-09). That tool ran this
+    /// aggregate inline in `epigraph-mcp/src/tools/embeddings.rs` with no
+    /// `Viewer` parameter at all. It is the same cardinality-oracle shape as
+    /// [`Self::embedding_density_stats`] — which already exists for the HTTP
+    /// twin `GET /api/v1/voids/density` — but not the same query: this one
+    /// gates on cosine *distance* `<= radius` rather than similarity
+    /// `>= min_similarity`, and adds the median. Keeping them separate is
+    /// deliberate: collapsing them would silently change one caller's
+    /// threshold semantics.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, viewer, embedding))]
+    pub async fn embedding_radius_density(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        embedding: &str,
+        radius: f64,
+    ) -> Result<(i64, Option<f64>, Option<f64>), DbError> {
+        let sql = viewer.splice(
+            "SELECT COUNT(*)::bigint, \
+                    AVG(1 - (c.embedding <=> $1::vector))::float8, \
+                    percentile_cont(0.5) WITHIN GROUP \
+                        (ORDER BY 1 - (c.embedding <=> $1::vector))::float8 \
+             FROM claims c \
+             WHERE c.embedding IS NOT NULL \
+               AND c.is_current = true \
+               AND (c.embedding <=> $1::vector) <= $2 \
+               /* {VISIBILITY:c} */",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (i64, Option<f64>, Option<f64>)>(&sql)
+            .bind(embedding)
+            .bind(radius);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(pool).await?)
+    }
+
+    /// `properties->>'level'` / `properties->>'source_type'` for the nearest
+    /// claims inside a distance radius, viewer-filtered.
+    ///
+    /// The MCP `embedding_neighborhood_density` breakdown. Unfiltered this was
+    /// the sharper of that tool's two leaks: the level/source-type histogram of
+    /// the nearest neighbours to a caller-chosen probe is a membership oracle
+    /// over the whole corpus — it answers "is there private material near this
+    /// topic, and what kind" without returning a single id.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, viewer, embedding))]
+    pub async fn embedding_radius_breakdown(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        embedding: &str,
+        radius: f64,
+        limit: i64,
+    ) -> Result<Vec<LevelAndSourceType>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.properties->>'level', c.properties->>'source_type' \
+             FROM claims c \
+             WHERE c.embedding IS NOT NULL \
+               AND c.is_current = true \
+               AND (c.embedding <=> $1::vector) <= $2 \
+               /* {VISIBILITY:c} */ \
+             ORDER BY c.embedding <=> $1::vector \
+             LIMIT $3",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, LevelAndSourceType>(&sql)
+            .bind(embedding)
+            .bind(radius)
             .bind(limit);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
@@ -2571,6 +2663,100 @@ impl ClaimRepository {
         }
         let rows = q.fetch_all(pool).await?;
         Ok(rows.into_iter().collect())
+    }
+
+    /// Fetch `(id, content)` for a batch of claim ids **at any version**.
+    ///
+    /// Identical to [`Self::contents_by_ids`] except that it does not filter
+    /// `is_current`. It exists because that filter is a *contract of the rerank
+    /// pool*, not a property of "fetch some content" — and PR-09 nearly
+    /// exported it as one.
+    ///
+    /// `epigraph-api`'s `routes/cross_source.rs::list_candidates` replaced an
+    /// inline `SELECT id, content FROM claims WHERE id = ANY($1)` (no
+    /// `is_current`) with a call to `contents_by_ids` (which has one).
+    /// `match_candidates` rows are long-lived and routinely name claims that
+    /// are later retired by `supersede_claim` / `mark_duplicate`, and nothing
+    /// prunes the queue when that happens — so every such row would have
+    /// rendered as the literal string `"(claim not found)"` for a claim that
+    /// does exist. That is a silent narrowing of an endpoint whose own doc
+    /// advertises "verbatim content excerpts of both claims in each pair", and
+    /// it is unrelated to tenancy. A separate function rather than a
+    /// `bool` parameter: a boolean at a security-relevant read is a flag that
+    /// eventually gets passed wrong, and `contents_by_ids`'s current-only
+    /// contract is pinned by name in
+    /// `contents_by_ids_returns_current_only_and_skips_missing`.
+    ///
+    /// The visibility predicate is identical, so this is not a widening of read
+    /// authority — only of version scope.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    pub async fn contents_by_ids_any_version(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, String>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let sql = viewer.splice(
+            "SELECT c.id, c.content FROM claims c \
+             WHERE c.id = ANY($1) /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (uuid::Uuid, String)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(pool).await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// The subset of `ids` that name a `claims` row this viewer **cannot**
+    /// read.
+    ///
+    /// The Rust-callable half of the rule
+    /// [`crate::repos::EventRepository::list`] implements in SQL, for callers
+    /// that hold rows the database cannot filter — specifically
+    /// `epigraph-api`'s `list_events`, which merges an in-process ring buffer
+    /// (`global_event_store()`) into the same response as the persisted table.
+    /// Filtering only the SQL half would have left the merge as the trivial
+    /// bypass for the filter, and the ring buffer is not a no-db artefact: the
+    /// `db`-build handlers in `routes/edges.rs`, `routes/belief.rs` and
+    /// `routes/community.rs` all push into it.
+    ///
+    /// "Cannot read" is deliberately narrower than "is absent from the
+    /// result": an id that names **no** row at all is not returned, because
+    /// there is no row to classify and no owner to protect. Only
+    /// *existing-but-invisible* ids come back, so a caller that drops its
+    /// records on a non-empty intersection matches the SQL exactly.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    pub async fn hidden_claim_ids(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashSet<uuid::Uuid>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        // EXCEPT rather than a negated predicate: `render_predicate` produces a
+        // positive `AND (...)` fragment and there is no spelling of the marker
+        // that inverts it. Set difference gets the same answer without asking
+        // the splice mechanism to do something it was not built for.
+        let sql = viewer.splice(
+            "SELECT id FROM claims WHERE id = ANY($1) \
+             EXCEPT \
+             SELECT c.id FROM claims c WHERE c.id = ANY($1) /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, uuid::Uuid>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(pool).await?.into_iter().collect())
     }
 
     /// Fetch `labels` for a batch of claim ids in one round-trip.
@@ -5056,6 +5242,215 @@ mod tests {
         .await
         .unwrap();
         assert!(empty.is_empty());
+    }
+
+    /// The sibling that does NOT filter `is_current`, and the reason it exists.
+    ///
+    /// `routes/cross_source.rs::list_candidates` renders excerpts for a queue
+    /// of `match_candidates` rows that outlive the claims they name — nothing
+    /// prunes the queue when `supersede_claim` / `mark_duplicate` flips
+    /// `is_current`. Calling `contents_by_ids` there returns `None` for every
+    /// such pair, and `excerpt(None)` renders the literal
+    /// `"(claim not found)"` for a claim that exists. This test is the
+    /// discriminator between the two functions: swap the call under test to
+    /// `contents_by_ids` and the `stale_id` assertion fails.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn contents_by_ids_any_version_returns_superseded_rows_too(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'test-any-version', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let current_text = format!("current-claim-{}", Uuid::new_v4());
+        let current_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, true)
+             RETURNING id",
+        )
+        .bind(&current_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let stale_text = format!("superseded-claim-{}", Uuid::new_v4());
+        let stale_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, false)
+             RETURNING id",
+        )
+        .bind(&stale_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let absent_id = Uuid::new_v4();
+        let viewer = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]);
+        let map = ClaimRepository::contents_by_ids_any_version(
+            &pool,
+            &viewer,
+            &[current_id, stale_id, absent_id],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            map.get(&stale_id).map(String::as_str),
+            Some(stale_text.as_str()),
+            "a superseded claim's content MUST come back — this is the whole difference from `contents_by_ids`, and the reason `list_candidates` calls this one"
+        );
+        assert_eq!(
+            map.get(&current_id).map(String::as_str),
+            Some(current_text.as_str()),
+            "current rows are unaffected"
+        );
+        assert!(
+            !map.contains_key(&absent_id),
+            "an id naming no row is still absent"
+        );
+        assert_eq!(map.len(), 2);
+
+        // The visibility predicate is NOT relaxed alongside the version scope.
+        // A stranger's viewer (empty group set) must still be refused a
+        // group-private superseded row.
+        // A REAL group, not the world group: `claims_group_needs_real_group`
+        // (migration 062) refuses `visibility = 'group'` paired with the
+        // all-zero world group id, which is exactly what makes an unbackfilled
+        // row unable to masquerade as private.
+        let group_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id)
+             VALUES ('t', 'did:epigraph:test:' || gen_random_uuid()::text, ''::bytea,
+                     'personal', $1)
+             RETURNING id",
+        )
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let private_text = format!("private-superseded-{}", Uuid::new_v4());
+        let private_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current,
+                                 visibility, owner_group_id)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, false, 'group', $3)
+             RETURNING id",
+        )
+        .bind(&private_text)
+        .bind(agent_id)
+        .bind(group_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let stranger_map =
+            ClaimRepository::contents_by_ids_any_version(&pool, &viewer, &[private_id])
+                .await
+                .unwrap();
+        assert!(
+            stranger_map.is_empty(),
+            "dropping the `is_current` filter must not drop the visibility predicate with it"
+        );
+
+        let member = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![group_id]);
+        let member_map =
+            ClaimRepository::contents_by_ids_any_version(&pool, &member, &[private_id])
+                .await
+                .unwrap();
+        assert_eq!(
+            member_map.get(&private_id).map(String::as_str),
+            Some(private_text.as_str()),
+            "a member of the owning group must still read it — otherwise the assertion above is satisfied by a function that returns nothing"
+        );
+    }
+
+    /// `hidden_claim_ids` is the Rust half of `EventRepository::list`'s rule,
+    /// used to filter the in-process event ring buffer in
+    /// `epigraph-api`'s `list_events`. Its contract is narrower than "absent
+    /// from the visible set": an id naming NO row must not be reported, or the
+    /// caller would drop events for hard-deleted claims and agent ids.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn hidden_claim_ids_reports_existing_but_invisible_ids_only(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'test-hidden-ids', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // A REAL group, not the world group: `claims_group_needs_real_group`
+        // (migration 062) refuses `visibility = 'group'` paired with the
+        // all-zero world group id, which is exactly what makes an unbackfilled
+        // row unable to masquerade as private.
+        let group_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id)
+             VALUES ('t', 'did:epigraph:test:' || gen_random_uuid()::text, ''::bytea,
+                     'personal', $1)
+             RETURNING id",
+        )
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let public_text = format!("public-{}", Uuid::new_v4());
+        let public_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id)
+             VALUES ($1, sha256($1::bytea), 0.5, $2) RETURNING id",
+        )
+        .bind(&public_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let private_text = format!("private-{}", Uuid::new_v4());
+        let private_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id,
+                                 visibility, owner_group_id)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, 'group', $3) RETURNING id",
+        )
+        .bind(&private_text)
+        .bind(agent_id)
+        .bind(group_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let absent_id = Uuid::new_v4();
+        let stranger = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]);
+        let hidden = ClaimRepository::hidden_claim_ids(
+            &pool,
+            &stranger,
+            &[public_id, private_id, absent_id],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            hidden.contains(&private_id),
+            "an existing row the viewer cannot read IS hidden"
+        );
+        assert!(!hidden.contains(&public_id), "a public row is not hidden");
+        assert!(
+            !hidden.contains(&absent_id),
+            "an id naming no row has no owner to protect and must NOT be reported — reporting it would make the caller drop every event carrying an agent_id or a hard-deleted claim id"
+        );
+        assert_eq!(hidden.len(), 1);
+
+        let member = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![group_id]);
+        let for_member =
+            ClaimRepository::hidden_claim_ids(&pool, &member, &[public_id, private_id])
+                .await
+                .unwrap();
+        assert!(
+            for_member.is_empty(),
+            "nothing is hidden from a member of the owning group — without this, a function that reports EVERY id passes the assertions above"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

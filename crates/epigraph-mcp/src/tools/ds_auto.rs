@@ -500,12 +500,22 @@ pub async fn auto_wire_ds_update(
     // (m({0})>0 AND m({1})>0) and a new pure-support BBA can push mass to
     // missing via Inagaki redistribution and reduce pignistic_prob even when
     // supports=true.  We bound the result from below by the pre-addition value.
-    let prior_betp: Option<f64> =
-        sqlx::query_scalar::<_, Option<f64>>("SELECT pignistic_prob FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(None);
+    let prior_betp: Option<f64> = {
+        // PR-09: a per-id belief oracle over a caller-supplied uuid, so it
+        // is filtered rather than exempted. `unwrap_or(None)` already
+        // treats "no row" as "no prior", so an invisible claim degrades to
+        // the same answer a nonexistent one gives — no new failure mode.
+        let sql = viewer.splice(
+            "SELECT c.pignistic_prob FROM claims c \
+                 WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Option<f64>>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(pool).await.ok().flatten().flatten()
+    };
 
     let combined = if all_rows.len() <= 1 {
         // Single BBA — still apply discount

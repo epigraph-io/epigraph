@@ -93,6 +93,11 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str)] = &[
     ("claim_theme.rs", "assign_unthemed_batch"),
     ("claim_theme.rs", "recompute_all_centroids"),
     ("claim_theme.rs", "recompute_centroid_for_theme"),
+    // PR-09. `agents` is not in migration 062's `tier_a` array — it has
+    // `profile_visibility` and `default_group_id`, no `owner_group_id` — so
+    // there is nothing to filter on. Corpus cardinality, same category as
+    // `triple.rs::index_counts`; one scalar leaves the function.
+    ("corpus_stats.rs", "agent_count"),
     ("evidence.rs", "delete"),
     ("mass_function.rs", "list_claim_ids"),
     ("semantic_link.rs", "retract"),

@@ -127,6 +127,46 @@ pub enum ThemeKmeansError {
 ///
 /// See module docs for what this does.  Both the HTTP handler and the
 /// scheduled cron job call this with their own `config`.
+///
+/// # Tenancy: NOT viewer-scoped, and the residual is PERSISTED (PR-09)
+///
+/// This function takes no [`Viewer`](epigraph_db::visibility::Viewer) and runs
+/// `SELECT id, embedding … FROM claims` corpus-wide. Plan §2.4 registers
+/// `claim_themes` as `tenancy_exempt` and names viewer-scoped clustering — i.e.
+/// threading a viewer through here — as its compensating control. **PR-09 did
+/// not deliver it.** Every place that cites the control now says so instead of
+/// asserting it (`epigraph-mcp/src/tools/recall.rs::compute_corpus_scope`'s
+/// `VISIBILITY-EXEMPT` annotation, `tests/tool_viewer_coverage.rs`), and it is
+/// ledgered as `D-PR16-theme-cluster-viewer-scope`.
+///
+/// **Read the residual as a persisted one, not as an unfiltered read.** This
+/// function does not merely return corpus-wide rows to its caller; it
+/// materialises content-derived data from them into two tables that other,
+/// unrelated reads then serve:
+///
+/// * the cluster centroid — a mean of the member embeddings — into
+///   `claim_themes.centroid` / `.centroid_3072`, and
+/// * the membership list, via `ClaimThemeRepository::bulk_assign`, into
+///   `claim_theme_members`.
+///
+/// Neither table is in migration 062's `tier_a`, so neither can carry a
+/// predicate. `epigraph-api/tests/viewer_route_table_lint.rs` treats
+/// `claims.embedding` as approximately invertible to content, which is why the
+/// centroid counts as content-derived rather than as a statistic.
+///
+/// The consequence for sequencing: once PR-12's backfill writes the first
+/// `visibility = 'group'` row, the *scheduled rebuild job* — not an interactive
+/// `theme_cluster` call — is what creates the leak, and it persists in the
+/// database rather than being confined to one response. The job must be gated,
+/// or `claim_themes` / `claim_theme_members` given tenancy columns, **before**
+/// that backfill runs.
+///
+/// Why it was not fixed here: the signature change has two callers —
+/// `epigraph-mcp/src/tools/themes.rs::theme_cluster` and
+/// `epigraph-api/src/routes/crud.rs::build_themes_from_corpus` — and landing
+/// one without the other hardens MCP while leaving HTTP corpus-wide, which is
+/// an MCP/HTTP parity break of the kind plan §8.4 #16 exists to catch. They
+/// must land together.
 pub async fn run_theme_kmeans(
     pool: &PgPool,
     config: &RunThemeKmeansConfig,

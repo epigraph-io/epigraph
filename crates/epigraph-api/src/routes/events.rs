@@ -219,10 +219,52 @@ const MAX_PAYLOAD_SIZE: usize = 65_536;
 /// Returns events ordered by `graph_version` (ascending). Supports
 /// filtering by `event_type` and `since` timestamp, with `limit`/`offset`
 /// pagination.
+///
+/// # Tenancy (PR-09)
+///
+/// **Both** halves of the merge are viewer-scoped, by the same rule.
+///
+/// * The persisted half goes through `EventRepository::list`, whose doc states
+///   the rule: an event is returned unless some uuid appearing anywhere in its
+///   payload names a `claims` row the caller cannot read.
+/// * The in-process half — `global_event_store()`, a ring buffer with no claim
+///   join to hang a SQL predicate on — is filtered in Rust by
+///   [`retain_visible_events`], which extracts the same uuids with
+///   [`payload_uuids`] and asks `ClaimRepository::hidden_claim_ids` the same
+///   question.
+///
+/// An earlier revision filtered only the persisted half and recorded the merge
+/// as "not fixed, an in-process bus is not SQL" (plan §4.12's rationale for
+/// deferring webhook fan-out to PR-10). That does not transfer: the ring buffer
+/// is not a no-db artefact. `routes/edges.rs` pushes `edge.added` (payload:
+/// `source_id`, `target_id`) and `claim.superseded`, `routes/belief.rs` pushes
+/// `frame.created`, and `routes/community.rs` pushes too — all from
+/// `#[cfg(feature = "db")]` handlers. Leaving step 2 open would have made the
+/// merge the trivial bypass for the filter added one function up.
+///
+/// This is the HTTP twin of MCP `list_events`; both are fixed in the same
+/// change so the two transports agree.
+///
+/// The signature is deliberately **not** `#[cfg]`-split. `ViewerExtractor` is
+/// defined in both configurations (`middleware/bearer.rs` — `epigraph_db::Viewer`
+/// under `db`, `NoDbViewer` under `not(db)`, with the same two 401 branches in
+/// the same order) precisely so a handler can name it once and branch only its
+/// body, per the convention `routes/rag.rs` states verbatim. An earlier revision
+/// split the signature on the false premise that the extractor is db-only; the
+/// result was a `not(db)` build whose `/api/v1/events` had no authentication
+/// precondition at all while the `db` build 401s an `agent_id`-less token —
+/// "a strictly weaker second implementation of the same route table", which is
+/// the exact divergence `bearer.rs`'s own doc says `NoDbViewer` exists to
+/// prevent.
 pub async fn list_events(
     State(_state): State<AppState>,
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     Query(filter): Query<EventFilter>,
 ) -> Result<Json<EventListResponse>, ApiError> {
+    // Bound in both configurations so the extractor — and therefore its two
+    // 401 branches — runs identically in both. Under `not(db)` the value is a
+    // `NoDbViewer` unit and nothing reads it.
+    let _ = &viewer;
     #[cfg(feature = "db")]
     {
         let limit = filter.limit.unwrap_or(100).min(1000);
@@ -234,6 +276,7 @@ pub async fn list_events(
         let overfetch = (limit.saturating_add(offset)).saturating_mul(2).max(limit);
         let rows = epigraph_db::EventRepository::list(
             &_state.db_pool,
+            &viewer,
             filter.event_type.as_deref(),
             None, // actor_id — not part of the public filter
             overfetch as i64,
@@ -264,7 +307,12 @@ pub async fn list_events(
             limit: Some(usize::MAX),
             offset: None,
         };
-        let (in_mem, _) = global_event_store().list(&in_mem_filter).await;
+        let (mut in_mem, _) = global_event_store().list(&in_mem_filter).await;
+        // 2b. Apply the SAME visibility rule the persisted half got. See this
+        //     handler's doc: the ring buffer is written by db-build handlers,
+        //     so an unfiltered merge would hand back the private claim ids the
+        //     step-1 filter just withheld.
+        retain_visible_events(&_state.db_pool, &viewer, &mut in_mem).await?;
         events.extend(in_mem);
 
         // 3. Defensive since-filter on the merged set. The DB query above
@@ -297,6 +345,81 @@ pub async fn list_events(
         let (events, total) = store.list(&filter).await;
         Ok(Json(EventListResponse { events, total }))
     }
+}
+
+/// Every uuid-shaped token anywhere in `payload`'s JSON text.
+///
+/// The Rust mirror of the `regexp_matches(e.payload::text, '<uuid>', 'g')` in
+/// `epigraph_db::EventRepository::list`. Both are deliberately blunt — they
+/// scan the *serialised document*, so nested objects, arrays, object keys and
+/// uuids quoted inside free text are all found. Over-collecting is the safe
+/// direction: a token that names no `claims` row cannot suppress anything,
+/// because `ClaimRepository::hidden_claim_ids` returns only ids that exist
+/// *and* are invisible.
+///
+/// Hand-written rather than a `regex` compile, because the shape is fixed: 36
+/// characters, hex except for `-` at offsets 8, 13, 18 and 23. The two
+/// implementations must agree; if either changes, change both.
+#[cfg(feature = "db")]
+fn payload_uuids(payload: &serde_json::Value) -> Vec<Uuid> {
+    const DASHES: [usize; 4] = [8, 13, 18, 23];
+    let text = payload.to_string();
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    if bytes.len() < 36 {
+        return out;
+    }
+    for start in 0..=(bytes.len() - 36) {
+        let w = &bytes[start..start + 36];
+        let shaped = w.iter().enumerate().all(|(i, &b)| {
+            if DASHES.contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        });
+        if shaped {
+            if let Ok(id) = std::str::from_utf8(w).unwrap_or("").parse::<Uuid>() {
+                out.push(id);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Drop every event carrying a uuid that names a claim `viewer` cannot read.
+///
+/// The in-process half of the rule `EventRepository::list` applies in SQL. One
+/// round-trip for the whole batch, and none at all when no event carries a
+/// uuid.
+#[cfg(feature = "db")]
+async fn retain_visible_events(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::Viewer,
+    events: &mut Vec<GraphEvent>,
+) -> Result<(), ApiError> {
+    let per_event: Vec<Vec<Uuid>> = events.iter().map(|e| payload_uuids(&e.payload)).collect();
+    let mut all: Vec<Uuid> = per_event.iter().flatten().copied().collect();
+    all.sort_unstable();
+    all.dedup();
+    if all.is_empty() {
+        return Ok(());
+    }
+    let hidden = epigraph_db::ClaimRepository::hidden_claim_ids(pool, viewer, &all)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to resolve event payload visibility: {e}"),
+        })?;
+    if hidden.is_empty() {
+        return Ok(());
+    }
+    let mut keep = per_event
+        .iter()
+        .map(|ids| !ids.iter().any(|i| hidden.contains(i)));
+    events.retain(|_| keep.next().unwrap_or(true));
+    Ok(())
 }
 
 /// `POST /api/v1/events` - Record a new graph event.
@@ -378,10 +501,28 @@ pub async fn create_event(
 /// information needed to reconstruct the graph as it existed at that point.
 /// A future enhancement will replay events from periodic checkpoints for
 /// efficiency.
+///
+/// # Tenancy (PR-09)
+///
+/// Viewer-scoped for the same reason `list_events` is — it replays the same
+/// rows through the same repo function, so leaving it unfiltered would have
+/// made it the trivial bypass for the filter added one function up.
+///
+/// Two consequences worth stating, because neither is a tenancy property:
+/// `event_count` is now viewer-dependent (it counts the events *this* caller
+/// may see, not the events that exist), and an event whose payload names a
+/// claim the caller cannot read is absent from the replay. An event naming a
+/// uuid that resolves to no `claims` row is deliberately **kept** — see
+/// `EventRepository::list` — so snapshot fidelity does not depend on
+/// referential integrity.
+///
+/// The signature is **not** `#[cfg]`-split; see `list_events`'s doc for why.
 pub async fn graph_snapshot(
     State(_state): State<AppState>,
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     Path(version): Path<i64>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
+    let _ = &viewer;
     if version < 0 {
         return Err(ApiError::ValidationError {
             field: "version".to_string(),
@@ -406,11 +547,12 @@ pub async fn graph_snapshot(
 
         // Fetch all events up to version via the event list (filter by version not yet in repo,
         // so we fetch all and filter client-side for now)
-        let rows = epigraph_db::EventRepository::list(&_state.db_pool, None, None, version + 1)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to fetch events for snapshot: {e}"),
-            })?;
+        let rows =
+            epigraph_db::EventRepository::list(&_state.db_pool, &viewer, None, None, version + 1)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("Failed to fetch events for snapshot: {e}"),
+                })?;
         let events: Vec<GraphEvent> = rows
             .into_iter()
             .filter(|r| r.graph_version <= version)
@@ -720,6 +862,123 @@ mod tests {
         assert_ne!(
             e1.graph_version, e2.graph_version,
             "Each event must have a unique version"
+        );
+    }
+}
+
+// ── payload_uuids unit tests ────────────────────────────────────────────────
+//
+// `payload_uuids` is hand-rolled (no `regex` compile) and must agree with the
+// `regexp_matches(payload::text, '<uuid>', 'g')` in
+// `epigraph_db::EventRepository::list`. It is the half of `list_events`'s
+// visibility rule that a database test cannot reach, so it is pinned here.
+
+#[cfg(all(test, feature = "db"))]
+mod payload_uuid_tests {
+    use super::payload_uuids;
+    use uuid::Uuid;
+
+    #[test]
+    fn finds_a_uuid_under_any_key() {
+        let a = Uuid::new_v4();
+        let v = serde_json::json!({ "winner_id": a.to_string() });
+        assert_eq!(payload_uuids(&v), vec![a]);
+    }
+
+    /// The blocker this rule exists for: the `conflict.resolved` shape names
+    /// three claims and none of them under `claim_id`.
+    #[test]
+    fn finds_every_uuid_in_a_conflict_resolved_payload() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let v = serde_json::json!({
+            "claim_a_id": a.to_string(),
+            "claim_b_id": b.to_string(),
+            "winner_id": a.to_string(),
+        });
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(payload_uuids(&v), want, "all three ids, deduplicated");
+    }
+
+    /// `publish_event` and `POST /api/v1/events` accept arbitrary payloads, so
+    /// a one-level scan would be a fail-open one nesting level down.
+    #[test]
+    fn descends_into_nested_objects_and_arrays() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let v = serde_json::json!({
+            "outer": { "inner": { "id": a.to_string() } },
+            "list": [ { "id": b.to_string() } ],
+        });
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(payload_uuids(&v), want);
+    }
+
+    /// Deliberately blunt: a uuid quoted inside free text counts. That
+    /// over-collects, which is the safe direction — an id naming no `claims`
+    /// row cannot suppress anything.
+    #[test]
+    fn finds_a_uuid_embedded_in_free_text() {
+        let a = Uuid::new_v4();
+        let v = serde_json::json!({ "goal": format!("reconcile {a} with the log") });
+        assert_eq!(payload_uuids(&v), vec![a]);
+    }
+
+    #[test]
+    fn returns_nothing_for_a_payload_with_no_uuid() {
+        let v = serde_json::json!({ "note": "no claim here", "n": 7 });
+        assert!(payload_uuids(&v).is_empty());
+    }
+
+    /// A near-miss must not be reported, or every event would be dropped the
+    /// moment one such string appeared beside a private id.
+    #[test]
+    fn rejects_strings_that_are_not_uuid_shaped() {
+        for bad in [
+            "not-a-uuid",
+            "12345678-1234-1234-1234-12345678901",  // 35 chars
+            "12345678_1234_1234_1234_123456789012", // wrong separators
+            "gggggggg-1234-1234-1234-123456789012", // non-hex
+        ] {
+            let v = serde_json::json!({ "x": bad });
+            assert!(
+                payload_uuids(&v).is_empty(),
+                "{bad} must not be read as a uuid"
+            );
+        }
+    }
+
+    /// An over-long hex-and-dash run DOES yield the 36-character prefix, from
+    /// both implementations, and that is the correct outcome to pin.
+    ///
+    /// The SQL side is `regexp_matches(payload::text, '<uuid>', 'g')` with no
+    /// anchors, so Postgres returns the same prefix — verified by hand against
+    /// the test database:
+    ///
+    /// ```sql
+    /// SELECT m[1] FROM regexp_matches(
+    ///   '{"x": "12345678-1234-1234-1234-1234567890123"}',
+    ///   '[0-9a-fA-F]{8}-...-[0-9a-fA-F]{12}', 'g') AS m;
+    /// -- 12345678-1234-1234-1234-123456789012
+    /// ```
+    ///
+    /// An earlier draft of this test asserted the opposite (that a 37-character
+    /// run yields nothing) and failed. Tightening the Rust side to match that
+    /// assertion would have been the wrong fix: it would have made the two
+    /// halves of one visibility rule disagree, which is the only property here
+    /// that can produce a leak. What matters is that neither side ever
+    /// fabricates an id that is not literally present in the payload.
+    #[test]
+    fn an_over_long_hex_run_yields_its_prefix_in_both_implementations() {
+        let v = serde_json::json!({
+            "x": "12345678-1234-1234-1234-1234567890123"
+        });
+        let found = payload_uuids(&v);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].to_string(), "12345678-1234-1234-1234-123456789012");
+        assert!(
+            v.to_string().contains(&found[0].to_string()),
+            "never fabricate an id that is not a substring of the payload"
         );
     }
 }

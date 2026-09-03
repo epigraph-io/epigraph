@@ -679,6 +679,14 @@ pub async fn report_workflow_outcome(
     // flat-workflow path only when the id is not a hierarchical workflow
     // (preserves backward-compat for the ~144 legacy flat-workflow claims).
     let is_hierarchical: bool =
+        // VISIBILITY-EXEMPT: `workflows` is not in migration 062's `tier_a`
+        // array and carries neither `visibility` nor `owner_group_id` (verified
+        // against `information_schema.columns`), so no predicate can be written
+        // here. Same category as `papers` in `recall.rs::compute_corpus_scope`.
+        // What leaves the function is one boolean routing decision — which of
+        // two outcome paths to take — and both paths perform their own
+        // viewer-scoped reads. Owner of the residual: the PR that gives
+        // `workflows` tenancy columns (plan §2.4's registration pass).
         sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM workflows WHERE id = $1)")
             .bind(workflow_id)
             .fetch_one(&server.pool)
@@ -927,13 +935,25 @@ pub async fn deprecate_workflow(
                 }
                 let child_id = edge.source_id;
                 // Filter to workflow-labeled claims only.
-                let is_workflow: bool =
-                    sqlx::query_scalar("SELECT 'workflow' = ANY(labels) FROM claims WHERE id = $1")
-                        .bind(child_id)
-                        .fetch_optional(&server.pool)
+                let is_workflow: bool = {
+                    // PR-09: a label-membership oracle over an id reached by
+                    // graph traversal. Filtered rather than exempted — a child
+                    // the viewer cannot read must not be cascaded into, and
+                    // `unwrap_or(false)` already means "not a workflow, skip".
+                    let sql = viewer.splice(
+                        "SELECT 'workflow' = ANY(c.labels) FROM claims c \
+                         WHERE c.id = $1 /* {VISIBILITY:c} */",
+                        2,
+                    );
+                    let mut q = sqlx::query_scalar(&sql).bind(child_id);
+                    if let Some(g) = viewer.group_bind() {
+                        q = q.bind(g);
+                    }
+                    q.fetch_optional(&server.pool)
                         .await
                         .map_err(internal_error)?
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                };
                 if !is_workflow {
                     continue;
                 }

@@ -399,47 +399,123 @@ impl MatchCandidateRepo {
     }
 
     /// Rows in any status, sorted by score desc, optionally filtered by status.
+    ///
+    /// # Tenancy (PR-09)
+    ///
+    /// `match_candidates` is **not** in migration 062's `tier_a` array, so it
+    /// carries no `visibility` / `owner_group_id` of its own. Visibility is
+    /// therefore derived from the pair it names: a row is returned only when the
+    /// viewer can read **both** `claim_a` and `claim_b`. Deriving from one side
+    /// would leak the other's id, and the row's `verifier_rationale` is free
+    /// text written from both claims' content — it is the leakiest column in the
+    /// table, not an identifier.
+    ///
+    /// Both joins are INNER, so a candidate naming a claim the viewer cannot see
+    /// is absent rather than partially rendered (§8.5's existence-oracle rule).
     pub async fn list(
         &self,
+        viewer: &crate::visibility::Viewer,
         status: Option<&str>,
         limit: i64,
     ) -> sqlx::Result<Vec<MatchCandidateRow>> {
         match status {
             Some(s) => {
-                sqlx::query_as(
-                    "SELECT * FROM match_candidates
-                 WHERE status = $1
-                 ORDER BY score DESC
-                 LIMIT $2",
-                )
-                .bind(s)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
+                let sql = viewer.splice(
+                    "SELECT mc.* FROM match_candidates mc
+                     JOIN claims ca ON ca.id = mc.claim_a
+                     JOIN claims cb ON cb.id = mc.claim_b
+                     WHERE mc.status = $1 /* {VISIBILITY:ca} */ /* {VISIBILITY:cb} */
+                     ORDER BY mc.score DESC
+                     LIMIT $2",
+                    3,
+                );
+                let mut q = sqlx::query_as(&sql).bind(s).bind(limit);
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                q.fetch_all(&self.pool).await
             }
             None => {
-                sqlx::query_as(
-                    "SELECT * FROM match_candidates
-                 ORDER BY score DESC
-                 LIMIT $1",
-                )
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
+                let sql = viewer.splice(
+                    "SELECT mc.* FROM match_candidates mc
+                     JOIN claims ca ON ca.id = mc.claim_a
+                     JOIN claims cb ON cb.id = mc.claim_b
+                     WHERE true /* {VISIBILITY:ca} */ /* {VISIBILITY:cb} */
+                     ORDER BY mc.score DESC
+                     LIMIT $1",
+                    2,
+                );
+                let mut q = sqlx::query_as(&sql).bind(limit);
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                q.fetch_all(&self.pool).await
             }
         }
     }
 
     /// All rows where `claim_id` is either side of the pair. Used by the
     /// per-claim "find cross-source matches" API/MCP read paths.
-    pub async fn list_for_claim(&self, claim_id: Uuid) -> sqlx::Result<Vec<MatchCandidateRow>> {
-        sqlx::query_as(
-            "SELECT * FROM match_candidates
-             WHERE claim_a = $1 OR claim_b = $1
-             ORDER BY score DESC",
-        )
-        .bind(claim_id)
-        .fetch_all(&self.pool)
-        .await
+    ///
+    /// Same both-sides-visible rule as [`Self::list`]; see its doc.
+    pub async fn list_for_claim(
+        &self,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> sqlx::Result<Vec<MatchCandidateRow>> {
+        let sql = viewer.splice(
+            "SELECT mc.* FROM match_candidates mc
+             JOIN claims ca ON ca.id = mc.claim_a
+             JOIN claims cb ON cb.id = mc.claim_b
+             WHERE (mc.claim_a = $1 OR mc.claim_b = $1)
+               /* {VISIBILITY:ca} */ /* {VISIBILITY:cb} */
+             ORDER BY mc.score DESC",
+            2,
+        );
+        let mut q = sqlx::query_as(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(&self.pool).await
+    }
+
+    /// `CORROBORATES` edges incident on `claim_id` — the already-promoted half
+    /// of a cross-source match read.
+    ///
+    /// # Tenancy (PR-09)
+    ///
+    /// This SQL previously lived inline in **two** places —
+    /// `epigraph-mcp/src/tools/matching.rs::find_cross_source_matches` and
+    /// `epigraph-api/src/routes/cross_source.rs::get_cross_source_matches` —
+    /// duplicated, unfiltered, and returning the id of the claim on the far end
+    /// of every edge. It is one function now, which is what CLAUDE.md's
+    /// "do not duplicate SQL between them" asks for, and it filters.
+    ///
+    /// The predicate is on `edges` (`Viewer::predicate_fragment`, not the
+    /// co-ownership `edge_predicate_fragment` — that is PR-13's and the column
+    /// it names does not exist yet) **and** on the far-side claim. The edge
+    /// predicate alone is not enough: `edges.owner_group_id` today defaults to
+    /// the world group for every pre-062 row, so a public edge would still hand
+    /// back a private claim's id.
+    pub async fn corroborates_edges_for_claim(
+        &self,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> sqlx::Result<Vec<(Uuid, Uuid, Uuid, serde_json::Value)>> {
+        let sql = viewer.splice(
+            "SELECT e.id, e.source_id, e.target_id, e.properties
+             FROM edges e
+             JOIN claims far
+               ON far.id = CASE WHEN e.source_id = $1 THEN e.target_id ELSE e.source_id END
+             WHERE e.relationship = 'CORROBORATES'
+               AND (e.source_id = $1 OR e.target_id = $1)
+               /* {VISIBILITY:e} */ /* {VISIBILITY:far} */",
+            2,
+        );
+        let mut q = sqlx::query_as(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(&self.pool).await
     }
 }
