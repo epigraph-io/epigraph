@@ -150,6 +150,19 @@ name = "retire_match_candidates"
 path = "src/bin/retire_match_candidates.rs"
 required-features = ["db"]
 
+# PR-12's tenancy backfill. A [[bin]] here rather than a new
+# `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
+# names the binary with no path, the PR's own title is `feat(cli)`, every
+# comparable maintenance tool in this tree is a [[bin]] in this crate, and a new
+# workspace member would need its own `.github/workflows/ci.yml` `--exclude` +
+# serialized step (ci.yml is on PR-16's Files line, not PR-12's). The binary
+# NAME is what migration 066's header and plan §9.2 invoke, and it is preserved
+# exactly.
+[[bin]]
+name = "epigraph-tenancy-backfill"
+path = "src/bin/tenancy_backfill.rs"
+required-features = ["db"]
+
 [dependencies]
 epigraph-core = { workspace = true }
 epigraph-engine = { workspace = true }
