@@ -106,7 +106,7 @@ pub use sqlx::PgPool;
 
 // Re-export row types for users of repositories
 pub use repos::activity::ActivityRow;
-pub use repos::community::{CommunityMemberRow, CommunityRow};
+pub use repos::community::{CommunityMemberRow, CommunityRow, MembershipOutcome};
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
 pub use repos::edge::{AttributedClaimRow, EdgeRow, EPISTEMIC_RELATIONSHIPS};
