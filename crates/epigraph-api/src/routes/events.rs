@@ -360,8 +360,13 @@ pub async fn list_events(
 /// Hand-written rather than a `regex` compile, because the shape is fixed: 36
 /// characters, hex except for `-` at offsets 8, 13, 18 and 23. The two
 /// implementations must agree; if either changes, change both.
+///
+/// `pub(crate)` since PR-10: `routes/webhooks.rs::deliver_event` applies the
+/// same rule to the webhook fan-out, and a second hand-rolled uuid scanner
+/// would be a second thing to keep in step with `EventRepository::list`'s
+/// `regexp_matches`. Two implementations were already one too many.
 #[cfg(feature = "db")]
-fn payload_uuids(payload: &serde_json::Value) -> Vec<Uuid> {
+pub(crate) fn payload_uuids(payload: &serde_json::Value) -> Vec<Uuid> {
     const DASHES: [usize; 4] = [8, 13, 18, 23];
     let text = payload.to_string();
     let bytes = text.as_bytes();

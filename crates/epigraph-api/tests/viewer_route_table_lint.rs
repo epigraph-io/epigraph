@@ -190,7 +190,14 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     ("edges.rs", 9),
     ("papers.rs", 1),
     ("tasks.rs", 6),
-    ("webhooks.rs", 2),
+    // `("webhooks.rs", 2)` REMOVED by PR-10, which converted both sites in
+    // `delete_webhook` to the prescribed
+    // `auth_ctx.ok_or(ApiError::Unauthorized { .. })?` shape and made the scope
+    // check unconditional. Removed rather than set to `0`: this constant is
+    // compared as a whole `BTreeMap` against `measure_fail_open_scope_sites`,
+    // which only inserts a key when its count is non-zero, so a `0` row is a
+    // key the measurement can never produce and the assertion would fail on a
+    // correct fix.
 ];
 
 fn routes_dir() -> PathBuf {

@@ -13,6 +13,44 @@
 //! the four decisions, say so in the commit body; do not leave the reviewer to
 //! infer it from an untouched test file.
 //!
+//! ## Status at PR-10
+//!
+//! **PR-10 adds a migration and does NOT touch any of the four.** Said
+//! explicitly, because it adds one (085, `webhook_subscriptions`) and the
+//! rejection trigger above is written to catch exactly the PR that adds a
+//! migration and leaves this file alone.
+//!
+//! * **D1 (nothing is public by absence, omission, or default-on-error)** —
+//!   reinforced, not changed. The new fan-out filter in
+//!   `epigraph-api/src/routes/webhooks.rs::retain_visible_subscriptions` has
+//!   three failure branches (no `agent_id`, `Viewer::resolve` errors,
+//!   `hidden_claim_ids` errors) and all three DROP the delivery. A database
+//!   outage stops webhooks; it does not broadcast every tenant's claims.
+//! * **D3 (`public` means any authenticated agent; no anonymous shape)** —
+//!   unchanged. PR-10 adds no `Viewer` constructor and no `SystemReason`. Its
+//!   viewers come from `Viewer::resolve` over a subscription's `agent_id`,
+//!   which is the one production path. `list_webhooks` / `get_webhook` gained
+//!   `middleware::bearer::RequirePrincipal`, which enforces D3's two 401
+//!   branches (no `AuthContext`, then no `agent_id`) and deliberately does NOT
+//!   hand out a `Viewer` — there is no visibility predicate on a subscription
+//!   row for one to be spent on, and an unspent viewer is a fail-open dressed
+//!   as diligence.
+//! * **Migration 085 is not a tenancy column change.** `webhook_subscriptions`
+//!   has no `claim_id` and no foreign key onto `claims`, so it is outside the
+//!   §2.4 protected set under both of `tenancy_coverage.rs::protected_set`'s
+//!   generators, carries neither `visibility` nor `owner_group_id`, and gets no
+//!   `tenancy_exempt` row (the registry is for relations the generators DO
+//!   find; `migration_068_and_069_apply_twice` pins its cardinality at 12).
+//! * **No route moved between the `public` and `protected` chains.** The four
+//!   webhook routes were already on `protected` in both `create_router`
+//!   variants and still are; `public_router_allowlist.rs` is untouched.
+//! * **No RLS policy.** None exists yet (PR-17 owns 077/079).
+//! * **No write-side tenancy predicate.** `register_webhook` now writes a row,
+//!   which is disclosed on the handler itself, but it adds no
+//!   `writable_bind()`, no `WITH CHECK` and no policy — that is PR-16's
+//!   mechanism and it does not exist. Refusing when `AuthContext` is absent
+//!   (`delete_webhook`) is authentication, not the PR-16 control.
+//!
 //! ## Status at PR-09
 //!
 //! **PR-09 DOES touch a locked decision, and this file grows accordingly.**
