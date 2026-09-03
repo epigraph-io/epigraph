@@ -358,8 +358,24 @@ pub async fn list_events(
 /// *and* are invisible.
 ///
 /// Hand-written rather than a `regex` compile, because the shape is fixed: 36
-/// characters, hex except for `-` at offsets 8, 13, 18 and 23. The two
-/// implementations must agree; if either changes, change both.
+/// characters, hex except for `-` at offsets 8, 13, 18 and 23.
+///
+/// # The two implementations are not identical, and the asymmetry is the safe
+/// # one — do NOT "fix" it
+///
+/// Postgres `regexp_matches(..., 'g')` returns **non-overlapping** matches: it
+/// resumes scanning after the end of each match. This scanner slides over
+/// **every** byte offset, so on a long hex-and-dash run it collects overlapping
+/// windows that Postgres skips. The Rust set is therefore a **superset** of the
+/// SQL set, which means the in-memory half can only drop MORE events than the
+/// persisted half — fail-closed.
+///
+/// Narrowing the Rust side to match Postgres exactly would make the in-memory
+/// half the more permissive of the two, which is the direction that produces a
+/// leak. The property to preserve is `rust ⊇ sql`, not `rust == sql`. Both
+/// sides are pinned by
+/// `payload_uuid_tests::an_over_long_hex_run_yields_its_prefix_in_both_implementations`,
+/// which records the Postgres output verbatim.
 #[cfg(feature = "db")]
 fn payload_uuids(payload: &serde_json::Value) -> Vec<Uuid> {
     const DASHES: [usize; 4] = [8, 13, 18, 23];

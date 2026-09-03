@@ -260,6 +260,23 @@ pub async fn submit_ds_evidence(
         // for anyone who can guess an id. `fetch_optional` + the not-found
         // branch below make an invisible claim indistinguishable from a
         // nonexistent one (plan §8.5).
+        //
+        // NOTE that this refusal is DIFFERENT IN KIND from the other three
+        // per-id oracles PR-09 hardened. `ds_auto.rs`, `link_epistemic.rs` and
+        // `workflows.rs` all DEGRADE when the row is invisible (no prior, skip
+        // the best-effort recompute, skip the cascade child) and leave the
+        // write-half question to PR-16. This one aborts the whole call, so it
+        // DOES decide the write half for `submit_ds_evidence`: a viewer that
+        // cannot read the claim cannot submit evidence against it. That is the
+        // right answer under D3 — you may not assert about what you may not
+        // read — but it is a decision, not a side effect, and the ledger's
+        // D-PR16-per-id-claim-oracles-write-half is scoped to the other three
+        // for that reason.
+        //
+        // Reachable today, independently of PR-12: a caller passing a
+        // NONEXISTENT claim_id now gets `invalid_request` where the previous
+        // `fetch_one` gave `RowNotFound` -> internal_error. Strictly better,
+        // and recorded in the PR-09 ledger's behaviour_changes.
         let sql = viewer.splice(
             "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing
              FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
