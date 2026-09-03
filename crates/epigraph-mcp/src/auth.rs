@@ -176,7 +176,27 @@ pub fn unauthorized(resource_metadata_url: Option<&str>, error: &str) -> Respons
 /// *everything* with "no auth context", rendering the flag misleading (backlog
 /// bug `be2a3391`). Injecting this permissive context lets calls through, which
 /// is exactly what the operator asked for.
-pub fn unauthenticated_context() -> AuthContext {
+///
+/// # Tenancy (PR-09)
+///
+/// `agent_id` now carries `server_agent_id` — the server's own `agents.id` —
+/// instead of `None`. Plan §4.12 assigns this change to PR-09, and it is
+/// required for the flag to keep working now that
+/// `tools::viewer::request_viewer` refuses an `AuthContext` with no agent
+/// principal: with `None` here, every content tool on this listener would
+/// return the "token carries no agent principal" error and the flag would be
+/// misleading in a *new* way.
+///
+/// **Call it a widening, because it is one.** Before, `request_viewer` mapped
+/// this context's nil `client_id` to `Viewer::resolve(pool, nil)` — an empty
+/// group set, public rows only, fail-closed by accident. Now every holder of
+/// this listener's credential (in production, one shared bearer token in front
+/// of a unix socket) reads with the server agent's group set. On today's corpus
+/// the two are identical, because migration 062 defaults `visibility` to
+/// `'public'` and backfills nothing; the difference appears the moment PR-12's
+/// backfill writes the first `'group'` row. Operators who do not want that
+/// should not be running `--allow-unauthenticated-http`.
+pub fn unauthenticated_context(server_agent_id: Option<uuid::Uuid>) -> AuthContext {
     let mut scopes: Vec<String> = crate::scope_map::SCOPE_MAP
         .iter()
         .map(|(_, scope)| (*scope).to_string())
@@ -185,7 +205,7 @@ pub fn unauthenticated_context() -> AuthContext {
     scopes.dedup();
     AuthContext {
         client_id: uuid::Uuid::nil(),
-        agent_id: None,
+        agent_id: server_agent_id,
         owner_id: None,
         client_type: epigraph_auth::ClientType::Service,
         scopes,
@@ -198,8 +218,13 @@ pub fn unauthenticated_context() -> AuthContext {
 /// scope gate passes. Mirrors how [`bearer_auth_middleware`] inserts a
 /// *validated* `AuthContext`, minus the validation. Attach this ONLY when the
 /// operator passed `--allow-unauthenticated-http` (enforced in `main.rs`).
-pub async fn inject_unauthenticated_context(mut req: Request, next: Next) -> Response {
-    req.extensions_mut().insert(unauthenticated_context());
+pub async fn inject_unauthenticated_context(
+    axum::extract::State(server_agent_id): axum::extract::State<Option<uuid::Uuid>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    req.extensions_mut()
+        .insert(unauthenticated_context(server_agent_id));
     next.run(req).await
 }
 

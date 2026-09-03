@@ -13,6 +13,34 @@
 //! the four decisions, say so in the commit body; do not leave the reviewer to
 //! infer it from an untouched test file.
 //!
+//! ## Status at PR-09
+//!
+//! **PR-09 DOES touch a locked decision, and this file grows accordingly.**
+//! It changes how an MCP caller obtains read authority, which is D3 — not a
+//! route split, not a tenancy column, but the third of the four. Two changes,
+//! both in the direction D3 points:
+//!
+//! * `crates/epigraph-mcp/src/tools/viewer.rs::request_viewer` no longer
+//!   flattens `agent_id.or(owner_id).unwrap_or(client_id)`. `owner_id` and
+//!   `client_id` are `oauth_clients.id` values; feeding either to
+//!   `Viewer::resolve` was a type confusion that produced the D3-correct answer
+//!   (public only) *by accident*, because the membership lookup happened never
+//!   to match. An HTTP `AuthContext` with no `agent_id` is now refused.
+//!   Asserted by [`d3_mcp_viewer_acquisition_does_not_flatten_a_client_id`].
+//! * `crates/epigraph-mcp/src/auth.rs::unauthenticated_context` now carries the
+//!   server's own `agents.id`, so the `--allow-unauthenticated-http` listener
+//!   resolves the server's viewer rather than a nil principal's. This is a
+//!   **widening** of that listener's read authority, and it is the change plan
+//!   §4.12 assigns to PR-09. It does not create an anonymous *shape* — there is
+//!   still exactly one `Viewer::resolve` and it still requires a principal — so
+//!   [`d3_viewer_has_no_infallible_constructor`] is unchanged and correct.
+//!
+//! Nothing else in PR-09 is one of the four: the rest is read-path filtering
+//! (viewer predicates spliced into repo functions and into `recall.rs`'s
+//! `sqlx::query!` macros), inline SQL moved to `crates/epigraph-db/src/repos/`,
+//! and three new test files. No migration; no RLS policy; no route moved
+//! between the `public` and `protected` chains.
+//!
 //! ## Status at PR-08
 //!
 //! PR-06, PR-07 and PR-08 leave every assertion below unchanged, and that is the
@@ -92,6 +120,15 @@ const ROUTES_MOD_RS: &str = concat!(
     "/../epigraph-api/src/routes/mod.rs"
 );
 
+/// D3's MCP half (PR-09). `crates/epigraph-mcp/src/tools/viewer.rs` is where a
+/// tool call turns an `AuthContext` into read authority — the MCP counterpart of
+/// `epigraph-api`'s `ViewerExtractor`, and therefore the other place D3 can be
+/// violated. Same cross-crate rationale as [`ROUTES_MOD_RS`].
+const MCP_VIEWER_RS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../epigraph-mcp/src/tools/viewer.rs"
+);
+
 fn read(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
 }
@@ -166,6 +203,50 @@ fn d3_viewer_has_no_infallible_constructor() {
         violations.is_empty(),
         "D3 is violated in src/visibility.rs:\n{}",
         violations.join("\n\n")
+    );
+}
+
+/// D3, MCP half: read authority comes from an `agents.id` or it does not come
+/// at all (PR-09).
+///
+/// `epigraph-api`'s side of this is the `ViewerExtractor`, which 401s a
+/// principal-less token. MCP has no extractor — `tools/viewer.rs::request_viewer`
+/// is the whole of it — and until PR-09 it flattened
+/// `agent_id.or(owner_id).unwrap_or(client_id)` and resolved whatever came out.
+///
+/// Why that mattered even though the outcome was correct: `owner_id` and
+/// `client_id` are `oauth_clients.id` values, so `Viewer::resolve` looked up
+/// `group_memberships.agent_id = <a client id>`, matched nothing, and returned a
+/// public-only viewer. Right answer, wrong reason — and a reason that stops
+/// holding the moment those id spaces overlap, at which point the flatten is a
+/// silent authority grant with no error and no metric. Plan §4.12 says so
+/// directly, prescribing `None => Err(unauthorized(...))`.
+///
+/// This is a source-text assertion for the same reason
+/// [`d3_viewer_has_no_infallible_constructor`] is: the property is "this
+/// spelling does not appear", which no runtime test can establish.
+#[test]
+fn d3_mcp_viewer_acquisition_does_not_flatten_a_client_id() {
+    let code = strip_line_comments(&read(MCP_VIEWER_RS));
+
+    assert!(
+        !code.contains("unwrap_or(a.client_id)") && !code.contains("or(a.owner_id)"),
+        "D3 is violated in epigraph-mcp/src/tools/viewer.rs: request_viewer is \
+         flattening an oauth_clients.id into an agents.id position again. A \
+         token with no agent principal has no read authority; refuse it."
+    );
+    assert!(
+        code.contains("a.agent_id.ok_or_else("),
+        "request_viewer must refuse an AuthContext carrying no agent_id, not \
+         substitute another id for it. If the refusal moved or changed shape, \
+         update this assertion deliberately — it is the only mechanical record \
+         that MCP's read authority is agent-derived."
+    );
+    assert!(
+        code.contains("Viewer::resolve"),
+        "request_viewer must still go through Viewer::resolve — the one \
+         constructor a request path can reach. A second acquisition path is a \
+         second place D3 can be violated."
     );
 }
 

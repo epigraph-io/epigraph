@@ -42,55 +42,109 @@ impl EventRepository {
         Ok(id)
     }
 
-    /// List events with optional type and actor filters.
+    /// Recent events, newest first, optionally filtered by type and actor.
+    ///
+    /// # Tenancy (PR-09)
+    ///
+    /// `events` is **not** in migration 062's `tier_a` array and has no
+    /// `visibility` / `owner_group_id` of its own. But an event payload is not
+    /// metadata: `epigraph-events/src/events.rs` puts `claim_id`, `agent_id`
+    /// and `initial_truth` in it, so `list_events` was handing a stranger the
+    /// id and asserted truth value of every claim written to the graph,
+    /// corpus-wide, regardless of that claim's visibility.
+    ///
+    /// ## The rule, stated as the SQL actually implements it
+    ///
+    /// **An event is returned unless some uuid appearing anywhere in its
+    /// payload names a `claims` row this viewer cannot read.**
+    ///
+    /// The first revision of this function keyed on `payload->>'claim_id'`
+    /// alone, which was default-OPEN for every other payload shape and — worse
+    /// — was documented as if it were not. The live emitters refute the
+    /// narrower rule directly: `epigraph-api`'s `routes/conflicts.rs` writes
+    /// `conflict.resolved` with `claim_a_id` / `claim_b_id` / `winner_id` and
+    /// **no** `claim_id`; `routes/gaps.rs` writes `gap.surfaced` with
+    /// `challenge_id`; and both MCP `publish_event` and
+    /// `POST /api/v1/events` accept caller-supplied payloads, so the key set is
+    /// open-ended by construction. Any rule written as an allowlist of keys is
+    /// therefore a rule that the next emitter silently escapes.
+    ///
+    /// So the extraction is deliberately blunt: `regexp_matches` over
+    /// `payload::text` with the `'g'` flag finds every uuid-shaped token in the
+    /// whole document — nested objects, arrays, keys, and uuids embedded in
+    /// free text alike. That over-collects (an `agent_id`, a `challenge_id`, a
+    /// uuid quoted inside a `goal` string) and over-collecting is the safe
+    /// direction: a token that names no `claims` row cannot suppress anything,
+    /// because the `EXISTS` on the next line requires the row to exist first.
+    ///
+    /// [`crate::repos::ClaimRepository::hidden_claim_ids`] implements the same
+    /// rule for the caller-side (in-memory) half of `epigraph-api`'s
+    /// `list_events`, and `epigraph-api`'s `payload_uuids` is the Rust mirror
+    /// of this regex. The three must agree; they are cross-referenced in all
+    /// three places for that reason.
+    ///
+    /// ## Two shapes that deliberately survive the filter
+    ///
+    /// * **An event naming no claim at all** — most of them. `NOT EXISTS` over
+    ///   an empty match set is true.
+    /// * **An event naming a uuid that resolves to no `claims` row** (a
+    ///   hard-deleted claim, an `agent_id`, a malformed or foreign id). There
+    ///   is no row to classify, no owner to protect, and dropping it would make
+    ///   `graph_snapshot`'s replay depend on referential integrity rather than
+    ///   on visibility. The earlier revision dropped these; that was a
+    ///   behaviour change unrelated to tenancy and it is reverted here.
+    ///
+    /// No `CASE` guard is needed around the cast, and its absence is not the
+    /// short-circuit hazard the earlier revision documented: `regexp_matches`
+    /// yields only substrings that already matched the uuid pattern, so
+    /// `m[1]::uuid` cannot raise `22P02`. The hazard was real for
+    /// `payload->>'claim_id'`, whose value is arbitrary text.
+    ///
+    /// ## Cost
+    ///
+    /// One regex pass over each event row the `created_at` ordering touches,
+    /// plus a primary-key probe per uuid found. The overwhelming majority of
+    /// rows pass, so `LIMIT n` still stops after roughly `n` rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`sqlx::Error`] if the query fails.
     pub async fn list(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         event_type: Option<&str>,
         actor_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<EventRow>, sqlx::Error> {
-        if let Some(et) = event_type {
-            if let Some(aid) = actor_id {
-                sqlx::query_as::<_, EventRow>(
-                    "SELECT id, event_type, actor_id, payload, graph_version, created_at \
-                     FROM events WHERE event_type = $1 AND actor_id = $2 \
-                     ORDER BY created_at DESC LIMIT $3",
-                )
-                .bind(et)
-                .bind(aid)
-                .bind(limit)
-                .fetch_all(pool)
-                .await
-            } else {
-                sqlx::query_as::<_, EventRow>(
-                    "SELECT id, event_type, actor_id, payload, graph_version, created_at \
-                     FROM events WHERE event_type = $1 \
-                     ORDER BY created_at DESC LIMIT $2",
-                )
-                .bind(et)
-                .bind(limit)
-                .fetch_all(pool)
-                .await
-            }
-        } else if let Some(aid) = actor_id {
-            sqlx::query_as::<_, EventRow>(
-                "SELECT id, event_type, actor_id, payload, graph_version, created_at \
-                 FROM events WHERE actor_id = $1 \
-                 ORDER BY created_at DESC LIMIT $2",
-            )
-            .bind(aid)
-            .bind(limit)
-            .fetch_all(pool)
-            .await
-        } else {
-            sqlx::query_as::<_, EventRow>(
-                "SELECT id, event_type, actor_id, payload, graph_version, created_at \
-                 FROM events ORDER BY created_at DESC LIMIT $1",
-            )
-            .bind(limit)
-            .fetch_all(pool)
-            .await
+        let sql = viewer.splice(
+            "SELECT e.id, e.event_type, e.actor_id, e.payload, e.graph_version, e.created_at \
+             FROM events e \
+             WHERE ($1::text IS NULL OR e.event_type = $1) \
+               AND ($2::uuid IS NULL OR e.actor_id = $2) \
+               AND NOT EXISTS ( \
+                     SELECT 1 \
+                     FROM regexp_matches(e.payload::text, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-\
+[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', 'g') AS m \
+                     WHERE EXISTS (SELECT 1 FROM claims cx WHERE cx.id = m[1]::uuid) \
+                       AND NOT EXISTS ( \
+                             SELECT 1 FROM claims c \
+                             WHERE c.id = m[1]::uuid /* {VISIBILITY:c} */ \
+                           ) \
+                   ) \
+             ORDER BY e.created_at DESC LIMIT $3",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, EventRow>(&sql)
+            .bind(event_type)
+            .bind(actor_id)
+            .bind(limit);
+        // Guarded, not `unwrap_or(&[])`: `render_predicate` emits nothing for a
+        // `Bypass` viewer, so an unconditional bind would send one more
+        // parameter than the rendered statement references.
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
         }
+        q.fetch_all(pool).await
     }
 
     /// Get the latest graph version number.

@@ -194,12 +194,22 @@ pub async fn do_link_epistemic(
     // `trigger_edge_ds_recomputation` does. Resolved here via a runtime query
     // (no `query!` macro → zero .sqlx offline-data churn).
     let mut belief_wired = false;
-    let source_agent_id: Option<uuid::Uuid> =
-        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
-            .bind(source_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(internal_error)?;
+    let source_agent_id: Option<uuid::Uuid> = {
+        // PR-09: an authorship oracle over a caller-supplied uuid —
+        // it names the `agents.id` behind any claim. Filtered rather than
+        // exempted; `fetch_optional` already handles "no row", so an
+        // invisible source simply skips the best-effort belief recompute.
+        let sql = viewer.splice(
+            "SELECT c.agent_id FROM claims c \
+                 WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(source_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(pool).await.map_err(internal_error)?
+    };
 
     if let Some(agent_id) = source_agent_id {
         // Best-effort: a recompute error must not lose the durable edge.

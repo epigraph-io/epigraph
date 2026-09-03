@@ -389,6 +389,7 @@ async fn truncation_flags_when_siblings_limit_below_total(pool: PgPool) {
     let fx = fixture::build(&pool).await;
     let ctx = fetch_batched_context(
         &pool,
+        &viewerfx::public_viewer(&pool).await,
         &[fx.paragraphs[0]],
         /*siblings_limit=*/ 2,
         /*corroborates_limit=*/ 4,
@@ -416,9 +417,15 @@ async fn truncation_flags_when_siblings_limit_below_total(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn bridge_to_paragraphs_populated(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .expect("fetch_batched_context");
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+    )
+    .await
+    .expect("fetch_batched_context");
 
     let atoms = ctx
         .atoms_by_paragraph
@@ -449,9 +456,15 @@ async fn bridge_to_paragraphs_populated(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn corroborates_includes_paper_doi(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .expect("fetch_batched_context");
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+    )
+    .await
+    .expect("fetch_batched_context");
 
     let corr = ctx
         .corroborates_by_paragraph
@@ -469,9 +482,15 @@ async fn corroborates_appears_on_both_endpoints_when_both_in_result_set(pool: Pg
     let fx = fixture::build(&pool).await;
     // paragraphs[0] -[CORROBORATES]-> corroborates_target.
     // Pass BOTH as paragraph_ids so each should see the other in its list.
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0], fx.corroborates_target], 8, 4)
-        .await
-        .unwrap();
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0], fx.corroborates_target],
+        8,
+        4,
+    )
+    .await
+    .unwrap();
 
     // paragraphs[0] sees corroborates_target as a neighbor.
     let p0_corr = ctx
@@ -526,7 +545,7 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
     let _fx = fixture::build(&pool).await;
 
     // Sanity: helper reports 0.0 for the unpopulated 3072 column.
-    let frac = paragraph_3072_population(&pool)
+    let frac = paragraph_3072_population(&pool, &viewerfx::public_viewer(&pool).await)
         .await
         .expect("paragraph_3072_population helper");
     assert_eq!(
@@ -573,9 +592,15 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_include_continues_argument(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .unwrap();
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+    )
+    .await
+    .unwrap();
     let neighbors = ctx
         .continues_argument_by_paragraph
         .get(&fx.paragraphs[0])
@@ -594,9 +619,15 @@ async fn neighbor_paragraphs_include_continues_argument(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_include_atom_atom_bridge(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .unwrap();
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+    )
+    .await
+    .unwrap();
     // shared_atom (paper A) -[same_as]-> paper_b_atom (paper B);
     // paper_b_atom is a child of corroborates_target.
     let links = ctx
@@ -624,9 +655,15 @@ async fn neighbor_paragraphs_include_atom_atom_bridge(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_dedupe_and_via_aggregation(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .unwrap();
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+    )
+    .await
+    .unwrap();
 
     let atoms = ctx
         .atoms_by_paragraph
@@ -719,9 +756,15 @@ async fn neighbor_paragraphs_dedupe_and_via_aggregation(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_truncation_flag_when_over_limit(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .unwrap();
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+    )
+    .await
+    .unwrap();
 
     let atoms = ctx
         .atoms_by_paragraph

@@ -9,6 +9,9 @@
 
 mod common;
 
+#[path = "viewer_fixture.rs"]
+mod viewerfx;
+
 use common::{build_test_server, first_text, insert_claim_edge, seed_claim};
 use epigraph_mcp::tools::alternative_sets::{
     suggest_alternative_sets, SuggestAlternativeSetsParams,
@@ -32,6 +35,7 @@ async fn suggest_returns_only_contradicts_pair(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let result = suggest_alternative_sets(
         &server,
+        &viewerfx::public_viewer(&pool).await,
         SuggestAlternativeSetsParams {
             target_claim_id: Some(target.to_string()),
             // `pignistic_prob` is NULL on fresh-seeded claims; SQL coalesces to
@@ -97,6 +101,7 @@ async fn suggest_skips_pairs_with_existing_alternative_of(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let result = suggest_alternative_sets(
         &server,
+        &viewerfx::public_viewer(&pool).await,
         SuggestAlternativeSetsParams {
             target_claim_id: Some(target.to_string()),
             min_pair_strength: 0.0,
@@ -150,6 +155,7 @@ async fn exclude_settled_default_drops_chosen_pair(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let result = suggest_alternative_sets(
         &server,
+        &viewerfx::public_viewer(&pool).await,
         SuggestAlternativeSetsParams {
             target_claim_id: Some(target.to_string()),
             min_pair_strength: 0.0,
@@ -187,6 +193,7 @@ async fn exclude_settled_false_surfaces_chosen_pair(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let result = suggest_alternative_sets(
         &server,
+        &viewerfx::public_viewer(&pool).await,
         SuggestAlternativeSetsParams {
             target_claim_id: Some(target.to_string()),
             min_pair_strength: 0.0,
@@ -234,6 +241,7 @@ async fn surface_reconsiderations_yields_rejected_with_stronger_rival(pool: PgPo
     let server = build_test_server(pool.clone());
     let result = suggest_alternative_sets(
         &server,
+        &viewerfx::public_viewer(&pool).await,
         SuggestAlternativeSetsParams {
             target_claim_id: Some(target.to_string()),
             // BetP gap is 0.5; must exceed min_pair_strength.
@@ -287,6 +295,7 @@ async fn surface_reconsiderations_skips_when_gap_too_small(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let result = suggest_alternative_sets(
         &server,
+        &viewerfx::public_viewer(&pool).await,
         SuggestAlternativeSetsParams {
             target_claim_id: Some(target.to_string()),
             // BetP gap of 0.1 does NOT exceed this threshold.

@@ -6,6 +6,7 @@
 pub mod activity;
 pub mod agent;
 pub mod agent_key;
+pub mod alternative_set;
 pub mod analysis;
 pub mod authorization_code;
 pub mod authorize_session;
@@ -17,6 +18,7 @@ pub mod claim_theme;
 pub mod claim_version;
 pub mod community;
 pub mod context;
+pub mod corpus_stats;
 pub mod counterfactual;
 pub mod divergence;
 pub mod edge;
@@ -67,14 +69,16 @@ pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, CapabilityFilter,
 };
 pub use agent_key::{AgentKeyRepository, AgentKeyRow};
+pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
     BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
     ClaimNeighbor, ClaimPairDistance, ClaimRepository, ConsolidateMode, ConsolidateResult,
     DedupRepair, EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, HybridHit, LabelQuery,
-    LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection, SweepCandidate,
-    CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
+    LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
+    SortDirection, SweepCandidate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
+    EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
@@ -83,6 +87,7 @@ pub use claim_theme::{
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
 pub use community::CommunityRepository;
 pub use context::ContextRepository;
+pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
 pub use divergence::DivergenceRepository;
 pub use edge::EdgeRepository;

@@ -472,6 +472,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let read_only = cli.read_only;
         let federation = federation.clone();
 
+        // PR-09: resolve (and, on first boot, create) the server's own agent
+        // row + personal group once, here, so the
+        // `--allow-unauthenticated-http` middleware has a principal to inject.
+        // Best-effort: if it fails, the injected context carries `None` and the
+        // listener's content tools refuse rather than reading with an
+        // ill-defined identity — fail-closed, and loudly.
+        let unauthenticated_server_agent_id: Option<uuid::Uuid> = if cli.allow_unauthenticated_http
+        {
+            let probe = EpiGraphMcpFull::new_shared_with_federation(
+                pool.clone(),
+                signer.clone(),
+                embedder.clone(),
+                read_only,
+                federation.clone(),
+                llm_identity.clone(),
+            );
+            let probe = if identity_declared {
+                probe
+            } else {
+                probe.with_generated_signer_identity()
+            };
+            match probe.server_agent_id().await {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::error!(
+                        error = ?e,
+                        "could not resolve the server agent id for \
+                         --allow-unauthenticated-http; content tools on that listener \
+                         will refuse (no agent principal)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let service = StreamableHttpService::new(
             move || {
                 let srv = EpiGraphMcpFull::new_shared_with_federation(
@@ -511,7 +548,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // behind filesystem perms). Inject a permissive AuthContext so the
             // per-tool scope gate passes — without it every tool 403s on a
             // missing auth context, making the flag misleading (bug be2a3391).
-            router.layer(axum::middleware::from_fn(
+            // PR-09: the injected context carries the server's own agents.id,
+            // so `tools::viewer::request_viewer` resolves the same viewer this
+            // process uses on stdio. Resolving it here (once, at boot) also
+            // creates the agent row and its personal group before the first
+            // request, rather than racing on the first concurrent tool call.
+            router.layer(axum::middleware::from_fn_with_state(
+                unauthenticated_server_agent_id,
                 epigraph_mcp::auth::inject_unauthenticated_context,
             ))
         } else {

@@ -447,7 +447,13 @@ async fn boot_unauth_router() -> axum::Router {
 
     axum::Router::new()
         .nest_service("/mcp", service)
-        .layer(axum::middleware::from_fn(
+        // PR-09: the middleware now takes the server's own agents.id as state.
+        // This router's pool points at an unreachable database on purpose (the
+        // test asserts the SCOPE gate, not a DB read), so there is no agent to
+        // resolve — `None` is the honest value and matches what main.rs injects
+        // when boot-time resolution fails.
+        .layer(axum::middleware::from_fn_with_state(
+            None::<uuid::Uuid>,
             epigraph_mcp::auth::inject_unauthenticated_context,
         ))
 }

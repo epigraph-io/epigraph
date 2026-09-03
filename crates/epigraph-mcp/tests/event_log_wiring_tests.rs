@@ -106,6 +106,7 @@ async fn submit_claim_emits_claim_created_event() {
     // Read back via the canonical surface — `list_events` MCP tool.
     let result = tools::events::list_events(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListEventsParams {
             event_type: Some("claim.created".to_string()),
             actor_id: None,
@@ -262,6 +263,7 @@ async fn claim_repo_create_emits_claim_created_event() {
 
     let result = tools::events::list_events(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListEventsParams {
             event_type: Some("claim.created".to_string()),
             actor_id: Some(agent_id.to_string()),
@@ -344,6 +346,7 @@ async fn claim_repo_create_with_id_if_absent_emits_once() {
 
     let result = tools::events::list_events(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListEventsParams {
             event_type: Some("claim.created".to_string()),
             actor_id: Some(agent_id.to_string()),
@@ -410,6 +413,7 @@ async fn create_agent_emits_agent_registered_event() {
 
     let result = tools::events::list_events(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListEventsParams {
             event_type: Some("agent.registered".to_string()),
             actor_id: Some(created.id.as_uuid().to_string()),
@@ -480,6 +484,7 @@ async fn tool_dispatch_emits_tool_invoked_event() {
 
     let result = tools::events::list_events(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListEventsParams {
             event_type: Some("tool.invoked".to_string()),
             actor_id: None,
