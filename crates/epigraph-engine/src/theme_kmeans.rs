@@ -161,12 +161,39 @@ pub enum ThemeKmeansError {
 /// or `claim_themes` / `claim_theme_members` given tenancy columns, **before**
 /// that backfill runs.
 ///
-/// Why it was not fixed here: the signature change has two callers —
-/// `epigraph-mcp/src/tools/themes.rs::theme_cluster` and
-/// `epigraph-api/src/routes/crud.rs::build_themes_from_corpus` — and landing
-/// one without the other hardens MCP while leaving HTTP corpus-wide, which is
-/// an MCP/HTTP parity break of the kind plan §8.4 #16 exists to catch. They
-/// must land together.
+/// # PR-12's interim gate: `AND visibility = 'public'` on the corpus read
+///
+/// **PR-12 is the PR that first gives this pre-existing leak something to
+/// leak.** Before it, `ownership` writes landed in a table no read path
+/// consulted, so the corpus was uniformly public and this function's input
+/// contained no private content — the leak was real but empty. Migration 071
+/// changes that on its first firing: every `ownership` write now transcribes
+/// into `claims.owner_group_id / visibility`, and 070 propagates it. So
+/// "PR-12 does not increase the exposure" is **false**, and the exposure it
+/// creates is not hypothetical: a centroid is a mean of its members'
+/// embeddings, and `viewer_route_table_lint.rs` already treats
+/// `claims.embedding` as approximately invertible to content. A
+/// nearest-neighbour probe against a published centroid is an information
+/// channel about the private text that fed it.
+///
+/// The holding change is therefore made **here**, in the one place both the
+/// MCP tool, the HTTP handler and the scheduled `epigraph-jobs` rebuild share:
+/// the corpus read is restricted to `visibility = 'public'`. That is
+/// fail-closed, it lands all three callers together by construction (so it
+/// cannot cause the MCP/HTTP parity break plan §8.4 #16 exists to catch), and
+/// it needs no `Viewer` — which matters because the scheduled rebuild has no
+/// principal to supply one from and is the caller a signature change could not
+/// have reached anyway.
+///
+/// What it costs: themes are computed over public claims only, so a
+/// group-private claim is not clustered. That is the correct default for an
+/// untenanted output table, and it is strictly better than the alternative of
+/// clustering private content into a world-readable centroid.
+///
+/// **This is a holding change, not the control.** The real fix — a `Viewer`
+/// threaded through, or tenancy columns on `claim_themes` /
+/// `claim_theme_members` — remains `D-PR16-theme-cluster-viewer-scope`, and the
+/// two-callers-together constraint still binds whoever lands it.
 pub async fn run_theme_kmeans(
     pool: &PgPool,
     config: &RunThemeKmeansConfig,
@@ -197,10 +224,16 @@ pub async fn run_theme_kmeans(
     } else {
         "embedding"
     };
+    // `AND visibility = 'public'` IS THE PR-12 INTERIM GATE — see the
+    // "Tenancy" section of this function's doc comment. It is fail-closed, it
+    // costs nothing while the corpus is still overwhelmingly public, and it
+    // does NOT require threading a `Viewer` (which the scheduled rebuild job
+    // has no principal to supply).
     let select_sql = format!(
         "SELECT id, {source_col}::real[] \
          FROM claims \
          WHERE {source_col} IS NOT NULL \
+           AND visibility = 'public' \
          ORDER BY id \
          LIMIT $1"
     );

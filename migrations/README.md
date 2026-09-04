@@ -78,8 +78,8 @@ Current reservation:
   |---|---|---|
   | **068** | PR-05 | communities → groups; `encryption_key_id` de-overload |
   | **069** | PR-05 | `entity_types.tenancy_tier` + `tenancy_exempt` registry |
-  | **070** | PR-12 | write-side stamping triggers (statement-level, transition form) |
-  | **071** | PR-12 | `ownership` compat shim |
+  | **070** | PR-12 | write-side stamping triggers (statement-level, transition form) — drafted PR-12; **validated on a throwaway DB only, NOT applied to any deployed database** (plan §9.2 puts that at week 11c) |
+  | **071** | PR-12 | `ownership` compat shim — drafted PR-12; **validated on a throwaway DB only, NOT applied to any deployed database** |
   | **072** | PR-13 | `edges.co_owner_group_id` |
   | **073** | PR-13 | edge co-owner index (`-- no-transaction`) |
   | **074** | PR-16 | tenancy REQUIRED: `DROP DEFAULT`, require-tenancy trigger, no-widening trigger |

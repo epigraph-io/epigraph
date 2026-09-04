@@ -86,7 +86,7 @@ pub use claim_theme::{
     DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
-pub use community::CommunityRepository;
+pub use community::{CommunityRepository, MembershipOutcome};
 pub use context::ContextRepository;
 pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};

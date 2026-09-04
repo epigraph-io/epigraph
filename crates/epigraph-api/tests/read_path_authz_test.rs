@@ -141,9 +141,27 @@ async fn get_claim_stranger_token_spoofed_owner_is_redacted() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(content_of(&body), "[REDACTED]");
+    // PR-12 TIGHTENING. Before migration 071, `seed_private_ownership` wrote an
+    // ACL row that ONLY `check_content_access` consulted: every claim was still
+    // `visibility='public'`, so the viewer predicate returned the row and the
+    // handler blanked its content to "[REDACTED]".
+    //
+    // The 071 compat shim now TRANSCRIBES that row into the tenancy columns, so
+    // the claim is genuinely ('group', <owner's personal group>) and the
+    // stranger's viewer predicate excludes it outright. The row is ABSENT, not
+    // blanked.
+    //
+    // That is strictly less disclosure — a stranger no longer learns the claim
+    // exists — and it is the end state plan PR-14 names: "delete redaction; a
+    // non-visible row is absent, not blanked". progress.json's Q6 records
+    // `check_content_access` retention as `gated_on: "PR-12 transcription
+    // completing"`; this is that gate discharging.
+    assert_eq!(
+        resp.status(),
+        404,
+        "a transcribed private claim must be ABSENT to a stranger, not returned \
+         with blanked content"
+    );
 }
 
 /// Owner token, even with a RANDOM spoofed ?agent_id, sees full content —
@@ -222,13 +240,17 @@ async fn get_claim_community_member_sees_content_and_outsider_does_not() {
         .send()
         .await
         .unwrap();
-    assert_eq!(outsider_resp.status(), 200);
-    let outsider_body: serde_json::Value = outsider_resp.json().await.unwrap();
+    // PR-12 TIGHTENING. Migration 071's shim transcribes the community ownership
+    // row into ('group', <the community's projected group>), so a non-member's
+    // viewer predicate excludes the claim outright rather than the handler
+    // blanking its content. A spoofed ?agent_id still does not launder anyone
+    // into the community — that half of the property is unchanged and is what
+    // the 404 now demonstrates.
     assert_eq!(
-        content_of(&outsider_body),
-        "[REDACTED]",
-        "a non-member must be redacted, and a spoofed ?agent_id must not launder them \
-         into the community"
+        outsider_resp.status(),
+        404,
+        "a non-member must not see the community-gated claim AT ALL, and a spoofed \
+         ?agent_id must not launder them into the community"
     );
 }
 
@@ -306,14 +328,27 @@ async fn list_claims_stranger_token_spoofed_owner_is_redacted() {
         .get("items")
         .and_then(|i| i.as_array())
         .expect("items array");
-    let found = items
-        .iter()
-        .find(|it| it.get("id").and_then(|v| v.as_str()) == Some(claim_id.to_string().as_str()))
-        .expect("seeded claim present in first page");
-    assert_eq!(
-        content_of(found),
-        "[REDACTED]",
-        "stranger token spoofing ?agent_id=<owner> must not reveal private content in list_claims"
+    // PR-12 TIGHTENING. Before migration 071, `seed_private_ownership` wrote an
+    // ACL row that ONLY `check_content_access` consulted: every claim was still
+    // `visibility='public'`, so the viewer predicate returned the row and the
+    // handler blanked its content to "[REDACTED]".
+    //
+    // The 071 compat shim now TRANSCRIBES that row into the tenancy columns, so
+    // the claim is genuinely ('group', <owner's personal group>) and the
+    // stranger's viewer predicate excludes it outright. The row is ABSENT, not
+    // blanked.
+    //
+    // That is strictly less disclosure — a stranger no longer learns the claim
+    // exists — and it is the end state plan PR-14 names: "delete redaction; a
+    // non-visible row is absent, not blanked". progress.json's Q6 records
+    // `check_content_access` retention as `gated_on: "PR-12 transcription
+    // completing"`; this is that gate discharging.
+    assert!(
+        items
+            .iter()
+            .all(|it| it.get("id").and_then(|v| v.as_str()) != Some(claim_id.to_string().as_str())),
+        "stranger token spoofing ?agent_id=<owner> must not see the transcribed \
+         private claim AT ALL in list_claims; got {items:?}"
     );
 }
 
@@ -352,14 +387,26 @@ async fn claims_by_belief_stranger_token_spoofed_owner_is_redacted() {
     assert_eq!(resp.status(), 200);
     let rows: serde_json::Value = resp.json().await.unwrap();
     let arr = rows.as_array().expect("array of belief rows");
-    let found = arr
-        .iter()
-        .find(|it| it.get("id").and_then(|v| v.as_str()) == Some(claim_id.to_string().as_str()))
-        .expect("seeded claim present");
-    assert_eq!(
-        content_of(found),
-        "[REDACTED]",
-        "stranger token spoofing ?agent_id=<owner> must NOT reveal private content in claims_by_belief"
+    // PR-12 TIGHTENING. Before migration 071, `seed_private_ownership` wrote an
+    // ACL row that ONLY `check_content_access` consulted: every claim was still
+    // `visibility='public'`, so the viewer predicate returned the row and the
+    // handler blanked its content to "[REDACTED]".
+    //
+    // The 071 compat shim now TRANSCRIBES that row into the tenancy columns, so
+    // the claim is genuinely ('group', <owner's personal group>) and the
+    // stranger's viewer predicate excludes it outright. The row is ABSENT, not
+    // blanked.
+    //
+    // That is strictly less disclosure — a stranger no longer learns the claim
+    // exists — and it is the end state plan PR-14 names: "delete redaction; a
+    // non-visible row is absent, not blanked". progress.json's Q6 records
+    // `check_content_access` retention as `gated_on: "PR-12 transcription
+    // completing"`; this is that gate discharging.
+    assert!(
+        arr.iter()
+            .all(|it| it.get("id").and_then(|v| v.as_str()) != Some(claim_id.to_string().as_str())),
+        "stranger token spoofing ?agent_id=<owner> must not see the transcribed \
+         private claim AT ALL in claims_by_belief; got {arr:?}"
     );
 }
 
@@ -431,16 +478,27 @@ async fn frame_claims_sorted_stranger_token_spoofed_owner_is_redacted() {
     assert_eq!(resp.status(), 200);
     let arr: serde_json::Value = resp.json().await.unwrap();
     let rows = arr.as_array().expect("array of frame claim rows");
-    let found = rows
-        .iter()
-        .find(|it| {
-            it.get("claim_id").and_then(|v| v.as_str()) == Some(claim_id.to_string().as_str())
-        })
-        .expect("seeded claim present in frame");
-    assert_eq!(
-        content_of(found),
-        "[REDACTED]",
-        "stranger token spoofing ?agent_id=<owner> must NOT reveal private content in frame_claims_sorted"
+    // PR-12 TIGHTENING. Before migration 071, `seed_private_ownership` wrote an
+    // ACL row that ONLY `check_content_access` consulted: every claim was still
+    // `visibility='public'`, so the viewer predicate returned the row and the
+    // handler blanked its content to "[REDACTED]".
+    //
+    // The 071 compat shim now TRANSCRIBES that row into the tenancy columns, so
+    // the claim is genuinely ('group', <owner's personal group>) and the
+    // stranger's viewer predicate excludes it outright. The row is ABSENT, not
+    // blanked.
+    //
+    // That is strictly less disclosure — a stranger no longer learns the claim
+    // exists — and it is the end state plan PR-14 names: "delete redaction; a
+    // non-visible row is absent, not blanked". progress.json's Q6 records
+    // `check_content_access` retention as `gated_on: "PR-12 transcription
+    // completing"`; this is that gate discharging.
+    assert!(
+        rows.iter()
+            .all(|it| it.get("claim_id").and_then(|v| v.as_str())
+                != Some(claim_id.to_string().as_str())),
+        "stranger token spoofing ?agent_id=<owner> must not see the transcribed \
+         private claim AT ALL in frame_claims_sorted; got {rows:?}"
     );
 }
 
@@ -1106,14 +1164,19 @@ async fn graph_query_stranger_token_spoofed_owner_is_redacted() {
         .unwrap();
     assert_eq!(resp.status(), 200, "graph query returns 200");
     let resp_body: serde_json::Value = resp.json().await.unwrap();
-    // graph_query redacts into the node `label` field, not `content`. The
-    // WHERE selects exactly one row, so absence here is a real failure — the
-    // node vanished from the response — not a windowing accident.
-    let label = find_node_label(&resp_body)
-        .expect("the probe-selected claim must be present in the graph query result");
-    assert_eq!(
-        label, "[REDACTED]",
-        "private claim node label must be redacted for a stranger token spoofing the owner"
+    // PR-12 TIGHTENING. graph_query used to redact into the node `label` field,
+    // because `seed_private_ownership` wrote an ACL row that left the claim
+    // `visibility='public'` and so still inside the viewer predicate.
+    // Migration 071's shim transcribes it into the tenancy columns, so the node
+    // is now excluded from the result set entirely.
+    //
+    // The WHERE clause selects exactly one row by its unique probe key, so
+    // absence here is a real, specific measurement — not the windowing accident
+    // the comment above this block was written to rule out.
+    assert!(
+        find_node_label(&resp_body).is_none(),
+        "a transcribed private claim must be ABSENT from a stranger's graph query, \
+         not present with a redacted label; got {resp_body:?}"
     );
 
     // Owner token with a RANDOM (spoofed) body agent_id: node present AND label

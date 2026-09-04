@@ -106,6 +106,7 @@ fn default_limit() -> i64 {
 /// `POST /api/v1/communities`
 #[cfg(feature = "db")]
 pub async fn create_community(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<CreateCommunityRequest>,
 ) -> Result<(StatusCode, Json<CommunityResponse>), ApiError> {
@@ -123,6 +124,19 @@ pub async fn create_community(
         request.description.as_deref(),
         Some(&request.governance_type),
         Some(&request.ownership_type),
+        // THE CREATOR, which is what closes migration 068's "a projected
+        // community group has ZERO administrators until PR-12 gives it one".
+        // `Viewer::principal()` is `None` only for a bypass/system viewer,
+        // which is not a principal that should own a community — that case
+        // still lands on the memberless-group bootstrap path, which
+        // `CommunityRepository::add_member` treats as open.
+        //
+        // This route is on the PROTECTED router, so `ViewerExtractor` already
+        // 401s an unauthenticated caller; taking the viewer here changes who
+        // the creator IS, not whether the route is reachable. It touches
+        // neither register in `viewer_route_table_lint.rs` — `community.rs`
+        // appears in neither.
+        viewer.principal(),
     )
     .await?;
 
@@ -223,8 +237,30 @@ pub async fn add_member(
             id: request.perspective_id.to_string(),
         })?;
 
-    epigraph_db::CommunityRepository::add_member(pool, community_id, request.perspective_id)
-        .await?;
+    // CLOSED MEMBERSHIP (PR-12). `POST /api/v1/communities/:id/members` had no
+    // authorization at all beyond the two existence checks above, and PR-12 is
+    // what makes that a confidentiality problem rather than a bookkeeping one:
+    // the projected `group_memberships` row is read authority the moment PR-17
+    // arms the predicate, so a stranger could create a perspective, POST it
+    // into any community, and read that community's private corpus. The rule —
+    // and why it is "a live member" and not "an admin" — is in
+    // `epigraph-db/src/repos/community.rs`'s module docs. Full route-level
+    // authorization is still PR-16's.
+    match epigraph_db::CommunityRepository::add_member(
+        pool,
+        viewer.principal(),
+        community_id,
+        request.perspective_id,
+    )
+    .await?
+    {
+        epigraph_db::MembershipOutcome::DeniedNotAMember => {
+            return Err(ApiError::Forbidden {
+                reason: "only a live member of this community may add members".to_string(),
+            })
+        }
+        epigraph_db::MembershipOutcome::Applied | epigraph_db::MembershipOutcome::NotFound => {}
+    }
 
     // Materialize MEMBER_OF edge (perspective → community)
     let _ = epigraph_db::EdgeRepository::create(
@@ -248,21 +284,36 @@ pub async fn add_member(
 /// `DELETE /api/v1/communities/:id/members/:perspective_id`
 #[cfg(feature = "db")]
 pub async fn remove_member(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path((community_id, perspective_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     let pool = &state.db_pool;
 
-    let removed =
-        epigraph_db::CommunityRepository::remove_member(pool, community_id, perspective_id).await?;
-
-    if removed {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::NotFound {
+    // THE VIEWER IS NEW HERE. This handler previously extracted nothing at all,
+    // so self-service EVICTION was as open as self-service joining: any caller
+    // could revoke any member. PR-12 makes the revocation real (`revoked_at =
+    // now()` on the projected `group_memberships` row), which turns that from a
+    // bookkeeping no-op into a denial of read against a legitimate member.
+    // Adding the extractor here does not touch `viewer_route_table_lint.rs` —
+    // `community.rs` appears in neither of its registers.
+    match epigraph_db::CommunityRepository::remove_member(
+        pool,
+        viewer.principal(),
+        community_id,
+        perspective_id,
+    )
+    .await?
+    {
+        epigraph_db::MembershipOutcome::Applied => Ok(StatusCode::NO_CONTENT),
+        epigraph_db::MembershipOutcome::DeniedNotAMember => Err(ApiError::Forbidden {
+            reason: "only a live member of this community, or the perspective's own owner,                      may remove members"
+                .to_string(),
+        }),
+        epigraph_db::MembershipOutcome::NotFound => Err(ApiError::NotFound {
             entity: "community_member".to_string(),
             id: format!("{community_id}/{perspective_id}"),
-        })
+        }),
     }
 }
 

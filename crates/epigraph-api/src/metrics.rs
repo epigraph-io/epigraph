@@ -5,10 +5,23 @@
 //! once at startup and shared via `axum::Extension<Arc<Metrics>>`.
 
 use prometheus_client::encoding::text::encode;
+use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use std::sync::Arc;
+
+/// Label set for [`Metrics::tenancy_undeclared_writes`]: one series per table.
+///
+/// A single scalar would answer "is anything undeclared" but not "which write
+/// path", and the deploy gate is per-table — plan §9.2 week 11b requires
+/// `tenancy_undeclared_writes` **flat at zero for 24 h across every tier-A
+/// table**, which cannot be read off an aggregate.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TenancyTableLabel {
+    pub table_name: String,
+}
 
 /// Application-level Prometheus metrics.
 ///
@@ -24,6 +37,27 @@ pub struct Metrics {
     pub claims_submitted: Counter,
     /// Current number of registered agents tracked in the in-memory store.
     pub active_agents: Gauge,
+    /// Undeclared tenancy writes counted by migration 070 arm (a), per table.
+    ///
+    /// **This is the instrument plan §9.2's week-11b gate reads**: migration
+    /// 074 (PR-16) turns the arm-(a) warning into a hard `23502`, and the gate
+    /// before it is that this number is flat at zero for 24 hours across every
+    /// tier-A table. Without an exported series, that gate has nothing to read.
+    ///
+    /// It is a `Gauge`, not a `Counter`, and the distinction is load-bearing:
+    /// the value is *sampled* from `tenancy_undeclared_writes.n` — a table the
+    /// database owns and this process does not increment — so it can legitimately
+    /// go down (a new `day` row, an operator truncating the table). A Counter
+    /// would make a decrease look like a process restart to Prometheus.
+    ///
+    /// **The plan's *Acceptance* line asks for this gauge and says nothing about
+    /// how it is fed.** `prometheus_client::collector::Collector::encode` is
+    /// SYNCHRONOUS, so it cannot run an async sqlx query and a custom Collector
+    /// is not an option; the value has to be pushed in by a sampler task. See
+    /// `bin/server.rs`. The field itself is deliberately NOT behind
+    /// `#[cfg(feature = "db")]` — it is pure `prometheus_client` and naming it
+    /// under `--no-default-features` must keep compiling.
+    pub tenancy_undeclared_writes: Family<TenancyTableLabel, Gauge>,
 }
 
 impl Metrics {
@@ -58,12 +92,20 @@ impl Metrics {
             active_agents.clone(),
         );
 
+        let tenancy_undeclared_writes = Family::<TenancyTableLabel, Gauge>::default();
+        registry.register(
+            "epigraph_tenancy_undeclared_writes",
+            "Undeclared tenancy writes counted by migration 070 arm (a), by table",
+            tenancy_undeclared_writes.clone(),
+        );
+
         Self {
             registry,
             requests_total,
             request_errors,
             claims_submitted,
             active_agents,
+            tenancy_undeclared_writes,
         }
     }
 }

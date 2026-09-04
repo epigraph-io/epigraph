@@ -56,7 +56,18 @@ use uuid::Uuid;
 mod common;
 use common::build_test_server;
 
-const REDACTED: &str = "[REDACTED]";
+// The `REDACTED` constant this file used to carry is GONE, and its absence is
+// the headline result of PR-12 on this surface. Every assertion here that once
+// read `content == "[REDACTED]"` is now an absence assertion, because migration
+// 071 transcribes `ownership` into the tenancy columns and the Viewer predicate
+// drops the row before any handler can blank it. Redaction is not merely
+// unused on the community arm — it is unreachable.
+//
+// That is exactly what plan PR-14 ("delete redaction; a non-visible row is
+// absent, not blanked") is scheduled to formalise, and what
+// `docs/tenancy/progress.json`'s Q6 means by recording `check_content_access`
+// retention as `gated_on: "PR-12 transcription completing"`. PR-12 does not
+// delete `check_content_access`; it makes its remaining branches unreachable.
 
 // ── 1. The discriminating positive: the two-hop membership path ─────────────
 //
@@ -67,7 +78,6 @@ const REDACTED: &str = "[REDACTED]";
 // simplified to a one-hop lookup, this case is what fails.
 #[sqlx::test(migrations = "../../migrations")]
 async fn community_member_via_perspective_sees_content(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let member = seed_agent(&pool).await;
     let community = seed_community(&pool).await;
@@ -78,12 +88,13 @@ async fn community_member_via_perspective_sees_content(pool: PgPool) {
     seed_community_ownership(&pool, claim_id, owner, Some(community)).await;
 
     let server = build_test_server(pool.clone());
-    let body = get_claim_as(&server, &viewer, claim_id, Some(member)).await;
+    let body = get_claim_as(&server, &pool, claim_id, Some(member)).await;
     assert_eq!(
         body["content"].as_str().unwrap(),
         expected,
         "an agent owning a perspective that is a member of the gating community \
-         must see the full content"
+         must see the full content — after PR-12 that means its projected \
+         group_memberships row puts the community group in its Viewer"
     );
 }
 
@@ -94,7 +105,6 @@ async fn community_member_via_perspective_sees_content(pool: PgPool) {
 // membership join is load-bearing rather than always-true.
 #[sqlx::test(migrations = "../../migrations")]
 async fn community_non_member_is_redacted(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let member = seed_agent(&pool).await;
     let outsider = seed_agent(&pool).await;
@@ -109,12 +119,9 @@ async fn community_non_member_is_redacted(pool: PgPool) {
     seed_community_ownership(&pool, claim_id, owner, Some(community)).await;
 
     let server = build_test_server(pool.clone());
-    let body = get_claim_as(&server, &viewer, claim_id, Some(outsider)).await;
-    assert_eq!(
-        body["content"].as_str().unwrap(),
-        REDACTED,
-        "an agent with a perspective in NO relevant community must be redacted"
-    );
+    // PR-12 TIGHTENING: absent, not blanked. The claim is now genuinely
+    // ('group', <community group>) and the outsider is in no such group.
+    assert_claim_absent_for(&server, &pool, claim_id, Some(outsider)).await;
 }
 
 // ── 3. Anonymous is redacted before any lookup ─────────────────────────────
@@ -125,7 +132,6 @@ async fn community_non_member_is_redacted(pool: PgPool) {
 // here.
 #[sqlx::test(migrations = "../../migrations")]
 async fn community_anonymous_requester_is_redacted(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let community = seed_community(&pool).await;
     // Make the owner a member, so the ONLY reason to redact is anonymity.
@@ -135,13 +141,8 @@ async fn community_anonymous_requester_is_redacted(pool: PgPool) {
     seed_community_ownership(&pool, claim_id, owner, Some(community)).await;
 
     let server = build_test_server(pool.clone());
-    let body = get_claim_as(&server, &viewer, claim_id, None).await;
-    assert_eq!(
-        body["content"].as_str().unwrap(),
-        REDACTED,
-        "an anonymous requester must be redacted even when the community would \
-         have admitted the owner"
-    );
+    // PR-12 TIGHTENING: absent, not blanked.
+    assert_claim_absent_for(&server, &pool, claim_id, None).await;
 }
 
 // ── 4. `community_id IS NULL` → owner-only fallback ────────────────────────
@@ -160,7 +161,6 @@ async fn community_anonymous_requester_is_redacted(pool: PgPool) {
 // with the Viewer predicate, owns that decision.
 #[sqlx::test(migrations = "../../migrations")]
 async fn community_row_with_null_community_id_falls_back_to_owner_only(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let stranger = seed_agent(&pool).await;
 
@@ -170,19 +170,16 @@ async fn community_row_with_null_community_id_falls_back_to_owner_only(pool: PgP
 
     let server = build_test_server(pool.clone());
 
-    let owner_body = get_claim_as(&server, &viewer, claim_id, Some(owner)).await;
+    let owner_body = get_claim_as(&server, &pool, claim_id, Some(owner)).await;
     assert_eq!(
         owner_body["content"].as_str().unwrap(),
         expected,
-        "with no gating community recorded, the owner keeps access"
+        "with no gating community recorded, the owner keeps access — migration 071 \
+         falls the unresolvable-community case back to the owner's personal group"
     );
 
-    let stranger_body = get_claim_as(&server, &viewer, claim_id, Some(stranger)).await;
-    assert_eq!(
-        stranger_body["content"].as_str().unwrap(),
-        REDACTED,
-        "the NULL-community fallback is OWNER-ONLY, not open"
-    );
+    // PR-12 TIGHTENING: absent, not blanked.
+    assert_claim_absent_for(&server, &pool, claim_id, Some(stranger)).await;
 }
 
 // ── 5. The owner who is not a member IS redacted ───────────────────────────
@@ -198,7 +195,6 @@ async fn community_row_with_null_community_id_falls_back_to_owner_only(pool: PgP
 // a member. Asserted explicitly so that change has to be argued.
 #[sqlx::test(migrations = "../../migrations")]
 async fn community_owner_who_is_not_a_member_is_redacted(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let member = seed_agent(&pool).await;
     let community = seed_community(&pool).await;
@@ -211,17 +207,14 @@ async fn community_owner_who_is_not_a_member_is_redacted(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
 
-    let owner_body = get_claim_as(&server, &viewer, claim_id, Some(owner)).await;
-    assert_eq!(
-        owner_body["content"].as_str().unwrap(),
-        REDACTED,
-        "on the community arm, ownership alone does NOT grant access once a \
-         community resolves — membership is the whole test. If you are changing \
-         this, change it on purpose."
-    );
+    // PR-12 TIGHTENING: absent, not blanked — and the underlying decision is
+    // UNCHANGED. Migration 071 deliberately does NOT project the declaring owner
+    // into the community's group, precisely so this property survives; see the
+    // comment at that arm, which cites this test by name.
+    assert_claim_absent_for(&server, &pool, claim_id, Some(owner)).await;
 
     // And the member does, so the fixture is not simply broken.
-    let member_body = get_claim_as(&server, &viewer, claim_id, Some(member)).await;
+    let member_body = get_claim_as(&server, &pool, claim_id, Some(member)).await;
     assert_eq!(member_body["content"].as_str().unwrap(), expected);
 }
 
@@ -234,7 +227,6 @@ async fn community_owner_who_is_not_a_member_is_redacted(pool: PgPool) {
 // and asserts each gets its own.
 #[sqlx::test(migrations = "../../migrations")]
 async fn batch_check_mixed_community_and_public(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let member = seed_agent(&pool).await;
     let community = seed_community(&pool).await;
@@ -255,6 +247,7 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
     seed_community_ownership(&pool, hidden_id, owner, Some(other_community)).await;
 
     let server = build_test_server(pool.clone());
+    let viewer = viewer_for(&pool, Some(member)).await;
     let result = query_claims(
         &server,
         &viewer,
@@ -279,11 +272,21 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
         visible_content,
         "the member's own community claim must survive the batch path"
     );
-    assert_eq!(
-        find_claim(&claims, hidden_id)["content"].as_str().unwrap(),
-        REDACTED,
-        "a claim gated by a DIFFERENT community must be redacted — under a \
-         per-id mispairing this and the case above swap"
+    // PR-12 TIGHTENING: the third claim is now ('group', <other community>),
+    // which the member is not in, so the Viewer predicate drops it from the
+    // result set rather than the handler blanking its content.
+    //
+    // The discriminating property the original assertion was protecting is
+    // PRESERVED and is still asserted above: `visible_id` and `hidden_id` differ
+    // only in WHICH community gates them, so a per-id mispairing would still
+    // swap them — and would now show up as `visible_id` going missing while
+    // `hidden_id` appears.
+    assert!(
+        claims
+            .iter()
+            .all(|c| c["id"].as_str() != Some(hidden_id.as_uuid().to_string().as_str())),
+        "a claim gated by a DIFFERENT community must be ABSENT for this member, \
+         not returned blanked; got {claims:?}"
     );
 }
 
@@ -298,7 +301,6 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
 // the row by hand.
 #[sqlx::test(migrations = "../../migrations")]
 async fn assign_with_community_writes_the_column_access_control_reads(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     use epigraph_db::OwnershipRepository;
 
     let owner = seed_agent(&pool).await;
@@ -337,7 +339,7 @@ async fn assign_with_community_writes_the_column_access_control_reads(pool: PgPo
     assert_eq!(quarantined, 0);
 
     let server = build_test_server(pool.clone());
-    let body = get_claim_as(&server, &viewer, claim_id, Some(member)).await;
+    let body = get_claim_as(&server, &pool, claim_id, Some(member)).await;
     assert_eq!(
         body["content"].as_str().unwrap(),
         expected,
@@ -354,7 +356,6 @@ async fn assign_with_community_writes_the_column_access_control_reads(pool: PgPo
 // would resurrect the old gate.
 #[sqlx::test(migrations = "../../migrations")]
 async fn demoting_out_of_community_clears_the_gate(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     use epigraph_db::OwnershipRepository;
 
     let owner = seed_agent(&pool).await;
@@ -420,8 +421,9 @@ async fn demoting_out_of_community_clears_the_gate(pool: PgPool) {
 
     // The member (who is not the owner) now sees nothing: the row is private.
     let server = build_test_server(pool.clone());
-    let body = get_claim_as(&server, &viewer, claim_id, Some(member)).await;
-    assert_eq!(body["content"].as_str().unwrap(), REDACTED);
+    // PR-12 TIGHTENING: absent, not blanked. The demoted row is now
+    // ('group', <owner's personal group>), which the member is not in.
+    assert_claim_absent_for(&server, &pool, claim_id, Some(member)).await;
 }
 
 // ── 9. A gate may only exist on the partition that uses it ─────────────────
@@ -562,15 +564,45 @@ async fn join_community(pool: &PgPool, community: Uuid, agent: Uuid) {
         .expect("join community");
 }
 
+/// Resolve the Viewer for `requester`, or the public viewer when anonymous.
+///
+/// # Why this replaced a shared `fixture::public_viewer`
+///
+/// Every test in this file used to build ONE `public_viewer` (empty group set)
+/// and then pass the acting principal separately as the `requester` wire
+/// parameter, because before PR-12 the community gate lived entirely in
+/// `check_content_access`'s two-hop join and the Viewer predicate matched every
+/// row (all content was `visibility='public'`).
+///
+/// Migration 071 transcribes `ownership` into the tenancy columns, so the
+/// Viewer is now the FIRST filter and a viewer with no groups can no longer see
+/// a community-gated claim at all — regardless of who the `requester` says it
+/// is. Keeping the empty viewer would have made every test here assert against
+/// a principal that cannot exist in production: `Viewer::resolve` is called on
+/// the authenticated agent, so viewer and requester are the same principal on
+/// every real request.
+///
+/// Resolving from `requester` restores that correspondence, and the tests now
+/// exercise the real composition — Viewer filter, THEN redaction.
+async fn viewer_for(pool: &PgPool, requester: Option<Uuid>) -> epigraph_db::visibility::Viewer {
+    match requester {
+        Some(agent) => epigraph_db::visibility::Viewer::resolve(pool, agent)
+            .await
+            .expect("resolve viewer"),
+        None => fixture::public_viewer(pool).await,
+    }
+}
+
 async fn get_claim_as(
     server: &epigraph_mcp::EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
+    pool: &PgPool,
     claim_id: ClaimId,
     requester: Option<Uuid>,
 ) -> Value {
+    let viewer = viewer_for(pool, requester).await;
     let result = get_claim(
         server,
-        viewer,
+        &viewer,
         GetClaimParams {
             claim_id: claim_id.as_uuid().to_string(),
             frame_id: None,
@@ -581,6 +613,43 @@ async fn get_claim_as(
     .await
     .expect("get_claim");
     parse_claim(&result)
+}
+
+/// Assert `requester` cannot see `claim_id` AT ALL.
+///
+/// After PR-12 a non-visible row is ABSENT, not blanked: the Viewer predicate
+/// excludes it and `get_claim` reports "not found". That is strictly less
+/// disclosure than the old `[REDACTED]` body, which told a stranger the claim
+/// existed, and it is the end state plan PR-14 formalises.
+async fn assert_claim_absent_for(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    pool: &PgPool,
+    claim_id: ClaimId,
+    requester: Option<Uuid>,
+) {
+    let viewer = viewer_for(pool, requester).await;
+    let result = get_claim(
+        server,
+        &viewer,
+        GetClaimParams {
+            claim_id: claim_id.as_uuid().to_string(),
+            frame_id: None,
+            perspective_id: None,
+        },
+        requester,
+    )
+    .await;
+    match result {
+        Err(e) => assert!(
+            e.to_string().contains("not found"),
+            "expected a not-found for a claim outside the viewer's scope, got: {e}"
+        ),
+        Ok(ok) => panic!(
+            "expected the claim to be ABSENT for this requester, but get_claim \
+             returned a body: {:?}",
+            parse_claim(&ok)
+        ),
+    }
 }
 
 fn parse_claim(result: &CallToolResult) -> Value {

@@ -130,6 +130,30 @@ async fn seed_corpus(pool: &PgPool, scopes: &[&str]) -> Corpus {
         (pub_a, priv_c, "SUPPORTS", "public", Uuid::nil()),
         (pub_b, priv_c, "SUPPORTS", "public", Uuid::nil()),
         (pub_a, pub_b, "RELATES_TO", "group", owner_group),
+        // A FOURTH EDGE, ADDED BY PR-12, WHOSE ONLY JOB IS TO KEEP THE
+        // STRANGER'S `edge_counts` MAP NON-EMPTY.
+        //
+        // Once arm (b)'s endpoint meet made both SUPPORTS edges group-private
+        // (they touch `priv_c`), every assertion about `sedges` became
+        // NEGATIVE — `!contains_key(..)` twice — so an `edge_counts` statement
+        // that returned `{}` for every principal would have passed. This edge
+        // joins two PUBLIC claims and is itself public, so the meet leaves it
+        // ('public', world) and the stranger MUST count it. That restores a
+        // positive on the stranger's edge map, which is what distinguishes a
+        // working edge filter from a dead statement.
+        //
+        // It is deliberately a NEW relationship between the EXISTING pair, so
+        // it changes no node count: `degree_stats.total_nodes`,
+        // `temporal_bins` and `belief_stats` are untouched, and the stranger's
+        // `clustering_stats.eligible_nodes` stays 0 because one public edge
+        // still leaves both visible nodes at degree 1.
+        //
+        // `CONTRADICTS` and not some invented label: `edge_counts` projects only
+        // `repos/structural.rs::COARSE_EDGE_TYPES`, so a relationship outside
+        // that whitelist is silently dropped and the assertion below would fail
+        // for a reason that has nothing to do with tenancy. Measured — the first
+        // attempt used `CITES` and the stranger's map came back empty.
+        (pub_a, pub_b, "CONTRADICTS", "public", Uuid::nil()),
     ] {
         sqlx::query(
             "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
@@ -348,11 +372,46 @@ async fn owner_sees_the_whole_subgraph_and_a_stranger_only_its_public_part() {
         "each public edge is counted once per owned endpoint, and the owner owns \
          both endpoints of both; got {oedges:?}"
     );
+    // PR-12 TIGHTENING: an edge is now the MEET of its endpoints.
+    //
+    // Both SUPPORTS edges touch `priv_c`, which is group-private. Migration 070
+    // arm (b) therefore stamps them ('group', owner_group) at INSERT, and a
+    // stranger sees NEITHER. Before PR-12 they were stored ('public', world) as
+    // the fixture bound them, and the stranger saw each one at its single
+    // visible endpoint.
+    //
+    // The tightening is correct, not incidental: an edge touching a private
+    // claim ATTESTS THAT THE PRIVATE CLAIM EXISTS and stands in a named
+    // relationship to a public one. That is precisely the structural leak the
+    // endpoint meet exists to close, and it is why arm (b) derives rather than
+    // trusting the writer.
+    //
+    // The discriminating power of this case is preserved, and is now carried by
+    // the two assertions around it: the owner still sees SUPPORTS 4 (so the
+    // edges exist and the endpoint-pair counting is unchanged), and the stranger
+    // still sees the two public CLAIMS (so this is edge filtering, not a dead
+    // endpoint).
+    assert!(
+        !sedges.contains_key("SUPPORTS"),
+        "both SUPPORTS edges touch the group-private claim, so migration 070 arm \
+         (b)'s endpoint meet makes them group-private too — a stranger must see \
+         neither; got {sedges:?}"
+    );
+    // THE POSITIVE. Without it every assertion about `sedges` is a negative and
+    // an `edge_counts` statement returning `{}` would pass.
     assert_eq!(
-        sedges.get("SUPPORTS"),
+        sedges.get("CONTRADICTS"),
         Some(&2),
-        "the stranger must still see BOTH public edges — but each only at the \
-         endpoint it can see, never at the group-private one; got {sedges:?}"
+        "the stranger MUST count the public edge between two public claims — \
+         once per visible endpoint, the same convention the owner's counts use. \
+         An empty map here means the edge statement is dead, not that the \
+         filter works; got {sedges:?}"
+    );
+    assert_eq!(
+        oedges.get("CONTRADICTS"),
+        Some(&2),
+        "and the owner counts it identically — the two principals differ only \
+         on what is private; got {oedges:?}"
     );
 
     // 3. degree_stats ───────────────────────────────────────────────────

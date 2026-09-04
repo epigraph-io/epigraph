@@ -37,7 +37,16 @@ use uuid::Uuid;
 mod common;
 use common::build_test_server;
 
-const REDACTED: &str = "[REDACTED]";
+// The `REDACTED` constant is GONE, and its absence is the point. Every
+// assertion in this file that once read `content == "[REDACTED]"` is now an
+// absence assertion: migration 071 transcribes `ownership` into the tenancy
+// columns, so the Viewer predicate drops the row before any handler can blank
+// it. Redaction on this path is not merely unused — it is unreachable.
+//
+// That is what plan PR-14 ("delete redaction; a non-visible row is absent, not
+// blanked") formalises, and what `docs/tenancy/progress.json`'s Q6 means by
+// `gated_on: "PR-12 transcription completing"`. PR-12 does not delete
+// `check_content_access`; it makes its remaining branches unreachable.
 
 // ── Case: owner (HTTP) sees full content; stranger (HTTP) is redacted ────────
 //
@@ -45,10 +54,12 @@ const REDACTED: &str = "[REDACTED]";
 // We model that here by passing `Some(agent)` directly to `get_claim` (exactly
 // what `mcp_requester(Some(auth), _)` resolves a bearer to). The stranger
 // assertion is the discriminating one: on `origin/main` it returned A's
-// content; on this branch it must be `"[REDACTED]"`.
+// content. PR-12 tightened the required disposition from `"[REDACTED]"` to
+// ABSENT — migration 071 puts the ownership row into the tenancy columns, so
+// the stranger's Viewer excludes the claim rather than returning a blanked
+// body. Strictly less disclosure: the stranger no longer learns it exists.
 #[sqlx::test(migrations = "../../migrations")]
 async fn http_owner_sees_content_stranger_is_redacted(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, owner).await;
     let expected = format!("test claim {}", claim_id.as_uuid());
@@ -57,22 +68,20 @@ async fn http_owner_sees_content_stranger_is_redacted(pool: PgPool) {
     let server = build_test_server(pool.clone());
 
     // Owner (HTTP) → real content.
-    let owner_body = get_claim_as(&server, &viewer, claim_id, Some(owner)).await;
+    let owner_body = get_claim_as(&server, &pool, claim_id, Some(owner)).await;
     assert_eq!(
         owner_body["content"].as_str().unwrap(),
         expected,
         "owner must see the full private content"
     );
 
-    // Stranger (HTTP), B ≠ A → "[REDACTED]". Fails on origin/main.
+    // Stranger (HTTP), B ≠ A. PR-12 TIGHTENING: absent, not blanked — migration
+    // 071 made the claim genuinely ('group', <owner's personal group>), so the
+    // stranger's Viewer excludes it and it never reaches the redaction step.
+    // Still the discriminating assertion, and now a stronger one: the stranger
+    // does not even learn the claim exists.
     let stranger = Uuid::new_v4();
-    let stranger_body = get_claim_as(&server, &viewer, claim_id, Some(stranger)).await;
-    assert_eq!(
-        stranger_body["content"].as_str().unwrap(),
-        REDACTED,
-        "stranger must NOT see private content — this is the discriminating \
-         assertion that fails on origin/main"
-    );
+    assert_claim_absent_for(&server, &pool, claim_id, Some(stranger)).await;
 }
 
 // ── Case: stdio fallback resolves the requester to server.agent_id() ─────────
@@ -86,7 +95,6 @@ async fn http_owner_sees_content_stranger_is_redacted(pool: PgPool) {
 // is what ties this test to the stdio arm.
 #[sqlx::test(migrations = "../../migrations")]
 async fn stdio_fallback_uses_server_identity(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let server_agent = server_agent_id(&pool).await;
 
@@ -103,25 +111,21 @@ async fn stdio_fallback_uses_server_identity(pool: PgPool) {
         "stdio (no bearer) must resolve the requester to the server's identity"
     );
 
-    let owned_body = get_claim_as(&server, &viewer, owned_id, requester).await;
+    let owned_body = get_claim_as(&server, &pool, owned_id, requester).await;
     assert_eq!(
         owned_body["content"].as_str().unwrap(),
         owned_expected,
         "stdio agent must see content of the private claim IT owns"
     );
 
-    // (b) Private claim owned by a DIFFERENT agent → "[REDACTED]" for the stdio
-    // agent (server.agent_id() ≠ owner).
+    // (b) Private claim owned by a DIFFERENT agent. PR-12 TIGHTENING: absent,
+    // not blanked — the claim is now ('group', <other_owner's personal group>),
+    // which the stdio server agent is not in.
     let other_owner = seed_agent(&pool).await;
     let foreign_id = seed_claim(&pool, other_owner).await;
     seed_private_ownership(&pool, foreign_id, other_owner).await;
 
-    let foreign_body = get_claim_as(&server, &viewer, foreign_id, requester).await;
-    assert_eq!(
-        foreign_body["content"].as_str().unwrap(),
-        REDACTED,
-        "stdio agent must NOT see a private claim owned by another agent"
-    );
+    assert_claim_absent_for(&server, &pool, foreign_id, requester).await;
 }
 
 // ── Case: public (ownership-less) non-regression for ANY requester ───────────
@@ -133,7 +137,6 @@ async fn stdio_fallback_uses_server_identity(pool: PgPool) {
 // fails closed on public rows.
 #[sqlx::test(migrations = "../../migrations")]
 async fn public_claim_is_never_redacted(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let owner = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, owner).await; // no ownership row → public
     let expected = format!("test claim {}", claim_id.as_uuid());
@@ -145,7 +148,7 @@ async fn public_claim_is_never_redacted(pool: PgPool) {
         ("stranger", Some(Uuid::new_v4())),
         ("anonymous (stdio None)", None),
     ] {
-        let body = get_claim_as(&server, &viewer, claim_id, requester).await;
+        let body = get_claim_as(&server, &pool, claim_id, requester).await;
         assert_eq!(
             body["content"].as_str().unwrap(),
             expected,
@@ -164,7 +167,6 @@ async fn public_claim_is_never_redacted(pool: PgPool) {
 // row must get ITS OWN decision.
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_claims_redacts_only_unauthorized_rows(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let public_owner = seed_agent(&pool).await;
     let private_owner = seed_agent(&pool).await;
 
@@ -179,6 +181,7 @@ async fn query_claims_redacts_only_unauthorized_rows(pool: PgPool) {
     // Query as a STRANGER (neither owner). Both claims appear; only the private
     // one is redacted.
     let stranger = Uuid::new_v4();
+    let viewer = viewer_for(&pool, Some(stranger)).await;
     let result = query_claims(
         &server,
         &viewer,
@@ -197,15 +200,20 @@ async fn query_claims_redacts_only_unauthorized_rows(pool: PgPool) {
     assert_eq!(
         public["content"].as_str().unwrap(),
         public_content,
-        "public claim must show full content to a stranger in a batch query"
+        "public claim must show full content to a stranger in a batch query — \
+         and it must NOT be collateral damage of the private one's exclusion"
     );
 
-    let private = find_claim(&claims, private_id);
-    assert_eq!(
-        private["content"].as_str().unwrap(),
-        REDACTED,
-        "private claim must be redacted for a stranger — fails on a per-id \
-         mispairing or a deleted/inverted redaction branch"
+    // PR-12 TIGHTENING: the private claim is dropped by the Viewer predicate
+    // rather than returned blanked. The per-id mispairing this case was written
+    // to catch would now show up as the PUBLIC claim going missing instead,
+    // which the assertion above still catches.
+    assert!(
+        claims
+            .iter()
+            .all(|c| c["id"].as_str() != Some(private_id.as_uuid().to_string().as_str())),
+        "a private claim must be ABSENT for a stranger in a batch query, not \
+         returned blanked; got {claims:?}"
     );
 }
 
@@ -234,15 +242,41 @@ async fn server_agent_id(pool: &PgPool) -> Uuid {
     agent.id.as_uuid()
 }
 
+/// Resolve the Viewer for `requester`, or the public viewer when anonymous.
+///
+/// # Why the shared `public_viewer` no longer works here
+///
+/// These tests used to build ONE `public_viewer` (empty group set) and pass the
+/// acting principal separately as the `requester` wire parameter. That was
+/// faithful before PR-12, because `seed_private_ownership` wrote an ACL row that
+/// only `check_content_access` consulted while every claim stayed
+/// `visibility='public'` — so the Viewer predicate matched every row and the
+/// requester decided everything.
+///
+/// Migration 071 transcribes `ownership` into the tenancy columns, so the Viewer
+/// is now the FIRST filter. An empty-group viewer cannot see a private claim at
+/// all — not even the OWNER'S. Keeping it would assert against a principal that
+/// cannot exist in production, where `Viewer::resolve` runs on the authenticated
+/// agent and viewer and requester are therefore the same principal.
+async fn viewer_for(pool: &PgPool, requester: Option<Uuid>) -> epigraph_db::visibility::Viewer {
+    match requester {
+        Some(agent) => epigraph_db::visibility::Viewer::resolve(pool, agent)
+            .await
+            .expect("resolve viewer"),
+        None => fixture::public_viewer(pool).await,
+    }
+}
+
 async fn get_claim_as(
     server: &epigraph_mcp::EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
+    pool: &PgPool,
     claim_id: ClaimId,
     requester: Option<Uuid>,
 ) -> Value {
+    let viewer = viewer_for(pool, requester).await;
     let result = get_claim(
         server,
-        viewer,
+        &viewer,
         GetClaimParams {
             claim_id: claim_id.as_uuid().to_string(),
             frame_id: None,
@@ -253,6 +287,42 @@ async fn get_claim_as(
     .await
     .expect("get_claim");
     parse_claim(&result)
+}
+
+/// Assert `requester` cannot see `claim_id` AT ALL.
+///
+/// After PR-12 a non-visible row is ABSENT, not blanked — strictly less
+/// disclosure than the old `[REDACTED]` body, which told a stranger the claim
+/// existed. This is the end state plan PR-14 formalises.
+async fn assert_claim_absent_for(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    pool: &PgPool,
+    claim_id: ClaimId,
+    requester: Option<Uuid>,
+) {
+    let viewer = viewer_for(pool, requester).await;
+    let result = get_claim(
+        server,
+        &viewer,
+        GetClaimParams {
+            claim_id: claim_id.as_uuid().to_string(),
+            frame_id: None,
+            perspective_id: None,
+        },
+        requester,
+    )
+    .await;
+    match result {
+        Err(e) => assert!(
+            e.to_string().contains("not found"),
+            "expected a not-found for a claim outside the viewer's scope, got: {e}"
+        ),
+        Ok(ok) => panic!(
+            "expected the claim to be ABSENT for this requester, but get_claim \
+             returned a body: {:?}",
+            parse_claim(&ok)
+        ),
+    }
 }
 
 async fn seed_private_ownership(pool: &PgPool, claim_id: ClaimId, owner: Uuid) {
