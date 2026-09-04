@@ -134,7 +134,7 @@ impl ExperimentRepository {
                          AND ed.relationship = 'analyzes'
             WHERE e.hypothesis_id = $1
               AND e.status = 'complete'
-              /* {VISIBILITY:ed} */
+              /* {EDGE_VISIBILITY:ed} */
             "#,
             2,
         );

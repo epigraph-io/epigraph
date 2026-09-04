@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) as count\n            FROM edges\n            WHERE ((source_id = $1 AND source_type = $2)\n                OR (target_id = $1 AND target_type = $2))\n              AND ($3::bool OR visibility = 'public'\n                   OR (owner_group_id = ANY($4::uuid[])\n                       AND (co_owner_group_id IS NULL\n                            OR co_owner_group_id = ANY($4::uuid[]))))\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bool",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "057cb1a12bc850d6c429fd9f2c72d871cb708b41b1e84226d30828cabea05beb"
+}

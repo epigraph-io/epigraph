@@ -491,9 +491,9 @@ impl MatchCandidateRepo {
     /// of every edge. It is one function now, which is what CLAUDE.md's
     /// "do not duplicate SQL between them" asks for, and it filters.
     ///
-    /// The predicate is on `edges` (`Viewer::predicate_fragment`, not the
-    /// co-ownership `edge_predicate_fragment` — that is PR-13's and the column
-    /// it names does not exist yet) **and** on the far-side claim. The edge
+    /// The predicate is on `edges` (`Viewer::edge_predicate_fragment`, the
+    /// co-ownership INTERSECTION, since PR-13 created the column it names)
+    /// **and** on the far-side claim. The edge
     /// predicate alone is not enough: `edges.owner_group_id` today defaults to
     /// the world group for every pre-062 row, so a public edge would still hand
     /// back a private claim's id.
@@ -509,7 +509,7 @@ impl MatchCandidateRepo {
                ON far.id = CASE WHEN e.source_id = $1 THEN e.target_id ELSE e.source_id END
              WHERE e.relationship = 'CORROBORATES'
                AND (e.source_id = $1 OR e.target_id = $1)
-               /* {VISIBILITY:e} */ /* {VISIBILITY:far} */",
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:far} */",
             2,
         );
         let mut q = sqlx::query_as(&sql).bind(claim_id);

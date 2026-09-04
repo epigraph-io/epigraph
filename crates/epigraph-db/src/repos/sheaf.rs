@@ -76,7 +76,7 @@ impl SheafRepository {
             WHERE e.relationship IN ('supports', 'refutes', 'contradicts', 'corroborates', 'elaborates', 'specializes', 'generalizes', 'frame_validates')
             AND c.pignistic_prob IS NOT NULL
             AND n.pignistic_prob IS NOT NULL
-            /* {VISIBILITY:c} */ /* {VISIBILITY:n} */ /* {VISIBILITY:e} */
+            /* {VISIBILITY:c} */ /* {VISIBILITY:n} */ /* {EDGE_VISIBILITY:e} */
             ORDER BY c.id
             LIMIT $1
             "#,
@@ -123,7 +123,7 @@ impl SheafRepository {
             AND (e.valid_to IS NULL OR e.valid_to > now())
             AND src.pignistic_prob IS NOT NULL
             AND tgt.pignistic_prob IS NOT NULL
-            /* {VISIBILITY:e} */ /* {VISIBILITY:src} */ /* {VISIBILITY:tgt} */
+            /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:src} */ /* {VISIBILITY:tgt} */
             "#,
             1,
         );

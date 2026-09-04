@@ -174,7 +174,9 @@ impl ProvenanceChainRepository {
                 ) nxt
                 WHERE c.depth < $4 AND NOT c.is_cycle
                   AND ($5::bool OR e.visibility = 'public'
-                       OR e.owner_group_id = ANY($6::uuid[]))
+                       OR (e.owner_group_id = ANY($6::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($6::uuid[]))))
             )
             SELECT node AS "node!", depth AS "depth!", is_cycle AS "is_cycle!",
                    path AS "path!", e_source, e_target, e_rel

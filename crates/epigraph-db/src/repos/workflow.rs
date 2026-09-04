@@ -210,7 +210,7 @@ impl WorkflowRepository {
                         COALESCE(( \
                             SELECT COUNT(*) FROM edges e \
                             WHERE (e.source_id = c.id OR e.target_id = c.id) \
-                              /* {VISIBILITY:e} */ \
+                              /* {EDGE_VISIBILITY:e} */ \
                         ), 0) AS edge_count \
                  FROM claims c, query_vec q \
                  WHERE c.embedding IS NOT NULL AND vector_norm(c.embedding) > 0 \
@@ -223,7 +223,7 @@ impl WorkflowRepository {
                     b.similarity * 0.6 + b.truth_value * 0.2 + LEAST(b.edge_count::float / 10.0, 1.0) * 0.2 AS hybrid_score, \
                     (SELECT e2.source_id::text FROM edges e2 \
                      WHERE e2.target_id = b.id AND e2.relationship IN ('variant_of', 'supersedes') \
-                       /* {VISIBILITY:e2} */ LIMIT 1) AS parent_id \
+                       /* {EDGE_VISIBILITY:e2} */ LIMIT 1) AS parent_id \
              FROM base b \
              ORDER BY hybrid_score DESC \
              LIMIT $3",
@@ -270,7 +270,7 @@ impl WorkflowRepository {
                         COALESCE(( \
                             SELECT COUNT(*) FROM edges e \
                             WHERE (e.source_id = c.id OR e.target_id = c.id) \
-                              /* {VISIBILITY:e} */ \
+                              /* {EDGE_VISIBILITY:e} */ \
                         ), 0) AS edge_count \
                  FROM claims c \
                  WHERE c.content ILIKE $1 AND c.truth_value >= $2 \
@@ -282,7 +282,7 @@ impl WorkflowRepository {
                     b.truth_value * 0.5 + LEAST(b.edge_count::float / 10.0, 1.0) * 0.5 AS hybrid_score, \
                     (SELECT e2.source_id::text FROM edges e2 \
                      WHERE e2.target_id = b.id AND e2.relationship IN ('variant_of', 'supersedes') \
-                       /* {VISIBILITY:e2} */ LIMIT 1) AS parent_id \
+                       /* {EDGE_VISIBILITY:e2} */ LIMIT 1) AS parent_id \
              FROM base b \
              ORDER BY hybrid_score DESC \
              LIMIT $3",
@@ -375,12 +375,12 @@ impl WorkflowRepository {
             "WITH RECURSIVE descendants AS ( \
                  SELECT source_id AS id FROM edges \
                  WHERE target_id = $1 AND relationship IN ('variant_of', 'supersedes') \
-                   /* {VISIBILITY:edges} */ \
+                   /* {EDGE_VISIBILITY:edges} */ \
                  UNION ALL \
                  SELECT e.source_id FROM edges e \
                  JOIN descendants d ON e.target_id = d.id \
                  WHERE e.relationship IN ('variant_of', 'supersedes') \
-                   /* {VISIBILITY:e} */ \
+                   /* {EDGE_VISIBILITY:e} */ \
              ) \
              SELECT id FROM descendants",
             2,
@@ -416,7 +416,7 @@ impl WorkflowRepository {
                 JOIN edges e ON e.source_id = a.id
                     AND e.relationship IN ('variant_of', 'supersedes')
                     AND e.source_type = 'claim' AND e.target_type = 'claim'
-                WHERE true /* {VISIBILITY:e} */
+                WHERE true /* {EDGE_VISIBILITY:e} */
             )
             SELECT a.id FROM ancestors a
             WHERE NOT EXISTS (
@@ -458,7 +458,7 @@ impl WorkflowRepository {
             WHERE e.source_id = $1
               AND e.relationship IN ('variant_of', 'supersedes')
               AND e.source_type = 'claim' AND e.target_type = 'claim'
-              /* {VISIBILITY:e} */
+              /* {EDGE_VISIBILITY:e} */
             LIMIT 1
             "#,
             2,
@@ -491,7 +491,7 @@ impl WorkflowRepository {
              FROM edges e \
              JOIN claims c ON c.id = e.target_id \
              WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
-               /* {VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
              ORDER BY e.created_at ASC, c.id ASC",
             2,
         );
@@ -621,7 +621,7 @@ impl WorkflowRepository {
              WHERE e.source_id = ANY($1) \
                AND e.relationship = 'executes' \
                AND (c.properties->>'level')::int = 2 \
-               /* {VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
              ORDER BY e.source_id, e.created_at ASC, c.id ASC",
             2,
         );

@@ -587,3 +587,205 @@ async fn a_superuser_owned_definer_body_satisfies_verify(pool: PgPool) {
          stderr:\n{stderr}"
     );
 }
+
+// ===========================================================================
+// The stale cross-group edge — the shape migration 072 makes expressible but
+// does not reconcile
+// ===========================================================================
+
+/// An edge with the tenancy of the `('group', G, co_owner = NULL)` shape,
+/// written WITHOUT touching `source_id` / `target_id`.
+///
+/// That omission is the whole point. `edges_tenancy_meet` is
+/// `BEFORE INSERT OR UPDATE OF source_id, target_id`, so an UPDATE that names
+/// neither column never fires arm (b) and the tuple is stored verbatim. It is
+/// the only way to construct the population from a `#[sqlx::test]` database:
+/// every one of those runs migrations 001→073, so 070's arm (d) body is created
+/// and immediately replaced by 072's, and no test can ever run a privatization
+/// against the body that produced these rows in the first place.
+async fn force_edge_tenancy(pool: &PgPool, edge: Uuid, owner: Uuid, co_owner: Option<Uuid>) {
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $1, co_owner_group_id = $2 \
+         WHERE id = $3",
+    )
+    .bind(owner)
+    .bind(co_owner)
+    .bind(edge)
+    .execute(pool)
+    .await
+    .expect("force edge tenancy without touching the endpoint columns");
+}
+
+/// A `visibility = 'public'` claim owned by a REAL group.
+///
+/// Not `fixture::seed_public_claim`, which owns its claim by the world group —
+/// that is the pre-backfill shape and `verify`'s `residual("claims")` check
+/// counts it as an undeclared row, so it would fail this test for an unrelated
+/// reason and destroy the clean-corpus baseline the negative controls rest on.
+/// `('public', <real group>)` is what the backfill actually produces:
+/// [`claims_are_stamped_with_the_authors_personal_group_never_world_or_seed`]
+/// pins that.
+async fn seed_public_claim_owned_by(
+    pool: &PgPool,
+    agent: Uuid,
+    group: Uuid,
+    content: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let mut hash = vec![0u8; 32];
+    for (i, b) in content.as_bytes().iter().enumerate() {
+        hash[i % 32] ^= *b;
+    }
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.8, $4, true, 'public', $5)",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(&hash)
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed a public claim owned by a real group");
+    id
+}
+
+async fn seed_cross_group_edge(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'claim', $2, 'claim', 'supports', \
+                 jsonb_build_object('created_by', $3::text, 'strength', 0.7)) \
+         RETURNING id",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(Uuid::new_v4().to_string())
+    .fetch_one(pool)
+    .await
+    .expect("insert edge")
+}
+
+/// `verify` must FLAG an edge that joins two group-private endpoints in
+/// different groups while carrying no co-owner — and must NOT flag the two
+/// legitimate shapes beside it.
+///
+/// # Why this is a `verify` check and not a statement in migration 072
+///
+/// The row is reachable under migration 070 alone, with **no cross-owner
+/// write**: arm (b) stamps `('group', G)` while both endpoints are in G, then
+/// one endpoint moves to H and 070's arm (d) — `ELSE NULL AS g`, guarded by
+/// `AND m.g IS NOT NULL` — skips it. 070's header calls that fail-closed and
+/// says "072 resolves it properly with `co_owner_group_id`". 072 resolves it
+/// for FUTURE transitions; it reconciles nothing already stored, and under
+/// `Viewer::edge_predicate_fragment` the `co_owner_group_id IS NULL` disjunct
+/// then hands the row to every member of G.
+///
+/// A bulk reconciliation inside 072 was rejected: 072 holds ACCESS EXCLUSIVE on
+/// `edges` for its `ADD COLUMN`, `SET LOCAL lock_timeout` bounds acquisition
+/// and not hold, and `edges_co_owner_shape` is enforced on new writes despite
+/// shipping `NOT VALID` — so a bad CASE would raise 23514 mid-migration, record
+/// no sqlx row, and re-run on every restart. Plan §6.5 puts this same meet in
+/// `repos/privatization.rs::seal_boundary_edges`, a batched resumable function
+/// scoped to `batch_ids`, which is PR-18's.
+///
+/// # The controls
+///
+/// The negatives are what make the positive mean something. `leaky_edges`, the
+/// check that already existed, filters `e.owner_group_id = WORLD` and therefore
+/// cannot see this shape at all — so a check that merely "fails on a corpus
+/// with edges in it" would look identical to a correct one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_flags_a_cross_group_edge_that_carries_no_co_owner(pool: PgPool) {
+    let (agent_g, group_g) = fixture::seed_agent_with_group(&pool, "g").await;
+    let (agent_h, group_h) = fixture::seed_agent_with_group(&pool, "h").await;
+
+    let g1 = fixture::seed_group_claim(&pool, agent_g, group_g, "g one").await;
+    let g2 = fixture::seed_group_claim(&pool, agent_g, group_g, "g two").await;
+    let h1 = fixture::seed_group_claim(&pool, agent_h, group_h, "h one").await;
+    let pub1 = seed_public_claim_owned_by(&pool, agent_g, group_g, "public one").await;
+
+    // NEGATIVE CONTROL 1 — same-group edge, correctly single-owner.
+    let same_group = seed_cross_group_edge(&pool, g1, g2).await;
+    // NEGATIVE CONTROL 2 — cross-group edge stamped CORRECTLY by 072's arm (b).
+    let co_owned = seed_cross_group_edge(&pool, g1, h1).await;
+    // NEGATIVE CONTROL 3 — one public endpoint: the meet is single-owner and a
+    // NULL co-owner is right, so a check keyed on "NULL co-owner" alone would
+    // false-positive here.
+    let half_public = seed_cross_group_edge(&pool, pub1, h1).await;
+
+    // Arm (b) must have produced exactly those three shapes, or the controls
+    // are not controls.
+    let co: Option<Uuid> = sqlx::query_scalar("SELECT co_owner_group_id FROM edges WHERE id = $1")
+        .bind(co_owned)
+        .fetch_one(&pool)
+        .await
+        .expect("read co_owner");
+    assert_eq!(
+        co,
+        Some(group_h),
+        "precondition: 072's arm (b) stamps a genuinely cross-group edge with a co-owner"
+    );
+    for (edge, label) in [(same_group, "same-group"), (half_public, "half-public")] {
+        let co: Option<Uuid> =
+            sqlx::query_scalar("SELECT co_owner_group_id FROM edges WHERE id = $1")
+                .bind(edge)
+                .fetch_one(&pool)
+                .await
+                .expect("read co_owner");
+        assert_eq!(co, None, "precondition: a {label} edge carries no co-owner");
+    }
+
+    // The corpus is otherwise clean, so `verify` passes. This is the assertion
+    // that stops the positive below from being "verify fails on any corpus".
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "the three legitimate edge shapes must NOT be flagged; stderr:\n{stderr}"
+    );
+
+    // POSITIVE — the pre-072 population, forced into place without firing
+    // arm (b): owner = G, co_owner = NULL, target still private to H.
+    force_edge_tenancy(&pool, co_owned, group_g, None).await;
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "a cross-group edge with no co-owner is visible to all of G while naming \
+         H's private claim; verify is the deploy gate that must catch it. \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("co_owner_group_id"),
+        "the failure must NAME the shape so an operator can act on it; stderr:\n{stderr}"
+    );
+
+    // And the remediation the failure message prints must actually work.
+    // PostgreSQL fires `UPDATE OF source_id` on column MENTION, not on value
+    // change, so this no-op re-runs arm (b) and it re-derives the meet.
+    sqlx::query("UPDATE edges SET source_id = source_id WHERE co_owner_group_id IS NULL")
+        .execute(&pool)
+        .await
+        .expect("re-fire arm (b)");
+
+    let co: Option<Uuid> = sqlx::query_scalar("SELECT co_owner_group_id FROM edges WHERE id = $1")
+        .bind(co_owned)
+        .fetch_one(&pool)
+        .await
+        .expect("read co_owner");
+    assert_eq!(
+        co,
+        Some(group_h),
+        "the documented remediation must restore the co-owner — if this fails, the \
+         FAIL message in tenancy_backfill.rs::verify is telling operators to run \
+         something that does not work"
+    );
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "and verify must clear once the meet is restamped; stderr:\n{stderr}"
+    );
+}

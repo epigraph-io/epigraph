@@ -369,7 +369,7 @@ impl BehavioralExecutionRepository {
                 JOIN edges e ON e.source_id = l.root_id
                     AND e.relationship IN ('variant_of', 'supersedes')
                     AND e.source_type = 'claim' AND e.target_type = 'claim'
-                WHERE true /* {VISIBILITY:e} */
+                WHERE true /* {EDGE_VISIBILITY:e} */
             ),
             -- The true root per execution: the ancestor with no outgoing variant_of or supersedes
             roots AS (
@@ -380,7 +380,7 @@ impl BehavioralExecutionRepository {
                     WHERE e.source_id = l.root_id
                       AND e.relationship IN ('variant_of', 'supersedes')
                       AND e.source_type = 'claim' AND e.target_type = 'claim'
-                      /* {VISIBILITY:e} */
+                      /* {EDGE_VISIBILITY:e} */
                 )
             ),
             -- Filter out deprecated lineage roots

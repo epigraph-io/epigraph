@@ -13,6 +13,50 @@
 //! the four decisions, say so in the commit body; do not leave the reviewer to
 //! infer it from an untouched test file.
 //!
+//! ## Status at PR-13
+//!
+//! **PR-13 DOES touch a locked decision.** It adds a tenancy column —
+//! `edges.co_owner_group_id` (migration 072). "A tenancy column" is one of the
+//! three things named above that make extending this file mandatory, so this
+//! section is not optional.
+//!
+//! * **D1 (nothing is public by absence, omission, or default-on-error)** —
+//!   preserved, and the *shape* of the new column is where it bites.
+//!   `co_owner_group_id` is nullable **with no `DEFAULT`**, and NULL means
+//!   "single owner", not "unknown". That reads like the implicit-public D1
+//!   forbids, and it is not: the column is never the sole carrier of an
+//!   authorization decision. `owner_group_id` (NOT NULL, CHECKed, stamped by a
+//!   trigger) decides visibility; `co_owner_group_id` can only NARROW it.
+//!   A NULL therefore fails toward the pre-072 behaviour, which is the
+//!   single-owner predicate — never toward public. Pinned by
+//!   [`d1_the_co_owner_column_has_no_default_and_cannot_widen`].
+//! * **D3 (`public` = any authenticated agent; no anonymous shape)** —
+//!   unchanged. PR-13 adds `Viewer::edge_predicate_fragment`, a second *method*
+//!   on the existing type; it adds no shape, no constructor, no `SystemReason`,
+//!   and `no_anonymous_viewer.rs`'s source lint over `visibility.rs` is
+//!   unchanged and still passes.
+//! * **No route moved**, and `public_router_allowlist.rs` is untouched.
+//! * **No RLS policy, no `WITH CHECK`, no write-side SQL predicate.** Migration
+//!   072 `CREATE OR REPLACE`s two *stamping* trigger arms and creates no policy.
+//!   It also REMOVES a write-side membership test — arm (b)'s
+//!   `sg = ANY(epigraph_session_groups()) AND tg = ANY(...)` hatch — and that
+//!   direction is the one this bullet permits: it moves write authorization
+//!   OUT of a stamping trigger and leaves it to PR-16, rather than pre-empting
+//!   PR-16 by adding some. The hatch was unsatisfiable in production anyway
+//!   (personal groups admit no principal in two of them, and every edge writer
+//!   reaches the trigger on a bare `&PgPool` with no session GUCs), so nothing
+//!   that ever fired was removed. Pinned by
+//!   `tenancy_triggers.rs::arm_b_no_longer_raises_on_a_cross_group_edge`.
+//! * **No `VALIDATE CONSTRAINT`, no `DROP DEFAULT`.** Both 072 constraints ship
+//!   `NOT VALID`; validation is PR-16's 075/076.
+//!   [`d1_the_stamping_trigger_is_still_the_transition_form`] still passes,
+//!   i.e. `claims.owner_group_id` keeps its `column_default`.
+//! * **No `FAIL_OPEN_SCOPE_SITES` row moved.**
+//! * **The trigger inventory count is unchanged at 21.** 072 replaces two
+//!   function BODIES with `CREATE OR REPLACE`, which does not re-create a
+//!   trigger — [`d1_tenancy_stamping_triggers_are_armed`] would catch a
+//!   replacement that silently dropped one.
+//!
 //! ## Status at PR-11
 //!
 //! **PR-11 DOES touch a locked decision.** It changes the kernel's *write*
@@ -841,4 +885,105 @@ async fn d2_world_and_seed_remain_memberless(pool: PgPool) {
              author's personal group as the backfill target."
         );
     }
+}
+
+// =============================================================================
+// D1 — PR-13: the co-ownership column narrows, and can never widen.
+//
+// Plan §0.2 requires every PR that adds a tenancy column to extend this file.
+// `edges.co_owner_group_id` (migration 072) is one.
+// =============================================================================
+
+/// D1 — `edges.co_owner_group_id` has NO `DEFAULT`, and NULL cannot widen.
+///
+/// The nullable column is the part of PR-13 that most resembles the thing D1
+/// forbids: "nothing is public by absence, by omission, or by
+/// default-on-error". Three catalog facts are what make it not that, and all
+/// three are one edit away from being untrue:
+///
+/// 1. **No `column_default`.** 062's DEFAULTs on `owner_group_id` /
+///    `visibility` are the transition form PR-16's 074 removes; adding one here
+///    would be a NEW implicit declaration, arriving after the decision to stop
+///    making them. There is also nothing a default could sensibly say — a
+///    co-owner is derived from two endpoints, never assumed.
+/// 2. **`owner_group_id` is still NOT NULL.** Co-ownership adds a SECOND owner;
+///    it never replaces the first. A row whose only ownership signal were a
+///    nullable column would be exactly the absence-means-public shape.
+/// 3. **`edges_co_owner_shape` requires `visibility = 'group'`.** A co-owner on
+///    a `visibility = 'public'` row is rejected, so the column cannot be read as
+///    a restriction on an otherwise-public edge — the read fragment's leading
+///    `visibility = 'public'` disjunct short-circuits before the co-owner test,
+///    and this CHECK is what stops those two facts from disagreeing.
+///
+/// Together: a NULL co-owner degrades to the pre-072 single-owner predicate,
+/// which is strictly narrower than public. The behavioural half of this lives
+/// in `privatization_boundary.rs`; this is the catalog half, which survives a
+/// database whose column was altered out of band.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d1_the_co_owner_column_has_no_default_and_cannot_widen(pool: PgPool) {
+    let (nullable, default): (String, Option<String>) = sqlx::query_as(
+        "SELECT is_nullable, column_default FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'edges' \
+            AND column_name = 'co_owner_group_id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("edges.co_owner_group_id must exist after migration 072");
+
+    assert_eq!(
+        nullable, "YES",
+        "NULL is the single-owner case and must stay expressible; NOT NULL here \
+         would force every edge to name a second group it does not have"
+    );
+    assert_eq!(
+        default, None,
+        "a DEFAULT on co_owner_group_id would be a new implicit tenancy \
+         declaration, which is the D1 shape migration 074 exists to remove"
+    );
+
+    let owner_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'edges' \
+            AND column_name = 'owner_group_id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("edges.owner_group_id");
+    assert_eq!(
+        owner_nullable, "NO",
+        "the FIRST owner stays NOT NULL: co-ownership adds an owner, it does \
+         not make ownership optional"
+    );
+
+    // The shape CHECK exists, still NOT VALID (validation is PR-16's 075/076),
+    // and still names both conjuncts.
+    let (src, validated): (String, bool) = sqlx::query_as(
+        "SELECT pg_get_constraintdef(oid), convalidated FROM pg_constraint \
+          WHERE conrelid = 'public.edges'::regclass AND conname = 'edges_co_owner_shape'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("edges_co_owner_shape must exist after migration 072");
+
+    assert!(
+        !validated,
+        "edges_co_owner_shape must stay NOT VALID; VALIDATE CONSTRAINT is \
+         PR-16's 075/076 and takes a full-table lock this migration does not \
+         advertise"
+    );
+    assert!(
+        src.contains("co_owner_group_id IS NULL"),
+        "the single-owner case must be permitted: {src}"
+    );
+    assert!(
+        src.contains("visibility)::text = 'group'::text") || src.contains("visibility = 'group'"),
+        "a co-owner is only meaningful on a group-visible row; without this \
+         conjunct a public edge could carry a co-owner the read fragment never \
+         checks: {src}"
+    );
+    assert!(
+        src.contains("co_owner_group_id <> owner_group_id"),
+        "co_owner = owner is not co-ownership; permitting it would make the \
+         read fragment test one group's membership twice: {src}"
+    );
 }

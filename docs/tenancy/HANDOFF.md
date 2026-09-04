@@ -54,7 +54,7 @@ Group-scoped encryption (`seal`) is last and deliberately optional.
 | PR-10 | filter webhook fan-out and federation forwarding by tenancy | not started |
 | PR-11 | fail-closed, resource-aware write gate (replaces assign_ownership) | not started |
 | PR-12 | batched, resumable tenancy backfill with write-side stamping | **done** (migrations 070/071, `epigraph-tenancy-backfill`) |
-| PR-13 | edge co-ownership so the endpoint meet is expressible | not started |
+| PR-13 | edge co-ownership so the endpoint meet is expressible | **done** (migrations **072/073**, not the plan's 068/069; `Viewer::edge_predicate_fragment` + the `/* {EDGE_VISIBILITY:…} */` marker; `DbError::CheckViolation` → 400). Closes 070 arm (b)'s cross-group `RAISE`, which 071's transcription had made reachable. Residual it does NOT fix: an edge stamped `('group', G, co_owner = NULL)` **before** 072, whose endpoints later diverged into different groups, is not reconciled by 072 and stays visible to all of G — `epigraph-tenancy-backfill verify` now fails on that shape (`D-PR18-stale-cross-group-edges`) |
 | PR-14 | delete redaction — a non-visible row is absent, not blanked | not started |
 | PR-15 | maintenance DSN for every background writer, before FORCE | not started |
 | PR-16 | ownership REQUIRED — drop defaults, arm trigger, validate (D1) | not started |

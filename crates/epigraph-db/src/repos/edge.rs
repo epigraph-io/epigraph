@@ -349,15 +349,22 @@ impl EdgeRepository {
         source_type: &str,
     ) -> Result<Vec<EdgeRow>, DbError> {
         // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
-        // spliced. `edges` uses the plain predicate, NOT an edge-specific
-        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
-        // and does not exist yet (see `visibility.rs`'s module docs).
+        // spliced. This is the STATIC TRANSCRIPTION of
+        // `Viewer::edge_predicate_fragment` (PR-13): the co-ownership
+        // INTERSECTION, not the plain predicate. Same arity and the SAME two
+        // binds as before — `co_owner_group_id` (migration 072) reads the group
+        // array a second time. A cross-group edge is visible only to a
+        // principal in BOTH groups; `co_owner_group_id IS NULL` is the
+        // single-owner case and short-circuits.
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE source_id = $1 AND source_type = $2
-              AND ($3::bool OR visibility = 'public' OR owner_group_id = ANY($4::uuid[]))
+              AND ($3::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($4::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($4::uuid[]))))
             ORDER BY created_at DESC
             "#,
             source_id,
@@ -427,9 +434,9 @@ impl EdgeRepository {
         // opposite directions — a retracted edge still cascading, or a private
         // claim leaking into a cascade.
         //
-        // The markers are escaped `{{VISIBILITY:e}}` because this string now
+        // The markers are escaped `{{EDGE_VISIBILITY:e}}` because this string now
         // goes through `format!` first (to interpolate `EDGE_IN_FORCE`); an
-        // unescaped `{VISIBILITY:e}` would be parsed as a format argument and
+        // unescaped `{EDGE_VISIBILITY:e}` would be parsed as a format argument and
         // fail to compile. `splice` then substitutes the real predicate and
         // asserts the marker was present, so a future edit that drops it fails
         // loudly rather than failing open.
@@ -444,7 +451,7 @@ impl EdgeRepository {
               AND e.target_type = 'claim'
               AND e.relationship <> 'supersedes'
               AND {EDGE_IN_FORCE}
-              /* {{VISIBILITY:e}} */ /* {{VISIBILITY:c}} */
+              /* {{EDGE_VISIBILITY:e}} */ /* {{VISIBILITY:c}} */
             ORDER BY e.id
             "#
             ),
@@ -529,15 +536,22 @@ impl EdgeRepository {
         target_type: &str,
     ) -> Result<Vec<EdgeRow>, DbError> {
         // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
-        // spliced. `edges` uses the plain predicate, NOT an edge-specific
-        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
-        // and does not exist yet (see `visibility.rs`'s module docs).
+        // spliced. This is the STATIC TRANSCRIPTION of
+        // `Viewer::edge_predicate_fragment` (PR-13): the co-ownership
+        // INTERSECTION, not the plain predicate. Same arity and the SAME two
+        // binds as before — `co_owner_group_id` (migration 072) reads the group
+        // array a second time. A cross-group edge is visible only to a
+        // principal in BOTH groups; `co_owner_group_id IS NULL` is the
+        // single-owner case and short-circuits.
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE target_id = $1 AND target_type = $2
-              AND ($3::bool OR visibility = 'public' OR owner_group_id = ANY($4::uuid[]))
+              AND ($3::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($4::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($4::uuid[]))))
             ORDER BY created_at DESC
             "#,
             target_id,
@@ -575,15 +589,22 @@ impl EdgeRepository {
         relationship: &str,
     ) -> Result<Vec<EdgeRow>, DbError> {
         // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
-        // spliced. `edges` uses the plain predicate, NOT an edge-specific
-        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
-        // and does not exist yet (see `visibility.rs`'s module docs).
+        // spliced. This is the STATIC TRANSCRIPTION of
+        // `Viewer::edge_predicate_fragment` (PR-13): the co-ownership
+        // INTERSECTION, not the plain predicate. Same arity and the SAME two
+        // binds as before — `co_owner_group_id` (migration 072) reads the group
+        // array a second time. A cross-group edge is visible only to a
+        // principal in BOTH groups; `co_owner_group_id IS NULL` is the
+        // single-owner case and short-circuits.
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE relationship = $1
-              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($3::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($3::uuid[]))))
             ORDER BY created_at DESC
             "#,
             relationship,
@@ -623,16 +644,23 @@ impl EdgeRepository {
         target_type: &str,
     ) -> Result<Vec<EdgeRow>, DbError> {
         // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
-        // spliced. `edges` uses the plain predicate, NOT an edge-specific
-        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
-        // and does not exist yet (see `visibility.rs`'s module docs).
+        // spliced. This is the STATIC TRANSCRIPTION of
+        // `Viewer::edge_predicate_fragment` (PR-13): the co-ownership
+        // INTERSECTION, not the plain predicate. Same arity and the SAME two
+        // binds as before — `co_owner_group_id` (migration 072) reads the group
+        // array a second time. A cross-group edge is visible only to a
+        // principal in BOTH groups; `co_owner_group_id IS NULL` is the
+        // single-owner case and short-circuits.
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE source_id = $1 AND source_type = $2
               AND target_id = $3 AND target_type = $4
-              AND ($5::bool OR visibility = 'public' OR owner_group_id = ANY($6::uuid[]))
+              AND ($5::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($6::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($6::uuid[]))))
             ORDER BY created_at DESC
             "#,
             source_id,
@@ -687,6 +715,12 @@ impl EdgeRepository {
         target_type: Option<&str>,
         limit: i64,
     ) -> Result<Vec<EdgeRow>, DbError> {
+        // MACRO SITE — the static transcription of
+        // `Viewer::edge_predicate_fragment` (PR-13). This site carried no
+        // PR-13 comment before, which is exactly why it is called out now: an
+        // implementer converting the marked sites by grep would have converted
+        // six of the eleven `edges` reads in this file and left five reading on
+        // `owner_group_id` alone.
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
@@ -696,7 +730,10 @@ impl EdgeRepository {
               AND ($3::text IS NULL OR relationship = $3)
               AND ($4::text IS NULL OR source_type = $4)
               AND ($5::text IS NULL OR target_type = $5)
-              AND ($7::bool OR visibility = 'public' OR owner_group_id = ANY($8::uuid[]))
+              AND ($7::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($8::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($8::uuid[]))))
             ORDER BY valid_from DESC NULLS LAST, id
             LIMIT $6
             "#,
@@ -739,14 +776,21 @@ impl EdgeRepository {
         limit: i64,
     ) -> Result<Vec<EdgeRow>, DbError> {
         // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
-        // spliced. `edges` uses the plain predicate, NOT an edge-specific
-        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
-        // and does not exist yet (see `visibility.rs`'s module docs).
+        // spliced. This is the STATIC TRANSCRIPTION of
+        // `Viewer::edge_predicate_fragment` (PR-13): the co-ownership
+        // INTERSECTION, not the plain predicate. Same arity and the SAME two
+        // binds as before — `co_owner_group_id` (migration 072) reads the group
+        // array a second time. A cross-group edge is visible only to a
+        // principal in BOTH groups; `co_owner_group_id IS NULL` is the
+        // single-owner case and short-circuits.
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
-            WHERE ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
+            WHERE ($2::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($3::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($3::uuid[]))))
             ORDER BY created_at DESC
             LIMIT $1
             "#,
@@ -783,9 +827,13 @@ impl EdgeRepository {
         relationship: &str,
     ) -> Result<Vec<EdgeRow>, DbError> {
         // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
-        // spliced. `edges` uses the plain predicate, NOT an edge-specific
-        // fragment: `edges.co_owner_group_id` is created by PR-13's migration
-        // and does not exist yet (see `visibility.rs`'s module docs).
+        // spliced. This is the STATIC TRANSCRIPTION of
+        // `Viewer::edge_predicate_fragment` (PR-13): the co-ownership
+        // INTERSECTION, not the plain predicate. Same arity and the SAME two
+        // binds as before — `co_owner_group_id` (migration 072) reads the group
+        // array a second time. A cross-group edge is visible only to a
+        // principal in BOTH groups; `co_owner_group_id IS NULL` is the
+        // single-owner case and short-circuits.
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
@@ -793,7 +841,10 @@ impl EdgeRepository {
             WHERE (source_id = $1 OR target_id = $1)
               AND relationship = $2
               AND valid_to IS NULL
-              AND ($3::bool OR visibility = 'public' OR owner_group_id = ANY($4::uuid[]))
+              AND ($3::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($4::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($4::uuid[]))))
             ORDER BY valid_from DESC NULLS LAST
             "#,
             entity_id,
@@ -961,14 +1012,22 @@ impl EdgeRepository {
     ) -> Result<i64, DbError> {
         // MACRO SITE. PARENTHESES: the pre-existing predicate is an OR chain,
         // and AND binds tighter, so the visibility term is ANDed to the whole
-        // disjunction rather than to its last arm.
+        // disjunction rather than to its last arm. The visibility term is the
+        // static transcription of `Viewer::edge_predicate_fragment` (PR-13),
+        // whose own internal parenthesisation matters for the same reason: the
+        // co-ownership conjunct must bind to `owner_group_id = ANY(...)`, NOT
+        // to the whole `visibility = 'public' OR ...` disjunction — otherwise a
+        // PUBLIC edge would be hidden from a viewer outside its co-owner group.
         let row = sqlx::query!(
             r#"
             SELECT COUNT(*) as count
             FROM edges
             WHERE ((source_id = $1 AND source_type = $2)
                 OR (target_id = $1 AND target_type = $2))
-              AND ($3::bool OR visibility = 'public' OR owner_group_id = ANY($4::uuid[]))
+              AND ($3::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($4::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($4::uuid[]))))
             "#,
             entity_id,
             entity_type,
@@ -1022,7 +1081,7 @@ impl EdgeRepository {
               AND e.source_type = 'claim'
               AND e.relationship IN ('attributed_to', 'ATTRIBUTED_TO')
               AND c.truth_value >= $2
-              /* {VISIBILITY:e} */ /* {VISIBILITY:c} */
+              /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */
             ORDER BY c.created_at DESC
             LIMIT $3 OFFSET $4
             "#,
@@ -1062,7 +1121,7 @@ impl EdgeRepository {
               AND e.source_type = 'claim'
               AND e.relationship IN ('attributed_to', 'ATTRIBUTED_TO')
               AND c.truth_value >= $2
-              /* {VISIBILITY:e} */ /* {VISIBILITY:c} */
+              /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */
             "#,
             3,
         );

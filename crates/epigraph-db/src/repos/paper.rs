@@ -105,7 +105,10 @@ impl PaperRepository {
               AND source_type = 'paper'
               AND relationship = 'processed_by'
               AND properties ->> 'pipeline' = $2
-              AND ($3::bool OR visibility = 'public' OR owner_group_id = ANY($4::uuid[]))
+              AND ($3::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($4::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($4::uuid[]))))
             LIMIT 1
             "#,
             paper_id,
@@ -150,7 +153,10 @@ impl PaperRepository {
               AND source_type = 'paper'
               AND target_type = 'claim'
               AND relationship = 'asserts'
-              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($3::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($3::uuid[]))))
             "#,
             paper_id,
             viewer.bypass_bind(),
@@ -222,7 +228,10 @@ impl PaperRepository {
               AND e.target_type = 'paper'
               AND e.source_type = 'agent'
               AND e.relationship = 'authored'
-              AND ($2::bool OR e.visibility = 'public' OR e.owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
             ORDER BY a.display_name NULLS LAST, a.id
             "#,
             paper_id,
@@ -265,7 +274,10 @@ impl PaperRepository {
               AND e.source_type = 'paper'
               AND e.target_type = 'claim'
               AND e.relationship = 'asserts'
-              AND ($3::bool OR e.visibility = 'public' OR e.owner_group_id = ANY($4::uuid[]))
+              AND ($3::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($4::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($4::uuid[]))))
               AND ($3::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($4::uuid[]))
             ORDER BY c.created_at ASC, c.id
             LIMIT $2

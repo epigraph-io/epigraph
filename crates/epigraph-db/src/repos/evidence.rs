@@ -300,7 +300,11 @@ impl EvidenceRepository {
     /// reason.
     ///
     /// The `edges` marker sits in the JOIN's ON clause, matching
-    /// [`crate::ClaimRepository::count_all_evidence_for_claim`].
+    /// [`crate::ClaimRepository::count_all_evidence_for_claim`]. It is the
+    /// `/* {EDGE_VISIBILITY:ed} */` spelling (PR-13) while `e` — `evidence`, not
+    /// `edges` — keeps the plain one. This statement is the reason the edge
+    /// fragment needs its own marker rather than an alias-keyed dispatch: `e`
+    /// names `evidence` here and `edges` in `repos/structural.rs`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -317,7 +321,7 @@ impl EvidenceRepository {
              JOIN edges ed ON ed.source_id = e.id \
                 AND ed.target_type = 'claim' \
                 AND ed.target_id = $1 \
-                /* {VISIBILITY:ed} */ \
+                /* {EDGE_VISIBILITY:ed} */ \
              WHERE e.created_at <= $2 \
                /* {VISIBILITY:e} */ \
              ORDER BY e.created_at ASC",

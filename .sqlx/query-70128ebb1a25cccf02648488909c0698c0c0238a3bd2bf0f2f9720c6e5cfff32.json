@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to\n            FROM edges\n            WHERE ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))\n            ORDER BY created_at DESC\n            LIMIT $1\n            ",
+  "query": "\n            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to\n            FROM edges\n            WHERE (source_id = $1 OR target_id = $1)\n              AND relationship = $2\n              AND valid_to IS NULL\n              AND ($3::bool OR visibility = 'public'\n                   OR (owner_group_id = ANY($4::uuid[])\n                       AND (co_owner_group_id IS NULL\n                            OR co_owner_group_id = ANY($4::uuid[]))))\n            ORDER BY valid_from DESC NULLS LAST\n            ",
   "describe": {
     "columns": [
       {
@@ -51,7 +51,8 @@
     ],
     "parameters": {
       "Left": [
-        "Int8",
+        "Uuid",
+        "Text",
         "Bool",
         "UuidArray"
       ]
@@ -68,5 +69,5 @@
       true
     ]
   },
-  "hash": "16eb9d3afee40d81be8ffdc2717f995a7a59c3f86e66f3311d5d1555add95a31"
+  "hash": "70128ebb1a25cccf02648488909c0698c0c0238a3bd2bf0f2f9720c6e5cfff32"
 }

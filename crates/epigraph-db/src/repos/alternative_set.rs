@@ -28,9 +28,11 @@
 //! written in the same change, states the same rule ("the edge predicate alone
 //! is not enough") and it applies symmetrically here.
 //!
-//! Per `visibility.rs`'s module doc these use [`Viewer::predicate_fragment`],
-//! not the co-ownership `edge_predicate_fragment` that PR-13's migration makes
-//! possible.
+//! The three `edges` aliases (`s1`, `s2`, `contr`) take
+//! [`Viewer::edge_predicate_fragment`] via `/* {EDGE_VISIBILITY:...} */`
+//! (PR-13); the three `claims` aliases keep [`Viewer::predicate_fragment`]. The
+//! edge predicate alone is still not enough — the far-side claim is filtered
+//! independently, for the reason stated above.
 //!
 //! The `existing` LEFT JOIN on `alternative_of` is left UNFILTERED, and that is
 //! a decision rather than an omission. Its role is suppression: a pair already
@@ -127,7 +129,7 @@ impl AlternativeSetRepository {
               AND ($1::uuid IS NULL OR s1.target_id = $1)
               AND existing.id IS NULL
               /* {VISIBILITY:ca} */ /* {VISIBILITY:cb} */ /* {VISIBILITY:ct} */
-              /* {VISIBILITY:s1} */ /* {VISIBILITY:s2} */ /* {VISIBILITY:contr} */
+              /* {EDGE_VISIBILITY:s1} */ /* {EDGE_VISIBILITY:s2} */ /* {EDGE_VISIBILITY:contr} */
         )
         SELECT
             claim_a, claim_b, target_claim, score,

@@ -425,7 +425,7 @@ impl MethodRepository {
              CROSS JOIN LATERAL unnest(m.source_claim_ids) AS scid \
              JOIN claims c ON c.id = scid \
              LEFT JOIN edges e ON e.target_id = c.id AND e.source_type = 'paper' AND e.relationship = 'asserts' \
-                 /* {VISIBILITY:e} */ \
+                 /* {EDGE_VISIBILITY:e} */ \
              WHERE m.id = $1 /* {VISIBILITY:c} */",
             2,
         );
@@ -463,7 +463,7 @@ impl MethodRepository {
              CROSS JOIN LATERAL unnest(m.source_claim_ids) AS scid \
              JOIN edges e ON e.target_id = scid AND e.source_type = 'paper' AND e.relationship = 'asserts' \
              JOIN papers p ON p.id = e.source_id \
-             WHERE m.id = $1 /* {VISIBILITY:e} */ \
+             WHERE m.id = $1 /* {EDGE_VISIBILITY:e} */ \
              ORDER BY pub_year DESC NULLS LAST",
             2,
         );
@@ -501,7 +501,7 @@ impl MethodRepository {
              FROM analysis_methods am \
              JOIN analyses a ON a.id = am.analysis_id \
              LEFT JOIN edges e ON e.target_id = am.analysis_id AND e.source_type = 'paper' \
-                 /* {VISIBILITY:e} */ \
+                 /* {EDGE_VISIBILITY:e} */ \
              LEFT JOIN papers p ON p.id = e.source_id \
              WHERE am.method_id = $1 \
              ORDER BY a.created_at DESC \

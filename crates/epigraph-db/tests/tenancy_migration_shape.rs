@@ -37,6 +37,11 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
     ),
     ("065_idx_edges_owner_group.sql", "idx_edges_owner_group"),
     ("066_idx_claims_world_owned.sql", "idx_claims_world_owned"),
+    // PR-13. Not a 06x file: `-- no-transaction` is a property of the file, not
+    // of a version range, and `no_transaction_files_contain_exactly_one_statement`
+    // discovers them by reading the first bytes of every `.sql` in the
+    // directory rather than by number.
+    ("073_idx_edges_co_owner.sql", "idx_edges_co_owner"),
 ];
 
 /// The tier-A set migration 062 widens. Duplicated here on purpose: a test that
@@ -340,7 +345,7 @@ fn no_transaction_files_contain_exactly_one_statement() {
     assert_eq!(
         checked,
         INDEX_MIGRATIONS.len(),
-        "expected exactly {} `-- no-transaction` migrations (063-066); found {checked}. \
+        "expected exactly {} `-- no-transaction` migrations (063-066, 073); found {checked}. \
          Adding one is fine — add it to INDEX_MIGRATIONS so its index validity is \
          checked too.",
         INDEX_MIGRATIONS.len()

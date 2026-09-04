@@ -173,9 +173,11 @@ impl SemanticLinkRepository {
     ) -> Result<Option<SemanticLink>, DbError> {
         let uuid: Uuid = id.into();
 
-        // `edges` uses the plain `predicate_fragment`, not an edge-specific
-        // one: `edges.co_owner_group_id` does not exist until PR-13's
-        // migration. See `visibility.rs`'s module docs.
+        // `edges` takes `edge_predicate_fragment` via the
+        // `/* {EDGE_VISIBILITY:...} */` spelling (PR-13): the co-ownership
+        // INTERSECTION over `edges.co_owner_group_id` (migration 072), not the
+        // plain single-owner predicate. A cross-group link is visible only to a
+        // principal in both endpoint groups.
         let sql = viewer.splice(
             r#"
             SELECT id, source_id, target_id, relationship, properties
@@ -183,7 +185,7 @@ impl SemanticLinkRepository {
             WHERE id = $1
               AND source_type = 'claim'
               AND target_type = 'claim'
-              /* {VISIBILITY:edges} */
+              /* {EDGE_VISIBILITY:edges} */
             "#,
             2,
         );
@@ -218,7 +220,7 @@ impl SemanticLinkRepository {
             WHERE source_id = $1
               AND source_type = 'claim'
               AND target_type = 'claim'
-              /* {VISIBILITY:edges} */
+              /* {EDGE_VISIBILITY:edges} */
             ORDER BY created_at DESC
             "#,
             2,
@@ -256,7 +258,7 @@ impl SemanticLinkRepository {
             WHERE target_id = $1
               AND source_type = 'claim'
               AND target_type = 'claim'
-              /* {VISIBILITY:edges} */
+              /* {EDGE_VISIBILITY:edges} */
             ORDER BY created_at DESC
             "#,
             2,
@@ -299,7 +301,7 @@ impl SemanticLinkRepository {
                 OR (source_id = $2 AND target_id = $1))
               AND source_type = 'claim'
               AND target_type = 'claim'
-              /* {VISIBILITY:edges} */
+              /* {EDGE_VISIBILITY:edges} */
             ORDER BY created_at DESC
             "#,
             3,
@@ -337,7 +339,7 @@ impl SemanticLinkRepository {
             WHERE relationship = $1
               AND source_type = 'claim'
               AND target_type = 'claim'
-              /* {VISIBILITY:edges} */
+              /* {EDGE_VISIBILITY:edges} */
             ORDER BY created_at DESC
             "#,
             2,
@@ -421,7 +423,7 @@ impl SemanticLinkRepository {
             FROM edges
             WHERE source_type = 'claim'
               AND target_type = 'claim'
-              /* {VISIBILITY:edges} */
+              /* {EDGE_VISIBILITY:edges} */
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
             "#,
@@ -453,7 +455,7 @@ impl SemanticLinkRepository {
             FROM edges
             WHERE source_type = 'claim'
               AND target_type = 'claim'
-              /* {VISIBILITY:edges} */
+              /* {EDGE_VISIBILITY:edges} */
             "#,
             1,
         );

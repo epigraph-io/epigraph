@@ -46,6 +46,22 @@
 //! behind it is a comment style, not a control, so
 //! [`the_exemption_set_is_exactly_what_was_reviewed`] pins the exact set.
 //!
+//! # What it checks since PR-13: WHICH fragment, not only that there is one
+//!
+//! `edges` has two owning groups as of migration 072, so it takes a different
+//! predicate — [`epigraph_db::visibility::Viewer::edge_predicate_fragment`],
+//! spelled `/* {EDGE_VISIBILITY:<alias>} */`. Every check above is satisfied by
+//! an `edges` read that uses the SINGLE-OWNER predicate: it spends its viewer,
+//! it contains `visibility = 'public'`, it calls `.splice(`. It just shows a
+//! cross-group edge to a principal in only one of its two owning groups.
+//!
+//! [`every_edges_marker_uses_the_edge_spelling_and_no_others_do`] closes that
+//! by resolving each marker's alias to the table it names and requiring the two
+//! to agree — in both directions, since the edge fragment names a column no
+//! other table has. It is a textual approximation of a SQL parser and is
+//! calibrated by [`the_edge_marker_scanner_is_not_vacuous`], because a scanner
+//! that resolved every alias to `None` would be silently vacuous.
+//!
 //! # What it deliberately does NOT check
 //!
 //! **Where** the marker sits. A marker in the wrong clause — inside a `LEFT
@@ -379,38 +395,272 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
     );
 }
 
-/// The lint and the repo layer must not drift to two spellings of the marker.
+/// The lint and the repo layer must not drift to spellings of the marker that
+/// only one of them knows.
 ///
-/// `visibility.rs`'s module doc claims [`epigraph_db::visibility::VISIBILITY_MARKER_PREFIX`]
-/// is "the single spelling of the marker, shared with
-/// `crates/epigraph-db/tests/visibility_lint.rs`, so the lint and the repo
-/// layer cannot drift apart". This test is what makes that sentence true:
-/// every `.splice(` call site must carry the marker spelled the way the
-/// constant spells it.
+/// There are exactly TWO spellings, and both are constants in `visibility.rs`:
+/// [`epigraph_db::visibility::VISIBILITY_MARKER_PREFIX`] and, since PR-13,
+/// [`epigraph_db::visibility::EDGE_VISIBILITY_MARKER_PREFIX`]. The second exists
+/// because the marker's alias is a text substitution and not a dispatch key —
+/// `e` names `edges` in `repos/structural.rs` and `evidence` in
+/// `repos/evidence.rs`, so the `edges` co-ownership fragment cannot be selected
+/// by alias. See `visibility.rs`'s module docs.
+///
+/// WIDENED, NOT WEAKENED. A `.splice(` body carrying NEITHER spelling is still
+/// an offender, which is the whole assertion: `splice` panics at runtime on a
+/// marker-free literal, and this test turns that into a compile-time-shaped
+/// failure. What changed is only that an `edges`-only statement is now
+/// legitimate rather than reported.
 #[test]
 fn every_spliced_statement_carries_the_canonical_marker_spelling() {
     let prefix = epigraph_db::visibility::VISIBILITY_MARKER_PREFIX;
+    let edge_prefix = epigraph_db::visibility::EDGE_VISIBILITY_MARKER_PREFIX;
     // Statements built with `format!` double their braces, so the marker reads
     // `/* {{VISIBILITY:` in source. Accept both spellings of the same thing.
     let doubled = prefix.replace('{', "{{");
+    let edge_doubled = edge_prefix.replace('{', "{{");
+
+    // The two prefixes must stay disjoint strings. If `EDGE_VISIBILITY` ever
+    // became a superstring of `VISIBILITY` (or vice versa), `splice`'s two
+    // substitution passes would capture each other's markers and this test
+    // would accept a statement that filters nothing.
+    assert!(
+        !edge_prefix.contains(prefix) && !prefix.contains(edge_prefix),
+        "the two marker spellings must not contain one another: \
+         {prefix} / {edge_prefix}"
+    );
 
     let mut offenders = Vec::new();
     for f in viewer_taking_fns() {
         if !f.body.contains(".splice(") {
             continue;
         }
-        if !f.body.contains(prefix) && !f.body.contains(&doubled) {
+        let carries = f.body.contains(prefix)
+            || f.body.contains(&doubled)
+            || f.body.contains(edge_prefix)
+            || f.body.contains(&edge_doubled);
+        if !carries {
             offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
         }
     }
 
     assert!(
         offenders.is_empty(),
-        "\n\nThese functions call `Viewer::splice` on SQL that does not carry \
-         `{prefix}` (or its `format!`-doubled form `{doubled}`):\n{}\n\n\
+        "\n\nThese functions call `Viewer::splice` on SQL that carries neither \
+         `{prefix}` nor `{edge_prefix}` (nor their `format!`-doubled forms \
+         `{doubled}` / `{edge_doubled}`):\n{}\n\n\
          `splice` panics at runtime on a marker-free literal, so this would be \
          caught the first time the query executes — but only if a test touches \
          it. Catching it here makes it a compile-time-shaped failure.\n",
         offenders.join("\n")
     );
+}
+
+/// Every `edges` read that filters must use the EDGE spelling, and no other
+/// table may.
+///
+/// This is the ratchet PR-13's conversion needs and the plain lint cannot give:
+/// `visibility = 'public'` appears in both fragments, so a statement that
+/// filters `edges` with the SINGLE-OWNER predicate spends its viewer, carries a
+/// canonical marker, and passes every existing assertion here — while a
+/// cross-group edge remains visible to a principal in only one of its two
+/// owning groups. That is a leak that looks exactly like compliance.
+///
+/// The scan is textual and deliberately crude: for each marker, find the
+/// nearest preceding binding of its alias inside the same statement and check
+/// which table it names. It is therefore an approximation of the SQL parser
+/// nobody wants to write here, and it is calibrated by
+/// [`the_edge_marker_scanner_is_not_vacuous`] below.
+///
+/// # Two bounds this does NOT cover — state them rather than imply completeness
+///
+/// **1. Directory.** It reads [`repo_files`], i.e. `crates/epigraph-db/src/repos`
+/// only. The other `.splice(` call sites in the workspace —
+/// `epigraph-mcp/src/tools/{ds_auto,workflows,ds,link_epistemic}.rs` and
+/// `epigraph-api/src/routes/cross_source.rs` — are outside it. Every one of
+/// those filters `claims` today, so this is a reach limit and not a live leak;
+/// an `edges` read added to a route handler or an MCP tool would evade it in
+/// both directions. `epigraph-mcp/tests/tool_viewer_is_spent.rs` and
+/// `epigraph-api/tests/viewer_route_table_lint.rs` already scan those trees and
+/// are where the check would be widened.
+///
+/// **2. Marker sites only.** It resolves markers, so it is structurally blind
+/// to the static `sqlx::query!` / `query_as!` transcriptions, which carry no
+/// marker and spell the predicate inline. Those are the majority of PR-13's
+/// converted `edges` surface (`edge.rs`, `paper.rs`, `provenance_chain.rs`,
+/// `claim.rs`). A future `edges` read written as a macro with the single-owner
+/// spelling spends its viewer, contains `visibility = 'public'`, carries no
+/// `.splice(` and carries no marker — so it passes every check in this file,
+/// including this one. The conversion is complete TODAY (no `edges` read
+/// outside the documented exemptions still uses the single-owner form); it is
+/// the RATCHET that covers the marker half only.
+#[test]
+fn every_edges_marker_uses_the_edge_spelling_and_no_others_do() {
+    let mut plain_on_edges = Vec::new();
+    let mut edge_on_other = Vec::new();
+
+    for (file, src) in repo_files() {
+        for (line, alias, is_edge, table) in markers_with_their_tables(&src) {
+            match (table.as_deref(), is_edge) {
+                (Some("edges"), false) => plain_on_edges.push(format!(
+                    "  {file}:{line} — alias `{alias}` names `edges` but takes \
+                     the single-owner predicate"
+                )),
+                (Some(t), true) if t != "edges" => edge_on_other.push(format!(
+                    "  {file}:{line} — alias `{alias}` names `{t}`, which has no \
+                     co_owner_group_id column"
+                )),
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        plain_on_edges.is_empty(),
+        "\n\nThese `edges` reads filter on `owner_group_id` alone:\n{}\n\n\
+         An edge whose endpoints are private to different groups G and H is \
+         stored as (owner = G, co_owner = H) since migration 072. The \
+         single-owner predicate shows it to any principal in G, including one \
+         with no access to H's endpoint. Use `/* {{EDGE_VISIBILITY:<alias>}} */`.\n",
+        plain_on_edges.join("\n")
+    );
+    assert!(
+        edge_on_other.is_empty(),
+        "\n\nThese non-`edges` reads use the EDGE marker:\n{}\n\n\
+         `co_owner_group_id` exists only on `edges`; the rendered predicate \
+         would be a runtime `column does not exist` error, which is \
+         compile-time-clean.\n",
+        edge_on_other.join("\n")
+    );
+}
+
+/// The scanner above is an approximation, so it is calibrated rather than
+/// trusted: a scanner that resolved every alias to `None` would make the
+/// ratchet vacuous and stay green forever.
+#[test]
+fn the_edge_marker_scanner_is_not_vacuous() {
+    let plain = "let sql = viewer.splice(\"SELECT 1 FROM claims c \
+                 WHERE true /* {VISIBILITY:c} */\", 2);";
+    let edges = "let sql = viewer.splice(\"SELECT 1 FROM edges e \
+                 WHERE true /* {EDGE_VISIBILITY:e} */\", 2);";
+    let mixed = "let sql = viewer.splice(\"SELECT 1 FROM evidence e JOIN edges ed \
+                 ON ed.source_id = e.id /* {EDGE_VISIBILITY:ed} */ \
+                 WHERE true /* {VISIBILITY:e} */\", 3);";
+
+    let got = markers_with_their_tables(plain);
+    assert_eq!(got.len(), 1);
+    assert_eq!((got[0].2, got[0].3.as_deref()), (false, Some("claims")));
+
+    let got = markers_with_their_tables(edges);
+    assert_eq!(got.len(), 1);
+    assert_eq!((got[0].2, got[0].3.as_deref()), (true, Some("edges")));
+
+    // The collision that motivates the second spelling: `e` is `evidence` and
+    // `ed` is `edges`, in ONE statement.
+    let got = markers_with_their_tables(mixed);
+    assert_eq!(got.len(), 2, "{got:?}");
+    let by_alias: std::collections::HashMap<_, _> = got
+        .iter()
+        .map(|(_, a, is_edge, t)| (a.clone(), (*is_edge, t.clone())))
+        .collect();
+    assert_eq!(
+        by_alias["ed"],
+        (true, Some("edges".to_string())),
+        "{by_alias:?}"
+    );
+    assert_eq!(
+        by_alias["e"],
+        (false, Some("evidence".to_string())),
+        "{by_alias:?}"
+    );
+}
+
+/// `(line, alias, is_edge_spelling, table_the_alias_names)` for every marker.
+///
+/// The statement window is bounded at the nearest preceding `.splice(`,
+/// `sqlx::query`, or `format!` so a binding from an unrelated statement earlier
+/// in the file cannot answer for this one. `None` means the scan could not
+/// resolve the alias; unresolved aliases are ignored by the caller rather than
+/// reported, because a false accusation here is worse than a miss the runtime
+/// panic and `splice`'s own assertions already cover.
+fn markers_with_their_tables(src: &str) -> Vec<(usize, String, bool, Option<String>)> {
+    const ANCHORS: &[&str] = &[".splice(", "sqlx::query", "format!"];
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+
+    while let Some(rel) = src[idx..].find("VISIBILITY:") {
+        let at = idx + rel;
+        idx = at + "VISIBILITY:".len();
+
+        // Distinguish `{EDGE_VISIBILITY:` from `{VISIBILITY:`; skip anything
+        // that is neither (prose, constant names).
+        let before = &src[..at];
+        let is_edge = before.ends_with("{EDGE_") || before.ends_with("{{EDGE_");
+        let is_plain = before.ends_with('{');
+        if !is_edge && !is_plain {
+            continue;
+        }
+
+        let Some(end) = src[idx..].find('}') else {
+            continue;
+        };
+        let alias = src[idx..idx + end].trim().to_string();
+        if alias.is_empty()
+            || !alias
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            continue;
+        }
+
+        let win_start = ANCHORS
+            .iter()
+            .filter_map(|a| before.rfind(a))
+            .max()
+            .unwrap_or(0);
+        let window = &src[win_start..at];
+
+        // Last `FROM <table> <alias>` / `JOIN <table> <alias>` in the window,
+        // falling back to an unaliased `FROM <alias>` (the marker alias IS the
+        // table name, e.g. `/* {EDGE_VISIBILITY:edges} */`).
+        let table = last_binding(window, &alias);
+        out.push((before.matches('\n').count() + 1, alias, is_edge, table));
+    }
+    out
+}
+
+fn last_binding(window: &str, alias: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+    let words: Vec<&str> = window.split_whitespace().collect();
+    for i in 0..words.len() {
+        let kw = words[i].trim_start_matches(['(', ',']);
+        if !kw.eq_ignore_ascii_case("FROM") && !kw.eq_ignore_ascii_case("JOIN") {
+            continue;
+        }
+        let Some(tbl_raw) = words.get(i + 1) else {
+            continue;
+        };
+        let tbl = tbl_raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+        if tbl.is_empty() {
+            continue;
+        }
+        // `FROM edges` with no alias: the marker alias is the table itself.
+        if tbl == alias {
+            found = Some(tbl.to_string());
+            continue;
+        }
+        let next = words
+            .get(i + 2)
+            .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_'));
+        let aliased = match next {
+            Some(n) if n.eq_ignore_ascii_case("AS") => words
+                .get(i + 3)
+                .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')),
+            other => other,
+        };
+        if aliased == Some(alias) {
+            found = Some(tbl.to_string());
+        }
+    }
+    found
 }

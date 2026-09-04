@@ -1,0 +1,25 @@
+-- no-transaction
+-- One statement per file: see 063's header. `-- no-transaction` must be the
+-- LITERAL first bytes of the file (sqlx-core 0.8.6 src/migrate/source.rs does
+-- `sql.starts_with("-- no-transaction")`), which is why this comment is second.
+--
+-- 073, PR-13, paired with 072's `edges.co_owner_group_id`. The plan calls this
+-- file 069 and, in its *Files* line, also calls migration 073 "the edges_tenancy
+-- policy clause" -- migrations/README.md is authoritative: 073 is THIS index and
+-- the RLS policies are 077 (PR-17). No policy is created here.
+--
+-- PARTIAL, on `co_owner_group_id IS NOT NULL`. Co-ownership is the rare case --
+-- a single-owner edge (the overwhelming majority) stores NULL and buys no index
+-- entry at all. The column is served for exactly two shapes: PR-18's
+-- privatization closure, which must enumerate the edges a group co-owns before
+-- it can revoke, and the `edges_co_owner_fkey` reference scan that
+-- `DELETE FROM groups` would take (blocked outright by 060's trigger today, but
+-- 062's header records that its documented escape hatch is a maintenance-window
+-- operation whose cost is exactly these unindexed FK scans).
+--
+-- It is NOT the index for the D3 read predicate. `edge_predicate_fragment`'s
+-- co-ownership conjunct is evaluated on rows already selected by
+-- `visibility = 'public' OR owner_group_id = ANY(...)`; 065's
+-- idx_edges_owner_group serves that, and a second index would not be reached.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_edges_co_owner
+    ON public.edges (co_owner_group_id) WHERE co_owner_group_id IS NOT NULL;

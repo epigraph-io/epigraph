@@ -52,6 +52,9 @@ use sqlx::{PgPool, Row};
 /// Migration files embedded so the replay test cannot drift from them.
 const MIGRATION_068: &str = include_str!("../../../migrations/068_communities_to_groups.sql");
 const MIGRATION_069: &str = include_str!("../../../migrations/069_entity_types_tenancy_tier.sql");
+/// PR-13's transactional half. Embedded for the same reason as 068/069: a
+/// replay test that re-derived the SQL could not catch the file drifting.
+const MIGRATION_072: &str = include_str!("../../../migrations/072_edge_co_ownership.sql");
 
 /// Registered by migration 062's tier-A list by hand; neither generator's
 /// definition names them, so the union states them explicitly.
@@ -651,6 +654,174 @@ async fn migration_068_and_069_apply_twice(pool: PgPool) {
         .await
         .expect("exempt count");
     assert_eq!(exempt, 12, "the 069 seed must not double on replay");
+}
+
+/// PR-13's acceptance clause: migration 072 applies twice.
+///
+/// Same reasoning as `migration_068_and_069_apply_twice` — a `lock_timeout`
+/// abort records no `_sqlx_migrations` row, so the operator's remedy is to
+/// re-run the file, and "it applied once" is not the property that makes that
+/// safe.
+///
+/// 072 has three idempotence mechanisms and this exercises all three:
+/// `ADD COLUMN IF NOT EXISTS`, two CONRELID-qualified `pg_constraint` guards
+/// around `ADD CONSTRAINT` (which has no `IF NOT EXISTS`), and
+/// `CREATE OR REPLACE FUNCTION` for the two trigger arms. The post-conditions
+/// below are what distinguishes a real replay from "did not error": a guard
+/// that created a differently-named duplicate constraint, or a replay that
+/// dropped the column's data, would both return `Ok`.
+///
+/// 073 is deliberately NOT replayed here. It is `-- no-transaction` (a
+/// `CREATE INDEX CONCURRENTLY` cannot run in one) and this test body IS a
+/// transaction; its idempotence is `IF NOT EXISTS` plus the `indisvalid` sweep
+/// in `tenancy_migration_shape.rs`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_072_applies_twice(pool: PgPool) {
+    let mut tx = pool.begin().await.expect("begin");
+
+    // A row that must survive the replay: the column is added with no DEFAULT,
+    // so a re-run that dropped and re-added it would silently null this out.
+    // Written through the trigger arms, not around them — arm (b) is what 072
+    // replaces, so this also proves the replaced body still stamps.
+    //
+    // Real claims on both ends: `trigger_validate_edge_refs` (a pre-tenancy
+    // trigger) rejects an edge naming a nonexistent node, so a pair of random
+    // uuids is not a shortcut here.
+    let agent = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(agent)
+        .bind(
+            agent
+                .as_bytes()
+                .iter()
+                .copied()
+                .cycle()
+                .take(32)
+                .collect::<Vec<u8>>(),
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed agent");
+    let mut claims = Vec::new();
+    for label in ["072 replay A", "072 replay B"] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
+             VALUES ($1, $2, $3, 0.5, $4, true)",
+        )
+        .bind(id)
+        .bind(label)
+        .bind(
+            id.as_bytes()
+                .iter()
+                .copied()
+                .cycle()
+                .take(32)
+                .collect::<Vec<u8>>(),
+        )
+        .bind(agent)
+        .execute(&mut *tx)
+        .await
+        .expect("seed claim");
+        claims.push(id);
+    }
+    let edge_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supports') RETURNING id",
+    )
+    .bind(claims[0])
+    .bind(claims[1])
+    .fetch_one(&mut *tx)
+    .await
+    .expect("seed a public edge");
+
+    sqlx::raw_sql(MIGRATION_072)
+        .execute(&mut *tx)
+        .await
+        .expect("re-applying migration 072 must succeed");
+
+    for constraint in ["edges_co_owner_fkey", "edges_co_owner_shape"] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM pg_constraint \
+              WHERE conrelid = 'public.edges'::regclass AND conname = $1",
+        )
+        .bind(constraint)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("constraint count");
+        assert_eq!(
+            n, 1,
+            "edges.{constraint} must exist exactly once after a replay — a guard \
+             that is not CONRELID-qualified would either skip creating it or \
+             create a duplicate"
+        );
+    }
+
+    // Both ship NOT VALID: validation is PR-16's 075/076, and a replay must not
+    // quietly promote them (that would take an ACCESS EXCLUSIVE full scan on a
+    // table with ~1M rows, in a migration advertised as metadata-only).
+    let unvalidated: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM pg_constraint \
+          WHERE conrelid = 'public.edges'::regclass \
+            AND conname IN ('edges_co_owner_fkey', 'edges_co_owner_shape') \
+            AND NOT convalidated",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("convalidated probe");
+    assert_eq!(unvalidated, 2, "both 072 constraints must stay NOT VALID");
+
+    // The column survived, still nullable, still with no DEFAULT (a DEFAULT
+    // would be D1's implicit-public in a new place).
+    let (nullable, default): (String, Option<String>) = sqlx::query_as(
+        "SELECT is_nullable, column_default FROM information_schema.columns \
+          WHERE table_name = 'edges' AND column_name = 'co_owner_group_id'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("column probe");
+    assert_eq!(
+        nullable, "YES",
+        "co_owner_group_id is NULL for a single owner"
+    );
+    assert_eq!(
+        default, None,
+        "a DEFAULT here would be implicit co-ownership"
+    );
+
+    let still_there: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM edges WHERE id = $1")
+        .bind(edge_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("row probe");
+    assert_eq!(still_there, 1, "a replay must not touch existing rows");
+
+    // Both trigger arms are still bound to their triggers after the replace.
+    // CREATE OR REPLACE FUNCTION does not re-create the trigger, so a body
+    // replaced under a different signature would leave the OLD body live —
+    // exactly the failure mode 072's header calls out for migration 066.
+    for (trigger, table, function) in [
+        ("edges_tenancy", "edges", "epigraph_edges_tenancy"),
+        (
+            "claims_propagate_tenancy",
+            "claims",
+            "epigraph_propagate_tenancy",
+        ),
+    ] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM pg_trigger t \
+               JOIN pg_proc p ON p.oid = t.tgfoid \
+              WHERE t.tgrelid = ('public.' || $2)::regclass \
+                AND t.tgname = $1 AND p.proname = $3 AND NOT t.tgisinternal",
+        )
+        .bind(trigger)
+        .bind(table)
+        .bind(function)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("trigger probe");
+        assert_eq!(n, 1, "{trigger} on {table} must still call {function}");
+    }
 }
 
 /// PR-05's acceptance clause, made machine-checkable: the quarantine is a VIEW,

@@ -1031,6 +1031,22 @@ impl ClaimRepository {
     /// `c`, so an invisible neighbour drops out of the row entirely rather than
     /// appearing with truncated content.
     ///
+    /// # What is NOT filtered — the `edges` alias
+    ///
+    /// Only the joined `claims` alias `c` carries a predicate. The `edges`
+    /// alias `e` carries none, and the projection includes `e.source_id`,
+    /// `e.target_id` and `e.relationship` — so this is a member of
+    /// `F-edges-unfiltered` (see `docs/tenancy/progress.json`), and a stronger
+    /// one than `rag_hybrid_context`, whose residual is a scalar `edge_count`.
+    /// PR-13 converted every `edges` read that ALREADY carried a visibility
+    /// predicate; it did not ADD predicates to never-filtered statements,
+    /// because each needs its own JOIN-vs-WHERE placement reasoning rather than
+    /// a fragment swap. Adding `/* {{EDGE_VISIBILITY:e}} */` here is the fix,
+    /// and it is bind-safe (both fragments render to the same `$3`) — it is
+    /// deferred only so the whole class lands with one set of acceptance
+    /// numbers. Bounded meanwhile: the returned rows are claims-filtered, so
+    /// this discloses STRUCTURE, never content.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails, or
     /// `DbError::InvalidData` for an unrecognised `embedding_col`.
@@ -1231,9 +1247,12 @@ impl ClaimRepository {
     /// What it discloses is therefore a *degree* over unfiltered `edges` for a
     /// claim the viewer can already see: a scalar count, never the ids or the
     /// adjacency. That is a real residual, not a non-issue, and it is the same
-    /// unfiltered-`edges` gap recorded in `repos/graph_view.rs` — closing it
-    /// needs `Viewer::edge_predicate_fragment` and `edges.co_owner_group_id`,
-    /// which land in PR-13. Tracked in `docs/tenancy/progress.json`.
+    /// unfiltered-`edges` gap recorded in `repos/graph_view.rs`. PR-13 shipped
+    /// `Viewer::edge_predicate_fragment` and `edges.co_owner_group_id`, so the
+    /// tool to close it now exists — but this statement never carried an `edges`
+    /// marker at all, so it needs a predicate ADDED rather than swapped, and
+    /// PR-13 converted only the reads that already had one. Still open as
+    /// `F-edges-unfiltered` in `docs/tenancy/progress.json`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -3886,7 +3905,7 @@ impl ClaimRepository {
                 AND ed.source_id = $1 \
                 AND ed.source_type = 'claim' \
                 AND ed.relationship = 'derived_from' \
-                /* {VISIBILITY:ed} */ \
+                /* {EDGE_VISIBILITY:ed} */ \
              WHERE (e.claim_id = $1 OR ed.id IS NOT NULL) /* {VISIBILITY:e} */",
             2,
         );
@@ -3922,7 +3941,7 @@ impl ClaimRepository {
                   AND target_type = 'claim'
                   AND source_type IN ('paper', 'evidence', 'analysis')
                   AND relationship IN ('asserts', 'SUPPORTS', 'concludes', 'provides_evidence')
-                  /* {VISIBILITY:edges} */
+                  /* {EDGE_VISIBILITY:edges} */
             )
             "#,
             2,
@@ -4991,7 +5010,10 @@ impl ClaimRepository {
             WHERE target_id = ANY($1)
               AND source_type = 'claim' AND target_type = 'claim'
               AND relationship = ANY($2)
-              AND ($3::bool OR visibility = 'public' OR owner_group_id = ANY($4::uuid[]))
+              AND ($3::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($4::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($4::uuid[]))))
             GROUP BY target_id
             "#,
             claim_ids,
@@ -5051,7 +5073,10 @@ impl ClaimRepository {
             WHERE e.target_id = ANY($1)
               AND e.source_type = 'claim' AND e.target_type = 'claim'
               AND e.relationship IN ('contradicts', 'refutes')
-              AND ($2::bool OR e.visibility = 'public' OR e.owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
               AND ($2::bool OR src.visibility = 'public' OR src.owner_group_id = ANY($3::uuid[]))
             GROUP BY e.target_id
             "#,
