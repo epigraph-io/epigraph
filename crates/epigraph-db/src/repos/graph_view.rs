@@ -42,17 +42,35 @@
 //!    similar names; `claim_clusters` (tenancy-bearing) is not `graph_clusters`
 //!    (not tenancy-bearing).
 //!
-//! # Residual: `edges` traversals
+//! # Residual: the `edges` traversals — narrowed by PR-13, not closed
 //!
-//! The `edges` traversals *inside* these projections are unfiltered, and
-//! `edges` does carry tenancy columns, so this is a real gap rather than an
-//! absence of one. It is bounded: the returned rows are claims-filtered, so it
-//! discloses *structure* (which ids relate to which) and never content. Full
-//! edge filtering needs `Viewer::edge_predicate_fragment` and the
-//! `edges.co_owner_group_id` co-ownership INTERSECTION, which migration and
-//! helper both land in **PR-13**. Recorded as an open finding in
-//! `docs/tenancy/progress.json` and assigned there, rather than left as a
-//! comment nobody owns.
+//! **Corrected.** This section used to say "the `edges` traversals inside these
+//! projections are unfiltered" without exception. That was already stale:
+//! [`subgraph_edges`] has been filtered since PR-07 (finding M8), and it is now
+//! filtered with [`Viewer::edge_predicate_fragment`] via
+//! `/* {EDGE_VISIBILITY:edges} */`.
+//!
+//! What remains unfiltered is the `edges` joins *inside the node projections* —
+//! [`expand_cluster_nodes`], [`neighborhood_compound_nodes`],
+//! [`neighborhood_atomic_nodes`], [`neighborhood_compound_groups`] and
+//! [`compound_neighbors`]. These have never carried a marker, so PR-13's
+//! conversion (which rewrote the fragment every already-filtered `edges` read
+//! uses) does not reach them: they need a predicate ADDED, with the join-vs-
+//! WHERE placement reasoning each one needs, not a fragment swapped.
+//!
+//! The residual is bounded in the same way it always was: the returned rows are
+//! claims-filtered, so it discloses *structure* (which ids relate to which) and
+//! never content. It stays open finding `F-edges-unfiltered` in
+//! `docs/tenancy/progress.json`, re-scoped there to name these five functions
+//! rather than "all traversals".
+//!
+//! [`subgraph_edges`]: GraphViewRepository::subgraph_edges
+//! [`expand_cluster_nodes`]: GraphViewRepository::expand_cluster_nodes
+//! [`neighborhood_compound_nodes`]: GraphViewRepository::neighborhood_compound_nodes
+//! [`neighborhood_atomic_nodes`]: GraphViewRepository::neighborhood_atomic_nodes
+//! [`neighborhood_compound_groups`]: GraphViewRepository::neighborhood_compound_groups
+//! [`compound_neighbors`]: GraphViewRepository::compound_neighbors
+//! [`Viewer::edge_predicate_fragment`]: crate::visibility::Viewer::edge_predicate_fragment
 
 use sqlx::PgPool;
 use tracing::instrument;
@@ -546,7 +564,7 @@ impl GraphViewRepository {
                     relationship, properties \
              FROM edges \
              WHERE source_id = ANY($1) AND target_id = ANY($1) \
-               /* {VISIBILITY:edges} */",
+               /* {EDGE_VISIBILITY:edges} */",
             2,
         );
         let mut q = sqlx::query_as::<_, SubgraphEdgeRow>(&sql).bind(node_ids);

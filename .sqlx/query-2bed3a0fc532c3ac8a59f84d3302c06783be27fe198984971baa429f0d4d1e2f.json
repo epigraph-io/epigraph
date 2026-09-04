@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT a.id AS \"id!\", a.display_name\n            FROM edges e\n            JOIN agents a ON a.id = e.source_id\n            WHERE e.target_id = $1\n              AND e.target_type = 'paper'\n              AND e.source_type = 'agent'\n              AND e.relationship = 'authored'\n              AND ($2::bool OR e.visibility = 'public'\n                   OR (e.owner_group_id = ANY($3::uuid[])\n                       AND (e.co_owner_group_id IS NULL\n                            OR e.co_owner_group_id = ANY($3::uuid[]))))\n            ORDER BY a.display_name NULLS LAST, a.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "display_name",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bool",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "2bed3a0fc532c3ac8a59f84d3302c06783be27fe198984971baa429f0d4d1e2f"
+}

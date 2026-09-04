@@ -1118,6 +1118,77 @@ async fn verify(pool: &PgPool) -> anyhow::Result<usize> {
         );
     }
 
+    // The SECOND edge shape, and the one `leaky_edges` above structurally
+    // cannot see: an edge whose endpoints are group-private in DIFFERENT groups
+    // but which carries NO co-owner.
+    //
+    // WHY IT EXISTS AND WHY NOTHING REPAIRS IT. Migration 072 makes the
+    // cross-group case expressible and both stamping arms write it from then
+    // on, but 072 reconciles nothing that is already stored. A row can reach
+    // this shape entirely under 070, with no cross-owner write: arm (b) stamps
+    // an edge ('group', G) while both endpoints are in G, then one endpoint
+    // moves to H. 070's arm (d) computed `ELSE NULL AS g` for that transition
+    // and its `AND m.g IS NOT NULL` guard SKIPPED the row — 070's own header
+    // calls that "stale-but-still-private is fail-closed, and 072 resolves it
+    // properly with co_owner_group_id". 072 resolves it for FUTURE transitions.
+    // For a row already in this shape, `Viewer::edge_predicate_fragment`'s
+    // `co_owner_group_id IS NULL` disjunct short-circuits and the edge stays
+    // visible to every member of G while naming H's private claim. The read
+    // predicate is exactly as good as the stamp, and here the stamp is missing.
+    //
+    // Nor does a no-op `UPDATE claims` repair it: arm (d)'s firing gate is
+    // `(ch.owner_group_id, ch.visibility) IS DISTINCT FROM (p.…)`, so an
+    // UPDATE that changes no tenancy returns NULL before reaching the meet.
+    //
+    // So it is a PRE-FLIGHT obligation, checked here where the deploy gate is,
+    // rather than a bulk UPDATE inside 072: 072 already holds ACCESS EXCLUSIVE
+    // on `edges` for its ADD COLUMN, `lock_timeout` bounds acquisition and not
+    // hold, and `edges_co_owner_shape` is enforced on new writes even though it
+    // ships NOT VALID — so a full-table reconciliation there could raise 23514
+    // mid-migration, record no sqlx row, and re-run on every restart. Plan
+    // §6.5 puts this meet in `repos/privatization.rs::seal_boundary_edges`, a
+    // BATCHED, RESUMABLE function scoped to `batch_ids`, which is PR-18's.
+    //
+    // Same house style as `leaky_edges`: written against `claims` / `evidence`
+    // directly, never through `epigraph_node_tenancy` (which carries
+    // `REVOKE EXECUTE … FROM PUBLIC`), so `verify` stays runnable by an
+    // operator who is neither superuser nor the function owner. The
+    // `COALESCE(…, 'public')` on a missing endpoint is plan §6.5's rule: an
+    // edge onto a frame/agent/paper/task has no tenancy and contributes public.
+    let stale_cross_group_edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (
+           SELECT COALESCE(cs.visibility, es.visibility, 'public')      AS sv,
+                  COALESCE(cs.owner_group_id, es.owner_group_id, $1)    AS sg,
+                  COALESCE(ct.visibility, et.visibility, 'public')      AS tv,
+                  COALESCE(ct.owner_group_id, et.owner_group_id, $1)    AS tg
+             FROM edges e
+             LEFT JOIN claims   cs ON e.source_type = 'claim'    AND cs.id = e.source_id
+             LEFT JOIN evidence es ON e.source_type = 'evidence' AND es.id = e.source_id
+             LEFT JOIN claims   ct ON e.target_type = 'claim'    AND ct.id = e.target_id
+             LEFT JOIN evidence et ON e.target_type = 'evidence' AND et.id = e.target_id
+            WHERE e.co_owner_group_id IS NULL
+         ) m
+          WHERE m.sv = 'group' AND m.tv = 'group' AND m.sg <> m.tg",
+    )
+    .bind(WORLD)
+    .fetch_one(pool)
+    .await?;
+    if stale_cross_group_edges > 0 {
+        failures += 1;
+        eprintln!(
+            "FAIL: {stale_cross_group_edges} edge(s) join two group-private \
+             endpoints in DIFFERENT groups but carry no co_owner_group_id. \
+             Each is visible to every member of its single owner group while \
+             naming the other group's private node — migration 072 makes that \
+             case expressible but does not reconcile rows stamped before it. \
+             Remediation: re-fire the stamping arm by naming an endpoint column \
+             in an UPDATE that changes nothing, e.g. \
+             `UPDATE edges SET source_id = source_id WHERE co_owner_group_id IS NULL;` \
+             — PostgreSQL fires `UPDATE OF source_id` on column MENTION, not on \
+             value change, so arm (b) re-runs and stamps the meet."
+        );
+    }
+
     for t in TIER_A {
         if matches!(*t, "frames" | "contexts" | "edges" | "claims" | "evidence") {
             continue;

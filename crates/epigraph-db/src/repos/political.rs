@@ -275,7 +275,7 @@ impl PoliticalRepository {
             LEFT JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
                               AND e.target_id = $1 AND e.target_type = 'agent'
                               AND e.relationship IN ('attributed_to', 'ATTRIBUTED_TO', 'ORIGINATED_BY')
-                              /* {VISIBILITY:e} */
+                              /* {EDGE_VISIBILITY:e} */
             WHERE (c.agent_id = $1 OR e.id IS NOT NULL)
               /* {VISIBILITY:c} */
             ORDER BY c.created_at DESC
@@ -307,7 +307,7 @@ impl PoliticalRepository {
                         AND e.relationship IN ('supports', 'SUPPORTS', 'uses_evidence')
             JOIN claims c ON e.target_id = c.id
             WHERE c.agent_id = $1
-              /* {VISIBILITY:ev} */ /* {VISIBILITY:e} */ /* {VISIBILITY:c} */
+              /* {VISIBILITY:ev} */ /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */
             GROUP BY ev.evidence_type
             ORDER BY count DESC
             "#,
@@ -347,7 +347,7 @@ impl PoliticalRepository {
                 AND sup_edge.source_type = 'claim'
                 AND sup_edge.target_type = 'claim'
                 AND sup_edge.relationship IN ('supersedes', 'SUPERSEDES')
-                /* {VISIBILITY:sup_edge} */
+                /* {EDGE_VISIBILITY:sup_edge} */
             WHERE c.agent_id = $1
               AND c.created_at >= $2
               AND c.created_at <= $3
@@ -390,7 +390,7 @@ impl PoliticalRepository {
               AND e.source_type = 'claim'
               AND e.target_type = 'agent'
               AND e.relationship IN ('ORIGINATED_BY', 'AMPLIFIED_BY')
-              /* {VISIBILITY:e} */
+              /* {EDGE_VISIBILITY:e} */
             ORDER BY e.properties->>'date_asserted' ASC NULLS LAST,
                      e.properties->>'date_amplified' ASC NULLS LAST,
                      e.created_at ASC
@@ -423,12 +423,12 @@ impl PoliticalRepository {
                 AND orig.source_type = 'claim'
                 AND orig.target_id = $1 AND orig.target_type = 'agent'
                 AND orig.relationship = 'ORIGINATED_BY'
-                /* {VISIBILITY:orig} */
+                /* {EDGE_VISIBILITY:orig} */
             LEFT JOIN edges amp ON amp.source_id = c.id
                 AND amp.source_type = 'claim'
                 AND amp.target_type = 'agent'
                 AND amp.relationship = 'AMPLIFIED_BY'
-                /* {VISIBILITY:amp} */
+                /* {EDGE_VISIBILITY:amp} */
             WHERE true /* {VISIBILITY:c} */
             GROUP BY c.id, c.content
             HAVING COUNT(amp.id) >= $2
@@ -513,7 +513,7 @@ impl PoliticalRepository {
               AND e.source_type = 'claim'
               AND e.target_type = 'propaganda_technique'
               AND e.relationship = 'USES_TECHNIQUE'
-              /* {VISIBILITY:e} */
+              /* {EDGE_VISIBILITY:e} */
             ORDER BY (e.properties->>'confidence')::FLOAT DESC NULLS LAST
             "#,
                 2,

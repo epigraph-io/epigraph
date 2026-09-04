@@ -347,6 +347,43 @@ impl From<DbError> for ApiError {
                     "request references a row that does not exist (constraint {constraint})"
                 ),
             },
+            // 23514 — the row the request asked for is not one this schema can
+            // hold. A client error, mapped to 400 (PR-13). Before this arm it
+            // fell through to `QueryFailed` and surfaced as a bare 500 reading
+            // "A database error occurred", which is what migration 070's own
+            // comment predicted and asked PR-13 to fix.
+            //
+            // The constraint NAME is included for the same reason the FK arm
+            // includes it — it is the only thing that tells a caller which of
+            // several CHECKs it tripped — and it is safe to disclose: these are
+            // schema identifiers, not row contents.
+            //
+            // Mapped onto the EXISTING `BadRequest` variant on purpose. Adding
+            // an `ApiError` variant would be a wider change than the mapping
+            // needs: `ApiError` itself is compiled without the `db` feature
+            // while this `impl` is `#[cfg(feature = "db")]`, so a new variant
+            // lands in the no-db build with no arm that constructs it.
+            // LOGGED, like the `QueryFailed` arm beside it. The response body
+            // deliberately carries the constraint NAME only, but the driver's
+            // message must not vanish from the server too: a plpgsql
+            // `RAISE ... USING ERRCODE = '23514'` reports no constraint name,
+            // so for migration 071's memberless-group refusal the name alone is
+            // `<unnamed>` and the log line is the entire diagnostic.
+            DbError::CheckViolation {
+                constraint,
+                message,
+            } => {
+                tracing::warn!(
+                    constraint = %constraint,
+                    detail = %message,
+                    "CHECK constraint violated"
+                );
+                ApiError::BadRequest {
+                    message: format!(
+                        "request violates a database constraint (constraint {constraint})"
+                    ),
+                }
+            }
             DbError::ConnectionFailed { source } => {
                 tracing::error!(error = %source, "Database connection failed");
                 ApiError::DatabaseError {
@@ -390,6 +427,49 @@ mod tests {
         };
         let response = error.into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A CHECK violation reaches the client as **400**, not 500 (PR-13).
+    ///
+    /// Migration 070 asked for this in its own comment — it raises
+    /// `ERRCODE = '23514'` "so the API/MCP layer can map it to a 4xx instead of
+    /// surfacing a bare 500" — and before PR-13 nothing did the mapping:
+    /// `From<sqlx::Error> for DbError` classified only 23505 and 23503, so
+    /// 23514 became `QueryFailed` → `ApiError::DatabaseError` → 500.
+    ///
+    /// `#[cfg(feature = "db")]`, because `DbError` is only nameable when
+    /// `epigraph-db` is compiled in. Without the gate this test breaks
+    /// `cargo check -p epigraph-api --no-default-features`, which
+    /// `--workspace --all-targets` never exercises.
+    ///
+    /// The constraint NAME must survive into the message: it is the only thing
+    /// that tells a caller which of several CHECKs it tripped.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_check_violation_is_a_client_error_carrying_its_constraint_name() {
+        let api = ApiError::from(DbError::CheckViolation {
+            constraint: "edges_co_owner_shape".to_string(),
+            message: "new row for relation \"edges\" violates check constraint".to_string(),
+        });
+        match &api {
+            ApiError::BadRequest { message } => {
+                assert!(
+                    message.contains("edges_co_owner_shape"),
+                    "the constraint name must reach the caller: {message}"
+                );
+                // And the driver's message must NOT. It is server state — for
+                // migration 071's 23514 it names a group and its membership —
+                // so it goes to `tracing::warn!` and not to the HTTP body. The
+                // `DbError` `Display` still carries it, which is what
+                // `epigraph-mcp`'s operator-facing surface renders.
+                assert!(
+                    !message.contains("violates check constraint"),
+                    "the driver message must stay server-side: {message}"
+                );
+            }
+            other => panic!("23514 must not be a DatabaseError: {other:?}"),
+        }
+        assert_eq!(api.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

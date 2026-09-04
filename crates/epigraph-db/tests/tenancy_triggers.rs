@@ -85,6 +85,21 @@ async fn tenancy_of(pool: &PgPool, table: &str, id: Uuid) -> (Uuid, String) {
     .unwrap_or_else(|e| panic!("read tenancy of {table}: {e}"))
 }
 
+/// [`tenancy_of`] widened with `edges.co_owner_group_id` (migration 072).
+///
+/// Separate from `tenancy_of` rather than replacing it: `co_owner_group_id`
+/// exists ONLY on `edges`, and `tenancy_of` is called for `claims`, `evidence`
+/// and the derived tables throughout this file.
+async fn edge_tenancy_of(pool: &PgPool, id: Uuid) -> (Uuid, String, Option<Uuid>) {
+    sqlx::query_as(
+        "SELECT owner_group_id, visibility::text, co_owner_group_id FROM edges WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("read edge tenancy: {e}"))
+}
+
 // =============================================================================
 // Arm (a) — supersede must not declassify
 // =============================================================================
@@ -1403,6 +1418,19 @@ async fn arm_d_recomputes_the_meet_rather_than_copying_the_changed_endpoint(pool
         .await
         .expect("move B");
 
+    // THE INTERMEDIATE, ASSERTED (PR-13). Before migration 072 this step left
+    // the edge unchanged at `group_a` and nothing checked it, so the test
+    // passed whatever arm (d) did here. It is the only point in this file where
+    // the co-owner CASE's SIDE ORDERING is observable: A is in `group_a` and is
+    // the SOURCE, B is in `group_b` and is the TARGET, and the CASE is written
+    // `owner := s.g, co_owner := t.g`.
+    assert_eq!(
+        edge_tenancy_of(&pool, edge).await,
+        (group_a, "group".to_string(), Some(group_b)),
+        "moving one endpoint into a second group must co-own the edge, not \
+         leave it stale at the first group"
+    );
+
     // Now declassify A alone. B is still group-private, so the MEET is
     // ('group', group_b) — NOT ('public', world).
     sqlx::query("UPDATE claims SET owner_group_id = $1, visibility = 'public' WHERE id = $2")
@@ -1412,7 +1440,7 @@ async fn arm_d_recomputes_the_meet_rather_than_copying_the_changed_endpoint(pool
         .await
         .expect("declassify A");
 
-    let (owner, vis) = tenancy_of(&pool, "edges", edge).await;
+    let (owner, vis, co) = edge_tenancy_of(&pool, edge).await;
     assert_eq!(
         (owner, vis.as_str()),
         (group_b, "group"),
@@ -1420,25 +1448,250 @@ async fn arm_d_recomputes_the_meet_rather_than_copying_the_changed_endpoint(pool
          is still group-private: a public edge onto a private claim discloses \
          that the claim exists and stands in a named relationship"
     );
+    assert_eq!(
+        co, None,
+        "the meet collapsed to a single group, so the co-owner must be CLEARED. \
+         Leaving group_b in co_owner_group_id here would make the row \
+         (owner = group_b, co_owner = group_b) and raise 23514 from \
+         edges_co_owner_shape — inside a statement-level AFTER UPDATE on claims, \
+         i.e. a write outage on privatization"
+    );
 }
 
-/// **Arm (d) leaves a cross-group edge UNCHANGED rather than picking a side —
-/// and does not RAISE.**
+// =============================================================================
+// Migration 072 — the three-CASE meet, read from the catalog
+// =============================================================================
+
+/// **PR-13 acceptance: `epigraph_propagate_tenancy`'s body after 072 contains
+/// the three-CASE meet — asserted by reading `pg_proc.prosrc`.**
 ///
-/// Measured on a throwaway database against the earlier one-endpoint form: a
-/// single statement privatizing two claims into DIFFERENT personal groups made
-/// the edge take whichever join row Postgres matched first, so one group's
-/// members could see an edge whose far endpoint was the other group's private
-/// claim. Arm (b) RAISEs on that configuration at INSERT; the UPDATE path was
-/// silently picking a winner.
+/// The plan says to read the catalog rather than the migration text, and the
+/// reason is recorded in `progress.json`: migration 070 names this function
+/// `epigraph_propagate_tenancy` with a zero-argument trigger signature
+/// *specifically* so this assertion can find it — "a hard downstream contract,
+/// not a naming preference". Reading the `.sql` file would prove only that
+/// somebody typed the SQL, not that the LIVE function is that SQL; the whole
+/// class of bug 072 exists to close (070's prose describing one body while
+/// another was installed) is invisible to a file-text assertion.
 ///
-/// It must not raise either, and that asymmetry with arm (b) is deliberate:
-/// arm (d) fires on EVERY `claims` UPDATE, including this series' own backfill,
-/// so an exception here is a total write outage on any privatization that
-/// happens to touch a cross-group edge. Stale-but-still-private is fail-closed;
-/// PR-13's migration 072 resolves it properly with `co_owner_group_id`.
+/// # Why this is paired with a behavioural assertion
+///
+/// A keyword count is a weak oracle on its own — a body could contain three
+/// `CASE`s and still compute the wrong meet, and prose in the body's own
+/// comments can inflate the count (the comment in 072 says "three CASE
+/// expressions", which is why this counts `CASE WHEN` and not `CASE`). The
+/// structural checks below are therefore paired with
+/// `arm_d_co_owns_a_cross_group_edge_rather_than_picking_a_side` and with
+/// `privatization_boundary.rs`, which exercise the same body end to end.
 #[sqlx::test(migrations = "../../migrations")]
-async fn arm_d_leaves_a_cross_group_edge_unchanged_rather_than_picking_a_side(pool: PgPool) {
+async fn arm_d_body_carries_the_three_case_meet_over_co_ownership(pool: PgPool) {
+    let src: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc \
+          WHERE proname = 'epigraph_propagate_tenancy' \
+            AND pronamespace = 'public'::regnamespace",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect(
+        "epigraph_propagate_tenancy must exist under exactly this name — \
+         migration 070 chose the name for this assertion",
+    );
+
+    assert_eq!(
+        src.matches("CASE WHEN").count(),
+        3,
+        "the edges UPDATE must carry THREE CASE expressions — owner_group_id, \
+         visibility and co_owner_group_id. Migration 070's body had two and no \
+         way to express a second owner.\n\n{src}"
+    );
+    assert!(
+        src.contains("co_owner_group_id = m.co"),
+        "the edges UPDATE must ASSIGN the third CASE; computing it and not \
+         writing it is the shape of the divergence 072 exists to end.\n\n{src}"
+    );
+    assert!(
+        !src.contains("ELSE NULL END AS g"),
+        "070's `ELSE NULL` sentinel on the owner CASE — 'no computable meet, \
+         leave the row alone' — must be GONE. It is what made a cross-group \
+         edge stale-but-private, and 072 replaces it with `ELSE s.g` plus a \
+         co-owner.\n\n{src}"
+    );
+    // The two guards 070 added against measured leaks, still present.
+    assert!(
+        src.contains("NOT (e.visibility = 'group' AND m.v = 'public')"),
+        "arm (d)'s no-widening guard must survive the replacement: without it a \
+         declassification re-widens an explicitly private edge, which \
+         `structural_features_authz.rs` measured.\n\n{src}"
+    );
+    assert!(
+        src.contains("IS DISTINCT FROM (m.g, m.v, m.co)"),
+        "the idempotence guard must compare the whole TRIPLE; on the pair alone \
+         a co-ownership-only change would not be written.\n\n{src}"
+    );
+    // Arm (d) must never raise — see this file's arm (d) tests for why.
+    assert!(
+        !src.contains("edge spans groups"),
+        "arm (b)'s cross-group RAISE must not have been copied into arm (d), \
+         which fires on every claims UPDATE.\n\n{src}"
+    );
+}
+
+/// **Migration 072 removed arm (b)'s cross-group RAISE, and that is the window
+/// this PR closes.**
+///
+/// 070's own comment (070:210-218) says the RAISE "becomes reachable once
+/// migration 071's transcription makes two claims with DIFFERENT owners
+/// genuinely ('group', G), at which point a cross-owner link_epistemic /
+/// link_hierarchical / decomposition edge hard-fails", and names 072 as the
+/// fix. No test pinned the RAISE, so nothing would have gone red if 072 had
+/// silently left it in place. This pins its ABSENCE from the live body.
+///
+/// The session-membership hatch goes with it. It was unsatisfiable in
+/// production for two independent reasons — for personal groups one principal
+/// can never be a live member of two, and every production edge writer reaches
+/// this trigger on a bare `&PgPool` where `epigraph_session_groups()` is empty
+/// — so its removal takes away nothing that ever fired. Write-side
+/// authorization is PR-16's, and `locked_decisions.rs` pins that split.
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_b_no_longer_raises_on_a_cross_group_edge(pool: PgPool) {
+    let src: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc \
+          WHERE proname = 'epigraph_edges_tenancy' \
+            AND pronamespace = 'public'::regnamespace",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("epigraph_edges_tenancy must exist");
+
+    assert!(
+        !src.contains("RAISE EXCEPTION"),
+        "arm (b) must not raise: a cross-group edge is expressible as of 072.\n\n{src}"
+    );
+    assert!(
+        !src.contains("epigraph_session_groups"),
+        "the session-membership hatch is write-side AUTHORIZATION, which is \
+         PR-16's; it never fired here (personal groups make it unsatisfiable, \
+         and edge writers use a bare pool with no GUCs).\n\n{src}"
+    );
+    // The no-widening guard PR-12 added is NOT part of what 072 removes. The
+    // plan's printed body drops it; copying that verbatim reinstates a leak
+    // `arm_b_does_not_widen_an_explicitly_private_edge` measures.
+    assert!(
+        src.contains("NOT (sv = 'group' OR tv = 'group')"),
+        "arm (b)'s no-widening guard must survive the replacement.\n\n{src}"
+    );
+    // Every branch must clear or set the co-owner: this trigger also fires on
+    // `UPDATE OF source_id, target_id`, so a branch that left NEW.co_owner
+    // alone would carry a stale second owner across a re-pointed edge.
+    assert_eq!(
+        src.matches("NEW.co_owner_group_id := NULL").count(),
+        4,
+        "the four single-owner branches must each CLEAR co_owner_group_id.\n\n{src}"
+    );
+    assert!(
+        src.contains("NEW.co_owner_group_id := tg"),
+        "the cross-group branch must stamp the target's group as co-owner.\n\n{src}"
+    );
+}
+
+/// **The FIFTH branch — the no-widening early `RETURN NEW` — deliberately does
+/// NOT assign `co_owner_group_id`, and that is pinned rather than left implicit.**
+///
+/// The assertion above counts the four branches that CLEAR the co-owner. By
+/// construction it cannot pin the one that does not, and 072's header makes an
+/// explicit claim about it: "EVERY BRANCH ASSIGNS co_owner_group_id
+/// EXPLICITLY... The single exception is the no-widening early RETURN, which
+/// honours the writer's whole declaration; a writer-supplied co-owner there is
+/// STRICTER than the meet."
+///
+/// # Why the behaviour is left as-is rather than changed
+///
+/// On an INSERT the surviving co-owner is the writer's own, and keeping it is
+/// the same direction as the declaration that branch exists to preserve. On an
+/// `UPDATE OF source_id, target_id` it is the PRE-EXISTING row's, so the
+/// "writer-supplied" argument does not transfer: an edge at
+/// `('group', G, co = H)` whose endpoints both become public would keep `co = H`
+/// and stay invisible to G-only members. That direction is fail-CLOSED — it
+/// hides a row, it does not disclose one — and no single-statement path reaches
+/// it: the production re-pointing sites are `claim.rs`'s merge/dedup
+/// `UPDATE edges SET source_id = $1` / `SET target_id = $1`, which move ONE
+/// endpoint at a time, so the first move takes the `sv = 'public'` or
+/// `tv = 'public'` branch and clears the co-owner before both-public is ever
+/// reached.
+///
+/// So this test pins the CURRENT shape. If a future change makes the early
+/// RETURN assign, this test is the one to update — not silently, which is the
+/// whole point of writing it down.
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_b_early_return_is_the_one_branch_that_does_not_touch_the_co_owner(pool: PgPool) {
+    let src: String =
+        sqlx::query_scalar("SELECT prosrc FROM pg_proc WHERE proname = 'epigraph_edges_tenancy'")
+            .fetch_one(&pool)
+            .await
+            .expect("epigraph_edges_tenancy must exist");
+
+    // The body has exactly ONE bare `RETURN NEW;` that is not preceded by a
+    // co-owner assignment: the no-widening guard's. Locate it structurally.
+    let guard = src
+        .find("NOT (sv = 'group' OR tv = 'group')")
+        .expect("the no-widening guard must be present");
+    let early_return = src[guard..]
+        .find("RETURN NEW;")
+        .expect("the guard must be followed by an early RETURN NEW");
+    let branch = &src[guard..guard + early_return];
+    assert!(
+        !branch.contains("co_owner_group_id"),
+        "the no-widening branch must leave the writer's declaration ENTIRELY \
+         alone, co-ownership included — 072's header says so and the four \
+         clearing branches are counted separately.\n\n{branch}"
+    );
+
+    // Five branches total: four that assign, one that returns early.
+    assert_eq!(
+        src.matches("RETURN NEW;").count(),
+        2,
+        "arm (b) has exactly two RETURN NEW statements — the early one and the \
+         tail. A third would be an unpinned branch.\n\n{src}"
+    );
+}
+
+/// **Arm (d) CO-OWNS a cross-group edge rather than picking a side — and still
+/// does not RAISE.**
+///
+/// # Retargeted by PR-13, deliberately, and what survived
+///
+/// Before migration 072 this test was
+/// `arm_d_leaves_a_cross_group_edge_unchanged_rather_than_picking_a_side` and
+/// asserted `(WORLD, "public")` — the edge left alone. That was fail-CLOSED
+/// under a single-uuid `owner_group_id`, not a desirable end state: the edge
+/// stayed *stale*, still claiming to be public while both its endpoints had
+/// become private. 072 makes the meet expressible, so the assertion inverts to
+/// the real answer, `('group', group_a, co_owner = group_b)`.
+///
+/// Three things did NOT change and are still the point of the test:
+///
+/// * **It must not RAISE.** `.expect("a cross-group privatization must not
+///   raise from arm (d)")` is load-bearing. Arm (d) fires on EVERY `claims`
+///   UPDATE, including this series' own backfill, so an exception here is a
+///   total write outage on any privatization that happens to touch a
+///   cross-group edge — not a rejected row. This is why arm (d) never got arm
+///   (b)'s RAISE, and it is also why 072's co-owner CASE must yield NULL on
+///   every collapse path (see
+///   [`declassifying_one_endpoint_of_a_co_owned_edge_clears_the_co_owner`] in
+///   `privatization_boundary.rs`).
+/// * **It must not pick a side.** Measured on a throwaway database against the
+///   earlier one-endpoint form: a single statement privatizing two claims into
+///   DIFFERENT personal groups made the edge take whichever join row Postgres
+///   matched first, so one group's members could see an edge whose far endpoint
+///   was the other group's private claim. Co-ownership is not "picking
+///   `group_a`": under the INTERSECTION read fragment the edge is visible to
+///   neither group alone, which the read-side half of this asserts in
+///   `privatization_boundary.rs`.
+/// * **It must not stay public.** `assert_ne!(vis, "public")` is what the old
+///   `(WORLD, "public")` assertion would now silently permit if the edges
+///   UPDATE stopped firing altogether.
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_d_co_owns_a_cross_group_edge_rather_than_picking_a_side(pool: PgPool) {
     let (agent_a, group_a) = fixture::seed_agent_with_group(&pool, "a").await;
     let (agent_b, group_b) = fixture::seed_agent_with_group(&pool, "b").await;
     let a = fixture::seed_public_claim(&pool, agent_a, "A").await;
@@ -1473,16 +1726,26 @@ async fn arm_d_leaves_a_cross_group_edge_unchanged_rather_than_picking_a_side(po
     .await
     .expect("a cross-group privatization must not raise from arm (d)");
 
-    let (owner, vis) = tenancy_of(&pool, "edges", edge).await;
+    let (owner, vis, co) = edge_tenancy_of(&pool, edge).await;
     assert_eq!(
-        (owner, vis.as_str()),
-        (WORLD, "public"),
-        "with no computable meet the edge must be LEFT ALONE, not assigned to \
-         whichever endpoint the planner joined first — that would let one \
-         group see an edge whose far endpoint is the other group's private claim"
+        (owner, vis.as_str(), co),
+        (group_a, "group", Some(group_b)),
+        "a cross-group privatization must stamp BOTH owning groups; assigning \
+         whichever endpoint the planner joined first would let one group see an \
+         edge whose far endpoint is the other group's private claim"
     );
-    assert_ne!(owner, group_a);
-    assert_ne!(owner, group_b);
+    // Not a formatting variant of the assertion above: it is the property that
+    // survives a future change to which side lands in which column.
+    assert_ne!(
+        owner,
+        co.unwrap(),
+        "owner and co-owner must be DISTINCT groups — equal values would also \
+         violate edges_co_owner_shape"
+    );
+    assert_ne!(
+        vis, "public",
+        "an edge between two group-private claims is never public"
+    );
 }
 
 // =============================================================================

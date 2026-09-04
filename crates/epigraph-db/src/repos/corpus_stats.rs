@@ -98,7 +98,7 @@ impl CorpusStatsRepository {
               (SELECT COUNT(*) FROM evidence ev
                  WHERE true /* {VISIBILITY:ev} */)   AS evidence,
               (SELECT COUNT(*) FROM edges eg
-                 WHERE true /* {VISIBILITY:eg} */)   AS edges,
+                 WHERE true /* {EDGE_VISIBILITY:eg} */)   AS edges,
               (SELECT COUNT(*) FROM frames f
                  WHERE true /* {VISIBILITY:f} */)    AS frames
         ";

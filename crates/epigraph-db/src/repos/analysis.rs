@@ -123,7 +123,7 @@ impl AnalysisRepository {
                AND e.relationship = 'concludes' \
                AND e.source_type = 'analysis' \
                AND e.target_type = 'claim' \
-               /* {VISIBILITY:e} */ \
+               /* {EDGE_VISIBILITY:e} */ \
              ORDER BY a.created_at DESC",
             2,
         );
@@ -149,7 +149,7 @@ impl AnalysisRepository {
                AND e.relationship = 'concludes' \
                AND e.source_type = 'analysis' \
                AND e.target_type = 'claim' \
-               /* {VISIBILITY:c} */ /* {VISIBILITY:e} */ \
+               /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */ \
              ORDER BY c.truth_value DESC",
             2,
         );

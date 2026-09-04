@@ -53,9 +53,34 @@
 //!   inside `splice`. Two CTEs over `claims` in one query (see
 //!   `ClaimRepository::search_hybrid_scoped_since`) must both filter, and both
 //!   read the same `$V`.
-//! * [`VISIBILITY_MARKER_PREFIX`] is the single spelling of the marker, shared
-//!   with `crates/epigraph-db/tests/visibility_lint.rs`, so the lint and the
-//!   repo layer cannot drift apart.
+//! * [`VISIBILITY_MARKER_PREFIX`] and [`EDGE_VISIBILITY_MARKER_PREFIX`] are the
+//!   only two spellings of the marker, shared with
+//!   `crates/epigraph-db/tests/visibility_lint.rs`, so the lint and the repo
+//!   layer cannot drift apart.
+//!
+//! # Two markers, because an alias is a substitution and not a dispatch key
+//! (PR-13)
+//!
+//! `splice` reads the alias out of the marker and hands it to
+//! [`Viewer::render_predicate`] as *text*. Nothing in that chain knows which
+//! TABLE an alias names, and the aliases genuinely collide:
+//! `repos/structural.rs::degrees` writes `FROM edges e`, while
+//! `repos/evidence.rs::provided_for_claim_as_of` writes
+//! `FROM evidence e JOIN edges ed` — `e` is `edges` in one statement and
+//! `evidence` in the other. So the `edges` fragment cannot be selected by
+//! alias; it needs its own marker:
+//!
+//! ```sql
+//! WHERE e.valid_to IS NULL /* {EDGE_VISIBILITY:e} */
+//! ```
+//!
+//! Both spellings resolve to the SAME bind index (one `$V` per statement), both
+//! are accepted by `splice`'s missing-marker assertion, and
+//! `visibility_lint.rs::every_spliced_statement_carries_the_canonical_marker_spelling`
+//! accepts either — but still rejects a `.splice(` body carrying neither.
+//! The two prefixes are disjoint strings (`/* {EDGE_VISIBILITY:` does not
+//! contain `/* {VISIBILITY:`), so the two substitution passes inside `splice`
+//! are order-independent.
 //!
 //! `sqlx::query!` cannot be spliced — the macro needs a compile-time literal of
 //! fixed arity, and the two shapes differ in bind count. The four macro read
@@ -67,12 +92,29 @@
 //!
 //! # What is deliberately NOT here yet
 //!
-//! `edge_predicate_fragment` — the `edges` variant that carries the co-ownership
-//! INTERSECTION — is still deferred, now to **PR-13**. Plan §4.3 defines it in
-//! terms of `edges.co_owner_group_id`, a column PR-13's migration creates. A
-//! fragment naming a column that does not exist is compile-time-clean and
-//! runtime-fatal, which is exactly the shape this note exists to prevent, so
-//! `edges` reads use [`Viewer::predicate_fragment`] until PR-13 widens them.
+//! Nothing on the fragment side. PR-13 landed
+//! [`Viewer::edge_predicate_fragment`] together with migration 072, which
+//! creates the `edges.co_owner_group_id` it names — the ordering this note used
+//! to enforce, because a fragment naming a column that does not exist is
+//! compile-time-clean and runtime-fatal.
+//!
+//! What remains open is *coverage*, not capability: the never-filtered `edges`
+//! traversals in `repos/graph_view.rs` (`expand_cluster_nodes`,
+//! `neighborhood_*`, `compound_neighbors`), `repos/claim.rs`'s
+//! `rag_hybrid_context.edge_count` and — the strongest of them, because it
+//! projects `e.source_id`, `e.target_id` and `e.relationship` rather than a
+//! scalar — `repos/claim.rs::semantic_graph_neighbors` still join `edges` with
+//! no predicate at all. They are open finding `F-edges-unfiltered` in
+//! `docs/tenancy/progress.json`, re-scoped there rather than left as a comment
+//! nobody owns. That list is bounded to `crates/epigraph-db`; the MCP tool
+//! layer has its own unfiltered `edges` traversals (`epigraph-mcp/src/tools/
+//! recall.rs` spends its viewer on `claims` only) and is recorded separately.
+//!
+//! PR-13 converted the reads that ALREADY carried a predicate and did not ADD
+//! one anywhere, because a never-filtered statement needs its own
+//! JOIN-vs-WHERE placement reasoning — in a `LEFT JOIN ... ON` used for
+//! suppression, adding a filter is itself the fail-open — rather than a
+//! fragment swap.
 
 use crate::errors::DbError;
 use crate::repos::GroupMembershipRepository;
@@ -87,8 +129,23 @@ use uuid::Uuid;
 /// to two different spellings of "this query is filtered".
 pub const VISIBILITY_MARKER_PREFIX: &str = "/* {VISIBILITY:";
 
+/// The `edges` spelling of the in-SQL visibility marker (PR-13).
+///
+/// `/* {EDGE_VISIBILITY:<alias>} */` splices
+/// [`Viewer::edge_predicate_fragment`] — the co-ownership INTERSECTION — rather
+/// than [`Viewer::predicate_fragment`]. It exists because the marker's alias is
+/// a text substitution, not a dispatch key: `e` names `edges` in
+/// `repos/structural.rs` and `evidence` in `repos/evidence.rs`, so which
+/// fragment a marker wants cannot be inferred from the alias. See the module
+/// docs.
+///
+/// Deliberately NOT a substring of [`VISIBILITY_MARKER_PREFIX`] and deliberately
+/// not containing it, so the two substitution passes cannot capture each
+/// other's markers.
+pub const EDGE_VISIBILITY_MARKER_PREFIX: &str = "/* {EDGE_VISIBILITY:";
+
 /// The closing half of the marker, split out so the two halves are never
-/// written as separate literals at a call site.
+/// written as separate literals at a call site. Shared by both spellings.
 const VISIBILITY_MARKER_SUFFIX: &str = "} */";
 
 /// Read authority for one principal, for one request.
@@ -374,15 +431,65 @@ impl Viewer {
     /// * **`Bypass` emits a single space, not an empty string.** The fragment is
     ///   spliced between other SQL tokens; an empty string would join them.
     ///
-    /// The `edges` variant carrying the co-ownership INTERSECTION
-    /// (`edges.co_owner_group_id`) is deferred to PR-13, which creates that
-    /// column. See the module docs.
+    /// The `edges` variant carrying the co-ownership INTERSECTION is
+    /// [`Self::edge_predicate_fragment`] (PR-13). This fragment stays the one
+    /// for every single-owner table, and is what
+    /// `/* {VISIBILITY:<alias>} */` splices.
     #[must_use]
     pub const fn predicate_fragment(&self) -> &'static str {
         match self.shape {
             ViewerShape::Scoped { .. } => {
                 " AND ({alias}.visibility = 'public' \
                    OR {alias}.owner_group_id = ANY($V::uuid[])) "
+            }
+            ViewerShape::Bypass { .. } => " ",
+        }
+    }
+
+    /// [`Self::predicate_fragment`] for `edges`, which has TWO owning groups.
+    ///
+    /// `edges.co_owner_group_id` (migration 072) is the second owner of a
+    /// cross-group edge — an edge whose endpoints are private to different
+    /// groups G and H. It is `NULL` for every single-owner edge, which is the
+    /// overwhelming majority, and the `IS NULL` disjunct short-circuits there.
+    ///
+    /// **The group clause is an INTERSECTION, not a union.** A co-owned edge is
+    /// visible only to a principal in *both* G and H:
+    ///
+    /// ```sql
+    /// AND (e.visibility = 'public'
+    ///      OR (e.owner_group_id = ANY($V::uuid[])
+    ///          AND (e.co_owner_group_id IS NULL
+    ///               OR e.co_owner_group_id = ANY($V::uuid[]))))
+    /// ```
+    ///
+    /// A union would defeat the point of the column: the edge exists precisely
+    /// so that privatizing into two groups neither loses data nor discloses to
+    /// one group an edge naming the other group's claim. Membership in G alone
+    /// must not be enough.
+    ///
+    /// The same three properties [`Self::predicate_fragment`] is pinned on hold
+    /// here and are pinned by sibling unit tests, because a guarantee that only
+    /// half the fragments carry is not a guarantee:
+    ///
+    /// * **inline**, no `epigraph_*()` call;
+    /// * **`visibility = 'public'` leads**, so it stays a syntactic match for
+    ///   the leading disjunct of migration 077's `edges_tenancy` `USING`
+    ///   clause (the clause is written out in migration 072's header, next to
+    ///   the column, so PR-17 cannot re-derive a non-matching one);
+    /// * **`Bypass` emits a single space**, not an empty string.
+    ///
+    /// `$V` appears TWICE and resolves to ONE bind index —
+    /// [`Self::render_predicate`] replaces every occurrence — so a spliced
+    /// statement still binds [`Self::group_bind`] exactly once.
+    #[must_use]
+    pub const fn edge_predicate_fragment(&self) -> &'static str {
+        match self.shape {
+            ViewerShape::Scoped { .. } => {
+                " AND ({alias}.visibility = 'public' \
+                   OR ({alias}.owner_group_id = ANY($V::uuid[]) \
+                       AND ({alias}.co_owner_group_id IS NULL \
+                            OR {alias}.co_owner_group_id = ANY($V::uuid[])))) "
             }
             ViewerShape::Bypass { .. } => " ",
         }
@@ -400,61 +507,112 @@ impl Viewer {
     /// statement already has.
     #[must_use]
     pub fn render_predicate(&self, alias: &str, bind_index: usize) -> String {
+        self.render_fragment(self.predicate_fragment(), alias, bind_index)
+    }
+
+    /// [`Self::edge_predicate_fragment`] with its placeholders filled in.
+    ///
+    /// `{alias}` becomes `alias` at all four occurrences; **both** `$V`
+    /// occurrences become the SAME `$<bind_index>`, so the statement still
+    /// binds [`Self::group_bind`] once. A `Bypass` viewer renders to `" "`.
+    #[must_use]
+    pub fn render_edge_predicate(&self, alias: &str, bind_index: usize) -> String {
+        self.render_fragment(self.edge_predicate_fragment(), alias, bind_index)
+    }
+
+    /// Shared substitution for both fragments.
+    ///
+    /// `Bypass` short-circuits to `" "` rather than running `replace` over the
+    /// bypass fragment, so a `Bypass` render can never emit a `$` — the
+    /// property `a_bypass_splice_leaves_no_bind_and_no_placeholder` asserts.
+    fn render_fragment(&self, fragment: &'static str, alias: &str, bind_index: usize) -> String {
         match self.shape {
             ViewerShape::Bypass { .. } => " ".to_string(),
-            ViewerShape::Scoped { .. } => self
-                .predicate_fragment()
+            ViewerShape::Scoped { .. } => fragment
                 .replace("{alias}", alias)
                 .replace("$V", &format!("${bind_index}")),
         }
     }
 
-    /// Replace every `/* {VISIBILITY:<alias>} */` marker in `sql` with
-    /// [`Self::render_predicate`] for that alias, at `first_bind`.
+    /// Replace every `/* {VISIBILITY:<alias>} */` and
+    /// `/* {EDGE_VISIBILITY:<alias>} */` marker in `sql` with
+    /// [`Self::render_predicate`] / [`Self::render_edge_predicate`] for that
+    /// alias, at `first_bind`.
     ///
-    /// Every marker in one statement resolves to the SAME bind index — a
-    /// statement with two CTEs over `claims` filters both and reads one `$V`.
+    /// Every marker in one statement — of EITHER spelling — resolves to the
+    /// SAME bind index. A statement with two CTEs over `claims` filters both
+    /// and reads one `$V`; a statement joining `evidence e` to `edges ed`
+    /// filters both with one `$V` too, one marker per spelling.
     ///
     /// # Panics
     ///
-    /// Panics when `sql` contains no marker at all. This is deliberate and it is
-    /// the point of the function: a read that takes a `&Viewer` and does not use
-    /// it is a fail-open that compiles, passes every "a stranger cannot read"
-    /// test (because it returns *more*, not less), and is invisible in a diff.
-    /// The input is a `&'static str` the developer wrote three lines above the
-    /// call, so the panic is a compile-time-shaped error that happens to fire at
-    /// first execution — the first test that touches the query, not a
-    /// user-facing path.
+    /// Panics when `sql` contains no marker of either spelling. This is
+    /// deliberate and it is the point of the function: a read that takes a
+    /// `&Viewer` and does not use it is a fail-open that compiles, passes every
+    /// "a stranger cannot read" test (because it returns *more*, not less), and
+    /// is invisible in a diff. The input is a `&'static str` the developer wrote
+    /// three lines above the call, so the panic is a compile-time-shaped error
+    /// that happens to fire at first execution — the first test that touches the
+    /// query, not a user-facing path.
     ///
     /// Also panics on a marker that is opened and never closed.
     #[must_use]
     pub fn splice(&self, sql: &str, first_bind: usize) -> String {
         assert!(
-            sql.contains(VISIBILITY_MARKER_PREFIX),
+            sql.contains(VISIBILITY_MARKER_PREFIX) || sql.contains(EDGE_VISIBILITY_MARKER_PREFIX),
             "Viewer::splice called on SQL with no {VISIBILITY_MARKER_PREFIX}…{VISIBILITY_MARKER_SUFFIX} \
+             or {EDGE_VISIBILITY_MARKER_PREFIX}…{VISIBILITY_MARKER_SUFFIX} \
              marker. A read that takes a Viewer and does not filter on it is a \
              fail-open. SQL was:\n{sql}"
         );
 
+        // Two passes. The edge spelling goes FIRST only for readability: the two
+        // prefixes are disjoint strings and neither rendered fragment contains
+        // either prefix, so the passes are order-independent.
+        let edges_done = self.substitute_markers(
+            sql,
+            EDGE_VISIBILITY_MARKER_PREFIX,
+            |v, alias| v.render_edge_predicate(alias, first_bind),
+            sql,
+        );
+        self.substitute_markers(
+            &edges_done,
+            VISIBILITY_MARKER_PREFIX,
+            |v, alias| v.render_predicate(alias, first_bind),
+            sql,
+        )
+    }
+
+    /// One substitution pass for one marker spelling.
+    ///
+    /// `original` is the caller's SQL, carried through solely so a panic names
+    /// the literal the developer wrote rather than a half-substituted string.
+    fn substitute_markers(
+        &self,
+        sql: &str,
+        prefix: &str,
+        render: impl Fn(&Self, &str) -> String,
+        original: &str,
+    ) -> String {
         let mut out = String::with_capacity(sql.len() + 96);
         let mut rest = sql;
-        while let Some(open) = rest.find(VISIBILITY_MARKER_PREFIX) {
+        while let Some(open) = rest.find(prefix) {
             out.push_str(&rest[..open]);
-            let after_prefix = &rest[open + VISIBILITY_MARKER_PREFIX.len()..];
+            let after_prefix = &rest[open + prefix.len()..];
             let close = after_prefix
                 .find(VISIBILITY_MARKER_SUFFIX)
                 .unwrap_or_else(|| {
                     panic!(
                         "unterminated visibility marker: expected \
-                     {VISIBILITY_MARKER_SUFFIX} after {VISIBILITY_MARKER_PREFIX} in:\n{sql}"
+                     {VISIBILITY_MARKER_SUFFIX} after {prefix} in:\n{original}"
                     )
                 });
             let alias = after_prefix[..close].trim();
             assert!(
                 !alias.is_empty(),
-                "empty alias in visibility marker in:\n{sql}"
+                "empty alias in visibility marker in:\n{original}"
             );
-            out.push_str(&self.render_predicate(alias, first_bind));
+            out.push_str(&render(self, alias));
             rest = &after_prefix[close + VISIBILITY_MARKER_SUFFIX.len()..];
         }
         out.push_str(rest);
@@ -683,6 +841,196 @@ mod tests {
             frag.matches(')').count(),
             "unbalanced parentheses: {frag}"
         );
+    }
+
+    /// The sibling of `predicate_fragment_has_exactly_two_distinct_values`, for
+    /// the same reason and with the same teeth.
+    ///
+    /// PR-13 added a second fragment. Without this test the two-value guarantee
+    /// would silently cover only half the fragments in the module — and it would
+    /// stay GREEN while doing so, which is the failure mode a ratchet exists to
+    /// prevent.
+    #[test]
+    fn edge_predicate_fragment_has_exactly_two_distinct_values() {
+        let lease = MaintenanceLease::new();
+
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(Viewer::test_scoped(Uuid::new_v4(), vec![]).edge_predicate_fragment());
+        seen.insert(
+            Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4(), Uuid::new_v4()])
+                .edge_predicate_fragment(),
+        );
+        for reason in SystemReason::ALL {
+            seen.insert(Viewer::system(&lease, *reason).edge_predicate_fragment());
+        }
+
+        assert_eq!(
+            seen.len(),
+            2,
+            "edge_predicate_fragment must return exactly two distinct strings \
+             (one per shape); got {seen:?}"
+        );
+    }
+
+    /// The sibling of `scoped_fragment_is_inline_ordered_and_single_bind`.
+    ///
+    /// Same three properties, plus the one that is specific to this fragment:
+    /// the group clause is an INTERSECTION (`AND`), not a union. A union would
+    /// make the co-ownership column decorative — membership in G alone would
+    /// show an edge naming H's private claim.
+    #[test]
+    fn scoped_edge_fragment_is_inline_ordered_and_an_intersection() {
+        let frag =
+            Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]).edge_predicate_fragment();
+
+        assert!(
+            !frag.contains("epigraph_"),
+            "the Scoped edge fragment must be written inline: {frag}"
+        );
+
+        // Four alias-qualified column references: visibility, owner_group_id,
+        // and co_owner_group_id twice.
+        assert_eq!(
+            frag.matches("{alias}").count(),
+            4,
+            "every column reference must be alias-qualified: {frag}"
+        );
+
+        // ONE bind index, TWO occurrences. `render_predicate`'s `replace`
+        // rewrites every `$V`, so a spliced statement still binds the group
+        // array once — asserted end-to-end in
+        // `an_edge_marker_binds_one_index_at_both_co_owner_occurrences`.
+        assert_eq!(
+            frag.matches("$V").count(),
+            2,
+            "the edge fragment reads the viewer's groups twice, at one bind: {frag}"
+        );
+
+        // ORDERING, as in the plain fragment: `visibility = 'public'` leads.
+        let public_at = frag
+            .find("visibility = 'public'")
+            .expect("the public disjunct must be present verbatim");
+        let owner_at = frag
+            .find("owner_group_id")
+            .expect("the group disjunct must be present");
+        assert!(
+            public_at < owner_at,
+            "`visibility = 'public'` must come first: {frag}"
+        );
+
+        // THE INTERSECTION. `owner_group_id = ANY(...)` must be joined to the
+        // co-owner clause by AND, not OR. Written as a positional assertion
+        // rather than a substring match on a hand-copied clause, so a
+        // reformatting of the fragment does not make it vacuous.
+        let co_at = frag
+            .find("co_owner_group_id")
+            .expect("the co-owner clause must be present");
+        let between = &frag[owner_at..co_at];
+        assert!(
+            between.contains(" AND "),
+            "the co-owner clause must INTERSECT the owner clause, not union \
+             with it — a union makes co-ownership decorative: {frag}"
+        );
+        assert!(
+            !between.contains(" OR "),
+            "the co-owner clause must not be a disjunct of the owner clause: {frag}"
+        );
+
+        // NULL is the single-owner case and must short-circuit the whole
+        // co-owner test.
+        assert!(
+            frag.contains("co_owner_group_id IS NULL"),
+            "a single-owner edge (co_owner IS NULL) must remain visible to the \
+             owning group: {frag}"
+        );
+
+        assert!(frag.starts_with(" AND ("), "fragment shape changed: {frag}");
+        assert_eq!(
+            frag.matches('(').count(),
+            frag.matches(')').count(),
+            "unbalanced parentheses: {frag}"
+        );
+    }
+
+    /// The two fragments are not the same string, and neither is a `Bypass`
+    /// fragment. Cheap, and it catches a copy-paste that would silently drop
+    /// the co-ownership conjunct from every edge read.
+    #[test]
+    fn the_edge_fragment_is_not_the_plain_fragment() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        assert_ne!(v.predicate_fragment(), v.edge_predicate_fragment());
+        assert!(!v.predicate_fragment().contains("co_owner_group_id"));
+
+        // The two shapes still agree on Bypass: one space, both fragments.
+        let lease = MaintenanceLease::new();
+        let b = Viewer::system(&lease, SystemReason::DedupSweep);
+        assert_eq!(b.predicate_fragment(), " ");
+        assert_eq!(b.edge_predicate_fragment(), " ");
+    }
+
+    #[test]
+    fn an_edge_marker_binds_one_index_at_both_co_owner_occurrences() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        let sql = "SELECT 1 FROM edges e WHERE e.valid_to IS NULL \
+                   /* {EDGE_VISIBILITY:e} */";
+        let out = v.splice(sql, 3);
+
+        assert_eq!(
+            out.matches("$3").count(),
+            2,
+            "both group reads resolve to the caller's single bind: {out}"
+        );
+        assert_eq!(out.matches("e.co_owner_group_id").count(), 2);
+        assert!(
+            !out.contains(EDGE_VISIBILITY_MARKER_PREFIX),
+            "marker survived"
+        );
+        assert!(!out.contains("{alias}"), "alias left unsubstituted: {out}");
+    }
+
+    /// `repos/evidence.rs::provided_for_claim_as_of`'s shape: `e` is `evidence`
+    /// and `ed` is `edges`, in ONE statement. This is the collision that makes a
+    /// second marker spelling necessary rather than merely tidy — an
+    /// alias-keyed dispatch would have to give both aliases the same fragment.
+    #[test]
+    fn both_marker_spellings_coexist_in_one_statement_at_one_bind() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        let sql = "SELECT 1 FROM evidence e JOIN edges ed ON ed.target_id = e.id \
+                   WHERE true /* {VISIBILITY:e} */ /* {EDGE_VISIBILITY:ed} */";
+        let out = v.splice(sql, 5);
+
+        // evidence took the plain fragment; edges took the co-ownership one.
+        assert!(
+            !out.contains("e.co_owner_group_id"),
+            "the plain fragment must not name a column `evidence` does not have: {out}"
+        );
+        assert_eq!(out.matches("ed.co_owner_group_id").count(), 2);
+        // One bind index across both spellings: 1 (evidence) + 2 (edges).
+        assert_eq!(out.matches("$5").count(), 3, "{out}");
+        assert!(!out.contains(VISIBILITY_MARKER_PREFIX), "{out}");
+        assert!(!out.contains(EDGE_VISIBILITY_MARKER_PREFIX), "{out}");
+    }
+
+    /// The missing-marker panic must still fire for a statement carrying
+    /// neither spelling — widening the assertion to accept the edge marker must
+    /// not have widened it to accept nothing.
+    #[test]
+    #[should_panic(expected = "no")]
+    fn splicing_a_literal_with_neither_spelling_still_panics() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![]);
+        let _ = v.splice("SELECT * FROM edges WHERE valid_to IS NULL", 1);
+    }
+
+    #[test]
+    fn a_bypass_edge_splice_leaves_no_bind_and_no_placeholder() {
+        let lease = MaintenanceLease::new();
+        let v = Viewer::system(&lease, SystemReason::SchemaContractTest);
+        let sql = "SELECT 1 FROM edges e WHERE true /* {EDGE_VISIBILITY:e} */ AND true";
+        let out = v.splice(sql, 4);
+
+        assert!(!out.contains('$'), "a bypass splice binds nothing: {out}");
+        assert!(!out.contains("co_owner_group_id"), "{out}");
+        assert!(!out.contains(EDGE_VISIBILITY_MARKER_PREFIX), "{out}");
     }
 
     #[test]

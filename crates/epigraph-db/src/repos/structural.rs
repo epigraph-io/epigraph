@@ -80,19 +80,27 @@
 //! [`degrees`]: StructuralRepository::degrees
 //! [`clustering_coefficients`]: StructuralRepository::clustering_coefficients
 //!
-//! # Recorded residual: `edges`
+//! # Recorded residual: `edges` — the co-ownership half is closed
 //!
-//! [`edge_counts`], [`degrees`] and [`clustering_coefficients`] filter `edges`
-//! with the plain [`Viewer::predicate_fragment`]. That is the only fragment that
-//! exists: the co-ownership INTERSECTION variant (`edge_predicate_fragment`,
-//! naming `edges.co_owner_group_id`) is deferred to **PR-13**, which creates the
-//! column. An edge whose two endpoints belong to different groups is therefore
-//! still decided by the edge row's own `owner_group_id` alone — open finding
-//! `F-edges-unfiltered` in `docs/tenancy/progress.json`, owned by PR-13, not by
-//! PR-08.
+//! [`edge_counts`], [`degrees`] and [`clustering_coefficients`] now filter
+//! `edges` with [`Viewer::edge_predicate_fragment`], through the
+//! `/* {EDGE_VISIBILITY:<alias>} */` spelling (PR-13). An edge whose two
+//! endpoints belong to different groups G and H is therefore visible only to a
+//! principal in BOTH, rather than to anyone in the single group the edge row's
+//! `owner_group_id` happened to name.
+//!
+//! What is NOT fixed here is `F-edge-count-double-counts`: [`edge_counts`]
+//! joins `ownership` on `(e.source_id = o.node_id OR e.target_id = o.node_id)`,
+//! so an edge whose two endpoints are both owned by `owner_id` is counted
+//! twice, and `maybe_add_noise` assumes a Laplace sensitivity of 1. PR-08
+//! declined it because fixing it rewrites the acceptance numbers in
+//! `structural_features_authz.rs`; PR-13 declines it for the same reason plus
+//! one more — PR-22's migration 084 retires `ownership`, so a rewrite of this
+//! join now is work that gets thrown away. Still open in
+//! `docs/tenancy/progress.json`, re-assigned there.
 //!
 //! [`edge_counts`]: StructuralRepository::edge_counts
-//! [`Viewer::predicate_fragment`]: crate::visibility::Viewer::predicate_fragment
+//! [`Viewer::edge_predicate_fragment`]: crate::visibility::Viewer::edge_predicate_fragment
 //!
 //! # No write path
 //!
@@ -224,11 +232,10 @@ impl StructuralRepository {
     ///
     /// One consequence for the route layer: the Laplace sensitivity of this
     /// field is 2, not 1, because adding one both-endpoints-owned edge changes
-    /// the count by two. `maybe_add_noise` assumes sensitivity 1. Recorded as
-    /// open finding `F-edge-count-double-counts`, alongside `F-edges-unfiltered`
-    /// for PR-13, which is already rewriting this statement.
-    ///
-    /// See the module docs for the `edges` co-ownership residual (PR-13).
+    /// the count by two. `maybe_add_noise` assumes sensitivity 1. Still open as
+    /// `F-edge-count-double-counts`. PR-13 rewrote this statement's `edges`
+    /// PREDICATE and deliberately not its `ownership` JOIN — see the module docs
+    /// for why (the acceptance numbers, and PR-22 retiring `ownership`).
     ///
     /// # Errors
     /// Returns [`DbError`] if the query fails.
@@ -250,7 +257,7 @@ impl StructuralRepository {
             JOIN ownership o ON (e.source_id = o.node_id OR e.target_id = o.node_id)
             WHERE o.owner_id = $1
               AND e.relationship = ANY($2)
-              /* {VISIBILITY:e} */
+              /* {EDGE_VISIBILITY:e} */
               AND (
                    (o.node_type = 'claim'
                     AND EXISTS (SELECT 1 FROM claims vc
@@ -305,7 +312,7 @@ impl StructuralRepository {
                 SELECT o.node_id,
                        (SELECT COUNT(*) FROM edges e
                          WHERE (e.source_id = o.node_id OR e.target_id = o.node_id)
-                           /* {VISIBILITY:e} */) as deg
+                           /* {EDGE_VISIBILITY:e} */) as deg
                 FROM ownership o
                 WHERE o.owner_id = $1
                   AND (
@@ -523,7 +530,7 @@ impl StructuralRepository {
                 SELECT o.node_id, COUNT(*) as deg
                 FROM owned_nodes o
                 JOIN edges e ON (e.source_id = o.node_id OR e.target_id = o.node_id)
-                             /* {VISIBILITY:e} */
+                             /* {EDGE_VISIBILITY:e} */
                 GROUP BY o.node_id
                 HAVING COUNT(*) >= 2
             ),
@@ -532,17 +539,17 @@ impl StructuralRepository {
                        COUNT(*) as tri_count
                 FROM node_degrees nd
                 JOIN edges e1 ON (e1.source_id = nd.node_id OR e1.target_id = nd.node_id)
-                              /* {VISIBILITY:e1} */
+                              /* {EDGE_VISIBILITY:e1} */
                 JOIN edges e2 ON (e2.source_id = nd.node_id OR e2.target_id = nd.node_id)
                              AND e2.id > e1.id
-                              /* {VISIBILITY:e2} */
+                              /* {EDGE_VISIBILITY:e2} */
                 WHERE EXISTS (
                     SELECT 1 FROM edges e3
                     WHERE ((e3.source_id = CASE WHEN e1.source_id = nd.node_id THEN e1.target_id ELSE e1.source_id END
                        AND e3.target_id = CASE WHEN e2.source_id = nd.node_id THEN e2.target_id ELSE e2.source_id END)
                        OR (e3.source_id = CASE WHEN e2.source_id = nd.node_id THEN e2.target_id ELSE e2.source_id END
                        AND e3.target_id = CASE WHEN e1.source_id = nd.node_id THEN e1.target_id ELSE e1.source_id END))
-                       /* {VISIBILITY:e3} */
+                       /* {EDGE_VISIBILITY:e3} */
                 )
                 GROUP BY nd.node_id, nd.deg
             )

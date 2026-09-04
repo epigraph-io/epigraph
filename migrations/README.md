@@ -80,8 +80,8 @@ Current reservation:
   | **069** | PR-05 | `entity_types.tenancy_tier` + `tenancy_exempt` registry |
   | **070** | PR-12 | write-side stamping triggers (statement-level, transition form) — drafted PR-12; **validated on a throwaway DB only, NOT applied to any deployed database** (plan §9.2 puts that at week 11c) |
   | **071** | PR-12 | `ownership` compat shim — drafted PR-12; **validated on a throwaway DB only, NOT applied to any deployed database** |
-  | **072** | PR-13 | `edges.co_owner_group_id` |
-  | **073** | PR-13 | edge co-owner index (`-- no-transaction`) |
+  | **072** | PR-13 | `edges.co_owner_group_id` — column + FK + shape CHECK (both `NOT VALID`) and the `CREATE OR REPLACE` of 070's `epigraph_edges_tenancy` / `epigraph_propagate_tenancy`. **Drafted PR-13; validated on a throwaway DB only, NOT applied to any deployed database.** File: `072_edge_co_ownership.sql` |
+  | **073** | PR-13 | edge co-owner index (`-- no-transaction`, one `CREATE INDEX CONCURRENTLY`). File: `073_idx_edges_co_owner.sql`. NOT the `edges_tenancy` RLS policy — the plan's PR-13 *Files* line says "pre-staged for 073" and means **077**; the clause itself is written out in 072's header. **Drafted PR-13; validated on a throwaway DB only, NOT applied to any deployed database.** |
   | **074** | PR-16 | tenancy REQUIRED: `DROP DEFAULT`, require-tenancy trigger, no-widening trigger |
   | **075** | PR-16 | validate tenancy constraints — `claims` only |
   | **076** | PR-16 | validate tenancy constraints — remaining tier-A tables |

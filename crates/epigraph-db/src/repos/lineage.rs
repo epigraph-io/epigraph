@@ -282,7 +282,7 @@ impl LineageRepository {
                 JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
                 WHERE l.depth < $2
                   AND NOT c.id = ANY(l.path)
-                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
+                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             )
             SELECT DISTINCT ON (id)
                 id,
@@ -325,7 +325,7 @@ impl LineageRepository {
               AND target_type = 'claim'
               AND source_id = ANY($1)
               AND target_id = ANY($1)
-              /* {VISIBILITY:edges} */
+              /* {EDGE_VISIBILITY:edges} */
             "#,
             2,
         );
@@ -536,7 +536,7 @@ impl LineageRepository {
                 JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
                 WHERE NOT l.has_cycle
                   AND array_length(l.path, 1) < 1000
-                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
+                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             )
             SELECT bool_or(has_cycle) as has_cycle FROM lineage
             "#,
@@ -597,7 +597,7 @@ impl LineageRepository {
                 JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
                 WHERE NOT c.id = ANY(l.path)
                   AND l.depth < 1000
-                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
+                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             )
             SELECT MAX(depth) as max_depth FROM lineage
             "#,
@@ -663,7 +663,7 @@ impl LineageRepository {
                 JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
                 WHERE l.depth < $2
                   AND NOT c.id = ANY(l.path)
-                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
+                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             )
             SELECT DISTINCT ON (id) id, depth
             FROM lineage
@@ -764,7 +764,7 @@ impl LineageRepository {
                 JOIN descendants d ON e.source_id = d.id AND e.source_type = 'claim'
                 WHERE d.depth < $2
                   AND NOT c.id = ANY(d.path)
-                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
+                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             )
             SELECT DISTINCT ON (id)
                 id,
@@ -807,7 +807,7 @@ impl LineageRepository {
               AND target_type = 'claim'
               AND source_id = ANY($1)
               AND target_id = ANY($1)
-              /* {VISIBILITY:edges} */
+              /* {EDGE_VISIBILITY:edges} */
             "#,
             2,
         );
@@ -999,7 +999,7 @@ impl LineageRepository {
                 JOIN descendants d ON e.source_id = d.id AND e.source_type = 'claim'
                 WHERE d.depth < $2
                   AND NOT c.id = ANY(d.path)
-                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
+                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             )
             SELECT DISTINCT ON (id) id, depth
             FROM descendants
@@ -1081,7 +1081,7 @@ impl LineageRepository {
                 JOIN ancestors_a a ON e.target_id = a.id AND e.target_type = 'claim'
                 WHERE a.depth < $3
                   AND NOT c.id = ANY(a.path)
-                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
+                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             ),
             ancestors_b AS (
                 -- Ancestor set for claim B
@@ -1097,7 +1097,7 @@ impl LineageRepository {
                 JOIN ancestors_b b ON e.target_id = b.id AND e.target_type = 'claim'
                 WHERE b.depth < $3
                   AND NOT c.id = ANY(b.path)
-                  /* {VISIBILITY:c} */ /* {VISIBILITY:e} */
+                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             )
             SELECT
                 a.id AS ancestor_id,
