@@ -46,7 +46,6 @@ async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) 
             max_truth: Some(1.0),
             limit: Some(50),
         },
-        None,
     )
     .await
     .expect("query_claims");

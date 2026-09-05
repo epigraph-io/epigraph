@@ -128,9 +128,13 @@ use uuid::Uuid;
 /// Moved here from `crate::access_control` by PR-08 (plan §4.8: "the constant
 /// survives"), because after the SQL moved into this module
 /// [`StructuralRepository::edge_counts`] is its only consumer.
-/// `crate::access_control` re-exports it, so
-/// `epigraph_db::access_control::COARSE_EDGE_TYPES` and the
-/// `epigraph_api::access_control` shim keep resolving.
+///
+/// PR-08 left three re-export hops behind so the old paths kept resolving, and
+/// registered the cost as `F-coarse-edge-types-reexport-shim` on the grounds
+/// that `access_control.rs` was annotated for deletion in PR-14 and the unwind
+/// belonged in one place. **PR-14 deleted the module and all three hops.** This
+/// declaration and `epigraph_db::COARSE_EDGE_TYPES` (re-exported from
+/// `repos::mod`) are now the only ways to name it.
 pub const COARSE_EDGE_TYPES: &[&str] = &[
     "SUPPORTS",
     "CONTRADICTS",
@@ -675,14 +679,12 @@ mod tests {
         }
     }
 
-    /// The re-export in `crate::access_control` must keep naming this constant,
-    /// or `epigraph_api::access_control::COARSE_EDGE_TYPES` breaks silently at
-    /// the next edit.
-    #[test]
-    fn access_control_reexport_is_the_same_constant() {
-        assert!(std::ptr::eq(
-            COARSE_EDGE_TYPES,
-            crate::access_control::COARSE_EDGE_TYPES
-        ));
-    }
+    // A third test lived here until PR-14: `access_control_reexport_is_the_same
+    // _constant`, a pointer-identity assertion that `crate::access_control`'s
+    // re-export still named THIS constant. PR-08 moved the constant here and
+    // left that re-export hop in place because the file map annotated
+    // `access_control.rs` as deleted-in-PR-14 and the unwind belonged in one
+    // place (`progress.json::F-coarse-edge-types-reexport-shim`). PR-14 deleted
+    // the module, so the hop and its guard are both gone; the two tests above
+    // are the ones that were ever about the constant's CONTENT.
 }

@@ -50,16 +50,19 @@
 //!
 //! All migrations are in `/migrations/` and should be run with `sqlx migrate run`.
 
-pub mod access_control;
 pub mod errors;
 pub mod pool;
 pub mod repos;
 pub mod visibility;
 
 // Re-export primary types
-pub use access_control::{
-    batch_check_content_access, check_content_access, ContentAccess, COARSE_EDGE_TYPES,
-};
+//
+// `access_control` is gone (PR-14). It defined `check_content_access` /
+// `batch_check_content_access` / `ContentAccess`, the post-fetch pass that
+// blanked a row's content AFTER a viewer-filtered read had already returned
+// it, and it re-exported `COARSE_EDGE_TYPES` from `repos::structural` purely to
+// keep that module path resolving. The constant is unaffected and is exported
+// below from where PR-08 actually put it.
 pub use errors::DbError;
 pub use pool::{
     create_pool, create_pool_from_options, create_pool_with_options, MaintenanceConn, ScopedConn,
@@ -77,27 +80,27 @@ pub use repos::{
     CounterfactualRepository, CounterfactualRow, DedupRepair, DivergenceRepository,
     EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository, EntityRepository, EntityRow,
     EntityTypeEntry, EntityTypeRepository, EpistemicEdgePairRow, EventRepository, EventRow,
-    EvidenceAtTimeRow, EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceRepository,
-    EvidenceSearchResult, EvolveStepResult, ExperimentRepository, ExperimentResultRepository,
-    ExperimentResultRow, ExperimentRow, FactorRepository, FrameClaimBeliefHit, FrameRepository,
-    GapAnalysisResult, GapChallengeRow, GapRecord, GapRepository, GraphExpansionHit,
-    GraphViewRepository, GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository,
-    GroupRow, HierarchicalWorkflowRow, HybridHit, IndexCounts, KeyEpochRow, LabelQuery,
-    LearningEventRepository, LearningEventRow, LevelAndSourceType, LineageHead, LineageRepository,
-    MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow, MembershipRow, MentionRow,
-    MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
-    MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
-    NearestClaimHit, NewRecallEvent, OAuthClientRepository, OAuthClientRow, OwnershipRepository,
-    PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository,
-    PatternTemplateRow, PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository,
-    ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
-    ReasoningTraceRepository, RecallEventRepository, RecallEventRow, RefreshTokenRepository,
-    RefreshTokenRow, ResolvedStep, RevokeOutcome, ScopedBeliefRepository, SecurityEventRepository,
-    SecurityEventRow, SheafRepository, SortDirection, StructuralRepository, SweepCandidate,
-    TaskRepository, TaskRow, TenancyPrecondition, TripleRepository, TripleRow,
-    WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
-    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
-    WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceEncryptionRepository,
+    EvidenceEncryptionRow, EvidenceRepository, EvidenceSearchResult, EvolveStepResult,
+    ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
+    FactorRepository, FrameClaimBeliefHit, FrameRepository, GapAnalysisResult, GapChallengeRow,
+    GapRecord, GapRepository, GraphExpansionHit, GraphViewRepository, GroupKeyEpochRepository,
+    GroupMembershipRepository, GroupRepository, GroupRow, HierarchicalWorkflowRow, HybridHit,
+    IndexCounts, KeyEpochRow, LabelQuery, LearningEventRepository, LearningEventRow,
+    LevelAndSourceType, LineageHead, LineageRepository, MassFunctionRepository, MatchCandidateRepo,
+    MatchCandidateRow, MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength,
+    MethodFailureModes, MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult,
+    MethodSourcePaper, MethodUsageExample, NearestClaimHit, NewRecallEvent, OAuthClientRepository,
+    OAuthClientRow, OwnershipRepository, PaperRepository, PaperRow, PatchClaimDiff,
+    PatchClaimInput, PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository,
+    ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
+    ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
+    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RevokeOutcome, ScopedBeliefRepository,
+    SecurityEventRepository, SecurityEventRow, SheafRepository, SortDirection,
+    StructuralRepository, SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition,
+    TripleRepository, TripleRow, WebhookSubscriptionRepository, WebhookSubscriptionRow,
+    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
+    WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 pub use visibility::{MaintenanceLease, SystemReason, Viewer};
 

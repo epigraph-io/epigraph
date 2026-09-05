@@ -334,36 +334,28 @@ async fn forget_convention_attributes_evidence_to_caller() {
 }
 
 // ---------------------------------------------------------------------------
-// ownership.rs — 2 handlers
+// ownership.rs — 2 handlers, BOTH DELETED BY PR-14
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread")]
-async fn assign_ownership_with_claims_write_returns_403() {
-    let (addr, _shutdown) = spawn().await;
-    let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/api/v1/ownership"))
-        .bearer_auth(write_token())
-        .json(&serde_json::json!({
-            "node_id": uuid::Uuid::new_v4(),
-            "node_type": "claim",
-            "owner_id": uuid::Uuid::new_v4()
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403, "expected 403, got {}", resp.status());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn update_partition_with_claims_write_returns_403() {
-    let (addr, _shutdown) = spawn().await;
-    let node_id = uuid::Uuid::new_v4();
-    let resp = reqwest::Client::new()
-        .put(format!("http://{addr}/api/v1/ownership/{node_id}"))
-        .bearer_auth(write_token())
-        .json(&serde_json::json!({"partition_type": "private"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403, "expected 403, got {}", resp.status());
-}
+//
+// `assign_ownership_with_claims_write_returns_403` and
+// `update_partition_with_claims_write_returns_403` lived here. They minted a
+// `claims:write`-only token, called `POST /api/v1/ownership` and
+// `PUT /api/v1/ownership/:node_id`, and required 403 — locking those two gates
+// against an accidental downgrade to `claims:write`.
+//
+// PR-14 deleted both routes (and their MCP twins), so the requests now return
+// 404 and the assertions fail for a reason that has nothing to do with scopes.
+// There is no way to retarget them: the property is "THIS endpoint demands
+// claims:admin", and the endpoint is gone.
+//
+// The concern they encoded is not dropped, it is resolved more strongly than a
+// 403 ever expressed it. PR-12 recorded a live asymmetry — MCP gated
+// `assign_ownership` at `claims:write` while the HTTP route with the identical
+// declassification power demanded `claims:admin`, so the cheaper transport
+// reached the same capability. Deleting both surfaces closes that asymmetry at
+// the source rather than by levelling two scope entries, and
+// `epigraph-mcp/src/scope_map.rs` lost all three ownership entries in the same
+// commit. A capability that does not exist cannot be reached with the wrong
+// scope.
+//
+// Every other handler promoted by Bundle F still has its case below/above.

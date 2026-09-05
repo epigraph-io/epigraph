@@ -27,8 +27,13 @@
 //!   **infallible**: a [`PolicyError`] from an implementation is mapped to
 //!   `Decision::Deny`, once, in this file. Call sites cannot get the
 //!   `Err(_) => allow` mapping wrong because they never see the `Err`. This is
-//!   the D1 defect (`access_control.rs`'s `None => ContentAccess::Full`) closed
-//!   at the type level.
+//!   the D1 defect closed at the type level. The archetype it is named for was
+//!   `epigraph-db/src/access_control.rs`'s `None => ContentAccess::Full` — no
+//!   ownership row, therefore public — reached by a `.unwrap_or(None)` that
+//!   laundered every query error into that same value. **PR-14 deleted that
+//!   file.** The citation stays in the past tense deliberately: D1 is worded
+//!   the way it is BECAUSE of that defect, and dropping the example would leave
+//!   the rule without its evidence.
 //! * [`ResourceRef`] carries `Option` owners and the kernel gate denies when
 //!   both are absent. Nothing is authorized by absence.
 //! * The kernel's *type-level floor* is [`DenyAllPolicyGate`], not an
@@ -329,9 +334,10 @@ pub trait PolicyGate: Send + Sync + 'static {
     ///
     /// This is the whole reason `check` is not called directly. A gate that
     /// cannot decide has not decided "yes"; mapping `Err(_)` to allow is the
-    /// exact defect plan §0.2's D1 names (`access_control.rs`'s
-    /// `None => ContentAccess::Full`, `.unwrap_or(None)`). Doing the mapping
-    /// once, here, means no call site can do it differently.
+    /// exact defect plan §0.2's D1 names — historically
+    /// `access_control.rs`'s `None => ContentAccess::Full` reached through
+    /// `.unwrap_or(None)`, a file PR-14 deleted. Doing the mapping once, here,
+    /// means no call site can do it differently.
     async fn authorize(
         &self,
         principal: &Principal,

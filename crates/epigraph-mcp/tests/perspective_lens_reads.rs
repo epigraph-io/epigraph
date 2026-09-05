@@ -290,7 +290,6 @@ async fn get_claim_lens_diverges_by_perspective_and_is_absent_without_lens(pool:
             frame_id: None,
             perspective_id: None,
         },
-        None,
     )
     .await
     .expect("get_claim plain");
@@ -309,7 +308,6 @@ async fn get_claim_lens_diverges_by_perspective_and_is_absent_without_lens(pool:
             frame_id: Some(fx.frame_id.to_string()),
             perspective_id: Some(fx.skeptic_id.to_string()),
         },
-        None,
     )
     .await
     .expect("get_claim skeptic lens");
@@ -334,7 +332,6 @@ async fn get_claim_lens_diverges_by_perspective_and_is_absent_without_lens(pool:
             frame_id: Some(fx.frame_id.to_string()),
             perspective_id: Some(fx.believer_id.to_string()),
         },
-        None,
     )
     .await
     .expect("get_claim believer lens");
@@ -576,7 +573,6 @@ async fn lens_validation_rejects_only_one_of_and_unknown_ids(pool: PgPool) {
             frame_id: Some(fx.frame_id.to_string()),
             perspective_id: None,
         },
-        None,
     )
     .await;
     assert!(only_frame.is_err(), "only frame_id must be rejected");
@@ -590,7 +586,6 @@ async fn lens_validation_rejects_only_one_of_and_unknown_ids(pool: PgPool) {
             frame_id: None,
             perspective_id: Some(fx.skeptic_id.to_string()),
         },
-        None,
     )
     .await;
     assert!(only_persp.is_err(), "only perspective_id must be rejected");
@@ -605,7 +600,6 @@ async fn lens_validation_rejects_only_one_of_and_unknown_ids(pool: PgPool) {
             frame_id: Some(fx.frame_id.to_string()),
             perspective_id: Some(Uuid::new_v4().to_string()),
         },
-        None,
     )
     .await;
     assert!(
@@ -622,7 +616,6 @@ async fn lens_validation_rejects_only_one_of_and_unknown_ids(pool: PgPool) {
             frame_id: Some(Uuid::new_v4().to_string()),
             perspective_id: Some(fx.skeptic_id.to_string()),
         },
-        None,
     )
     .await;
     assert!(unknown_frame.is_err(), "unknown frame_id must be rejected");

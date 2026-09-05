@@ -92,56 +92,104 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Sites that still read claim content inline in the route layer, as measured
-/// on **2026-09-02**, under the corrected measurement described in the module
-/// docs (balanced-paren argument region + `let`-binding resolution + the
-/// `tier_a` column set).
+/// Counted `tier_a` reads that are **`#[cfg(test)]` read-backs**, not handler
+/// reads. As measured on **2026-09-04**.
 ///
-/// This list is a debt register, not a permission slip. Every entry is a
-/// handler whose `tier_a` read is still unfiltered by a `Viewer`, and each is
-/// latent rather than live only because migration 062 defaults `visibility` to
-/// `'public'` and nothing transcribes ownership into the tenancy columns until
-/// **PR-12**.
+/// # This register replaces `COMPENSATED_INLINE_READS`, and PR-14 is why
 ///
-/// # The compensating control does not exist for most of these
+/// The old constant was `[("claims.rs", 3), ("edges.rs", 4)]`, justified as
+/// "inline `tier_a` reads whose second line of defence is the per-row
+/// `check_content_access` pass". **PR-14 deleted `check_content_access`**, so
+/// that justification could not survive this commit in any form: there is no
+/// compensating control left to name.
 ///
-/// An earlier revision of this comment said "the compensating control is the
-/// per-row `check_content_access` pass, which PR-14 deletes — that is the
-/// deadline". That was asserted, never checked, and it is false for most of the
-/// register. `grep -c check_content_access` over `src/routes/` returns a
-/// non-zero count for **`claims.rs` and `edges.rs` only**; `clusters.rs`,
-/// `conflicts.rs`, `cross_source.rs`, `embeddings.rs`, `hypothesis.rs`,
-/// `policies.rs`, `political.rs`, `search.rs` and `workflows.rs` each return 0.
-/// (`cross_source.rs` belongs in THIS list and not in
-/// [`UNCOMPENSATED_INLINE_READS`] below: the two registers measure different
-/// things, and PR-09 briefly deleted it from both. Its
-/// `check_content_access` count was 0 before PR-09 and is 0 after.)
+/// The previous revision of this doc was explicit that it had never actually
+/// checked the claim it was making — *"this comment asserts only that the file
+/// CONTAINS `check_content_access` calls — NOT that the call sits on the return
+/// path of the specific counted statement. Establishing that per site is
+/// PR-14's job, and claiming it here without checking is how the previous
+/// version of this paragraph went wrong."* That determination is now done, and
+/// it found something better than expected on both files.
 ///
-/// So the register is split. For [`UNCOMPENSATED_INLINE_READS`] there is no
-/// second line of defence at all today, and the deadline is **PR-12** (when
-/// ownership lands in the columns), not PR-14.
+/// **`edges.rs` 4 → 0.** All four statements moved into the repo layer, where
+/// they carry a marker and are spliced with a `Viewer`:
+/// `get_evidence`'s evidence projection and `evidence_by_relationship`'s
+/// edge⋈evidence join became `EvidenceRepository::detail_by_id` and
+/// `::by_relationship_for_claim`; `claim_provenance`'s `SELECT id, content,
+/// trace_id FROM claims` became `ClaimRepository::get_by_id`; and
+/// `build_evidence_chains`'s evidence lookup now reuses `detail_by_id`. Three
+/// of those four were **genuinely uncompensated in the old sense too** — their
+/// rows came from raw viewerless SQL and `check_content_access` was the only
+/// control on them — which is why deleting the pass without moving them would
+/// have shipped a disclosure rather than a cleanup. The file leaves the
+/// register entirely rather than moving between halves.
 ///
-/// Even for the two compensated files this comment asserts only that the file
-/// contains `check_content_access` calls — NOT that the call sits on the return
-/// path of the specific counted statement. Establishing that per site is PR-14's
-/// job, and claiming it here without checking is how the previous version of
-/// this paragraph went wrong.
+/// Read "4 → 0" as **all four COUNTED statements**, which is the only thing
+/// this lint measures. `measure_inline_claim_content_reads` matches the
+/// `tier_a` *claim-content* column set and nothing else, so three inline reads
+/// survive in `edges.rs::claim_provenance` that it has never counted and still
+/// does not: two `SELECT target_id FROM edges …` projections (edge columns) and
+/// one `SELECT id, reasoning_type, confidence FROM reasoning_traces WHERE id =
+/// $1`. `reasoning_traces` IS a tier_a table (062 lists it; 070 carries it), and
+/// `ReasoningTraceRepository::get_by_id(pool, viewer, id)` is the filtered form —
+/// but it returns a parsed `Methodology` enum where the handler formats a raw
+/// `reasoning_type` string, so swapping it changes a response field and can turn
+/// an unrecognised value into a 500. That is a behaviour change, not a move, and
+/// PR-14 does not make it: the read is pre-existing, the deleted pass never
+/// covered it, and it is filed as `D-PR16-claim-provenance-trace-read-unfiltered`
+/// in `docs/tenancy/progress.json`. Stated here because a security ratchet whose
+/// prose over-claims its own measurement is how the previous revision of this
+/// file went wrong.
 ///
-/// PR-07 removed these files from the list by moving their statements into the
-/// repo layer: `belief.rs` (2), `search.rs` (2 of 3), `graph_query_utils.rs` (2),
-/// `assess.rs` (1), `graph_neighborhood.rs`, `graph.rs`, `rag.rs`, and — in the
-/// follow-up — `voids.rs` (3), `gaps.rs` (1), `experiments.rs` (2),
-/// `computation.rs` (1) and one of `hypothesis.rs`'s.
+/// **`claims.rs` 3 → 3, but they are not what the register said they were.**
+/// The three counted statements are at `claims.rs` lines 2193, 2241 and 2668,
+/// and every one of them is inside `#[cfg(all(test, feature = "db"))] mod
+/// db_tests` (which spans 2025..EOF). They are `SELECT properties FROM claims
+/// WHERE id = $1` read-backs that assert a write landed. They were never
+/// handler reads, so they were never "compensated" by a runtime pass — and they
+/// are not a disclosure surface at all. `measure_inline_claim_content_reads`
+/// does not exclude `#[cfg(test)]` (unlike
+/// `epigraph-mcp/tests/no_inline_sql_in_tools.rs`, which counts test and
+/// production sites in separate columns), so they must stay registered
+/// SOMEWHERE or the exact-set assertion fails on a correct tree. This constant
+/// is that somewhere, named for what they actually are.
 ///
-/// The count is asserted exactly, so this ratchet is monotone: adding a new
+/// The count is asserted exactly, so this ratchet stays monotone: adding a new
 /// inline `tier_a` read fails the build, and removing one fails it too until
 /// the number here is lowered. Do not raise it.
-const COMPENSATED_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 3), ("edges.rs", 4)];
+const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 3)];
 
-/// The register entries with NO `check_content_access` anywhere in the file.
+/// The register entries with **no filter and, since PR-14, no post-pass
+/// anywhere in the tree**.
 ///
-/// Deadline **PR-12**, not PR-14: these become live disclosure the moment
-/// ownership is transcribed into the tenancy columns, with nothing behind them.
+/// Thirteen handler sites across eight files read `tier_a` claim content inline
+/// in the route layer with no `Viewer` spliced into the statement. Before PR-14
+/// the register carried the sentence *"Deadline **PR-12**, not PR-14: these
+/// become live disclosure the moment ownership is transcribed into the tenancy
+/// columns, with nothing behind them."* That prediction is not stale — it has
+/// come true, and PR-14 is the commit that removes any ambiguity about it:
+///
+/// * PR-12 landed the transcription, so the condition the sentence named is
+///   satisfied for every row the backfill has reached.
+/// * `docs/deploy.md` now makes running `epigraph-tenancy-backfill` to
+///   completion a **prerequisite** of shipping this release, so the condition is
+///   satisfied for the rest by the time it deploys.
+/// * PR-14 deleted `check_content_access`, the pass these sites were once
+///   (wrongly — see the note on [`TEST_ONLY_INLINE_READS`]) believed to sit
+///   behind. There is now nothing behind them at all.
+///
+/// So this is a live-disclosure register, not a latent one, and the deadline it
+/// carries is **overdue since PR-12** rather than pending. PR-14 does not
+/// discharge it: the plan's *Files* line scopes this PR to deleting redaction,
+/// and converting thirteen handlers in eight unrelated files is a different
+/// change with a different blast radius. The owner is recorded on
+/// `open_findings::F-inline-claim-content-reads` in
+/// `docs/tenancy/progress.json` (proposed: PR-16, which already owns the
+/// write-side predicate for the same files).
+///
+/// This list is a debt register, not a permission slip. Every entry is a
+/// handler. Do not add to it — move the statement into
+/// `crates/epigraph-db/src/repos/`, mark it, and splice a `Viewer`.
 const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     ("clusters.rs", 2),
     ("conflicts.rs", 1),
@@ -477,7 +525,7 @@ fn diff_report(actual: &BTreeMap<String, usize>, want: &BTreeMap<String, usize>)
 #[test]
 fn no_new_inline_claim_content_reads_in_the_route_layer() {
     let actual = measure_inline_claim_content_reads();
-    let mut want = expected(COMPENSATED_INLINE_READS);
+    let mut want = expected(TEST_ONLY_INLINE_READS);
     want.extend(expected(UNCOMPENSATED_INLINE_READS));
     assert_eq!(
         actual,
@@ -493,7 +541,7 @@ fn no_new_inline_claim_content_reads_in_the_route_layer() {
          whether the word `ViewerExtractor` appears.\n\n\
          Fix: move the statement into crates/epigraph-db/src/repos/, add the \
          marker, and call `viewer.splice`. If you have genuinely removed a \
-         site, LOWER the number in COMPENSATED_INLINE_READS or \
+         site, LOWER the number in TEST_ONLY_INLINE_READS or \
          UNCOMPENSATED_INLINE_READS. Never raise it.\n",
         diff_report(&actual, &want)
     );
@@ -501,12 +549,13 @@ fn no_new_inline_claim_content_reads_in_the_route_layer() {
 
 /// The two registers must not both claim the same file.
 ///
-/// A file cannot be simultaneously compensated and uncompensated, and a stray
-/// duplicate would silently drop one of the two counts when the maps are
-/// merged — turning the ratchet's exact-count assertion into an under-count.
+/// A file cannot have its counted statements be simultaneously test-only and
+/// unfiltered-production, and a stray duplicate would silently drop one of the
+/// two counts when the maps are merged — turning the ratchet's exact-count
+/// assertion into an under-count.
 #[test]
 fn the_two_registers_are_disjoint() {
-    for (f, _) in COMPENSATED_INLINE_READS {
+    for (f, _) in TEST_ONLY_INLINE_READS {
         assert!(
             !UNCOMPENSATED_INLINE_READS.iter().any(|(g, _)| g == f),
             "{f} appears in both registers"

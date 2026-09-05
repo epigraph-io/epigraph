@@ -205,13 +205,43 @@ notable ones: `GET /claims`, `GET /claims/:id`, `GET /api/v1/claims`,
 `GET /agents`, `GET /lineage/:claim_id`, `POST /api/v1/search/semantic`,
 **`GET /api/v1/query/rag`**, **`GET /api/v1/search/evidence`**,
 `GET /api/v1/admin/stats`, `GET /api/v1/themes/:id/embeddings`,
-`GET /api/v1/ownership/:node_id`, `GET /api/v1/events`, all `/api/v1/graph/*`,
+`GET /api/v1/events`, all `/api/v1/graph/*`,
 all `/frames/*`, all `/belief*`, and every `/api/v1/perspectives*`,
 `/communities*`, `/contexts*`, `/workflows*`, `/methods*` and `/tasks*` read.
+
+`GET /api/v1/ownership/:node_id` was on that list until **PR-14 deleted the
+route**, so it is not listed above: it does not require a token, it does not
+exist. The same release removed `POST /api/v1/ownership`,
+`PUT /api/v1/ownership/:node_id` and `GET /api/v1/agents/:id/owned-nodes`, plus
+the MCP tools `assign_ownership`, `update_partition` and `get_ownership`.
+Callers of any of them now get **404, not 401**.
+
+**Those endpoints are removed, not relocated.** There is no replacement
+reclassification surface in this release. After PR-14 no HTTP route and no MCP
+tool can change an existing node's partition: tenancy is stamped at INSERT by
+migration 070's inherit trigger and by 071's write-through shim on the legacy
+`ownership` table, and nothing else writes `claims.visibility` or
+`claims.owner_group_id`. A claim created public stays public until a
+reclassification surface returns — PR-16 owns the write-side predicate, and no
+PR before it restores one. Plan accordingly if your rollout assumed you could
+demote a claim after the fact.
 
 **The RAG and evidence-search public-access guarantees are revoked.** Announce
 this; anything scraping those two endpoints anonymously stops working the
 moment this deploys.
+
+**Announce PR-14's read-path change in the same note.** A caller that used to
+receive a `200` whose claim `content` was the placeholder `"[REDACTED]"` now
+receives an absence instead: `404` on HTTP `GET /claims/:id`, a not-found error
+from MCP `get_claim`, or simple omission from a list. This is deliberate — a
+placeholder body confirms that a private claim exists at that id, and the two
+responses are now indistinguishable — but it is a breaking wire change for any
+client that pattern-matched on the placeholder string.
+
+**Deploy order for PR-14.** The read path no longer consults the legacy
+`ownership` table; the tenancy columns are the sole source of truth. Run
+`epigraph-tenancy-backfill` to completion and confirm its `verify` step reports
+zero outstanding rows **before** rolling out this release.
 
 #### One route needs more than a token
 

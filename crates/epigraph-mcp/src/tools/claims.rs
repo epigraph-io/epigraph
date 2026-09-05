@@ -12,9 +12,6 @@ use epigraph_core::{
     TruthValue,
 };
 use epigraph_crypto::ContentHasher;
-use epigraph_db::access_control::{
-    batch_check_content_access, check_content_access, ContentAccess,
-};
 use epigraph_db::PatchClaimInput;
 use epigraph_db::{ClaimRepository, EdgeRepository, EvidenceRepository, ReasoningTraceRepository};
 use uuid::Uuid;
@@ -436,7 +433,6 @@ pub async fn query_claims(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: QueryClaimsParams,
-    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min = params.min_truth.unwrap_or(0.0);
@@ -448,18 +444,11 @@ pub async fn query_claims(
         .await
         .map_err(internal_error)?;
 
-    // Redact PRIVATE content the requester cannot read (A3 §7.5). Build a
-    // per-id access map and look each claim's decision up BY ITS OWN ID rather
-    // than positionally zipping the batch result. The lookup fails closed
-    // (`unwrap_or(Redacted)`), so a future reorder — or any id the batch helper
-    // fails to return — redacts rather than leaks. This is a durable runtime
-    // guard, not a debug-only tripwire.
+    // No per-id access map. `list_by_truth_range` is spliced with `viewer`, so
+    // a claim this caller may not read is not in `claims`. The map existed to
+    // fail closed on an id the batch helper skipped — a hazard created by
+    // doing the check in a second pass keyed by id, which no longer happens.
     let ids: Vec<Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
-    let access_map: std::collections::HashMap<Uuid, ContentAccess> =
-        batch_check_content_access(&server.pool, &ids, requester)
-            .await
-            .into_iter()
-            .collect();
 
     // Populate labels via a single batch round-trip for all returned ids
     // (backlog babd5904: this handler previously hardcoded `labels: Vec::new()`
@@ -475,18 +464,12 @@ pub async fn query_claims(
         .into_iter()
         .map(|c| {
             let id = c.id.as_uuid();
-            let access = access_map
-                .get(&id)
-                .copied()
-                .unwrap_or(ContentAccess::Redacted);
-            let (content, content_hash) =
-                crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
             ClaimResponse {
                 id: id.to_string(),
-                content,
+                content: c.content.clone(),
                 truth_value: c.truth_value.value(),
                 agent_id: c.agent_id.as_uuid().to_string(),
-                content_hash,
+                content_hash: ContentHasher::to_hex(&c.content_hash),
                 created_at: c.created_at.to_rfc3339(),
                 labels: labels_map.get(&id).cloned().unwrap_or_default(),
                 is_current: true,
@@ -502,7 +485,6 @@ pub async fn get_claim(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: GetClaimParams,
-    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
     let claim_id = ClaimId::from_uuid(id);
@@ -522,9 +504,12 @@ pub async fn get_claim(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
-    let access = check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
-    let (content, content_hash) =
-        crate::tools::redaction::redact_content(access, &claim.content, &claim.content_hash);
+    // The `ok_or_else` above is now the ONLY outcome for a claim this viewer
+    // cannot read: `get_by_id_with_labels` filters, and the redaction pass that
+    // used to turn an already-fetched row into `("[REDACTED]", "")` is gone. A
+    // private claim and a nonexistent uuid therefore produce the same error.
+    let content = claim.content.clone();
+    let content_hash = ContentHasher::to_hex(&claim.content_hash);
     // Cached CDST classification ('supported' | 'contradicted' |
     // 'not_enough_info' | null). Flattened onto the standard claim response so
     // existing `ClaimResponse` consumers are unaffected.
@@ -1057,7 +1042,6 @@ pub async fn query_undecomposed_claims(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: crate::types::QueryUndecomposedClaimsParams,
-    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 1000);
     let offset = params.offset.unwrap_or(0).max(0);
@@ -1066,33 +1050,20 @@ pub async fn query_undecomposed_claims(
         .await
         .map_err(internal_error)?;
 
-    // Apply partition-aware content redaction so private/community-partitioned
-    // claims are not exposed to requesters who don't own them (parity with
-    // query_claims and get_claim — security finding: this path previously
-    // bypassed the check_content_access / batch_check_content_access layer).
-    let ids: Vec<Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
-    let access_map: std::collections::HashMap<Uuid, ContentAccess> =
-        batch_check_content_access(&server.pool, &ids, requester)
-            .await
-            .into_iter()
-            .collect();
-
+    // `list_undecomposed` is spliced with `viewer`. This path once bypassed the
+    // redaction layer entirely — a finding fixed by adding a second pass; the
+    // durable fix is that the read itself filters, so there is no second pass
+    // left to forget.
     let results: Vec<ClaimResponse> = claims
         .into_iter()
         .map(|c| {
             let id = c.id.as_uuid();
-            let access = access_map
-                .get(&id)
-                .copied()
-                .unwrap_or(ContentAccess::Redacted);
-            let (content, content_hash) =
-                crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
             ClaimResponse {
                 id: id.to_string(),
-                content,
+                content: c.content.clone(),
                 truth_value: c.truth_value.value(),
                 agent_id: c.agent_id.as_uuid().to_string(),
-                content_hash,
+                content_hash: ContentHasher::to_hex(&c.content_hash),
                 created_at: c.created_at.to_rfc3339(),
                 labels: Vec::new(),
                 is_current: true,

@@ -611,9 +611,7 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        let server_agent = self.agent_id().await?;
-        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::claims::query_claims(self, viewer, params, requester).await
+        tools::claims::query_claims(self, viewer, params).await
     }
 
     #[tool(
@@ -626,9 +624,7 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        let server_agent = self.agent_id().await?;
-        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::claims::query_undecomposed_claims(self, viewer, params, requester).await
+        tools::claims::query_undecomposed_claims(self, viewer, params).await
     }
 
     #[tool(
@@ -641,9 +637,7 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        let server_agent = self.agent_id().await?;
-        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::claims::get_claim(self, viewer, params, requester).await
+        tools::claims::get_claim(self, viewer, params).await
     }
 
     #[tool(
@@ -1040,9 +1034,7 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        let server_agent = self.agent_id().await?;
-        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::paper_queries::query_paper(self, viewer, params, requester).await
+        tools::paper_queries::query_paper(self, viewer, params).await
     }
 
     #[tool(
@@ -1055,9 +1047,7 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        let server_agent = self.agent_id().await?;
-        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::paper_queries::query_claims_by_evidence(self, viewer, params, requester).await
+        tools::paper_queries::query_claims_by_evidence(self, viewer, params).await
     }
 
     #[tool(
@@ -1070,9 +1060,7 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        let server_agent = self.agent_id().await?;
-        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::paper_queries::query_claims_by_methodology(self, viewer, params, requester).await
+        tools::paper_queries::query_claims_by_methodology(self, viewer, params).await
     }
 
     #[tool(
@@ -1085,9 +1073,7 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        let server_agent = self.agent_id().await?;
-        let requester = crate::tools::redaction::mcp_requester(auth, server_agent);
-        tools::paper_queries::query_claims_by_label(self, viewer, params, requester).await
+        tools::paper_queries::query_claims_by_label(self, viewer, params).await
     }
 
     #[tool(
@@ -1443,41 +1429,14 @@ impl EpiGraphMcpFull {
         tools::perspectives::get_perspective(self, viewer, params).await
     }
 
-    #[tool(
-        description = "Assign ownership of a graph node (claim, evidence, perspective, etc.) to an agent with a partition type (public/community/private)."
-    )]
-    async fn assign_ownership(
-        &self,
-        Parameters(params): Parameters<AssignOwnershipParams>,
-        extensions: rmcp::model::Extensions,
-    ) -> Result<CallToolResult, McpError> {
-        self.reject_if_read_only()?;
-        let auth = extensions.get::<epigraph_auth::AuthContext>();
-        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        tools::perspectives::assign_ownership(self, viewer, params).await
-    }
-
-    #[tool(description = "Get ownership info (partition, owner) for a graph node by UUID.")]
-    async fn get_ownership(
-        &self,
-        Parameters(params): Parameters<GetOwnershipParams>,
-    ) -> Result<CallToolResult, McpError> {
-        tools::perspectives::get_ownership(self, params).await
-    }
-
-    #[tool(
-        description = "Update the partition type of a node (public → private, etc.). Only changes visibility, not ownership."
-    )]
-    async fn update_partition(
-        &self,
-        Parameters(params): Parameters<UpdatePartitionParams>,
-        extensions: rmcp::model::Extensions,
-    ) -> Result<CallToolResult, McpError> {
-        self.reject_if_read_only()?;
-        let auth = extensions.get::<epigraph_auth::AuthContext>();
-        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        tools::perspectives::update_partition(self, viewer, params).await
-    }
+    // `assign_ownership`, `get_ownership` and `update_partition` were three
+    // tool-router entries here until PR-14. (Spelled without the attribute
+    // token on purpose: `tool_viewer_coverage.rs` slices this file on that
+    // literal, so writing it in a comment would inflate the tool count and
+    // trip `tools_are_line_initial_attributes`.) They were the MCP half of the
+    // legacy `ownership` ACL; the tenancy columns replaced the model, and
+    // `get_ownership` in particular answered "who owns this and how private is
+    // it" for any node to any caller, with no `Viewer` involved.
 
     // ── DS/Belief (7 tools — 4 enhanced + 3 new) ──
 
@@ -2095,5 +2054,66 @@ mod instructions_tests {
     fn instructions_reflect_mode_label() {
         assert!(EpiGraphMcpFull::server_instructions(true).contains("read-only"));
         assert!(EpiGraphMcpFull::server_instructions(false).contains("full"));
+    }
+}
+
+/// The MCP half of the write-gate wiring ratchet.
+///
+/// PR-11 installed `epigraph_authz::GroupPolicyGate` at six `AppState`
+/// constructors and both `EpiGraphMcpFull` constructors, and pinned the count —
+/// but only for the six, in
+/// `epigraph-api/src/state.rs::the_default_gate_is_installed_at_every_constructor`.
+/// The two here were asserted in prose only, in `locked_decisions.rs`'s module
+/// doc.
+///
+/// PR-14 deletes the tools that were the gate's only MCP-side callers
+/// (`assign_ownership`, `update_partition`), so `PolicyGate::authorize` has no
+/// production call site on either transport until PR-16 restores one
+/// (`D-PR16-reestablish-the-write-gate-call-site-lint`). A dormant mechanism
+/// with no lint over it is a mechanism that gets deleted as dead code, and the
+/// three call-site lints that would have objected went with the tools. This is
+/// the residual: the gate must still be CONSTRUCTED and fail-closed at both
+/// entry points when PR-16 comes to consult it.
+#[cfg(test)]
+mod policy_gate_wiring_tests {
+    /// Both `EpiGraphMcpFull` constructors install the fail-closed default.
+    ///
+    /// Counted from the source rather than from a built server because the
+    /// field is `pub(crate)` and `Arc<dyn PolicyGate>` has no equality — there
+    /// is nothing to compare two instances with. The needle is split so this
+    /// assertion is not itself a third occurrence of the thing it counts.
+    #[test]
+    fn the_default_gate_is_installed_at_both_mcp_constructors() {
+        let src = include_str!("server.rs");
+        let needle = concat!(
+            "policy_gate: Arc::new(epigraph_authz::",
+            "GroupPolicyGate::new())"
+        );
+        let installs = src.matches(needle).count();
+        assert_eq!(
+            installs, 2,
+            "expected the fail-closed default at both `policy_gate:` assignment \
+             sites — `new_with_federation` and `new_shared_with_federation`, \
+             which `new` and `new_shared` delegate to, so two assignments cover \
+             four public entry points — found {installs}. \
+             Since PR-14 the gate has no production caller here — see \
+             D-PR16-reestablish-the-write-gate-call-site-lint — so it is this \
+             test, and only this test, that stops it being removed as dead \
+             code before PR-16 revives it."
+        );
+    }
+
+    /// `with_policy_gate` is the documented injection seam and must survive the
+    /// dormant period: PR-16 needs it, and a deployment that swaps in a
+    /// stricter gate needs it now.
+    #[test]
+    fn the_injection_seam_survives() {
+        let src = include_str!("server.rs");
+        assert!(
+            src.contains("pub fn with_policy_gate("),
+            "EpiGraphMcpFull::with_policy_gate is the MCP counterpart of \
+             AppState::with_policy_gate; removing it would make the gate \
+             unswappable"
+        );
     }
 }

@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[cfg(feature = "db")]
-use crate::access_control::{check_content_access, ContentAccess};
 use crate::middleware::bearer::ViewerExtractor;
 use crate::{errors::ApiError, state::AppState};
 // set_group_context (from epigraph-privacy) lives in the epigraph-enterprise
@@ -934,17 +933,12 @@ pub async fn get_claim(
         response.group_id = Some(enc.group_id);
     }
 
-    // SECURITY (A3): derive the requester from the authenticated AuthContext
-    // (agent_id, falling back to client_id), NEVER the spoofable
-    // params.agent_id wire value. params.agent_id stays parsed-but-ignored.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    let access = check_content_access(&state.db_pool, id, requester).await;
-    if access == ContentAccess::Redacted {
-        crate::access_control::redact_claim_content(&mut response.content);
-    }
-
+    // No redaction pass. `get_by_id_conn` above already ran under `&viewer`,
+    // so reaching this line means the claim is readable; the post-pass that
+    // used to overwrite `response.content` here could only ever downgrade a row
+    // the viewer had ALREADY been allowed to fetch, and its absence-vs-blanking
+    // disagreement with the `ok_or_else` 404 four lines up is exactly the
+    // confirmation oracle PR-14 removes.
     Ok(Json(response))
 }
 
@@ -1082,17 +1076,8 @@ pub async fn list_claims(
     // Transaction auto-rolls-back on drop (read-only, no commit needed)
     drop(tx);
 
-    // SECURITY (A3): use the authenticated requester, not params.agent_id.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    for item in &mut items {
-        let access = check_content_access(&state.db_pool, item.id, requester).await;
-        if access == ContentAccess::Redacted {
-            crate::access_control::redact_claim_content(&mut item.content);
-        }
-    }
-
+    // No redaction pass: `ClaimRepository::list_conn` was already spliced with
+    // `&viewer`, so a row the caller may not read is not in `items` at all.
     Ok(Json(PaginatedResponse {
         items,
         total,

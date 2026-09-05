@@ -1880,7 +1880,6 @@ pub async fn claims_by_belief(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<BeliefFilterQuery>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<Vec<BeliefClaimRow>>, ApiError> {
     let pool = &state.db_pool;
     let min_bel = params.min_belief.unwrap_or(0.0);
@@ -1901,7 +1900,7 @@ pub async fn claims_by_belief(
     )
     .await?;
 
-    let mut result: Vec<BeliefClaimRow> = rows
+    let result: Vec<BeliefClaimRow> = rows
         .into_iter()
         .map(|hit| BeliefClaimRow {
             id: hit.id,
@@ -1913,17 +1912,8 @@ pub async fn claims_by_belief(
         })
         .collect();
 
-    // SECURITY (A3): use the authenticated requester, not params.agent_id.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    for row in &mut result {
-        let access = crate::access_control::check_content_access(pool, row.id, requester).await;
-        if access == crate::access_control::ContentAccess::Redacted {
-            crate::access_control::redact_claim_content(&mut row.content);
-        }
-    }
-
+    // No redaction pass: `list_by_belief_bounds` above is spliced with
+    // `&viewer`, so an unreadable row never reaches `result`.
     Ok(Json(result))
 }
 
@@ -1937,7 +1927,6 @@ pub async fn frame_claims_sorted(
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
     Query(params): Query<FrameClaimsQuery>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<Vec<FrameClaimBeliefRow>>, ApiError> {
     let pool = &state.db_pool;
 
@@ -1982,7 +1971,7 @@ pub async fn frame_claims_sorted(
     )
     .await?;
 
-    let mut result: Vec<FrameClaimBeliefRow> = rows
+    let result: Vec<FrameClaimBeliefRow> = rows
         .into_iter()
         .map(|hit| FrameClaimBeliefRow {
             claim_id: hit.claim_id,
@@ -1998,18 +1987,10 @@ pub async fn frame_claims_sorted(
         })
         .collect();
 
-    // SECURITY (A3): use the authenticated requester, not params.agent_id.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    for row in &mut result {
-        let access =
-            crate::access_control::check_content_access(pool, row.claim_id, requester).await;
-        if access == crate::access_control::ContentAccess::Redacted {
-            crate::access_control::redact_claim_content(&mut row.content);
-        }
-    }
-
+    // No redaction pass: the frame-claims repo read above is spliced with
+    // `&viewer`. `frame_claims_sorted` is the site PR-07 found holding a
+    // `ViewerExtractor` and never filtering on it; the filter is real now, and
+    // the post-pass that masked that defect is gone.
     Ok(Json(result))
 }
 

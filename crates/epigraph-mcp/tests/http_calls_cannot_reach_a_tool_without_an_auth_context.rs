@@ -128,6 +128,66 @@ fn enforce_tool_scope_refuses_a_missing_auth_context() {
     );
 }
 
+/// INHERITED FROM PR-14. `tools/redaction.rs` carried an audited
+/// confused-deputy regression, `http_auth_without_agent_uses_client_id_not_server`,
+/// against `mcp_requester`: an AUTHENTICATED caller whose token has no
+/// `agent_id` (a Service/Human client presenting only a read scope) must never
+/// be elevated to the server's own signer identity, because the server agent
+/// owns rows. `mcp_requester` defended that with `a.agent_id.or(Some(a.client_id))`
+/// — it scoped such a caller to its own `client_id`.
+///
+/// PR-14 deleted `mcp_requester` along with the redaction pass it fed. The
+/// property did not go with it: it MOVED to `request_viewer`, which is now the
+/// only place a principal is derived, and which is strictly stricter. Where
+/// `mcp_requester` substituted a fallback identity, `request_viewer` REFUSES —
+/// `Some(a) => a.agent_id.ok_or_else(..)`. There is no expression in the
+/// `Some(auth)` arm that can yield the server identity, so the elevation is not
+/// merely guarded against, it is inexpressible.
+///
+/// This test pins that shape. If someone re-introduces a fallback (`.or(`,
+/// `.unwrap_or(`, or a reach for `server.agent_id()` inside the authenticated
+/// arm), the old defect is back and this fails.
+///
+/// COMPLEMENTARY, NOT DUPLICATE, of
+/// `epigraph-db/tests/locked_decisions.rs::d3_mcp_viewer_acquisition_does_not_flatten_a_client_id`.
+/// That one scans the WHOLE file for two exact historical spellings
+/// (`unwrap_or(a.client_id)`, `or(a.owner_id)`) — the PR-09 defect verbatim.
+/// This one scopes to the authenticated MATCH ARM and rejects any fallback
+/// shape in it, which is the more general property `mcp_requester`'s deleted
+/// test was defending. Either alone would miss what the other catches.
+#[test]
+fn an_authenticated_token_without_an_agent_is_refused_not_elevated() {
+    let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "src", "tools", "viewer.rs"]
+        .iter()
+        .collect();
+    let src = std::fs::read_to_string(&path).expect("read tools/viewer.rs");
+
+    let start = src
+        .find("let principal = match auth {")
+        .expect("`request_viewer` must still derive its principal by matching on `auth`");
+    let arm = &src[start..];
+    let end = arm
+        .find("None =>")
+        .expect("the match must still have an unauthenticated (stdio) arm");
+    let authenticated_arm = &arm[..end];
+
+    assert!(
+        authenticated_arm.contains("ok_or_else") || authenticated_arm.contains("ok_or("),
+        "the authenticated arm of `request_viewer` must REFUSE a token with no \
+         `agent_id`, not substitute one. Arm was:\n{authenticated_arm}"
+    );
+    for fallback in [".or(", ".unwrap_or", "server.agent_id()", "client_id"] {
+        assert!(
+            !authenticated_arm.contains(fallback),
+            "the authenticated arm of `request_viewer` reintroduced the \
+             fallback `{fallback}`. An authenticated caller with no agent \
+             principal must be refused; substituting ANY other identity is the \
+             confused-deputy elevation PR-14 inherited this assertion to \
+             prevent. Arm was:\n{authenticated_arm}"
+        );
+    }
+}
+
 #[test]
 fn request_viewers_stdio_arm_is_documented_as_relying_on_that_gate() {
     // The doc and the gate are one control; a lint that pins the gate while the

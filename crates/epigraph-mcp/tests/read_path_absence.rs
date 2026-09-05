@@ -1,8 +1,13 @@
 //! Consolidated MCP read-path redaction parity test (A3 §7.5, Task 12).
 //!
-//! Tasks 10/11 relocated `check_content_access` into `epigraph-db` and wired
-//! `redact_content` + the per-transport `mcp_requester` into every MCP read
-//! tool. This file is the single discriminating regression that exercises the
+//! NAME NOTE: this file was `read_path_redaction.rs` through PR-13. PR-14
+//! deleted redaction outright, so the old name asserted a behaviour that no
+//! longer exists. The MATRIX it covers is unchanged and still worth one place:
+//! both transports (HTTP bearer vs. stdio fallback), owner vs. stranger, the
+//! public non-regression, and the batch per-id path — every one of them now
+//! expressed as presence-vs-ABSENCE rather than content-vs-placeholder.
+//!
+//! This file is the single discriminating regression that exercises the
 //! WHOLE matrix the spec enumerates — both transports (HTTP bearer vs. stdio
 //! fallback), owner vs. stranger, the public non-regression, and the batch
 //! per-id path — in one place, so a future refactor that breaks redaction trips
@@ -27,7 +32,6 @@ use epigraph_core::{Agent, ClaimId};
 use epigraph_crypto::AgentSigner;
 use epigraph_db::AgentRepository;
 use epigraph_mcp::tools::claims::{get_claim, query_claims};
-use epigraph_mcp::tools::redaction::mcp_requester;
 use epigraph_mcp::types::{GetClaimParams, QueryClaimsParams};
 use rmcp::model::CallToolResult;
 use serde_json::Value;
@@ -59,7 +63,7 @@ use common::build_test_server;
 // the stranger's Viewer excludes the claim rather than returning a blanked
 // body. Strictly less disclosure: the stranger no longer learns it exists.
 #[sqlx::test(migrations = "../../migrations")]
-async fn http_owner_sees_content_stranger_is_redacted(pool: PgPool) {
+async fn http_owner_sees_content_stranger_sees_nothing(pool: PgPool) {
     let owner = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, owner).await;
     let expected = format!("test claim {}", claim_id.as_uuid());
@@ -86,46 +90,59 @@ async fn http_owner_sees_content_stranger_is_redacted(pool: PgPool) {
 
 // ── Case: stdio fallback resolves the requester to server.agent_id() ─────────
 //
-// On the stdio transport there is no `AuthContext`, so `mcp_requester(None, _)`
-// falls the requester back to the server's own signer identity. We exercise the
-// REAL resolution function (`mcp_requester`) rather than passing a literal
-// `None` to `get_claim`: a literal `None` would always redact a private claim
-// (anonymous), so it cannot model the "owned-by-the-stdio-agent ⇒ full content"
-// sub-case the spec requires. Driving the redaction off the resolved requester
-// is what ties this test to the stdio arm.
+// On the stdio transport there is no `AuthContext`, so the principal falls back
+// to the server's own signer identity. PR-14 deleted `mcp_requester`, which used
+// to compute that alongside a separate viewer; the derivation now happens ONCE,
+// in `tools::viewer::request_viewer`'s `None` arm, and feeds the Viewer that
+// filters the read.
+//
+// THE VIEWER UNDER TEST IS THE ONE THE PRODUCTION ARM PRODUCES. We call
+// `request_viewer(&server, None)` — the real function, the real `None` arm —
+// rather than resolving a viewer from the literal `server.agent_id()`. The
+// literal form was tried and rejected: it constructs the fixture from the same
+// value it then confirms, so it would keep passing if the stdio arm stopped
+// resolving to the server agent, which is the only thing this case exists to
+// check. `request_viewer` was widened from `pub(crate)` to `pub` for exactly
+// this, and for nothing else.
+//
+// The choice of ARM (stdio ⇒ `auth == None` and nothing else) is pinned
+// separately, by `http_calls_cannot_reach_a_tool_without_an_auth_context.rs`:
+// an HTTP call with no `AuthContext` is refused one frame up, at dispatch.
 #[sqlx::test(migrations = "../../migrations")]
 async fn stdio_fallback_uses_server_identity(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let server_agent = server_agent_id(&pool).await;
 
     // (a) Private claim OWNED BY the stdio server agent → real content, because
-    // the stdio requester resolves to server_agent == owner.
+    // the stdio arm resolves the principal to server_agent == owner.
     let owned_id = seed_claim(&pool, server_agent).await;
     let owned_expected = format!("test claim {}", owned_id.as_uuid());
     seed_private_ownership(&pool, owned_id, server_agent).await;
 
-    let requester = mcp_requester(/* auth */ None, server_agent);
-    assert_eq!(
-        requester,
-        Some(server_agent),
-        "stdio (no bearer) must resolve the requester to the server's identity"
-    );
+    let stdio_viewer = epigraph_mcp::tools::viewer::request_viewer(&server, /* auth */ None)
+        .await
+        .expect("the stdio arm must establish the server's own agent row");
 
-    let owned_body = get_claim_as(&server, &pool, owned_id, requester).await;
+    let owned_body = get_claim_with(&server, &stdio_viewer, owned_id).await;
     assert_eq!(
         owned_body["content"].as_str().unwrap(),
         owned_expected,
-        "stdio agent must see content of the private claim IT owns"
+        "the viewer `request_viewer(_, None)` returns must carry the server \
+         agent's groups: it is what every claim the stdio process writes is \
+         authored by. Seeing an absence here means the stdio arm resolved some \
+         OTHER principal."
     );
 
     // (b) Private claim owned by a DIFFERENT agent. PR-12 TIGHTENING: absent,
     // not blanked — the claim is now ('group', <other_owner's personal group>),
-    // which the stdio server agent is not in.
+    // which the stdio server agent is not in. This is the non-vacuity control:
+    // without it, a `request_viewer` that returned an all-seeing viewer would
+    // satisfy (a).
     let other_owner = seed_agent(&pool).await;
     let foreign_id = seed_claim(&pool, other_owner).await;
     seed_private_ownership(&pool, foreign_id, other_owner).await;
 
-    assert_claim_absent_for(&server, &pool, foreign_id, requester).await;
+    assert_claim_absent_with(&server, &stdio_viewer, foreign_id).await;
 }
 
 // ── Case: public (ownership-less) non-regression for ANY requester ───────────
@@ -166,7 +183,7 @@ async fn public_claim_is_never_redacted(pool: PgPool) {
 // (one public, one private-owned-by-a-stranger) and query as a non-owner: each
 // row must get ITS OWN decision.
 #[sqlx::test(migrations = "../../migrations")]
-async fn query_claims_redacts_only_unauthorized_rows(pool: PgPool) {
+async fn query_claims_hides_only_unauthorized_rows(pool: PgPool) {
     let public_owner = seed_agent(&pool).await;
     let private_owner = seed_agent(&pool).await;
 
@@ -190,7 +207,6 @@ async fn query_claims_redacts_only_unauthorized_rows(pool: PgPool) {
             max_truth: Some(1.0),
             limit: Some(50),
         },
-        Some(stranger),
     )
     .await
     .expect("query_claims as stranger");
@@ -274,15 +290,27 @@ async fn get_claim_as(
     requester: Option<Uuid>,
 ) -> Value {
     let viewer = viewer_for(pool, requester).await;
+    get_claim_with(server, &viewer, claim_id).await
+}
+
+/// The same read, driven by a `Viewer` the caller already holds.
+///
+/// The stdio case obtains its viewer from `request_viewer` rather than by
+/// resolving a principal it names itself, so it cannot go through
+/// [`get_claim_as`]'s `Option<Uuid>` front door.
+async fn get_claim_with(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: ClaimId,
+) -> Value {
     let result = get_claim(
         server,
-        &viewer,
+        viewer,
         GetClaimParams {
             claim_id: claim_id.as_uuid().to_string(),
             frame_id: None,
             perspective_id: None,
         },
-        requester,
     )
     .await
     .expect("get_claim");
@@ -301,28 +329,61 @@ async fn assert_claim_absent_for(
     requester: Option<Uuid>,
 ) {
     let viewer = viewer_for(pool, requester).await;
+    assert_claim_absent_with(server, &viewer, claim_id).await;
+}
+
+/// [`assert_claim_absent_for`], driven by a `Viewer` the caller already holds.
+async fn assert_claim_absent_with(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: ClaimId,
+) {
     let result = get_claim(
         server,
-        &viewer,
+        viewer,
         GetClaimParams {
             claim_id: claim_id.as_uuid().to_string(),
             frame_id: None,
             perspective_id: None,
         },
-        requester,
     )
     .await;
-    match result {
-        Err(e) => assert!(
-            e.to_string().contains("not found"),
-            "expected a not-found for a claim outside the viewer's scope, got: {e}"
-        ),
+    let hidden_err = match result {
+        Err(e) => e.to_string(),
         Ok(ok) => panic!(
             "expected the claim to be ABSENT for this requester, but get_claim \
              returned a body: {:?}",
             parse_claim(&ok)
         ),
-    }
+    };
+
+    // THE ACCEPTANCE ORACLE (plan §8.4 N15), MCP half. "Not found" as a
+    // SUBSTRING is not enough: a message that says "not found" but differs in
+    // any other way from the one a never-created uuid produces still tells the
+    // caller which uuids name real private claims, which is the whole defect
+    // deleting redaction exists to close. Require the two to be identical once
+    // the echoed uuid — which the caller supplied and already knows — is
+    // normalised away.
+    let absent = Uuid::new_v4();
+    let absent_err = get_claim(
+        server,
+        viewer,
+        GetClaimParams {
+            claim_id: absent.to_string(),
+            frame_id: None,
+            perspective_id: None,
+        },
+    )
+    .await
+    .expect_err("a uuid that names nothing must not return a claim")
+    .to_string();
+
+    assert_eq!(
+        hidden_err.replace(&claim_id.as_uuid().to_string(), "<ID>"),
+        absent_err.replace(&absent.to_string(), "<ID>"),
+        "a claim outside the viewer's scope and a nonexistent uuid must be \
+         indistinguishable. hidden={hidden_err}  absent={absent_err}"
+    );
 }
 
 async fn seed_private_ownership(pool: &PgPool, claim_id: ClaimId, owner: Uuid) {

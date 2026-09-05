@@ -13,6 +13,66 @@
 //! the four decisions, say so in the commit body; do not leave the reviewer to
 //! infer it from an untouched test file.
 //!
+//! ## Status at PR-14
+//!
+//! **PR-14 DOES change a route split, so this file is touched deliberately
+//! rather than left to be read as an oversight.** Plan §0.2's rejection trigger
+//! is "a PR that changes a policy, a route split, or a tenancy column and does
+//! not touch `locked_decisions.rs`", and PR-14 removes four registrations from
+//! **both** `create_router` variants: `POST /api/v1/ownership`,
+//! `PUT /api/v1/ownership/:node_id`, `GET /api/v1/ownership/:node_id` and
+//! `GET /api/v1/agents/:id/owned-nodes`.
+//!
+//! **Every assertion below is unchanged, and that is the correct outcome.**
+//! The split D3 constrains is `public` vs `protected`, and
+//! [`d3_anonymous_route_surface_is_the_allowlist`] reads `routes/mod.rs` to
+//! check that the anonymous surface is exactly `/health` +
+//! `/api/v1/openapi.json`. All four deleted routes were on `protected` (PR-03
+//! moved `/api/v1/ownership/:node_id` there; the inversion comment in
+//! `routes/mod.rs` still names it as one of the routes that motivated the
+//! inversion). Deleting a `protected` route shrinks the authenticated surface
+//! and cannot grow the anonymous one, so the allowlist is untouched in both
+//! variants. Callers of those paths now get 404, not 401 — they stopped
+//! existing, they did not stop requiring a credential.
+//!
+//! PR-14 is otherwise a read-path deletion: it removes the post-fetch redaction
+//! pass (`check_content_access` / `redact_claim_content` / the MCP
+//! `redact_content`), moves four `epigraph-api/src/routes/edges.rs` statements
+//! into `crates/epigraph-db/src/repos/` behind `Viewer` predicates, and deletes
+//! the legacy `ownership` read/declassify surface. **No migration** —
+//! `migrations/README.md` reserves PR-14 no number. **No RLS policy.** **No
+//! tenancy column.** **No write-side predicate**: `viewer.writable_bind()`
+//! remains PR-16's mechanism, unused here.
+//!
+//! One D1-adjacent consequence is worth recording where a future reader will
+//! find it. `access_control.rs`'s `None => ContentAccess::Full` was cited in
+//! this file and in `epigraph-interfaces/src/policy.rs` as the canonical D1
+//! defect — "public by absence". PR-12 made it unreachable; PR-14 deletes it.
+//! Those citations are kept in the past tense on purpose: the archetype is why
+//! D1 is worded as it is, and losing the example would leave the rule without
+//! its evidence.
+//!
+//! **What PR-14 leaves dormant, stated because a passing test can be read as
+//! coverage when it is not.** PR-11's four `PolicyGate::authorize` call sites
+//! were the two HTTP ownership handlers and the two MCP ownership tools. All
+//! four are deleted here, along with both `require_declassify_authority`
+//! helpers, so `authorize` has **zero production callers** until PR-16 wires the
+//! write-side predicate. `GroupPolicyGate` is still constructed at all six
+//! `AppState` and both `EpiGraphMcpFull` sites, and D1's floor is still real —
+//! but the assertions that survive are constructor- and type-level, and none of
+//! them exercises a live decision. The three call-site lints that would have
+//! noticed the gate never coming back
+//! (`write_gate_call_sites.rs`, `write_gate_denies_at_the_route.rs`,
+//! `write_gate_denies_at_the_tool.rs`) were deleted rather than emptied: the
+//! first hard-asserts a symbol with no definitions left in the tree. The
+//! obligation to restore them is
+//! `D-PR16-reestablish-the-write-gate-call-site-lint` in
+//! `docs/tenancy/progress.json`. PR-14 adds one residual in exchange:
+//! `epigraph-mcp/src/server.rs::the_default_gate_is_installed_at_both_mcp_constructors`,
+//! which is the MCP half of the constructor count that `state.rs` only ever
+//! pinned for the six API sites — see the D1 bullet below, which asserted those
+//! two in prose alone.
+//!
 //! ## Status at PR-13
 //!
 //! **PR-13 DOES touch a locked decision.** It adds a tenancy column —
@@ -75,8 +135,11 @@
 //!     **Say "floor", not "the default a deployment gets":**
 //!     `DenyAllPolicyGate` has zero production install sites. All six
 //!     `AppState` constructors and both `EpiGraphMcpFull` constructors install
-//!     `epigraph_authz::GroupPolicyGate`, and the test that pins *that* is
-//!     `epigraph-api/src/state.rs::the_default_gate_is_installed_at_every_constructor`.
+//!     `epigraph_authz::GroupPolicyGate`, and the tests that pin *that* are
+//!     `epigraph-api/src/state.rs::the_default_gate_is_installed_at_every_constructor`
+//!     (the six) and, since PR-14,
+//!     `epigraph-mcp/src/server.rs::the_default_gate_is_installed_at_both_mcp_constructors`
+//!     (the two — asserted in this comment alone until then).
 //!     [`d1_the_kernel_write_gate_is_not_an_allow_all`] below is a source scan
 //!     over `policy.rs`; it proves no allow-all is reachable in a production
 //!     build, which is a weaker and different claim than "a running process

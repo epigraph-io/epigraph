@@ -161,8 +161,28 @@ and 071's shim raises 42501 on every `ownership` write.
 
 `ownership` is the pre-tenancy ACL table. Migration 071 demotes it to a
 write-through shim: writing an `ownership` row now **reclassifies** the node and
-cascades. It is a compatibility surface with a scheduled death —
-`POST /api/v1/ownership` and MCP `assign_ownership` are deleted in PR-14, and
-the table is dropped in migration 084.
+cascades. It is a compatibility surface with a scheduled death — **PR-14 deleted
+its API surface entirely** (`POST /api/v1/ownership`,
+`PUT /api/v1/ownership/:node_id`, `GET /api/v1/ownership/:node_id`,
+`GET /api/v1/agents/:id/owned-nodes`, and the MCP tools `assign_ownership`,
+`update_partition` and `get_ownership`) — and the table is dropped in migration
+084.
+
+Since PR-14 **nothing on the read path consults `ownership`**: the tenancy
+columns on the row are the sole source of truth. Completing the
+`epigraph-tenancy-backfill` transcription pass is therefore a prerequisite of
+deploying that release rather than a follow-up — see `docs/tenancy/progress.json`
+(PR-12's B5, and M1 under `blocked_measurements`, which sizes the pass).
+
+**Nothing replaces the deleted surface, and that is a capability removal, not a
+relocation.** Between PR-14 and PR-16 there is no API and no MCP tool that can
+reclassify an existing node. Tenancy is stamped at INSERT — 070's inherit
+trigger, and 071's write-through shim for anyone still writing `ownership` — and
+no code path updates `claims.visibility` or `claims.owner_group_id` afterwards.
+`OwnershipRepository` (`crates/epigraph-db/src/repos/ownership.rs`) is retained
+deliberately with **zero production callers** — its only remaining users are the
+community-partition tests — until migration 084 drops the table. Do not delete
+it as dead code, and do not read its survival as evidence that a write path
+still exists.
 
 If you are writing new code, do not write `ownership`.

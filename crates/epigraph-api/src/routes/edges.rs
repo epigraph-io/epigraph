@@ -14,8 +14,6 @@
 //! now the module-wide default and an exception would be the thing worth
 //! annotating.
 
-#[cfg(feature = "db")]
-use crate::access_control::{check_content_access, ContentAccess};
 use crate::errors::ApiError;
 use crate::state::AppState;
 use axum::{
@@ -1477,13 +1475,8 @@ pub async fn list_edges(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<EdgeQueryParams>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<Vec<EdgeResponse>>, ApiError> {
     let pool = &state.db_pool;
-
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     // AND-compose every non-null filter at the SQL layer so drainer
     // GET-then-POST guards work. Replaces the legacy first-non-null
@@ -1501,30 +1494,24 @@ pub async fn list_edges(
     )
     .await?;
 
-    // Filter edges where source or target has a redacted partition
-    let mut edges = Vec::new();
-    for row in rows {
-        let source_redacted = row.source_type == "claim"
-            && check_content_access(pool, row.source_id, requester).await
-                == ContentAccess::Redacted;
-        let target_redacted = row.target_type == "claim"
-            && check_content_access(pool, row.target_id, requester).await
-                == ContentAccess::Redacted;
-
-        if !source_redacted && !target_redacted {
-            edges.push(EdgeResponse {
-                id: row.id,
-                source_id: row.source_id,
-                target_id: row.target_id,
-                source_type: row.source_type,
-                target_type: row.target_type,
-                relationship: row.relationship,
-                properties: row.properties,
-                valid_from: row.valid_from,
-                valid_to: row.valid_to,
-            });
-        }
-    }
+    // No endpoint re-check. `list_filtered` is spliced with `&viewer`, and
+    // PR-13 made an edge's own tenancy the MEET of its two endpoints, so an
+    // edge touching a claim this viewer cannot read is already absent from
+    // `rows` — enforced by the database rather than re-derived per row here.
+    let edges: Vec<EdgeResponse> = rows
+        .into_iter()
+        .map(|row| EdgeResponse {
+            id: row.id,
+            source_id: row.source_id,
+            target_id: row.target_id,
+            source_type: row.source_type,
+            target_type: row.target_type,
+            relationship: row.relationship,
+            properties: row.properties,
+            valid_from: row.valid_from,
+            valid_to: row.valid_to,
+        })
+        .collect();
 
     Ok(Json(edges))
 }
@@ -1541,13 +1528,8 @@ pub async fn claim_neighborhood(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<NeighborhoodParams>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<NeighborhoodResponse>, ApiError> {
     let pool = &state.db_pool;
-
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     let max_depth = params.depth.unwrap_or(2).min(3); // Cap at 3 hops
 
@@ -1615,44 +1597,28 @@ pub async fn claim_neighborhood(
         .filter(|e| seen_edge_ids.insert(e.id))
         .collect();
 
-    // Apply partition filtering: remove edges touching redacted claim nodes
-    let mut unique_edges = Vec::new();
-    let mut redacted_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-    for row in deduped {
-        let source_redacted = row.source_type == "claim"
-            && row.source_id != claim_id
-            && check_content_access(pool, row.source_id, requester).await
-                == ContentAccess::Redacted;
-        let target_redacted = row.target_type == "claim"
-            && row.target_id != claim_id
-            && check_content_access(pool, row.target_id, requester).await
-                == ContentAccess::Redacted;
+    // Every `get_by_source`/`get_by_target` hop above was spliced with
+    // `&viewer`, so an edge onto an unreadable claim never entered `deduped`
+    // and there is no second population to subtract.
+    let unique_edges: Vec<EdgeResponse> = deduped
+        .into_iter()
+        .map(|row| EdgeResponse {
+            id: row.id,
+            source_id: row.source_id,
+            target_id: row.target_id,
+            source_type: row.source_type,
+            target_type: row.target_type,
+            relationship: row.relationship,
+            properties: row.properties,
+            valid_from: row.valid_from,
+            valid_to: row.valid_to,
+        })
+        .collect();
 
-        if source_redacted {
-            redacted_ids.insert(row.source_id);
-        }
-        if target_redacted {
-            redacted_ids.insert(row.target_id);
-        }
-        if !source_redacted && !target_redacted {
-            unique_edges.push(EdgeResponse {
-                id: row.id,
-                source_id: row.source_id,
-                target_id: row.target_id,
-                source_type: row.source_type,
-                target_type: row.target_type,
-                relationship: row.relationship,
-                properties: row.properties,
-                valid_from: row.valid_from,
-                valid_to: row.valid_to,
-            });
-        }
-    }
-
-    // Connected entity IDs (excluding the center and redacted nodes)
+    // Connected entity IDs (excluding the center)
     let connected: Vec<Uuid> = visited_ids
         .into_iter()
-        .filter(|&id| id != claim_id && !redacted_ids.contains(&id))
+        .filter(|&id| id != claim_id)
         .collect();
 
     Ok(Json(NeighborhoodResponse {
@@ -1721,30 +1687,17 @@ pub async fn graph_edges(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(_params): Query<GraphAccessParams>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<GraphEdgesResponse>, ApiError> {
     let pool = &state.db_pool;
 
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-
     let rows = EdgeRepository::list_all(pool, &viewer, 5000).await?;
 
-    // Filter to claim-to-claim edges, excluding edges touching redacted claims
-    let mut filtered = Vec::new();
-    for r in rows {
-        if r.source_type != "claim" || r.target_type != "claim" {
-            continue;
-        }
-        let source_redacted =
-            check_content_access(pool, r.source_id, requester).await == ContentAccess::Redacted;
-        let target_redacted =
-            check_content_access(pool, r.target_id, requester).await == ContentAccess::Redacted;
-        if !source_redacted && !target_redacted {
-            filtered.push(r);
-        }
-    }
+    // Filter to claim-to-claim edges. `list_all` is spliced with `&viewer`, so
+    // the endpoint-visibility half of this loop is now the database's job.
+    let filtered: Vec<_> = rows
+        .into_iter()
+        .filter(|r| r.source_type == "claim" && r.target_type == "claim")
+        .collect();
 
     let edges: Vec<SemanticEdgeResponse> = filtered
         .into_iter()
@@ -1861,13 +1814,8 @@ pub async fn graph_full(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(_params): Query<GraphAccessParams>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<FullGraphResponse>, ApiError> {
     let pool = &state.db_pool;
-
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     // 1. Fetch all edges (capped)
     let edge_rows = EdgeRepository::list_all(pool, &viewer, 2000).await?;
@@ -1938,16 +1886,9 @@ pub async fn graph_full(
         }));
     }
 
-    let mut resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
-    // Redact claim labels for nodes the requester cannot access
-    for node in &mut resp.nodes {
-        if node.entity_type == "claim" {
-            let access = check_content_access(pool, node.id, requester).await;
-            if access == ContentAccess::Redacted {
-                node.label = "[REDACTED]".to_string();
-            }
-        }
-    }
+    // No label-blanking pass: `load_subgraph` is spliced with `&viewer`, so an
+    // unreadable claim is not among `resp.nodes` to be relabelled.
+    let resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
     Ok(resp)
 }
 
@@ -1999,16 +1940,6 @@ pub struct EvidenceDetailResponse {
 // Row types for evidence and provenance queries
 #[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]
-struct EvidenceDetailRow {
-    id: Uuid,
-    raw_content: Option<String>,
-    content_hash: Vec<u8>,
-    source_url: Option<String>,
-    properties: serde_json::Value,
-    created_at: chrono::DateTime<chrono::Utc>,
-}
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
 struct SourceIdRow {
     source_id: Uuid,
 }
@@ -2047,25 +1978,25 @@ pub async fn get_evidence(
     State(state): State<AppState>,
     Path(evidence_id): Path<Uuid>,
     Query(_params): Query<EvidenceAccessParams>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
 ) -> Result<Json<EvidenceDetailResponse>, ApiError> {
     let pool = &state.db_pool;
 
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-
-    let row: EvidenceDetailRow = sqlx::query_as(
-        "SELECT id, raw_content, content_hash, source_url, properties, created_at FROM evidence WHERE id = $1"
-    )
-    .bind(evidence_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| ApiError::InternalError { message: format!("DB error: {e}") })?
-    .ok_or(ApiError::NotFound {
-        entity: "evidence".to_string(),
-        id: evidence_id.to_string(),
-    })?;
+    // Was an inline, viewer-less `SELECT … FROM evidence WHERE id = $1` whose
+    // only control was a post-fetch `check_content_access` on the linked claim,
+    // blanking `raw_content`/`caption`/`source_url` in place. PR-14 deletes that
+    // pass, so the read itself must filter: a row this viewer cannot see is
+    // `None`, which is the SAME value a missing row produces, and both render
+    // as the identical 404 below (§8.5).
+    let row = epigraph_db::EvidenceRepository::detail_by_id(pool, &viewer, evidence_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("DB error: {e}"),
+        })?
+        .ok_or(ApiError::NotFound {
+            entity: "evidence".to_string(),
+            id: evidence_id.to_string(),
+        })?;
 
     let props = &row.properties;
 
@@ -2094,34 +2025,18 @@ pub async fn get_evidence(
         .unwrap_or("unknown")
         .to_string();
 
-    // Redact content if linked claim is private/community and requester lacks access
-    let should_redact = if let Some(ref ce) = claim_edge {
-        check_content_access(pool, ce.source_id, requester).await == ContentAccess::Redacted
-    } else {
-        false
-    };
-
-    let content = if should_redact {
-        Some("[REDACTED]".to_string())
-    } else {
-        row.raw_content.clone()
-    };
-
-    // When the linked claim is private and the requester lacks access, the
-    // free-form `caption` (can carry the substance of the figure) and the
-    // identifying `source_url` are gated alongside `content`. The lower-value
-    // structural fields (content_hash, doi, figure_id, mime_type, page,
-    // extraction_target, page_range) follow the codebase-wide content-body
-    // redaction model and are left intact.
-    let source_url = if should_redact { None } else { row.source_url };
-    let caption = if should_redact {
-        None
-    } else {
-        props
-            .get("caption")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    };
+    // No blanking branch. Reaching this line means `detail_by_id` returned the
+    // row, which means the viewer may read it; `raw_content`, `source_url` and
+    // `caption` are therefore returned whole. The previous revision fetched the
+    // row unconditionally and then decided per-field whether to null it out —
+    // a decision that could only ever be made AFTER the secret was already in
+    // memory, and that had to be repeated correctly at each field.
+    let content = row.raw_content.clone();
+    let source_url = row.source_url;
+    let caption = props
+        .get("caption")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let response = EvidenceDetailResponse {
         id: row.id,
@@ -2209,33 +2124,39 @@ pub async fn claim_provenance(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(_params): Query<EvidenceAccessParams>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
 ) -> Result<Json<ProvenanceResponse>, ApiError> {
     let pool = &state.db_pool;
 
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    // 1. Fetch the claim THROUGH the viewer.
+    //
+    // Was an inline, viewer-less `SELECT id, content, trace_id FROM claims
+    // WHERE id = $1` followed by a `check_content_access` pass that replaced
+    // the step label with a placeholder. PR-14 deletes that pass, so the read
+    // filters instead: a claim this viewer cannot read is `None` — the same
+    // value a nonexistent id produces — and both render the identical 404.
+    let claim = epigraph_db::ClaimRepository::get_by_id(
+        pool,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(claim_id),
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("DB error: {e}"),
+    })?
+    .ok_or(ApiError::NotFound {
+        entity: "claim".to_string(),
+        id: claim_id.to_string(),
+    })?;
 
-    // 1. Fetch the claim
-    let claim_row: ClaimProvRow =
-        sqlx::query_as("SELECT id, content, trace_id FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("DB error: {e}"),
-            })?
-            .ok_or(ApiError::NotFound {
-                entity: "claim".to_string(),
-                id: claim_id.to_string(),
-            })?;
+    let claim_row = ClaimProvRow {
+        id: claim.id.into(),
+        content: claim.content.clone(),
+        trace_id: claim.trace_id.map(Into::into),
+    };
 
-    // Redact claim content in provenance chain if requester lacks access
-    let access = check_content_access(pool, claim_id, requester).await;
-    let claim_label = if access == ContentAccess::Redacted {
-        "[REDACTED]".to_string()
-    } else if claim_row.content.len() > 60 {
+    // Truncation only — there is no redacted spelling of this label any more.
+    let claim_label = if claim_row.content.len() > 60 {
         format!("{}...", &claim_row.content[..57])
     } else {
         claim_row.content.clone()
@@ -2250,8 +2171,17 @@ pub async fn claim_provenance(
     let mut chains = Vec::new();
 
     // Helper: build evidence chains from target_ids
+    //
+    // The evidence read here is VIEWER-FILTERED, and that is not redundant with
+    // the claim check at the top of `claim_provenance`. These ids come from
+    // `DERIVED_FROM` edges off the claim's reasoning TRACE, and a trace may cite
+    // evidence belonging to other claims — so "the caller may read the claim
+    // this chain starts from" does not imply "the caller may read every piece
+    // of evidence the chain passes through". The projected `properties` carries
+    // a free-form `caption`, which is content.
     async fn build_evidence_chains(
         pool: &epigraph_db::PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
         claim_step: &ProvenanceStep,
         trace_step: Option<&ProvenanceStep>,
         evidence_target_ids: Vec<Uuid>,
@@ -2259,13 +2189,16 @@ pub async fn claim_provenance(
         let mut chains = Vec::new();
         for target_id in evidence_target_ids {
             let ev: Option<EvidenceProvRow> =
-                sqlx::query_as("SELECT id, source_url, properties FROM evidence WHERE id = $1")
-                    .bind(target_id)
-                    .fetch_optional(pool)
+                epigraph_db::EvidenceRepository::detail_by_id(pool, viewer, target_id)
                     .await
                     .map_err(|e| ApiError::InternalError {
                         message: format!("DB error: {e}"),
-                    })?;
+                    })?
+                    .map(|r| EvidenceProvRow {
+                        id: r.id,
+                        source_url: r.source_url,
+                        properties: r.properties,
+                    });
 
             if let Some(ev) = ev {
                 let props = &ev.properties;
@@ -2350,7 +2283,14 @@ pub async fn claim_provenance(
                 let target_ids: Vec<Uuid> =
                     evidence_edges.into_iter().map(|e| e.target_id).collect();
                 chains.extend(
-                    build_evidence_chains(pool, &claim_step, Some(&trace_step), target_ids).await?,
+                    build_evidence_chains(
+                        pool,
+                        &viewer,
+                        &claim_step,
+                        Some(&trace_step),
+                        target_ids,
+                    )
+                    .await?,
                 );
             }
         }
@@ -2367,7 +2307,7 @@ pub async fn claim_provenance(
         .map_err(|e| ApiError::InternalError { message: format!("DB error: {e}") })?;
 
         let target_ids: Vec<Uuid> = evidence_edges.into_iter().map(|e| e.target_id).collect();
-        chains.extend(build_evidence_chains(pool, &claim_step, None, target_ids).await?);
+        chains.extend(build_evidence_chains(pool, &viewer, &claim_step, None, target_ids).await?);
     }
 
     Ok(Json(ProvenanceResponse { claim_id, chains }))
@@ -2408,16 +2348,6 @@ pub struct ClaimEvidenceListResponse {
     pub total: usize,
 }
 
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct EvidenceEdgeRow {
-    edge_id: Uuid,
-    evidence_id: Uuid,
-    raw_content: Option<String>,
-    strength: Option<f64>,
-    created_at: chrono::DateTime<chrono::Utc>,
-}
-
 /// Get all supporting evidence for a claim
 ///
 /// `GET /api/v1/claims/:id/supporting-evidence`
@@ -2429,12 +2359,9 @@ pub async fn supporting_evidence(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(_params): Query<EvidenceAccessParams>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
 ) -> Result<Json<ClaimEvidenceListResponse>, ApiError> {
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    evidence_by_relationship(&state, claim_id, "SUPPORTS", requester).await
+    evidence_by_relationship(&state, claim_id, "SUPPORTS", &viewer).await
 }
 
 /// Get all contradicting evidence for a claim
@@ -2448,12 +2375,9 @@ pub async fn contradicting_evidence(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(_params): Query<EvidenceAccessParams>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
 ) -> Result<Json<ClaimEvidenceListResponse>, ApiError> {
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    evidence_by_relationship(&state, claim_id, "CONTRADICTS", requester).await
+    evidence_by_relationship(&state, claim_id, "CONTRADICTS", &viewer).await
 }
 
 #[cfg(feature = "db")]
@@ -2461,39 +2385,28 @@ async fn evidence_by_relationship(
     state: &AppState,
     claim_id: Uuid,
     relationship: &str,
-    agent_id: Option<Uuid>,
+    viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<Json<ClaimEvidenceListResponse>, ApiError> {
     let pool = &state.db_pool;
 
-    // Check if the claim itself is accessible
-    let access = check_content_access(pool, claim_id, agent_id).await;
-    if access == ContentAccess::Redacted {
-        return Ok(Json(ClaimEvidenceListResponse {
-            claim_id,
-            relationship: relationship.to_string(),
-            evidence: vec![],
-            total: 0,
-        }));
-    }
-
-    let rows: Vec<EvidenceEdgeRow> = sqlx::query_as(
-        r#"
-        SELECT e.id as edge_id, ev.id as evidence_id,
-               ev.raw_content, (e.properties->>'strength')::float8 as strength,
-               ev.created_at
-        FROM edges e
-        JOIN evidence ev ON ev.id = e.source_id
-        WHERE e.target_id = $1
-          AND e.target_type = 'claim'
-          AND e.source_type = 'evidence'
-          AND e.relationship = $2
-        ORDER BY ev.created_at DESC
-        LIMIT 100
-        "#,
+    // The gate used to be `check_content_access(pool, claim_id, agent_id)`,
+    // early-returning an empty list on `Redacted`, with the evidence query
+    // itself unfiltered. That empty-list SHAPE is kept deliberately: this
+    // endpoint has never had a claim-existence check, so a nonexistent
+    // `claim_id` already returns exactly this body, and a non-visible claim
+    // returning the same body is therefore indistinguishable from a
+    // nonexistent one (§8.5) — converting it to a 404 would newly disclose
+    // which claim ids exist.
+    //
+    // What changed is that the filtering is now real rather than a post-pass:
+    // the repo statement filters BOTH the edge and the evidence row, so even a
+    // caller who reaches the query cannot pull `raw_content` it may not read.
+    let rows = epigraph_db::EvidenceRepository::by_relationship_for_claim(
+        pool,
+        viewer,
+        claim_id,
+        relationship,
     )
-    .bind(claim_id)
-    .bind(relationship)
-    .fetch_all(pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("DB error: {e}"),

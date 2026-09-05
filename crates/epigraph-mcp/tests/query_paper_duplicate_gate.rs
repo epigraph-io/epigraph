@@ -82,7 +82,6 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
         QueryPaperParams {
             doi: doi.to_string(),
         },
-        None,
     )
     .await
     .expect("query_paper succeeds");
@@ -108,7 +107,6 @@ async fn query_paper_reports_zero_for_unknown_doi(pool: PgPool) {
         QueryPaperParams {
             doi: "10.9999/never-ingested".to_string(),
         },
-        None,
     )
     .await
     .expect("query_paper succeeds");
