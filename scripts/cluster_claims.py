@@ -66,6 +66,7 @@ from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
 
 import theme_lib  # noqa: E402  (scripts/ is on sys.path when run as a script)
+from maintenance_dsn import maintenance_dsn  # noqa: E402  (same sys.path assumption)
 
 psycopg2.extras.register_uuid()
 
@@ -444,7 +445,7 @@ def main():
         description="UMAP-based claim clustering with coordinate frame")
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(DEFAULT_DATABASE_URL),
         help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
     )
     parser.add_argument("--sample-size", type=int, default=5000)

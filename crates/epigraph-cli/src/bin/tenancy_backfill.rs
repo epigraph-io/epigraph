@@ -84,7 +84,6 @@
 //!     epigraph-tenancy-backfill verify
 
 use clap::{Parser, Subcommand};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -214,15 +213,39 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let url =
-        std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL is not set"))?;
 
-    // A modest pool: this is a single-threaded batch walker, and a large pool
-    // against a live cluster is a way to starve the application.
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await?;
+    // THE VERIFIER MUST NOT BE ABLE TO PASS VACUOUSLY.
+    //
+    // Before PR-15 this binary read `DATABASE_URL` and handed it straight to
+    // `PgPoolOptions`, bypassing the pool abstraction entirely — no
+    // `ScopedPool`, no lease, no `Viewer`. That is tolerable for `run`, which
+    // fails loudly if it cannot write. It is not tolerable for `verify`, whose
+    // whole contract is a non-zero exit: `verify` counts rows that are *not*
+    // yet declared, so on a connection that cannot see undeclared rows the
+    // count is zero and it reports success. PR-16's acceptance consumes that
+    // exit code as a deploy pre-flight, so a vacuously-green verifier turns
+    // that gate into decoration.
+    //
+    // A `MaintenancePool` is therefore mandatory here rather than merely
+    // preferable, and the constructor refuses outright if the connection is
+    // unprivileged while any protected table carries row security — the one
+    // condition under which the silent-zero could occur.
+    //
+    // SIZING CHANGED, and the old note claiming otherwise is gone. This bin
+    // used to build its own pool with `max_connections(4)`, reasoned as "a
+    // single-threaded batch walker, and a large pool against a live cluster is
+    // a way to starve the application". `MaintenancePool` is one shared
+    // constructor at 11 (10 for work, 1 for the held lease — see its comment),
+    // so the cap here rose 4 -> 11. That is acceptable and not merely tolerated:
+    // sqlx opens connections lazily, and a single-threaded walker holding one
+    // lease and running one statement at a time never opens more than two, so
+    // the cap is a ceiling this bin does not approach rather than a workload
+    // increase. The trade is one sizing rule across the whole fleet instead of
+    // twelve, which is the same reason the DSN rule is centralised.
+    let maint = epigraph_cli::MaintenancePool::connect("epigraph-tenancy-backfill")
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pool = maint.pool().clone();
 
     match cli.command {
         Command::Run {

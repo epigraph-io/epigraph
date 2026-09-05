@@ -56,7 +56,7 @@ Group-scoped encryption (`seal`) is last and deliberately optional.
 | PR-12 | batched, resumable tenancy backfill with write-side stamping | **done** (migrations 070/071, `epigraph-tenancy-backfill`) |
 | PR-13 | edge co-ownership so the endpoint meet is expressible | **done** (migrations **072/073**, not the plan's 068/069; `Viewer::edge_predicate_fragment` + the `/* {EDGE_VISIBILITY:…} */` marker; `DbError::CheckViolation` → 400). Closes 070 arm (b)'s cross-group `RAISE`, which 071's transcription had made reachable. Residual it does NOT fix: an edge stamped `('group', G, co_owner = NULL)` **before** 072, whose endpoints later diverged into different groups, is not reconciled by 072 and stays visible to all of G — `epigraph-tenancy-backfill verify` now fails on that shape (`D-PR18-stale-cross-group-edges`) |
 | PR-14 | delete redaction — a non-visible row is absent, not blanked | **done** (code-only, no migration). Deletes `epigraph-db/src/access_control.rs`, **its `epigraph-api` re-export shim** (which also owned `redact_claim_content` — the plan's *Files* line named only one of the two), `epigraph-mcp/src/tools/redaction.rs` (taking `mcp_requester` with it), `routes/ownership.rs` (4 routes × 2 `create_router` variants) and **three** MCP tools — `assign_ownership`, `update_partition` and `get_ownership`; the plan named two. **Three `edges.rs` handlers were converted BEFORE the deletion, not after**: `get_evidence`, `claim_provenance` and `evidence_by_relationship` read raw viewerless SQL and `check_content_access` was their ONLY control, so deleting it without moving them behind a `Viewer` would have widened access rather than tidied it. All four of `edges.rs`'s counted inline reads now live in the repo layer (`viewer_route_table_lint` `edges.rs` 4 → 0). Ratchets moved: `EXPECTED_TOOLS_WITHOUT_A_VIEWER` 20 → 19, `#[tool(` 86 → 83, `SCOPE_MAP` −3 entries + 1 assertion, `COMPENSATED_INLINE_READS` retired → `TEST_ONLY_INLINE_READS`. Closes `F-access-control-none-full`, `F-coarse-edge-types-reexport-shim`, `F-PR11-ownership-reads-are-an-owner-oracle`; moots `F-PR11-ownership-upsert-is-check-then-act`. **Breaking** (announce with PR-03's RAG revocation): a caller that received `200` + `"[REDACTED]"` now receives an absence. **Deploy prerequisite**: the read path no longer consults `ownership`, so run `epigraph-tenancy-backfill` to completion first (`D-PR14-transcription-is-a-deploy-prerequisite`). **Left dormant for PR-16**: `PolicyGate::authorize` has zero production callers and the three write-gate lint files were deleted — `D-PR16-reestablish-the-write-gate-call-site-lint` |
-| PR-15 | maintenance DSN for every background writer, before FORCE | not started |
+| PR-15 | maintenance DSN for every background writer, before FORCE | **done** (code-only; `migrations/README.md` reserves no number for it). Corrects the plan on counts: **27** bin files, not 26, and the work list was **23** DB-touching bins, not 14. The scope recon's "Group B — already on the template, DO NOT TOUCH (9)" was wrong at the pool level — all nine bound a bypass `Viewer` from a `ScopedPool` they discarded and then ran every query on a raw `epigraph_cli::db_connect()` pool, i.e. the same privileged-viewer/ordinary-pool hybrid the recon flagged in only two. `epigraph_cli::db_connect` and `maintenance_pool_and_viewer` are **deleted**; `epigraph_cli::MaintenancePool` replaces both. It *improves* the old template's lifetime handling — the `MaintenanceConn` is returned to the caller instead of being dropped inside the constructor, and every converted bin binds it for the whole run — but does **not** discharge the obligation: the `Viewer` is still owned and outlives its lease, so the coupling is a convention, not a type-level guarantee (`D-PR17-maintenance-lease-coupling-is-a-convention`). `SystemReason` is taken by `MaintenancePool::viewer`, not by `connect`, so the twelve bins that need a privileged *connection* and never spend a viewer mint none — which is why `viewer_ratchet.rs`'s monotone bound of 10 was never in play. New lint `crates/epigraph-db/tests/no_unmaintained_dsn.rs`, keyed on pool CONSTRUCTION rather than the plan's `DATABASE_URL` axis (which passes vacuously on the clap-`env=` spelling and on any partial conversion); it cannot see the INJECTED-pool form of the same hybrid (`D-PR17-hybrid-shape-lint`). The boot probe keys on `relrowsecurity OR relforcerowsecurity`, **not FORCE alone**: a policy filters every non-owner without `BYPASSRLS`, and every protected table is owned by the superuser, so ENABLE is the operative arming signal for this fleet — FORCE-only would be disarmed through PR-17's own policies-before-FORCE window and after its `NO FORCE` kill switch. Two *Files*-line deviations, recorded because the plan prescribed files that do not exist: the shared constructor landed in `crates/epigraph-db/src/pool.rs` + `crates/epigraph-cli/src/lib.rs`, **not** the plan's new `crates/epigraph-jobs/src/pool.rs` and `crates/epigraph-cli/src/pool.rs` (`epigraph-jobs` has no binary and no pool constructor, and a second `epigraph-cli` pool module would fork the existing template); and the deploy checklist landed in `docs/deploy.md` §1c-bis/§1c-ter because **no `docs/runbooks/` directory exists** in this tree. Deliberately NOT done: `epigraph-mcp`'s three maintenance tools stay fail-CLOSED — see §5 |
 | PR-16 | ownership REQUIRED — drop defaults, arm trigger, validate (D1) | not started |
 | PR-17 | RLS policies, FORCE, and a canary that proves it | not started |
 | PR-18 | privatization plans, preview, restrict-mode apply (D4) | not started |
@@ -115,12 +115,56 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
 - ~~**PR-04 owes** an un-ignore of
   `no_anonymous_viewer.rs::resolve_unions_in_the_principals_personal_group`~~ —
   **discharged in PR-04.** The `#[ignore]` is gone and the test has a real body.
-- **PR-15 owes** two pool repoints, both prerequisites for PR-17:
-  `ScopedPool::unscoped_for_maintenance` must draw from `MAINTENANCE_DATABASE_URL`
-  rather than the application pool, and the background `job_pool` in
-  `bin/server.rs` must be routed through `ScopedPool` so it gets the
-  `after_release` tenancy scrub (keeping its `after_connect` statement_timeout
-  hook). Both are commented at their call sites and in `docs/deploy.md` §1c.
+- ~~**PR-15 owes** two pool repoints~~ — **both discharged in PR-15.**
+  `ScopedPool::unscoped_for_maintenance` draws from an attachable maintenance
+  pool (`ScopedPool::with_maintenance_pool`), and the `job_pool` is built by the
+  new `ScopedPool::connect_with_options` so it keeps both the `after_release`
+  scrub and its `after_connect` statement_timeout. See `docs/deploy.md` §1c-bis
+  for the operational surface.
+- **PR-17 owes** the `epigraph-mcp` maintenance wiring PR-15 deliberately left
+  closed. `EpiGraphMcpFull::with_scoped_pool` has zero callers, so
+  `sweep_semantic_duplicates`, `recompute_beliefs` and `backfill_embeddings`
+  currently fail with a clear error. Attaching a `ScopedPool` alone would make
+  it *worse*: the three tools query `self.pool`, so they would mint a privileged
+  viewer and spend it on an application connection — the hybrid PR-15 removed
+  from eleven CLI binaries — turning a hard error into a silent no-op under
+  FORCE. The fix is to move those three tools' queries onto the maintenance
+  connection. Reasoned at `crates/epigraph-mcp/src/maintenance.rs` and pinned as
+  an exemption in `no_unmaintained_dsn.rs`.
+- **PR-17 owes** `GRANT epigraph_maintenance TO epigraph_admin` as a deploy
+  runbook step (no migration), **together with the api job path's table
+  grants**. `epigraph_maintenance` is NOLOGIN and `epigraph_admin` is not a
+  member, so today no non-superuser role both connects and satisfies
+  `epigraph_bypass()`. This is also what blocks the two-role form of PR-15's
+  acceptance — see the note in
+  `crates/epigraph-cli/tests/backfill_idempotence.rs`. The grants half matters
+  because PR-15 moved the api's background job pool onto the maintenance DSN and
+  `assert_maintenance_privilege` probes bypass and row security but **not**
+  table privileges; CI connects as the superuser, so nothing in the suite
+  exercises the role switch.
+- **PR-17 owes** the type-level coupling of a bypass `Viewer` to its
+  `MaintenanceConn` (`D-PR17-maintenance-lease-coupling-is-a-convention`).
+  `MaintenancePool::viewer`, `AppState::maintenance_viewer` and
+  `epigraph_mcp::maintenance::maintenance_viewer` all return an owned `Viewer`
+  whose `MaintenanceLease` drops at return, so a caller can drop the connection
+  and keep a predicate-suppressing viewer. Every call site in the tree binds
+  both; nothing enforces it.
+- **PR-17 owes** a second lint keyed on the HYBRID SHAPE rather than on pool
+  construction (`D-PR17-hybrid-shape-lint`). `no_unmaintained_dsn.rs` fires on a
+  file that *builds* an unmaintained pool; it is blind to a file that builds
+  nothing, mints a bypass viewer, and runs the statement on an injected
+  `PgPool`. Calibration cases: `epigraph-jobs/src/db_reputation_service.rs::get_claim_outcomes`
+  (still has the shape; no production constructor) and
+  `epigraph-api/src/routes/claims.rs::find_claims_needing_embeddings` (had it,
+  fixed in PR-15 by making the repo method executor-generic).
+- **PR-17 owes** an answer on DERIVED-ROW visibility. `ClusterGraphHandler` and
+  `ThemeClusterRebuildHandler` now run on the maintenance DSN with no `Viewer`
+  at all, and they persist rows computed over group-private claims. What
+  `owner_group_id` / `visibility` migration 067's stamping triggers put on those
+  rows, on a bypass connection with no session GUCs, is currently nobody's
+  stated decision. "Derived rows inherit the meet of their inputs' visibility"
+  is the property that needs a test in `rls_enforcement.rs`; no test in PR-15
+  touches it.
 - **PR-16 owes** `REINDEX INDEX CONCURRENTLY idx_claims_world_owned;` after the
   backfill. That index is corpus-sized when migration 066 builds it, because
   `owner_group_id` defaults to the world group; the backfill empties it without

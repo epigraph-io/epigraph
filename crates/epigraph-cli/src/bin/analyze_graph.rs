@@ -12,7 +12,6 @@
 //! ```
 
 use epigraph_engine::{ReasoningClaim, ReasoningEdge, ReasoningEngine};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -21,16 +20,15 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://epigraph:epigraph@localhost:5432/epigraph".to_string());
-
     println!("=== EpiGraph Reasoning Engine Analysis ===\n");
     println!("Connecting to database...");
 
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&database_url)
-        .await?;
+    // Corpus-wide read. It enumerates every claim and every edge and reports
+    // aggregate structure, so on an application connection under FORCE it would
+    // silently analyse only the public subgraph and print a confident,
+    // wrong answer. See `epigraph_cli::MaintenancePool`.
+    let maint = epigraph_cli::MaintenancePool::connect("analyze_graph").await?;
+    let pool = maint.pool().clone();
 
     // -----------------------------------------------------------------------
     // Load claims

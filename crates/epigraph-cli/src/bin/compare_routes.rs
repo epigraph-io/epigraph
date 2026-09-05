@@ -75,6 +75,14 @@ fn shannon_entropy(counts: &[usize]) -> f64 {
 }
 
 async fn load_and_analyze(config: &DbConfig) -> Result<RouteMetrics, Box<dyn std::error::Error>> {
+    // MAINTENANCE-DSN-EXEMPT: dev benchmark against throwaway comparison
+    // databases, never a deployment. `config.url` is built from a hardcoded
+    // loopback base and names `epigraph_route_a`/`_b`/`_c` — databases that
+    // exist only when an operator has just created them by hand for this
+    // comparison, and that never carry tenancy declarations or RLS policies.
+    // It is read-only, it never reads `DATABASE_URL`, and it is not deployed,
+    // so there is no maintenance DSN for it to take. Pinned with this reason in
+    // `crates/epigraph-db/tests/no_unmaintained_dsn.rs`.
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&config.url)

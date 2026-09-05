@@ -42,14 +42,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // CLI maintenance bin: the operator is the authority and the work is
-    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
-    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
-        epigraph_db::visibility::SystemReason::TenancyBackfill,
-    )
-    .await
-    .expect("maintenance viewer");
-    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -60,19 +52,37 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    run(cli, viewer).await
+
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::MaintenancePool`.
+    //
+    // Before PR-15 the bypass viewer came from a `ScopedPool` that was then
+    // discarded, while the `EpiGraphMcpFull` this bin drives was built on a
+    // separate ordinary pool. Under FORCE the pool is what filters, so the
+    // privileged viewer did not save it. The whole ingest now runs on the
+    // maintenance pool.
+    let maint = epigraph_cli::MaintenancePool::connect_to(&cli.database_url, "ingest-document")
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    let (_maint_conn, viewer) = maint
+        .viewer(epigraph_db::visibility::SystemReason::TenancyBackfill)
+        .await
+        .context("mint maintenance viewer")?;
+
+    run(cli, maint.pool().clone(), &viewer).await
 }
 
-async fn run(cli: Cli, viewer: &epigraph_db::visibility::Viewer) -> anyhow::Result<()> {
+async fn run(
+    cli: Cli,
+    pool: sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> anyhow::Result<()> {
     let data = tokio::fs::read_to_string(&cli.file)
         .await
         .with_context(|| format!("cannot read {}", cli.file.display()))?;
     let extraction: DocumentExtraction =
         serde_json::from_str(&data).context("invalid DocumentExtraction JSON")?;
 
-    let pool = epigraph_db::create_pool(&cli.database_url)
-        .await
-        .context("connect target database")?;
     let signer = signer_from_cli(cli.agent_key.as_deref())?;
     let embedder = McpEmbedder::new(pool.clone(), cli.openai_api_key);
     let server = EpiGraphMcpFull::new(pool, signer, embedder, false);

@@ -1211,15 +1211,23 @@ pub async fn find_claims_needing_embeddings(
     // The lease comes from `AppState::maintenance_viewer` rather than being
     // minted here, because `tests/no_bypass_in_handlers.rs` bans the literals
     // `Viewer::system(` and `MaintenanceLease` under `routes/` — correctly.
-    // `_maint_conn` is bound, not dropped: releasing it releases the
-    // maintenance connection the viewer is paired with.
-    let (_maint_conn, viewer) = state
+    //
+    // THE STATEMENT RUNS ON `maint_conn`, NOT ON `state.db_pool`. That is the
+    // whole substance of this call site. A bypass viewer emits no predicate, so
+    // once RLS is active the connection decides what the enumerator sees;
+    // holding the privileged connection and then querying the application pool
+    // would return an empty worklist and HTTP 200 — the silent no-op shape,
+    // with the operator's backfill quietly told there is nothing to embed. It
+    // is also the exact privileged-viewer/ordinary-pool hybrid PR-15 deleted
+    // from the CLI fleet, which is why the repo method takes an executor rather
+    // than a `&PgPool`.
+    let (mut maint_conn, viewer) = state
         .maintenance_viewer(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: e.to_string(),
         })?;
-    let claims = ClaimRepository::find_claims_needing_embeddings(&state.db_pool, &viewer, limit)
+    let claims = ClaimRepository::find_claims_needing_embeddings(&mut *maint_conn, &viewer, limit)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: e.to_string(),

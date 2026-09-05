@@ -51,10 +51,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 
 import psycopg2
+
+from maintenance_dsn import maintenance_dsn
 
 DEFAULT_DATABASE_URL = "postgres://epigraph_dev:epigraph_dev@127.0.0.1:5432/epigraph"
 
@@ -308,7 +309,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(DEFAULT_DATABASE_URL),
     )
     ap.add_argument("--json", action="store_true", help="emit the report as JSON")
     ap.add_argument(

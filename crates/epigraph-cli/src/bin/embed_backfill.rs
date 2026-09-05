@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use epigraph_db::ClaimRepository;
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
@@ -40,28 +40,43 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // CLI maintenance bin: the operator is the authority and the work is
-    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
-    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
-        epigraph_db::visibility::SystemReason::EmbeddingBackfill,
-    )
-    .await
-    .expect("maintenance viewer");
-    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     let cli = Cli::parse();
-    run(cli, viewer).await
+
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::MaintenancePool`.
+    //
+    // Before PR-15 this bin held a bypass `Viewer` minted from a `ScopedPool`
+    // it then discarded, and ran `find_claims_needing_embeddings` and
+    // `store_embedding` on a second, ordinary pool from `--database-url`. The
+    // viewer suppressed the repo-layer predicate; the connection supplied the
+    // RLS-filtered one. Under FORCE that combination silently stops embedding
+    // private claims and reports success.
+    //
+    // `MAINTENANCE_DATABASE_URL` overrides `--database-url` when set; the
+    // database-name guard in `maintenance_database_url` refuses the two if they
+    // disagree.
+    let maint = epigraph_cli::MaintenancePool::connect_to(&cli.database_url, "embed_backfill")
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    let (_maint_conn, viewer) = maint
+        .viewer(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+        .await
+        .context("mint maintenance viewer")?;
+
+    run(cli, maint.pool(), &viewer).await
 }
 
-async fn run(cli: Cli, viewer: &epigraph_db::visibility::Viewer) -> anyhow::Result<()> {
-    let pool = epigraph_db::create_pool(&cli.database_url)
-        .await
-        .context("connect database")?;
-    let rows = ClaimRepository::find_claims_needing_embeddings(&pool, viewer, cli.limit)
+async fn run(
+    cli: Cli,
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> anyhow::Result<()> {
+    let rows = ClaimRepository::find_claims_needing_embeddings(pool, viewer, cli.limit)
         .await
         .context("find claims needing embeddings")?;
 
@@ -83,7 +98,7 @@ async fn run(cli: Cli, viewer: &epigraph_db::visibility::Viewer) -> anyhow::Resu
         match provider.generate(&content).await {
             Ok(embedding) => {
                 let pgvec = format_pgvector(&embedding);
-                match ClaimRepository::store_embedding(&pool, claim_id, &pgvec).await {
+                match ClaimRepository::store_embedding(pool, claim_id, &pgvec).await {
                     Ok(true) => written += 1,
                     Ok(false) => {
                         failed += 1;

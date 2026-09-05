@@ -44,11 +44,15 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
     let cli = Cli::parse();
 
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&cli.database_url)
+    // Retention pruning is corpus-wide and is a DELETE. On an application
+    // connection under FORCE the DELETE matches zero rows, the job exits 0,
+    // and the retention window silently stops being enforced.
+    // See `epigraph_cli::MaintenancePool`.
+    let maint = epigraph_cli::MaintenancePool::connect_to(&cli.database_url, "prune_recall_events")
         .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
         .context("connect to database")?;
+    let pool = maint.pool().clone();
 
     let days = cli
         .retention_days

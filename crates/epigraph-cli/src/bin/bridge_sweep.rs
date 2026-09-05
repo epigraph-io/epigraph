@@ -258,19 +258,16 @@ async fn main() {
         }
     };
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        eprintln!("ERROR: DATABASE_URL must be set");
-        std::process::exit(1);
-    });
-
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&database_url)
+    // Corpus-wide: a sweep that sees a subset of the graph proposes bridges
+    // across a boundary it cannot see, and silently misses the rest.
+    // See `epigraph_cli::MaintenancePool`.
+    let maint = epigraph_cli::MaintenancePool::connect("bridge_sweep")
         .await
         .unwrap_or_else(|e| {
             eprintln!("ERROR: Failed to connect to PostgreSQL: {e}");
             std::process::exit(1);
         });
+    let pool = maint.pool().clone();
 
     let started = std::time::Instant::now();
     let report_result = run_sweep(&pool, &args).await;

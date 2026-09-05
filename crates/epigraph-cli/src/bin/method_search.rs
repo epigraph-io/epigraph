@@ -25,21 +25,29 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    // CLI maintenance bin: the operator is the authority and the work is
-    // corpus-wide. See `epigraph_cli::maintenance_pool_and_viewer`.
-    let (_scoped, viewer) = epigraph_cli::maintenance_pool_and_viewer(
-        epigraph_db::visibility::SystemReason::SchemaContractTest,
-    )
-    .await
-    .expect("maintenance viewer");
-    let viewer = &viewer;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     let args = Args::parse();
-    let exit_code = match run(args, viewer).await {
+
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
+    // bypass and a request handler does not.
+    //
+    // Built AFTER clap has parsed: an argv error must be reported as an argv
+    // error, not as a connection failure. And `_maint_conn` is held for the
+    // whole run — the lease attests to THAT connection, and the pre-PR-15
+    // template dropped it while the viewer lived on.
+    let maint = epigraph_cli::MaintenancePool::connect("method_search")
+        .await
+        .expect("maintenance pool");
+    let (_maint_conn, viewer) = maint
+        .viewer(epigraph_db::visibility::SystemReason::SchemaContractTest)
+        .await
+        .expect("maintenance viewer");
+    let exit_code = match run(args, maint.pool().clone(), &viewer).await {
         Ok(all_filled) => {
             if all_filled {
                 0
@@ -58,9 +66,9 @@ async fn main() {
 /// Returns true if all gaps filled, false if gaps remain.
 async fn run(
     args: Args,
+    pool: sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let pool = epigraph_cli::db_connect().await?;
     let embedder = epigraph_cli::embedding_service()
         .ok_or("OPENAI_API_KEY not set — embeddings required for method_search ingestion")?;
 

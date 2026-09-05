@@ -936,12 +936,34 @@ async fn handle_community(client: &Client, base: &str, action: CommunityCmd) -> 
 // MIGRATE HANDLERS (direct DB connection)
 // =============================================================================
 
+/// The one pool constructor the five `dekg migrate` subcommands share.
+///
+/// Every one of them is a corpus-wide integrity check or a bulk write
+/// (`bootstrap-masses`, `materialize-edges`, `auto-frames`), so all five are
+/// maintenance work in the sense `epigraph_cli::MaintenancePool` documents.
+/// Before PR-15 each spelled its own `sqlx::PgPool::connect(&db_url)`, which
+/// made this file the workspace's worst instance of the "second, unconverted
+/// pool construction" failure — converting four of five would have read green.
+/// One function, five call sites, and
+/// `crates/epigraph-db/tests/no_unmaintained_dsn.rs` fails if a sixth
+/// construction reappears.
+///
+/// `MaintenancePool` is not held past this call: the `db_url` argument is the
+/// application DSN and the returned pool is the maintenance one, and no `dekg`
+/// migrate subcommand mints a `Viewer` (none calls a `Viewer`-taking API), so
+/// there is no lease whose lifetime the pool must outlive.
+async fn migrate_pool(db_url: &str) -> Result<sqlx::PgPool> {
+    let maint = epigraph_cli::MaintenancePool::connect_to(db_url, "dekg migrate")
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("Failed to connect to database")?;
+    Ok(maint.pool().clone())
+}
+
 async fn handle_migrate(action: MigrateCmd) -> Result<()> {
     match action {
         MigrateCmd::Validate { db_url } => {
-            let pool = sqlx::PgPool::connect(&db_url)
-                .await
-                .context("Failed to connect to database")?;
+            let pool = migrate_pool(&db_url).await?;
 
             println!("Validating DB integrity...\n");
 
@@ -1033,9 +1055,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
             db_url,
             confidence_scale,
         } => {
-            let pool = sqlx::PgPool::connect(&db_url)
-                .await
-                .context("Failed to connect to database")?;
+            let pool = migrate_pool(&db_url).await?;
 
             println!("Bootstrapping mass functions (confidence_scale={confidence_scale})...\n");
 
@@ -1109,9 +1129,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
         }
 
         MigrateCmd::ExtractAgents { db_url } => {
-            let pool = sqlx::PgPool::connect(&db_url)
-                .await
-                .context("Failed to connect to database")?;
+            let pool = migrate_pool(&db_url).await?;
 
             println!("Agent statistics:\n");
 
@@ -1144,9 +1162,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
         }
 
         MigrateCmd::MaterializeEdges { db_url, dry_run } => {
-            let pool = sqlx::PgPool::connect(&db_url)
-                .await
-                .context("Failed to connect to database")?;
+            let pool = migrate_pool(&db_url).await?;
 
             println!(
                 "Materializing edges from FK references{}...\n",
@@ -1249,9 +1265,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
             use linfa_clustering::KMeans;
             use ndarray::Array2;
 
-            let pool = sqlx::PgPool::connect(&db_url)
-                .await
-                .context("Failed to connect to database")?;
+            let pool = migrate_pool(&db_url).await?;
 
             println!(
                 "Auto-creating frames from claim embeddings{}...\n",
