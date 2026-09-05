@@ -38,7 +38,6 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
             frame_id: None,
             perspective_id: None,
         },
-        None,
     )
     .await
     .expect("get_claim open");
@@ -67,7 +66,6 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
             frame_id: None,
             perspective_id: None,
         },
-        None,
     )
     .await
     .expect("get_claim superseded");
@@ -97,7 +95,7 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
 /// path, and `epigraph-mcp/src/tools/redaction.rs::redact_content_blanks_hash_in_lockstep_with_content`
 /// for the helper all eight call sites go through.
 #[sqlx::test(migrations = "../../migrations")]
-async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
+async fn get_claim_hides_private_content_from_strangers(pool: PgPool) {
     let owner = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, owner, &[], true, None).await;
     let expected_content = format!("test claim {}", claim_id.as_uuid());
@@ -134,7 +132,6 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
                 frame_id: None,
                 perspective_id: None,
             },
-            Some(owner),
         )
         .await
         .expect("get_claim as owner"),
@@ -174,7 +171,6 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
             frame_id: None,
             perspective_id: None,
         },
-        Some(stranger),
     )
     .await;
     match stranger_result {
@@ -190,33 +186,44 @@ async fn get_claim_redacts_private_content_for_strangers(pool: PgPool) {
     }
 }
 
-/// The `content_hash` confirmation oracle stays closed on the branch that still
-/// BLANKS rather than hides.
+/// The read path decides on the row's own tenancy columns, and on nothing else.
 ///
-/// # Why this test had to be written, not just kept
+/// # What this replaces, and why it is a re-point rather than a deletion
 ///
-/// PR-12 rewrote three cases (`get_claim`, `query_claims_by_label`,
-/// `query_claims_redaction`) from "content is `[REDACTED]` and content_hash is
-/// `\"\"`" to "the row is absent". The absence disposition is strictly better —
-/// but it removed every integration-level assertion on the HASH half, while the
-/// blanking code stayed live behind eight `redact_content` call sites. A change
-/// that stopped blanking `content_hash` on a path that still redacts would then
-/// have been caught by nothing above the helper's own unit test.
+/// This case was `get_claim_blanks_the_content_hash_when_it_redacts` through
+/// PR-13. It asserted `content == "[REDACTED]"` and `content_hash == ""`, and
+/// its own message called the first of those a PRECONDITION: *"this must be the
+/// BLANKING branch, not the absence one."* PR-14 deletes the blanking branch, so
+/// that assertion is false by construction.
 ///
-/// # The shape, and why it is realistic rather than contrived
+/// The half it protected — that `content_hash` is an unsalted `BLAKE3(content)`
+/// and so must never be returned beside a body the caller may not read — is now
+/// closed by construction rather than by assertion: no branch returns a claim
+/// WITHOUT its content, so the two fields cannot disagree in any response.
 ///
-/// This is the LEGACY shape: an `ownership` row that predates migration 071 and
-/// was therefore never transcribed. `check_content_access` reads `ownership`
-/// and says Redacted; the tenancy columns still say public so the `Viewer`
-/// admits the row; `get_claim` reaches the blanking branch. It is exactly the
-/// population `epigraph-tenancy-backfill`'s `transcribe_legacy_ownership` arm
-/// exists to clear, reproduced here by disabling the trigger for one INSERT.
+/// The FIXTURE, however, is the only executable statement of a deploy-ordering
+/// constraint, and re-pointing it costs nothing. It constructs a row whose
+/// legacy `ownership` record and whose tenancy columns DISAGREE — the shape
+/// `epigraph-tenancy-backfill`'s `transcribe_legacy_ownership` arm exists to
+/// reconcile, reproduced by suppressing migration 071's write-through trigger
+/// for a single INSERT. Before PR-14 two different stores were consulted on the
+/// way to one answer; after it, exactly one is. This test asserts that
+/// singularity directly: the tenancy columns say readable, so the row is
+/// returned, whatever `ownership` says about it.
 ///
-/// `content_hash = BLAKE3(content)` — returning it for a redacted claim is a
-/// confirmation oracle over the redacted field, which is why the hash must be
-/// blanked in LOCKSTEP with the content and not in a separate branch.
+/// # Reading a failure
+///
+/// If this starts failing with an absence or a blanked field, the read path has
+/// re-acquired a second source of truth. That is a design change, not a bug fix:
+/// state which one in the PR body and update this test in the same commit.
+///
+/// The operational consequence of the singularity is recorded as
+/// `D-PR14-transcription-is-a-deploy-prerequisite` in
+/// `docs/tenancy/progress.json`, and in `docs/deploy.md` and `docs/tenancy.md`:
+/// the transcription pass must complete BEFORE this release rolls, because
+/// afterwards nothing but the columns is consulted.
 #[sqlx::test(migrations = "../../migrations")]
-async fn get_claim_blanks_the_content_hash_when_it_redacts(pool: PgPool) {
+async fn the_read_path_does_not_consult_the_legacy_ownership_table(pool: PgPool) {
     let owner = seed_agent(&pool).await;
     // NOT `seed_agent` twice: it binds a FIXED public key and
     // `agents_public_key_unique` rejects the second call. A stranger needs no
@@ -224,9 +231,10 @@ async fn get_claim_blanks_the_content_hash_when_it_redacts(pool: PgPool) {
     // correct, empty `Scoped` viewer, which is exactly what a stranger is.
     let stranger = Uuid::new_v4();
     let claim_id = seed_claim(&pool, owner, &[], true, None).await;
+    let expected_content = format!("test claim {}", claim_id.as_uuid());
 
-    // The legacy shape: an `ownership` row written while 071's trigger was not
-    // there. The claim's tenancy columns stay ('public', world).
+    // The legacy shape: an `ownership` row written while 071's write-through
+    // trigger was not there. The claim's tenancy columns stay ('public', world).
     sqlx::query("ALTER TABLE ownership DISABLE TRIGGER ownership_transcribe")
         .execute(&pool)
         .await
@@ -253,8 +261,8 @@ async fn get_claim_blanks_the_content_hash_when_it_redacts(pool: PgPool) {
             .expect("read visibility");
     assert_eq!(
         still_public, "public",
-        "precondition: the row must remain viewer-visible, or this test would be \
-         asserting absence again instead of blanking"
+        "precondition: the two stores must actually DISAGREE, or this test is \
+         not exercising the case it was written for"
     );
 
     let server = build_test_server(pool.clone());
@@ -271,24 +279,22 @@ async fn get_claim_blanks_the_content_hash_when_it_redacts(pool: PgPool) {
                 frame_id: None,
                 perspective_id: None,
             },
-            Some(stranger),
         )
         .await
-        .expect("the claim is viewer-visible, so get_claim must RETURN it"),
+        .expect("the tenancy columns admit this row, so get_claim must RETURN it"),
     );
 
     assert_eq!(
         body["content"].as_str().unwrap(),
-        "[REDACTED]",
-        "precondition: this must be the BLANKING branch, not the absence one — \
-         if this fails the test is no longer covering what it claims to cover"
+        expected_content,
+        "the tenancy columns are the sole source of truth on the read path; a \
+         disagreeing `ownership` record must not change the answer"
     );
-    assert_eq!(
-        body["content_hash"].as_str().unwrap(),
-        "",
-        "the content_hash must be blanked in lockstep with the content: \
-         content_hash = BLAKE3(content) is a confirmation oracle for the \
-         redacted field, so leaking it re-exposes what the redaction hid"
+    assert!(
+        !body["content_hash"].as_str().unwrap().is_empty(),
+        "there is no branch left that returns a claim without its content, so \
+         there is none that blanks its hash either — a blank hash here means a \
+         partial-disclosure shape has been reintroduced"
     );
 }
 

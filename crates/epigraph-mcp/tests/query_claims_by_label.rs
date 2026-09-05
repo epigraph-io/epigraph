@@ -44,7 +44,6 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
-        None,
     )
     .await
     .expect("query_claims_by_label default");
@@ -90,7 +89,6 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
-        None,
     )
     .await
     .expect("query_claims_by_label exclude_labels");
@@ -116,7 +114,6 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
-        None,
     )
     .await
     .expect("query_claims_by_label current_only");
@@ -142,7 +139,6 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
-        None,
     )
     .await
     .expect("query_claims_by_label both filters");
@@ -165,12 +161,20 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
 /// `"[REDACTED]"` + a blank hash. Migration 071 transcribes the `ownership` row
 /// into the tenancy columns, so the stranger's `Viewer` now excludes the row
 /// and the result set simply does not contain it — which subsumes both old
-/// assertions and discloses less. The blanking branch and its hash lockstep are
-/// covered where they are still reachable, by
-/// `get_claim.rs::get_claim_blanks_the_content_hash_when_it_redacts` and by
-/// `src/tools/redaction.rs`'s own unit test.
+/// assertions and discloses less.
+///
+/// **CORRECTED AGAIN FOR PR-14.** This paragraph used to close by pointing at
+/// `get_claim.rs::get_claim_blanks_the_content_hash_when_it_redacts` and at
+/// `src/tools/redaction.rs`'s unit test as the places the hash-oracle guard
+/// still lived. PR-14 deleted the branch, so both are gone and the guard is not
+/// re-homed anywhere — it does not need to be. The oracle was that
+/// `content_hash = BLAKE3(content)` unsalted, so returning the hash beside a
+/// blanked body confirms a guessable claim. With no branch that returns a row
+/// WITHOUT its content, no response can carry one field and not the other: the
+/// oracle is closed by construction rather than by an assertion somewhere else.
+/// `epigraph-api/tests/no_redaction_sentinel.rs` keeps it that way.
 #[sqlx::test(migrations = "../../migrations")]
-async fn query_by_label_redacts_private_content_for_strangers(pool: PgPool) {
+async fn query_by_label_hides_private_content_from_strangers(pool: PgPool) {
     let owner = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, owner, &["backlog"], true, None).await;
     let expected_content = format!("test claim {}", claim_id.as_uuid());
@@ -206,7 +210,7 @@ async fn query_by_label_redacts_private_content_for_strangers(pool: PgPool) {
 
     // Owner → full content + real hash.
     let owner_claims = parse_claims(
-        &query_claims_by_label(&server, &owner_viewer, params(), Some(owner))
+        &query_claims_by_label(&server, &owner_viewer, params())
             .await
             .expect("query as owner"),
     );
@@ -232,7 +236,7 @@ async fn query_by_label_redacts_private_content_for_strangers(pool: PgPool) {
         .await
         .expect("resolve stranger viewer");
     let stranger_claims = parse_claims(
-        &query_claims_by_label(&server, &stranger_viewer, params(), Some(stranger))
+        &query_claims_by_label(&server, &stranger_viewer, params())
             .await
             .expect("query as stranger"),
     );

@@ -78,7 +78,6 @@ pub mod mcp_tools;
 pub mod methods;
 #[cfg(test)]
 mod negative_tests;
-pub mod ownership;
 pub mod papers;
 pub mod perspective;
 #[cfg(feature = "db")]
@@ -320,11 +319,6 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/contexts", post(context::create_context))
         .route("/api/v1/frames/:id/refine", post(belief::refine_frame))
-        .route("/api/v1/ownership", post(ownership::assign_ownership))
-        .route(
-            "/api/v1/ownership/:node_id",
-            put(ownership::update_partition),
-        )
         .route("/api/v1/claims/:id/relate", post(edges::relate_claims))
         .route("/api/v1/workflows", post(workflows::store_workflow))
         .route("/api/v1/workflows/ingest", post(workflows::ingest_workflow))
@@ -523,7 +517,9 @@ pub fn create_router(state: AppState) -> Router {
     // with no `AuthContext` ("anonymous pass-through", bearer.rs). That made
     // every route below — verbatim claim text via `/api/v1/search/semantic`
     // and `/api/v1/query/rag`, the ownership ACL itself via
-    // `/api/v1/ownership/:node_id`, up to 5000 raw 1536-d embeddings via
+    // `/api/v1/ownership/:node_id` (a route PR-14 has since deleted outright,
+    // along with the rest of the legacy `ownership` read/declassify surface),
+    // up to 5000 raw 1536-d embeddings via
     // `/api/v1/themes/:id/embeddings` — readable by anyone who could reach the
     // port.
     //
@@ -679,11 +675,6 @@ pub fn create_router(state: AppState) -> Router {
             get(belief::frame_refinements),
         )
         .route("/api/v1/frames/:id/ancestry", get(belief::frame_ancestry))
-        .route("/api/v1/ownership/:node_id", get(ownership::get_ownership))
-        .route(
-            "/api/v1/agents/:id/owned-nodes",
-            get(ownership::owned_nodes),
-        )
         .route(
             "/api/v1/structural-features/:owner_id",
             get(structural::get_structural_features),
@@ -1051,11 +1042,6 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/contexts", post(context::create_context))
         .route("/api/v1/frames/:id/refine", post(belief::refine_frame))
-        .route("/api/v1/ownership", post(ownership::assign_ownership))
-        .route(
-            "/api/v1/ownership/:node_id",
-            put(ownership::update_partition),
-        )
         .route("/api/v1/claims/:id/relate", post(edges::relate_claims))
         // Political network monitoring — write endpoints (non-db stubs)
         .route(
@@ -1191,11 +1177,6 @@ pub fn create_router(state: AppState) -> Router {
             get(belief::frame_refinements),
         )
         .route("/api/v1/frames/:id/ancestry", get(belief::frame_ancestry))
-        .route("/api/v1/ownership/:node_id", get(ownership::get_ownership))
-        .route(
-            "/api/v1/agents/:id/owned-nodes",
-            get(ownership::owned_nodes),
-        )
         .route(
             "/api/v1/structural-features/:owner_id",
             get(structural::get_structural_features),

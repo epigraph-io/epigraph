@@ -61,27 +61,24 @@ use std::path::{Path, PathBuf};
 /// * **Pure-CPU, no DB (2).** `stage_claims` validates strings and takes
 ///   `_server`; `list_mcp_tools` reads the compiled-in manifest. A viewer here
 ///   would be a parameter with nothing to filter.
-/// * **Reads PR-09 did not convert (3), each with a named owner.**
+/// * **Reads PR-09 did not convert (2), each with a named owner.** This was 3
+///   until PR-14 deleted `get_ownership`.
 ///   - `get_workflow_executions` — `behavioral_executions` and `workflows` are
 ///     both outside migration 062's `tier_a` array, so there is no
 ///     `owner_group_id` anywhere on the path and no claim to derive one from.
 ///     A real fix needs a tenancy column, i.e. a migration, and PR-09 is
 ///     code-only. Backlog.
-///   - `get_ownership` — reads the legacy `ownership` table, which **PR-14
-///     deletes** along with `routes/ownership.rs` and MCP `assign_ownership` /
-///     `update_partition`. Filtering a surface that is being removed two PRs
-///     from now is churn. **This is an accepted residual, not a normal shape.**
-///     PR-11 gated the two WRITES on this table and deliberately left the reads
-///     open, and the consequence is worth stating plainly: `get_ownership` (MCP
-///     and HTTP) and HTTP `owned_nodes` disclose `owner_id` — the exact field the
-///     new write gate's decision turns on — to any authenticated caller, so the
-///     read side is a free oracle for the write gate's input, and `owned_nodes`
-///     enumerates which of an arbitrary agent's nodes are `private`. The
-///     available predicate is `owner_id = viewer.principal()`, which is the same
-///     predicate the gate itself uses; the reason it was not applied is
-///     sequencing (PR-14 deletes this whole surface), not that it is
-///     unavailable. Tracked as `F-PR11-ownership-reads-are-an-owner-oracle` in
-///     `docs/tenancy/progress.json`, owned by PR-14.
+///   - `get_ownership` — **RESOLVED BY DELETION IN PR-14, entry removed.** It
+///     was carried here as an explicitly "accepted residual": it read the
+///     legacy `ownership` table with no `Viewer`, and PR-09/PR-11 declined to
+///     filter a surface already scheduled for removal. The residual it named
+///     was real — that read, its HTTP twin, and HTTP `owned_nodes` disclosed
+///     `owner_id`, which is the field the write gate's own decision turns on.
+///     PR-14 deleted all three surfaces together with the write gate they fed,
+///     so the finding `F-PR11-ownership-reads-are-an-owner-oracle` closes by
+///     removal rather than by filtering — the resolution its own
+///     `suggested_fix` named. Recorded in `docs/tenancy/progress.json` under
+///     `closed_findings`.
 ///   - `theme_cluster` — the corpus-wide `FROM claims` is in
 ///     `epigraph-engine/src/theme_kmeans.rs::run_theme_kmeans`, not in the MCP
 ///     tool, and that function has a second caller: the HTTP twin
@@ -116,8 +113,8 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     // pure-CPU, no DB
     "list_mcp_tools",
     "stage_claims",
-    // reads not converted by PR-09 — see the module doc for the owner of each
-    "get_ownership",
+    // reads not converted by PR-09 — see the module doc for the owner of each.
+    // `get_ownership` was here until PR-14 deleted the tool.
     "get_workflow_executions",
     "theme_cluster",
 ];

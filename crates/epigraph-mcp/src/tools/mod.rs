@@ -27,7 +27,6 @@ pub mod provenance_chain;
 pub mod rdf;
 pub mod recall;
 pub mod recall_events;
-pub mod redaction;
 pub mod sheaf;
 pub mod step_ops;
 pub mod supersede;

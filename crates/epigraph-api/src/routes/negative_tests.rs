@@ -1265,13 +1265,12 @@ mod concurrency_tests {
 mod wrong_scope_with_malformed_body_tests {
     use crate::middleware::bearer::{AuthContext, ClientType};
     use crate::routes::crud::reassign_claim;
-    use crate::routes::ownership::{assign_ownership, update_partition};
     use crate::routes::policies::record_outcome;
     use crate::routes::webhooks::register_webhook;
     use crate::state::{ApiConfig, AppState};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use axum::routing::{post, put};
+    use axum::routing::post;
     use axum::{Extension, Router};
     use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt;
@@ -1321,61 +1320,13 @@ mod wrong_scope_with_malformed_body_tests {
             .unwrap()
     }
 
-    /// Build a PUT request with a body that fails `Json` extraction (see
-    /// [`post_malformed`] for rationale).
-    fn put_malformed(uri: &str) -> Request<Body> {
-        Request::builder()
-            .method("PUT")
-            .uri(uri)
-            .header("content-type", "application/json")
-            .body(Body::from("{}"))
-            .unwrap()
-    }
-
-    // ------------------------------------------------------------------
-    // assign_ownership: claims:admin required → wrong-scope must 403
-    // ------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn assign_ownership_wrong_scope_with_malformed_body_returns_403_not_422() {
-        let router = Router::new()
-            .route("/api/v1/ownership", post(assign_ownership))
-            .layer(Extension(read_only_auth()))
-            .with_state(test_state());
-
-        let resp = router
-            .oneshot(post_malformed("/api/v1/ownership"))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::FORBIDDEN,
-            "wrong-scope token + malformed body must be rejected at the scope gate (403), not at JSON parsing (422)"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // update_partition: claims:admin required → wrong-scope must 403
-    // ------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn update_partition_wrong_scope_with_malformed_body_returns_403_not_422() {
-        let node_id = Uuid::new_v4();
-        let router = Router::new()
-            .route("/api/v1/ownership/:node_id", put(update_partition))
-            .layer(Extension(read_only_auth()))
-            .with_state(test_state());
-
-        let resp = router
-            .oneshot(put_malformed(&format!("/api/v1/ownership/{node_id}")))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::FORBIDDEN,
-            "wrong-scope token + malformed body must return 403, not 422"
-        );
-    }
+    // Two cases covering `assign_ownership` and `update_partition` lived here
+    // until PR-14 deleted both routes. The extractor-ordering property they
+    // pinned — a wrong-scope token plus a malformed body must be rejected by
+    // the scope gate (403), not by JSON parsing (422) — is NOT abandoned: it is
+    // still asserted by the `reassign_claim`, `record_outcome` and
+    // `register_webhook` cases in this same module, which is why these two were
+    // deleted with their handlers rather than retargeted at a surviving route.
 
     // ------------------------------------------------------------------
     // reassign_claim: claims:admin required → wrong-scope must 403

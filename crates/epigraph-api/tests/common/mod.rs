@@ -464,10 +464,12 @@ pub async fn test_bearer_token_with_seeded_client_for_agent(
 /// read-path tests to produce OWNER (agent_id == ownership.owner_id) and
 /// STRANGER (random agent_id) tokens. The production
 /// optional_bearer_auth_middleware accepts the token and injects it as
-/// `AuthContext`; the redaction handlers (`get_claim`, `list_claims`) derive
-/// the requester from `auth_ctx.agent_id` (falling back to `client_id`), NOT
-/// the query-string `agent_id`, so this token — and only this token — drives
-/// the OWNER (Full) vs STRANGER (Redacted) distinction.
+/// `AuthContext`; `ViewerExtractor` resolves the `Viewer` from
+/// `auth_ctx.agent_id`, NOT from the query-string `agent_id`, so this token —
+/// and only this token — drives the OWNER (row visible) vs STRANGER (row
+/// absent) distinction. Before PR-14 the same token drove a Full-vs-Redacted
+/// distinction in a post-fetch pass; the pass is gone and the decision is now
+/// made by the read itself.
 #[allow(
     dead_code,
     reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
@@ -495,7 +497,7 @@ pub fn mint_token_with_agent(scopes: &[&str], agent_id: Uuid) -> String {
 /// `FrameRepository::get_by_id` (called by `frame_claims_sorted` to verify the
 /// frame exists) SELECTs it on every read. The shared `epigraph_db_repo_test`
 /// DB may predate migration 044, so without the column `get_by_id` errors →
-/// HTTP 500 *before* the handler reaches the redaction branch — silently
+/// HTTP 500 *before* the handler reaches the visibility-filtered read — silently
 /// turning the A3 `frame_claims_sorted` regression guard RED. `IF NOT EXISTS`
 /// makes it a no-op on a DB where 044 has already run.
 #[allow(
@@ -544,9 +546,22 @@ pub async fn seed_frame_with_claim(pool: &PgPool, claim_id: Uuid) -> Uuid {
 }
 
 /// Mark `node_id` (a claim) as a `private` partition owned by `owner_id`.
-/// `check_content_access` returns Full only to a requester equal to
-/// `owner_id`; everyone else gets Redacted. `node_type` is NOT NULL with a
-/// CHECK constraint, so it must be 'claim'. Create the claim first with
+///
+/// **What this helper does changed under the fixture's feet, twice.** It writes
+/// an `ownership` row, and it always has. Until PR-12 that row was consulted
+/// only by `check_content_access`, which returned Full to `owner_id` and
+/// Redacted to everyone else, while `claims.visibility` stayed `'public'`.
+/// Migration 071 made the write a WRITE-THROUGH: the `ownership_transcribe`
+/// trigger stamps the claim's tenancy columns to `('group', <owner's personal
+/// group>)` in the same statement. PR-14 then deleted `check_content_access`,
+/// so the trigger's effect is the whole mechanism.
+///
+/// Read it as: this seeds a row that `owner_id`'s `Viewer` admits and a
+/// stranger's `Viewer` excludes. It no longer sets up a redaction decision;
+/// there is no decision, only a predicate on the read.
+///
+/// `node_type` is NOT NULL with a CHECK constraint, so it must be 'claim'.
+/// Create the claim first with
 /// `seed_claim_with_agent(pool, content, owner_id)` so the owner agent row
 /// exists.
 #[allow(
@@ -571,10 +586,13 @@ pub async fn seed_private_ownership(pool: &PgPool, node_id: Uuid, owner_id: Uuid
 ///
 /// The counterpart to [`seed_private_ownership`] for the arm that, until PR-05,
 /// NO test in this repository exercised — every fixture in the suite wrote
-/// `'private'`. `check_content_access` returns Full only to a requester whose
-/// agent owns a perspective in `community_id` (a two-hop join through
-/// `community_members`), and Redacted to everyone else including an anonymous
-/// requester. Pass `None` for `community_id` to reach the owner-only fallback.
+/// `'private'`. Until PR-14, `check_content_access` returned Full only to a
+/// requester whose agent owns a perspective in `community_id` (a two-hop join
+/// through `community_members`) and Redacted to everyone else. That pass is
+/// deleted: 071's `ownership_transcribe` trigger now projects the community
+/// onto the claim's tenancy columns and the `Viewer` decides, so a non-member
+/// gets an ABSENCE rather than a placeholder. Pass `None` for `community_id` to
+/// reach the owner-only fallback.
 ///
 /// Writes `community_id`, NEVER `encryption_key_id`. Before migration 068 the
 /// gating community lived stringified in `encryption_key_id`, a `text` column
@@ -609,11 +627,15 @@ pub async fn seed_community_ownership(
     .expect("seed community ownership");
 }
 
-/// Create a community and put `agent` in it the ONLY way
-/// `check_content_access` recognises: via a perspective the agent owns.
+/// Create a community and put `agent` in it the ONLY way the community
+/// projection recognises: via a perspective the agent owns.
 ///
 /// The community arm is a two-hop join — `community_members ⋈ perspectives ON
-/// p.owner_agent_id` — not a direct agent membership table. A fixture that
+/// p.owner_agent_id` — not a direct agent membership table. This was
+/// `check_content_access`'s join until PR-14 deleted it; PR-12's community
+/// projection (which feeds `Viewer::resolve`'s group set) uses the same two
+/// hops, so the fixture's shape is unchanged and its reason is not. A fixture
+/// that
 /// inserted a `community_members` row without an owning perspective would
 /// produce a community the agent is "in" and still cannot read from.
 ///

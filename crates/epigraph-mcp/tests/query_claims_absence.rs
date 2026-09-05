@@ -1,23 +1,35 @@
-//! Discriminating redaction regression for the BATCH read path (A3 §7.5,
-//! Task 11). `query_claims` uses `batch_check_content_access` + a per-id
+//! Discriminating per-row regression for the BATCH read path (A3 §7.5).
+//!
+//! NAME NOTE: this file was `query_claims_redaction.rs` through PR-13; PR-14
+//! deleted redaction, so the name described a behaviour that no longer exists.
+//!
+//! `query_claims` used to run `batch_check_content_access` + a per-id
 //! `access_map` lookup — a DIFFERENT code path from the singular `get_claim`
-//! check. Its distinctive failure mode is a *mispairing*: the access decision
-//! landing on the wrong claim's content. That failure mode literally cannot
-//! occur with a single claim, so this test seeds TWO claims with DIFFERENT
-//! access (one public, one private-owned-by-a-stranger), queries as a
-//! non-owner, and asserts each claim gets ITS OWN decision:
+//! check — whose distinctive failure mode was a *mispairing*: the access
+//! decision landing on the wrong claim's content. PR-14 deleted that second
+//! pass; the filtering is now a `Viewer` predicate inside
+//! `ClaimRepository::list_by_truth_range`, which cannot mispair because there
+//! is no separate decision to pair. **This test is kept anyway, and it is not
+//! vacuous**: it is now the assertion that the SET is filtered per row rather
+//! than all-or-nothing, which is the failure mode a single-claim test cannot
+//! see and which a viewer that matched nothing would exhibit.
+//!
+//! It seeds TWO claims with DIFFERENT visibility (one public, one
+//! private-owned-by-a-stranger), queries as a non-owner, and asserts each claim
+//! gets ITS OWN disposition:
 //!
 //! - the public claim → full content + real content_hash
 //! - the private claim → ABSENT from the result set
 //!
-//! **CORRECTED FOR PR-12.** The private claim's required disposition used to be
-//! `"[REDACTED]"` content + blank content_hash. Migration 071 transcribes the
-//! `ownership` row into the tenancy columns, so the non-owner's `Viewer`
-//! excludes it outright. The per-row discrimination this file exists to test is
-//! UNCHANGED — a zip/order mispairing still swaps the two decisions and still
-//! fails — but the private half is now an absence assertion. The blank-hash
-//! oracle guard lives on the branch that still blanks:
-//! `get_claim.rs::get_claim_blanks_the_content_hash_when_it_redacts`.
+//! **CORRECTED FOR PR-12, THEN PR-14.** The private claim's required
+//! disposition was once `"[REDACTED]"` content + blank content_hash; migration
+//! 071 made the non-owner's `Viewer` exclude it outright, and PR-14 removed the
+//! blanking branch entirely. The blank-hash confirmation-oracle guard that
+//! `get_claim.rs::get_claim_blanks_the_content_hash_when_it_redacts` used to
+//! provide is not re-homed anywhere, and does not need to be: `content_hash`
+//! is `BLAKE3(content)`, and with no branch that returns a row without its
+//! content there is no longer a response in which the two can disagree. The
+//! oracle is closed by construction rather than by assertion.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -34,7 +46,7 @@ mod common;
 use common::build_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn query_claims_redacts_only_the_private_claim_per_id(pool: PgPool) {
+async fn query_claims_hides_only_the_private_claim_per_id(pool: PgPool) {
     let public_owner = seed_agent(&pool).await;
     let private_owner = seed_agent(&pool).await;
 
@@ -73,7 +85,6 @@ async fn query_claims_redacts_only_the_private_claim_per_id(pool: PgPool) {
             max_truth: Some(1.0),
             limit: Some(50),
         },
-        Some(stranger),
     )
     .await
     .expect("query_claims as stranger");

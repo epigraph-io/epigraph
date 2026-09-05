@@ -1,7 +1,6 @@
 use axum::{extract::State, Json};
 use serde::Deserialize;
 
-use crate::access_control::{check_content_access, ContentAccess};
 use crate::errors::ApiError;
 use crate::query_parser::{parse_gql, EdgeDirection, GqlQuery, Operator, ReturnClause, Value};
 use crate::routes::edges::FullGraphResponse;
@@ -23,14 +22,8 @@ pub async fn execute_graph_query(
     // so both of its subgraph loads returned unfiltered claim content.
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<GraphQueryRequest>,
 ) -> Result<Json<FullGraphResponse>, ApiError> {
-    // SECURITY (A3): redact on the authenticated requester, not request.agent_id.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-
     // 1. Parse GQL
     let ast: GqlQuery = parse_gql(&request.query).map_err(|e| ApiError::ValidationError {
         field: "query".to_string(),
@@ -239,8 +232,9 @@ pub async fn execute_graph_query(
             }));
         }
 
-        let mut resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
-        apply_partition_filter(pool, &mut resp, requester).await;
+        // No `apply_partition_filter`: `load_subgraph` is spliced with
+        // `&viewer`, so a claim node the caller may not read is not in `resp`.
+        let resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
         Ok(resp)
     } else {
         let sql = format!(
@@ -282,26 +276,10 @@ pub async fn execute_graph_query(
             }));
         }
 
-        let mut resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
-        apply_partition_filter(pool, &mut resp, requester).await;
+        // No `apply_partition_filter`: `load_subgraph` is spliced with
+        // `&viewer`, so a claim node the caller may not read is not in `resp`.
+        let resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
         Ok(resp)
-    }
-}
-
-/// Redact content of claim nodes that the requester cannot access.
-#[cfg(feature = "db")]
-async fn apply_partition_filter(
-    pool: &sqlx::PgPool,
-    resp: &mut Json<FullGraphResponse>,
-    requester_agent_id: Option<Uuid>,
-) {
-    for node in &mut resp.nodes {
-        if node.entity_type == "claim" {
-            let access = check_content_access(pool, node.id, requester_agent_id).await;
-            if access == ContentAccess::Redacted {
-                node.label = "[REDACTED]".to_string();
-            }
-        }
     }
 }
 

@@ -1158,6 +1158,168 @@ async fn seed_belief_at_evidence(pool: &PgPool, claim: Uuid, tag: &str) -> Uuid 
     id
 }
 
+/// The PR-14 twin of [`evidence_as_of_hides_private_evidence_and_private_edges_from_a_stranger`],
+/// for the statement PR-14 introduced.
+///
+/// `EvidenceRepository::by_relationship_for_claim` — which backs
+/// `GET /api/v1/claims/:id/{supporting,contradicting}-evidence` — carries TWO
+/// independent markers, `{VISIBILITY:ev}` on the evidence row and
+/// `{EDGE_VISIBILITY:ed}` on the join. Its only other exercise,
+/// `read_path_authz_test.rs::supporting_evidence_stranger_token_spoofed_owner_sees_empty_owner_sees_evidence`,
+/// privatises a single CLAIM — after which 070's arm (c) stamps the evidence row
+/// and PR-13's meet stamps the edge, so both markers go private together and
+/// either one alone would produce the observed empty list. Deleting a marker
+/// would leave that test green.
+///
+/// So this seeds the two kinds of private row SEPARATELY, on a PUBLIC claim, in
+/// the shape the sibling test above already established as the standard for a
+/// two-marker statement. The `{VISIBILITY:ev}` half is the one that matters when
+/// an evidence row and its edge diverge.
+///
+/// The third row is the non-vacuity control: without it a filter that matched
+/// nothing at all would satisfy both negative assertions.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supporting_evidence_filters_the_evidence_row_and_the_edge_independently(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "supev-markers").await;
+    // PUBLIC claim: the stranger is not stopped at the claim, so the two markers
+    // are the only thing that can withhold anything.
+    let claim = fixture::seed_public_claim(&pool, agent, "supev public claim").await;
+    let owner = Viewer::resolve(&pool, agent).await.expect("owner viewer");
+    let stranger = fixture::public_viewer(&pool).await;
+
+    let private_evidence = seed_supporting_evidence(&pool, claim, "private-evidence").await;
+    let private_edge_evidence = seed_supporting_evidence(&pool, claim, "private-edge").await;
+    let public_evidence = seed_supporting_evidence(&pool, claim, "public-control").await;
+
+    // `{VISIBILITY:ev}` alone withholds this one: the edge is world-readable,
+    // the body is not.
+    sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $1 WHERE id = $2")
+        .bind(group)
+        .bind(private_evidence)
+        .execute(&pool)
+        .await
+        .expect("privatise evidence row");
+
+    // `{EDGE_VISIBILITY:ed}` alone withholds this one: the body is
+    // world-readable, but the fact that it SUPPORTS this claim is not.
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $1 \
+         WHERE source_id = $2 AND target_id = $3",
+    )
+    .bind(group)
+    .bind(private_edge_evidence)
+    .bind(claim)
+    .execute(&pool)
+    .await
+    .expect("privatise edge row");
+
+    let owner_rows =
+        EvidenceRepository::by_relationship_for_claim(&pool, &owner, claim, "SUPPORTS")
+            .await
+            .expect("owner supporting evidence");
+    let owner_ids: Vec<Uuid> = owner_rows.iter().map(|r| r.evidence_id).collect();
+    for expected in [private_evidence, private_edge_evidence, public_evidence] {
+        assert!(
+            owner_ids.contains(&expected),
+            "the owner must see every row on its own claim; got {owner_ids:?}"
+        );
+    }
+
+    let stranger_rows =
+        EvidenceRepository::by_relationship_for_claim(&pool, &stranger, claim, "SUPPORTS")
+            .await
+            .expect("stranger supporting evidence");
+    let stranger_ids: Vec<Uuid> = stranger_rows.iter().map(|r| r.evidence_id).collect();
+    assert!(
+        stranger_ids.contains(&public_evidence),
+        "the stranger must still see the public control row — otherwise this \
+         test cannot tell a working filter from a broken join; got {stranger_ids:?}"
+    );
+    assert!(
+        !stranger_ids.contains(&private_evidence),
+        "a stranger must not receive group-private evidence content \
+         ({{VISIBILITY:ev}}); got {stranger_ids:?}"
+    );
+    assert!(
+        !stranger_ids.contains(&private_edge_evidence),
+        "a stranger must not learn that {private_edge_evidence} supports this \
+         claim through a group-private edge ({{EDGE_VISIBILITY:ed}}); \
+         got {stranger_ids:?}"
+    );
+
+    // `detail_by_id` — `GET /api/v1/evidence/:id` — carries the single
+    // `{VISIBILITY:e}` marker and its own §8.5 obligation: a row the viewer
+    // cannot read must be `None`, the same value a nonexistent id yields. The
+    // parent claim here is PUBLIC, so this is the case the OLD gate got wrong
+    // in the other direction: it decided on the claim reached through an
+    // arbitrary `LIMIT 1` edge, and would have disclosed private evidence
+    // hanging off a public claim.
+    assert!(
+        EvidenceRepository::detail_by_id(&pool, &owner, private_evidence)
+            .await
+            .expect("owner detail")
+            .is_some(),
+        "the owner must be able to read its own evidence row"
+    );
+    assert!(
+        EvidenceRepository::detail_by_id(&pool, &stranger, private_evidence)
+            .await
+            .expect("stranger detail")
+            .is_none(),
+        "a stranger must get None for group-private evidence even when the \
+         claim it hangs off is public"
+    );
+    assert!(
+        EvidenceRepository::detail_by_id(&pool, &stranger, public_evidence)
+            .await
+            .expect("stranger detail control")
+            .is_some(),
+        "the stranger must still read the public control row — without this the \
+         two assertions above pass on a query that returns nothing at all"
+    );
+}
+
+/// One evidence row plus the `SUPPORTS` edge `by_relationship_for_claim` walks.
+///
+/// The edge direction is evidence → claim (`source_type='evidence'`,
+/// `target_type='claim'`), which is the OPPOSITE of the `DERIVED_FROM` edges
+/// `claim_provenance` follows; getting it backwards yields an empty result for
+/// everyone and a test that cannot fail.
+async fn seed_supporting_evidence(pool: &PgPool, claim: Uuid, tag: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO evidence (id, claim_id, evidence_type, raw_content, content_hash, properties) \
+         VALUES ($1, $2, 'observation', $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(claim)
+    .bind(format!("{tag} body"))
+    .bind(
+        id.as_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(32)
+            .collect::<Vec<u8>>(),
+    )
+    .bind(serde_json::json!({ "strength": 0.6 }))
+    .execute(pool)
+    .await
+    .expect("seed evidence");
+
+    sqlx::query(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship) \
+         VALUES ($1, $2, 'evidence', 'claim', 'SUPPORTS')",
+    )
+    .bind(id)
+    .bind(claim)
+    .execute(pool)
+    .await
+    .expect("seed SUPPORTS edge");
+
+    id
+}
+
 /// `load_subgraph` must never return an edge naming a node it withheld.
 ///
 /// It used to fetch edges FIRST, over the caller's raw id set, and never
@@ -1239,9 +1401,12 @@ async fn load_subgraph_never_returns_an_edge_naming_a_withheld_node(pool: PgPool
 ///
 /// That satisfied acceptance criterion #1 *syntactically* — the extractor is
 /// present — while leaking, which is the exact `frame_claims_sorted` shape the
-/// criterion's own lint says it exists to catch. `hypothesis.rs` contains zero
-/// `check_content_access` calls, so the register's stated compensating control
-/// did not exist here either.
+/// criterion's own lint says it exists to catch. `hypothesis.rs` contained zero
+/// `check_content_access` calls, so the register's then-stated compensating
+/// control did not exist here either — and PR-14 has since deleted that
+/// function outright, so it exists nowhere. See
+/// `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS`, which still
+/// carries `hypothesis.rs`.
 ///
 /// This is HTTP-level rather than repo-level for the same reason as the two
 /// guards above: the defect lived in the handler, not in a repo function, so a

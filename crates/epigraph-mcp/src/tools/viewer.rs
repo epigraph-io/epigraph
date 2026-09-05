@@ -117,7 +117,22 @@ use crate::server::EpiGraphMcpFull;
 /// stdio arm cannot establish the server's own agent row. Returns an MCP
 /// invalid-request error when an HTTP `AuthContext` carries no `agent_id` — a
 /// token with no agent principal has no read authority under plan §0.1's D3.
-pub(crate) async fn request_viewer(
+///
+/// # Visibility
+///
+/// `pub`, not `pub(crate)`, since PR-14, and only so that an INTEGRATION test
+/// can drive the stdio arm through the real function. `tests/read_path_absence.rs`
+/// previously modelled that arm by resolving a viewer from the literal
+/// `server.agent_id()`, which is the value the arm produces — so the test
+/// confirmed its own fixture and would have passed if the arm stopped producing
+/// it. A test that cannot fail when its subject changes is not coverage.
+///
+/// This is not an invitation to acquire a viewer somewhere new.
+/// `tests/tool_viewer_coverage.rs::viewer_acquisition_lives_in_server_rs_not_in_the_tool_modules`
+/// still asserts that `viewer.rs` is the ONLY file under `src/tools/` naming
+/// this function, and every production call site remains a `#[tool]` body in
+/// `server.rs`.
+pub async fn request_viewer(
     server: &EpiGraphMcpFull,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<Viewer, McpError> {

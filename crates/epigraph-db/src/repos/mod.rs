@@ -95,7 +95,9 @@ pub use edge::EdgeRepository;
 pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
 pub use event::{EventRepository, EventRow};
-pub use evidence::{EvidenceAtTimeRow, EvidenceRepository, EvidenceSearchResult};
+pub use evidence::{
+    EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceRepository, EvidenceSearchResult,
+};
 pub use experiment::{
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
 };

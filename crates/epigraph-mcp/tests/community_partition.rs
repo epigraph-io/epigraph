@@ -104,7 +104,7 @@ async fn community_member_via_perspective_sees_content(pool: PgPool) {
 // with case 1 against the same fixture shape, this is what proves the
 // membership join is load-bearing rather than always-true.
 #[sqlx::test(migrations = "../../migrations")]
-async fn community_non_member_is_redacted(pool: PgPool) {
+async fn community_non_member_cannot_see_the_claim(pool: PgPool) {
     let owner = seed_agent(&pool).await;
     let member = seed_agent(&pool).await;
     let outsider = seed_agent(&pool).await;
@@ -131,7 +131,7 @@ async fn community_non_member_is_redacted(pool: PgPool) {
 // authority") applies to the community arm too, and nothing had asserted it
 // here.
 #[sqlx::test(migrations = "../../migrations")]
-async fn community_anonymous_requester_is_redacted(pool: PgPool) {
+async fn community_anonymous_requester_cannot_see_the_claim(pool: PgPool) {
     let owner = seed_agent(&pool).await;
     let community = seed_community(&pool).await;
     // Make the owner a member, so the ONLY reason to redact is anonymity.
@@ -194,7 +194,7 @@ async fn community_row_with_null_community_id_falls_back_to_owner_only(pool: PgP
 // which would silently widen access for every community node whose owner is not
 // a member. Asserted explicitly so that change has to be argued.
 #[sqlx::test(migrations = "../../migrations")]
-async fn community_owner_who_is_not_a_member_is_redacted(pool: PgPool) {
+async fn community_owner_who_is_not_a_member_cannot_see_the_claim(pool: PgPool) {
     let owner = seed_agent(&pool).await;
     let member = seed_agent(&pool).await;
     let community = seed_community(&pool).await;
@@ -256,7 +256,6 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
             max_truth: Some(1.0),
             limit: Some(50),
         },
-        Some(member),
     )
     .await
     .expect("query_claims");
@@ -468,41 +467,69 @@ async fn a_community_id_on_a_private_partition_is_refused(pool: PgPool) {
     assert_eq!(rows, 0);
 }
 
-// ── 10. A FAILED ownership lookup redacts; it does not publish ─────────────
+// ── 10. A FAILED lookup REFUSES; it does not publish (D1) ─────────────────
 //
-// `check_content_access` used to end its lookup with `.unwrap_or(None)`, and
-// `None` is the sentinel for "no ownership row -> public". Every transient
-// database failure — pool exhaustion, a statement timeout, a reset connection,
-// or a binary rolled ahead of migration 068 so `ownership.community_id` does
-// not exist yet — therefore returned FULL CONTENT for a private or
-// community-gated claim. `EPIGRAPH_MIGRATE_ON_BOOT` is default-off, so the
-// schema-skew case is operator-reachable rather than theoretical, and the MCP
-// server has no startup probe that would catch it.
+// PR-14 RETARGETED, NOT DELETED. The original case pinned the D1 archetype in
+// `check_content_access`, which ended its ownership lookup with
+// `.unwrap_or(None)` — and `None` was the sentinel for "no ownership row =>
+// public". Every transient database failure (pool exhaustion, statement
+// timeout, reset connection, or a binary rolled ahead of its migration)
+// therefore returned FULL CONTENT for a private claim. That function is gone,
+// so the original assertion has no subject.
 //
-// A closed pool is the cheapest way to make the query return `Err` and not
-// `Ok(None)`, which is exactly the distinction under test.
+// The property is NOT gone, and this is where it now lives. Visibility is
+// decided by a `Viewer` predicate inside the repo statement, and a repo read
+// returns `Result<_, DbError>`. There is no value in that type which means
+// "public": a failure is an `Err` the caller must handle, not a sentinel that
+// silently widens. This case proves that empirically on the same cheap
+// failure injection the original used — a closed pool — because "we changed the
+// shape so the bug is impossible" is exactly the kind of claim that deserves a
+// test rather than a comment.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_failed_ownership_lookup_redacts(pool: PgPool) {
-    use epigraph_db::access_control::{check_content_access, ContentAccess};
-
+async fn a_failed_read_refuses_rather_than_publishing(pool: PgPool) {
     let owner = seed_agent(&pool).await;
     let community = seed_community(&pool).await;
     let claim_id = seed_claim(&pool, owner).await;
     seed_community_ownership(&pool, claim_id, owner, Some(community)).await;
 
-    // Control: while the pool works, the owner-less stranger is Redacted and
-    // the row is genuinely present — so the assertion below is about the ERROR
-    // path and not about a missing fixture.
-    let control = check_content_access(&pool, claim_id.as_uuid(), Some(owner)).await;
-    assert_eq!(control, ContentAccess::Redacted);
+    let stranger = Uuid::new_v4();
+    let stranger_viewer = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
+        .await
+        .expect("resolve stranger viewer");
+
+    // Control: while the pool works the read SUCCEEDS and returns nothing for
+    // the stranger. Both halves matter — this is what distinguishes the error
+    // path below from a fixture that was simply never visible.
+    let control = epigraph_db::ClaimRepository::get_by_id(&pool, &stranger_viewer, claim_id)
+        .await
+        .expect("a working pool must not error");
+    assert!(
+        control.is_none(),
+        "control: a community claim the stranger is not a member of must be absent"
+    );
+
+    // And the owner CAN read it, so the fixture is genuinely present rather
+    // than absent for everybody (Class P — a mechanism that returns nothing to
+    // anybody would pass the assertion above).
+    let owner_viewer = epigraph_db::visibility::Viewer::resolve(&pool, owner)
+        .await
+        .expect("resolve owner viewer");
+    assert!(
+        epigraph_db::ClaimRepository::get_by_id(&pool, &owner_viewer, claim_id)
+            .await
+            .expect("a working pool must not error")
+            .is_some(),
+        "control: the owner must be able to read the claim, or the absence \
+         above proves nothing about tenancy"
+    );
 
     pool.close().await;
-    let broken = check_content_access(&pool, claim_id.as_uuid(), Some(owner)).await;
-    assert_eq!(
-        broken,
-        ContentAccess::Redacted,
-        "a query error must FAIL CLOSED. `Err` is not `Ok(None)`, and only `Ok(None)` \
-         means 'no ownership row, therefore public'."
+    let broken = epigraph_db::ClaimRepository::get_by_id(&pool, &owner_viewer, claim_id).await;
+    assert!(
+        broken.is_err(),
+        "a query error must surface as `Err`, never as a value the caller can \
+         mistake for an answer. The deleted `check_content_access` laundered \
+         exactly this `Err` into `Ok(None)` and then read `None` as 'public'."
     );
 }
 
@@ -608,7 +635,6 @@ async fn get_claim_as(
             frame_id: None,
             perspective_id: None,
         },
-        requester,
     )
     .await
     .expect("get_claim");
@@ -636,7 +662,6 @@ async fn assert_claim_absent_for(
             frame_id: None,
             perspective_id: None,
         },
-        requester,
     )
     .await;
     match result {
