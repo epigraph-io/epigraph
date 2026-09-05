@@ -41,6 +41,8 @@ import psycopg2.extras
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _api_client import EpiGraphClient
 
+from maintenance_dsn import maintenance_dsn
+
 DEFAULT_DATABASE_URL = (
     "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
 )
@@ -321,7 +323,7 @@ def anchor_worker(claim: dict, args: argparse.Namespace, api: EpiGraphClient) ->
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--database-url", default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL))
+    ap.add_argument("--database-url", default=maintenance_dsn(DEFAULT_DATABASE_URL))
     ap.add_argument("--layer", choices=["textbook", "review", "both"], default="both")
     ap.add_argument("--level", type=int, default=3, help="Paper claim level to anchor (default 3 = atoms).")
     ap.add_argument("--top-k", type=int, default=8)

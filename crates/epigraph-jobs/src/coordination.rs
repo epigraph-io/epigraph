@@ -119,10 +119,9 @@ pub async fn apply_job_connection_settings(
     conn: &mut PgConnection,
     statement_timeout: Duration,
 ) -> Result<(), sqlx::Error> {
-    // `SET` cannot be parameterized; the value is our own (not user input).
-    let ms = statement_timeout.as_millis();
-    sqlx::query(&format!("SET statement_timeout = {ms}"))
-        .execute(conn)
-        .await?;
-    Ok(())
+    // One definition of the statement, in `epigraph_db::apply_statement_timeout`,
+    // so this hook and `ScopedPoolOptions::statement_timeout` (which PR-15 added
+    // so the job pool could be built through `ScopedPool` and keep its scrub)
+    // are provably issuing the same `SET`.
+    epigraph_db::apply_statement_timeout(conn, statement_timeout).await
 }

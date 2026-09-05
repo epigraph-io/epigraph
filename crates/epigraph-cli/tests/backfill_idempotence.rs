@@ -29,11 +29,31 @@ const WORLD: Uuid = Uuid::nil();
 const BIN: &str = env!("CARGO_BIN_EXE_epigraph-tenancy-backfill");
 
 /// Run the binary against `pool`'s database. Returns `(exit_code, stderr)`.
+///
+/// **Both DSN variables are set explicitly.** PR-15 taught this binary to
+/// prefer `MAINTENANCE_DATABASE_URL`, and `Command::env` adds to the parent
+/// environment rather than replacing it — so an inherited value would point the
+/// subprocess at a different database than the `#[sqlx::test]` template just
+/// seeded, and every assertion here would pass or fail for reasons unrelated to
+/// the code. Setting it also means the ordinary path through these tests
+/// exercises the *configured* maintenance DSN rather than the WARN fallback.
 async fn run_backfill(pool: &PgPool, args: &[&str]) -> (i32, String) {
+    let url = fixture::database_url_for(pool).await;
+    run_backfill_with_maintenance_dsn(pool, args, &url).await
+}
+
+/// [`run_backfill`] with an explicit `MAINTENANCE_DATABASE_URL`, so the
+/// database-name guard can be exercised through the real binary.
+async fn run_backfill_with_maintenance_dsn(
+    pool: &PgPool,
+    args: &[&str],
+    maintenance_url: &str,
+) -> (i32, String) {
     let url = fixture::database_url_for(pool).await;
     let out = Command::new(BIN)
         .args(args)
         .env("DATABASE_URL", &url)
+        .env("MAINTENANCE_DATABASE_URL", maintenance_url)
         // Quiet: these tests care about exit codes and database state, and the
         // binary's INFO logging is per-batch.
         .env("RUST_LOG", "warn")
@@ -43,6 +63,44 @@ async fn run_backfill(pool: &PgPool, args: &[&str]) -> (i32, String) {
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// A claim that IS declared: owned by a real group and not public.
+///
+/// `claims.visibility` in this tree is `public | group` (migration 062's
+/// `claims_visibility_check`), not `public | private` as the plan's prose says,
+/// and `claims_group_needs_real_group` forbids `visibility = 'group'` on a
+/// world- or dead-owned row. So a "private undeclared" row is not constructible
+/// here at all — a non-public row is by construction already owned.
+async fn seed_group_private_claim(pool: &PgPool, agent: Uuid, group: Uuid, content: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let mut hash = vec![0u8; 32];
+    for (i, b) in content.as_bytes().iter().enumerate() {
+        hash[i % 32] ^= *b;
+    }
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             owner_group_id, visibility) \
+         VALUES ($1, $2, $3, 0.8, $4, true, $5, 'group')",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(&hash)
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed group-private claim");
+    id
+}
+
+/// `(owner_group_id, visibility)` for one claim.
+async fn tenancy_of(pool: &PgPool, id: Uuid) -> (Uuid, String) {
+    sqlx::query_as("SELECT owner_group_id, visibility::text FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read tenancy")
 }
 
 /// A claim naming neither tenancy column, so migration 062's DEFAULT supplies
@@ -103,6 +161,137 @@ async fn verify_fails_before_the_backfill_and_succeeds_after(pool: PgPool) {
     assert_eq!(
         code, 0,
         "verify must exit 0 once every entity is declared; stderr: {stderr}"
+    );
+}
+
+/// PR-15's positive acceptance: the backfill **updates the row**, and leaves a
+/// row that is already declared non-public alone.
+///
+/// # Why this is not "does not error"
+///
+/// `run` reports success whether it stamped a thousand rows or none. Under
+/// FORCE on an unprivileged connection it would stamp none and still exit 0 —
+/// plan §4.3's R2: *"fail-closed regressions look like data loss, not errors."*
+/// So the assertion is on the value in the row, per claim id, before and after.
+///
+/// # And why the non-public row is the interesting one
+///
+/// It is the row an application connection cannot see once RLS is FORCEd. Its
+/// presence in the corpus is what makes the whole run non-vacuous: a binary
+/// pointed at a filtered connection would not see it, and — the direction that
+/// matters — would not see the *undeclared* rows either, so the positive
+/// assertion above is what fails first. That the declared row comes through
+/// byte-identical is the second half: the backfill's `WHERE owner_group_id =
+/// <world>` guard is the only thing stopping it from declassifying a row
+/// somebody deliberately restricted, and nothing else pins it.
+///
+/// # What this test CANNOT claim
+///
+/// The plan's differential — `verify` failing on an app DSN and passing on the
+/// maintenance DSN — is not constructible on this tree. `epigraph_app` is
+/// NOLOGIN, so there is no second role a fixture can connect as, and BOTH
+/// `relrowsecurity` and `relforcerowsecurity` are false on every protected
+/// table (RLS arrives in PR-17), so a non-bypass role would see every row
+/// anyway and the differential would be zero by construction. Both flags are
+/// named, not just FORCE: a policy filters every non-owner without `BYPASSRLS`,
+/// so ENABLE alone would already produce the differential. `GRANT
+/// epigraph_maintenance TO
+/// epigraph_admin` — a PR-17 deploy-runbook item, no migration — is what
+/// unblocks the real two-role form.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_backfill_updates_the_undeclared_row_and_leaves_a_declared_one_alone(pool: PgPool) {
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (other, other_group) = fixture::seed_agent_with_group(&pool, "other").await;
+
+    let undeclared = seed_undeclared_claim(&pool, author, "undeclared").await;
+    let restricted = seed_group_private_claim(&pool, other, other_group, "restricted").await;
+
+    // Preconditions, so a later assertion cannot pass because the fixture did
+    // nothing.
+    assert_eq!(
+        tenancy_of(&pool, undeclared).await,
+        (WORLD, "public".to_string()),
+        "precondition: the undeclared claim is world-owned"
+    );
+    assert_eq!(
+        tenancy_of(&pool, restricted).await,
+        (other_group, "group".to_string()),
+        "precondition: the restricted claim is declared and non-public"
+    );
+
+    // verify must FAIL, and it must fail because of the undeclared row — not
+    // because the restricted row confused it.
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(code, 1, "verify before the backfill; stderr: {stderr}");
+
+    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    assert_eq!(code, 0, "run must succeed; stderr: {stderr}");
+
+    // THE POSITIVE ASSERTION.
+    assert_eq!(
+        tenancy_of(&pool, undeclared).await,
+        (author_group, "public".to_string()),
+        "the backfill must have UPDATED the undeclared claim to its author's personal group; \
+         a run that stamped nothing also exits 0"
+    );
+
+    // THE PRESERVATION ASSERTION. `visibility = 'group'` on a row owned by a
+    // real group is a deliberate restriction; the backfill's world-owner guard
+    // is what keeps it from being flattened to `public`.
+    assert_eq!(
+        tenancy_of(&pool, restricted).await,
+        (other_group, "group".to_string()),
+        "the backfill must not declassify or re-own an already-declared claim"
+    );
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(code, 0, "verify after the backfill; stderr: {stderr}");
+}
+
+/// The database-name guard, end to end through the shipped binary.
+///
+/// A maintenance DSN pointing at a *different* database is the worst available
+/// misconfiguration: it does not error, it reads zero rows and writes nowhere,
+/// so `verify` reports success and `run` reports success and nothing happened.
+/// It is also the realistic accident — one variable exported globally while
+/// `DATABASE_URL` varies per process, or a test harness leaking its own.
+///
+/// This is the closest this tree can get to the plan's app-DSN-vs-maintenance-DSN
+/// differential, and unlike that one it is testable today: the refusal is
+/// keyed on configuration, not on a role and not on whether any table carries
+/// row security. Both of those are fixed on this tree — `epigraph_app` is
+/// NOLOGIN and no relation in `public` has RLS at head 91 — so a role-keyed
+/// differential would have zero measurable difference by construction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_dsn_naming_another_database_is_refused(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let undeclared = seed_undeclared_claim(&pool, agent, "undeclared").await;
+
+    // `postgres` exists on every cluster and is never this test's template DB.
+    let url = fixture::database_url_for(&pool).await;
+    let elsewhere = url.rsplit_once('/').expect("DSN has a path").0.to_string() + "/postgres";
+
+    let (code, stderr) = run_backfill_with_maintenance_dsn(&pool, &["run"], &elsewhere).await;
+    assert_ne!(
+        code, 0,
+        "a maintenance DSN on another database must refuse, not silently no-op; stderr: {stderr}"
+    );
+    // The QUOTED form, not the bare token. `resolve_maintenance_url` formats
+    // the offending database with `{maint_db:?}`, so `"postgres"` can only come
+    // from the mismatch itself — whereas a bare `postgres` also matches the
+    // `postgres://` scheme in any DSN echoed to stderr, which would let this
+    // assertion keep passing after the message stopped naming the database.
+    assert!(
+        stderr.contains("\"postgres\"") && stderr.contains("MAINTENANCE_DATABASE_URL"),
+        "the refusal must name the variable and the mismatched database so it is \
+         actionable: {stderr}"
+    );
+
+    // And it must have refused BEFORE doing anything.
+    assert_eq!(
+        tenancy_of(&pool, undeclared).await,
+        (WORLD, "public".to_string()),
+        "a refused run must not have written"
     );
 }
 

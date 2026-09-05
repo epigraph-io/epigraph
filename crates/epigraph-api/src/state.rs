@@ -463,8 +463,16 @@ impl AppState {
     /// looking for "who can bypass" will actually find it.
     ///
     /// The returned `MaintenanceConn` must be held for as long as the viewer is
-    /// used: dropping it returns the connection to the pool, and from PR-15 on
-    /// the maintenance connection is the privileged one.
+    /// used, and from PR-15 on it must also be the thing the statements RUN on:
+    /// the maintenance connection is the privileged one, so a caller that holds
+    /// it and then queries `db_pool` gets a bypass viewer on an unprivileged
+    /// connection — an empty result and a 200. `routes/claims.rs::find_claims_needing_embeddings`
+    /// is the one call site and it passes `&mut *maint_conn`.
+    ///
+    /// The coupling is NOT enforced by the type: the `Viewer` is owned and the
+    /// `MaintenanceLease` it was minted from drops at return, so dropping the
+    /// connection leaves a usable viewer behind. Making that structural is
+    /// `D-PR17-maintenance-lease-coupling-is-a-convention`.
     ///
     /// # Errors
     /// `DbError::InvalidData` when this `AppState` was not built from a

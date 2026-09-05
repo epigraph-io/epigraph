@@ -29,12 +29,13 @@ weights.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import tomllib
 from pathlib import Path
 
 import psycopg2
+
+from maintenance_dsn import maintenance_dsn
 
 DEFAULT_DATABASE_URL = (
     "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
@@ -171,7 +172,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(DEFAULT_DATABASE_URL),
     )
     parser.add_argument(
         "--calibration",

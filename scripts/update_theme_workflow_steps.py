@@ -23,6 +23,8 @@ import psycopg2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _api_client import EpiGraphClient
 
+from maintenance_dsn import maintenance_dsn
+
 DEFAULT_DATABASE_URL = (
     "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
 )
@@ -39,7 +41,7 @@ UPDATES = {
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--database-url", default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL))
+    ap.add_argument("--database-url", default=maintenance_dsn(DEFAULT_DATABASE_URL))
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 

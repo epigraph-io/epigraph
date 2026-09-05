@@ -280,7 +280,9 @@ async fn main() {
         // only mint — a process that throws the `ScopedPool` away can never
         // construct a bypass viewer for its own backfill routes. Handlers still
         // read `state.db_pool`; migrating them onto `ScopedPool::acquire_as` is
-        // PR-07/PR-15.
+        // PR-07/PR-17. PR-15 gave this pool a *sibling*: see the maintenance
+        // pool below, which is where `AppState::maintenance_viewer` now draws
+        // from.
         let pool = scoped.inner().clone();
         tracing::info!("PostgreSQL connected");
 
@@ -335,36 +337,119 @@ async fn main() {
         // hours and saturating Postgres (incident 2026-05-29). Kept separate
         // from the API pool so the cap never affects request handling.
         //
-        // NOT a `ScopedPool`, and therefore WITHOUT the `after_release` scrub
-        // the comment above calls "the single mechanism standing between a
-        // recycled connection and a cross-tenant read". That is safe today and
-        // only today: nothing stamps a job connection, because every background
-        // writer runs under a bypass viewer. **PR-15 OBLIGATION** — alongside
-        // repointing `ScopedPool::unscoped_for_maintenance` at
-        // `MAINTENANCE_DATABASE_URL`, this pool must be routed through
-        // `ScopedPool` (keeping the `after_connect` statement_timeout hook)
-        // before PR-17 turns RLS on. A job pool that can be stamped but never
-        // scrubbed is the same defect the API pool was rebuilt to close.
+        // PR-15 DISCHARGES THE OBLIGATION THIS COMMENT USED TO RECORD.
+        //
+        // The job pool is now a `ScopedPool`, so it carries the `after_release`
+        // scrub the comment above calls "the single mechanism standing between
+        // a recycled connection and a cross-tenant read" — a job pool that can
+        // be stamped but never scrubbed was the same defect the API pool was
+        // rebuilt to close. Routing it through `ScopedPool` was not a call-site
+        // swap: `ScopedPool::connect` hardcoded sizing and had no
+        // `after_connect`, so PR-15 added `ScopedPool::connect_with_options`
+        // rather than choose between the scrub and the timeout.
+        //
+        // It is also on the MAINTENANCE DSN. Background handlers run under a
+        // bypass viewer, which emits no predicate — so once RLS is FORCEd the
+        // *connection* decides what they see, and on the application DSN a
+        // corpus-wide job would read zero rows and write nowhere without
+        // erroring. `maintenance_database_url` falls back to `DATABASE_URL`
+        // with a WARN and refuses only if the two name different databases;
+        // `assert_maintenance_privilege` refuses outright once any table is
+        // FORCEd and this connection cannot bypass.
+        //
+        // THIS COUPLES REQUEST-PATH AVAILABILITY TO BACKGROUND-WRITER
+        // CONFIGURATION, and that is a deliberate trade, not an oversight. A
+        // `MAINTENANCE_DATABASE_URL` naming a different database — or a role
+        // that cannot bypass once RLS is active — now prevents the process from
+        // serving `/health` and the openapi document at all, not merely from
+        // running jobs. The alternative (log, skip the pools, boot anyway) is
+        // worse in the direction that matters: the API would come up healthy
+        // while every background write silently landed nowhere, which is the
+        // failure this whole PR exists to make impossible to ship. It is called
+        // out in `docs/deploy.md` §1c-bis so an operator meets it in the
+        // runbook rather than in an outage.
+        let (maintenance_url, maintenance_source) =
+            epigraph_db::maintenance_database_url(&database_url)
+                .expect("MAINTENANCE_DATABASE_URL is unusable; refusing to start");
+
         let job_statement_timeout = std::time::Duration::from_millis(
             std::env::var("EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(2_700_000), // 45 minutes
         );
-        let job_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(8)
-            .after_connect(move |conn, _meta| {
-                Box::pin(async move {
-                    epigraph_jobs::apply_job_connection_settings(conn, job_statement_timeout).await
-                })
-            })
-            .connect(&database_url)
-            .await
-            .expect("Failed to create background job pool");
+        let job_scoped = epigraph_db::ScopedPool::connect_with_options(
+            &maintenance_url,
+            guc_mode,
+            epigraph_db::ScopedPoolOptions {
+                max_connections: 8,
+                statement_timeout: Some(job_statement_timeout),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to create background job pool");
+        let job_pool = job_scoped.inner().clone();
+
+        // A THIRD, deliberately small pool, and not a reuse of `job_pool`.
+        //
+        // `AppState::maintenance_viewer` draws from this one. It has exactly
+        // ONE consumer today — `routes/claims.rs::find_claims_needing_embeddings`,
+        // the `claims:admin` embedding-gap enumerator — and that handler runs
+        // its statement on the connection it leases from here, not on
+        // `state.db_pool`. That is what makes this pool load-bearing rather
+        // than decorative: acquiring a privileged connection and querying the
+        // application pool would be the same hybrid PR-15 deleted from the CLI
+        // fleet. (`grep -rn maintenance_viewer crates/epigraph-api/src` is the
+        // check; if that grep ever returns zero call sites, delete this pool
+        // rather than leaving it idling.)
+        //
+        // Handing that route the job pool instead would silently give it the
+        // 45-minute `EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS`, which is an
+        // availability change to the request path smuggled inside a
+        // pool-plumbing change — exactly the "unreviewable second decision"
+        // `ScopedPool::connect`'s own doc warns about. Two connections: this is
+        // an occasional operator-triggered read, not a work queue. Each
+        // in-flight request pins one, so a third concurrent call waits on the
+        // acquire timeout; that is acceptable for an admin-scoped backfill
+        // enumerator and would not be for a caller-facing route.
+        //
+        // Connection budget at boot is therefore API(10) + jobs(8) +
+        // maintenance(2) = 20, up from 18. See `docs/deploy.md` §1c-bis.
+        let maintenance_pool = epigraph_db::ScopedPool::connect_with_options(
+            &maintenance_url,
+            guc_mode,
+            epigraph_db::ScopedPoolOptions {
+                max_connections: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to create maintenance pool");
+
+        // One probe for the DSN both pools share. Refuses to start if RLS is
+        // FORCEd and this connection cannot bypass — the condition under which
+        // every background write would silently become a no-op.
+        epigraph_db::assert_maintenance_privilege(
+            maintenance_pool.inner(),
+            maintenance_source,
+            "epigraph-api",
+        )
+        .await
+        .expect("maintenance connection is not privileged enough to run background writes");
+
         tracing::info!(
             statement_timeout_ms = job_statement_timeout.as_millis() as u64,
-            "Background job pool ready"
+            dsn_source = maintenance_source.as_str(),
+            "Background job pool ready on the maintenance DSN"
         );
+
+        // Both handles are clones of a `ScopedPool`-built pool, so the
+        // `after_release` scrub travels with them: `PgPool` is a handle onto a
+        // shared, reference-counted pool whose options — including the scrub —
+        // were fixed at build time. Dropping the `ScopedPool` wrapper here does
+        // not drop the pool or uninstall the hook.
+        let scoped = scoped.with_maintenance_pool(maintenance_pool.inner().clone());
 
         let state =
             AppState::with_scoped_pool(scoped, config).with_embedding_service(embedding_service);

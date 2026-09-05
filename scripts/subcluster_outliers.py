@@ -32,6 +32,13 @@ from sklearn.preprocessing import normalize
 
 psycopg2.extras.register_uuid()
 
+# MAINTENANCE-DSN-EXEMPT: read-only by design, on the `epigraph_ro` role, and
+# the module docstring above states "script never writes" as a property callers
+# rely on. Threading MAINTENANCE_DATABASE_URL in would silently escalate it to a
+# writable role whenever that variable is exported for a sibling job — a
+# privilege increase smuggled in as a DSN change. If a FORCEd deployment ever
+# needs this script to see non-public rows, give it its own read-only
+# maintenance role rather than borrowing the writer's.
 DEFAULT_DATABASE_URL = "postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph"
 
 

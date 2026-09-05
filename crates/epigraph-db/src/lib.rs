@@ -65,8 +65,11 @@ pub mod visibility;
 // below from where PR-08 actually put it.
 pub use errors::DbError;
 pub use pool::{
-    create_pool, create_pool_from_options, create_pool_with_options, MaintenanceConn, ScopedConn,
-    ScopedPool, ScopedTx, SessionGucMode,
+    apply_statement_timeout, assert_maintenance_privilege, create_pool, create_pool_from_options,
+    create_pool_with_options, maintenance_database_url, maintenance_verdict,
+    probe_maintenance_privilege, resolve_maintenance_url, MaintenanceConn, MaintenanceDsnSource,
+    MaintenancePrivilege, MaintenanceVerdict, ScopedConn, ScopedPool, ScopedPoolOptions, ScopedTx,
+    SessionGucMode, MAINTENANCE_DATABASE_URL,
 };
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentPublicProfile, AgentRepository,

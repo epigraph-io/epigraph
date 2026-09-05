@@ -4018,14 +4018,31 @@ impl ClaimRepository {
     ///
     /// Excludes activity log claims (content starting with known activity prefixes).
     ///
+    /// # The executor is generic, and that is the point
+    ///
+    /// This is a corpus-wide maintenance enumerator: it runs under a bypass
+    /// `Viewer`, which emits no predicate, so once RLS is active the
+    /// *connection* — not the viewer — decides what it sees. Taking `&PgPool`
+    /// forced every caller onto whatever pool it happened to hold, which is how
+    /// `epigraph-api`'s handler ended up minting a privileged lease and then
+    /// spending it on the application pool: the privileged handle existed and
+    /// the statement ran somewhere else. Accepting any `PgExecutor` lets a
+    /// caller pass the maintenance connection it is already holding
+    /// (`&mut *maint_conn`), so the bypass and the connection cannot drift
+    /// apart. Callers that legitimately hold a maintenance pool still pass
+    /// `&PgPool` unchanged.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn find_claims_needing_embeddings(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn find_claims_needing_embeddings<'e, E>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         limit: i64,
-    ) -> Result<Vec<(Uuid, String)>, DbError> {
+    ) -> Result<Vec<(Uuid, String)>, DbError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         debug_assert!(
             viewer.is_bypass(),
             "find_claims_needing_embeddings is a maintenance enumerator; a Scoped \
@@ -4048,7 +4065,8 @@ impl ClaimRepository {
             -- row; a per-tenant view of the gap would leave every other
             -- tenant's claims unembedded forever and silently break semantic
             -- recall for them. Runs under SystemReason::EmbeddingBackfill on a
-            -- maintenance connection (debug_assert above).
+            -- maintenance connection (debug_assert above, and the generic
+            -- executor so the caller can pass that very connection).
             --
             -- Encrypted claims are excluded instead. Keyed on `claim_encryption`,
             -- NEVER on `visibility`: a group-private claim is still plaintext in
@@ -4068,7 +4086,7 @@ impl ClaimRepository {
             "#,
         )
         .bind(limit)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows)

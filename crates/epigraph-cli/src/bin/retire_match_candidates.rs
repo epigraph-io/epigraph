@@ -57,7 +57,6 @@
 //!         --affected-out /tmp/affected_claims.txt --apply
 
 use clap::Parser;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -143,12 +142,13 @@ fn pair_key(a: Uuid, b: Uuid) -> (Uuid, Uuid) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let db_url =
-        std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL must be set"))?;
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&db_url)
-        .await?;
+    // Corpus-wide, and it writes: the retirement UPDATEs must match the rows
+    // the operator named, not the subset an application connection can see.
+    // See `epigraph_cli::MaintenancePool`.
+    let maint = epigraph_cli::MaintenancePool::connect("retire_match_candidates")
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pool = maint.pool().clone();
 
     let ids = read_ids(&args.ids_file)?;
     if ids.is_empty() {

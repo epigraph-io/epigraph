@@ -327,7 +327,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Connect to database
+    // Connect to database.
+    //
+    // MAINTENANCE-DSN-EXEMPT: this process serves callers, so its pool is
+    // deliberately the application pool. Its three genuine maintenance tools
+    // (dedup sweep, embedding backfill, belief recompute) reach a bypass
+    // through `crate::maintenance::maintenance_viewer`, which today fails
+    // CLOSED because `EpiGraphMcpFull::with_scoped_pool` has no caller.
+    //
+    // PR-15 left that closed rather than half-opening it: those three tools run
+    // their queries on `self.pool`, so attaching a `ScopedPool` here would let
+    // them mint a privileged viewer and spend it on an unprivileged connection
+    // — the privileged-viewer/ordinary-pool hybrid PR-15 deleted from eleven
+    // CLI binaries — trading a hard error for a silent no-op under FORCE.
+    // Closing it properly is a change to the three tools' query plumbing and
+    // belongs with PR-17. See `crates/epigraph-mcp/src/maintenance.rs`.
     tracing::info!("Connecting to database...");
     let pool = create_pool(&cli.database_url).await?;
     tracing::info!("Database connected");

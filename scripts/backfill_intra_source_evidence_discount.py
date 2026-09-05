@@ -83,7 +83,6 @@ is now just to emit the claim list for it to consume.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -93,6 +92,8 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for older interpreter
     import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 import psycopg2
+
+from maintenance_dsn import maintenance_dsn
 
 
 DEFAULT_DATABASE_URL = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
@@ -385,7 +386,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(DEFAULT_DATABASE_URL),
     )
     parser.add_argument(
         "--calibration",

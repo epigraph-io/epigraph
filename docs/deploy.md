@@ -456,18 +456,160 @@ someone remembered to set a flag is not a security control.
 
 ### 1c. Obligations this PR hands to PR-15 and PR-16
 
-* **PR-15** — `ScopedPool::unscoped_for_maintenance` currently draws from the
-  *application* pool. Harmless until RLS is enabled, unsound after: a bypass
-  viewer emits no predicate but the policy still filters, so it reads zero rows.
-  Repoint it at `MAINTENANCE_DATABASE_URL` **before PR-17**.
-* **PR-15** — the background `job_pool` (`bin/server.rs`) is a second pool on the
-  same database built with bare `PgPoolOptions`, so it has **no scrub**. Route it
-  through `ScopedPool` (keeping its `after_connect` `statement_timeout` hook)
-  before anything can stamp a job connection.
+* ~~**PR-15** — `ScopedPool::unscoped_for_maintenance` draws from the
+  *application* pool.~~ **Discharged.** It now draws from the pool
+  `ScopedPool::with_maintenance_pool` attached, falling back to the application
+  pool when none was. `bin/server.rs` attaches one; test fixtures deliberately
+  do not (a `#[sqlx::test]` database has one DSN and one role).
+* ~~**PR-15** — the background `job_pool` has no scrub.~~ **Discharged.** It is
+  built by `ScopedPool::connect_with_options`, which PR-15 added because
+  `ScopedPool::connect` hardcoded sizing and had no `after_connect` — so the
+  choice was otherwise between the scrub and the 45-minute
+  `EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS`. Both are kept.
 * **PR-16** — after the backfill, `REINDEX INDEX CONCURRENTLY
   idx_claims_world_owned;`. That index is corpus-sized when `066` builds it
   (`owner_group_id` defaults to the world group, so the partial predicate
   matches every row) and the backfill empties it without reclaiming the pages.
+
+### 1c-bis. `MAINTENANCE_DATABASE_URL` (PR-15)
+
+**What it is.** The DSN every background writer connects on: the CLI binaries,
+the API's job pool and its `AppState::maintenance_viewer` pool, and the operator
+scripts under `scripts/`. It should differ from `DATABASE_URL` **only in the
+role** — a role that is a member of `epigraph_maintenance`, so
+`epigraph_bypass()` is true on it.
+
+**If it is unset**, every one of those falls back to `DATABASE_URL` and logs a
+WARN. That is correct today and only today: no table in `public` has row
+security at head 91, so a bypass viewer on an ordinary connection still sees
+everything. Once PR-17's policies land it would see nothing — and
+`epigraph_db::assert_maintenance_privilege` refuses to start rather than let
+that happen, so the refusal arms itself with no second deploy step. The refusal
+is deliberately *not* an unconditional `epigraph_bypass()` assertion: migration
+060 downgrades `insufficient_privilege` on its `CREATE ROLE` to a NOTICE, so on
+a managed cluster where that fired the role may not exist at all, and an
+unconditional assertion would take the whole fleet down to prevent a failure
+that cannot yet occur.
+
+**The arming signal is `ENABLE`, not `FORCE`.** The probe keys on
+`relrowsecurity OR relforcerowsecurity`. A policy filters every role except the
+table's owner and holders of `BYPASSRLS`; `FORCE` only *additionally* subjects
+the owner. Every protected table here is owned by `epigraph` (superuser,
+`rolbypassrls = t`), and every role a background writer connects as is a
+non-owner without `BYPASSRLS` — so plain `ENABLE ROW LEVEL SECURITY` is already
+what starts truncating their results. **Operationally this matters at two
+moments:** the window between the migration that applies policies and the one
+that adds `FORCE` (they are separate migrations), and after an operator pulls
+the documented `ALTER TABLE … NO FORCE ROW LEVEL SECURITY` kill switch, which
+drops FORCE and leaves the policies enabled. A FORCE-only probe would be
+disarmed in both.
+
+**It must name the same database as `DATABASE_URL`.** A maintenance DSN pointing
+elsewhere does not error — it reads zero rows and writes nowhere — so
+`maintenance_database_url` compares the two **effective** database names (the
+path, or the role name when the DSN is pathless, exactly as libpq defaults it)
+and refuses on a mismatch. **Host and port are compared but only WARN.**
+Refusing on host equality would boot-fail every deployment where `localhost`,
+`127.0.0.1` and a container DNS name denote the same server. The residual is
+real and is stated rather than hidden: a `MAINTENANCE_DATABASE_URL` copied from
+staging beside a production `DATABASE_URL` names the same database `epigraph` on
+a different cluster, and produces a warning naming both endpoints, not a
+refusal. **Read that warning.**
+
+**A bad value now blocks the whole api process, not just background work.** The
+resolution and the privilege probe run before the router is built, so an
+unusable `MAINTENANCE_DATABASE_URL` takes `/health` and the openapi document
+down with it. That is deliberate: the alternative is an API that reports healthy
+while every background write silently lands nowhere. Treat this variable as a
+boot-critical setting and change it the way you would change `DATABASE_URL`.
+
+**The role needs more than `epigraph_maintenance` membership.** The api's
+background job pool — `PostgresJobQueue`, the stale-job reaper,
+`ClusterGraphHandler`, `ThemeClusterRebuildHandler` — now connects on this DSN
+instead of `DATABASE_URL`. `assert_maintenance_privilege` probes bypass and row
+security; it does **not** probe table grants, and CI connects as the superuser,
+so the role dimension is not exercised by any test. Whatever role you point
+`MAINTENANCE_DATABASE_URL` at must hold the API's full job-path INSERT/UPDATE
+grants, not merely membership of `epigraph_maintenance`. Enumerate them
+alongside the `GRANT` below before the first non-superuser deploy.
+
+**Connection budget.** The api process now opens API(10) + jobs(8) +
+maintenance(2) = **20** connections at boot, up from 18. The maintenance pool is
+separate from the job pool on purpose: sharing it would give the request-path
+maintenance read the job pool's 45-minute `statement_timeout`. That pool has
+exactly one consumer — `GET /api/v1/claims/needing-embeddings` — and that
+handler runs its statement *on the connection it leases from the pool*, which is
+what makes the pool load-bearing rather than decorative.
+
+**Fleet-wide pool sizing changed.** `MaintenancePool` uses one cap of 11 (10 for
+work, 1 for the connection the bypass lease holds) for every converted CLI
+binary. Several bins previously chose 2, 4 or 5 explicitly. sqlx opens
+connections lazily and most of these are single-threaded, so this is a ceiling
+raise rather than a workload increase — but a cron fleet running several of
+these concurrently against production Postgres now has a higher ceiling than it
+did.
+
+**The Python half warns about none of this.** `scripts/maintenance_dsn.py`
+mirrors the precedence and the database-name refusal, and deliberately does
+**not** assert privilege — these are operator one-shots, and a second
+implementation of the verdict rule would drift from the Rust one. So a script
+run on an unprivileged role once policies land reads a subset and exits 0 with
+no warning. The refusal that protects you is at the API and CLI boundary only.
+
+**Deploy surfaces that need the variable** (each currently takes the WARN
+fallback): `decompose_claims` (a bind-mounted host binary, not baked into the
+image), the binaries layered into `epigraph-agent:latest`, `epiclaw.env`, the
+decomposition-cycle schedule, and foreman.
+
+**Known prerequisite, NOT shipped by PR-15.** `epigraph_maintenance` is NOLOGIN
+and `epigraph_admin` is not a member of it, so today no non-superuser role both
+connects *and* satisfies `epigraph_bypass()`. `GRANT epigraph_maintenance TO
+epigraph_admin` is a PR-17 runbook step; it adds no migration. Until it is run,
+the only role that satisfies the bypass is the superuser, which is what the
+throwaway test database and CI use. **Do that GRANT together with the job-path
+table grants named above** — a role that satisfies `epigraph_bypass()` but
+cannot INSERT into the job tables passes the boot probe and then fails on first
+use, which is a worse outcome than failing at boot.
+
+### 1c-ter. The role inventory, including `epigraph_admin` (PR-15)
+
+The plan's PR-15 acceptance asks that `epigraph_admin` be *"either mapped to
+`epigraph_maintenance` or documented as a fourth deliberate role"*. It is the
+latter, and this is that record. Measured with `SELECT rolname, rolcanlogin,
+rolsuper, rolbypassrls FROM pg_roles`:
+
+| role | login | superuser | bypassrls | what it is for |
+|---|---|---|---|---|
+| `epigraph` | yes | **yes** | yes | The migration/dev/CI superuser. Every `#[sqlx::test]` and `ci.yml` connect as this, which is why `epigraph_bypass()` is unconditionally true in the test suite and why PR-15's refusal rule is unit-tested on a pure function rather than asserted against a live connection. |
+| `epigraph_app` | **no** | no | no | The request-path role RLS is written against. NOLOGIN today; PR-17 gives it a login and makes `current_user = 'epigraph_app'` a boot assertion. |
+| `epigraph_maintenance` | **no** | no | no | The bypass role. `epigraph_bypass()` (migration 067) is membership of this. NOLOGIN, so it is a *membership grant target*, not a connect-as identity. |
+| `epigraph_seed` | **no** | no | no | Migration 074 arm 4's fixture escape hatch (PR-16). |
+| `epigraph_ro` | yes | no | no | Read-only. Used by `scripts/subcluster_outliers.py` and `run_assessment_worker.py`'s read side, both of which PR-15 deliberately left alone. |
+| `epigraph_dev` | yes | no | no | Developer convenience. |
+| **`epigraph_admin`** | yes | no | no | **A deliberate fourth role, not an accident.** It is the operator identity the Python scripts default to (`scripts/theme_lib.py` and eleven siblings) and the natural home for `MAINTENANCE_DATABASE_URL`: of the three login-capable non-superusers (`epigraph_ro`, `epigraph_dev`, `epigraph_admin`) it is the only one intended for writes. PR-15 does **not** grant it `epigraph_maintenance` — that is a privilege change, it needs no code, and doing it inside a code-only PR would put a security-relevant GRANT somewhere nobody would look for it. It is a PR-17 runbook step. |
+
+**The consequence, stated plainly:** until `GRANT epigraph_maintenance TO
+epigraph_admin` is run, the only role that both connects and satisfies
+`epigraph_bypass()` is the superuser. That is why PR-15's refusal is gated on
+row security being active at all — an unconditional assertion would refuse to
+start on every correctly-configured cluster that exists today.
+
+**Pre-existing, flagged not fixed:** twelve scripts under `scripts/` hardcode a
+**production** DSN (`postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph`
+and two `epigraph_ro` variants) as the default when `DATABASE_URL` is unset.
+PR-15 added `MAINTENANCE_DATABASE_URL` ahead of that default in the precedence
+chain but did **not** change the default itself: that is a long-standing
+property of this script family, and changing where a dozen operator scripts
+point by default is not a decision to make inside a pool-plumbing PR.
+
+**Where the Python rule lives.** `scripts/maintenance_dsn.py` — standard library
+only, so the seventeen scripts that need the rule but not numpy do not acquire a
+numpy dependency to get it. `scripts/theme_lib.py::maintenance_dsn` is now a thin
+binding of it to this family's default. The refusal it carries is not optional
+politeness: giving `MAINTENANCE_DATABASE_URL` precedence means an operator
+pointing `DATABASE_URL` at a scratch database, while a sibling job has that
+variable exported, would otherwise have every write in this family silently
+redirected — and several of these scripts write.
 
 ### 1d. Deleting a group is a maintenance-window operation
 
