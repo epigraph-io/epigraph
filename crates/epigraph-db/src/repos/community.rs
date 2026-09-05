@@ -206,8 +206,9 @@ impl CommunityRepository {
 
         let row: CommunityRow = sqlx::query_as(
             r#"
-            INSERT INTO communities (name, description, governance_type, ownership_type)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO communities (name, description, governance_type, ownership_type,
+                                     visibility, owner_group_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id, name, description, governance_type, ownership_type, mass_override, created_at
             "#,
         )
@@ -215,6 +216,15 @@ impl CommunityRepository {
         .bind(description)
         .bind(governance_type)
         .bind(ownership_type)
+        // Tenancy declaration (PR-16): `communities` has no parent and no
+        // author, so migration 074's `epigraph_root_require_tenancy` has
+        // nothing to derive from and the write must name both columns. The
+        // community's OWN group is projected below (migration 068's shape) and
+        // is not the owner of the registry row -- a community that owned its
+        // own directory entry would be invisible to anyone deciding whether to
+        // join it.
+        .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
+        .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
         .fetch_one(&mut *tx)
         .await?;
 

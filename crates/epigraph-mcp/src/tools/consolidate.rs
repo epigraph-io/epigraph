@@ -73,7 +73,17 @@ pub async fn consolidate_claims(
         acting_agent_id,
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(|e| match e {
+        // The cross-group refusal (PR-16, plan §4.6) is a CLIENT error: the
+        // caller asked for a merge whose sources span two owner groups, and
+        // the answer is "pick sources within one group", not "the server
+        // failed". `internal_error` would render it as INTERNAL_ERROR and an
+        // agent would retry it forever. The HTTP twin is 409
+        // (`DbError::Conflict` -> `ApiError::Conflict`); INVALID_PARAMS is the
+        // nearest JSON-RPC code that carries the message to the caller.
+        epigraph_db::DbError::Conflict { ref reason } => invalid_params(reason.clone()),
+        other => internal_error(other),
+    })?;
 
     // Post-commit embedding, best-effort: warn but never fail the merge (the
     // CLAUDE.md write-path invariant). Skipped on the idempotent return, where

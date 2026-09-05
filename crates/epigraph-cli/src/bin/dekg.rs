@@ -1410,11 +1410,17 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                 } else {
                     // Create frame
                     let hyp_json = serde_json::to_value(&hypotheses).unwrap();
+                    // Tenancy declaration (PR-16): same as
+                    // `FrameRepository::create` -- an instance-wide hypothesis
+                    // space with no parent and no author.
                     let frame_row: (Uuid,) = sqlx::query_as(
-                        "INSERT INTO frames (name, hypotheses) VALUES ($1, $2) RETURNING id",
+                        "INSERT INTO frames (name, hypotheses, visibility, owner_group_id) \
+                         VALUES ($1, $2, $3, $4) RETURNING id",
                     )
                     .bind(&frame_name)
                     .bind(&hyp_json)
+                    .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
+                    .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
                     .fetch_one(&pool)
                     .await
                     .context("Failed to create frame")?;

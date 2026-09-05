@@ -62,14 +62,20 @@ impl FrameRepository {
     ) -> Result<FrameRow, DbError> {
         let row: FrameRow = sqlx::query_as(
             r#"
-            INSERT INTO frames (name, description, hypotheses)
-            VALUES ($1, $2, $3)
+            INSERT INTO frames (name, description, hypotheses, visibility, owner_group_id)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             "#,
         )
         .bind(name)
         .bind(description)
         .bind(hypotheses)
+        // Tenancy declaration (PR-16): a frame is a shared hypothesis space
+        // that Dempster-Shafer mass functions from every group hang off. Giving
+        // it an owner group would make cross-group belief combination
+        // unreadable for no gain. See `TenancyDecl::instance_wide`.
+        .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
+        .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
         .fetch_one(pool)
         .await?;
 
@@ -239,8 +245,9 @@ impl FrameRepository {
     ) -> Result<FrameRow, DbError> {
         let row: FrameRow = sqlx::query_as(
             r#"
-            INSERT INTO frames (name, description, hypotheses, parent_frame_id)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO frames (name, description, hypotheses, parent_frame_id,
+                                visibility, owner_group_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             "#,
         )
@@ -248,6 +255,13 @@ impl FrameRepository {
         .bind(description)
         .bind(hypotheses)
         .bind(parent_frame_id)
+        // Tenancy declaration (PR-16). `parent_frame_id` is bound, but 074
+        // gives `frames` the ROOT trigger, not the derived one -- there is no
+        // frame-to-frame inheritance arm, deliberately: a refinement is a
+        // narrower hypothesis space, not a child row of its parent's content.
+        // So this declares, exactly as `create` above does.
+        .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
+        .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
         .fetch_one(pool)
         .await?;
 

@@ -668,22 +668,40 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
              silently drop rows."
         );
 
-        // The transition DEFAULTs are PRESENT at PR-04. Migration 074 drops them;
-        // asserting their absence is PR-16's job (see locked_decisions.rs).
+        // INVERTED BY PR-16. This asserted the transition DEFAULTs were still
+        // PRESENT, with the reason: without them, 062's ADD COLUMN is a table
+        // rewrite on a live `claims` table and every pre-PR-06 INSERT fails.
+        // That reason was about migration 062's own application, and it is
+        // spent — the columns exist, the backfill has run, the call sites are
+        // patched, and migration 074 drops the defaults. This file measures the
+        // schema at HEAD, so the assertion has to face the same direction the
+        // schema does.
+        //
+        // The full acceptance for the drop is `tenancy_required.rs` (§8.2 A1)
+        // and `locked_decisions.rs::d1_no_tier_a_tenancy_column_carries_a_default`.
+        // What is asserted here is the narrower thing this file is for: the
+        // per-table SHAPE, so a tier-A table that somehow kept its default
+        // fails next to its own name rather than inside a corpus-wide query.
         for r in &rows {
             let default: Option<String> = r.get("column_default");
             assert!(
-                default.is_some(),
-                "public.{table}.{} lost its transition DEFAULT. Without it, \
-                 ADD COLUMN is a table rewrite on a live claims table and every \
-                 pre-PR-06 INSERT fails.",
+                default.is_none(),
+                "public.{table}.{} still carries a DEFAULT after migration 074. A \
+                 DEFAULT means the column is never NULL inside a BEFORE trigger, \
+                 which makes the require-tenancy arm unreachable — the row lands on \
+                 a value nobody chose and no error is raised.",
                 r.get::<String, _>("column_name")
             );
         }
 
-        // All three constraints, all NOT VALID: validating them is migration
-        // 075's job, after the backfill, and doing it here would take an ACCESS
-        // EXCLUSIVE lock and a full scan on the largest tables in the schema.
+        // All three constraints, and after migrations 075/076 all VALIDATED.
+        //
+        // INVERTED BY PR-16, and the original reason is kept because it is what
+        // justifies the two-stage shape: 062 ships them NOT VALID because
+        // validating is a full scan under SHARE UPDATE EXCLUSIVE and belongs
+        // AFTER the backfill. 075 (claims) and 076 (everything else) are that
+        // second stage, split into two files so the largest table's lock is not
+        // held for the sum of every scan.
         for suffix in [
             "_visibility_check",
             "_owner_group_fkey",
@@ -704,10 +722,13 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
             .unwrap_or_else(|| panic!("constraint {name} is missing"));
             let validated: bool = row.get("convalidated");
             assert!(
-                !validated,
-                "{name} is VALIDATED at PR-04. It must ship NOT VALID: validation \
-                 is a full scan under ACCESS EXCLUSIVE, and it belongs after the \
-                 backfill (migration 075)."
+                validated,
+                "{name} is still NOT VALID after migrations 075/076. A NOT VALID \
+                 constraint IS enforced on new rows, so this is not an open write \
+                 hole — what it leaves open is the EXISTING corpus: an \
+                 owner_group_id pointing at no group, or a ('group', world) black \
+                 hole, that every later RLS policy and privatization plan would \
+                 silently skip."
             );
         }
 

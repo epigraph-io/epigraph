@@ -44,7 +44,9 @@ async fn create_test_claim(pool: &PgPool, content: &str, truth_value: f64) -> Uu
     let agent = make_agent(None);
     let agent = AgentRepository::create(pool, &agent).await.unwrap();
     let claim = make_claim(agent.id, content, truth_value);
-    let claim = ClaimRepository::create(pool, &claim).await.unwrap();
+    let claim = ClaimRepository::create(pool, &claim, epigraph_core::TenancyDecl::Inherited)
+        .await
+        .unwrap();
     claim.id.as_uuid()
 }
 
@@ -246,15 +248,24 @@ async fn test_lineage_includes_all_evidence_at_each_level(pool: PgPool) {
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
 
     let root_claim = make_claim(agent.id, "Root claim with evidence", 0.9);
-    let root_claim = ClaimRepository::create(&pool, &root_claim).await.unwrap();
+    let root_claim =
+        ClaimRepository::create(&pool, &root_claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .unwrap();
     let root_id = root_claim.id.as_uuid();
 
     let middle_claim = make_claim(agent.id, "Middle claim with evidence", 0.8);
-    let middle_claim = ClaimRepository::create(&pool, &middle_claim).await.unwrap();
+    let middle_claim =
+        ClaimRepository::create(&pool, &middle_claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .unwrap();
     let middle_id = middle_claim.id.as_uuid();
 
     let leaf_claim = make_claim(agent.id, "Leaf claim with evidence", 0.7);
-    let leaf_claim = ClaimRepository::create(&pool, &leaf_claim).await.unwrap();
+    let leaf_claim =
+        ClaimRepository::create(&pool, &leaf_claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .unwrap();
     let leaf_id = leaf_claim.id.as_uuid();
 
     // Create edges
@@ -333,11 +344,17 @@ async fn test_lineage_includes_all_reasoning_traces(pool: PgPool) {
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
 
     let root_claim = make_claim(agent.id, "Root claim", 0.85);
-    let root_claim = ClaimRepository::create(&pool, &root_claim).await.unwrap();
+    let root_claim =
+        ClaimRepository::create(&pool, &root_claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .unwrap();
     let root_id = root_claim.id.as_uuid();
 
     let child_claim = make_claim(agent.id, "Child claim", 0.75);
-    let child_claim = ClaimRepository::create(&pool, &child_claim).await.unwrap();
+    let child_claim =
+        ClaimRepository::create(&pool, &child_claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .unwrap();
     let child_id = child_claim.id.as_uuid();
 
     // Create edge

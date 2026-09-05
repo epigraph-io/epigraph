@@ -69,9 +69,12 @@ use std::path::{Path, PathBuf};
 ///   outstanding; the leak is not.
 /// * **`workflow_hierarchical.rs` (3 production).** One read, one `UPDATE
 ///   workflows`, one `edges ⨝ claims` read on the
-///   `report_hierarchical_outcome` write path. Write paths are PR-16's
-///   (`viewer.writable_bind()`, which does not exist yet), so PR-09 left them
-///   alone rather than half-converting a write.
+///   `report_hierarchical_outcome` write path. Write paths are PR-16's, so
+///   PR-09 left them alone rather than half-converting a write. (PR-16
+///   correction: the parenthetical here used to read "`viewer.writable_bind()`,
+///   which does not exist yet". It has existed since PR-04 and is consumed by
+///   `pool.rs::apply_session_gucs`; what is missing is the SQL half — the
+///   write-side predicate and `WITH CHECK` — and PR-16a does not add it.)
 /// * **One-line read-backs (`ds.rs`, `ds_auto.rs`, `link_epistemic.rs`,
 ///   `workflows.rs` — 5 production).** Each re-reads a scalar of a row the
 ///   caller just wrote, or probes existence by id. Not content reads.

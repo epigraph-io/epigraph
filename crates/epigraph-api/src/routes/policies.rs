@@ -159,9 +159,20 @@ pub async fn create_challenge(
     );
     let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
 
+    // Tenancy declaration (PR-16). A policy challenge is authored by the SYSTEM
+    // agent (resolved above) and is instance-wide by construction -- the
+    // approval surface that reads it back is not scoped to the requester's
+    // group -- so the declaration is the system agent's own group, publicly
+    // visible. The caller's `AuthContext` is spent on the `claims:write` scope
+    // check above, which is what it is for here.
+    let decl =
+        epigraph_db::ClaimRepository::default_decl_for_author_pool(&state.db_pool, sys_agent_id)
+            .await?;
+
     let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties) \
-         VALUES ($1, $2, $3, 0.5, ARRAY['policy','policy:challenge'], $4) \
+        "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, ARRAY['policy','policy:challenge'], $4, $5, $6) \
          RETURNING id",
     )
     .bind(&content)
@@ -173,6 +184,8 @@ pub async fn create_challenge(
         "protocol": req.protocol,
         "status": "pending",
     }))
+    .bind(decl.visibility_bind())
+    .bind(decl.owner_group_bind())
     .fetch_one(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {

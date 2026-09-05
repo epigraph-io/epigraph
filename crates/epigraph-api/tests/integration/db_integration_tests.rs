@@ -165,9 +165,10 @@ async fn create_claim_with_trace(
 ) -> ClaimWithTrace {
     // Create claim first (without trace)
     let claim = create_test_claim_without_trace(agent_id, truth_value);
-    let created_claim = ClaimRepository::create(pool, &claim)
-        .await
-        .expect("Claim creation should succeed");
+    let created_claim =
+        ClaimRepository::create(pool, &claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Claim creation should succeed");
 
     // Create trace with claim_id
     let trace = create_test_trace(agent_id, methodology);
@@ -206,9 +207,10 @@ async fn test_create_claim_persists_to_db(pool: PgPool) {
 
     // Create the claim first (without trace, since trace needs claim_id)
     let claim = create_test_claim_without_trace(created_agent.id, 0.75);
-    let created_claim = ClaimRepository::create(&pool, &claim)
-        .await
-        .expect("Claim creation should succeed");
+    let created_claim =
+        ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Claim creation should succeed");
 
     // Create a reasoning trace (requires claim_id)
     let trace = create_test_trace(created_agent.id, Methodology::Deductive);
@@ -311,7 +313,7 @@ async fn test_list_claims_with_pagination(pool: PgPool) {
     let mut claim_ids = Vec::new();
     for i in 0..5 {
         let claim = create_test_claim_without_trace(created_agent.id, 0.5 + (i as f64 * 0.1));
-        let created = ClaimRepository::create(&pool, &claim)
+        let created = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
             .await
             .expect("Claim creation should succeed");
         claim_ids.push(created.id);
@@ -451,9 +453,10 @@ async fn test_retrieve_evidence_by_claim_id(pool: PgPool) {
 
     // Test empty case
     let other_claim = create_test_claim_without_trace(created_agent.id, 0.5);
-    let other_created = ClaimRepository::create(&pool, &other_claim)
-        .await
-        .expect("Claim creation should succeed");
+    let other_created =
+        ClaimRepository::create(&pool, &other_claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Claim creation should succeed");
     let empty_evidence = EvidenceRepository::get_by_claim(&pool, &viewer, other_created.id)
         .await
         .expect("Retrieval should succeed");
@@ -560,14 +563,16 @@ async fn test_create_reasoning_trace_with_dag_structure(pool: PgPool) {
 
     // Create claims first (traces need claim_id)
     let parent_claim = create_test_claim_without_trace(created_agent.id, 0.9);
-    let created_parent_claim = ClaimRepository::create(&pool, &parent_claim)
-        .await
-        .expect("Parent claim creation should succeed");
+    let created_parent_claim =
+        ClaimRepository::create(&pool, &parent_claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Parent claim creation should succeed");
 
     let child_claim = create_test_claim_without_trace(created_agent.id, 0.8);
-    let created_child_claim = ClaimRepository::create(&pool, &child_claim)
-        .await
-        .expect("Child claim creation should succeed");
+    let created_child_claim =
+        ClaimRepository::create(&pool, &child_claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Child claim creation should succeed");
 
     // Create parent trace
     let parent_trace = ReasoningTrace::new(
@@ -631,9 +636,10 @@ async fn test_reasoning_trace_methodology_and_confidence(pool: PgPool) {
 
     // Create claim first (trace needs claim_id)
     let claim = create_test_claim_without_trace(created_agent.id, 0.8);
-    let created_claim = ClaimRepository::create(&pool, &claim)
-        .await
-        .expect("Claim creation should succeed");
+    let created_claim =
+        ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Claim creation should succeed");
 
     // Create trace with specific methodology
     let trace = ReasoningTrace::new(
@@ -769,7 +775,8 @@ async fn test_concurrent_claim_creation_no_conflicts(pool: PgPool) {
                 [0u8; 32], // Placeholder public key for tests
                 TruthValue::new(0.5 + (i as f64 * 0.05)).unwrap(),
             );
-            ClaimRepository::create(&pool_clone, &claim).await
+            ClaimRepository::create(&pool_clone, &claim, epigraph_core::TenancyDecl::Inherited)
+                .await
         });
         handles.push(handle);
     }
@@ -830,7 +837,8 @@ async fn test_foreign_key_constraints_enforced(pool: PgPool) {
         TruthValue::new(0.5).unwrap(),
     );
 
-    let result = ClaimRepository::create(&pool, &claim).await;
+    let result =
+        ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited).await;
     assert!(result.is_err(), "Claim with non-existent agent should fail");
 
     // Test 2: Evidence with non-existent claim should fail
@@ -924,9 +932,10 @@ async fn test_high_reputation_agent_no_evidence_gets_low_truth(pool: PgPool) {
         [0u8; 32],                     // Placeholder public key for tests
         TruthValue::new(0.2).unwrap(), // Low truth despite "famous" agent
     );
-    let created_claim = ClaimRepository::create(&pool, &claim)
-        .await
-        .expect("Claim creation should succeed");
+    let created_claim =
+        ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Claim creation should succeed");
 
     // 3. Create trace with minimal reasoning (simulating weak evidence)
     let weak_trace = ReasoningTrace::new(
@@ -1316,9 +1325,10 @@ async fn test_dag_cycle_detection_self_reference_rejected(pool: PgPool) {
 
     // Create claim first (trace needs claim_id)
     let claim = create_test_claim_without_trace(created_agent.id, 0.8);
-    let created_claim = ClaimRepository::create(&pool, &claim)
-        .await
-        .expect("Claim creation should succeed");
+    let created_claim =
+        ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Claim creation should succeed");
 
     let trace = ReasoningTrace::new(
         created_agent.id,
@@ -1374,19 +1384,22 @@ async fn test_dag_multi_hop_cycle_detection(pool: PgPool) {
 
     // Create claims for each trace
     let claim_a = create_test_claim_without_trace(created_agent.id, 0.8);
-    let created_claim_a = ClaimRepository::create(&pool, &claim_a)
-        .await
-        .expect("Claim A creation should succeed");
+    let created_claim_a =
+        ClaimRepository::create(&pool, &claim_a, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Claim A creation should succeed");
 
     let claim_b = create_test_claim_without_trace(created_agent.id, 0.8);
-    let created_claim_b = ClaimRepository::create(&pool, &claim_b)
-        .await
-        .expect("Claim B creation should succeed");
+    let created_claim_b =
+        ClaimRepository::create(&pool, &claim_b, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Claim B creation should succeed");
 
     let claim_c = create_test_claim_without_trace(created_agent.id, 0.8);
-    let created_claim_c = ClaimRepository::create(&pool, &claim_c)
-        .await
-        .expect("Claim C creation should succeed");
+    let created_claim_c =
+        ClaimRepository::create(&pool, &claim_c, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Claim C creation should succeed");
 
     let trace_a = ReasoningTrace::new(
         created_agent.id,

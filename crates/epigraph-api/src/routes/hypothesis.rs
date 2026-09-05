@@ -50,11 +50,44 @@ pub async fn create_hypothesis(
             })?;
 
     // 2. Create claim with hypothesis labels and properties
+    //
+    // Tenancy declaration (PR-16). This statement binds no parent, so migration
+    // 074 has nothing to inherit from and the write must name both columns.
+    //
+    // CORRECTION TO THE PLAN. §4.6 says "explicit declaration from
+    // `AuthContext`". This handler takes no `AuthContext` -- it reads the
+    // author from `request.agent_id` -- and the owner it needs is the CLAIM'S
+    // AUTHOR, not the caller. Those are the same principal on every honest
+    // invocation, and where they differ the author is the right answer: the row
+    // records `agent_id` as its author, so owning it from anywhere else would
+    // make authorship and ownership disagree on the same row. Nothing is
+    // disclosed either way -- the row is `public` -- so this is a question of
+    // whose group a later privatization acts on, and the author's is the only
+    // defensible one. Threading an `AuthContext` in to check that the caller
+    // MAY author as `request.agent_id` is a real gap, and it is the write-side
+    // gate's, not this PR's.
+    //
+    // DIVERGENCE FROM `routes/claims.rs::create_claim`, DELIBERATE and made in
+    // review. That handler derives the declaration from the AUTHENTICATED
+    // PRINCIPAL rather than from the body's author, because `ViewerExtractor`
+    // guarantees it has one and deriving `owner_group_id` from an
+    // un-authenticated body field would let a caller place rows into a group it
+    // is not a member of. This handler has neither a `ViewerExtractor` nor an
+    // `AuthContext` -- it is one of the fail-open surfaces the write-side gate
+    // owns -- so there is no principal here to derive from, and the author is
+    // the only identity in scope. Tracked as
+    // `D-PR16-claim-authorship-is-not-a-credential` in
+    // `docs/tenancy/progress.json`.
     let content_hash = epigraph_crypto::ContentHasher::hash(request.statement.as_bytes());
+    let decl = epigraph_db::ClaimRepository::default_decl_for_author_pool(
+        &state.db_pool,
+        request.agent_id,
+    )
+    .await?;
     let claim_id: (Uuid,) = sqlx::query_as(
         r#"
-        INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, embedding)
-        VALUES ($1, $2, $3, 0.5, ARRAY['hypothesis'], $4, $5::vector)
+        INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, embedding, visibility, owner_group_id)
+        VALUES ($1, $2, $3, 0.5, ARRAY['hypothesis'], $4, $5::vector, $6, $7)
         RETURNING id
         "#,
     )
@@ -67,6 +100,8 @@ pub async fn create_hypothesis(
         "search_radius": search_radius,
     }))
     .bind(format_embedding(&embedding))
+    .bind(decl.visibility_bind())
+    .bind(decl.owner_group_bind())
     .fetch_one(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {

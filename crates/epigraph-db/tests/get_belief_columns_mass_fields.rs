@@ -64,7 +64,7 @@ async fn get_belief_columns_includes_mass_on_empty_and_missing() {
     insert_test_agent(&pool, agent_id).await;
 
     let claim = make_claim(&format!("belief mass fields {}", Uuid::new_v4()), agent_id);
-    let created = ClaimRepository::create(&pool, &claim)
+    let created = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("create");
 
@@ -109,7 +109,7 @@ async fn get_belief_columns_mass_fields_default_to_zero_on_fresh_claim() {
         &format!("belief mass fields default {}", Uuid::new_v4()),
         agent_id,
     );
-    let created = ClaimRepository::create(&pool, &claim)
+    let created = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("create");
 

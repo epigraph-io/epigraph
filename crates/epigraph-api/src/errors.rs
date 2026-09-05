@@ -334,6 +334,7 @@ impl From<DbError> for ApiError {
             DbError::DuplicateKey { entity } => ApiError::BadRequest {
                 message: format!("{} already exists", entity),
             },
+            DbError::Conflict { reason } => ApiError::Conflict { reason },
             DbError::InvalidData { reason } => ApiError::ValidationError {
                 field: "data".to_string(),
                 reason,

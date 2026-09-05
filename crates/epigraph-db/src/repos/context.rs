@@ -51,8 +51,9 @@ impl ContextRepository {
         let row: ContextRow = sqlx::query_as(
             r#"
             INSERT INTO contexts (name, context_type, description, valid_from, valid_until,
-                                  applicable_frame_ids, parameters, modifier_type)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                                  applicable_frame_ids, parameters, modifier_type,
+                                  visibility, owner_group_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id, name, context_type, description, valid_from, valid_until,
                       applicable_frame_ids, parameters, modifier_type, properties, created_at
             "#,
@@ -65,6 +66,11 @@ impl ContextRepository {
         .bind(applicable_frame_ids)
         .bind(&params)
         .bind(mod_type)
+        // Tenancy declaration (PR-16): a context is an instance-wide modifier
+        // over frames, with no parent and no author. See
+        // `TenancyDecl::instance_wide`.
+        .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
+        .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
         .fetch_one(pool)
         .await?;
 

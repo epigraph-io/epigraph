@@ -490,6 +490,9 @@ mod tests {
             sys_agent_id,
             epigraph_core::TruthValue::clamped(0.5),
             &["paper_atom".to_string()],
+            epigraph_db::ClaimRepository::default_decl_for_author_pool(&pool, sys_agent_id)
+                .await
+                .unwrap(),
         )
         .await
         .unwrap();

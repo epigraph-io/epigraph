@@ -1110,8 +1110,24 @@ async fn persist_packet(
         now,
     );
 
+    // Tenancy declaration (PR-16), resolved from the packet's author inside
+    // the same transaction as the insert. `SubmitPacket` carries no visibility
+    // field; a signed packet's author is the principal, and its own personal
+    // group is the only owner this surface can name without inventing one.
+    let decl = epigraph_db::ClaimRepository::default_decl_for_author(&mut tx, agent_id.into())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new(
+                    "DatabaseError",
+                    format!("Failed to resolve the author's tenancy: {e}"),
+                ),
+            )
+        })?;
+
     let (persisted, was_created) =
-        epigraph_db::ClaimRepository::create_or_get(&mut tx, viewer, &claim)
+        epigraph_db::ClaimRepository::create_or_get(&mut tx, viewer, &claim, decl)
             .await
             .map_err(|e| {
                 (

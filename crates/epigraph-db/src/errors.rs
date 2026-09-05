@@ -92,6 +92,22 @@ pub enum DbError {
     #[error("Invalid data: {reason}")]
     InvalidData { reason: String },
 
+    /// The request is well-formed but conflicts with the state of the graph,
+    /// and no automatic resolution is safe. Maps to HTTP **409**.
+    ///
+    /// Distinct from [`Self::InvalidData`] (422 — the caller sent something
+    /// unusable) and from [`Self::CheckViolation`] (the schema rejected the
+    /// row). This one is a REFUSAL BY POLICY: the statement would have
+    /// succeeded, and we decline because the outcome would be wrong.
+    ///
+    /// PR-16 introduces it for `ClaimRepository::consolidate`'s cross-group
+    /// case (plan §4.6): merging claims owned by two different groups into one
+    /// row discloses each group's content to the other, and neither authorized
+    /// it. Picking a winner and picking the world group are both disclosures;
+    /// refusing is the only answer that is not.
+    #[error("Conflict: {reason}")]
+    Conflict { reason: String },
+
     /// Migration failed
     #[error("Migration failed: {source}")]
     MigrationFailed {

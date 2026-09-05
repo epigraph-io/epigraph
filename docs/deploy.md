@@ -709,3 +709,63 @@ Unchanged from PR-01. The api binary runs migrations only when
 `EPIGRAPH_MIGRATE_ON_BOOT` is set; `ExecStartPre=` running `epigraph-migrate` is
 the supported path, and it honours `-- no-transaction` (the flag is propagated
 into the compile-time `migrate!()` literal).
+
+#### `MIGRATION_DATABASE_URL` (PR-16)
+
+`epigraph-migrate` now reads **`MIGRATION_DATABASE_URL`**, falling back to
+`DATABASE_URL` with a `WARN`. Set it in the unit that runs `ExecStartPre=`.
+
+The two are different credentials on purpose. Applying migrations needs **DDL
+privilege on every tier-A table** — from migration 074 on, the migrator drops
+column defaults and creates 23 triggers — and that is strictly stronger than
+either of the other two roles:
+
+| Role | Holds | Can it migrate? |
+|---|---|---|
+| `epigraph_app` | the application's DML | **No.** After 074 it cannot even `ALTER TABLE … SET DEFAULT`; `tenancy_required.rs` asserts that. |
+| `epigraph_maintenance` | `SELECT, INSERT, UPDATE` schema-wide (migration 070) | **No.** No DDL at all. |
+| the migration role | table ownership / DDL | Yes. This is what `MIGRATION_DATABASE_URL` points at. |
+
+The fallback exists so this change is not itself a deploy break: a unit that
+still sets only `DATABASE_URL` keeps working and logs the WARN. It is a
+migration path, not an end state — the whole point of the split is that the
+serving process must NOT hold DDL privilege.
+
+#### Deploy ordering for 074/075/076 — do not compress this
+
+Plan §9.2 / ops F10, and the largest single outage risk in the tenancy series.
+**The migrations do not ship in the same deploy step as the code.**
+
+1. Deploy the binaries carrying the patched `INSERT INTO claims` call sites,
+   with 074/075/076 **not applied**.
+2. Watch `epigraph_tenancy_undeclared_writes` (PR-12's gauge, scraped from
+   `EPIGRAPH_METRICS_ADDR`) **flat at zero for 24 hours across every tier-A
+   table**.
+
+   **Falsify the counter FIRST, before the 24 hours start.** Zero and unwired
+   look identical on a dashboard, and after 074 no test exercises the
+   trigger→counter link any more (074's `CREATE OR REPLACE` removes migration
+   070 arm (a)'s counting limb, so the link only exists on a pre-074 database —
+   which is exactly the database you are standing on at this step, and the only
+   place it can still be demonstrated). On a canary pod, perform ONE deliberate
+   undeclared insert as the application role and confirm the series increments
+   and appears in the scrape; then reset the observation window. A gate whose
+   instrument was never proved live is not a gate.
+
+   Tracked as `D-PR16-undeclared-write-counter-link-uncovered` in
+   `docs/tenancy/progress.json`.
+3. Then apply 074, then 075, then 076, as **three separate steps** — 075 and 076
+   are split so `claims`'s `VALIDATE CONSTRAINT` scan does not hold
+   `SHARE UPDATE EXCLUSIVE` for the sum of every other table's.
+
+Skipping step 2 is the failure: the previous pods still run
+`ClaimRepository::create` without the tenancy columns, and **every claim write
+raises `23502` the instant 074 commits**.
+
+Run `epigraph-tenancy-backfill verify` before step 3; its exit code is the
+guard, and it prints the offending ids. Migration 066's header also requires
+`REINDEX INDEX CONCURRENTLY idx_claims_world_owned` as a post-backfill step —
+that is required, not an optimisation.
+
+074 is a **one-way door**. Its undo script is `docs/runbooks/074-undo.sql`; read
+it before applying 074 to anything you cannot rebuild.

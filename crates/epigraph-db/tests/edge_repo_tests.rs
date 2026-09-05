@@ -16,7 +16,9 @@ async fn create_if_not_exists_is_idempotent(pool: PgPool) {
     let agent = make_agent(Some("a"));
     let agent_row = AgentRepository::create(&pool, &agent).await.unwrap();
     let claim = make_claim(agent_row.id, "the claim", 0.5);
-    let claim_row = ClaimRepository::create(&pool, &claim).await.unwrap();
+    let claim_row = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+        .await
+        .unwrap();
     let claim_id: uuid::Uuid = claim_row.id.into();
 
     let (row1, was_created1) = EdgeRepository::create_if_not_exists(
@@ -62,7 +64,9 @@ async fn create_if_not_exists_distinguishes_by_relationship(pool: PgPool) {
     let agent = make_agent(Some("b"));
     let agent_row = AgentRepository::create(&pool, &agent).await.unwrap();
     let claim = make_claim(agent_row.id, "another", 0.5);
-    let claim_row = ClaimRepository::create(&pool, &claim).await.unwrap();
+    let claim_row = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+        .await
+        .unwrap();
     let claim_id: uuid::Uuid = claim_row.id.into();
 
     let (row_a, _) = EdgeRepository::create_if_not_exists(
@@ -124,16 +128,18 @@ async fn reverse_direction_dedup_returns_false(pool: PgPool) {
     let agent_row = AgentRepository::create(&pool, &agent).await.unwrap();
     let claim_a = make_claim(agent_row.id, "claim A for symmetric dedup", 0.5);
     let claim_b = make_claim(agent_row.id, "claim B for symmetric dedup", 0.5);
-    let a: uuid::Uuid = ClaimRepository::create(&pool, &claim_a)
-        .await
-        .unwrap()
-        .id
-        .into();
-    let b: uuid::Uuid = ClaimRepository::create(&pool, &claim_b)
-        .await
-        .unwrap()
-        .id
-        .into();
+    let a: uuid::Uuid =
+        ClaimRepository::create(&pool, &claim_a, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .unwrap()
+            .id
+            .into();
+    let b: uuid::Uuid =
+        ClaimRepository::create(&pool, &claim_b, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .unwrap()
+            .id
+            .into();
 
     let props = serde_json::json!({"source": "cross_source_matcher", "score": 0.91});
 
@@ -174,16 +180,18 @@ async fn create_symmetric_if_absent_distinguishes_by_relationship(pool: PgPool) 
     let agent_row = AgentRepository::create(&pool, &agent).await.unwrap();
     let claim_a = make_claim(agent_row.id, "claim A for rel discrimination", 0.5);
     let claim_b = make_claim(agent_row.id, "claim B for rel discrimination", 0.5);
-    let a: uuid::Uuid = ClaimRepository::create(&pool, &claim_a)
-        .await
-        .unwrap()
-        .id
-        .into();
-    let b: uuid::Uuid = ClaimRepository::create(&pool, &claim_b)
-        .await
-        .unwrap()
-        .id
-        .into();
+    let a: uuid::Uuid =
+        ClaimRepository::create(&pool, &claim_a, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .unwrap()
+            .id
+            .into();
+    let b: uuid::Uuid =
+        ClaimRepository::create(&pool, &claim_b, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .unwrap()
+            .id
+            .into();
 
     let props = serde_json::json!({"source": "cross_source_matcher"});
 

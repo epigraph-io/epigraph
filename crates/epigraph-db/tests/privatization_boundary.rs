@@ -421,16 +421,36 @@ async fn declassifying_one_endpoint_of_a_co_owned_edge_clears_the_co_owner(pool:
         "precondition: co-owned"
     );
 
-    sqlx::query("UPDATE claims SET owner_group_id = $1, visibility = 'public' WHERE id = $2")
-        .bind(WORLD)
-        .bind(c.claim_g)
-        .execute(&pool)
-        .await
-        .expect(
-            "declassifying one endpoint of a CO-OWNED edge must not raise: an \
-             exception from arm (d) is a write outage on privatization, not a \
-             rejected row",
-        );
+    // PR-16: declassification now needs the admin GUC. Migration 074 adds
+    // `claims_block_widening`, which refuses a group→public UPDATE unless
+    // `epigraph.allow_declassify = 'yes'` — the GUC the admin declassification
+    // surface sets. The GUC is SESSION-scoped, so it and the UPDATE must ride
+    // the SAME connection; issuing the SET on the pool would land on an
+    // arbitrary one and the UPDATE would be refused intermittently.
+    //
+    // This does NOT weaken what the test is about. The assertion below is about
+    // arm (d)'s edge recomputation, and the thing it must not do is RAISE — a
+    // 42501 from `claims_block_widening` is the guard doing its job on the
+    // caller's statement, not arm (d) failing on the cascade. Taking the
+    // documented admin path is what puts the test back on the path a
+    // privatization job actually takes.
+    {
+        use sqlx::Executor;
+        let mut conn = pool.acquire().await.expect("acquire");
+        conn.execute("SET epigraph.allow_declassify = 'yes'")
+            .await
+            .expect("set the admin declassification GUC");
+        sqlx::query("UPDATE claims SET owner_group_id = $1, visibility = 'public' WHERE id = $2")
+            .bind(WORLD)
+            .bind(c.claim_g)
+            .execute(&mut *conn)
+            .await
+            .expect(
+                "declassifying one endpoint of a CO-OWNED edge must not raise: an \
+                 exception from arm (d) is a write outage on privatization, not a \
+                 rejected row",
+            );
+    }
 
     assert_eq!(
         edge_tenancy(&pool, edge).await,
@@ -459,15 +479,25 @@ async fn declassifying_both_endpoints_does_not_widen_a_co_owned_edge(pool: PgPoo
     let c = corpus(&pool).await;
     let edge = seed_edge(&pool, c.claim_g, c.claim_h).await;
 
-    sqlx::query(
-        "UPDATE claims SET owner_group_id = $1, visibility = 'public' WHERE id IN ($2, $3)",
-    )
-    .bind(WORLD)
-    .bind(c.claim_g)
-    .bind(c.claim_h)
-    .execute(&pool)
-    .await
-    .expect("declassifying both endpoints must not raise");
+    // PR-16: same as the single-endpoint case above — migration 074's
+    // `claims_block_widening` requires the admin GUC, and it is session-scoped
+    // so it must share the UPDATE's connection.
+    {
+        use sqlx::Executor;
+        let mut conn = pool.acquire().await.expect("acquire");
+        conn.execute("SET epigraph.allow_declassify = 'yes'")
+            .await
+            .expect("set the admin declassification GUC");
+        sqlx::query(
+            "UPDATE claims SET owner_group_id = $1, visibility = 'public' WHERE id IN ($2, $3)",
+        )
+        .bind(WORLD)
+        .bind(c.claim_g)
+        .bind(c.claim_h)
+        .execute(&mut *conn)
+        .await
+        .expect("declassifying both endpoints must not raise");
+    }
 
     let (_, vis, _) = edge_tenancy(&pool, edge).await;
     assert_eq!(

@@ -32,7 +32,17 @@ pub async fn create_claim_idempotent(
     tool_name: &'static str,
 ) -> Result<(Claim, bool), McpError> {
     let mut conn = pool.acquire().await.map_err(internal_error)?;
-    let (claim, was_created) = ClaimRepository::create_or_get(&mut conn, viewer, claim)
+    // Tenancy declaration (PR-16). Every MCP writer that reaches this helper
+    // (`submit_claim`, `memorize`, `batch_submit_claims`) posts a claim
+    // authored by the calling principal and carries no visibility parameter, so
+    // the declaration is the author's own personal group, publicly visible.
+    // Giving those tools a `visibility` argument is the write-side gate's work,
+    // not this PR's; when it arrives, this is the single place it lands for all
+    // three.
+    let decl = ClaimRepository::default_decl_for_author(&mut conn, claim.agent_id.into())
+        .await
+        .map_err(internal_error)?;
+    let (claim, was_created) = ClaimRepository::create_or_get(&mut conn, viewer, claim, decl)
         .await
         .map_err(internal_error)?;
     drop(conn);

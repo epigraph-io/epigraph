@@ -606,9 +606,14 @@ async fn submit_packet_dedup_onto_null_trace_claim_returns_null_trace(pool: PgPo
     );
     let viewer = fixture::public_viewer(&pool).await;
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let (persisted, created) = ClaimRepository::create_or_get(&mut conn, &viewer, &seeded)
-        .await
-        .expect("seeding the null-trace claim should succeed");
+    let (persisted, created) = ClaimRepository::create_or_get(
+        &mut conn,
+        &viewer,
+        &seeded,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("seeding the null-trace claim should succeed");
     assert!(created, "seed must be a fresh create");
     assert!(
         persisted.trace_id.is_none(),

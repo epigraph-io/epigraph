@@ -2,7 +2,7 @@
 
 use crate::errors::DbError;
 use chrono::{DateTime, Utc};
-use epigraph_core::{AgentId, Claim, ClaimId, TraceId, TruthValue};
+use epigraph_core::{AgentId, Claim, ClaimId, TenancyDecl, TraceId, TruthValue};
 use epigraph_crypto::ContentHasher;
 use sqlx::PgPool;
 use tracing::instrument;
@@ -399,6 +399,97 @@ fn claim_from_row(
 }
 
 impl ClaimRepository {
+    /// The declaration a write path uses when its caller expressed no
+    /// preference: **`('public', <the author's personal group>)`**.
+    ///
+    /// This is D2's shape, applied forward. The one-shot backfill stamps every
+    /// pre-existing row `('public', <author's personal group>)` — those rows
+    /// were already world-readable, so declaring `public` is a no-op rather
+    /// than a new disclosure — and a new claim from a surface that has not yet
+    /// grown a "which group?" parameter must land in the same place, or the
+    /// corpus splits into two populations with different owners for no reason a
+    /// reader could see.
+    ///
+    /// **It is not a default.** The distinction matters and is the whole of
+    /// D1: a `DEFAULT` in `pg_attrdef` applies to a write that said nothing,
+    /// with no principal in scope and nobody to hold responsible. This resolves
+    /// a *named* agent's *own* group, fails if it cannot, and is spelled at
+    /// every call site. Grepping this symbol enumerates exactly the surfaces
+    /// that still owe their callers a visibility parameter.
+    ///
+    /// `ensure_personal_group` is idempotent and is already called for every
+    /// authenticated principal at token mint (PR-02), so on a live path this is
+    /// a lookup, not a write.
+    ///
+    /// # Errors
+    /// Returns `DbError::ForeignKeyViolation` if `agent_id` names no agent, and
+    /// `DbError::QueryFailed` for other database failures.
+    pub async fn default_decl_for_author(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<TenancyDecl, DbError> {
+        Ok(TenancyDecl::public(
+            Self::personal_group_of(conn, agent_id).await?,
+        ))
+    }
+
+    /// The id of `agent_id`'s personal group: **read first, mint only if
+    /// absent.**
+    ///
+    /// The read-first order is a security property, not an optimisation.
+    /// `AgentRepository::ensure_personal_group`'s membership statement is
+    /// `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at =
+    /// NULL, role = 'admin'`, so calling it unconditionally **revives a revoked
+    /// membership as admin**. That is correct where it is called from — PR-02's
+    /// token mint, where the principal is authenticating and its own personal
+    /// group must work — and wrong on a write path, where restoring a
+    /// membership somebody deliberately revoked would be a privilege change
+    /// hidden inside an unrelated claim insert.
+    ///
+    /// The lookup below cannot revive anything. The mint runs only when the
+    /// group does not exist at all, and then there is no membership to revive.
+    ///
+    /// The `did_key` is the deterministic
+    /// `did:epigraph:personal:<agent_uuid>`, spelled the same way
+    /// `ensure_personal_group` spells it: nothing on `agents` records which
+    /// group is the personal one, so that key against `groups_did_key_key
+    /// UNIQUE` is the whole of the identification. A second spelling here would
+    /// silently resolve a different row — which is exactly the defect the test
+    /// fixture `seed_agent_with_group` had until PR-16.
+    ///
+    /// # Errors
+    /// Returns `DbError::ForeignKeyViolation` if `agent_id` names no agent (the
+    /// mint path FKs to `agents`), and `DbError::QueryFailed` otherwise.
+    async fn personal_group_of(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Uuid, DbError> {
+        let existing: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+        )
+        .bind(agent_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        match existing {
+            Some(g) => Ok(g),
+            None => crate::repos::AgentRepository::ensure_personal_group(conn, agent_id).await,
+        }
+    }
+
+    /// [`Self::default_decl_for_author`] for a caller holding a pool rather
+    /// than a connection.
+    ///
+    /// # Errors
+    /// As [`Self::default_decl_for_author`], plus `DbError::ConnectionFailed`
+    /// if no connection can be acquired.
+    pub async fn default_decl_for_author_pool(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<TenancyDecl, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::default_decl_for_author(&mut conn, agent_id).await
+    }
+
     /// Create a new claim in the database (LEGACY — implicit content-hash dedup)
     ///
     /// **Legacy behavior:** dedups on `content_hash` alone (NOT on
@@ -410,10 +501,18 @@ impl ClaimRepository {
     /// internal callers of this method are migrated as a separate
     /// out-of-band task.
     ///
+    /// `decl` declares the row's tenancy. Migration 074 drops the
+    /// `visibility` / `owner_group_id` defaults, so a write that names neither
+    /// and has no parent to inherit from raises `23502`. This method's INSERT
+    /// binds no parent at all, so [`TenancyDecl::Inherited`] here reaches the
+    /// seed escape hatch for a test-harness role and raises for an application
+    /// role — which is the intended asymmetry, not an oversight. See
+    /// `docs/tenancy.md#declaring-visibility-on-write`.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool, claim))]
-    pub async fn create(pool: &PgPool, claim: &Claim) -> Result<Claim, DbError> {
+    pub async fn create(pool: &PgPool, claim: &Claim, decl: TenancyDecl) -> Result<Claim, DbError> {
         let id: Uuid = claim.id.into();
         let agent_id: Uuid = claim.agent_id.into();
         let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
@@ -453,9 +552,9 @@ impl ClaimRepository {
             r#"
             INSERT INTO claims (
                 id, content, content_hash, truth_value, agent_id, trace_id,
-                created_at, updated_at
+                created_at, updated_at, visibility, owner_group_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at
             "#,
             id,
@@ -465,7 +564,9 @@ impl ClaimRepository {
             agent_id,
             trace_id,
             created_at,
-            updated_at
+            updated_at,
+            decl.visibility_bind(),
+            decl.owner_group_bind()
         )
         .fetch_one(pool)
         .await?;
@@ -1364,6 +1465,7 @@ impl ClaimRepository {
     pub async fn create_with_tx(
         conn: &mut sqlx::PgConnection,
         claim: &Claim,
+        decl: TenancyDecl,
     ) -> Result<Claim, DbError> {
         let id: Uuid = claim.id.into();
         let agent_id: Uuid = claim.agent_id.into();
@@ -1400,8 +1502,8 @@ impl ClaimRepository {
         }
 
         let row = sqlx::query(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
         )
         .bind(id)
@@ -1412,6 +1514,8 @@ impl ClaimRepository {
         .bind(trace_id)
         .bind(created_at)
         .bind(updated_at)
+        .bind(decl.visibility_bind())
+        .bind(decl.owner_group_bind())
         .fetch_one(&mut *conn)
         .await?;
 
@@ -3216,6 +3320,11 @@ impl ClaimRepository {
     /// # Arguments
     /// * `pool` - Database connection pool
     /// * `claims` - Slice of claims to insert
+    /// * `decl` - the tenancy declaration applied to EVERY claim in the batch.
+    ///   One declaration for the whole batch, not one per claim: a batch is a
+    ///   single caller's single decision, and a per-claim vector would make it
+    ///   possible to mix two groups' rows into one statement, which is the
+    ///   shape `consolidate`'s cross-group refusal exists to forbid.
     ///
     /// # Returns
     /// Vector of created claims with server-generated timestamps
@@ -3228,7 +3337,11 @@ impl ClaimRepository {
     /// - Batch size is limited internally to prevent memory issues
     /// - For very large batches (>1000), consider chunking externally
     #[instrument(skip(pool, claims), fields(batch_size = claims.len()))]
-    pub async fn batch_create(pool: &PgPool, claims: &[Claim]) -> Result<Vec<Claim>, DbError> {
+    pub async fn batch_create(
+        pool: &PgPool,
+        claims: &[Claim],
+        decl: TenancyDecl,
+    ) -> Result<Vec<Claim>, DbError> {
         if claims.is_empty() {
             return Ok(Vec::new());
         }
@@ -3249,28 +3362,32 @@ impl ClaimRepository {
         // Build multi-value INSERT query dynamically
         // PostgreSQL supports multi-row VALUES: INSERT INTO t VALUES (...), (...), (...)
         let mut query_builder = String::from(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at)
+            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id)
                VALUES "#,
         );
 
-        // Build parameter placeholders and collect values
+        // Build parameter placeholders and collect values.
+        //
+        // TEN placeholders per row, not eight: the two tenancy columns are
+        // bound per row rather than hoisted into a single shared pair of
+        // parameters. Hoisting would be fewer binds, but it would put the
+        // declaration outside the per-row loop below and the two would drift
+        // the first time someone made `decl` per-claim. The stride and the
+        // bind order are the same arithmetic; keeping them adjacent is what
+        // makes an off-by-two visible.
+        const PARAMS_PER_ROW: usize = 10;
         let mut param_idx = 1;
         for (i, _) in claims.iter().enumerate() {
             if i > 0 {
                 query_builder.push_str(", ");
             }
-            query_builder.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                param_idx,
-                param_idx + 1,
-                param_idx + 2,
-                param_idx + 3,
-                param_idx + 4,
-                param_idx + 5,
-                param_idx + 6,
-                param_idx + 7
-            ));
-            param_idx += 8;
+            let placeholders: Vec<String> = (0..PARAMS_PER_ROW)
+                .map(|k| format!("${}", param_idx + k))
+                .collect();
+            query_builder.push('(');
+            query_builder.push_str(&placeholders.join(", "));
+            query_builder.push(')');
+            param_idx += PARAMS_PER_ROW;
         }
 
         query_builder.push_str(
@@ -3300,7 +3417,9 @@ impl ClaimRepository {
                 .bind(agent_id)
                 .bind(trace_id)
                 .bind(claim.created_at)
-                .bind(claim.updated_at);
+                .bind(claim.updated_at)
+                .bind(decl.visibility_bind())
+                .bind(decl.owner_group_bind());
         }
 
         let rows = query.fetch_all(&mut *tx).await?;
@@ -3610,6 +3729,7 @@ impl ClaimRepository {
     pub async fn create_strict(
         conn: &mut sqlx::PgConnection,
         claim: &Claim,
+        decl: TenancyDecl,
     ) -> Result<Claim, DbError> {
         use sqlx::Row;
 
@@ -3622,8 +3742,8 @@ impl ClaimRepository {
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
         let row = sqlx::query(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
         )
         .bind(id)
@@ -3634,6 +3754,8 @@ impl ClaimRepository {
         .bind(trace_id)
         .bind(created_at)
         .bind(updated_at)
+        .bind(decl.visibility_bind())
+        .bind(decl.owner_group_bind())
         .fetch_one(&mut *conn)
         .await?;
 
@@ -3706,6 +3828,7 @@ impl ClaimRepository {
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         claim: &Claim,
+        decl: TenancyDecl,
     ) -> Result<(Claim, bool), DbError> {
         let agent_id: Uuid = claim.agent_id.into();
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
@@ -3721,7 +3844,7 @@ impl ClaimRepository {
             return Ok((existing, false));
         }
 
-        match Self::create_strict(&mut *conn, claim).await {
+        match Self::create_strict(&mut *conn, claim, decl).await {
             Ok(c) => Ok((c, true)),
             Err(DbError::DuplicateKey { .. }) => {
                 // Post-107 race: another writer won. Re-find and return.
@@ -3749,6 +3872,13 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` for non-conflict failures.
+    // Eight parameters, one over clippy's default. Allowed rather than bundled
+    // into a struct: the eighth is `decl`, and the whole point of PR-16 is that
+    // the tenancy declaration is VISIBLE at every call site. A parameter object
+    // would hide it inside a literal that a caller can construct without
+    // thinking about the field — which is the shape a `Default` impl grows out
+    // of, and D1 is the rule that says there must not be one.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(pool, content, content_hash, labels))]
     pub async fn create_with_id_if_absent(
         pool: &PgPool,
@@ -3758,10 +3888,12 @@ impl ClaimRepository {
         agent_id: Uuid,
         truth: TruthValue,
         labels: &[String],
+        decl: TenancyDecl,
     ) -> Result<bool, DbError> {
         let row: Option<(bool,)> = sqlx::query_as(
-            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels, \
+                                 visibility, owner_group_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (id) DO NOTHING \
              RETURNING (xmax = 0) AS was_inserted",
         )
@@ -3771,6 +3903,8 @@ impl ClaimRepository {
         .bind(agent_id)
         .bind(truth.value())
         .bind(labels)
+        .bind(decl.visibility_bind())
+        .bind(decl.owner_group_bind())
         .fetch_optional(pool)
         .await?;
         // RETURNING is empty when the conflict path is taken, so None == not new.
@@ -4237,19 +4371,51 @@ impl ClaimRepository {
         let parent_uuid: Uuid = parent.into();
         let mut tx = pool.begin().await?;
 
-        let row: Option<(Option<Uuid>, bool)> =
+        // The parent's tenancy is read HERE, under the same FOR UPDATE that
+        // guards the lineage id, and bound explicitly on the INSERT below.
+        //
+        // Migration 074 arm 2 would derive it from `step_lineage_id` anyway, so
+        // this is belt and braces -- but the plan says "prefer explicit" and the
+        // reason is concrete: arm 2 picks the lineage's most recent row by
+        // `created_at DESC`, which is not necessarily THIS parent. On a
+        // `revises` branch the lineage has two live heads, and inheriting from
+        // whichever was written last is a different answer from inheriting from
+        // the step being revised. Binding the parent's own values makes the two
+        // agree by construction instead of by timing.
+        let row: Option<(Option<Uuid>, bool, Uuid, String)> =
             sqlx::query_as(
                 r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-                SELECT step_lineage_id, COALESCE(is_current, true) FROM claims
+                SELECT step_lineage_id, COALESCE(is_current, true),
+                       owner_group_id, visibility
+                FROM claims
                 WHERE id = $1 FOR UPDATE"#,
             )
                 .bind(parent_uuid)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let (existing_lineage, parent_current) = row.ok_or(DbError::NotFound {
-            entity: "Claim".into(),
-            id: parent_uuid,
-        })?;
+        let (existing_lineage, parent_current, parent_group, parent_visibility) =
+            row.ok_or(DbError::NotFound {
+                entity: "Claim".into(),
+                id: parent_uuid,
+            })?;
+        let decl = match epigraph_core::Visibility::from_db_str(&parent_visibility) {
+            Some(v) => TenancyDecl::Declared {
+                visibility: v,
+                owner_group_id: parent_group,
+            },
+            // An unparseable stored visibility is not a value to guess at. The
+            // column is NOT NULL with a CHECK, so reaching this means the
+            // constraint was dropped out of band -- fail the write rather than
+            // pick a side.
+            None => {
+                return Err(DbError::InvalidData {
+                    reason: format!(
+                        "evolve_step: parent claim {parent_uuid} has visibility \
+                         {parent_visibility:?}, which is outside the vocabulary"
+                    ),
+                })
+            }
+        };
         if edge_type == "supersedes" && !parent_current {
             return Err(DbError::QueryFailed {
                 source: sqlx::Error::Protocol(format!(
@@ -4277,8 +4443,9 @@ impl ClaimRepository {
             "step_lineage_id": lineage_id.to_string(),
         });
         sqlx::query(
-            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels, properties, step_lineage_id) \
-             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6)",
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels, properties, step_lineage_id, \
+                                 visibility, owner_group_id) \
+             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6, $7, $8)",
         )
         .bind(new_uuid)
         .bind(new_content)
@@ -4286,6 +4453,8 @@ impl ClaimRepository {
         .bind(agent_id)
         .bind(&properties)
         .bind(lineage_id)
+        .bind(decl.visibility_bind())
+        .bind(decl.owner_group_bind())
         .execute(&mut *tx)
         .await?;
 
@@ -5517,7 +5686,10 @@ mod tests {
             public_key,
             TruthValue::clamped(0.5),
         );
-        let persisted = ClaimRepository::create(&pool, &claim).await.unwrap();
+        let persisted =
+            ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+                .await
+                .unwrap();
         let props = serde_json::json!({"level": 3, "section": "Body", "source_type": "Wiki"});
 
         ClaimRepository::set_properties(&pool, persisted.id, props.clone())
@@ -5556,7 +5728,10 @@ mod tests {
             public_key,
             TruthValue::clamped(0.5),
         );
-        let persisted = ClaimRepository::create(&pool, &claim).await.unwrap();
+        let persisted =
+            ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+                .await
+                .unwrap();
         ClaimRepository::set_properties(&pool, persisted.id, serde_json::json!({"level": 2}))
             .await
             .unwrap();
@@ -5659,6 +5834,7 @@ mod tests {
             agent_id,
             TruthValue::clamped(0.5),
             &["test".to_string()],
+            epigraph_core::TenancyDecl::Inherited,
         )
         .await
         .unwrap();
@@ -5670,6 +5846,7 @@ mod tests {
             agent_id,
             TruthValue::clamped(0.5),
             &["test".to_string()],
+            epigraph_core::TenancyDecl::Inherited,
         )
         .await
         .unwrap();
@@ -6270,7 +6447,7 @@ impl ClaimRepository {
         let locked = sqlx::query!(
             r#"
             -- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-            SELECT id, is_current, supersedes, labels
+            SELECT id, is_current, supersedes, labels, visibility, owner_group_id
             FROM claims WHERE id = ANY($1) FOR UPDATE
             "#,
             source_ids,
@@ -6320,6 +6497,125 @@ impl ClaimRepository {
                 "reason": reason,
             }
         });
+        // ── The merged row's tenancy (plan §4.6) ──
+        //
+        // `consolidate` binds NEITHER `supersedes` NOR `step_lineage_id` --
+        // the sources are retired separately, AFTER this insert -- so none of
+        // migration 074's inheritance arms can reach it. Left undeclared it
+        // would raise 23502 for the app role. Left on the old default it was
+        // worse than that: a WIDENING primitive, merging a private claim into a
+        // world-owned public row.
+        //
+        // The rule itself is a pure function in epigraph-core so it can be
+        // tested without a database (§8.1); this is the only place it is
+        // applied. `owner_group_id` on a source is read under the FOR UPDATE
+        // taken above, so it cannot change between the decision and the insert.
+        let source_tenancy: Vec<epigraph_core::SourceTenancy> = locked
+            .iter()
+            .map(|r| {
+                epigraph_core::Visibility::from_db_str(&r.visibility)
+                    .map(|v| (r.owner_group_id, v))
+                    .ok_or_else(|| DbError::InvalidData {
+                        reason: format!(
+                            "consolidate: source {} has visibility {:?}, which is outside \
+                             the vocabulary",
+                            r.id, r.visibility
+                        ),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // THE REFUSAL IS DECIDED FIRST, and it costs nothing: `consolidate_owner`
+        // is a pure function over the tenancies just read under FOR UPDATE. A
+        // cross-group merge therefore refuses before this transaction has
+        // written anything at all, and refuses identically whether or not a
+        // retry has already inserted the row.
+        //
+        // `Ok(None)` means every source is public, and the owner is the acting
+        // agent's own group -- resolved BELOW, after the idempotent-return
+        // branch, because that resolution can WRITE.
+        let merged_owner = epigraph_core::consolidate_owner(&source_tenancy).map_err(|e| {
+            // The PAIR is logged, never rendered into the 409: see
+            // `ConsolidateTenancyError`'s `Display` impl for why. An
+            // operator reads the owners here; the caller reads only that
+            // the sources span more than one group.
+            // A `match` rather than `if let`: `ConsolidateTenancyError` has
+            // one variant today, so `if let` is irrefutable and lints — and
+            // a `match` is what forces this arm to be revisited if a second
+            // refusal reason is ever added.
+            match &e {
+                epigraph_core::ConsolidateTenancyError::CrossGroup { groups: (a, b) } => {
+                    tracing::warn!(
+                        owner_a = %a,
+                        owner_b = %b,
+                        acting_agent_id = %acting_agent_id,
+                        "consolidate refused: sources span two owner groups"
+                    );
+                }
+            }
+            DbError::Conflict {
+                reason: e.to_string(),
+            }
+        })?;
+
+        // ── The actor must be IN the group it is writing into (PR-16) ──
+        //
+        // `consolidate` takes no `Viewer`. Before migration 074 that was a
+        // DISCLOSURE hole and nothing more: a cross-tenant merge landed on the
+        // world default, so it produced a public row. The meet rule above is
+        // the right rule, but it changes the shape of the hole — the merged row
+        // now lands INSIDE the owning group, so an unrelated caller could write
+        // its own content into a foreign group's private corpus while retiring
+        // that group's claims through the `supersedes` forwarding below. That
+        // is an integrity and availability defect against a group the caller
+        // has no relationship with.
+        //
+        // The full write-side gate (`viewer.writable_bind()`'s SQL half, the
+        // fail-open scope sites, the MCP write tools) is 16b's territory and is
+        // NOT delivered here. This is the narrow refusal that keeps 16a's own
+        // tenancy rule from creating a primitive 16b would have to close: every
+        // group-visible source's owner must be a live group of the acting
+        // agent. It costs one query, and only on merges that actually touch a
+        // private claim — an all-public merge (`merged_owner == None`) skips it
+        // entirely.
+        //
+        // Membership, not write-role: role-granularity is `writable_bind`'s
+        // job and arrives with 16b. Refusing a non-member is strictly stronger
+        // than the nothing that stood here before.
+        let private_owners: Vec<Uuid> = source_tenancy
+            .iter()
+            .filter(|(_, v)| *v == epigraph_core::Visibility::Group)
+            .map(|(g, _)| *g)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if !private_owners.is_empty() {
+            let member_of: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT group_id FROM group_memberships \
+                  WHERE agent_id = $1 AND group_id = ANY($2) AND revoked_at IS NULL",
+            )
+            .bind(acting_agent_id)
+            .bind(&private_owners)
+            .fetch_all(&mut *tx)
+            .await?;
+            let member_of: std::collections::HashSet<Uuid> = member_of.into_iter().collect();
+            if let Some(foreign) = private_owners.iter().find(|g| !member_of.contains(g)) {
+                // Same disclosure discipline as the cross-group refusal: the
+                // group id goes to the log, not to the caller.
+                tracing::warn!(
+                    owner_group_id = %foreign,
+                    acting_agent_id = %acting_agent_id,
+                    "consolidate refused: actor is not a live member of a source's owner group"
+                );
+                return Err(DbError::Conflict {
+                    reason: "consolidate: at least one source is private to a group you are \
+                             not a member of. Merging would write into that group's corpus \
+                             and retire its claims."
+                        .to_string(),
+                });
+            }
+        }
+
         let content_hash = epigraph_crypto::ContentHasher::hash(merged_content.as_bytes()).to_vec();
 
         // Post-107 (content_hash, agent_id) uniqueness: an identical merged
@@ -6344,11 +6640,26 @@ impl ClaimRepository {
             });
         }
 
+        // ── The actor's own group, for the all-public case ──
+        //
+        // AFTER the idempotent-return branch above, deliberately: that branch
+        // ends in `tx.rollback()`, and resolving the group before it would make
+        // a no-op retry perform a `groups` upsert and a `group_memberships`
+        // upsert only to discard them.
+        //
+        // `personal_group_of` reads first and mints only if absent -- see its
+        // doc for why calling `ensure_personal_group` unconditionally here
+        // would revive a revoked membership as a side effect of a merge.
+        let decl = match merged_owner {
+            Some(g) => TenancyDecl::group(g),
+            None => TenancyDecl::public(Self::personal_group_of(&mut tx, acting_agent_id).await?),
+        };
+
         let merged_id = sqlx::query_scalar!(
             r#"
             INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current,
-                                labels, properties)
-            VALUES ($1, $2, $3, $4, true, $5, $6)
+                                labels, properties, visibility, owner_group_id)
+            VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8)
             RETURNING id
             "#,
             merged_content,
@@ -6357,6 +6668,8 @@ impl ClaimRepository {
             acting_agent_id,
             &labels[..],
             merge_props,
+            decl.visibility_bind(),
+            decl.owner_group_bind(),
         )
         .fetch_one(&mut *tx)
         .await?;

@@ -131,10 +131,15 @@ const EXEMPT: &[(&str, &str)] = &[
     ),
     (
         "crates/epigraph-api/src/bin/epigraph-migrate.rs",
-        "PR-16 territory. The migrator needs DDL privilege, which is a different and stronger \
-         role than epigraph_maintenance; PR-16's Files line assigns it MIGRATION_DATABASE_URL. \
-         Giving it the maintenance DSN here would be the wrong role AND would pre-empt a \
-         change whose CI workflow update ships in that PR.",
+        "PR-16 DONE, and the exemption STAYS. The migrator now reads MIGRATION_DATABASE_URL \
+         (falling back to DATABASE_URL with a WARN), and .github/workflows/ci.yml sets it. \
+         What it still does NOT do is build its pool through a maintenance constructor, and \
+         it must not: applying migrations needs DDL privilege on every tier-A table, which is \
+         a strictly stronger role than epigraph_maintenance -- that role holds \
+         SELECT/INSERT/UPDATE and no DDL at all (migration 070's grant block). This lint is \
+         keyed on pool construction, not on the DSN variable, so the PR-16 change is invisible \
+         to it by design; the entry is what records that the remaining PgPool::connect is \
+         deliberate.",
     ),
     (
         "crates/epigraph-mcp/src/main.rs",

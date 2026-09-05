@@ -33,9 +33,46 @@ use viewer_fixture as fixture;
 
 const WORLD: Uuid = Uuid::nil();
 
+/// A **legacy** claim: `('public', <world group>)`, stamped explicitly.
+///
+/// PR-16. Before migration 074 this state was what an undeclared insert
+/// produced, via 062's `DEFAULT`. 074 drops the default, and an undeclared
+/// insert on the harness role now takes arm 4 and lands on the SEED group
+/// instead — so a test that needs the pre-tenancy shape has to build it.
+///
+/// Deliberately separate from [`insert_undeclared_claim`] rather than replacing
+/// it: after 074 the two mean different things, and this file wants each in
+/// different places.
+async fn insert_legacy_world_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let mut hash = vec![0u8; 32];
+    for (i, b) in content.as_bytes().iter().enumerate() {
+        hash[i % 32] ^= *b;
+    }
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.8, $4, true, 'public', \
+                 '00000000-0000-0000-0000-000000000000'::uuid)",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(&hash)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("insert legacy world-owned claim");
+    id
+}
+
 /// Insert a claim the way an unpatched production call site does — naming
-/// neither tenancy column, so migration 062's DEFAULTs supply the world group.
-/// This is precisely the "undeclared write" arm (a) exists to catch.
+/// neither tenancy column.
+///
+/// Before migration 074 that meant 062's DEFAULTs supplied the world group and
+/// arm (a) counted the write. After 074 it means arm 4: on the harness role
+/// (which satisfies `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`
+/// because it is a superuser) the row is stamped `('public', <seed group>)`,
+/// and on `epigraph_app` the same statement raises `23502`.
 async fn insert_undeclared_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
     let id = Uuid::new_v4();
     let mut hash = vec![0u8; 32];
@@ -174,48 +211,71 @@ async fn evolve_step_lineage_also_inherits_tenancy(pool: PgPool) {
     assert_eq!((owner, vis.as_str()), (group, "group"));
 }
 
-/// The instrument limb: a genuinely undeclared insert is COUNTED, and the
-/// counter is per-table and per-day because plan §9.2's week-11b gate reads it
-/// that way.
+/// **INVERTED BY PR-16.** This test used to assert the TRANSITION behaviour:
+/// that an undeclared insert bumped `tenancy_undeclared_writes` and landed on
+/// `('public', world)`. Its own message named migration 074 as the thing that
+/// would turn that into a `23502`, and 074 has now landed.
 ///
-/// Arm (a) WARNS; it does not raise. That is the transition form, and reading
-/// it as the enforcement point over-reports PR-12's blast radius by 13
-/// production call sites — migration 074 (PR-16) is what raises.
+/// What replaced it, and why it is a different shape rather than a tweak:
+///
+/// * **The counter can no longer be exercised at all on this harness.** Arm 4
+///   (`pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`) returns before
+///   the counting arm, and a superuser satisfies `pg_has_role` for every role —
+///   so on the test connection an undeclared insert is STAMPED, not counted.
+///   Under `SET SESSION AUTHORIZATION epigraph_app` it RAISES, so it is not
+///   counted there either. There is no role on this host that both reaches the
+///   counting arm and can write, because migration 074 deleted that arm.
+///
+/// * **That is the point, not a gap.** The counter is plan §9.2's week-11b
+///   deploy INSTRUMENT: it measures how many undeclared writes are still
+///   happening while the defaults are present, so an operator can gate the
+///   074 rollout on it being flat at zero. Once 074 is applied the question it
+///   answers is settled by construction. `tenancy_gauge.rs` keeps the
+///   counter-table→Prometheus half under test; what is no longer test-covered
+///   is arm (a) FEEDING it, and that is stated there rather than dropped
+///   silently.
+///
+/// So this now asserts the two things that ARE still true and still regressible:
+/// the stamp goes to the seed group (not world — §8.2 A4), and the counter
+/// table survives 074 so the deploy instrument can still be read on a database
+/// that has not applied it yet.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_undeclared_insert_is_counted_and_not_rejected(pool: PgPool) {
+async fn an_undeclared_insert_takes_the_seed_arm_after_074(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
 
-    let before: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(sum(n), 0)::bigint FROM tenancy_undeclared_writes \
-          WHERE table_name = 'claims' AND day = current_date",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("read counter");
+    let seed: Uuid = sqlx::query_scalar("SELECT id FROM groups WHERE kind = 'seed'")
+        .fetch_one(&pool)
+        .await
+        .expect("the seed group is seeded by migration 062");
 
     let id = insert_undeclared_claim(&pool, agent, "undeclared").await;
-
-    let after: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(sum(n), 0)::bigint FROM tenancy_undeclared_writes \
-          WHERE table_name = 'claims' AND day = current_date",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("read counter");
-
-    assert_eq!(
-        after,
-        before + 1,
-        "arm (a) must bump tenancy_undeclared_writes for an undeclared insert — \
-         this counter IS the week-11b deploy gate"
-    );
 
     let (owner, vis) = tenancy_of(&pool, "claims", id).await;
     assert_eq!(
         (owner, vis.as_str()),
-        (WORLD, "public"),
-        "the transition form must let the row through on the default, not raise; \
-         migration 074 is what turns this into a 23502"
+        (seed, "public"),
+        "after migration 074 an undeclared insert on a seed-satisfying role must be \
+         STAMPED with the seed group, not the world group. Stamping world would make \
+         plan §8.2 A4 (count of world-owned claims is 0) unsatisfiable, and would \
+         make the deferred strong CHECK (owner_group_id <> world) permanently \
+         unshippable."
+    );
+    assert_ne!(owner, WORLD);
+
+    // The counter table itself must survive 074: the week-11b gate is read on
+    // databases that have NOT yet applied 074, and dropping the table here
+    // would silently remove the evidence that gate depends on.
+    let counter_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = 'public' AND c.relname = 'tenancy_undeclared_writes')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("counter table probe");
+    assert!(
+        counter_exists,
+        "tenancy_undeclared_writes must outlive migration 074 — it is plan §9.2's \
+         week-11b deploy gate, read BEFORE 074 is applied"
     );
 }
 
@@ -476,10 +536,24 @@ async fn an_orphan_claim_id_is_rejected_where_no_foreign_key_would_catch_it(pool
     .await
     .expect_err("an orphan claim_id must be rejected, never defaulted");
 
-    let msg = err.to_string();
-    assert!(
-        msg.contains("nonexistent parent claim") || msg.contains("23503"),
-        "expected arm (c)'s 23503 orphan rejection, got: {msg}"
+    // PR-16 changed WHICH arm refuses, and the assertion moved off the prose
+    // onto the SQLSTATE because of it. Before migration 074 the only guard was
+    // 070 arm (c) — AFTER STATEMENT — whose message is "N row(s) in <table>
+    // reference a nonexistent parent claim". 074 adds
+    // `epigraph_derived_require_tenancy`, a BEFORE ROW trigger that has to look
+    // the parent up anyway in order to inherit its tenancy, so the orphan is
+    // caught one step earlier and its message names the ROW rather than the
+    // statement.
+    //
+    // That is a better diagnosis, not a regression, and the contract both arms
+    // share is the SQLSTATE — which is what the API/MCP layer maps to a 4xx.
+    // Matching on message text made this test a hostage to which arm fired
+    // first.
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23503"),
+        "an orphan claim_id must be refused as a foreign-key violation, by \
+         whichever arm reaches it first; got: {err}"
     );
 }
 
@@ -1254,11 +1328,15 @@ async fn a_public_ownership_row_cannot_declassify_a_group_private_claim(pool: Pg
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_public_ownership_row_still_stamps_the_owner_on_a_public_claim(pool: PgPool) {
     let (agent, group) = fixture::seed_agent_with_group(&pool, "owner").await;
-    let claim = insert_undeclared_claim(&pool, agent, "public claim").await;
+    // PR-16: constructed, not defaulted. Migration 074 dropped 062's DEFAULT,
+    // so `insert_undeclared_claim` now lands on ('public', <seed group>) via
+    // arm 4. The state this test needs is the LEGACY one — a pre-tenancy row
+    // the backfill has not reached — and after 074 no write path produces it.
+    let claim = insert_legacy_world_claim(&pool, agent, "public claim").await;
     assert_eq!(
         tenancy_of(&pool, "claims", claim).await,
         (WORLD, "public".to_string()),
-        "precondition: the claim starts on 062's world default"
+        "precondition: the claim is a legacy world-owned row"
     );
 
     sqlx::query(
@@ -1433,12 +1511,26 @@ async fn arm_d_recomputes_the_meet_rather_than_copying_the_changed_endpoint(pool
 
     // Now declassify A alone. B is still group-private, so the MEET is
     // ('group', group_b) — NOT ('public', world).
-    sqlx::query("UPDATE claims SET owner_group_id = $1, visibility = 'public' WHERE id = $2")
-        .bind(WORLD)
-        .bind(a)
-        .execute(&pool)
-        .await
-        .expect("declassify A");
+    //
+    // PR-16: this needs `epigraph.allow_declassify` now. Migration 074 adds
+    // `claims_block_widening`, which refuses a group→public UPDATE unless the
+    // admin declassification surface's GUC is set. The GUC is SESSION-scoped,
+    // so it and the UPDATE must ride the SAME connection — issuing the SET on
+    // the pool would land on an arbitrary one and the UPDATE would be refused
+    // intermittently.
+    {
+        use sqlx::Executor;
+        let mut conn = pool.acquire().await.expect("acquire");
+        conn.execute("SET epigraph.allow_declassify = 'yes'")
+            .await
+            .expect("set the admin declassification GUC");
+        sqlx::query("UPDATE claims SET owner_group_id = $1, visibility = 'public' WHERE id = $2")
+            .bind(WORLD)
+            .bind(a)
+            .execute(&mut *conn)
+            .await
+            .expect("declassify A");
+    }
 
     let (owner, vis, co) = edge_tenancy_of(&pool, edge).await;
     assert_eq!(
@@ -1830,26 +1922,49 @@ async fn a_live_member_of_the_current_group_may_still_re_declare(pool: PgPool) {
     let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "owner").await;
     let claim = fixture::seed_group_claim(&pool, owner, owner_group, "mine").await;
 
-    // A second personal group for the same owner, with a live membership, is
-    // the simplest stand-in for "a group the declarer is already in".
-    let second: Uuid = sqlx::query_scalar(
+    // PR-16 RESHAPED THIS FIXTURE, AND IT IS STRONGER FOR IT.
+    //
+    // This block used to insert a SECOND group carrying the canonical
+    // `did:epigraph:personal:<owner>` key, because `seed_agent_with_group`
+    // used a test-local `did:epigraph:test:...` key and therefore did NOT
+    // produce the group `ensure_personal_group` resolves. PR-16 fixed that
+    // fixture — the two are now the same row — and this insert began failing on
+    // `groups_did_key_key`.
+    //
+    // Collapsing `second` onto `owner_group` would have made the assertion
+    // below VACUOUS: the claim's current group and the declarer's canonical
+    // personal group would be the same id, so "the shim resolved the canonical
+    // group" and "the shim left it where it was" become indistinguishable.
+    //
+    // So the claim is moved into a THIRD group instead — a community-kind group
+    // the owner is also a live member of. The discrimination survives:
+    // `current` is where the claim starts, `owner_group` is where the shim must
+    // land it.
+    let second = owner_group;
+    let current: Uuid = sqlx::query_scalar(
         "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
-         VALUES ('second', 'did:epigraph:personal:' || $1::text, ''::bytea, 'personal', $1) \
+         VALUES ('current', 'did:epigraph:current:' || $1::text, ''::bytea, 'community', $1) \
          RETURNING id",
     )
     .bind(owner)
     .fetch_one(&pool)
     .await
-    .expect("seed a canonical personal group for the owner");
+    .expect("seed the claim's current group");
     sqlx::query(
         "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
          VALUES ($1, $2, ''::bytea, 0, 'admin')",
     )
-    .bind(second)
+    .bind(current)
     .bind(owner)
     .execute(&pool)
     .await
-    .expect("seed membership");
+    .expect("seed membership in the claim's current group");
+    sqlx::query("UPDATE claims SET owner_group_id = $1 WHERE id = $2")
+        .bind(current)
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("move the claim into the current group");
 
     sqlx::query(
         "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \

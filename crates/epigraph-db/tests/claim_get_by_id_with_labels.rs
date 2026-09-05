@@ -82,7 +82,7 @@ async fn get_by_id_with_labels_matches_separate_calls() {
     insert_test_agent(&pool, agent_id).await;
 
     let claim = make_claim(&format!("atomic read {}", Uuid::new_v4()), agent_id);
-    let created = ClaimRepository::create(&pool, &claim)
+    let created = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("create");
 

@@ -208,9 +208,28 @@ pub async fn add_step(
     let agent_id = get_or_create_system_agent(pool).await?;
     let step_lineage = Uuid::new_v4();
 
+    // ── Tenancy declaration (PR-16) ──
+    //
+    // This statement binds a FRESH `step_lineage_id`, so migration 074's arm 2
+    // finds no sibling to inherit from and the row would fall through to the
+    // seed arm (test roles) or raise 23502 (the app role). It has to declare.
+    //
+    // CORRECTION TO THE PLAN. §4.6 says `add_step` "takes a `TenancyDecl` from
+    // its caller". Its two callers -- `epigraph-mcp/src/tools/step_ops.rs` and
+    // `epigraph-api/src/routes/workflows.rs` -- have no group to give: a
+    // workflow step is instance-wide content authored by the SYSTEM agent
+    // (`get_or_create_system_agent` above, already resolved for `agent_id`),
+    // and `find_workflow` / `find_workflow_hierarchical` read it for every
+    // principal. Owning a step with the calling principal's group would make
+    // every workflow private to whoever last edited it. A parameter here would
+    // therefore only widen the ways to get it wrong, so the declaration is
+    // derived from the author the row already names.
+    let decl = epigraph_db::ClaimRepository::default_decl_for_author_pool(pool, agent_id).await?;
+
     sqlx::query(
-        "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels, properties, step_lineage_id) \
-         VALUES ($1, $2, $3, $4, 0.99, ARRAY['claim','workflow_step'], $5, $6) \
+        "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels, properties, step_lineage_id, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, $4, 0.99, ARRAY['claim','workflow_step'], $5, $6, $7, $8) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(step_claim_id)
@@ -224,6 +243,8 @@ pub async fn add_step(
         "step_lineage_id": step_lineage.to_string(),
     }))
     .bind(step_lineage)
+    .bind(decl.visibility_bind())
+    .bind(decl.owner_group_bind())
     .execute(pool)
     .await?;
 

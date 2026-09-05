@@ -85,11 +85,49 @@ impl RecallEventRepository {
             .as_ref()
             .map(|v| ContentHasher::hash(v.as_bytes()).to_vec());
 
+        // ── Tenancy declaration (PR-16), AND A DELIBERATE NON-CHANGE ──
+        //
+        // `recall_events` has no parent and no inheritance arm, so migration
+        // 074 requires this write to name both columns. `instance_wide()`
+        // preserves EXACTLY the value the row carried under migration 062's
+        // DEFAULT: ('public', world). Nothing about who can read this table
+        // changes in PR-16.
+        //
+        // THAT IS NOT THE RIGHT LONG-TERM ANSWER, and it is recorded here
+        // rather than left to be discovered. `query_text` is the querying
+        // agent's raw search string, and plan §4.9's leak table rates
+        // "MCP get_recall_events -- others' raw search text" a BLOCKER. The
+        // correct declaration is `TenancyDecl::group(<the querying agent's
+        // personal group>)`, which would make each agent's recall history
+        // readable only by that agent.
+        //
+        // It is not made here, for two stated reasons rather than by omission:
+        //   1. It is a READ-path behaviour change -- cross-agent reads of
+        //      `get_recall_events` and `RecallEventRepository::list` start
+        //      returning fewer rows -- and PR-16's charter is "declare, do not
+        //      default". Changing the VALUE while changing the MECHANISM would
+        //      make a read regression indistinguishable from a 074 defect.
+        //   2. `log` is on the hot path of every `recall` / `recall_with_context`
+        //      call, and resolving a personal group per event is an extra round
+        //      trip per query. It wants the group threaded in on
+        //      `NewRecallEvent`, resolved once by the caller.
+        //
+        // TRACKED, NOT JUST COMMENTED. A `grep -rn instance_wide` breadcrumb is
+        // not a commitment; every other residual in this series carries a `D-`
+        // id, and so does this one:
+        // `D-PR16-recall-events-are-instance-wide` in
+        // `docs/tenancy/progress.json`, owned by the read-path PR. Closing it
+        // is a one-line change here plus a `NewRecallEvent` field, resolved
+        // once by each of the three callers (`mcp/tools/recall.rs`,
+        // `mcp/tools/memory.rs`, `engine/recall.rs`).
+        let decl = epigraph_core::TenancyDecl::instance_wide();
+
         let row = sqlx::query!(
             r#"
             INSERT INTO recall_events
-                (id, agent_id, tool, query_text, query_embedding_hash, params, returned_claim_ids)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (id, agent_id, tool, query_text, query_embedding_hash, params,
+                 returned_claim_ids, visibility, owner_group_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id
             "#,
             event.id,
@@ -99,6 +137,8 @@ impl RecallEventRepository {
             hash.as_deref(),
             event.params,
             &event.returned_claim_ids[..],
+            decl.visibility_bind(),
+            decl.owner_group_bind(),
         )
         .fetch_one(pool)
         .await?;

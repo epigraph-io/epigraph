@@ -1,6 +1,6 @@
 //! Hypothesis lifecycle CLI.
 //!
-//! hypothesis create "statement" [--search-radius 0.3] [--agent-id UUID]
+//! hypothesis create "statement" (--public | --group UUID) [--search-radius 0.3] [--agent-id UUID]
 //! hypothesis status <id>
 //! hypothesis promote <id>
 
@@ -14,12 +14,38 @@ struct Cli {
     command: Command,
 }
 
+/// The operator's tenancy choice, after clap has proved exactly one flag was
+/// given. A two-variant enum rather than the raw `(bool, Option<Uuid>)` so the
+/// "neither" and "both" states are unrepresentable past the parse.
+#[derive(Debug, Clone, Copy)]
+enum TenancyChoice {
+    /// `--public`: readable by every authenticated agent.
+    Public,
+    /// `--group <uuid>`: readable only by live members of that group.
+    Group(Uuid),
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Create a new hypothesis claim with VOI assessment
+    ///
+    /// Exactly one of `--public` / `--group <uuid>` is REQUIRED. There is no
+    /// default, deliberately: migration 074 (PR-16) removes the database's
+    /// `DEFAULT 'public'`, and replacing it with a clap `default_value` would
+    /// move the "public by omission" defect D1 names from `pg_attrdef` into
+    /// argv rather than removing it. An operator who has not decided must be
+    /// told, not guessed at.
+    #[command(group(clap::ArgGroup::new("tenancy").required(true).multiple(false)))]
     Create {
         /// Hypothesis statement
         statement: String,
+        /// Readable by every authenticated agent; owned by the author's
+        /// personal group.
+        #[arg(long, group = "tenancy")]
+        public: bool,
+        /// Readable only by live members of this group.
+        #[arg(long, group = "tenancy", value_name = "UUID")]
+        group: Option<Uuid>,
         /// Semantic search radius for neighborhood
         #[arg(long, default_value = "0.3")]
         search_radius: f64,
@@ -80,13 +106,28 @@ async fn run(
     match cli.command {
         Command::Create {
             statement,
+            public,
+            group,
             search_radius,
             agent_id,
             research_question,
         } => {
+            // clap's ArgGroup guarantees exactly one of the two is present, so
+            // the `None` arm below is unreachable through argv. It is still
+            // written as a hard error rather than a `_ => Public` fallback: an
+            // unreachable arm that DEFAULTS is how a later edit to the ArgGroup
+            // silently reintroduces public-by-omission.
+            let tenancy = match (public, group) {
+                (_, Some(g)) => TenancyChoice::Group(g),
+                (true, None) => TenancyChoice::Public,
+                (false, None) => {
+                    return Err("exactly one of --public / --group <uuid> is required".into())
+                }
+            };
             create(
                 &pool,
                 &statement,
+                tenancy,
                 search_radius,
                 agent_id,
                 research_question.as_deref(),
@@ -101,6 +142,7 @@ async fn run(
 async fn create(
     pool: &sqlx::PgPool,
     statement: &str,
+    tenancy: TenancyChoice,
     search_radius: f64,
     agent_id: Uuid,
     research_question: Option<&str>,
@@ -124,10 +166,21 @@ async fn create(
             .join(",")
     );
 
+    // Tenancy declaration (PR-16). `--public` owns the row with the AUTHOR's
+    // personal group, not the world group: §8.2 A4 asserts no claim is
+    // world-owned, and `public` is about who may read, not about who owns.
+    let decl = match tenancy {
+        TenancyChoice::Group(g) => epigraph_core::TenancyDecl::group(g),
+        TenancyChoice::Public => {
+            let mut conn = pool.acquire().await?;
+            epigraph_db::ClaimRepository::default_decl_for_author(&mut conn, agent_id).await?
+        }
+    };
+
     let claim_id: (Uuid,) = sqlx::query_as(
         r#"
-        INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, embedding)
-        VALUES ($1, $2, $3, 0.5, ARRAY['hypothesis'], $4, $5::vector)
+        INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, embedding, visibility, owner_group_id)
+        VALUES ($1, $2, $3, 0.5, ARRAY['hypothesis'], $4, $5::vector, $6, $7)
         RETURNING id
         "#,
     )
@@ -140,6 +193,8 @@ async fn create(
         "search_radius": search_radius,
     }))
     .bind(&embedding_str)
+    .bind(decl.visibility_bind())
+    .bind(decl.owner_group_bind())
     .fetch_one(pool)
     .await?;
 
