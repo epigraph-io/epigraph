@@ -1337,52 +1337,105 @@ mod tests {
 
     /// The verdict tests above are pure, so they prove the RULE and nothing
     /// about the PROBE that feeds it. This one closes that gap against a real
-    /// catalog: a fresh database at head must report `rls_active = false`, and
-    /// a plain `ENABLE ROW LEVEL SECURITY` — no `FORCE` — must flip it true.
+    /// catalog.
     ///
-    /// Without this, the whole ENABLE-vs-FORCE correction would be asserted
-    /// only in prose. The earlier `relforcerowsecurity`-only predicate passes
-    /// the first half of this test and FAILS the second, which is exactly the
-    /// discrimination that matters: policies are applied (074) before FORCE is
-    /// (076), and the documented emergency lever drops FORCE while leaving the
-    /// policies enabled.
+    /// # PR-17 REWROTE THE INSTRUMENT, AND THE NEW ONE IS STRICTLY STRONGER
+    ///
+    /// Until migration 077 this test opened by asserting `!before.rls_active`
+    /// on a database at head — "no relation in `public` carries row security" —
+    /// and then created a scratch table, `ENABLE`d row security on it, and
+    /// asserted the flag flipped. 077 ENABLEs row security on 35 relations, so
+    /// that precondition is now false by construction.
+    ///
+    /// Flipping the precondition to `assert!(before.rls_active)` would have
+    /// been the cheap edit and it would have DESTROYED the test: with row
+    /// security already active the scratch-table half proves nothing, because
+    /// the probe answers `true` whatever it looks at. The discrimination this
+    /// test exists for — ENABLE arms the probe, not only FORCE — would have
+    /// become unobservable while the test stayed green.
+    ///
+    /// So the scratch table is replaced by the state the discrimination is
+    /// actually ABOUT: `ALTER TABLE … NO FORCE ROW LEVEL SECURITY` across the
+    /// protected set, i.e. exactly what `docs/runbooks/079-undo.sql` does. That
+    /// leaves `relforcerowsecurity` false everywhere and `relrowsecurity` true
+    /// everywhere — the post-rollback state — and the probe must still report
+    /// `rls_active`. A `relforcerowsecurity`-only predicate passes the first
+    /// assertion below and FAILS the second, which is the same discrimination
+    /// as before against a real, reachable, operationally important state
+    /// rather than a synthetic one.
     ///
     /// `#[sqlx::test]` gives this test its own throwaway database, so the DDL
-    /// cannot reach any shared table — and the scratch table is created here
-    /// rather than in a migration precisely so no migration number is spent.
+    /// cannot reach any shared table.
     #[sqlx::test(migrations = "../../migrations")]
     async fn the_probe_observes_enable_row_level_security_not_only_force(pool: PgPool) {
-        let before = probe_maintenance_privilege(&pool)
+        let armed = probe_maintenance_privilege(&pool)
             .await
-            .expect("probe a fresh database");
+            .expect("probe a database at head");
         assert!(
-            !before.rls_active,
-            "no relation in `public` carries row security at head; if this fails the fixture \
-             changed and the arming signal below proves nothing"
+            armed.rls_active,
+            "migration 077 ENABLEs row security on the protected set, so a database at head \
+             must report rls_active; if this fails the fixture changed and everything below \
+             proves nothing"
         );
 
-        sqlx::query("CREATE TABLE rls_probe_scratch (id int primary key)")
-            .execute(&pool)
-            .await
-            .expect("create scratch table");
-        sqlx::query("ALTER TABLE rls_probe_scratch ENABLE ROW LEVEL SECURITY")
-            .execute(&pool)
-            .await
-            .expect("enable row security");
+        // Calibration: the FORCE half really is set at head, so dropping it
+        // below is a real state change and not a no-op.
+        let forced_before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = 'public' AND c.relkind IN ('r','p') AND c.relforcerowsecurity",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count forced relations");
+        assert!(
+            forced_before > 0,
+            "migration 079 must have FORCEd at least one relation, or the NO FORCE step below \
+             changes nothing and this test is vacuous"
+        );
+
+        // The documented kill switch, applied the way docs/runbooks/079-undo.sql
+        // applies it.
+        sqlx::query(
+            "DO $$ DECLARE t text; BEGIN \
+               FOR t IN SELECT c.relname FROM pg_class c \
+                          JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = 'public' AND c.relkind IN ('r','p') \
+                           AND c.relforcerowsecurity LOOP \
+                 EXECUTE format('ALTER TABLE public.%I NO FORCE ROW LEVEL SECURITY', t); \
+               END LOOP; END $$",
+        )
+        .execute(&pool)
+        .await
+        .expect("pull the NO FORCE kill switch");
+
+        let forced_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = 'public' AND c.relkind IN ('r','p') AND c.relforcerowsecurity",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("recount forced relations");
+        assert_eq!(
+            forced_after, 0,
+            "the kill switch must drop FORCE everywhere"
+        );
 
         let after = probe_maintenance_privilege(&pool)
             .await
-            .expect("probe after ENABLE");
+            .expect("probe after NO FORCE");
         assert!(
             after.rls_active,
-            "ENABLE ROW LEVEL SECURITY alone must arm the probe. A policy filters every role \
-             except the table owner and BYPASSRLS holders, so for every role a background \
-             writer connects as, ENABLE is what starts truncating results — FORCE only \
-             additionally subjects the owner."
+            "ENABLE ROW LEVEL SECURITY alone must keep the probe armed. A policy filters every \
+             role except the table owner and BYPASSRLS holders, so for every role a background \
+             writer connects as, ENABLE is what truncates results — FORCE only additionally \
+             subjects the owner. A relforcerowsecurity-only predicate reads FALSE here and \
+             would disarm every maintenance refusal in exactly the state the documented \
+             rollback leaves behind."
         );
 
-        // And the arming is what the verdict keys on: the same unprivileged
-        // connection that warned before must now refuse.
+        // And the arming is what the verdict keys on: an unprivileged
+        // connection must still refuse after the kill switch, because the
+        // policies are still filtering it.
         assert!(
             maintenance_verdict(
                 MaintenancePrivilege {
@@ -1392,7 +1445,8 @@ mod tests {
                 FALLBACK,
             )
             .is_err(),
-            "an unprivileged connection must refuse once a table has row security"
+            "an unprivileged connection must refuse while any table has row security, \
+             including after NO FORCE"
         );
     }
 

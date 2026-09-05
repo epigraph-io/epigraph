@@ -274,3 +274,86 @@ it as dead code, and do not read its survival as evidence that a write path
 still exists.
 
 If you are writing new code, do not write `ownership`.
+
+## Row-level security, and who may declassify (PR-17)
+
+Migrations 077/078/079 install the RLS policy set, the canary table, and
+`FORCE ROW LEVEL SECURITY`.
+
+**Enforcement begins at 077, not at 079.** In PostgreSQL a policy filters every
+role except the table's *owner* and holders of `BYPASSRLS`; `FORCE` only
+*additionally* subjects the owner. Every protected table is owned by the
+superuser `epigraph`, and `epigraph_app`, `epigraph_admin` and
+`epigraph_maintenance` are all non-owners without `BYPASSRLS`. So from 077
+onward the policies already filter every role the application and the job fleet
+connect as. 079 closes the remaining owner hole and is the terminal, gated step.
+
+The corollary is what makes the migrations safe to land ahead of the credential
+split: while `DATABASE_URL` still names the owning superuser, **all three
+migrations are observably inert**. The risk lives in deploy step 11d, not in
+the schema change.
+
+### The kill switch
+
+`ALTER TABLE … NO FORCE ROW LEVEL SECURITY`, scripted at
+`docs/runbooks/079-undo.sql`. Instant, no rewrite, no data change; paired with
+reverting `DATABASE_URL` to the owner role it is a sub-minute rollback. The
+undo script loops the *same array* as `079_rls_force.sql`, because
+`AppState::assert_rls_posture` refuses to boot on a **partially** FORCEd set —
+a half-applied undo would leave the cluster un-bootable.
+
+### `epigraph.allow_declassify` — what actually controls it
+
+Migration 074's `epigraph_claims_block_widening` refuses an UPDATE that widens a
+claim from `group` to `public` unless the session GUC
+`epigraph.allow_declassify` is set. PR-17 owns writing down who may set it, and
+the honest answer is **nobody is stopped by the database**:
+
+* `REVOKE SET ON PARAMETER "epigraph.allow_declassify" FROM PUBLIC` returns
+  `REVOKE` and **records no `pg_parameter_acl` row** — a silent no-op. Measured
+  on PostgreSQL 16.13.
+* Even with an explicit `pg_parameter_acl` row granting `SET` to one role, a
+  session that has `SET ROLE`d to another still sets it successfully.
+  Customized (placeholder) GUCs are `PGC_USERSET`, and parameter ACLs do not
+  gate them.
+* The `REVOKE EXECUTE` in `074_tenancy_required.sql` applies to the **trigger
+  function**, not to the GUC. It is frequently miscredited with restricting the
+  GUC; it does not.
+
+So the control on declassification is **not** a `GRANT`. It is:
+
+1. **The trigger itself**, which is unconditional for a *sealed* claim — arm (a)
+   refuses `sealed ⇒ public` and the GUC deliberately does not reach it.
+2. **Reaching the statement at all.** Under 077 an UPDATE of a claim the session
+   cannot see matches zero rows, so declassifying somebody else's private claim
+   is not available regardless of the GUC.
+3. **`security_events`**, which is append-only by default-deny.
+
+**Treat `epigraph.allow_declassify` as a safety interlock against an accidental
+widening, not as an authorization boundary.** A code path that sets it is
+asserting "this widening is intended", and the authorization for that decision
+has to be made in the repo/route layer above it. PR-18's privatization surface
+is where a real approval boundary appears.
+
+#### The same reasoning applies to the three TENANCY GUCs, and that is the more important half
+
+`epigraph.allow_declassify` is the GUC PR-17 was asked to write down, but nothing
+above is specific to it. `epigraph.group_ids`, `epigraph.writable_group_ids` and
+`epigraph.principal_id` are customized GUCs too, therefore `PGC_USERSET` too,
+therefore settable by any session — measured: as `epigraph_app` a session can
+`SET epigraph.principal_id` to an arbitrary uuid and `epigraph_principal_id()`
+returns it. Since the entire policy set in 077 keys on those three functions,
+**the confidentiality of the corpus rests on GUCs that the database does not
+protect.**
+
+The control is therefore not a `GRANT` here either. It is that **no code path
+interpolates untrusted input into a `SET`**: `apply_session_gucs` is private,
+takes the `&Viewer` itself, has exactly two callers (`acquire_as`, `begin_as`),
+and binds from `Viewer::resolve`'s output rather than from a request. That is a
+structural convention, not a boundary, and it should be read as one.
+
+This is latent rather than live today — nothing in the tree sets those GUCs from
+user input, and `acquire_as` has no request-path callers at all — but the natural
+reading of the `allow_declassify` conclusion above is that the tenancy GUCs are
+different in kind. They are not. Recorded as
+`D-PR17-tenancy-gucs-are-pgc-userset`.

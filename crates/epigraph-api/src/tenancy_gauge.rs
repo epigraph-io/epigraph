@@ -93,4 +93,62 @@ impl TenancyGaugeSampler {
         }
         Ok(())
     }
+
+    /// PR-17's canary pass: **the plan's "60-second canary health metric".**
+    ///
+    /// Deliberately a SECOND method on the existing sampler rather than a
+    /// second tick loop. The plan asks for a 60-second canary and PR-12 already
+    /// built a 60-second tick with a stateful sampler on the API pool; adding a
+    /// task would double the connections held for periodic work and give an
+    /// operator two intervals to keep in step.
+    ///
+    /// # Why this does not share `sample`'s error handling
+    ///
+    /// It does not return `Err`. `sample`'s caller logs and retries, which is
+    /// right for a count that can go stale harmlessly. This probe's failure is
+    /// itself a finding: if the canary read errors, the honest export is "I
+    /// could not measure it" (`-1`), not the previous value and not zero. A
+    /// stuck-at-zero canary is the single worst failure mode available here —
+    /// it reports "RLS is enforcing" forever.
+    ///
+    /// The two series are set together and in this order so a scrape can never
+    /// catch a fresh canary count beside a stale role flag, which is the pair
+    /// the alert expression joins on.
+    pub async fn sample_canary(&mut self, state: &crate::state::AppState, metrics: &Metrics) {
+        let app_role: i64 = match sqlx::query_scalar::<_, String>("SELECT current_user::text")
+            .fetch_one(&state.db_pool)
+            .await
+        {
+            Ok(u) if u == crate::state::EXPECTED_APP_ROLE => 1,
+            Ok(_) => 0,
+            Err(e) => {
+                tracing::warn!(error = %e, "rls canary: could not read current_user");
+                -1
+            }
+        };
+        metrics.rls_app_role.set(app_role);
+
+        match state.rls_canary_visible().await {
+            // Below migration 078 there is no table to read. Not an error, but
+            // not a measurement either.
+            Ok(None) => {
+                metrics.rls_canary_visible.set(-1);
+            }
+            Ok(Some(n)) => {
+                if n > 0 && app_role == 1 {
+                    // The one combination that is a live security failure.
+                    tracing::error!(
+                        canary_rows = n,
+                        "RLS CANARY VISIBLE on an epigraph_app connection: row-level security \
+                         is NOT protecting this database. See docs/tenancy.md."
+                    );
+                }
+                metrics.rls_canary_visible.set(n);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "rls canary probe failed; exporting -1 (unmeasured)");
+                metrics.rls_canary_visible.set(-1);
+            }
+        }
+    }
 }

@@ -571,6 +571,21 @@ table grants named above** — a role that satisfies `epigraph_bypass()` but
 cannot INSERT into the job tables passes the boot probe and then fails on first
 use, which is a worse outcome than failing at boot.
 
+**PR-17 adds a SECOND reason for that same GRANT, and it is a hard one.**
+`GroupMembershipRepository::list_live_for_agent` now reads through
+`public.epigraph_live_memberships()`, a `SECURITY DEFINER` function migration 077
+`REVOKE`s from `PUBLIC`. Measured with `has_function_privilege`: only `epigraph`,
+`epigraph_app` and `epigraph_maintenance` may EXECUTE it — `epigraph_admin`,
+`epigraph_dev` and `epigraph_ro` may not, and
+`pg_has_role('epigraph_admin','epigraph_maintenance','MEMBER')` is false today.
+So `GRANT epigraph_maintenance TO epigraph_admin` was previously needed only to
+satisfy `epigraph_bypass()`; it is now ALSO needed for EXECUTE on a definer
+function that `Viewer::resolve` calls. This is not a live outage — the only
+non-test caller is on the API pool, and maintenance pools mint a `Bypass` viewer
+via `MaintenancePool::viewer` rather than resolving — but a maintenance-role
+process that ever resolves a viewer fails with `42501 permission denied for
+function epigraph_live_memberships` until the GRANT is run.
+
 ### 1c-ter. The role inventory, including `epigraph_admin` (PR-15)
 
 The plan's PR-15 acceptance asks that `epigraph_admin` be *"either mapped to
@@ -581,7 +596,7 @@ rolsuper, rolbypassrls FROM pg_roles`:
 | role | login | superuser | bypassrls | what it is for |
 |---|---|---|---|---|
 | `epigraph` | yes | **yes** | yes | The migration/dev/CI superuser. Every `#[sqlx::test]` and `ci.yml` connect as this, which is why `epigraph_bypass()` is unconditionally true in the test suite and why PR-15's refusal rule is unit-tested on a pure function rather than asserted against a live connection. |
-| `epigraph_app` | **no** | no | no | The request-path role RLS is written against. NOLOGIN today; PR-17 gives it a login and makes `current_user = 'epigraph_app'` a boot assertion. |
+| `epigraph_app` | **no** | no | no | The request-path role RLS is written against. **Still NOLOGIN after PR-17.** Migration 077 grants it schema `USAGE`, table DML and sequence access — the migration-shaped half — but `ALTER ROLE epigraph_app LOGIN PASSWORD …` is an out-of-band operator step in the 11d runbook, because this repository is public and a credential must never land in it. That `ALTER ROLE` is what arms every PR-17 posture refusal: they are staged on `current_user`, so they are inert until it runs. `current_user <> 'epigraph_app'` remains a WARN and not a refusal — see `epigraph_api::state::rls_verdict`. |
 | `epigraph_maintenance` | **no** | no | no | The bypass role. `epigraph_bypass()` (migration 067) is membership of this. NOLOGIN, so it is a *membership grant target*, not a connect-as identity. |
 | `epigraph_seed` | **no** | no | no | Migration 074 arm 4's fixture escape hatch (PR-16). |
 | `epigraph_ro` | yes | no | no | Read-only. Used by `scripts/subcluster_outliers.py` and `run_assessment_worker.py`'s read side, both of which PR-15 deliberately left alone. |

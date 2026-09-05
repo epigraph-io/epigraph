@@ -484,6 +484,23 @@ async fn main() {
             tracing::warn!(error = %e, "could not read the connection posture");
         }
 
+        // PR-17's RLS posture assertion. It REFUSES, and it is STAGED on the
+        // connecting role: inert on every environment that has not performed
+        // plan §9.2 week 11d's credential split, fully armed the moment
+        // `current_user` is `epigraph_app`. `epigraph_api::state::rls_verdict`
+        // carries the whole argument, including why keying it on
+        // `relforcerowsecurity` — which is what PR-17's *Acceptance* line asks
+        // for — would brick step 11d, the 077→079 window and the documented
+        // `NO FORCE` rollback all at once.
+        //
+        // Placed AFTER `warn_on_privileged_connection` so a database whose
+        // posture is merely unusual is described in the log before this line
+        // decides whether it is fatal.
+        state
+            .assert_rls_posture()
+            .await
+            .expect("refusing to serve: RLS posture assertion failed");
+
         (state, job_pool)
     };
 
@@ -677,6 +694,12 @@ async fn main() {
     #[cfg(feature = "db")]
     {
         let sampler_pool = state.db_pool.clone();
+        // PR-17's canary rides the SAME tick. `AppState` is cheap to clone
+        // (every field behind it is an `Arc` or a pool handle) and
+        // `sample_canary` needs the state, not the bare pool, so the probe and
+        // the boot assertion read through one definition
+        // (`AppState::rls_canary_visible`) rather than two copies of the SQL.
+        let canary_state = state.clone();
         let sampler_metrics = metrics.clone();
         let interval_secs: u64 = std::env::var("EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS")
             .ok()
@@ -700,6 +723,10 @@ async fn main() {
                         "tenancy undeclared-write sampler failed; gauge will go stale"
                     );
                 }
+                // Returns no error by design: a canary probe that fails must
+                // export -1 ("unmeasured"), never the previous value and never
+                // zero. See `TenancyGaugeSampler::sample_canary`.
+                sampler.sample_canary(&canary_state, &sampler_metrics).await;
             }
         });
         tracing::info!(

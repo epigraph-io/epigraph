@@ -68,58 +68,54 @@ pub struct SecurityEventFilter {
 pub struct SecurityEventRepository;
 
 impl SecurityEventRepository {
-    /// Insert a new security event row.
+    /// Insert a new security event row. Returns the row as written.
+    ///
+    /// **The statement deliberately has no `RETURNING` clause.** PostgreSQL
+    /// applies a table's SELECT policy to the rows a `RETURNING` produces, so
+    /// once migration 077 gives `security_events` a principal-keyed
+    /// `security_events_read`, an `INSERT … RETURNING` of an event whose
+    /// `agent_id` is not the session principal is refused `42501 new row
+    /// violates row-level security policy` — while the identical INSERT without
+    /// `RETURNING` succeeds. That would have defeated the whole point of
+    /// `security_events_append` being permissive, which exists so that an actor
+    /// can never suppress its own audit record by failing a predicate. Both call
+    /// sites (`middleware/rate_limit.rs` and `oauth/providers/provision.rs`)
+    /// spawn this and discard the returned value behind a `tracing::warn!`, so
+    /// the failure would not have surfaced as a 500 — the OAuth provisioning
+    /// audit trail would simply have stopped being written. It is invisible to
+    /// CI, which connects as a `BYPASSRLS` superuser.
+    ///
+    /// Echoing the input back is exact: every column is bound from `row`, and
+    /// the database defaults nothing here.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the INSERT fails.
     #[instrument(skip(pool, row))]
     pub async fn log(pool: &PgPool, row: SecurityEventRow) -> Result<SecurityEventRow, DbError> {
         // ip_address is passed as text and cast to INET in the query.
-        // On RETURNING we cast back to text so sqlx maps it as String rather
-        // than the pgvector INET custom type which is not available here.
-        let stored = sqlx::query!(
+        sqlx::query!(
             r#"
             INSERT INTO security_events (
                 id, event_type, agent_id, success, details,
                 ip_address, user_agent, correlation_id, created_at
             )
             VALUES ($1, $2, $3, $4, $5, $6::inet, $7, $8, $9)
-            RETURNING
-                id,
-                event_type,
-                agent_id,
-                success,
-                details,
-                ip_address::text AS ip_address,
-                user_agent,
-                correlation_id,
-                created_at
             "#,
             row.id,
             row.event_type,
             row.agent_id,
             row.success,
             row.details,
-            row.ip_address as Option<String>,
+            row.ip_address.clone() as Option<String>,
             row.user_agent,
             row.correlation_id,
             row.created_at,
         )
-        .fetch_one(pool)
+        .execute(pool)
         .await
         .map_err(DbError::from)?;
 
-        Ok(SecurityEventRow {
-            id: stored.id,
-            event_type: stored.event_type,
-            agent_id: stored.agent_id,
-            success: stored.success,
-            details: stored.details,
-            ip_address: stored.ip_address,
-            user_agent: stored.user_agent,
-            correlation_id: stored.correlation_id,
-            created_at: stored.created_at,
-        })
+        Ok(row)
     }
 
     /// Query security events matching optional filter criteria.

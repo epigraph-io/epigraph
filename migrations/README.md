@@ -85,9 +85,9 @@ Current reservation:
   | **074** | PR-16 | tenancy REQUIRED: `DROP DEFAULT`, require-tenancy trigger, no-widening trigger |
   | **075** | PR-16 | validate tenancy constraints — `claims` only |
   | **076** | PR-16 | validate tenancy constraints — remaining tier-A tables |
-  | **077** | PR-17 | RLS policies (`ENABLE` only) |
-  | **078** | PR-17 | RLS canary table |
-  | **079** | PR-17 | `FORCE ROW LEVEL SECURITY` |
+  | **077** | PR-17 | RLS policies (`ENABLE` only) + `epigraph_app` GRANTs + `security_invoker=true` on the two view exemptions. File: `077_rls_policies.sql`. **Applied to a throwaway database only, NOT to any deployed database.** |
+  | **078** | PR-17 | RLS canary table (`rls_canary`, FORCEd at creation and deliberately absent from 079's array). File: `078_rls_canary.sql`. **Throwaway only.** |
+  | **079** | PR-17 | `FORCE ROW LEVEL SECURITY` over 062's `tier_a` ∪ the ten control tables. File: `079_rls_force.sql`; undo at `docs/runbooks/079-undo.sql`, which loops the SAME array. **The plan's 079 array also names `privatization_plans`, `privatization_plan_items`, `privatization_audit` and `instance_admins`; none exist — they are PR-18's 080–083 — and 079 RAISEs rather than silently skipping a missing table.** **Throwaway only.** |
   | **080** | PR-18 | privatization plans, items, closure |
   | **081** | PR-18 | privatization guards |
   | **082** | PR-18 | privatization audit + `security_events` hardening |
@@ -123,6 +123,23 @@ Current reservation:
   against `alternative_set` and `alt_set_decisions`. **Any VIEW added in this
   range must set it.** Both properties are pinned by
   `crates/epigraph-db/tests/tenancy_coverage.rs::ownership_key_id_quarantine_is_a_view`.
+
+  **The app-role grant rule, from 077 onward.** Migration 077 grants
+  `epigraph_app` SELECT/INSERT/UPDATE/DELETE `ON ALL TABLES IN SCHEMA public`.
+  That binds only the tables that exist at version 077, so on a FRESH migrate
+  (CI, a new cluster, a restore) every table created by a LATER migration is
+  missed — while on the already-deployed database the same statement catches
+  them, because there the later tables already exist. That divergence was real:
+  `webhook_subscriptions` (085) was measured as the one relation in `public` for
+  which `has_table_privilege('epigraph_app', …, 'SELECT')` was false at head.
+  077 therefore ALSO issues `ALTER DEFAULT PRIVILEGES FOR ROLE epigraph … GRANT
+  … TO epigraph_app`, which covers tables created afterwards **by the migration
+  runner**. A table created by any other role is not covered and needs its own
+  explicit grant, the way 078 grants `rls_canary`. Pinned by
+  `rls_enforcement.rs::the_app_role_can_reach_every_public_table_without_the_test_fixture`,
+  which deliberately does NOT call `viewer_fixture::grant_app_privileges` — that
+  fixture re-issues the schema-wide grant at test time and would mask exactly
+  this gap.
 
   Two comments in migrations already applied to a database still carry
   pre-shift numbers and **cannot be corrected**: editing an applied file changes

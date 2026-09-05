@@ -335,6 +335,282 @@ impl ApiConfig {
     }
 }
 
+/// The relations `migrations/079_rls_force.sql` FORCEs, transcribed.
+///
+/// 062's `tier_a` (25) ∪ the ten group/identity/encryption control tables.
+/// Duplicated here rather than derived from the catalog on purpose: a probe
+/// that asked "which tables are FORCEd" and then checked that they are all
+/// FORCEd would pass whatever the migration did.
+///
+/// `rls_canary` is deliberately absent — migration 078 FORCEs it at creation and
+/// 079's array omits it for the same reason.
+///
+/// **A correction to the plan:** its 079 array also names `privatization_plans`,
+/// `privatization_plan_items`, `privatization_audit` and `instance_admins`. None
+/// exist; under `migrations/README.md` they are PR-18's 080–083. PR-18 adds them
+/// to 079's array, to this constant and to
+/// `locked_decisions.rs::FORCE_PROTECTED_SET` in one commit.
+#[cfg(feature = "db")]
+pub const FORCE_PROTECTED_SET: &[&str] = &[
+    "claims",
+    "evidence",
+    "edges",
+    "triples",
+    "entity_mentions",
+    "claim_versions",
+    "mass_functions",
+    "ds_combined_beliefs",
+    "ds_bayesian_divergence",
+    "claim_frames",
+    "harvester_claim_provenance",
+    "challenges",
+    "reasoning_traces",
+    "experiment_triples",
+    "experiment_entity_mentions",
+    "claim_clusters",
+    "claim_cluster_membership",
+    "claim_neighborhood_membership",
+    "claim_signature_revocations",
+    "harvester_fragments",
+    "frames",
+    "contexts",
+    "perspectives",
+    "communities",
+    "recall_events",
+    "groups",
+    "group_memberships",
+    "group_key_epochs",
+    "agents",
+    "jobs",
+    "security_events",
+    "claim_encryption",
+    "claim_version_encryption",
+    "evidence_encryption",
+    "edge_encryption",
+];
+
+/// The role the application is expected to connect as from plan §9.2 step 11d.
+///
+/// This string is the ARMING MARKER for every posture refusal in
+/// [`rls_verdict`]. See its documentation for why.
+#[cfg(feature = "db")]
+pub const EXPECTED_APP_ROLE: &str = "epigraph_app";
+
+/// What a connection observed about the RLS posture of itself and the database.
+///
+/// Split from the verdict so the I/O and the decision can be tested separately —
+/// the same reason `epigraph_db::MaintenancePrivilege` exists, and for the same
+/// underlying constraint: **CI and every developer host connect as a superuser**,
+/// for whom the interesting combinations never occur. Without the split, the
+/// refusal branches here would be untestable prose.
+#[cfg(feature = "db")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RlsPosture {
+    /// `current_user` on this connection.
+    pub current_user: String,
+    /// Is `session_user` a superuser? Superusers hold implicit `BYPASSRLS`.
+    pub is_superuser: bool,
+    /// Does `session_user` carry the `BYPASSRLS` attribute explicitly? Half of
+    /// the plan's first acceptance refusal, and it was probed NOWHERE on this
+    /// tree before PR-17 — `rolbypassrls` appears in no file under
+    /// `crates/epigraph-api`.
+    pub has_bypassrls: bool,
+    /// Can this connection take migration 074's `epigraph_seed` escape hatch?
+    /// `D-PR16-seed-membership-refusal-downgraded` assigns arming this to PR-17
+    /// and notes it is a SEVENTH refusal, not one of the six the plan lists.
+    pub is_seed_member: bool,
+    /// How many relations in `public` carry `relforcerowsecurity`, excluding
+    /// `rls_canary` (which migration 078 FORCEs at creation and which 079's
+    /// array deliberately omits).
+    pub forced_count: i64,
+    /// How many relations migration 079's array names and that exist.
+    pub protected_count: i64,
+    /// Does `public.rls_canary` exist? False below migration 078.
+    pub canary_exists: bool,
+    /// How many `rls_canary` rows THIS connection can see. Must be zero on an
+    /// app connection: the table is `FORCE`d and its only policy is
+    /// bypass-only, so a visible row means the policy is gone.
+    pub canary_visible: i64,
+}
+
+/// The non-refusing outcomes of [`rls_verdict`].
+#[cfg(feature = "db")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RlsVerdict {
+    /// Connected as [`EXPECTED_APP_ROLE`] and every armed check passed.
+    Armed,
+    /// Not connected as [`EXPECTED_APP_ROLE`]. Carries the posture warning to
+    /// emit. This is the state of every environment that exists today.
+    NotYetTheAppRole(String),
+}
+
+/// The PR-17 boot rule, as a pure function.
+///
+/// # THE STAGING PROBLEM, AND WHY THE PLAN'S OWN TWO SENTENCES CANNOT BOTH HOLD
+///
+/// PR-17's *Acceptance* line says the process "refuses if
+/// `pg_class.relforcerowsecurity` is false on any protected table". Plan §9.2
+/// step **11d** says: point `DATABASE_URL` at `epigraph_app`, "confirm the six
+/// boot assertions and the session-GUC probe, **then run**" the migrations.
+///
+/// At the moment the assertions are confirmed the migrations have not run, so
+/// `relforcerowsecurity` is false everywhere, the flat assertion refuses, and
+/// step 11d can never reach "then run". A flat FORCE assertion **bricks the
+/// rollout it exists to protect**. It also bricks the window between 077
+/// (ENABLE) and 079 (FORCE), and it bricks the documented `NO FORCE` kill
+/// switch, which is step 11d's own stated rollback.
+///
+/// [`AppState::assert_tenancy_triggers_armed`] already solved this class of
+/// problem in this file, and says why in the strongest available words: "a flat
+/// assertion would refuse to boot — turning the control that prevents the
+/// outage into the outage." This function stages the same way.
+///
+/// # THE MARKER IS `current_user`, NOT A MIGRATION NUMBER
+///
+/// Two candidate markers were considered and rejected.
+///
+/// * **FORCE itself** repeats the bug PR-15 fixed. A policy filters every role
+///   except the table owner and `BYPASSRLS` holders; `FORCE` only
+///   *additionally* subjects the owner. `epigraph-db/src/pool.rs`'s
+///   `MaintenancePrivilege::rls_active` was widened to
+///   `(relrowsecurity OR relforcerowsecurity)` for exactly that reason, and
+///   anything keyed on FORCE alone is disarmed in the two states it exists
+///   for — the 077→079 window and the post-`NO FORCE` rollback.
+/// * **`rls_active`** (either flag, the maintenance-side signal) arms the
+///   moment 077 lands, which is BEFORE the credential split. It would refuse to
+///   boot on every developer host and in CI, both of which connect as the
+///   superuser `epigraph`, and it would do so to prevent a failure that cannot
+///   occur there — a superuser bypasses every policy.
+///
+/// The signal that actually distinguishes "this deployment has performed the
+/// §9.2 step 11d credential split" from "this is a dev box" is **the connecting
+/// role itself**. `epigraph_app` is `NOLOGIN` with no password until an
+/// operator issues an out-of-band `ALTER ROLE`, so `current_user` cannot be
+/// `epigraph_app` by accident. Keying on it gives exactly the property the
+/// three states demand:
+///
+/// | State | Behaviour |
+/// |---|---|
+/// | pre-077, any role | inert (plus the partial-FORCE check, which is vacuous) |
+/// | 077→079 window as `epigraph_app` | `forced_count` is 0, so the FORCE check is inert; the canary check is live and passes |
+/// | post-079 as `epigraph_app` | fully armed |
+/// | post-`NO FORCE` rollback as `epigraph_app` | `forced_count` is 0 again; boots, still filtered by 077's policies |
+/// | rollback that also reverts `DATABASE_URL` | not the app role, so WARN; **boots** |
+///
+/// # THE SOLE CALLER IS `bin/server.rs`, AND THE STAGING DESIGN RELIES ON IT
+///
+/// MEASURED: `assert_rls_posture` is called from exactly one place,
+/// `crates/epigraph-api/src/bin/server.rs`'s boot sequence, alongside
+/// `assert_tenancy_triggers_armed` and `warn_on_privileged_connection`.
+/// `epigraph_api::build_app_for_tests` — which `epigraph-api/tests/common`'s
+/// `spawn_app` uses, and through it roughly sixty integration binaries — builds
+/// its pool with `PgPoolOptions::connect` and calls `AppState::with_db`
+/// directly, reaching none of them.
+///
+/// That is why arming these refusals does not turn the test suite red, and it
+/// is also why arming them is MORE dangerous rather than less: no gate in the
+/// four-command CI sequence exercises this function's refusal branches. They are
+/// covered instead by the pure unit tests over [`rls_verdict`] below, which is
+/// the same split `epigraph_db::maintenance_verdict` uses and for the same
+/// reason. If a future refactor makes `build_app_for_tests` run the boot
+/// sequence, re-check the staging argument before assuming it still holds.
+///
+/// # THE ONE ACCEPTANCE ITEM THIS DELIBERATELY DOES NOT ARM
+///
+/// "Refuses if `current_user <> 'epigraph_app'`" is **kept as a WARN**, and
+/// that is a considered deviation rather than an omission. Arming it makes the
+/// marker its own trigger: every environment that has not yet done 11d — CI,
+/// every developer host, and production today — would refuse to boot the moment
+/// this code deploys, which is plan §9.2 step (i)'s failure mode exactly. Worse,
+/// it would make §9.2's *documented* rollback ("`NO FORCE` + revert
+/// `DATABASE_URL`", sub-minute, no data change) un-bootable, because reverting
+/// the DSN is precisely what puts `current_user` back to the owner role. There
+/// is no marker that separates "misconfigured" from "deliberately rolled back",
+/// so the honest instrument is the one that is: the CANARY. A privileged
+/// connection serving traffic is caught by `canary_visible` whenever the
+/// deployment claims to be the app role, which is the harm the `current_user`
+/// check was reaching for.
+///
+/// # THE PARTIAL-FORCE CHECK IS IDENTITY-INDEPENDENT
+///
+/// Zero FORCEd relations is a pre-079 or rolled-back database and is inert; all
+/// of them is the armed state; **a strict subset has no legitimate cause** — it
+/// is a half-applied 079 or a half-applied `079-undo.sql`, and it means some
+/// protected tables are enforcing against their owner and others are not. That
+/// refusal fires whatever role is connecting, because a half-applied flip is
+/// wrong for all of them. `docs/runbooks/079-undo.sql` loops the same array as
+/// `079_rls_force.sql` so the rollback cannot create this state.
+///
+/// # Errors
+/// `DbError::InvalidData` when a refusal fires. Each message names the fix.
+#[cfg(feature = "db")]
+pub fn rls_verdict(p: &RlsPosture) -> Result<RlsVerdict, epigraph_db::DbError> {
+    let refuse = |reason: String| epigraph_db::DbError::InvalidData { reason };
+
+    // Identity-independent: a half-applied FORCE, in either direction.
+    if p.forced_count > 0 && p.forced_count < p.protected_count {
+        return Err(refuse(format!(
+            "refusing to serve: FORCE ROW LEVEL SECURITY is applied to {} of the {} protected \
+             tables. A strict subset has no legitimate cause — it is a half-applied migration \
+             079 or a half-applied docs/runbooks/079-undo.sql, and it leaves some protected \
+             tables enforcing against their owner while others are not. Finish the flip by \
+             re-running epigraph-migrate, or complete the rollback with \
+             docs/runbooks/079-undo.sql, then restart.",
+            p.forced_count, p.protected_count
+        )));
+    }
+
+    if p.current_user != EXPECTED_APP_ROLE {
+        return Ok(RlsVerdict::NotYetTheAppRole(format!(
+            "connecting as `{}`, not `{EXPECTED_APP_ROLE}`. The PR-17 posture refusals are \
+             STAGED on the connecting role and are therefore inert here: a superuser bypasses \
+             every policy, so nothing this process does is filtered. FORCE is applied to {} of \
+             {} protected tables. Plan §9.2 week 11d is the credential split that arms them.",
+            p.current_user, p.forced_count, p.protected_count
+        )));
+    }
+
+    // ---- armed from here: this deployment has performed the 11d split ----
+
+    if p.is_superuser {
+        return Err(refuse(format!(
+            "refusing to serve: connected as `{EXPECTED_APP_ROLE}` but `session_user` is a \
+             SUPERUSER. A superuser holds implicit BYPASSRLS, so every policy migration 077 \
+             installs is inert for this process and tenancy is enforced by nothing below the \
+             repo layer. Fix with: ALTER ROLE {EXPECTED_APP_ROLE} NOSUPERUSER."
+        )));
+    }
+    if p.has_bypassrls {
+        return Err(refuse(format!(
+            "refusing to serve: connected as `{EXPECTED_APP_ROLE}` but `session_user` carries \
+             BYPASSRLS. Every row-level security policy is skipped for this process. Fix with: \
+             ALTER ROLE {EXPECTED_APP_ROLE} NOBYPASSRLS."
+        )));
+    }
+    if p.is_seed_member {
+        return Err(refuse(format!(
+            "refusing to serve: connected as `{EXPECTED_APP_ROLE}` but this connection is a \
+             member of `epigraph_seed`, so migration 074's arm 4 STAMPS an undeclared write \
+             ('public', <seed group>) instead of raising 23502. The escape hatch exists for \
+             test fixtures, not for a serving process. Audit with: SELECT count(*) FROM claims \
+             WHERE owner_group_id = '00000000-0000-0000-0000-00000000dead'. Fix with: REVOKE \
+             epigraph_seed FROM {EXPECTED_APP_ROLE}."
+        )));
+    }
+    if p.canary_exists && p.canary_visible > 0 {
+        return Err(refuse(format!(
+            "refusing to serve: the `rls_canary` row IS VISIBLE on this `{EXPECTED_APP_ROLE}` \
+             connection. That table is FORCE'd with a bypass-only policy (migration 078), so a \
+             visible row means the policy has been dropped or row security has been disabled — \
+             row-level security is NOT protecting this database and every group-private row is \
+             readable. Re-run epigraph-migrate and restart; if that does not clear it, revert \
+             DATABASE_URL to the owner role while you investigate."
+        )));
+    }
+
+    Ok(RlsVerdict::Armed)
+}
+
 /// The tenancy triggers **migration 070** installs, as `(relation, trigger)`.
 ///
 /// Transcribed from `migrations/070_tenancy_write_path.sql`: arm (c)'s
@@ -934,6 +1210,157 @@ impl AppState {
         Ok(())
     }
 
+    /// Ask the database the questions [`rls_verdict`] decides on.
+    ///
+    /// One round trip for the role/catalog facts and one for the canary, which
+    /// has to be a separate statement because it may not exist yet and a
+    /// missing relation is a parse-time error, not a row-level one.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the catalog cannot be read at all.
+    #[cfg(feature = "db")]
+    pub async fn probe_rls_posture(&self) -> Result<RlsPosture, epigraph_db::DbError> {
+        let (current_user, is_superuser, has_bypassrls, is_seed_member, forced, protected): (
+            String,
+            bool,
+            bool,
+            bool,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT current_user::text, \
+                    COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = session_user), false), \
+                    COALESCE((SELECT rolbypassrls FROM pg_roles WHERE rolname = session_user), \
+                             false), \
+                    EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_seed') \
+                      AND pg_has_role(session_user, 'epigraph_seed', 'MEMBER'), \
+                    (SELECT count(*) FROM pg_class c \
+                       JOIN pg_namespace n ON n.oid = c.relnamespace \
+                      WHERE n.nspname = 'public' AND c.relname = ANY($1) \
+                        AND c.relkind IN ('r','p') AND c.relforcerowsecurity), \
+                    (SELECT count(*) FROM pg_class c \
+                       JOIN pg_namespace n ON n.oid = c.relnamespace \
+                      WHERE n.nspname = 'public' AND c.relname = ANY($1) \
+                        AND c.relkind IN ('r','p'))",
+        )
+        .bind(FORCE_PROTECTED_SET)
+        .fetch_one(&self.db_pool)
+        .await?;
+
+        // Below 078 there is no canary. `to_regclass` returns NULL rather than
+        // raising, so this is one statement either way.
+        let canary_exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.rls_canary') IS NOT NULL")
+                .fetch_one(&self.db_pool)
+                .await?;
+        let canary_visible: i64 = if canary_exists {
+            sqlx::query_scalar("SELECT count(*) FROM public.rls_canary")
+                .fetch_one(&self.db_pool)
+                .await?
+        } else {
+            0
+        };
+
+        Ok(RlsPosture {
+            current_user,
+            is_superuser,
+            has_bypassrls,
+            is_seed_member,
+            forced_count: forced,
+            protected_count: protected,
+            canary_exists,
+            canary_visible,
+        })
+    }
+
+    /// Probe, decide, and either log or refuse. The PR-17 boot assertion.
+    ///
+    /// See [`rls_verdict`] for the staging rule and for the one acceptance item
+    /// this deliberately leaves as a warning.
+    ///
+    /// # A FAILURE TO *READ* THE POSTURE IS NOT A REFUSAL
+    ///
+    /// The caller wraps this in `.expect()`, so anything returned here is a boot
+    /// panic. Staging the VERDICT (see [`rls_verdict`]) buys nothing if the
+    /// PROBE is unconditionally fatal, and the probe has a reachable failure
+    /// that has nothing to do with posture: its canary read needs the GRANT that
+    /// migration 078 issues inside `IF EXISTS (SELECT 1 FROM pg_roles WHERE
+    /// rolname = 'epigraph_app')`. Migration 060 only `NOTICE`s when it cannot
+    /// `CREATE ROLE` — the managed-Postgres case — so on any cluster where the
+    /// tenancy roles are provisioned out of band AFTER the migrations, that
+    /// grant silently no-ops and the read raises `42501 permission denied for
+    /// table rls_canary`. Propagating that would crash-loop a database whose RLS
+    /// posture is perfectly fine, and would make the documented sub-minute
+    /// rollback un-bootable for the same reason an unstaged verdict would.
+    ///
+    /// So the two outcomes are separated: a probe error WARNS and continues,
+    /// matching [`Self::warn_on_privileged_connection`] next to it in the boot
+    /// sequence; only an [`rls_verdict`] refusal is returned. "Cannot measure"
+    /// and "measured, and it is wrong" are different claims, and the metrics
+    /// side already models the distinction with its `-1` unmeasured value.
+    ///
+    /// # Errors
+    /// Propagates [`rls_verdict`] refusals ONLY.
+    #[cfg(feature = "db")]
+    pub async fn assert_rls_posture(&self) -> Result<(), epigraph_db::DbError> {
+        let posture = match self.probe_rls_posture().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not read the RLS posture; continuing without the assertion"
+                );
+                return Ok(());
+            }
+        };
+        match rls_verdict(&posture)? {
+            RlsVerdict::Armed => {
+                tracing::info!(
+                    current_user = %posture.current_user,
+                    forced = posture.forced_count,
+                    protected = posture.protected_count,
+                    canary_exists = posture.canary_exists,
+                    "RLS posture armed: connected as the application role, canary invisible"
+                );
+            }
+            RlsVerdict::NotYetTheAppRole(warning) => {
+                tracing::warn!(
+                    current_user = %posture.current_user,
+                    superuser = posture.is_superuser,
+                    bypassrls = posture.has_bypassrls,
+                    seed_member = posture.is_seed_member,
+                    canary_visible = posture.canary_visible,
+                    "{warning}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The number of `rls_canary` rows visible on the API pool.
+    ///
+    /// Zero is healthy on an app connection; non-zero means row security is not
+    /// protecting this database. Sampled on the 60-second gauge tick by
+    /// [`crate::tenancy_gauge::TenancyGaugeSampler`], which is where the plan's
+    /// "60-second canary health metric" lives. `None` below migration 078.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the read fails.
+    #[cfg(feature = "db")]
+    pub async fn rls_canary_visible(&self) -> Result<Option<i64>, epigraph_db::DbError> {
+        let exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.rls_canary') IS NOT NULL")
+                .fetch_one(&self.db_pool)
+                .await?;
+        if !exists {
+            return Ok(None);
+        }
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM public.rls_canary")
+            .fetch_one(&self.db_pool)
+            .await?;
+        Ok(Some(n))
+    }
+
     /// PR-16 boot posture check: **is this process connecting as the
     /// application role, and can it take the seed escape hatch?**
     ///
@@ -1241,5 +1668,198 @@ mod tests {
     fn test_appstate_without_embedding_service_is_none() {
         let state = AppState::new(ApiConfig::default());
         assert!(state.embedding_service().is_none());
+    }
+}
+
+/// PR-17: the staging rule for [`rls_verdict`], proved on the pure function.
+///
+/// These are unit tests and not `#[sqlx::test]`s on purpose. The refusal
+/// branches are unreachable against a real connection in this repository — CI
+/// and every developer host connect as the superuser `epigraph`, so
+/// `current_user` is never `epigraph_app` and the armed half never executes.
+/// Splitting the I/O from the decision is what makes it testable at all, which
+/// is the same split (and the same justification) as
+/// `epigraph_db::maintenance_verdict`.
+///
+/// **The three-state property is the point.** A FORCE assertion that is not
+/// staged bricks plan §9.2 step 11d, the 077→079 window, and the documented
+/// `NO FORCE` rollback. Each of those is a test below, so "inert where it must
+/// be inert" is asserted rather than argued.
+#[cfg(all(test, feature = "db"))]
+mod rls_verdict_tests {
+    use super::{rls_verdict, RlsPosture, RlsVerdict, EXPECTED_APP_ROLE, FORCE_PROTECTED_SET};
+
+    /// One row of the identity-refusal table: `(label, mutation, expected
+    /// phrase)`. Named because the tuple trips `clippy::type_complexity`.
+    type PostureCase = (&'static str, fn(&mut RlsPosture), &'static str);
+
+    /// A posture with nothing wrong with it, as the app role at rest.
+    fn armed() -> RlsPosture {
+        let n = i64::try_from(FORCE_PROTECTED_SET.len()).expect("small");
+        RlsPosture {
+            current_user: EXPECTED_APP_ROLE.to_string(),
+            is_superuser: false,
+            has_bypassrls: false,
+            is_seed_member: false,
+            forced_count: n,
+            protected_count: n,
+            canary_exists: true,
+            canary_visible: 0,
+        }
+    }
+
+    #[test]
+    fn a_correctly_configured_app_connection_is_armed() {
+        assert_eq!(rls_verdict(&armed()).unwrap(), RlsVerdict::Armed);
+    }
+
+    /// STATE 1 — plan §9.2 step 11d: `DATABASE_URL` already points at
+    /// `epigraph_app`, the migrations have NOT run yet, and the runbook says
+    /// "confirm the six boot assertions, **then run**" them.
+    ///
+    /// A flat `relforcerowsecurity` assertion refuses here, and step 11d can
+    /// then never reach "then run" — the control that prevents the outage
+    /// becomes the outage.
+    #[test]
+    fn step_11d_boots_before_the_migrations_have_run() {
+        let mut p = armed();
+        p.forced_count = 0;
+        p.canary_exists = false;
+        p.protected_count = 0;
+        assert_eq!(rls_verdict(&p).unwrap(), RlsVerdict::Armed);
+    }
+
+    /// STATE 2 — the window between 077 (ENABLE) and 079 (FORCE). Policies are
+    /// live and filtering every non-owner; FORCE is not applied yet.
+    #[test]
+    fn the_enable_to_force_window_boots() {
+        let mut p = armed();
+        p.forced_count = 0;
+        assert_eq!(rls_verdict(&p).unwrap(), RlsVerdict::Armed);
+    }
+
+    /// STATE 3 — after `docs/runbooks/079-undo.sql`. This is step 11d's own
+    /// documented rollback, and an assertion that refuses here makes the
+    /// rollback un-bootable.
+    #[test]
+    fn the_no_force_kill_switch_leaves_the_process_bootable() {
+        let mut p = armed();
+        p.forced_count = 0;
+        // The canary stays FORCEd — 078 creates it that way and 079-undo.sql
+        // deliberately does not touch it — so it is still invisible.
+        assert_eq!(rls_verdict(&p).unwrap(), RlsVerdict::Armed);
+    }
+
+    /// STATE 4 — the rollback that also reverts `DATABASE_URL` to the owner.
+    /// Everything is inert, and it must WARN rather than refuse.
+    #[test]
+    fn reverting_the_dsn_to_the_owner_role_warns_and_boots() {
+        let mut p = armed();
+        p.current_user = "epigraph".to_string();
+        p.is_superuser = true;
+        p.has_bypassrls = true;
+        p.is_seed_member = true;
+        p.canary_visible = 1;
+        let RlsVerdict::NotYetTheAppRole(w) = rls_verdict(&p).unwrap() else {
+            panic!("a non-app role must never refuse: that is what makes the rollback bootable");
+        };
+        assert!(w.contains("epigraph"), "the warning names the role: {w}");
+    }
+
+    /// Every environment that exists today: CI and every developer host.
+    /// Nothing here is a refusal, which is what lets this code deploy at all.
+    #[test]
+    fn a_superuser_dev_or_ci_connection_warns_and_boots() {
+        let mut p = armed();
+        p.current_user = "epigraph".to_string();
+        p.is_superuser = true;
+        p.has_bypassrls = true;
+        assert!(matches!(
+            rls_verdict(&p).unwrap(),
+            RlsVerdict::NotYetTheAppRole(_)
+        ));
+    }
+
+    /// A strict subset FORCEd is a half-applied 079 or a half-applied undo. It
+    /// has no legitimate cause and it refuses whatever role is connecting,
+    /// because the state is wrong for all of them.
+    #[test]
+    fn a_partially_forced_set_refuses_for_any_role() {
+        for user in [EXPECTED_APP_ROLE, "epigraph", "epigraph_admin"] {
+            let mut p = armed();
+            p.current_user = user.to_string();
+            p.forced_count = p.protected_count - 1;
+            let err = rls_verdict(&p).expect_err("a partial flip must refuse");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("079-undo") && msg.contains("subset"),
+                "the refusal must name both directions of the fix: {msg}"
+            );
+        }
+    }
+
+    /// The canary is the instrument that replaces the `current_user` refusal.
+    #[test]
+    fn a_visible_canary_refuses_under_the_app_role() {
+        let mut p = armed();
+        p.canary_visible = 1;
+        let err = rls_verdict(&p).expect_err("a visible canary must refuse");
+        assert!(format!("{err}").contains("rls_canary"));
+    }
+
+    /// ...and it cannot fire before migration 078 exists to make it meaningful.
+    #[test]
+    fn the_canary_check_is_inert_before_migration_078() {
+        let mut p = armed();
+        p.canary_exists = false;
+        p.canary_visible = 7; // nonsense, and unreadable: the table is absent
+        assert_eq!(rls_verdict(&p).unwrap(), RlsVerdict::Armed);
+    }
+
+    /// The three identity refusals, including `rolbypassrls`, which was probed
+    /// NOWHERE in `crates/epigraph-api` before PR-17 — half of the plan's first
+    /// acceptance refusal had no measurement at all.
+    #[test]
+    fn a_privileged_app_role_refuses_on_each_attribute_independently() {
+        // (label, mutation, a phrase the refusal must contain). Each attribute
+        // is set on an OTHERWISE-CLEAN posture, so a single over-broad refusal
+        // cannot satisfy all three.
+        let cases: [PostureCase; 3] = [
+            ("superuser", |p| p.is_superuser = true, "SUPERUSER"),
+            ("bypassrls", |p| p.has_bypassrls = true, "BYPASSRLS"),
+            (
+                "epigraph_seed",
+                |p| p.is_seed_member = true,
+                "epigraph_seed",
+            ),
+        ];
+        for (label, mutate, phrase) in cases {
+            let mut p = armed();
+            mutate(&mut p);
+            let err = rls_verdict(&p)
+                .err()
+                .unwrap_or_else(|| panic!("{label} must refuse under the app role"));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(phrase),
+                "the {label} refusal must name what is wrong and how to fix it; got: {msg}"
+            );
+        }
+    }
+
+    /// ...and none of the three fires when the connection is not the app role,
+    /// which is what keeps CI and every dev host bootable.
+    #[test]
+    fn the_identity_refusals_are_staged_on_the_connecting_role() {
+        let mut p = armed();
+        p.current_user = "epigraph".to_string();
+        p.is_superuser = true;
+        p.has_bypassrls = true;
+        p.is_seed_member = true;
+        assert!(
+            matches!(rls_verdict(&p).unwrap(), RlsVerdict::NotYetTheAppRole(_)),
+            "all three identity findings are true here and NONE may refuse: this is the \
+             posture of every environment that has not done the §9.2 11d credential split"
+        );
     }
 }

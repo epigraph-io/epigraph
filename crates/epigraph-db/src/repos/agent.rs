@@ -1157,20 +1157,30 @@ impl AgentRepository {
             let derived = blake3::derive_key("epigraph-oauth-client", client_row_id.as_bytes());
 
             // 4. Insert (or re-find) the agent — but ONLY ever a derived one.
-            let row: Option<(Uuid,)> = sqlx::query_as(
-                r#"
-                INSERT INTO agents (public_key, display_name, agent_type, key_kind, labels)
-                VALUES ($1, $2, $3, 'derived', ARRAY['oauth-principal'])
-                ON CONFLICT (public_key) DO UPDATE SET updated_at = now()
-                    WHERE agents.key_kind = 'derived'
-                RETURNING id
-                "#,
-            )
-            .bind(derived.as_slice())
-            .bind(&display_name)
-            .bind(agent_type)
-            .fetch_optional(&mut *conn)
-            .await?;
+            //
+            // The upsert itself is `public.epigraph_provision_oauth_agent()`
+            // (migration 077), a SECURITY DEFINER writer, for the same reason
+            // `ensure_personal_group` delegates: this runs pre-authentication,
+            // so the only policy arm that could admit it is one keyed on "the
+            // session proved nothing" — and because the request path never
+            // stamps the session GUCs, that is an app connection's steady state,
+            // not a pre-authentication instant. Such an arm was live on every
+            // statement and reached every `key_kind = 'derived'` row.
+            //
+            // The function wraps the SAME statement, `WHERE agents.key_kind =
+            // 'derived'` guard included. A `RETURNS uuid` function always yields
+            // exactly one row, so the zero-rows case that used to arrive as
+            // `None` from `fetch_optional` now arrives as an inner `NULL` — the
+            // binding is `(Option<Uuid>,)` and the refusal below is driven off
+            // that inner `Option`. Reading it as "a row came back, therefore it
+            // worked" would silently drop the guard.
+            let (row,): (Option<Uuid>,) =
+                sqlx::query_as("SELECT public.epigraph_provision_oauth_agent($1, $2, $3)")
+                    .bind(derived.as_slice())
+                    .bind(&display_name)
+                    .bind(agent_type)
+                    .fetch_one(&mut *conn)
+                    .await?;
 
             row.ok_or_else(|| DbError::DuplicateKey {
                 entity: format!(
@@ -1178,7 +1188,6 @@ impl AgentRepository {
                      non-derived agent; refusing to adopt it as an OAuth principal"
                 ),
             })?
-            .0
         };
 
         // 5. Link the client (write-once).
@@ -1197,6 +1206,22 @@ impl AgentRepository {
 
     /// Idempotently create the agent's personal group and its own live
     /// `role='admin'` membership in it. Returns the group id.
+    ///
+    /// **The two statements live in `public.epigraph_ensure_personal_group()`
+    /// (migration 077), not here.** They are a bootstrap: the mint runs before
+    /// any principal exists, so no membership-keyed policy on `groups` or
+    /// `group_memberships` can admit them. Expressing that as a policy arm was
+    /// tried and was wrong — the only predicate available to a policy is the
+    /// row's own shape, and `did_key` is derived from `created_by_agent_id`, so
+    /// such an arm references no session state and grants every connection read
+    /// of every personal group and every personal-group membership row,
+    /// `wrapped_key_share` included. A `SECURITY DEFINER` writer confines the
+    /// bootstrap to the two statements that need it and leaves the policies with
+    /// no personal-group arm in either direction. The behaviour, the
+    /// deterministic `did:epigraph:personal:<uuid>` key and the
+    /// revive-on-conflict semantics described below are unchanged; see the
+    /// migration for why the composite `(group_id, agent_id, epoch)` target is
+    /// the correct one.
     ///
     /// Idempotency comes from a deterministic `did_key`
     /// (`did:epigraph:personal:<agent_uuid>`) against the existing
@@ -1228,31 +1253,11 @@ impl AgentRepository {
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
     ) -> Result<Uuid, DbError> {
-        let (group_id,): (Uuid,) = sqlx::query_as(
-            r#"
-            INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id)
-            VALUES ($2, 'did:epigraph:personal:' || $1::text, ''::bytea, 'personal', $1)
-            ON CONFLICT (did_key) DO UPDATE SET updated_at = now()
-            RETURNING id
-            "#,
-        )
-        .bind(agent_id)
-        .bind(format!("personal:{agent_id}"))
-        .fetch_one(&mut *conn)
-        .await?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
-            VALUES ($1, $2, ''::bytea, 0, 'admin')
-            ON CONFLICT (group_id, agent_id, epoch)
-            DO UPDATE SET revoked_at = NULL, role = 'admin'
-            "#,
-        )
-        .bind(group_id)
-        .bind(agent_id)
-        .execute(&mut *conn)
-        .await?;
+        let (group_id,): (Uuid,) =
+            sqlx::query_as("SELECT public.epigraph_ensure_personal_group($1)")
+                .bind(agent_id)
+                .fetch_one(&mut *conn)
+                .await?;
 
         Ok(group_id)
     }
