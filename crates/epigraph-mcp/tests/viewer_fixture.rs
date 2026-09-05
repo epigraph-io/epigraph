@@ -139,12 +139,28 @@ pub async fn seed_agent_with_group(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
     // `personal` group carries an empty `public_key` (only `kind = 'team'` may
     // carry 32 bytes, per `groups_public_key_shape`) and an `admin` membership
     // at epoch 0.
+    //
+    // THE `did_key` MUST BE `did:epigraph:personal:<agent>`, NOT A TEST-LOCAL
+    // SPELLING. `ensure_personal_group`'s idempotency comes entirely from that
+    // deterministic key against `groups_did_key_key UNIQUE` — there is no
+    // column on `agents` remembering which group is the personal one. This
+    // fixture used `did:epigraph:test:<label>:<agent>`, so a later production
+    // call to `ensure_personal_group` for the same agent MINTED A SECOND
+    // `kind='personal'` group and returned that one instead.
+    //
+    // Measured: `ClaimRepository::consolidate`'s all-public fallback resolves
+    // the actor's group through `ensure_personal_group`, and the merged row
+    // landed on a group the test had never heard of. Every assertion comparing
+    // "the group the fixture made" with "the group production resolves" was
+    // therefore comparing two different rows — and the ones that passed did so
+    // because they never crossed that boundary.
     let group: Uuid = sqlx::query_scalar(
         "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
-         VALUES ($1, $2, ''::bytea, 'personal', $3) RETURNING id",
+         VALUES ($1, 'did:epigraph:personal:' || $2::text, ''::bytea, 'personal', $2) \
+         ON CONFLICT (did_key) DO UPDATE SET updated_at = now() \
+         RETURNING id",
     )
     .bind(format!("{label}:{agent}"))
-    .bind(format!("did:epigraph:test:{label}:{agent}"))
     .bind(agent)
     .fetch_one(pool)
     .await
@@ -173,13 +189,95 @@ pub async fn seed_group_claim(pool: &PgPool, agent: Uuid, group: Uuid, content: 
     seed_claim(pool, agent, content, "group", group).await
 }
 
-/// The seeded world group (migration 060/062), which is the `owner_group_id`
-/// DEFAULT every pre-existing row carries.
+/// The seeded world group (migration 060/062).
+///
+/// It **was** the `owner_group_id` DEFAULT every pre-existing row carried;
+/// migration 074 (PR-16) dropped that default, so it is now a shape constant
+/// only — the sentinel for *owned by nobody*, memberless by design, and legal
+/// on a row only in the pair `('public', world)`. `('group', world)` is refused
+/// by `<table>_group_needs_real_group`.
+///
+/// Fixtures that stamp it are declaring "this row has no owner", which is true
+/// of the ownerless registry tables and of a public claim written before D2's
+/// backfill. It is NOT what migration 074's seed escape hatch stamps — that is
+/// [`seed_group`], and §8.2 A4 asserts no CLAIM is world-owned.
 pub async fn world_group(pool: &PgPool) -> Uuid {
     sqlx::query_scalar("SELECT id FROM groups WHERE kind = 'world' LIMIT 1")
         .fetch_one(pool)
         .await
         .expect("the world group is seeded by migration 060")
+}
+
+/// The seeded `epigraph_seed` group (migration 062), which migration 074's
+/// arm 4 stamps on an undeclared insert by a member of the `epigraph_seed`
+/// role.
+pub async fn seed_group(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM groups WHERE kind = 'seed' LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .expect("the seed group is seeded by migration 062")
+}
+
+/// Run `f` on a connection whose **`session_user`** is `role`, then restore.
+///
+/// # Why `SET SESSION AUTHORIZATION` and not `SET ROLE`
+///
+/// Migration 074's seed escape hatch is
+/// `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`, keyed on
+/// `session_user` and not `current_user` because inside a `SECURITY DEFINER`
+/// frame `current_user` is the function owner. `SET ROLE` changes only
+/// `current_user`, so **it does not reach the arm at all** — measured: an
+/// undeclared `INSERT INTO claims` under `SET ROLE epigraph_app` still takes
+/// arm 4 and succeeds, because the session is still the superuser the test
+/// harness connected as.
+///
+/// `SET SESSION AUTHORIZATION` changes both, is available to a superuser, and
+/// is the only way a test on this harness can produce the `23502` that
+/// `tenancy_required.rs` exists to assert. Without it every such assertion is
+/// vacuous.
+///
+/// `epigraph_app` and `epigraph_maintenance` are `NOLOGIN` (migration 060), so
+/// there is no second connection to open instead.
+///
+/// The reset is `RESET SESSION AUTHORIZATION`, issued whether or not `f`
+/// failed: a connection left as `epigraph_app` and returned to the pool would
+/// make an unrelated later test fail somewhere else entirely.
+pub async fn as_role<F, Fut, T>(pool: &PgPool, role: &str, f: F) -> T
+where
+    F: FnOnce(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Fut,
+    Fut: std::future::Future<Output = (sqlx::pool::PoolConnection<sqlx::Postgres>, T)>,
+{
+    use sqlx::Executor;
+    let mut conn = pool.acquire().await.expect("acquire");
+    // Role names are test-local literals, never caller data; there is no
+    // identifier-quoting facility for SET SESSION AUTHORIZATION in a bind.
+    conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+        .await
+        .unwrap_or_else(|e| panic!("SET SESSION AUTHORIZATION {role}: {e}"));
+    let (mut conn, out) = f(conn).await;
+    conn.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("RESET SESSION AUTHORIZATION");
+    out
+}
+
+/// Grant every table privilege on `public` to `role`.
+///
+/// `epigraph_app` is a bare `CREATE ROLE ... NOLOGIN` (migration 060 issues no
+/// GRANT of its own), so an [`as_role`] block that does not do this first fails
+/// with `42501 permission denied for table claims` — a plausible-looking error
+/// that has nothing to do with tenancy and would mask the `23502` under test.
+pub async fn grant_app_privileges(pool: &PgPool, role: &str) {
+    use sqlx::Executor;
+    for stmt in [
+        format!("GRANT USAGE ON SCHEMA public TO {role}"),
+        format!("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role}"),
+        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role}"),
+    ] {
+        pool.execute(stmt.as_str())
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
 }
 
 async fn seed_claim(

@@ -144,7 +144,12 @@ pub async fn learn_convention(
     let mut claim = epigraph_core::Claim::new(request.content.clone(), agent_id, pub_key, truth);
     claim.content_hash = epigraph_crypto::ContentHasher::hash(request.content.as_bytes());
 
-    epigraph_db::ClaimRepository::create(pool, &claim).await?;
+    // A convention is authored by the SYSTEM agent, so the declaration names
+    // the system agent's own personal group. There is no caller-supplied group
+    // on this surface -- a convention is instance-wide by construction.
+    let decl =
+        epigraph_db::ClaimRepository::default_decl_for_author_pool(pool, agent_id.into()).await?;
+    epigraph_db::ClaimRepository::create(pool, &claim, decl).await?;
 
     // Set labels: convention + any user tags
     let mut labels = vec!["convention".to_string(), "learned".to_string()];
@@ -423,7 +428,12 @@ pub async fn share_skill(
         epigraph_core::Claim::new(claim.content.clone(), agent_id, pub_key, claim.truth_value);
     shared_claim.content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
 
-    epigraph_db::ClaimRepository::create(pool, &shared_claim).await?;
+    // Same as `record_convention` above: the system agent's personal group.
+    // A "shared" workflow claim is explicitly instance-wide; making it
+    // group-private would defeat the sharing this endpoint exists to do.
+    let decl =
+        epigraph_db::ClaimRepository::default_decl_for_author_pool(pool, agent_id.into()).await?;
+    epigraph_db::ClaimRepository::create(pool, &shared_claim, decl).await?;
 
     // Set labels
     let labels = vec![

@@ -256,7 +256,7 @@ async fn claim_repo_create_emits_claim_created_event() {
 
     let before = chrono::Utc::now();
 
-    let persisted = ClaimRepository::create(&pool, &claim)
+    let persisted = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("ClaimRepository::create succeeds");
     let persisted_id = persisted.id.as_uuid();
@@ -325,6 +325,7 @@ async fn claim_repo_create_with_id_if_absent_emits_once() {
         agent_id,
         TruthValue::new(0.5).unwrap(),
         &["workflow_claim".to_string()],
+        epigraph_core::TenancyDecl::Inherited,
     )
     .await
     .expect("first create_with_id_if_absent");
@@ -339,6 +340,7 @@ async fn claim_repo_create_with_id_if_absent_emits_once() {
         agent_id,
         TruthValue::new(0.5).unwrap(),
         &["workflow_claim".to_string()],
+        epigraph_core::TenancyDecl::Inherited,
     )
     .await
     .expect("second create_with_id_if_absent");

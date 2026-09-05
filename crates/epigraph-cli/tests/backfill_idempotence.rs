@@ -103,8 +103,28 @@ async fn tenancy_of(pool: &PgPool, id: Uuid) -> (Uuid, String) {
         .expect("read tenancy")
 }
 
-/// A claim naming neither tenancy column, so migration 062's DEFAULT supplies
-/// the world group — the state the backfill exists to clear.
+/// A **legacy** claim: `('public', <world group>)`, which is the state the
+/// backfill exists to clear.
+///
+/// # Why this now stamps world EXPLICITLY — PR-16
+///
+/// This helper used to name neither tenancy column and let migration 062's
+/// `DEFAULT` supply the world group. Migration 074 drops that default, and an
+/// undeclared insert on the test harness role now takes the seed escape hatch
+/// instead — landing on `('public', <seed group>)`. Every test in this file
+/// then failed on its own precondition, because the backfill targets
+/// `owner_group_id = <world>` and there was nothing there.
+///
+/// The right fix is to construct the state rather than to widen what the
+/// backfill looks for. The world-owned corpus is **historical**: it is what
+/// migration 062 created on a live database, and after 074 no write path
+/// produces another one. A fixture that reproduced it by omission was only ever
+/// getting it by accident of the default, and would have kept passing while
+/// silently testing a different row shape.
+///
+/// The seed group is deliberately NOT what the backfill targets, and
+/// `claims_are_stamped_with_the_authors_personal_group_never_world_or_seed`
+/// below is what pins that distinction.
 async fn seed_undeclared_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
     let id = Uuid::new_v4();
     let mut hash = vec![0u8; 32];
@@ -112,8 +132,10 @@ async fn seed_undeclared_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uui
         hash[i % 32] ^= *b;
     }
     sqlx::query(
-        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
-         VALUES ($1, $2, $3, 0.8, $4, true)",
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.8, $4, true, 'public', \
+                 '00000000-0000-0000-0000-000000000000'::uuid)",
     )
     .bind(id)
     .bind(content)
@@ -121,7 +143,7 @@ async fn seed_undeclared_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uui
     .bind(agent)
     .execute(pool)
     .await
-    .expect("seed undeclared claim");
+    .expect("seed legacy world-owned claim");
     id
 }
 

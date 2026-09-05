@@ -59,13 +59,48 @@ fn series_lines(body: &str) -> Vec<&str> {
         .collect()
 }
 
-/// An undeclared write reaches the scrape, labelled by table.
+/// A counted undeclared write reaches the scrape, labelled by table --
+/// counted **at the counter table**, not through the trigger. See below.
 ///
-/// The claim is inserted through the REAL trigger — arm (a) is what increments
-/// `tenancy_undeclared_writes` — rather than by writing the counter table
-/// directly, so this also proves the two halves are connected.
+/// # PR-16 CHANGED THIS TEST'S MECHANISM, AND THE LOSS IS REAL
+///
+/// Until migration 074 this test inserted an undeclared claim and let migration
+/// 070 arm (a) count it, which also proved the two halves — trigger and gauge —
+/// were connected. **That is no longer reachable from any role on this host,
+/// and it is not a test-harness limitation:**
+///
+/// * arm (a)'s counting limb no longer exists. 074 `CREATE OR REPLACE`s
+///   `epigraph_claims_require_tenancy` with the final form, whose undeclared
+///   arm RAISES instead of counting.
+/// * on the harness (superuser) connection an undeclared insert takes arm 4 —
+///   `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')` is true of a
+///   superuser — and is silently STAMPED, so nothing is counted.
+/// * under `SET SESSION AUTHORIZATION epigraph_app` it raises `23502`, so
+///   nothing is counted there either.
+///
+/// So the trigger→counter half is **no longer test-covered**, and this comment
+/// is the record of that rather than a silent deletion. It is defensible only
+/// because of what the counter is FOR: it is plan §9.2's week-11b deploy
+/// instrument, read on a database that has **not yet applied 074**, to decide
+/// whether 074 may be applied at all. `tenancy_triggers.rs` pinned the
+/// trigger→counter link for as long as that link existed; PR-12's assertion of
+/// it is preserved in that file's git history and in the inverted test that
+/// replaced it.
+///
+/// What this file still covers, and what still matters after 074, is the
+/// counter-table→Prometheus half: an operator watching the gate is watching
+/// this gauge, and a gauge that exports nothing would let "flat at zero" read
+/// as satisfied while the counter climbed.
+///
+/// The uncovered half is tracked as
+/// `D-PR16-undeclared-write-counter-link-uncovered` in
+/// `docs/tenancy/progress.json`, and `docs/deploy.md` step (ii) now requires
+/// the counter be **positively falsified on a canary** — one deliberate
+/// undeclared write, observed to increment — before the 24-hour observation
+/// window starts. Otherwise "zero" and "unwired" are the same picture, and the
+/// gate passes vacuously into the outage it exists to prevent.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_undeclared_write_reaches_the_prometheus_scrape(pool: PgPool) {
+async fn the_undeclared_write_counter_table_reaches_the_prometheus_scrape(pool: PgPool) {
     let metrics = Metrics::new();
     let mut sampler = TenancyGaugeSampler::new();
 
@@ -80,18 +115,17 @@ async fn an_undeclared_write_reaches_the_prometheus_scrape(pool: PgPool) {
          distinguish this from a sampler that never ran"
     );
 
-    // An undeclared INSERT — no tenancy columns named, exactly what an unpatched
-    // production call site does. Migration 070 arm (a) counts it.
-    let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    // The row migration 070 arm (a) writes, written directly. Seeding the agent
+    // as well, so the fixture still exercises a database in the shape the
+    // sampler runs against rather than an empty one.
+    let (_agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
     sqlx::query(
-        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
-         VALUES (gen_random_uuid(), 'undeclared', $1, 0.8, $2, true)",
+        "INSERT INTO tenancy_undeclared_writes (table_name, day, n, last_seen) \
+         VALUES ('claims', current_date, 1, now())",
     )
-    .bind(vec![5u8; 32])
-    .bind(agent)
     .execute(&pool)
     .await
-    .expect("undeclared insert");
+    .expect("seed the counter row arm (a) would have written");
 
     sample_once(&mut sampler, &metrics, &pool).await;
     let body = scrape(&metrics);

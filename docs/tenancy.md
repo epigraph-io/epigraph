@@ -58,10 +58,11 @@ Prometheus gauge exports (scraped from the internal metrics listener,
 ## What you should do about it
 
 **If you are seeing this from application code:** the write path needs to
-declare tenancy. Fixing the thirteen production `INSERT INTO claims` call sites
-is **PR-16's** job, not something to do piecemeal — the whole point of stamping
-in the database first is that inheritance covers paths that do not exist yet.
-Report the table and the code path; do not add a `DEFAULT`.
+declare tenancy. PR-16 patched the thirteen production `INSERT INTO claims`
+call sites plus the nine on the parentless root tables, so a warning from a
+path other than those is a NEW writer that was added without one — see
+[Declaring visibility on write](#declaring-visibility-on-write). Report the
+table and the code path; do not add a `DEFAULT`.
 
 **If you are seeing this from a test:** most test fixtures insert claims
 directly. Migration 074 arm 4 gives them an escape hatch — as the database role
@@ -84,7 +85,94 @@ back. Migration 062 forbids that pairing outright with
 | A claim-derived row (`evidence`, `triples`, …) | inherited from the parent claim by 070 arm (c), at insert |
 | A visibility change on a claim | propagated to 17 derived tables, `harvester_fragments` and `edges` by 070 arm (d), in the same transaction |
 | An edge | the **meet** of its two endpoints, 070 arm (b) |
-| A row with no derivable owner (`frames`, `contexts`) | stays `('public', world)`. Legal: the strong `owner_group_id <> world` CHECK is scoped to `claims`. |
+| A row with no derivable owner (`frames`, `contexts`, `perspectives`, `communities`, `harvester_fragments`, `recall_events`) | **must be declared by the writer.** Before 074 these landed on `('public', world)`; after 074 there is no default to land on. See the next section. |
+
+## Declaring visibility on write
+
+This is the section migration 074's error `HINT` points at. If you got here from
+a `23502` whose message begins `epigraph tenancy:`, the write path you are on
+did not declare tenancy and the database could not derive it.
+
+Every tier-A table carries two columns, both `NOT NULL` and — from migration
+074 — both with **no `DEFAULT`**:
+
+| Column | Values |
+|---|---|
+| `visibility` | `'public'` or `'group'` |
+| `owner_group_id` | a real `groups.id` |
+
+`'public'` under D3 means *any authenticated agent*, not *anonymous*. A public
+row still carries a real owner group: `visibility` says who may read it,
+`owner_group_id` says who owns it. Pairing `'group'` with the `world` or `seed`
+group is refused outright (`<table>_group_needs_real_group`) — both are
+memberless by design, so such a row is a black hole nobody, including its
+author, can read back.
+
+### Three ways a write can satisfy the requirement
+
+**1. Name both columns.** The normal case for a root row.
+
+```sql
+INSERT INTO claims (id, content, content_hash, truth_value, agent_id,
+                    visibility, owner_group_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7);
+```
+
+In Rust this is `epigraph_core::TenancyDecl` — `TenancyDecl::public(group)` or
+`TenancyDecl::group(group)` — threaded into the repository call. The type has no
+`Default` and no zero-argument constructor, for the same reason `Viewer` has
+none: a constructor that needs no argument is a decision nobody made.
+
+**2. Bind a parent the database can read the tenancy off.** This is *preferred*
+over restating, because restating invites an accidental downgrade.
+
+| Table | Parent column | Trigger arm |
+|---|---|---|
+| `claims` | `supersedes` | 074 arm 1 |
+| `claims` | `step_lineage_id` | 074 arm 2 |
+| the 17 claim-derived tables (`evidence`, `triples`, `claim_versions`, …) | `claim_id` | 074's `epigraph_derived_require_tenancy` |
+| `edges` | `source_id` / `target_id` | 072's `epigraph_edges_tenancy` (the endpoint meet) |
+
+**Inheritance is checked even when you also declare.** The parent arms run
+*before* the "fully declared" arm, so binding `supersedes` to a group-private
+claim and declaring `('public', world)` in the same statement raises `42501`,
+not a silent declassification. A declaration may narrow or move a row between
+groups; it may never widen it past its parent.
+
+**3. Be a member of `epigraph_seed`.** The escape hatch, and it is for test
+fixtures only. An undeclared insert by a member of that role yields
+`('public', <seed group>)` rather than raising. It is **role membership**, not a
+GUC an application can `SET`, it is keyed on `session_user` (so `SET ROLE` does
+not reach it — `SET SESSION AUTHORIZATION` does), it is revocable with one
+`REVOKE`, and every row it stamps is greppable:
+
+```sql
+SELECT count(*) FROM claims
+ WHERE owner_group_id = '00000000-0000-0000-0000-00000000dead'::uuid;
+```
+
+Production code must never rely on it. At boot the API **logs a warning** when
+its connecting role can take the hatch (`AppState::warn_on_privileged_connection`).
+It is a warning and not a refusal today, deliberately: the connecting role is
+still `epigraph` — a superuser, which satisfies `pg_has_role` for every role —
+so refusing would stop the API booting in CI and in development before the
+credential split has happened. PR-17 repoints `DATABASE_URL` (plan §9.2 week
+11d) and its acceptance line already owns turning this into a refusal.
+
+### The six tables with no parent at all
+
+`frames`, `contexts`, `perspectives`, `communities`, `harvester_fragments` and
+`recall_events` have no `claim_id` and no predecessor, so route 2 does not exist
+for them. Their writers declare, or the write raises. In this tree that is nine
+production statements, in `repos/community.rs`, `repos/context.rs`,
+`repos/frame.rs`, `repos/perspective.rs`, `repos/recall_event.rs` and
+`bin/dekg.rs`.
+
+### What you must not do
+
+Do not add a `DEFAULT` back. Do not stamp the seed or world group from
+application code. Do not "fix" a `23502` by widening the row to `'public'` when
+the caller meant `'group'` — a failed write is recoverable, a disclosure is not.
 
 ## Running the backfill
 

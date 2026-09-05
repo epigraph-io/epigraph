@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO claims (\n                id, content, content_hash, truth_value, agent_id, trace_id,\n                created_at, updated_at\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n            RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at\n            ",
+  "query": "\n            INSERT INTO claims (\n                id, content, content_hash, truth_value, agent_id, trace_id,\n                created_at, updated_at, visibility, owner_group_id\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\n            RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -48,7 +48,9 @@
         "Uuid",
         "Uuid",
         "Timestamptz",
-        "Timestamptz"
+        "Timestamptz",
+        "Varchar",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -61,5 +63,5 @@
       false
     ]
   },
-  "hash": "b93c68d5235227b73a98f090799bf9f7dd3c5a41a602ddb2dc191a67bd346c43"
+  "hash": "c9a1c9ab53524d45392fbca4a8ebf43b4c51b890a80c13acbf339a4983a99d9a"
 }

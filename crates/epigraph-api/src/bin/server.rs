@@ -464,6 +464,26 @@ async fn main() {
             .expect("Failed to load entity_types registry cache");
         tracing::info!("entity_types registry cache loaded");
 
+        // PR-16 boot assertions (plan §8.2 A5). Same placement and the same
+        // reason as the cache load above: `with_db` is sync and cannot SELECT.
+        //
+        // The trigger check REFUSES. After migration 074 there is no DEFAULT
+        // left to catch an undeclared write, so a disabled require-tenancy
+        // trigger is not a degraded mode — it is a corpus acquiring rows whose
+        // tenancy nobody declared, silently, until the NOT NULL backstop
+        // happens to fire.
+        state
+            .assert_tenancy_triggers_armed()
+            .await
+            .expect("refusing to serve: tenancy triggers are not armed");
+
+        // The connection-posture check WARNS. See its doc comment: making it
+        // fatal today would stop this binary booting in CI and in development,
+        // and PR-17 is the PR that repoints DATABASE_URL and can arm it.
+        if let Err(e) = state.warn_on_privileged_connection().await {
+            tracing::warn!(error = %e, "could not read the connection posture");
+        }
+
         (state, job_pool)
     };
 

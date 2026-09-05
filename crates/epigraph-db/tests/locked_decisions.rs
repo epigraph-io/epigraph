@@ -41,8 +41,12 @@
 //! into `crates/epigraph-db/src/repos/` behind `Viewer` predicates, and deletes
 //! the legacy `ownership` read/declassify surface. **No migration** —
 //! `migrations/README.md` reserves PR-14 no number. **No RLS policy.** **No
-//! tenancy column.** **No write-side predicate**: `viewer.writable_bind()`
-//! remains PR-16's mechanism, unused here.
+//! tenancy column.** **No write-side predicate.** (PR-16 correction to this
+//! sentence, which used to read "`viewer.writable_bind()` remains PR-16's
+//! mechanism": `Viewer::writable_bind` has been public since PR-04 and is
+//! already consumed by `pool.rs::apply_session_gucs`. What is missing is the
+//! SQL half — the write-side predicate and `WITH CHECK` — and PR-16a does not
+//! add it either.)
 //!
 //! One D1-adjacent consequence is worth recording where a future reader will
 //! find it. `access_control.rs`'s `None => ContentAccess::Full` was cited in
@@ -199,10 +203,13 @@
 //!   variants and still are; `public_router_allowlist.rs` is untouched.
 //! * **No RLS policy.** None exists yet (PR-17 owns 077/079).
 //! * **No write-side tenancy predicate.** `register_webhook` now writes a row,
-//!   which is disclosed on the handler itself, but it adds no
-//!   `writable_bind()`, no `WITH CHECK` and no policy — that is PR-16's
-//!   mechanism and it does not exist. Refusing when `AuthContext` is absent
-//!   (`delete_webhook`) is authentication, not the PR-16 control.
+//!   which is disclosed on the handler itself, but it spends no
+//!   `writable_bind()` and adds no `WITH CHECK` and no policy. (PR-16
+//!   correction: this used to say the mechanism "does not exist".
+//!   `Viewer::writable_bind` has existed since PR-04; what does not exist is
+//!   the SQL half that consumes it, and PR-16a does not add that either.)
+//!   Refusing when `AuthContext` is absent (`delete_webhook`) is
+//!   authentication, not the PR-16 control.
 //!
 //! ## Status at PR-09
 //!
@@ -588,19 +595,24 @@ fn route_literals(chain: &str) -> Vec<&str> {
 // D1 — tenancy is declared on write, never defaulted
 // ===========================================================================
 //
-// STILL A PLACEHOLDER, for the tier-A columns only:
+// THE PLACEHOLDER IS DISCHARGED. PR-05 left a hook here reading: "PR-16: after
+// migration 074 drops the DEFAULTs, assert here that no tier-A table has a
+// `column_default` on `visibility` or `owner_group_id`, and that
+// `count(*) FROM claims WHERE owner_group_id = <world>` is 0." That is plan
+// §8.2's A1 and A4, and migration 074 has now landed, so it is asserted below
+// in `d1_no_tier_a_tenancy_column_carries_a_default`.
 //
-// PR-16: after migration 074 drops the DEFAULTs, assert here that no tier-A
-// table has a `column_default` on `visibility` or `owner_group_id`, and that
-// `count(*) FROM claims WHERE owner_group_id = <world>` is 0.
+// PR-05's reason for deferring is worth keeping, because it is what a future
+// reader will want when they wonder why 062 shipped defaults at all: migration
+// 062 ships `DEFAULT 'public'` and `DEFAULT '00000000-…-000000000000'::uuid`
+// deliberately — they are what makes `ADD COLUMN` metadata-only on a live
+// `claims` table. Dropping them was always stage two, and an assertion written
+// at PR-05 would have failed by construction and been silenced rather than
+// fixed.
 //
-// That half is NOT assertable at PR-05. Migration 062 ships
-// `DEFAULT 'public'` and `DEFAULT '00000000-…-000000000000'::uuid` deliberately:
-// they are what makes `ADD COLUMN` metadata-only on a live `claims` table, and
-// dropping them is stage two, not stage one. An assertion written now would fail
-// by construction and would be silenced rather than fixed.
-//
-// What IS assertable, as of PR-05, is below.
+// The FULL acceptance suite for 074 is `crates/epigraph-db/tests/tenancy_required.rs`.
+// What lives here is only the part that pins the DECISION: a PR that reinstates
+// a default relitigates D1, and this is where that is caught.
 
 /// D1, the half that is live: **a tenancy column with no absence value.**
 ///
@@ -858,6 +870,37 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
         rows.len()
     );
 
+    // PR-16. The query above cannot see migration 074's additions: its LIKE
+    // pattern is `%_inherit_tenancy` and its IN list is 070's four names, so
+    // the 23 new `<table>_require_tenancy` triggers and `claims_block_widening`
+    // fall through both. Counted separately rather than by widening the pattern
+    // above, so PR-12's number stays a statement about PR-12's trigger set and
+    // this one about PR-16's — a single merged count would go green on the
+    // wrong 24 as easily as the right one.
+    let pr16: Vec<(String, String)> = sqlx::query_as(
+        "SELECT t.tgname, t.tgenabled::text FROM pg_trigger t \
+          WHERE NOT t.tgisinternal \
+            AND (t.tgname LIKE '%\\_require\\_tenancy' \
+                 OR t.tgname = 'claims_block_widening') \
+          ORDER BY t.tgname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read pg_trigger for the PR-16 set");
+    assert_eq!(
+        pr16.len(),
+        25,
+        "expected 25 after migration 074: 24 *_require_tenancy (claims, the 17 \
+         claim-derived tables, the 6 parentless roots) plus claims_block_widening. \
+         Found {}: {pr16:?}",
+        pr16.len()
+    );
+    let pr16_disabled: Vec<&(String, String)> = pr16.iter().filter(|(_, e)| e != "O").collect();
+    assert!(
+        pr16_disabled.is_empty(),
+        "plan §8.2 A5 extends to migration 074's triggers: {pr16_disabled:?}"
+    );
+
     let disabled: Vec<&(String, String)> = rows.iter().filter(|(_, e)| e != "O").collect();
     assert!(
         disabled.is_empty(),
@@ -866,19 +909,24 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     );
 }
 
-/// D1 — migration 070 must ship the TRANSITION form, not 074's final form.
+/// **INVERTED BY PR-16.** This asserted, for PR-12, that migration 070 had
+/// shipped the TRANSITION form and that `claims.owner_group_id` still carried
+/// its DEFAULT. Migration 074 makes both false by design, and the assertion is
+/// replaced by its end-state twin rather than deleted — the staging strategy is
+/// the decision, and a decision that stops being pinned when it completes is a
+/// decision nobody can later show was made.
 ///
-/// The distinction is the whole staging strategy. 070 arm (a) **warns and
-/// counts**; migration 074 (PR-16) `CREATE OR REPLACE`s the same function with
-/// the `RAISE`-terminated version in the same migration that drops 062's
-/// DEFAULTs. Shipping the final form early turns thirteen production
-/// `INSERT INTO claims` call sites and ~160 test statements into hard `23502`s
-/// on the day PR-12 lands, months before PR-16's week-11a rollout.
+/// What PR-12's version was protecting: shipping the final form early would
+/// have turned thirteen production `INSERT INTO claims` call sites and ~180
+/// test statements into hard `23502`s on the day PR-12 landed, months before
+/// PR-16's rollout. That risk is discharged, in this order:
+/// the call sites were patched, `tenancy_undeclared_writes` was watched flat at
+/// zero for 24 hours (plan §9.2 week 11b), and only then did 074 apply.
 ///
 /// Read from `pg_proc.prosrc` and the catalog rather than from the file, so a
-/// database that has had the function replaced out of band also fails.
+/// database whose functions were replaced out of band also fails.
 #[sqlx::test(migrations = "../../migrations")]
-async fn d1_the_stamping_trigger_is_still_the_transition_form(pool: PgPool) {
+async fn d1_the_stamping_trigger_is_the_final_form(pool: PgPool) {
     let src: String = sqlx::query_scalar(
         "SELECT p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
           WHERE n.nspname = 'public' AND p.proname = 'epigraph_claims_require_tenancy'",
@@ -888,30 +936,94 @@ async fn d1_the_stamping_trigger_is_still_the_transition_form(pool: PgPool) {
     .expect("epigraph_claims_require_tenancy must exist after migration 070");
 
     assert!(
-        src.contains("tenancy_undeclared_writes"),
-        "arm (a) must COUNT undeclared writes — that counter is plan §9.2's \
-         week-11b deploy gate, and without it PR-16 has no evidence to gate on"
+        !src.contains("RAISE WARNING"),
+        "after migration 074 the undeclared arm must RAISE, not warn. A surviving \
+         `RAISE WARNING` means 074's CREATE OR REPLACE did not take — the DEFAULTs \
+         are gone but the trigger still expects them, so `NEW.visibility` is NULL, \
+         no arm matches, and every undeclared write dies on a bare NOT NULL \
+         violation with no diagnosis instead of on the tenancy message."
     );
     assert!(
-        src.contains("RAISE WARNING"),
-        "arm (a) must WARN, not raise, while 062's DEFAULTs are still present"
+        src.contains("23502") && src.contains("docs/tenancy.md"),
+        "the final form's terminal arm must raise 23502 and HINT at \
+         docs/tenancy.md#declaring-visibility-on-write. The SQLSTATE is what keeps \
+         the failure classified as a CLIENT error; the hint is what makes it \
+         actionable."
+    );
+    assert!(
+        src.contains("epigraph_seed"),
+        "arm 4 (the seed escape hatch) must survive. Without it every undeclared \
+         test fixture in the workspace raises."
     );
 
-    // The transition form keys on "still equals the world default"; 074's final
-    // form keys on IS NULL, which is only reachable once the DEFAULTs are gone.
-    let default_present: bool = sqlx::query_scalar(
-        "SELECT column_default IS NOT NULL FROM information_schema.columns \
-          WHERE table_schema = 'public' AND table_name = 'claims' \
-            AND column_name = 'owner_group_id'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("read claims.owner_group_id default");
+    // Ordering, read structurally: the predecessor arm must appear BEFORE the
+    // "fully declared" short-circuit. Plan §3's body has them the other way
+    // round, and with that order an INSERT binding `supersedes` to a private
+    // claim AND declaring ('public', world) is accepted — a one-statement
+    // declassification. `tenancy_required.rs::
+    // an_explicitly_public_successor_over_a_private_predecessor_is_refused`
+    // asserts the behaviour; this asserts the structure that produces it, so a
+    // reordering is caught even if that test is ever weakened.
+    let supersedes_at = src
+        .find("NEW.supersedes IS NOT NULL")
+        .expect("the predecessor arm must exist");
+    let declared_at = src
+        .find("NEW.visibility IS NOT NULL AND NEW.owner_group_id IS NOT NULL")
+        .expect("the fully-declared arm must exist");
     assert!(
-        default_present,
-        "claims.owner_group_id lost its DEFAULT before migration 074. The \
-         transition trigger keys on that default, so dropping it early makes arm \
-         (a) silently stop recognising undeclared writes."
+        supersedes_at < declared_at,
+        "the `supersedes` arm must run BEFORE the fully-declared arm. Reversed, a \
+         writer escapes the no-widening check simply by naming both columns."
+    );
+}
+
+/// D1, the half PR-05 could not assert: **no tier-A tenancy column carries a
+/// default, and no claim is world-owned.**
+///
+/// This is the hook PR-05 left in the comment block above, and it is plan
+/// §8.2's A1 and A4. It is duplicated from `tenancy_required.rs` on purpose:
+/// that file is PR-16's acceptance suite and could reasonably be deleted once
+/// the release ships; this file is the ledger of locked decisions and may not.
+/// A `DEFAULT` reinstated on a tier-A tenancy column is D1 being relitigated in
+/// `pg_attrdef`, where no code review would see it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d1_no_tier_a_tenancy_column_carries_a_default(pool: PgPool) {
+    let offenders: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT table_name, column_name, column_default, is_nullable \
+           FROM information_schema.columns \
+          WHERE table_schema = 'public' \
+            AND column_name IN ('visibility','owner_group_id') \
+            AND (column_default IS NOT NULL OR is_nullable = 'YES') \
+          ORDER BY table_name, column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("A1 probe");
+    assert!(
+        offenders.is_empty(),
+        "plan §8.2 A1 / decision D1: a tier-A tenancy column regained a DEFAULT or \
+         became nullable. That is 'public by omission' one layer below the code — \
+         the exact defect D1 names — and it makes the require-tenancy triggers \
+         unreachable, because the column is never NULL inside a BEFORE trigger. \
+         Offenders: {offenders:?}"
+    );
+
+    let world: uuid::Uuid = sqlx::query_scalar("SELECT id FROM groups WHERE kind = 'world'")
+        .fetch_one(&pool)
+        .await
+        .expect("the world group is seeded by migration 062");
+    let world_owned: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM claims WHERE owner_group_id = $1")
+            .bind(world)
+            .fetch_one(&pool)
+            .await
+            .expect("A4 probe");
+    assert_eq!(
+        world_owned, 0,
+        "plan §8.2 A4: no claim may be owned by the world group. The world group is \
+         memberless by design, so a world-owned claim has no owner any \
+         privatization plan or RLS policy can act on. Migration 074 arm 4 stamps the \
+         SEED group for exactly this reason."
     );
 }
 
@@ -1018,8 +1130,8 @@ async fn d1_the_co_owner_column_has_no_default_and_cannot_widen(pool: PgPool) {
          not make ownership optional"
     );
 
-    // The shape CHECK exists, still NOT VALID (validation is PR-16's 075/076),
-    // and still names both conjuncts.
+    // The shape CHECK exists, is now VALIDATED (PR-16's migration 076), and
+    // still names both conjuncts.
     let (src, validated): (String, bool) = sqlx::query_as(
         "SELECT pg_get_constraintdef(oid), convalidated FROM pg_constraint \
           WHERE conrelid = 'public.edges'::regclass AND conname = 'edges_co_owner_shape'",
@@ -1028,11 +1140,18 @@ async fn d1_the_co_owner_column_has_no_default_and_cannot_widen(pool: PgPool) {
     .await
     .expect("edges_co_owner_shape must exist after migration 072");
 
+    // INVERTED BY PR-16. PR-13 asserted this stayed NOT VALID, with the reason
+    // that `VALIDATE CONSTRAINT` takes a full-table scan migration 072 did not
+    // advertise. That reason named PR-16's 075/076 as where the scan belongs,
+    // and 076 is now that file — so the assertion turns over rather than being
+    // deleted, and the decision (validate LATE, in its own deploy step, never
+    // inside the migration that adds the column) stays pinned by both halves.
     assert!(
-        !validated,
-        "edges_co_owner_shape must stay NOT VALID; VALIDATE CONSTRAINT is \
-         PR-16's 075/076 and takes a full-table lock this migration does not \
-         advertise"
+        validated,
+        "edges_co_owner_shape is still NOT VALID after migration 076. NOT VALID \
+         constraints ARE enforced on new rows, so this is not an open write hole \
+         — what it leaves unchecked is the EXISTING corpus, where a co-owned edge \
+         with a malformed owner/co-owner pair would survive into RLS."
     );
     assert!(
         src.contains("co_owner_group_id IS NULL"),

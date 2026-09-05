@@ -203,7 +203,7 @@ async fn find_by_content_hash_and_agent_returns_some_when_matching() {
     insert_test_agent(&pool, agent_id).await;
 
     let claim = make_claim(&format!("matching {}", Uuid::new_v4()), agent_id);
-    let _ = ClaimRepository::create(&pool, &claim)
+    let _ = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("create");
 
@@ -245,16 +245,18 @@ async fn create_strict_inserts_unconditionally_pre_107() {
     let claim_b = make_claim(&content, agent_id);
 
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let first = ClaimRepository::create_strict(&mut conn, &claim_a)
-        .await
-        .expect("first");
+    let first =
+        ClaimRepository::create_strict(&mut conn, &claim_a, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("first");
     drop(conn);
 
     // Second insert with same (content_hash, agent_id) — pre-107 produces a duplicate
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let second = ClaimRepository::create_strict(&mut conn, &claim_b)
-        .await
-        .expect("second");
+    let second =
+        ClaimRepository::create_strict(&mut conn, &claim_b, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("second");
     drop(conn);
 
     let first_id: Uuid = first.id.into();
@@ -285,13 +287,16 @@ async fn create_strict_returns_duplicate_key_post_107() {
     let claim_b = make_claim(&content, agent_id);
 
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let _ = ClaimRepository::create_strict(&mut conn, &claim_a)
-        .await
-        .expect("first");
+    let _ =
+        ClaimRepository::create_strict(&mut conn, &claim_a, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("first");
     drop(conn);
 
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let result = ClaimRepository::create_strict(&mut conn, &claim_b).await;
+    let result =
+        ClaimRepository::create_strict(&mut conn, &claim_b, epigraph_core::TenancyDecl::Inherited)
+            .await;
     assert!(
         matches!(result, Err(epigraph_db::DbError::DuplicateKey { .. })),
         "expected DuplicateKey, got {:?}",
@@ -315,9 +320,14 @@ async fn create_or_get_inserts_when_no_existing() {
     let claim = make_claim(&format!("cog insert {}", Uuid::new_v4()), agent_id);
     let mut conn = pool.acquire().await.expect("acquire conn");
 
-    let (returned, was_created) = ClaimRepository::create_or_get(&mut conn, &viewer, &claim)
-        .await
-        .expect("create_or_get");
+    let (returned, was_created) = ClaimRepository::create_or_get(
+        &mut conn,
+        &viewer,
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create_or_get");
 
     assert!(was_created, "first call should report was_created=true");
     assert_eq!(returned.content, claim.content);
@@ -334,15 +344,25 @@ async fn create_or_get_returns_existing_when_present() {
 
     let claim = make_claim(&format!("cog existing {}", Uuid::new_v4()), agent_id);
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let (first, first_created) = ClaimRepository::create_or_get(&mut conn, &viewer, &claim)
-        .await
-        .expect("first call");
+    let (first, first_created) = ClaimRepository::create_or_get(
+        &mut conn,
+        &viewer,
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("first call");
     drop(conn);
 
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let (second, second_created) = ClaimRepository::create_or_get(&mut conn, &viewer, &claim)
-        .await
-        .expect("second call");
+    let (second, second_created) = ClaimRepository::create_or_get(
+        &mut conn,
+        &viewer,
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("second call");
 
     assert!(first_created, "first call should be was_created=true");
     assert!(!second_created, "second call should be was_created=false");
@@ -381,15 +401,25 @@ async fn create_or_get_is_idempotent_post_107() {
     let claim = make_claim(&format!("cog post107 {}", Uuid::new_v4()), agent_id);
 
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let (first, first_created) = ClaimRepository::create_or_get(&mut conn, &viewer, &claim)
-        .await
-        .expect("first call");
+    let (first, first_created) = ClaimRepository::create_or_get(
+        &mut conn,
+        &viewer,
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("first call");
     drop(conn);
 
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let (second, second_created) = ClaimRepository::create_or_get(&mut conn, &viewer, &claim)
-        .await
-        .expect("second call");
+    let (second, second_created) = ClaimRepository::create_or_get(
+        &mut conn,
+        &viewer,
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("second call");
 
     assert!(first_created, "first call should be was_created=true");
     assert!(!second_created, "second call should be was_created=false");

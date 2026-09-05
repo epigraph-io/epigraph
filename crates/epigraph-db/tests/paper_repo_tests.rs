@@ -63,7 +63,7 @@ async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
         .await
         .expect("create agent");
     let claim = make_claim(agent_row.id, "test claim", 0.5);
-    let claim_row = ClaimRepository::create(&pool, &claim)
+    let claim_row = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("create claim");
 
@@ -119,7 +119,7 @@ async fn count_claims_by_doi_label_ignores_asserts_edges(pool: PgPool) {
         .await
         .expect("create agent");
     let claim = make_claim(agent_row.id, "orphan-labeled claim", 0.5);
-    let claim_row = ClaimRepository::create(&pool, &claim)
+    let claim_row = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("create claim");
 

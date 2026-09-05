@@ -28,6 +28,19 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      # PR-16 (ops F9). `epigraph-migrate` reads MIGRATION_DATABASE_URL and
+      # falls back to DATABASE_URL with a WARN, so CI would still pass without
+      # this line -- and would then never exercise the variable the deploy path
+      # uses. Set it explicitly so the "Run migrations" step below is a real
+      # test of the new code path rather than of the fallback.
+      #
+      # Same DSN as DATABASE_URL here on purpose: the service container's
+      # POSTGRES_USER is a superuser, so there is only one credential to give.
+      # Splitting the migration role from the application role is a DEPLOYMENT
+      # concern (docs/deploy.md) that a single-container CI service cannot
+      # model, and pretending otherwise with a second identical-privilege role
+      # would assert a separation that is not there.
+      MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
       SQLX_OFFLINE: "true"
       # The claim fixtures in crates/epigraph-db/tests/claim_repo_helpers.rs and
       # crates/epigraph-mcp/tests/common/mod.rs DROP uq_claims_content_hash_agent

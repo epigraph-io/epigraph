@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            -- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.\n            SELECT id, is_current, supersedes, labels, visibility, owner_group_id\n            FROM claims WHERE id = ANY($1) FOR UPDATE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "is_current",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 2,
+        "name": "supersedes",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "labels",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 4,
+        "name": "visibility",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "owner_group_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "6a5b60d5727f402bee041fb5caf462c5ead69a419cce93c46802def0b23d423a"
+}

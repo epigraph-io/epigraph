@@ -504,9 +504,74 @@ pub async fn create_claim(
             message: format!("Failed to begin transaction: {e}"),
         })?;
 
+    // ── Tenancy declaration (PR-16) ──
+    //
+    // THIS SURFACE ALREADY HAS A PRIVACY CHOICE, and the declaration must
+    // follow it. `privacy_tier = "fully_private"` requires `group_id`, and the
+    // block above has already verified — against the AUTHENTICATED identity,
+    // never the request body — that the caller is a live member of that group
+    // and that the group has an active key epoch.
+    //
+    // Declaring `('public', <author's personal group>)` on that path would be a
+    // disclosure, not a cosmetic mismatch: the row would carry
+    // `visibility = 'public'` while a `claim_encryption` row is written for it
+    // a few lines below, so every authenticated agent could read the sealed
+    // claim's labels, properties and existence. And it would be UNFIXABLE
+    // in place — migration 074's `claims_block_widening` refuses to make a
+    // sealed claim public on UPDATE, but it is a BEFORE UPDATE trigger and
+    // cannot see an INSERT that starts out public. The row would have to be
+    // unsealed to be corrected.
+    //
+    // For the public tier the declaration is the AUTHENTICATED PRINCIPAL's own
+    // personal group, publicly visible: what the row carried before migration
+    // 074 dropped the defaults, minus the world ownership §8.2 A4 forbids.
+    //
+    // NOT `claim.agent_id`, and that is a correction made in review. The block
+    // above spells out at length that `claims.agent_id` comes from the request
+    // BODY and is NOT a credential — `decompose_claims` deliberately posts
+    // atoms under the parent claim's author — and that nothing downstream may
+    // treat it as one. Deriving `owner_group_id` from it would have done
+    // exactly that, and `owner_group_id` is the column PR-17's RLS predicate
+    // keys on. Two concrete consequences of the body-derived version:
+    //
+    //   * a caller could place rows into a group it is not a member of, which
+    //     is inert while the rows are `public` and becomes a disclosure the
+    //     moment that group privatizes its corpus and the injected rows ride
+    //     along;
+    //   * `personal_group_of` MINTS a `groups` row and an admin
+    //     `group_memberships` row when none exists, so a third-party agent
+    //     could be provisioned as a side effect of an unrelated claim write.
+    //
+    // `author_agent_id` above is `ctx.agent_id`, already required, already
+    // resolved against `agents`, and already the only identity this handler
+    // trusts for the encrypted-tier membership check a few lines up. It also
+    // cannot mint: PR-02's token mint has provisioned its personal group.
+    //
+    // Authorship and ownership can now disagree on a delegated write. That is
+    // the correct direction of the two: `agent_id` records WHO SAID IT,
+    // `owner_group_id` records WHO IS ACCOUNTABLE FOR THE ROW, and only the
+    // second is a security decision. Closing the authorship half — checking the
+    // caller MAY author as `request.agent_id` — is the write-side gate's, and
+    // is recorded as `D-PR16-claim-authorship-is-not-a-credential`.
+    //
+    // Resolved inside the same transaction as the insert, so a rollback takes
+    // any minted personal group with it.
+    let decl = if privacy_tier == "public" {
+        ClaimRepository::default_decl_for_author(&mut tx, author_agent_id).await?
+    } else {
+        // `validate_privacy_fields` above rejects a non-public tier with no
+        // `group_id`, and the membership check has already run against it.
+        epigraph_core::TenancyDecl::group(request.group_id.ok_or_else(|| {
+            ApiError::ValidationError {
+                field: "group_id".to_string(),
+                reason: "group_id required for encrypted/private claims".to_string(),
+            }
+        })?)
+    };
+
     // Persist claim — branch on if_not_exists per noun-claims-and-verb-edges S1.
     let (created_claim, was_created) = if request.if_not_exists {
-        ClaimRepository::create_or_get(&mut tx, &viewer, &claim).await?
+        ClaimRepository::create_or_get(&mut tx, &viewer, &claim, decl).await?
     } else {
         // The (content_hash, agent_id) UNIQUE constraint that create_strict's
         // 409-on-duplicate contract relied on was dropped (migration 107), so
@@ -534,7 +599,7 @@ pub async fn create_claim(
         {
             return Err(dup_conflict());
         }
-        match ClaimRepository::create_strict(&mut tx, &claim).await {
+        match ClaimRepository::create_strict(&mut tx, &claim, decl).await {
             Ok(c) => (c, true),
             // Belt-and-suspenders: if the UNIQUE constraint is ever restored, or
             // a concurrent writer wins the race between the check above and this

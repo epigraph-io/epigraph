@@ -335,6 +335,114 @@ impl ApiConfig {
     }
 }
 
+/// The tenancy triggers **migration 070** installs, as `(relation, trigger)`.
+///
+/// Transcribed from `migrations/070_tenancy_write_path.sql`: arm (c)'s
+/// 17-element `inheritors` array, plus `claims_require_tenancy` (arm a),
+/// `edges_tenancy` (arm b) and `claims_propagate_tenancy` (arm d).
+///
+/// Required unconditionally by [`AppState::assert_tenancy_triggers_armed`],
+/// because every database from 070 onward has them — including one sitting at
+/// plan §9.2 step (i) with 074 not yet applied.
+#[cfg(feature = "db")]
+const TENANCY_TRIGGERS_070: &[(&str, &str)] = &[
+    ("claims", "claims_require_tenancy"),
+    ("claims", "claims_propagate_tenancy"),
+    ("edges", "edges_tenancy"),
+    ("evidence", "evidence_inherit_tenancy"),
+    ("triples", "triples_inherit_tenancy"),
+    ("entity_mentions", "entity_mentions_inherit_tenancy"),
+    ("claim_versions", "claim_versions_inherit_tenancy"),
+    ("mass_functions", "mass_functions_inherit_tenancy"),
+    ("ds_combined_beliefs", "ds_combined_beliefs_inherit_tenancy"),
+    (
+        "ds_bayesian_divergence",
+        "ds_bayesian_divergence_inherit_tenancy",
+    ),
+    ("claim_frames", "claim_frames_inherit_tenancy"),
+    (
+        "harvester_claim_provenance",
+        "harvester_claim_provenance_inherit_tenancy",
+    ),
+    ("challenges", "challenges_inherit_tenancy"),
+    ("reasoning_traces", "reasoning_traces_inherit_tenancy"),
+    ("experiment_triples", "experiment_triples_inherit_tenancy"),
+    (
+        "experiment_entity_mentions",
+        "experiment_entity_mentions_inherit_tenancy",
+    ),
+    ("claim_clusters", "claim_clusters_inherit_tenancy"),
+    (
+        "claim_cluster_membership",
+        "claim_cluster_membership_inherit_tenancy",
+    ),
+    (
+        "claim_neighborhood_membership",
+        "claim_neighborhood_membership_inherit_tenancy",
+    ),
+    (
+        "claim_signature_revocations",
+        "claim_signature_revocations_inherit_tenancy",
+    ),
+];
+
+/// The tenancy triggers **migration 074** ADDS, as `(relation, trigger)`.
+///
+/// Transcribed from `migrations/074_tenancy_required.sql`: section 2's
+/// 17 derived-table `*_require_tenancy` triggers (the same 17 relations as
+/// 070's `inheritors`, on the BEFORE INSERT side), section 3's 6 roots, and
+/// section 4's `claims_block_widening`.
+///
+/// Required by [`AppState::assert_tenancy_triggers_armed`] **only when
+/// `claims_block_widening` is present**, which is the marker that 074 ran.
+/// See that function's doc for why a flat required set would refuse to boot at
+/// plan §9.2 step (i) and cause the outage it exists to prevent.
+#[cfg(feature = "db")]
+const TENANCY_TRIGGERS_074: &[(&str, &str)] = &[
+    ("claims", "claims_block_widening"),
+    ("evidence", "evidence_require_tenancy"),
+    ("triples", "triples_require_tenancy"),
+    ("entity_mentions", "entity_mentions_require_tenancy"),
+    ("claim_versions", "claim_versions_require_tenancy"),
+    ("mass_functions", "mass_functions_require_tenancy"),
+    ("ds_combined_beliefs", "ds_combined_beliefs_require_tenancy"),
+    (
+        "ds_bayesian_divergence",
+        "ds_bayesian_divergence_require_tenancy",
+    ),
+    ("claim_frames", "claim_frames_require_tenancy"),
+    (
+        "harvester_claim_provenance",
+        "harvester_claim_provenance_require_tenancy",
+    ),
+    ("challenges", "challenges_require_tenancy"),
+    ("reasoning_traces", "reasoning_traces_require_tenancy"),
+    ("experiment_triples", "experiment_triples_require_tenancy"),
+    (
+        "experiment_entity_mentions",
+        "experiment_entity_mentions_require_tenancy",
+    ),
+    ("claim_clusters", "claim_clusters_require_tenancy"),
+    (
+        "claim_cluster_membership",
+        "claim_cluster_membership_require_tenancy",
+    ),
+    (
+        "claim_neighborhood_membership",
+        "claim_neighborhood_membership_require_tenancy",
+    ),
+    (
+        "claim_signature_revocations",
+        "claim_signature_revocations_require_tenancy",
+    ),
+    ("frames", "frames_require_tenancy"),
+    ("contexts", "contexts_require_tenancy"),
+    ("perspectives", "perspectives_require_tenancy"),
+    ("communities", "communities_require_tenancy"),
+    ("harvester_fragments", "harvester_fragments_require_tenancy"),
+    ("recall_events", "recall_events_require_tenancy"),
+];
+
 impl AppState {
     /// Create new application state with the given configuration (no database)
     #[cfg(not(feature = "db"))]
@@ -658,6 +766,232 @@ impl AppState {
         }
         if let Ok(mut cache) = self.entity_type_cache.write() {
             *cache = map;
+        }
+        Ok(())
+    }
+
+    /// PR-16 boot assertion: **the tenancy triggers are armed.**
+    ///
+    /// Plan §8.2 A5, checked at startup rather than only in the test suite.
+    /// `ALTER TABLE … DISABLE TRIGGER` and `SET session_replication_role =
+    /// 'replica'` are the two ways to revert D1's whole write-side enforcement
+    /// with no diff and no migration, and migration 074's own header names them
+    /// as the residual it cannot close. Both need table ownership, which the
+    /// application role does not have — but a database restored from a dump, or
+    /// one an operator "fixed" during an incident, can arrive with a trigger
+    /// disabled and nothing would say so.
+    ///
+    /// **This one refuses to serve.** A disabled require-tenancy trigger is
+    /// indistinguishable at the row level from an absent one: writes succeed
+    /// and land on nothing, because migration 074 also removed the DEFAULT that
+    /// used to catch them. Serving in that state produces rows with a `NOT
+    /// NULL` violation waiting to happen and, worse, a corpus whose tenancy
+    /// nobody declared.
+    ///
+    /// Placed here, not in `with_db`: that constructor is sync and cannot
+    /// `SELECT`. [`Self::load_entity_type_cache`] is the existing precedent for
+    /// a post-connect async boot step, and `bin/server.rs` calls both together.
+    ///
+    /// # The set is checked by NAME, not by count — and it is STAGED
+    ///
+    /// A "non-empty, none disabled" probe passes on a database that is missing
+    /// `claims_require_tenancy` and nothing else, because the other 43 matching
+    /// triggers are still there. That is the case that matters: it is D1's
+    /// primary enforcement, and after 074 there is no `DEFAULT` left behind it.
+    /// So the expected `(relation, trigger)` pairs are enumerated below, the
+    /// same way `visibility_lint.rs::EXPECTED_EXEMPTIONS` and
+    /// `viewer_route_table_lint.rs::FAIL_OPEN_SCOPE_SITES` enumerate theirs.
+    ///
+    /// **It is staged on purpose, and transcribing 074's arrays as one flat
+    /// required set would brick plan §9.2 step (i).** That step deploys these
+    /// binaries with 074 NOT YET APPLIED, to watch PR-12's
+    /// `tenancy_undeclared_writes` counter sit at zero for 24 hours before the
+    /// migration commits. On such a database 074's 23 additional
+    /// `*_require_tenancy` triggers and `claims_block_widening` do not exist,
+    /// and a flat assertion would refuse to boot — turning the control that
+    /// prevents the outage into the outage.
+    ///
+    /// Hence two tiers:
+    ///   * [`TENANCY_TRIGGERS_070`] is required unconditionally. Every database
+    ///     that has applied 070 has it, before and after 074.
+    ///   * [`TENANCY_TRIGGERS_074`] is required only once `claims_block_widening`
+    ///     is present, which is the marker that 074 has run. A half-applied 074
+    ///     (some roots armed, `claims_block_widening` created) is therefore
+    ///     still caught, because that trigger is created in section 4, before
+    ///     section 5 drops the defaults.
+    ///
+    /// A trigger whose *table* does not exist is not required — 070 and 074
+    /// both guard their `CREATE TRIGGER` with `IF EXISTS (… relkind = 'r')`, so
+    /// requiring it would refuse on exactly the databases those guards exist
+    /// for. Missing-table is reported as a warning, not a refusal.
+    ///
+    /// # Errors
+    /// Returns `DbError::InvalidData` if an expected trigger is absent on a
+    /// table that exists, or if any matching trigger is not `tgenabled = 'O'`.
+    #[cfg(feature = "db")]
+    pub async fn assert_tenancy_triggers_armed(&self) -> Result<(), epigraph_db::DbError> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT c.relname, t.tgname, t.tgenabled::text \
+               FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+              WHERE NOT t.tgisinternal \
+                AND (t.tgname LIKE '%\\_require\\_tenancy' \
+                     OR t.tgname LIKE '%\\_inherit\\_tenancy' \
+                     OR t.tgname IN ('edges_tenancy','claims_propagate_tenancy', \
+                                     'claims_block_widening')) \
+              ORDER BY c.relname, t.tgname",
+        )
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        let present: std::collections::HashSet<(&str, &str)> = rows
+            .iter()
+            .map(|(rel, tg, _)| (rel.as_str(), tg.as_str()))
+            .collect();
+
+        // Which of the expected tables actually exist. `relkind = 'r'` matches
+        // the guard 070/074 use, so a VIEW or an absent relation is excluded
+        // here for the same reason no trigger was created on it there.
+        let existing_tables: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname = ANY($1)",
+        )
+        .bind(
+            TENANCY_TRIGGERS_070
+                .iter()
+                .chain(TENANCY_TRIGGERS_074.iter())
+                .map(|(rel, _)| (*rel).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .fetch_all(&self.db_pool)
+        .await?;
+        let existing: std::collections::HashSet<&str> =
+            existing_tables.iter().map(String::as_str).collect();
+
+        // 074 ran iff `claims_block_widening` is installed. It is created in
+        // section 4, ahead of section 5's `DROP DEFAULT`, so this marker cannot
+        // be true on a database that still has the defaults to fall back on.
+        let migration_074_applied = present.contains(&("claims", "claims_block_widening"));
+
+        let mut required: Vec<(&str, &str)> = TENANCY_TRIGGERS_070.to_vec();
+        if migration_074_applied {
+            required.extend_from_slice(TENANCY_TRIGGERS_074);
+        }
+
+        let mut missing: Vec<String> = Vec::new();
+        let mut table_absent: Vec<&str> = Vec::new();
+        for (rel, tg) in required {
+            if !existing.contains(rel) {
+                table_absent.push(rel);
+                continue;
+            }
+            if !present.contains(&(rel, tg)) {
+                missing.push(format!("{rel}.{tg}"));
+            }
+        }
+        if !table_absent.is_empty() {
+            table_absent.sort_unstable();
+            table_absent.dedup();
+            tracing::warn!(
+                tables = ?table_absent,
+                "tenancy-trigger tables absent; their triggers are not required on this database"
+            );
+        }
+        if !missing.is_empty() {
+            return Err(epigraph_db::DbError::InvalidData {
+                reason: format!(
+                    "refusing to serve: {} expected tenancy trigger(s) are MISSING: {}. \
+                     Migration 070 installs the first tier and 074 the second; a database \
+                     without them accepts writes that declare no owner, and after 074 there \
+                     is no DEFAULT left to catch them. Re-run epigraph-migrate, then restart.",
+                    missing.len(),
+                    missing.join(", ")
+                ),
+            });
+        }
+
+        let disabled: Vec<String> = rows
+            .iter()
+            .filter(|(_, _, e)| e != "O")
+            .map(|(rel, tg, e)| format!("{rel}.{tg}={e}"))
+            .collect();
+        if !disabled.is_empty() {
+            return Err(epigraph_db::DbError::InvalidData {
+                reason: format!(
+                    "refusing to serve: {} tenancy trigger(s) are not ENABLED \
+                     (tgenabled <> 'O'): {}. Re-enable them with ALTER TABLE … ENABLE \
+                     TRIGGER as the table owner, then restart.",
+                    disabled.len(),
+                    disabled.join(", ")
+                ),
+            });
+        }
+
+        tracing::info!(
+            triggers = rows.len(),
+            migration_074_applied,
+            "tenancy triggers armed"
+        );
+        Ok(())
+    }
+
+    /// PR-16 boot posture check: **is this process connecting as the
+    /// application role, and can it take the seed escape hatch?**
+    ///
+    /// # Why this WARNS and does not refuse — a correction to the plan
+    ///
+    /// PR-16's *Files* line says the boot assertions gain, alongside
+    /// `tgenabled='O'`, "not-a-member-of-`epigraph_seed`" and
+    /// `current_user = 'epigraph_app'`. Measured on this tree: the connecting
+    /// role is `epigraph`, which is `rolsuper` and therefore satisfies
+    /// `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')` for free, and
+    /// `current_user` is `epigraph`, not `epigraph_app`. Making either a hard
+    /// refusal would stop the API booting in CI and in every development
+    /// environment **today**, before anything has gone wrong — a self-inflicted
+    /// outage in service of a posture nothing yet establishes.
+    ///
+    /// The credential split is plan §9.2's week 11d, and PR-17 owns it by name:
+    /// its *Acceptance* line already reads "the process refuses to serve as a
+    /// superuser or `BYPASSRLS` holder … refuses if `current_user <>
+    /// 'epigraph_app'`". So the two checks are duplicated across PR-16 and
+    /// PR-17's *Files* lines, and PR-17 is where they can be armed, because
+    /// that is the PR that repoints `DATABASE_URL`.
+    ///
+    /// Shipping them as WARNs now is not a no-op: it puts the measurement in
+    /// the boot log of every environment, so week 11d's flip is a change whose
+    /// blast radius is already known rather than discovered on the day.
+    ///
+    /// # Errors
+    /// Returns the underlying `DbError` if the catalog probe itself fails. The
+    /// posture findings are logged, not returned.
+    #[cfg(feature = "db")]
+    pub async fn warn_on_privileged_connection(&self) -> Result<(), epigraph_db::DbError> {
+        let (current_user, is_seed_member, is_super): (String, bool, bool) = sqlx::query_as(
+            "SELECT current_user::text, \
+                    EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_seed') \
+                      AND pg_has_role(session_user, 'epigraph_seed', 'MEMBER'), \
+                    (SELECT rolsuper FROM pg_roles WHERE rolname = session_user)",
+        )
+        .fetch_one(&self.db_pool)
+        .await?;
+
+        if current_user != "epigraph_app" {
+            tracing::warn!(
+                current_user = %current_user,
+                "connecting as a role other than epigraph_app. PR-17 (plan §9.2 week 11d) \
+                 turns this into a refusal; until then it is a posture note."
+            );
+        }
+        if is_seed_member {
+            tracing::warn!(
+                current_user = %current_user,
+                superuser = is_super,
+                "this connection can take migration 074's epigraph_seed escape hatch, so an \
+                 undeclared write is STAMPED ('public', <seed group>) instead of raising \
+                 23502. Audit with: SELECT count(*) FROM claims WHERE owner_group_id = \
+                 '00000000-0000-0000-0000-00000000dead'. \
+                 Arming this as a refusal is D-PR16-seed-membership-refusal-downgraded, \
+                 owned by PR-17."
+            );
         }
         Ok(())
     }

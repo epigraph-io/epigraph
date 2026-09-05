@@ -517,6 +517,12 @@ pub async fn do_ingest_document(
     let mut dedup_count = 0_usize;
     let mut ds_entries: Vec<BatchDsEntry> = Vec::new();
 
+    // Tenancy declaration (PR-16), hoisted above the loop -- see
+    // `persist_planned_claim`'s `decl` parameter for why. `TenancyDecl` is
+    // `Copy`, so passing it per iteration costs nothing.
+    let decl = ClaimRepository::default_decl_for_author_pool(pool, agent_id)
+        .await
+        .map_err(internal_error)?;
     for planned in &plan.claims {
         let confidence = planned.confidence.clamp(0.0, 1.0);
         let methodology = methodology_from_planned(planned);
@@ -542,6 +548,7 @@ pub async fn do_ingest_document(
             planned,
             agent_id,
             TruthValue::clamped(raw_truth),
+            decl,
         )
         .await?;
         // Idempotent add: also runs on the dedup branch below, so an atom
@@ -977,6 +984,15 @@ async fn persist_planned_claim(
     planned: &PlannedClaim,
     agent_id: Uuid,
     truth: TruthValue,
+    // Tenancy declaration (PR-16): the ingesting agent's own personal group,
+    // resolved ONCE by the caller above its loop. It was resolved here per
+    // planned claim until review: an N-claim document then performed N
+    // `pool.acquire()` calls and N identical `SELECT id FROM groups WHERE
+    // did_key = ...` round trips for the same agent.
+    // `epigraph-ingest-executor::execute_workflow_ingest_plan` already hoists
+    // the identical lookup, with a comment saying exactly that; the two
+    // siblings now agree.
+    decl: epigraph_core::TenancyDecl,
 ) -> Result<(Uuid, bool), McpError> {
     if planned.id_is_document_scoped() {
         let was_new = ClaimRepository::create_with_id_if_absent(
@@ -987,6 +1003,7 @@ async fn persist_planned_claim(
             agent_id,
             truth,
             &[],
+            decl,
         )
         .await
         .map_err(internal_error)?;
@@ -1003,7 +1020,7 @@ async fn persist_planned_claim(
     // `persisted_id != planned.id` catches a hash collision against some other
     // claim; `trace_id.is_some()` catches genuine atom convergence, where the
     // earlier ingestion already wrote the provenance we must not overwrite.
-    let persisted = ClaimRepository::create(pool, claim)
+    let persisted = ClaimRepository::create(pool, claim, decl)
         .await
         .map_err(internal_error)?;
     let persisted_id: Uuid = persisted.id.into();
@@ -1199,6 +1216,10 @@ pub async fn do_ingest_document_spine(
     let mut para_dedup_count = 0_usize;
     let mut new_paragraph_paths: Vec<String> = Vec::new();
 
+    // Hoisted, as above.
+    let decl = ClaimRepository::default_decl_for_author_pool(pool, agent_id)
+        .await
+        .map_err(internal_error)?;
     for planned in &plan.claims {
         if planned.level == 3 {
             continue;
@@ -1225,6 +1246,7 @@ pub async fn do_ingest_document_spine(
             planned,
             agent_id,
             TruthValue::clamped(raw_truth),
+            decl,
         )
         .await?;
         ClaimRepository::update_labels(pool, persisted_id, std::slice::from_ref(&paper_label), &[])

@@ -757,19 +757,33 @@ async fn migration_072_applies_twice(pool: PgPool) {
         );
     }
 
-    // Both ship NOT VALID: validation is PR-16's 075/076, and a replay must not
-    // quietly promote them (that would take an ACCESS EXCLUSIVE full scan on a
-    // table with ~1M rows, in a migration advertised as metadata-only).
-    let unvalidated: i64 = sqlx::query_scalar(
+    // INVERTED BY PR-16. This asserted that both constraints were still
+    // NOT VALID, with the reason that promoting them takes a full scan in a
+    // migration advertised as metadata-only. That reason named PR-16's 075/076
+    // as where the scan belongs, and migration 076 is now that file, so the
+    // assertion turns over rather than being deleted — the decision (add the
+    // constraint NOT VALID in 072, validate it LATE in its own deploy step)
+    // stays pinned by both halves.
+    //
+    // Note what is still being tested: this runs inside a REPLAY of migration
+    // 072 (the surrounding `tx` re-applies the file). What must not happen is
+    // 072 itself promoting the constraints. It does not — 076 already validated
+    // them before this test's transaction began, and 072's guards are
+    // catalog-checked so the replay is a no-op on them either way.
+    let validated: i64 = sqlx::query_scalar(
         "SELECT count(*)::bigint FROM pg_constraint \
           WHERE conrelid = 'public.edges'::regclass \
             AND conname IN ('edges_co_owner_fkey', 'edges_co_owner_shape') \
-            AND NOT convalidated",
+            AND convalidated",
     )
     .fetch_one(&mut *tx)
     .await
     .expect("convalidated probe");
-    assert_eq!(unvalidated, 2, "both 072 constraints must stay NOT VALID");
+    assert_eq!(
+        validated, 2,
+        "both 072 constraints must be VALIDATED after migration 076, and must \
+         survive a replay of 072"
+    );
 
     // The column survived, still nullable, still with no DEFAULT (a DEFAULT
     // would be D1's implicit-public in a new place).
