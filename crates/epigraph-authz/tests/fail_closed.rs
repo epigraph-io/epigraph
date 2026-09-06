@@ -21,12 +21,22 @@
 //!
 //! # Why the fixture is local rather than a sixth `viewer_fixture.rs`
 //!
-//! `crates/{api,cli,db,engine,mcp}/tests/viewer_fixture.rs` are five
-//! byte-identical copies. A sixth would be more drift surface for the one
-//! helper this file needs and does not have: **`seed_agent_with_group`
-//! hardcodes `role = 'admin'`**, so it cannot produce the principal this test
-//! exists to examine. [`seed_agent_in_group`] below takes the role as a
-//! parameter, which is the whole difference.
+//! `crates/{api,cli,db,engine,mcp}/tests/viewer_fixture.rs` were five
+//! byte-identical copies. **They are no longer**: PR-26 added
+//! `scoped_pool_with_mode`, `downgraded_pool`, `seed_edge` and
+//! `seed_edge_owned_by` to the **api** and **db** copies only, so the five now
+//! split into two groups — api+db carrying those four helpers, cli+engine+mcp
+//! not. Corrected here rather than left standing, because no test hashes or
+//! compares the copies (grepped), so this prose was the only record of the
+//! invariant and a stale claim would send the next author to a copy that does
+//! not have what they read about. Do not copy an arbitrary one of the five and
+//! expect `downgraded_pool`.
+//!
+//! A sixth would still be more drift surface for the one helper this file needs
+//! and does not have: **`seed_agent_with_group` hardcodes `role = 'admin'`**,
+//! so it cannot produce the principal this test exists to examine.
+//! [`seed_agent_in_group`] below takes the role as a parameter, which is the
+//! whole difference.
 
 use epigraph_authz::{GroupPolicyGate, GRANT_GROUP_WRITER};
 use epigraph_db::visibility::Viewer;

@@ -36,7 +36,7 @@
 //!
 //! `ScopedPoolOptions` exposes `max_connections` / `acquire_timeout` /
 //! `statement_timeout` and no `after_connect`, so the SCOPED arm is still a
-//! superuser session. The three assertions below therefore observe the in-query
+//! superuser session. The assertions below therefore observe the in-query
 //! `$V` predicate on the converted path, exactly as the pilot's do. The policy
 //! half — that a STAMPED connection and an UNSTAMPED one disagree about the
 //! viewer's own rows once the session is filtered — is pinned on the repo
@@ -250,7 +250,7 @@ async fn the_walk_does_not_serve_a_strangers_group_private_ancestor(pool: PgPool
 }
 
 /// THE OTHER WALK. `get_descendants_conn` is a SEPARATE recursive CTE with its
-/// own six markers, and the three assertions above exercise none of it —
+/// own six markers, and the assertions above exercise none of it —
 /// `direction` defaults to `ancestors`.
 ///
 /// The shard converts both, and the register's own rule is that one function
@@ -292,6 +292,77 @@ async fn the_descendant_walk_does_not_serve_a_strangers_group_private_descendant
         "a descendant owned by a group the viewer is not in must be ABSENT. It is \
          reachable over a PUBLIC edge, so the only control excluding it is the \
          visibility predicate on get_descendants' RECURSIVE term; got {ids:?}"
+    );
+}
+
+/// THE `Both` ARM — the only one that runs two walks on one connection, and
+/// the arm the handler's atomicity prose is about.
+///
+/// Every other test here passes `None` (which defaults to `Ancestors`) or
+/// `Descendants`, so before this test the `Both` branch was NEVER EXECUTED:
+/// neither the second `get_ancestor_lineage`/`get_descendant_lineage` pair on
+/// the same handle nor the node/edge merge that follows them. A later shard
+/// re-introducing a second `state.read_as(&viewer)` inside
+/// `get_descendant_lineage` — the single most likely regression, because that
+/// is what the pre-conversion shape looked like — would have falsified the
+/// handler's central claim and left every assertion in this file green.
+///
+/// This does NOT prove single-connection-ness; nothing here can observe the
+/// checkout. It makes the arm executable, so the stronger assertion has
+/// somewhere to hang, and it pins the dedup (nodes by `claim_id`, edges by
+/// `(source_id, target_id)`) that is otherwise unexercised.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_both_arm_merges_one_ancestor_and_one_descendant_without_duplicating_the_root(
+    pool: PgPool,
+) {
+    let (agent, group) = seed_agent_with_group(&pool, "lineage-both").await;
+
+    let root = seed_group_claim(&pool, agent, group, "both root").await;
+    let ancestor = seed_group_claim(&pool, agent, group, "both ancestor").await;
+    let descendant = seed_group_claim(&pool, agent, group, "both descendant").await;
+
+    // Left as the 070 trigger stamps them: all three claims are private to the
+    // SAME group, so both edges inherit it and the viewer can traverse them.
+    seed_edge(&pool, ancestor, root).await;
+    seed_edge(&pool, root, descendant).await;
+
+    let state = split_state(&pool).await;
+    let out = walk_in(&pool, state, agent, root, Some(LineageDirection::Both)).await;
+
+    let ids = node_ids(&out);
+    assert!(
+        ids.contains(&ancestor) && ids.contains(&descendant),
+        "the Both arm must merge the results of BOTH walks — an ancestor from one and \
+         a descendant from the other. A missing side means one walk did not run or its \
+         nodes were dropped by the merge; got {ids:?}"
+    );
+
+    // The root is returned by BOTH walks, so it is the only row the node merge
+    // can duplicate. Counting is the assertion: `contains` would pass on a
+    // merge that appends blindly.
+    assert_eq!(
+        ids.iter().filter(|i| **i == root).count(),
+        1,
+        "the root appears in both walks, so the HashSet dedup on claim_id is what keeps \
+         it single. A duplicate here is a merge regression, not a tenancy one; got {ids:?}"
+    );
+    let edge_keys: Vec<(Uuid, Uuid)> = out
+        .edges
+        .iter()
+        .map(|e| (e.source_id, e.target_id))
+        .collect();
+    let mut unique = edge_keys.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        edge_keys.len(),
+        unique.len(),
+        "the edge merge dedups on (source_id, target_id); got {edge_keys:?}"
+    );
+    assert!(
+        edge_keys.contains(&(ancestor, root)) && edge_keys.contains(&(root, descendant)),
+        "both edges must survive the merge, or the dedup above is passing over an empty \
+         set; got {edge_keys:?}"
     );
 }
 

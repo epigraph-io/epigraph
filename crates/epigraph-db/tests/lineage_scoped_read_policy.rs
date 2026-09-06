@@ -43,6 +43,15 @@
 //! there, while the identical code in `Transaction` mode is atomic. A shard
 //! claiming atomicity has to drive both.
 //!
+//! # And both WALKS
+//!
+//! Factored over [`Walk`] as well as the mode, so `get_lineage_conn` and
+//! `get_descendants_conn` each get the stamped/unstamped differential on each
+//! mode — four arms. The shard converted both functions and the register's rule
+//! is that one being correct does not cover its twin; the descendant walk
+//! otherwise appeared only in `anchor_case`, on a SUPERUSER session where no
+//! policy filters anything, i.e. with no policy-side evidence at all.
+//!
 //! # No `grant_app_privileges`
 //!
 //! Migration 077 issues the app-role grants itself. Re-granting here would paper
@@ -71,6 +80,38 @@ impl Observation {
     }
 }
 
+/// Which converted walk an arm drives.
+///
+/// A parameter and not a closure: the arms take `&mut ScopedRead` / `&mut
+/// PgConnection`, which a shared `Fn(..) -> Fut` cannot thread without an HRTB
+/// fight, and the two primitives differ in arity anyway (`get_descendants_conn`
+/// has no `max_nodes`). `anchor_case` below CAN use a closure because it takes
+/// only `Uuid`s and acquires its own connection inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    Ancestors,
+    Descendants,
+}
+
+impl Walk {
+    async fn run(
+        self,
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
+        root: Uuid,
+    ) -> Result<Vec<Uuid>, epigraph_db::DbError> {
+        let result = match self {
+            Walk::Ancestors => {
+                LineageRepository::get_lineage_conn(conn, viewer, root, Some(10), None).await?
+            }
+            Walk::Descendants => {
+                LineageRepository::get_descendants_conn(conn, viewer, root, Some(10)).await?
+            }
+        };
+        Ok(result.claims.keys().copied().collect())
+    }
+}
+
 /// A group-private root with one group-private ancestor, both owned by a group
 /// `agent` is an `admin` of.
 ///
@@ -94,7 +135,13 @@ async fn seed_graph(pool: &PgPool, label: &str) -> (Uuid, Uuid, Uuid) {
 /// is switched on that same connection — the only idiom that composes with
 /// `AppState::read_as`, which acquires its own connection internally and offers
 /// no seam a `viewer_fixture::as_role` closure could be routed through.
-async fn stamped(pool: &PgPool, mode: SessionGucMode, agent: Uuid, root: Uuid) -> Observation {
+async fn stamped(
+    pool: &PgPool,
+    mode: SessionGucMode,
+    walk: Walk,
+    agent: Uuid,
+    root: Uuid,
+) -> Observation {
     let scoped = scoped_pool_with_mode(pool, mode).await;
     let viewer = Viewer::resolve(pool, agent).await.expect("resolve");
 
@@ -114,7 +161,8 @@ async fn stamped(pool: &PgPool, mode: SessionGucMode, agent: Uuid, root: Uuid) -
         .await
         .expect("epigraph_bypass()");
 
-    let result = LineageRepository::get_lineage_conn(&mut r, &viewer, root, Some(10), None)
+    let ids = walk
+        .run(&mut r, &viewer, root)
         .await
         .expect("the stamped walk must SERVE — a failure here is the outage, not the fix");
 
@@ -125,15 +173,12 @@ async fn stamped(pool: &PgPool, mode: SessionGucMode, agent: Uuid, root: Uuid) -
     // roll back silently on drop.
     r.commit().await.expect("commit");
 
-    Observation {
-        ids: result.claims.keys().copied().collect(),
-        bypass,
-    }
+    Observation { ids, bypass }
 }
 
 /// The same walk, the same viewer, the same primitive — on a connection nothing
 /// stamped. This is the pre-conversion request path.
-async fn unstamped(pool: &PgPool, agent: Uuid, root: Uuid) -> Observation {
+async fn unstamped(pool: &PgPool, walk: Walk, agent: Uuid, root: Uuid) -> Observation {
     let viewer = Viewer::resolve(pool, agent).await.expect("resolve");
     let mut conn = pool.acquire().await.expect("acquire");
     conn.execute("SET SESSION AUTHORIZATION epigraph_app")
@@ -145,12 +190,10 @@ async fn unstamped(pool: &PgPool, agent: Uuid, root: Uuid) -> Observation {
         .await
         .expect("epigraph_bypass()");
 
-    let result = LineageRepository::get_lineage_conn(&mut conn, &viewer, root, Some(10), None)
-        .await
-        .expect(
-            "the unstamped walk must not ERROR — it must return FEWER rows, which is \
-                 precisely why the defect is invisible",
-        );
+    let ids = walk.run(&mut conn, &viewer, root).await.expect(
+        "the unstamped walk must not ERROR — it must return FEWER rows, which is \
+             precisely why the defect is invisible",
+    );
 
     // Mandatory: this pool has no `after_release` scrub, so a connection left as
     // `epigraph_app` would fail an unrelated later test somewhere else entirely.
@@ -158,35 +201,46 @@ async fn unstamped(pool: &PgPool, agent: Uuid, root: Uuid) -> Observation {
         .await
         .expect("reset");
 
-    Observation {
-        ids: result.claims.keys().copied().collect(),
-        bypass,
-    }
+    Observation { ids, bypass }
 }
 
-async fn coherence_case(pool: PgPool, mode: SessionGucMode) {
-    let (agent, root, ancestor) = seed_graph(&pool, &format!("policy-half-{mode:?}")).await;
+/// The differential, over one walk.
+///
+/// `walk_root` is where the walk starts and `expected` is what it must return:
+/// the ancestor walk runs from the root and reaches the ancestor, the
+/// descendant walk runs from the ancestor and reaches the root, over the SAME
+/// seeded edge.
+async fn coherence_case_for(pool: PgPool, mode: SessionGucMode, walk: Walk) {
+    let (agent, root, ancestor) =
+        seed_graph(&pool, &format!("policy-half-{mode:?}-{walk:?}")).await;
 
-    let stamped = stamped(&pool, mode, agent, root).await;
-    let unstamped = unstamped(&pool, agent, root).await;
+    let (walk_root, expected) = match walk {
+        Walk::Ancestors => (root, [root, ancestor]),
+        Walk::Descendants => (ancestor, [ancestor, root]),
+    };
+
+    let stamped = stamped(&pool, mode, walk, agent, walk_root).await;
+    let unstamped = unstamped(&pool, walk, agent, walk_root).await;
+    let (seed, reached) = (expected[0], expected[1]);
+    let arm = format!("{mode:?}/{walk:?}");
 
     assert!(
         !stamped.bypass,
-        "CALIBRATION ({mode:?}): the stamped session must NOT hold bypass, or the \
+        "CALIBRATION ({arm}): the stamped session must NOT hold bypass, or the \
          policies filter nothing and this test passes vacuously"
     );
     assert!(
         !unstamped.bypass,
-        "CALIBRATION ({mode:?}): the unstamped session must NOT hold bypass either — \
+        "CALIBRATION ({arm}): the unstamped session must NOT hold bypass either — \
          if it did, the differential below would be an artifact of the role switch \
          rather than of the stamp"
     );
 
     assert!(
-        stamped.has(root) && stamped.has(ancestor),
-        "COHERENCE ({mode:?}): the group whose id the walk binds as $V is in the GUC \
-         read_as stamped, so 077's policies must admit that group's private root AND \
-         the ancestor the recursive term reaches through its own private edge. \
+        stamped.has(seed) && stamped.has(reached),
+        "COHERENCE ({arm}): the group whose id the walk binds as $V is in the GUC \
+         read_as stamped, so 077's policies must admit that group's private seed row \
+         AND the row the recursive term reaches through its own private edge. \
          Missing rows here are the fail-closed drift that is indistinguishable from \
          data loss. got {:?}",
         stamped.ids
@@ -194,7 +248,7 @@ async fn coherence_case(pool: PgPool, mode: SessionGucMode) {
 
     assert!(
         unstamped.ids.is_empty(),
-        "THE DIFFERENTIAL ({mode:?}): the identical call on an UNSTAMPED connection \
+        "THE DIFFERENTIAL ({arm}): the identical call on an UNSTAMPED connection \
          must return nothing — the $V predicate admits the rows and the policy, seeing \
          no epigraph.group_ids, does not. If this is non-empty the fixture is not \
          filtering and the assertion above proves nothing about the conversion. got {:?}",
@@ -206,7 +260,33 @@ async fn coherence_case(pool: PgPool, mode: SessionGucMode) {
 async fn the_stamped_walk_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_session_mode(
     pool: PgPool,
 ) {
-    coherence_case(pool, SessionGucMode::Session).await;
+    coherence_case_for(pool, SessionGucMode::Session, Walk::Ancestors).await;
+}
+
+/// The SAME differential on the converted TWIN.
+///
+/// `get_descendants_conn` is a separate recursive CTE, and before PR-26's
+/// review it appeared on a filtered session nowhere: the two mode arms drove
+/// only `get_lineage_conn`, and `anchor_case` drives the descendant walk on a
+/// SUPERUSER session where — by this file's own admission — no policy filters
+/// anything and only the `$V` predicate is observable. So the descendant walk
+/// had no evidence at all for the property the conversion exists to deliver.
+/// The register's rule is that one function being correct does not cover its
+/// twin.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_descendant_walk_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_session_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Session, Walk::Descendants).await;
+}
+
+/// The descendant twin on the transaction arm, for the reason given on
+/// [`the_stamped_walk_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode`].
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_descendant_walk_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Transaction, Walk::Descendants).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -312,5 +392,5 @@ async fn the_descendant_walks_anchor_term_suppresses_a_root_the_viewer_cannot_se
 async fn the_stamped_walk_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode(
     pool: PgPool,
 ) {
-    coherence_case(pool, SessionGucMode::Transaction).await;
+    coherence_case_for(pool, SessionGucMode::Transaction, Walk::Ancestors).await;
 }

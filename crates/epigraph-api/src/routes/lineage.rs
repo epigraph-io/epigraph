@@ -191,14 +191,31 @@ pub struct TraceNode {
 /// `EPIGRAPH_SESSION_GUC_MODE=transaction`, the pooler fallback `bin/server.rs`
 /// advertises to operators.
 ///
-/// **Footprint, stated rather than left for a reviewer to find.** The handle is
-/// now held across `1 + 5 + N` statements — the existence probe, the walk's five
-/// statements, and one `get_by_id_conn` per returned claim — and this handler
-/// passes `max_nodes: None`, so `N` is bounded only by `max_depth`. That is one
-/// connection where there were `1 + 5 + N` unstamped checkouts, against a pool
-/// whose `ScopedPoolOptions::default()` is 10 connections, so it is strictly
-/// fewer; but it is a long-lived checkout and a `direction=both` request holds
-/// it across two walks.
+/// # Footprint — a recorded trade-off, not a free win
+///
+/// The handle is held across `1 + 5 + N` statements: the existence probe, the
+/// walk's five statements, and one `get_by_id_conn` per returned claim. `N` is
+/// the size of the visible walk result, and this handler passes
+/// `max_nodes: None`, so `max_depth`'s `.min(MAX_LINEAGE_DEPTH)` clamp bounds
+/// the walk's DEPTH and nothing bounds its BRANCHING — `N` is not capped.
+///
+/// The total number of checkouts went DOWN (`1 + 5 + N` transient ones became
+/// one), but the duration of a single checkout went UP, and that is the axis
+/// that matters for a shared pool. `bin/server.rs` builds the request pool at
+/// `max_connections: 8` (the second, 2-connection pool is maintenance), and it
+/// serves every route, so concurrent deep-lineage requests can hold handles
+/// that unrelated handlers then wait for at `acquire_timeout`. Under
+/// `SessionGucMode::Transaction` the hold is an OPEN READ TRANSACTION for all
+/// `N` round trips — idle-in-transaction, which also pins the vacuum horizon.
+/// `direction=both` doubles the walk on the same handle.
+///
+/// Deliberately NOT mitigated in this shard, and the reasons are recorded in
+/// `docs/tenancy/progress.json` as `F-PR26-lineage-holds-one-connection-for-n-round-trips`:
+/// passing a node cap here would truncate the response while `truncated` is
+/// computed from depth alone, i.e. it would under-serve SILENTLY, which is the
+/// same fail-quiet class this series exists to remove. The real repair is to
+/// collapse the per-node `get_by_id_conn` loop into one batched viewer-scoped
+/// fetch, which is new repo surface and its own evidence.
 pub async fn get_lineage(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
@@ -231,8 +248,16 @@ pub async fn get_lineage(
         }
     })?;
 
-    // First, check if the claim exists (for 404)
-    let _root_claim =
+    // First, check if the claim exists (for 404).
+    //
+    // THIS IS THE ROOT'S ONLY DISCLOSURE DECISION, and the row is kept rather
+    // than dropped on the floor. Both helpers serve the root's CONTENT when the
+    // walk comes back empty; before PR-26's review they each re-fetched it with
+    // a second `get_by_id_conn`, so the same viewer's access to the same row was
+    // decided twice by two separately-written call sites. Two predicate
+    // evaluations where one will do is a divergence surface, and the direction
+    // it fails in is disclosure. Fetched once, here, and threaded down.
+    let root_claim =
         ClaimRepository::get_by_id_conn(&mut read, &viewer, ClaimId::from_uuid(claim_id))
             .await?
             .ok_or_else(|| ApiError::NotFound {
@@ -246,6 +271,7 @@ pub async fn get_lineage(
             get_ancestor_lineage(
                 &mut read,
                 &viewer,
+                &root_claim,
                 claim_id,
                 max_depth,
                 include_evidence,
@@ -257,6 +283,7 @@ pub async fn get_lineage(
             get_descendant_lineage(
                 &mut read,
                 &viewer,
+                &root_claim,
                 claim_id,
                 max_depth,
                 include_evidence,
@@ -271,6 +298,7 @@ pub async fn get_lineage(
             let (ancestor_nodes, ancestor_edges, ancestor_depth) = get_ancestor_lineage(
                 &mut read,
                 &viewer,
+                &root_claim,
                 claim_id,
                 max_depth,
                 include_evidence,
@@ -280,6 +308,7 @@ pub async fn get_lineage(
             let (descendant_nodes, descendant_edges, descendant_depth) = get_descendant_lineage(
                 &mut read,
                 &viewer,
+                &root_claim,
                 claim_id,
                 max_depth,
                 include_evidence,
@@ -324,8 +353,21 @@ pub async fn get_lineage(
     // but `ScopedRead` has no `Drop` impl and finishing explicitly is what
     // returns the connection without a wasted round trip under
     // `SessionGucMode::Transaction`.
-    read.commit().await.map_err(|e| ApiError::InternalError {
-        message: format!("Failed to finish the scoped read: {e}"),
+    // Same shape as the acquire arm above, and for the same reason: the reason
+    // goes to the operator's log, the client gets an opaque message. A
+    // `format!`-ed `DbError` here would render its `#[source]` driver text into
+    // the response body, since `errors.rs` serialises
+    // `ApiError::InternalError { message }` verbatim.
+    read.commit().await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_lineage",
+            "could not finish a viewer-stamped read"
+        );
+        ApiError::InternalError {
+            message: "Failed to finish the scoped read".to_string(),
+        }
     })?;
 
     // Determine if truncated (there might be more nodes beyond max_depth)
@@ -348,9 +390,16 @@ pub async fn get_lineage(
 /// Takes the caller's viewer-stamped connection rather than the `AppState`: the
 /// acquire belongs to [`get_lineage`], which calls this and
 /// [`get_descendant_lineage`] on the SAME handle.
+///
+/// `root` is the row [`get_lineage`]'s existence probe already fetched under
+/// this viewer on this connection. It is passed in rather than re-fetched
+/// because the empty-walk branch below serves the root's CONTENT: re-fetching
+/// would put a SECOND, independently-written predicate evaluation in front of
+/// the same disclosure, and the two could only ever agree by coincidence.
 async fn get_ancestor_lineage(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
+    root: &epigraph_core::Claim,
     claim_id: Uuid,
     max_depth: i32,
     include_evidence: bool,
@@ -361,24 +410,22 @@ async fn get_ancestor_lineage(
         LineageRepository::get_lineage_conn(&mut *conn, viewer, claim_id, Some(max_depth), None)
             .await?;
 
-    // If no claims found (empty result), return just the root claim
+    // If no claims found (empty result), return just the root claim.
+    //
+    // The row comes from the caller's existence probe, NOT from a second
+    // `get_by_id_conn` here. This branch serves the root's content, so a
+    // re-fetch would mean two independently-written visibility predicates
+    // voting on one disclosure; they happen to be the same predicate today, but
+    // that is a property of two hand-written queries rather than a control, and
+    // `get_by_id_conn` has drifted from its sibling before.
     if lineage_result.claims.is_empty() {
-        // Get the root claim info
-        let claim =
-            ClaimRepository::get_by_id_conn(&mut *conn, viewer, ClaimId::from_uuid(claim_id))
-                .await?
-                .ok_or_else(|| ApiError::NotFound {
-                    entity: "Claim".to_string(),
-                    id: claim_id.to_string(),
-                })?;
-
         let node = LineageNode {
             claim_id,
-            content: claim.content,
-            truth_value: claim.truth_value.value(),
+            content: root.content.clone(),
+            truth_value: root.truth_value.value(),
             depth: 0,
-            agent_id: claim.agent_id.into(),
-            created_at: claim.created_at,
+            agent_id: root.agent_id.into(),
+            created_at: root.created_at,
             evidence: vec![],
             trace: None,
         };
@@ -472,9 +519,13 @@ async fn get_ancestor_lineage(
 ///
 /// Delegates to LineageRepository::get_descendants for the recursive CTE query,
 /// then transforms the result to the API response format.
+///
+/// Same connection and same `root` row as [`get_ancestor_lineage`], and for the
+/// same reasons: one acquire per request, one disclosure decision on the root.
 async fn get_descendant_lineage(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
+    root: &epigraph_core::Claim,
     claim_id: Uuid,
     max_depth: i32,
     include_evidence: bool,
@@ -485,24 +536,22 @@ async fn get_descendant_lineage(
         LineageRepository::get_descendants_conn(&mut *conn, viewer, claim_id, Some(max_depth))
             .await?;
 
-    // If no claims found (empty result), return just the root claim
+    // If no claims found (empty result), return just the root claim.
+    //
+    // The row comes from the caller's existence probe, NOT from a second
+    // `get_by_id_conn` here. This branch serves the root's content, so a
+    // re-fetch would mean two independently-written visibility predicates
+    // voting on one disclosure; they happen to be the same predicate today, but
+    // that is a property of two hand-written queries rather than a control, and
+    // `get_by_id_conn` has drifted from its sibling before.
     if lineage_result.claims.is_empty() {
-        // Get the root claim info
-        let claim =
-            ClaimRepository::get_by_id_conn(&mut *conn, viewer, ClaimId::from_uuid(claim_id))
-                .await?
-                .ok_or_else(|| ApiError::NotFound {
-                    entity: "Claim".to_string(),
-                    id: claim_id.to_string(),
-                })?;
-
         let node = LineageNode {
             claim_id,
-            content: claim.content,
-            truth_value: claim.truth_value.value(),
+            content: root.content.clone(),
+            truth_value: root.truth_value.value(),
             depth: 0,
-            agent_id: claim.agent_id.into(),
-            created_at: claim.created_at,
+            agent_id: root.agent_id.into(),
+            created_at: root.created_at,
             evidence: vec![],
             trace: None,
         };

@@ -226,8 +226,22 @@ pub async fn classify_conflict(
     // Read-only, so an un-committed transaction arm would merely roll back —
     // but finishing explicitly returns the connection without a wasted round
     // trip under `SessionGucMode::Transaction`.
-    conn.commit().await.map_err(|e| ApiError::InternalError {
-        message: format!("Failed to finish the scoped read: {e}"),
+    // The commit arm gets the SAME shape as the acquire arm above. It used to
+    // `format!` the `DbError` into the response body — the one thing the
+    // comment 30 lines up tells every converted site not to do — and emitted no
+    // log line at all, so an operator got nothing and the client got the driver
+    // text. Corrected in PR-26 alongside the copy in `routes/lineage.rs`,
+    // because two copies of a template that disagree is itself the finding.
+    conn.commit().await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "classify_conflict",
+            "could not finish a viewer-stamped read"
+        );
+        ApiError::InternalError {
+            message: "Failed to finish the scoped read".to_string(),
+        }
     })?;
 
     // Basic classification based on truth values and content

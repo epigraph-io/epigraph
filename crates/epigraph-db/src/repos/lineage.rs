@@ -250,12 +250,24 @@ impl LineageRepository {
     /// `epigraph-db/tests/lineage_tests.rs` call it unchanged — which is what
     /// makes those tests a regression check on the inversion.
     ///
+    /// That MCP caller is an UNCONVERTED caller-facing lineage read, and
+    /// documenting it here as a reason to keep the API is not the same as
+    /// registering it. `no_unscoped_pool.rs`'s scan root is
+    /// `crates/epigraph-api/src`, so no counter can reach `epigraph-mcp` at all;
+    /// it is named with an owner in `docs/tenancy/progress.json`'s `prs.next`,
+    /// alongside `epigraph-mcp/src/tools/events.rs`, which is the only control
+    /// available for a site outside the scan root.
+    ///
     /// Note what the wrapper does and does not buy: it acquires ONE connection
     /// for all five statements, so they can no longer interleave with another
     /// request's writes across five separate checkouts. It does not open a
     /// transaction. A caller that needs the transaction arm reaches
     /// [`Self::get_lineage_conn`] through `ScopedPool::read_as`.
-    #[instrument(skip(pool, viewer))]
+    ///
+    /// No `#[instrument]`: the primitive it delegates to carries one with the
+    /// same fields, and a span here would double every pool-path call's span
+    /// volume for nothing. The ~50 shards that copy this template should not
+    /// each add a second identical span.
     pub async fn get_lineage(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,
@@ -263,7 +275,14 @@ impl LineageRepository {
         max_depth: Option<i32>,
         max_nodes: Option<usize>,
     ) -> Result<LineageResult, DbError> {
-        let mut conn = pool.acquire().await?;
+        // `ConnectionFailed`, not the `From<sqlx::Error>` catch-all, which sends
+        // `PoolTimedOut` to `QueryFailed` and mislabels pool exhaustion as a
+        // failing query in the operator's log. Matches
+        // `ScopedPool::unscoped_for_maintenance` and every acquire in `pool.rs`.
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|source| DbError::ConnectionFailed { source })?;
         Self::get_lineage_conn(&mut conn, viewer, claim_id, max_depth, max_nodes).await
     }
 
@@ -791,14 +810,20 @@ impl LineageRepository {
     /// kept anyway: `epigraph-db/tests/lineage_tests.rs` calls it unedited, and
     /// symmetry between the two walks is what stops a later author from
     /// "restoring" one of them by duplicating the body.
-    #[instrument(skip(pool, viewer))]
+    ///
+    /// No `#[instrument]`, for the reason given on [`Self::get_lineage`].
     pub async fn get_descendants(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
     ) -> Result<LineageResult, DbError> {
-        let mut conn = pool.acquire().await?;
+        // `ConnectionFailed`, not the `From<sqlx::Error>` catch-all — see
+        // [`Self::get_lineage`].
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|source| DbError::ConnectionFailed { source })?;
         Self::get_descendants_conn(&mut conn, viewer, claim_id, max_depth).await
     }
 
