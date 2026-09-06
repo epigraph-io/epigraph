@@ -201,7 +201,8 @@
 //! * **No route moved between the `public` and `protected` chains.** The four
 //!   webhook routes were already on `protected` in both `create_router`
 //!   variants and still are; `public_router_allowlist.rs` is untouched.
-//! * **No RLS policy.** None exists yet (PR-17 owns 077/079).
+//! * **No RLS policy.** None existed at PR-10 (PR-17 owns 077/079; see the
+//!   PR-17 status block below, which is where that stopped being true).
 //! * **No write-side tenancy predicate.** `register_webhook` now writes a row,
 //!   which is disclosed on the handler itself, but it spends no
 //!   `writable_bind()` and adds no `WITH CHECK` and no policy. (PR-16
@@ -300,6 +301,40 @@
 //! in particular also boots the app and proves every protected route really 401s,
 //! and documents why axum 0.7.9 makes a runtime walk of "both variants"
 //! impossible. What is here is the cheaper, structural half.
+
+//! ## Status at PR-17
+//!
+//! **PR-17 changes an RLS policy, so this file grows.** It is the first PR in
+//! the series that does — until 077 there was no policy in `pg_policy` at all.
+//!
+//! * **D4 gains a subject.** `migrations/077_rls_policies.sql` installs the
+//!   policy set and `079_rls_force.sql` FORCEs it over
+//!   [`FORCE_PROTECTED_SET`]. The per-command coverage table D4 asks for lives
+//!   in `crates/epigraph-db/tests/rls_enforcement.rs`, enumerated from
+//!   `pg_policy.polcmd` and never from the migration text, with an exact
+//!   `DELIBERATELY_UNCOVERED` register.
+//! * **The locked array is 062's `tier_a` (25) ∪ the ten group/identity/
+//!   encryption control tables**, asserted by
+//!   [`d4_the_force_array_is_tier_a_plus_the_control_tables`]. The plan says
+//!   this array equals "the generated protected set ∪ the group/encryption/
+//!   admin tables"; **that formulation is not literally satisfiable** — the
+//!   generated set (`tenancy_coverage.rs::protected_set`) contains two VIEWs and
+//!   nine `tenancy_exempt` relations and OMITS the five non-claim-keyed roots
+//!   (`frames`, `contexts`, `perspectives`, `communities`, `recall_events`).
+//!   062's array is the honest referent and is what 079 transcribes.
+//! * **`security_invoker` on the two view exemptions.** 077 sets it on
+//!   `alternative_set` and `alt_set_decisions` and rewrites their
+//!   `tenancy_exempt` residuals; `tenancy_coverage.rs::
+//!   the_two_view_exemptions_are_security_invoker` is the inverted assertion.
+//! * **No route moved between the `public` and `protected` chains**, and no
+//!   tenancy column changed. `public_router_allowlist.rs` is untouched.
+//! * **A write-side predicate now exists at the database layer**, which is a
+//!   correction to the PR-10 note above: every `FOR ALL` policy 077 installs
+//!   carries an explicit `WITH CHECK`. The RUST write gate is still absent —
+//!   PR-16 landed as 16a only and the call-site gate is unnumbered 16b — so
+//!   `Viewer::writable_bind` remains unspent in the repo layer. What changed is
+//!   that the database no longer accepts a write into a group the session
+//!   cannot write to, whatever the Rust does.
 
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -1167,5 +1202,178 @@ async fn d1_the_co_owner_column_has_no_default_and_cannot_widen(pool: PgPool) {
         src.contains("co_owner_group_id <> owner_group_id"),
         "co_owner = owner is not co-ownership; permitting it would make the \
          read fragment test one group's membership twice: {src}"
+    );
+}
+
+// ===========================================================================
+// D4 — the FORCE array (PR-17)
+// ===========================================================================
+
+/// Migration 079's protected set, transcribed.
+///
+/// A test that read the array back out of the catalog would agree with the
+/// migration by construction, including when the migration is wrong. This is
+/// the third independent copy — the other two are `079_rls_force.sql` itself
+/// and `epigraph_api::state::FORCE_PROTECTED_SET` — and the assertion below
+/// pins all of them to 062's `tier_a` plus a named ten.
+const FORCE_PROTECTED_SET: &[&str] = &[
+    "claims",
+    "evidence",
+    "edges",
+    "triples",
+    "entity_mentions",
+    "claim_versions",
+    "mass_functions",
+    "ds_combined_beliefs",
+    "ds_bayesian_divergence",
+    "claim_frames",
+    "harvester_claim_provenance",
+    "challenges",
+    "reasoning_traces",
+    "experiment_triples",
+    "experiment_entity_mentions",
+    "claim_clusters",
+    "claim_cluster_membership",
+    "claim_neighborhood_membership",
+    "claim_signature_revocations",
+    "harvester_fragments",
+    "frames",
+    "contexts",
+    "perspectives",
+    "communities",
+    "recall_events",
+    "groups",
+    "group_memberships",
+    "group_key_epochs",
+    "agents",
+    "jobs",
+    "security_events",
+    "claim_encryption",
+    "claim_version_encryption",
+    "evidence_encryption",
+    "edge_encryption",
+];
+
+/// The ten non-`tier_a` members, named so the arithmetic below is checkable.
+const CONTROL_TABLES: &[&str] = &[
+    "groups",
+    "group_memberships",
+    "group_key_epochs",
+    "agents",
+    "jobs",
+    "security_events",
+    "claim_encryption",
+    "claim_version_encryption",
+    "evidence_encryption",
+    "edge_encryption",
+];
+
+/// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
+/// tables, and it is exactly what the catalog reports.
+///
+/// A table added to 062's generators and not to 079 fails here, which is the
+/// property the plan asks `locked_decisions.rs` to hold.
+///
+/// `tier_a` is recovered from the CATALOG — the relations carrying both tenancy
+/// columns — rather than by parsing 062, because that is the same set 062's loop
+/// produces and it cannot drift from what the database actually has.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
+    let tier_a: BTreeSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'public' AND c.relkind IN ('r','p') \
+            AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid \
+                          AND a.attname = 'visibility' AND NOT a.attisdropped) \
+            AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid \
+                          AND a.attname = 'owner_group_id' AND NOT a.attisdropped)",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("tier_a probe")
+    .into_iter()
+    .collect();
+    assert_eq!(
+        tier_a.len(),
+        25,
+        "migration 062's tier_a is 25 relations; got {}: {tier_a:?}",
+        tier_a.len()
+    );
+
+    let expected: BTreeSet<String> = tier_a
+        .iter()
+        .cloned()
+        .chain(CONTROL_TABLES.iter().map(|s| (*s).to_string()))
+        .collect();
+    let declared: BTreeSet<String> = FORCE_PROTECTED_SET
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(
+        declared, expected,
+        "migration 079's array must be 062's tier_a union the ten control tables. If a table \
+         was ADDED to the generators, add it to 079_rls_force.sql, docs/runbooks/079-undo.sql, \
+         epigraph_api::state::FORCE_PROTECTED_SET, rls_enforcement.rs::PROTECTED and this \
+         constant — all five, in the same commit."
+    );
+
+    let forced: BTreeSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'public' AND c.relkind IN ('r','p') AND c.relforcerowsecurity \
+            AND c.relname <> 'rls_canary'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("forced probe")
+    .into_iter()
+    .collect();
+    assert_eq!(
+        forced, declared,
+        "the catalog and migration 079's array disagree. `rls_canary` is excluded on purpose: \
+         078 FORCEs it at creation and 079's array omits it."
+    );
+}
+
+/// The kill switch and the migration loop the SAME array.
+///
+/// `AppState::assert_rls_posture` refuses to boot on a PARTIALLY FORCEd set, so
+/// a `079-undo.sql` that missed a table would leave the cluster un-bootable —
+/// turning the documented sub-minute rollback into an outage. This is a source
+/// lint because the undo script is a runbook, never executed by the suite.
+#[test]
+fn d4_the_kill_switch_covers_the_same_relations_as_the_flip() {
+    let raw = read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/runbooks/079-undo.sql"
+    ));
+    // Strip `--` comments before matching. The file's VERIFY section quotes the
+    // relation names inside comments, including `rls_canary`, and a scanner
+    // that read prose would find whatever the prose happened to mention.
+    let undo: String = raw
+        .lines()
+        .map(|l| match l.find("--") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        undo.contains("NO FORCE ROW LEVEL SECURITY"),
+        "079-undo.sql must pull the documented kill switch"
+    );
+    let missing: Vec<&str> = FORCE_PROTECTED_SET
+        .iter()
+        .copied()
+        .filter(|t| !undo.contains(&format!("'{t}'")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "docs/runbooks/079-undo.sql does not name these FORCEd relations: {missing:?}. A \
+         partial undo leaves a strict subset FORCEd, which is the state the boot assertion \
+         refuses on — the rollback would not come back up."
+    );
+    assert!(
+        !undo.contains("'rls_canary'"),
+        "079-undo.sql must NOT un-FORCE rls_canary: the canary would become visible to the \
+         owner and the boot probe would report a false alarm during the rollback itself"
     );
 }

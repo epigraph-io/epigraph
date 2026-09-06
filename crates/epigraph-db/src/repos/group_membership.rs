@@ -310,6 +310,39 @@ impl GroupMembershipRepository {
     /// whose cost is proportional to the array length and nothing downstream
     /// should have to trust an index it cannot see.
     ///
+    /// # Why this goes through `epigraph_live_memberships()` and not the table
+    ///
+    /// PR-17. This is the ONE statement in the system that provably runs with
+    /// no tenancy GUC set, and it reads the table those GUCs are derived from.
+    /// `Viewer::resolve` cannot use `ScopedPool::acquire_as` to stamp the
+    /// connection first, because `acquire_as` takes the very `Viewer` this call
+    /// is constructing — the dependency is circular by nature, not by oversight.
+    ///
+    /// Migration 077's `group_memberships_tenancy` keys its non-bypass arms on
+    /// `epigraph_session_groups()` and `epigraph_principal_id()`, both of which
+    /// are empty on an unstamped connection. Read directly, this query would
+    /// therefore return ZERO rows for every principal once the app connects as a
+    /// non-owner role; every viewer would resolve to `group_ids = []`; and the
+    /// whole corpus would silently narrow to `visibility = 'public'` for its own
+    /// owners. That is the sec-F1 defect, one layer ABOVE where the plan looks
+    /// for it — it defeats RLS from above rather than from below, and it is
+    /// fail-closed and invisible, indistinguishable from data loss.
+    ///
+    /// MEASURED on the throwaway at head 079, as `epigraph_app` with no GUCs:
+    /// the direct read returns 0 rows and this call returns 1.
+    ///
+    /// `epigraph_live_memberships(uuid)` is `SECURITY DEFINER`, owned by
+    /// `epigraph_maintenance`, `REVOKE`d from `PUBLIC` and granted only to
+    /// `epigraph_app`. Inside its frame `current_user` is the owner, so
+    /// `epigraph_definer_bypass()` is true and the policy's definer disjunct
+    /// admits the scan. Its exposure is identical to this function's own: it was
+    /// already callable with an arbitrary `agent_id` and already returned
+    /// exactly `(group_id, role)`.
+    ///
+    /// The index note above still holds — the function body carries the same
+    /// predicate and projection, so `idx_group_memberships_agent_live` serves it
+    /// index-only exactly as before.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
@@ -317,16 +350,11 @@ impl GroupMembershipRepository {
         pool: &PgPool,
         agent_id: Uuid,
     ) -> Result<Vec<(Uuid, String)>, DbError> {
-        let rows: Vec<(Uuid, String)> = sqlx::query_as(
-            r#"
-            SELECT group_id, role
-            FROM group_memberships
-            WHERE agent_id = $1 AND revoked_at IS NULL
-            "#,
-        )
-        .bind(agent_id)
-        .fetch_all(pool)
-        .await?;
+        let rows: Vec<(Uuid, String)> =
+            sqlx::query_as("SELECT group_id, role FROM public.epigraph_live_memberships($1)")
+                .bind(agent_id)
+                .fetch_all(pool)
+                .await?;
 
         Ok(rows)
     }

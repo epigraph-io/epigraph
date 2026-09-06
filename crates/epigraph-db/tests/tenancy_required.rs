@@ -559,6 +559,27 @@ async fn a_step_in_a_private_lineage_inherits_and_cannot_be_declared_public(pool
 /// Run as `epigraph_app` deliberately: on the harness role the seed arm would
 /// mask a missing derived trigger by stamping `('public', seed)` — the row
 /// would land, with the WRONG tenancy, and the test would pass.
+///
+/// # PR-17: the block now stamps the session GUCs, and it has to
+///
+/// Migration 077 puts a `WITH CHECK (… owner_group_id = ANY(
+/// epigraph_writable_groups()))` on all 17 of these tables. 074's BEFORE ROW
+/// trigger derives `('group', <the parent's group>)` from the claim, and the
+/// policy then asks whether this session may write into that group. On a
+/// connection with no GUCs `epigraph_writable_groups()` is `{}`, so the answer
+/// is no and every insert below raises `42501`.
+///
+/// That refusal is CORRECT, not a regression: a session carrying no tenancy
+/// context genuinely has no authority to write into a private group. What was
+/// missing was the test's half of the production contract — `ScopedPool::acquire_as`
+/// stamps these three GUCs at checkout on every real request, and this block
+/// was standing in for a request without doing so. `set_config` is used rather
+/// than `acquire_as` because `acquire_as` takes a `ScopedPool` and this
+/// connection's `session_user` has already been switched, which is a property
+/// of the connection and not of the pool.
+///
+/// The thing under test is untouched: the trigger arms key on `session_user`
+/// and on the parent claim, neither of which a GUC affects.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_claim_derived_tables_inherit_at_insert_on_the_app_role(pool: PgPool) {
     let (agent, group) = fixture::seed_agent_with_group(&pool, "derived").await;
@@ -575,6 +596,18 @@ async fn the_claim_derived_tables_inherit_at_insert_on_the_app_role(pool: PgPool
 
     // One row per §8.2's named tables, each inserted WITHOUT naming tenancy.
     let ids = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        // What `ScopedPool::acquire_as` does at checkout on every real request.
+        sqlx::query(
+            "SELECT set_config('epigraph.group_ids', $1, false), \
+                    set_config('epigraph.writable_group_ids', $1, false), \
+                    set_config('epigraph.principal_id', $2, false)",
+        )
+        .bind(group.to_string())
+        .bind(agent.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("stamp the session GUCs");
+
         let evidence: Uuid = sqlx::query_scalar(
             "INSERT INTO evidence (id, claim_id, content_hash, evidence_type) \
              VALUES (gen_random_uuid(), $1, $2, 'document') RETURNING id",
@@ -652,6 +685,94 @@ async fn the_claim_derived_tables_inherit_at_insert_on_the_app_role(pool: PgPool
              evidence.embedding are a full second copy WITH ITS OWN ANN VECTOR."
         );
     }
+}
+
+/// The sibling of the test above, asserting the half the GUC stamp papers over:
+/// an app-role session with NO GUCs is REFUSED a derived-table insert.
+///
+/// # Why this is the most consequential runtime property migration 077 introduces
+///
+/// The test above was changed, correctly, to stamp the three session GUCs — that
+/// is what `ScopedPool::acquire_as` does on every real request, and the thing it
+/// tests (074's BEFORE ROW trigger) keys on `session_user` and the parent claim,
+/// neither of which a GUC affects. But the refusal it stopped hitting is the
+/// measured proof of a hard precondition on the deploy: 077's `WITH CHECK (…
+/// owner_group_id = ANY(epigraph_writable_groups()))` refuses every derived
+/// insert on a session with no GUCs, and
+/// `D-PR17-request-path-never-stamps-session-gucs` records that the request path
+/// never stamps them at any of its `state.db_pool` sites.
+///
+/// **So step 11d cannot repoint `DATABASE_URL` at `epigraph_app` before the
+/// `acquire_as` conversion is done.** That was a paragraph in a doc comment and
+/// nothing else; here it is an assertion. If a later PR makes this test fail by
+/// admitting the insert, either the conversion landed (and this test should be
+/// retired deliberately) or a policy was widened by accident.
+///
+/// The `42501` is the RLS refusal specifically, not the `23502` NOT NULL backstop
+/// — the trigger DOES stamp the row, and the policy then rejects it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_derived_insert_is_refused_when_the_session_gucs_are_unstamped(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "unstamped-derived").await;
+    let claim = group_claim(&pool, agent, group, "private parent").await;
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+
+    let (unstamped, stamped) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let unstamped = sqlx::query(
+            "INSERT INTO evidence (id, claim_id, content_hash, evidence_type) \
+             VALUES (gen_random_uuid(), $1, $2, 'document')",
+        )
+        .bind(claim)
+        .bind(vec![31u8; 32])
+        .execute(&mut *conn)
+        .await;
+
+        // CALIBRATION: the identical statement with the GUCs stamped must
+        // succeed. Without this, "refused" would be satisfied by a connection
+        // that cannot write evidence for any reason at all — a missing grant, a
+        // bad fixture, a constraint.
+        sqlx::query(
+            "SELECT set_config('epigraph.group_ids', $1, false), \
+                    set_config('epigraph.writable_group_ids', $1, false), \
+                    set_config('epigraph.principal_id', $2, false)",
+        )
+        .bind(group.to_string())
+        .bind(agent.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("stamp the session GUCs");
+        let stamped = sqlx::query(
+            "INSERT INTO evidence (id, claim_id, content_hash, evidence_type) \
+             VALUES (gen_random_uuid(), $1, $2, 'document')",
+        )
+        .bind(claim)
+        .bind(vec![32u8; 32])
+        .execute(&mut *conn)
+        .await;
+
+        (conn, (unstamped, stamped))
+    })
+    .await;
+
+    let err = unstamped.expect_err(
+        "an app-role session with no tenancy GUCs must be REFUSED a derived-table insert. \
+         If this succeeds, 077's WITH CHECK is not filtering — or the request path has been \
+         converted to acquire_as and this test needs retiring on purpose.",
+    );
+    let code = err
+        .as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    assert_eq!(
+        code, "42501",
+        "the refusal must be the RLS policy (42501), not the NOT NULL backstop (23502) — \
+         074's BEFORE ROW trigger DOES stamp the row and 077's WITH CHECK then rejects it. \
+         Got {code}: {err}"
+    );
+    stamped.expect(
+        "CALIBRATION: with the GUCs stamped the identical insert must succeed, or the \
+         refusal above proves nothing about tenancy",
+    );
 }
 
 /// A derived row with no resolvable parent is refused, not defaulted.

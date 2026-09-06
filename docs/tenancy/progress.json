@@ -718,12 +718,98 @@
         },
         "explicitly_not_done": "The 16b write-side gate in full: the SQL half of viewer.writable_bind(), the 35 fail-open scope sites across 8 files, the 16 MCP write tools among the 19 viewer-less ones, theme_cluster's viewer scope, and the call-site lint. `epigraph_seed` granted to the test harness pools (see plan_corrections). `agents.profile_visibility DROP DEFAULT` (see plan_corrections). The trigger-to-counter link's test coverage (inherent to 074; see D-PR16-undeclared-write-counter-link-uncovered).",
         "notes": "CI: .github/workflows/ci.yml gains MIGRATION_DATABASE_URL alongside DATABASE_URL, in THIS PR, because epigraph-migrate now prefers it -- shipping the code without the workflow change turns CI red on merge. The migrate binary still logs a WARN and falls back to DATABASE_URL when the variable is unset, so a unit that sets only DATABASE_URL keeps working."
+      },
+      {
+        "pr": "PR-17 - feat(db): arm RLS (policies, canary, FORCE)",
+        "sha": "SHA_PLACEHOLDER",
+        "branch": "tenancy/pr-17-rls-force, based on integration/tenancy at e4d76ec0",
+        "verified_by": "Implemented, then re-derived under adversarial review. Every count below was measured on a FRESHLY RECREATED throwaway (the database was dropped and re-migrated after 077 was edited, so no assertion is made against a stale applied checksum). claim.rs counts by BRACE-MATCHING the #[cfg(test)] boundary at line 5303, never by grepping markers.",
+        "tests": "MEASURED on the full run: 4104 passed / 0 failed / 72 ignored across 376 test binaries (cargo test --workspace --locked --no-fail-fast). All 72 ignored are pre-existing and unrelated (bp_factors, oauth_authorization_code, perspectival_*, table_graph_dossier_*, propagation_db, reasoning_db, sheaf_db, trust_db). Every tenancy/RLS binary ran with 0 ignored: rls_enforcement 18 (was 11 before this review pass), qual_guc_coherence 15 (was 14), tenancy_required 31 (was 30), tenancy_triggers 28, tenancy_coverage 17, locked_decisions 13, viewer_resolve 3, no_unmaintained_dsn 4.",
+        "gate": "fmt --check 0 / clippy --workspace --all-targets --locked -D warnings 0 / test --workspace --locked --no-fail-fast 0 / cargo check -p epigraph-api --no-default-features --locked 0, run in a GENUINELY COLD dedicated target dir (rm -rf'd first; 1m00s from scratch). The genai feature gate was NOT run and is not required: `git status --short crates/epigraph-cli/` is empty, so none of the five required-features=[\"genai\"] targets' files are touched. sqlx: ONE query! macro changed (security_event.rs::log lost its RETURNING). `cargo sqlx prepare --workspace` cannot complete on this tree - epigraph-mcp fails to compile under the feature unification that `--tests`/`--all-targets` produces, which is PRE-EXISTING and unrelated (`cargo check -p epigraph-mcp` is clean, and the full test gate passes). The single new .sqlx entry was taken from the partial prepare, verified by hand to be exactly the new statement with zero returned columns, and the orphaned RETURNING entry deleted. `git status --short .sqlx/` shows exactly that one add and one delete.",
+        "migrations": {
+          "assigned": "077 rls policies (ENABLE only) / 078 rls canary / 079 FORCE",
+          "plan_said": "073/074/075 in the Files line and 074/075/076 in the section 3 dependency table",
+          "why_the_plan_is_wrong": "073 is PR-13's and 074/075/076 are PR-16's, all APPLIED. Editing an applied version is a checksum mismatch, which panics the api binary on restart. migrations/README.md is authoritative and was followed.",
+          "checksum_safety": "073-076 untouched; verified the applied checksums still match the files byte-for-byte."
+        },
+        "security_fixes_from_review": {
+          "summary": "Adversarial review found that three policy arms written as 'structural, self-certifying' predicates referenced only ROW columns and therefore filtered nothing. All three are FIXED in this PR, not deferred. Detail is at mechanism level only: this repository is public.",
+          "the_general_property": "A policy arm that references none of epigraph_session_groups(), epigraph_writable_groups(), epigraph_principal_id(), epigraph_bypass() or epigraph_definer_bypass() is not a narrowing, it is an unconditional grant. Because an INSERT ... ON CONFLICT requires the SELECT side, such arms had to sit in USING as well as WITH CHECK, so they granted READ.",
+          "mechanism_of_the_fix": "The provisioning bootstraps moved out of the policies and into SECURITY DEFINER WRITERS - epigraph_ensure_personal_group() and epigraph_provision_oauth_agent() - so the policies need no personal-group or NULL-principal arm in either direction. agent.rs::ensure_personal_group and ::ensure_for_client now call them.",
+          "oracles_removed": "epigraph_is_group_admin and epigraph_is_group_creator lost their p_agent parameter and bind the subject to the calling principal inside the body; every policy call site already passed the principal. epigraph_is_personal_group is deleted outright. This removes three membership/authority oracles that were EXECUTE-able by epigraph_app over arbitrary (group, agent) pairs.",
+          "returning_under_rls": "PostgreSQL applies a table's SELECT policy to the rows a RETURNING clause produces. SecurityEventRepository::log's INSERT ... RETURNING was refused 42501 for any event not attributed to the session principal, while the identical INSERT without RETURNING succeeded - so the audit trail would have stopped being written, silently, since both call sites swallow the error. The RETURNING is removed and the input row echoed back. Same class as F-PR17-on-conflict-is-checked-against-the-using-clause, and the sweep for that one did not cover it.",
+          "attribution": "security_events_append was WITH CHECK (true), which argued anti-suppression correctly and said nothing about attribution. It now refuses cross-attribution from any session that HAS a principal, while staying permissive when there is none so a pre-authentication failure is still recorded. THREE arms, and the third is not redundant: `agent_id IS NULL` is its own arm because `NULL IS NOT DISTINCT FROM <uuid>` is FALSE, so an attribution arm written with IS NOT DISTINCT FROM does NOT admit an unattributed row - and oauth/providers/provision.rs::record_oauth_event hard-codes agent_id: None. A first draft got this wrong and its COMMENT asserted the opposite of what the predicate did; caught by re-reading the predicate against the comment, which is the same failure mode as the three blockers. MEASURED on a re-migrated throwaway, all four cases: principal+NULL succeeds, principal+foreign is refused, principal+own succeeds, no-principal+any succeeds. FULL binding rides the acquire_as precondition; see explicitly_not_done.",
+          "boot_probe": "AppState::assert_rls_posture propagated PROBE errors as well as verdict refusals, and the caller .expect()s it - so a failure to READ the posture was a boot panic. Staging the verdict buys nothing if the probe is unconditionally fatal. Probe errors now warn and continue; only a verdict refusal is returned.",
+          "grant_gap": "077's GRANT ... ON ALL TABLES binds only tables existing at version 077, so a fresh migrate missed every later migration's table - measured, webhook_subscriptions (085) was the one relation epigraph_app could not SELECT. Both halves now ship: ON ALL TABLES for the deployed database (where later tables already exist) and ALTER DEFAULT PRIVILEGES for fresh migrates. The rule is in migrations/README.md."
+        },
+        "plan_corrections": [
+          "Files line's migration numbers 073/074/075 are wrong for the seventh time in this series; README's 077/078/079 used instead.",
+          "Acceptance's 'refuses if relforcerowsecurity is false' cannot hold as written: at the moment the boot assertions are confirmed, deploy step 11d has not yet run the migrations. The refusal is STAGED on current_user instead, so it is inert before 079, inert in the 077->079 window, and inert after the documented NO FORCE rollback.",
+          "Enforcement begins at 077, not 079: a policy already filters every non-owner role, and every role the app and job fleet connect as is a non-owner without BYPASSRLS. 079 closes only the owner hole.",
+          "Acceptance's 'all 17 claim.rs read functions' is a conflation with the 17 claim-DERIVED TABLES used elsewhere in the plan. See counts_reconciled.",
+          "security_events_read's epigraph_is_instance_admin disjunct names a function that does not exist (instance_admins is PR-18's 083); the policy as written fails to create and aborts the migration. Dropped here, PR-18's to restore.",
+          "079's array in the plan names privatization_plans / privatization_plan_items / privatization_audit / instance_admins; none exist (PR-18's 080-083). 079 RAISEs rather than skipping a missing table.",
+          "The plan writes no policy for `groups`, which would mean default-deny and would break every token mint.",
+          "The plan mentions neither view exemption, though public.tenancy_exempt records the security_invoker obligation against 077 by name.",
+          "ops-F5 is unsatisfiable at PR-17: repos/privatization.rs and the apply handler do not exist, they are PR-18's 080-083. Recorded as a plan correction, not silently skipped."
+        ],
+        "counts_reconciled": {
+          "claim_rs": "MEASURED by brace-matching the #[cfg(test)] boundary (line 5303 of 7017): 81 `pub fn` in production code, 57 of which take a Viewer, of which 55 are reads (create_or_get and dispute_batch are the two writes). Three different numbers were in circulation (90/60/58 counted the test module, which PR-16's own verified_by line forbids; 84/59 was a third). The plan's 17 is the derived-table count.",
+          "visibility_markers": "54 `/* {VISIBILITY:...} */` markers in claim.rs - a different unit again, and not a function count. Not used to derive anything.",
+          "force_protected_set": "Rust FORCE_PROTECTED_SET (35) == 079's ARRAY (35) == 079-undo.sql's ARRAY (35), symmetric difference empty; catalog relforcerowsecurity is 36, the extra being rls_canary which 078 FORCEs at creation and 079 deliberately omits."
+        },
+        "scope_substitution": {
+          "sec-F1": "Asserted at the POLICY level, not per read function. One claims_tenancy policy governs every reader, so the policy is the honest unit; asserting 55 functions would be 55 copies of one fact. Recorded here because the Acceptance line names a different surface.",
+          "qual_guc_coherence": "The plan asks that this file run 'under FORCE'. Schema-level it now does, for free, but every assertion was on the #[sqlx::test] superuser session, which no policy filters - so that alone would be satisfaction in name only. One test was ADDED, the_guc_and_the_policy_agree_on_a_filtered_session, which carries the coherence claim through SET SESSION AUTHORIZATION epigraph_app. The rest of the file is left alone deliberately: GUC plumbing is role-independent. This was the one prescribed item with no disposition anywhere."
+        },
+        "behaviour_changes": [
+          "POST /admin/entity-types with tenancy_tier='columns' becomes usable for the first time, because 077/079 now satisfy the section 2.5 precondition for `claims`. A new production capability arriving as a migration side effect; not on the plan's Acceptance line.",
+          "GroupMembershipRepository::list_live_for_agent reads through public.epigraph_live_memberships(), a SECURITY DEFINER function, because Viewer::resolve runs upstream of the GUC it populates. NEW DEPLOY PREREQUISITE: the function is REVOKEd from PUBLIC and epigraph_admin is not a member of epigraph_maintenance, so the runbook's `GRANT epigraph_maintenance TO epigraph_admin` is now needed for EXECUTE as well as for epigraph_bypass(). Written into docs/deploy.md section 1c-ter.",
+          "AgentRepository::ensure_personal_group and ::ensure_for_client delegate their writes to the two new SECURITY DEFINER helpers. Same statements, same guards, same idempotency; ensure_for_client's binding changed to (Option<Uuid>,) because a RETURNS uuid function always yields one row, so the zero-rows case that drove the DuplicateKey refusal now arrives as an inner NULL.",
+          "SecurityEventRepository::log no longer has a RETURNING clause; it echoes the input row.",
+          "The database now carries an explicit WITH CHECK on every FOR ALL policy across 35 relations, so it will refuse writes the Rust layer still permits.",
+          "tenancy_required.rs::the_claim_derived_tables_inherit_at_insert_on_the_app_role now stamps the session GUCs. Legitimate (the trigger under test keys on session_user and the parent claim), but it retired the only place the 42501 was visible - so a_derived_insert_is_refused_when_the_session_gucs_are_unstamped was ADDED to assert both directions."
+        ],
+        "new_tests": [
+          "rls_enforcement.rs::no_policy_arm_is_session_independent - the general detector. Every arm of every 077 policy must reference a session helper. The allowlist is keyed on (policy, substring OF THE ARM), not on the policy name: exempting a whole policy would skip every arm it ever gains, which is the same 'exemption broader than the thing exempted' mistake the policies made. It is a ratchet in both directions - an allowlist entry matching no live arm fails the test. This is what makes the class of defect above unrepeatable, and it caught the security_events NULL arm during this pass.",
+          "rls_enforcement.rs::an_unstamped_app_connection_sees_no_private_group_state - the unstamped-NEGATIVE class that the suite structurally lacked. Every prior behavioural test stamped GUCs first or used the canary, so none constructed the state a request-path connection is actually in.",
+          "rls_enforcement.rs::an_unstamped_app_connection_cannot_update_a_foreign_agent, ::the_app_role_cannot_forge_a_derived_principal, ::security_event_log_writes_under_rls_on_the_app_role (through the real repo function), ::the_app_role_can_reach_every_public_table_without_the_test_fixture (deliberately does NOT call grant_app_privileges, which is what masked the 085 gap), ::guard_subquery_sites_are_enumerated.",
+          "qual_guc_coherence.rs::the_guc_and_the_policy_agree_on_a_filtered_session.",
+          "tenancy_required.rs::a_derived_insert_is_refused_when_the_session_gucs_are_unstamped.",
+          "admin.rs's preserved negative half had its two required `contains` checks restored to a conjunction; review found it was the one strictly-weaker assertion in the diff."
+        ],
+        "obligations_disposition": {
+          "D-PR16-seed-membership-refusal-downgraded": "DISCHARGED. Armed as the seventh refusal in epigraph_api::state::rls_verdict; pinned by the pure unit tests over that function.",
+          "F-PR12-ci-runs-as-superuser-so-the-42501-arm-is-untestable": "MATERIALLY ADDRESSED, not closed. viewer_fixture::as_role / SET SESSION AUTHORIZATION epigraph_app is now the path every behavioural test in rls_enforcement.rs takes, and each carries a calibration assertion. It stays open because the CI DSN is still the superuser.",
+          "D-PR16-seed-grant-to-the-harness-role": "STILL OPEN, and the ledger text needs amending: it says PR-17's 'refuses to serve as a superuser or BYPASSRLS holder' removes its precondition. Because every PR-17 refusal is STAGED behind current_user = 'epigraph_app', that precondition is removed on NO environment that exists today. It is removed at step 11d, not at this merge.",
+          "D-PR17-structural-force-mode-test": "DEFERRED to the PR that converts the request path to acquire_as. Its subject is what 067's triggers stamp on rows written by ClusterGraphHandler / ThemeClusterRebuildHandler on a bypass connection with no GUCs; those handlers run on the maintenance pool, where epigraph_bypass() is true, so the behaviour is unchanged by 077-079 and the test would assert the same thing before and after. Recorded rather than left moot-by-silence.",
+          "D-PR17-maintenance-lease-coupling-is-a-convention": "STILL OPEN. MaintenancePool::viewer returns an owned Viewer while the lease is a local that drops at return; all 23 bins holding it for the whole run is a convention, not a type-level guarantee. Unchanged by this PR - it is a Rust ownership question, not a policy one - and it becomes consequential at 11d, not at merge.",
+          "D-PR17-hybrid-shape-lint": "STILL OPEN, re-owned to the acquire_as conversion PR. The hybrid stops being latent when the app pool becomes live, which is 11d.",
+          "D-PR16-ownership-transfer-is-unguarded": "STILL OPEN. The database layer is authoritative from 077, but the transfer guard is a write-side gate and belongs to 16b.",
+          "D-PR17-maintenance-role-job-path-grants": "DOES NOT EXIST IN THE TREE UNDER THAT ID, and did not before this PR either - the id in the operator recon is a paraphrase of PR-15's L10. Its substance lives in docs/deploy.md section 1c-ter, which this PR EXTENDS with the second reason the same GRANT is now required (EXECUTE on epigraph_live_memberships)."
+        },
+        "files_line_reconciliation": {
+          "beyond_the_plans_files_line": "077 creates five SECURITY DEFINER helpers and an app-role GRANT block that the plan's Files line does not mention: epigraph_is_group_admin, epigraph_is_group_creator, epigraph_live_memberships, epigraph_ensure_personal_group, epigraph_provision_oauth_agent. Each exists to keep a live app-pool path working under FORCE, or to keep a bootstrap out of a read predicate.",
+          "discharges_a_pre_existing_obligation": "ALTER VIEW ... SET (security_invoker = true) on alternative_set and alt_set_decisions is NOT scope creep: public.tenancy_exempt records that obligation against 077 by name ('THIS IS AN OPEN RLS BYPASS, RECORDED HERE SO PR-17 CANNOT MISS IT') and tenancy_coverage.rs::the_two_view_exemptions_are_security_invoker was rewritten in the same commit as its own failure message demands.",
+          "group_creation_arm": "groups_tenancy's created_by_agent_id = principal arm makes routes/groups.rs::create_group and routes/community.rs work under FORCE. It reads as 16b territory but without it three consecutive statements on live HTTP paths are denied inside one transaction."
+        },
+        "explicitly_not_done": [
+          "no_unscoped_pool.rs was NOT created. There are 466 raw state.db_pool sites in epigraph-api and acquire_as has ZERO production callers, so the lint would fail on day one and would have to be introduced pre-failing. Recorded as D-PR17-request-path-never-stamps-session-gucs. PR-15's no_unmaintained_dsn.rs already asserts the pool-CONSTRUCTION half.",
+          "ops-F5 (the privatization apply job writes on the maintenance pool) is NOT tested: repos/privatization.rs and the apply handler do not exist. PR-18's 080-083. This is a plan correction, not an omission.",
+          "epigraph_app is NOT given LOGIN and no password appears anywhere. ALTER ROLE epigraph_app LOGIN PASSWORD is an out-of-band operator step; this repository is public. Nothing can use 077's grants until then, which is also what makes this PR inert on every environment that exists today.",
+          "The current_user <> 'epigraph_app' acceptance item ships as a WARN, not a refusal (D-PR17-current-user-refusal-left-as-a-warning): arming it makes the staging marker its own trigger and makes the documented NO FORCE + revert-DSN rollback un-bootable. A SEVENTH refusal (epigraph_seed membership) was added instead. Net: 5 of the plan's 6 armed, +1 new, with the missing one's harm covered by the armed canary refusal.",
+          "FULL security_events attribution binding (refusing a NON-NULL agent_id from a session with no principal) is not armed - it would refuse every authenticated rate-limit event while the callers swallow the error, trading fail-open-on-attribution for a silently absent audit trail. Rides the acquire_as precondition.",
+          "AgentRepository::list / get_by_id / list_by_label / get_by_public_key / find_by_role are NOT routed through get_public_profile's projection - see D-PR17-agent-projection-enforced-at-one-call-site. That is a public-API change and does not belong in an RLS migration.",
+          "The correlated-guard sites over `edges` are enumerated and recorded but NOT converted to real unique constraints - see D-PR17-read-guards-widen-under-rls.",
+          "warn_on_privileged_connection and rls_verdict's NotYetTheAppRole branch both warn about the same non-app-role condition, so every boot on every current environment emits two near-duplicate warnings. Left alone rather than touching PR-16 code to fix a log-tidiness nit."
+        ],
+        "notes": "This PR is INERT on every environment that exists today: epigraph_app is NOLOGIN, every DSN is still the superuser epigraph, for whom epigraph_bypass() is true and BYPASSRLS is implicit, and the boot refusal is staged on current_user. The policies become load-bearing at deploy step 11d, whose precondition (the acquire_as conversion) is NOT met - and is now asserted by a_derived_insert_is_refused_when_the_session_gucs_are_unstamped rather than merely documented."
       }
     ],
     "current": null,
     "failed": [],
     "halted": null,
-    "next": "PR-17 - feat(db): arm RLS (D1's database half). NOTE: the 16b write-side gate is UNDELIVERED and needs a number -- see prs.done[PR-16].the_16a_16b_split. PR-17 depends only on 16a, so it is not blocked."
+    "next": "PR-18 - privatization surface + instance_admins. Migrations 080-083 per migrations/README.md (the plan's PR-18 Files line says 076-079, which are PR-16's and PR-17's - do NOT follow it). PR-18 owns: restoring security_events_read's epigraph_is_instance_admin disjunct alongside the function, the security_events immutability trigger (the plan says 'in 078'; the README says 082), ops-F5's privatization apply job, and the three privatization job types jobs_app's WITH CHECK already names. NOTE: the 16b write-side gate is still UNDELIVERED and needs a number."
   },
   "env": {
     "postgres": "16.2 @127.0.0.1:55432",
@@ -755,7 +841,8 @@
       "owner": "PR-17 (the PR that arms RLS FORCE)",
       "what": "repos/structural.rs needs the FORCE-mode, repo-level positive test that plan line 2732 requires.",
       "detail": "Plan line 2732: `Each of these 17 gains a positive FORCE-mode test (§0.5, §4.5): a Scoped viewer over group G reads back exactly its own group-private rows. Same treatment in repos/{triple,lineage,...,structural,challenge,reasoning_trace}.rs.` PR-08 creates repos/structural.rs, so the obligation attaches here. The positive property IS asserted - owner_sees_the_whole_subgraph_and_a_stranger_only_its_public_part has the owner read back its own group-private claim (3 vs 2), its group-private edge (RELATES_TO present for the owner, absent for the stranger) and a non-zero clustering_stats.eligible_nodes against the stranger's zero - but at HTTP level, not under FORCE, which cannot exist until PR-17. Partially discharged, with a live residual.",
-      "status": "open"
+      "status": "DEFERRED by PR-17 to the acquire_as conversion PR",
+      "pr17_disposition": "Its subject is what 067's triggers stamp on rows written by ClusterGraphHandler / ThemeClusterRebuildHandler on a bypass connection with no GUCs. Those handlers run on the maintenance pool, where epigraph_bypass() is true, so 077-079 do not change the behaviour and the test would assert the same thing before and after. Recorded explicitly rather than left moot-by-silence."
     },
     {
       "id": "D-PR16-theme-cluster-viewer-scope",
@@ -864,7 +951,8 @@
       "owner": "PR-17 (the PR that arms RLS, and therefore the first PR in which dropping the lease has a consequence)",
       "what": "Make the coupling between a bypass `Viewer` and the maintenance connection it must be spent on STRUCTURAL rather than a call-site convention.",
       "detail": "`MaintenancePool::viewer` returns `(MaintenanceConn<'_>, Viewer)` where the `Viewer` is OWNED and the `MaintenanceLease` it was minted from is a local that drops at return. A caller that drops `_maint_conn` and keeps the viewer still compiles. `AppState::maintenance_viewer` and `epigraph_mcp::maintenance::maintenance_viewer` have the same shape, so PR-15 standardised the shape rather than removing the hazard. It is a real improvement over `maintenance_pool_and_viewer`, which dropped the connection INSIDE the constructor so the returned viewer had no privileged connection behind it at all, and every one of the 23 converted bins binds both for the whole run -- but that is enforced by review, not by the borrow checker.\n\nWHY IT MATTERS MORE AFTER PR-15 THAN BEFORE: pre-PR-15 the maintenance connection was an ordinary connection and holding it bought nothing. Post-PR-15 it is the privileged one, and from PR-17 on it is the ONLY thing making the bypass real -- so a call site that drops it and keeps the viewer holds a predicate-suppressing viewer with no privileged connection to spend it on, which is the silent-zero-rows shape.\n\nFIX: return a single guard owning both the `PoolConnection` and the `Viewer`, yielding the viewer only by reference (`fn viewer(&self) -> &Viewer`), applied at `ScopedPool::unscoped_for_maintenance` so all three constructors inherit it. Mechanical, with 23 call sites already binding both halves.\n\nCITED BY: `crates/epigraph-cli/src/lib.rs` (the `MaintenancePool` type doc names this id) and `docs/tenancy/HANDOFF.md` row 59.",
-      "status": "open"
+      "status": "open -- unchanged by PR-17, consequential at 11d",
+      "pr17_disposition": "MaintenancePool::viewer returns an owned Viewer while the lease is a local that drops at return. This is a Rust ownership question, not a policy one, so arming RLS does not change it; it becomes consequential when the app pool goes live at 11d."
     },
     {
       "id": "D-PR17-hybrid-shape-lint",
@@ -872,7 +960,8 @@
       "owner": "PR-17 (the PR that arms RLS, at which point the hybrid stops being latent)",
       "what": "A second lint keyed on the HYBRID SHAPE -- minting a bypass viewer and spending it on a pool that is not the maintenance one -- to complement `crates/epigraph-db/tests/no_unmaintained_dsn.rs`, which is keyed on pool CONSTRUCTION and structurally cannot see the injected-pool form.",
       "detail": "The construction lint proves a file builds no unmaintained pool. It does not prove the process is safe under RLS, because what determines that is the pool the statements RUN on, and the two coincide only when the file constructs its own pool. A file that takes an injected `PgPool` constructs nothing and passes green.\n\nCALIBRATION CASES -- use these, so a green run means 'there is nothing' rather than 'found nothing':\n  - `crates/epigraph-api/src/routes/claims.rs::find_claims_needing_embeddings`. It WAS an instance and PR-15 fixed it (the statement now runs on `&mut *maint_conn`), so it is the positive control that must stay clean; note that `routes/` is also an explicit non-root of the construction lint, so nothing would have caught the regression.\n  - `crates/epigraph-jobs/src/db_reputation_service.rs::get_claim_outcomes`. Still live: it mints a bypass viewer from `self.scoped` (post-PR-15, the privileged pool) and runs `ClaimRepository::get_by_agent(&self.pool, &viewer, ..)` on an injected `PgPool`. It is under a scan root of the construction lint and passes anyway. It has no production constructor today, which is the only reason it is not a second live instance.\n\nSHAPE: within a scanned file, flag any site that mints a bypass viewer (`Viewer::system(`, `maintenance_viewer(`, `MaintenancePool::viewer(`) whose subsequent repo calls pass a pool handle not derived from the maintenance one (`maint.pool()` or the `MaintenanceConn`). It has its own false-positive surface -- which is why it is not in PR-15 -- and it must be mutation-tested against both calibration cases before it is trusted.\n\nCITED BY: `crates/epigraph-db/tests/no_unmaintained_dsn.rs`'s Known-limits module doc and `docs/tenancy/HANDOFF.md` row 59.",
-      "status": "open"
+      "status": "open -- re-owned by PR-17 to the acquire_as conversion PR",
+      "pr17_disposition": "The hybrid stops being latent when the app pool becomes live, which is step 11d, not this merge."
     },
     {
       "id": "D-PR16-recall-events-are-instance-wide",
@@ -896,7 +985,8 @@
       "owner": "PR-17 -- its Acceptance line ('the process refuses to serve as a superuser or BYPASSRLS holder') is precisely the change that removes the precondition this depends on.",
       "what": "The PR-16 *Files* line item '`epigraph_seed` granted to the test harness pools' is NOT implemented. No role-membership GRANT exists anywhere in the tree.",
       "detail": "`grep -rn 'GRANT epigraph' migrations/ scripts/ .github/` returns nothing; migration 060 only CREATE ROLE ... NOLOGINs the three roles. The five viewer_fixture.rs copies reach the escape hatch via `SET SESSION AUTHORIZATION epigraph_seed`, a SUPERUSER-ONLY privilege. Three consequences: (i) on the default superuser connection pg_has_role(session_user,'epigraph_seed','MEMBER') is true for free, so every ordinary fixture insert silently takes 074 arm 4 and is STAMPED rather than raising -- part of the suite's green is the escape hatch, not the declaration path (PR-16's new round-trip cases are the part that is NOT, since a group(G) declaration reading back (G,'group') is unreachable through arm 4); (ii) a non-superuser CI harness would start raising 23502 across ~160 fixture statements with no diff to explain it; (iii) PR-17's superuser refusal is what forces this. NOT fixed by a hardcoded GRANT in 074's DO block -- the harness role differs per environment, and baking one into an applied migration is unfixable without a checksum mismatch. tenancy_required.rs::the_harness_role_can_take_the_seed_escape_hatch asserts the precondition so the failure names itself.",
-      "status": "open"
+      "status": "open -- and its stated precondition is NOT removed by PR-17",
+      "pr17_disposition": "AMENDMENT. This entry says PR-17's 'refuses to serve as a superuser or BYPASSRLS holder' acceptance 'is precisely the change that removes the precondition this depends on'. That is not what shipped: every PR-17 refusal is STAGED behind current_user = 'epigraph_app', which is true on NO environment today. The precondition is removed at deploy step 11d, not at this merge."
     },
     {
       "id": "D-PR16-seed-membership-refusal-downgraded",
@@ -904,7 +994,8 @@
       "owner": "PR-17 -- add it to that PR's Acceptance line explicitly; it is NOT covered by the superuser/BYPASSRLS/relforcerowsecurity/canary/current_user/GUC/tgenabled list PR-17 already enumerates.",
       "what": "FINAL-PLAN.md's epigraph_seed justification block lists FOUR mitigations that make the escape hatch acceptable. Mitigation (2) is 'AppState::with_db refuses to serve if pg_has_role(session_user, \\'epigraph_seed\\', \\'MEMBER\\')'. PR-16 ships it as a WARN, not a refusal, and unlike the current_user check nothing schedules its arming.",
       "detail": "state.rs::warn_on_privileged_connection argues the WARN correctly for the `current_user <> 'epigraph_app'` half, and PR-17's Acceptance line names that one verbatim, so it has an owner. Seed membership does not. On the current host PR-17's superuser refusal would incidentally cover it -- but that is an accident of the harness role being rolsuper, not a stated control. The warn! body now names this obligation id so the log line and the ledger agree.",
-      "status": "open"
+      "status": "DISCHARGED by PR-17",
+      "pr17_disposition": "Armed as the SEVENTH refusal in epigraph_api::state::rls_verdict (the RlsPosture.is_seed_member branch), pinned by the pure unit tests over that function. The ledger previously said 'open' while state.rs already said 'armed'; this reconciles them."
     },
     {
       "id": "D-PR16-claim-authorship-is-not-a-credential",
@@ -920,7 +1011,62 @@
       "owner": "PR-17 (the PR that makes the database layer authoritative)",
       "what": "`claims_block_widening` is BEFORE UPDATE OF visibility, so an UPDATE that changes ONLY owner_group_id fires no guard -- and 070 arm (d) then propagates the new owner to all 17 derived tables and to edges in the same transaction.",
       "detail": "074 section 4's header says 'widening is a separate, audited operation (D4's inverse)', which the guard half-delivers: relocating a group-private claim from group A to group B changes who can read it just as effectively as flipping visibility. DEFENSE IN DEPTH, NOT A REACHABLE HOLE TODAY: `grep -rn owner_group_id crates/*/src/ | grep -iE 'update|set '` matches only the one-shot epigraph-cli/src/bin/tenancy_backfill.rs, and PR-14 deleted the ownership routes and tools. NOT fixed inside 074 because 074 is a one-way door on the critical deploy path, the backfill's own re-stamping issues UPDATEs against owner_group_id, and adding an untested refusal arm to the migration that gates every claim write is the wrong place for that bet. THE FIX: extend to `BEFORE UPDATE OF visibility, owner_group_id` with an arm refusing OLD.visibility='group' AND NEW.owner_group_id <> OLD.owner_group_id without the declassify GUC -- or state in 074's header that ownership transfer is out of scope and name the PR that owns it.",
-      "status": "open"
+      "status": "open -- not taken by PR-17",
+      "pr17_disposition": "The database layer is authoritative from 077, but the transfer guard is a WRITE-SIDE gate and belongs to the still-unnumbered 16b. PR-17 touches no Rust write path."
+    },
+    {
+      "id": "D-PR17-request-path-never-stamps-session-gucs",
+      "raised_by": "PR-17",
+      "owner": "THE ROUTE-LAYER PR (PR-07/PR-17 per bin/server.rs's own note; unscheduled)",
+      "what": "ScopedPool::acquire_as and ::begin_as have ZERO non-test call sites. Handlers read the raw state.db_pool (411 `state.db_pool` line hits across ~50 files under routes/), so the tenancy session GUCs are never stamped on a request connection.",
+      "detail": "MEASURED on this base: `grep -rn '\\.acquire_as(\\|\\.begin_as(' --include=*.rs crates/ | grep -v /tests/` is empty. bin/server.rs does `let pool = scoped.inner().clone()` and hands that raw PgPool to AppState, with a comment naming 'PR-07/PR-17' as the owner of migrating it. On such a connection epigraph_session_groups() is {} and claims_tenancy collapses to `bypass OR visibility='public'`, so every group-private row becomes invisible to its own owner -- fail-closed, silent, indistinguishable from data loss. THIS IS A HARD PRECONDITION ON PLAN 9.2 STEP 11d, NOT ON LANDING 077/078/079: while DATABASE_URL names the owning superuser the policies are inert, so the migrations are safe to land and the defect stays latent. PR-17 deliberately did NOT attempt the 411-site conversion -- it is a route-layer refactor of a different shape and size, and shipping a `no_unscoped_pool.rs` lint against it would fail on day one. 11d MUST NOT run until this is closed."
+    },
+    {
+      "id": "D-PR17-current-user-refusal-left-as-a-warning",
+      "raised_by": "PR-17",
+      "owner": "the operator runbook for plan 9.2 step 11d",
+      "what": "PR-17's Acceptance line says the process 'refuses if current_user <> epigraph_app'. It is shipped as a WARN, not a refusal. Five of the six listed refusals are armed, plus the seventh from D-PR16-seed-membership-refusal-downgraded.",
+      "detail": "Every PR-17 posture refusal is STAGED on current_user = 'epigraph_app', because that is the only signal that distinguishes 'this deployment has done the 11d credential split' from 'this is a dev box' (epigraph_app is NOLOGIN with no password until an operator issues an out-of-band ALTER ROLE). Arming the current_user check itself would make the marker its own trigger: CI, every developer host and production today would refuse to boot the moment the code deploys. Worse, it would make 9.2's DOCUMENTED rollback -- 'NO FORCE + revert DATABASE_URL', sub-minute, no data change -- un-bootable, because reverting the DSN is exactly what puts current_user back to the owner role. The harm the check reaches for (a privileged connection serving traffic) is caught instead by the CANARY refusal, which is armed and which measures the thing directly. See epigraph_api::state::rls_verdict."
+    },
+    {
+      "id": "D-PR17-creator-arm-outlives-membership",
+      "raised_by": "PR-17",
+      "owner": "16b, the write-side gate PR",
+      "status": "open, recorded at mechanism level",
+      "what": "groups_tenancy's created_by_agent_id arm is in USING as well as WITH CHECK, because community.rs's ON CONFLICT needs the SELECT side, and created_by_agent_id is never rewritten - so the arm outlives the creator's own membership.",
+      "detail": "Narrowing it needs a liveness conjunct that the bootstrap it exists for cannot satisfy. It reaches a group's identity row and roster only, never claim content: claims_tenancy keys on epigraph_session_groups(), which a revoked member no longer carries. Deliberately kept at mechanism level here and in the migration comment - this repository is public."
+    },
+    {
+      "id": "D-PR17-live-memberships-is-parameterised-not-principal-bound",
+      "raised_by": "PR-17",
+      "owner": "the acquire_as conversion PR",
+      "status": "open, accepted",
+      "what": "public.epigraph_live_memberships(uuid) is the one SECURITY DEFINER helper 077 grants to epigraph_app that is parameterised by agent rather than bound to the calling principal.",
+      "detail": "Its only caller, Viewer::resolve, runs BEFORE the principal GUC it is computing exists, so there is no session subject to bind to. The Rust surface is unchanged - list_live_for_agent already took any agent id and already returned exactly (group_id, role) - but the SQL surface is new. The three sibling helpers WERE bound to the caller in the same pass, and epigraph_is_personal_group was deleted, so this is the only one left."
+    },
+    {
+      "id": "D-PR17-agent-projection-enforced-at-one-call-site",
+      "raised_by": "PR-17 (adversarial review)",
+      "owner": "the PR that touches the public agents API",
+      "status": "open, accepted with the exposure named",
+      "what": "agents_identity is USING (true) and the compensating profile_visibility projection exists in exactly one function, agent.rs::get_public_profile. Five sibling repo functions take no Viewer and return the full row.",
+      "detail": "AgentResponse does not serialize `properties`, so full_name/email/affiliations do not escape over HTTP; the accepted exposure is orcid and ror_id via routes/agents.rs::list_agents and ::get_agent. Universalising the projection is a public-API behaviour change and was deliberately not made inside an RLS migration. The VISIBILITY-EXEMPT comment in 077 was rewritten to say this rather than to imply one reader."
+    },
+    {
+      "id": "D-PR17-read-guards-widen-under-rls",
+      "raised_by": "PR-17 (adversarial review)",
+      "owner": "the acquire_as conversion PR",
+      "status": "open, enumerated and pinned",
+      "what": "An RLS-filtered read inside a write's guard predicate WIDENS the write: WHERE NOT EXISTS (SELECT 1 FROM t ...) over a protected t returns nothing to a non-bypass role whatever is in the table, so the guard degrades from a dedup check into an unconditional insert, silently.",
+      "detail": "Same mechanism as F-PR17-on-conflict-is-checked-against-the-using-clause; that sweep covered ON CONFLICT and not this shape. Sites, with the pool each runs on: postgres_queue.rs::enqueue_unique_pending over `jobs` is on the MAINTENANCE pool (bin/server.rs builds job_pool from maintenance_url; both PostgresJobQueue::new sites take it), so its guard is intact and 077's section-10 comment claiming otherwise was corrected. On the APP pool: edge.rs::create_symmetric_if_absent and ::create_symmetric_if_absent_returning, plus two sites each in graph_view.rs and routes/graph_neighborhood.rs, all over `edges`. NONE is a read leak; every one is a correctness degradation (duplicate edges, or already-decomposed claims reappearing as undecomposed), and every one is latent until 11d. alternative_of is additionally protected by edges_alternative_of_symmetric_uniq, so a duplicate there raises 23505 rather than landing. The fix is real unique constraints, not policy changes. Pinned by rls_enforcement.rs::guard_subquery_sites_are_enumerated."
+    },
+    {
+      "id": "D-PR17-tenancy-gucs-are-pgc-userset",
+      "raised_by": "PR-17 (adversarial review)",
+      "owner": "the acquire_as conversion PR",
+      "status": "open, documented",
+      "what": "The measured allow_declassify conclusion - customized GUCs are PGC_USERSET and parameter ACLs do not gate them - applies verbatim to epigraph.group_ids, epigraph.writable_group_ids and epigraph.principal_id, which is where it actually matters.",
+      "detail": "The entire 077 policy set keys on those three, so the corpus's confidentiality rests on GUCs the database does not protect. The control is that no code path interpolates untrusted input into a SET: apply_session_gucs is private, takes the &Viewer, and has exactly two callers. That is a structural convention, not a boundary. Latent today - nothing sets them from user input and acquire_as has no request-path callers. Written into docs/tenancy.md beside the allow_declassify paragraph, because the natural reading of that paragraph is that the tenancy GUCs are different in kind."
     }
   ],
   "resolved_measurements": {
@@ -1179,6 +1325,13 @@
       "what": "epigraph_definer_bypass() is pg_has_role(current_user, 'epigraph_maintenance', 'MEMBER') and CI connects as a superuser, for whom pg_has_role is true of every role. Arm (d)'s and the shim's 42501 assertions therefore CANNOT fire in the suite whatever the function owner is.",
       "status": "Mitigated, not closed. tenancy_triggers.rs::propagation_function_is_owned_by_the_maintenance_role asserts pg_proc.proowner and the EXECUTE grant from the CATALOG, which is owner-dependent and caller-independent, and is the honest instrument. A behavioural test would pass vacuously.",
       "owner": "PR-17, which is when a non-superuser deploy role becomes load-bearing."
+    },
+    {
+      "id": "F-PR17-on-conflict-is-checked-against-the-using-clause",
+      "raised_by": "PR-17",
+      "owner": "every future PR that adds an RLS policy",
+      "what": "`INSERT ... ON CONFLICT` is checked against the SELECT-side policy, so a provisioning arm present only in WITH CHECK is not enough. MEASURED, and it is not obvious from the PostgreSQL documentation.",
+      "detail": "On a FOR ALL policy the SELECT policy IS the USING clause. Measured as epigraph_app on the throwaway at head 079: a bare INSERT into group_memberships succeeded and the IDENTICAL statement with `ON CONFLICT ... DO UPDATE` -- and with `ON CONFLICT ... DO NOTHING` -- was refused with 42501, even with NO conflicting row present. `agents` was unaffected because its separate `agents_identity FOR SELECT USING (true)` satisfies the requirement. This is invisible to CI (superuser + BYPASSRLS) and it would have broken every token mint on the day 079 landed. PR-17 swept every ON CONFLICT site against a protected table and recorded the disposition of each; the app-pool ones are covered by arms in 077 and by rls_enforcement.rs, and the maintenance-pool ones (tenancy_backfill.rs, the CLI bins, PostgresJobQueue) are inert because epigraph_bypass() is true there."
     }
   ],
   "closed_findings": [

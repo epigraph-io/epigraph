@@ -58,6 +58,45 @@ pub struct Metrics {
     /// `#[cfg(feature = "db")]` — it is pure `prometheus_client` and naming it
     /// under `--no-default-features` must keep compiling.
     pub tenancy_undeclared_writes: Family<TenancyTableLabel, Gauge>,
+
+    /// PR-17's canary: how many `rls_canary` rows the API pool can see.
+    ///
+    /// **This is the plan's "60-second canary health metric".** Migration 078
+    /// creates one row in a `FORCE`d table whose only policy is bypass-only, so
+    /// on a correctly configured application connection the answer is `0` and
+    /// on a connection that bypasses row security it is `1`. That single
+    /// integer is the whole security posture, and there is no app-layer
+    /// equivalent — you cannot assert at runtime that 85 MCP tools remembered
+    /// to filter.
+    ///
+    /// # Read it with the companion series, not alone
+    ///
+    /// `1` is the CORRECT and expected value on every environment that has not
+    /// yet performed plan §9.2 week 11d's credential split, because those
+    /// connect as the owning superuser. Alerting on `> 0` unconditionally would
+    /// page on every dev box. The alert is
+    /// `epigraph_rls_canary_visible > 0 AND epigraph_rls_app_role == 1`.
+    ///
+    /// `-1` means the sampler could not decide: below migration 078 the table
+    /// does not exist. A distinguished value rather than an absent series,
+    /// because an absent series and a zero look identical in a `sum()` and this
+    /// is the one number where "I could not measure it" must not read as
+    /// "healthy".
+    ///
+    /// Registered on the INTERNAL listener like everything else here
+    /// (`progress.json::decisions_taken.Q1_metrics` = "separate internal
+    /// listener"); `/metrics` is not on the application router.
+    pub rls_canary_visible: Gauge,
+
+    /// `1` when the API pool's `current_user` is `epigraph_app`, else `0`.
+    ///
+    /// The companion series that makes [`Self::rls_canary_visible`] alertable,
+    /// and the same staging marker
+    /// `epigraph_api::state::rls_verdict` keys its refusals on. Without it an
+    /// operator cannot tell "canary visible because we are pre-11d" from
+    /// "canary visible because the policy was dropped" — which are a no-op and
+    /// a total tenancy failure respectively.
+    pub rls_app_role: Gauge,
 }
 
 impl Metrics {
@@ -99,6 +138,27 @@ impl Metrics {
             tenancy_undeclared_writes.clone(),
         );
 
+        // Seeded to -1, not 0. Until the first sampler tick this process has
+        // not measured anything, and 0 is the HEALTHY value — publishing it
+        // before the probe has run would report "RLS is enforcing" on a
+        // database nobody has looked at yet.
+        let rls_canary_visible: Gauge = Gauge::default();
+        rls_canary_visible.set(-1);
+        registry.register(
+            "epigraph_rls_canary_visible",
+            "rls_canary rows visible on the API pool: 0 healthy under the app role, \
+             1 on a bypassing connection, -1 not yet sampled or below migration 078",
+            rls_canary_visible.clone(),
+        );
+
+        let rls_app_role: Gauge = Gauge::default();
+        rls_app_role.set(-1);
+        registry.register(
+            "epigraph_rls_app_role",
+            "1 when the API pool connects as epigraph_app, 0 otherwise, -1 not yet sampled",
+            rls_app_role.clone(),
+        );
+
         Self {
             registry,
             requests_total,
@@ -106,6 +166,8 @@ impl Metrics {
             claims_submitted,
             active_agents,
             tenancy_undeclared_writes,
+            rls_canary_visible,
+            rls_app_role,
         }
     }
 }

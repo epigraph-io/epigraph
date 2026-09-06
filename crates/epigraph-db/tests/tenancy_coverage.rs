@@ -412,13 +412,28 @@ async fn the_generated_exemptions_are_exactly_the_nine_measured(pool: PgPool) {
 /// Two of the exemptions are VIEWS, not tables — `information_schema.columns`
 /// does not distinguish `relkind`, so Generator A returns them and a view can
 /// never carry a `NOT NULL` column. They are kept in the generated set on
-/// purpose rather than filtered out by `relkind = 'r'`: both have
-/// `security_invoker` UNSET and will therefore execute as the view OWNER and
-/// BYPASS the invoker's RLS once migration 079 FORCEs it. A relkind filter would
-/// have erased that finding. **Migration 077 owes both of them
-/// `security_invoker = true` (or a DROP).**
+/// purpose rather than filtered out by `relkind = 'r'`: both HAD
+/// `security_invoker` UNSET and would therefore have executed as the view OWNER
+/// and BYPASSED the invoker's RLS once migration 079 FORCEd it. A relkind filter
+/// would have erased that finding.
+///
+/// # PR-17 DISCHARGED IT, AND THIS ASSERTION IS NOW INVERTED
+///
+/// `public.tenancy_exempt` recorded the obligation against PR-17 in the
+/// strongest terms it had: *"Migration 077 MUST set security_invoker=true on it
+/// or drop it. THIS IS AN OPEN RLS BYPASS, RECORDED HERE SO PR-17 CANNOT MISS
+/// IT."* Migration 077 sets it on both, and rewrites the `tenancy_exempt`
+/// residual in the same file — which the previous version of this test demanded
+/// happen "in the same commit".
+///
+/// The assertion is kept, not deleted, and simply points the other way: these
+/// two views read `edges` and `claims`, so a future migration that recreated
+/// either without `security_invoker` would silently reopen a read path around
+/// every policy in 077. `migrations/README.md` states the general rule for the
+/// whole 060–085 range; this is its enforcement for the two relations that
+/// actually got it wrong.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_two_view_exemptions_are_still_security_definer(pool: PgPool) {
+async fn the_two_view_exemptions_are_security_invoker(pool: PgPool) {
     for view in ["alternative_set", "alt_set_decisions"] {
         let kind: Option<String> = sqlx::query_scalar(
             "SELECT relkind::text FROM pg_class \
@@ -444,14 +459,28 @@ async fn the_two_view_exemptions_are_still_security_definer(pool: PgPool) {
         .await
         .expect("reloptions probe");
 
-        // This is a RECORD of an open finding, not an endorsement. When PR-17
-        // sets security_invoker on these views, this assertion flips and the
-        // tenancy_exempt residual text must be rewritten in the same commit.
-        assert_ne!(
+        assert_eq!(
             invoker,
             Some(true),
-            "{view} now has security_invoker=true — PR-17 discharged the RLS-bypass \
-             obligation. Update its tenancy_exempt residual and invert this assertion."
+            "{view} has lost security_invoker=true. It would execute as its OWNER and BYPASS \
+             every policy migration 077 installs on the claims and edges it reads — an open \
+             read path around row-level security. Restore it with \
+             ALTER VIEW public.{view} SET (security_invoker = true)."
+        );
+
+        // The registry must agree with the catalog. Migration 077 rewrites both
+        // residuals; a future edit that reverted the view without touching
+        // `tenancy_exempt` would leave the ledger claiming a closed finding.
+        let residual: String =
+            sqlx::query_scalar("SELECT residual FROM public.tenancy_exempt WHERE table_name = $1")
+                .bind(view)
+                .fetch_one(&pool)
+                .await
+                .expect("tenancy_exempt residual");
+        assert!(
+            residual.contains("CLOSED by migration 077"),
+            "{view} is security_invoker=true but its tenancy_exempt residual still describes \
+             an open RLS bypass; got: {residual}"
         );
     }
 }

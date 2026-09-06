@@ -777,14 +777,31 @@ mod db_tests {
 
     /// The §2.5 precondition, checked at runtime against the live catalogs.
     ///
-    /// MEASURED AT MIGRATION HEAD 069: `relforcerowsecurity = false` and
-    /// `count(DISTINCT polcmd) = 0` for EVERY table in the schema, `claims`
-    /// included — RLS is PR-17's migrations 077/079. So this fires for every
-    /// table, and `claims` (which DOES have both NOT NULL columns) is the
-    /// discriminating target: it isolates the policy/FORCE half of the
-    /// precondition from the column half.
+    /// # PR-17 FLIPPED THIS TEST, AND THAT IS A PRODUCTION BEHAVIOUR CHANGE
+    ///
+    /// This function's own header records the state it was written in: "AT
+    /// MIGRATION HEAD 069 THIS REFUSES EVERY TABLE … the `columns` tier is
+    /// unregisterable through this endpoint for the whole PR-05 → PR-17
+    /// window." Migrations 077 and 079 give `claims` all four `polcmd`s, ENABLE
+    /// and FORCE, so `tenancy_precondition().is_satisfied()` is true for it and
+    /// the call SUCCEEDS. The old assertion (`ValidationError` naming "FORCE ROW
+    /// LEVEL SECURITY" and "polcmd") is now unreachable for `claims`.
+    ///
+    /// **`POST /admin/entity-types` with `tenancy_tier='columns'` therefore
+    /// becomes usable for the first time in this PR.** It is not on PR-17's
+    /// *Acceptance* line and is disclosed in the PR body. It is the intended
+    /// end state — the gate exists to refuse a tier the database cannot yet
+    /// enforce, and now it can — but it is a new capability appearing as a side
+    /// effect of a migration, which is exactly the kind of thing that should
+    /// not be discovered in production.
+    ///
+    /// The negative half of the gate is NOT lost: it moves to
+    /// [`register_entity_type_columns_tier_on_an_unprotected_table_is_400`],
+    /// which targets a table 077 deliberately leaves without policies. Deleting
+    /// the negative case and keeping only the success case would have removed
+    /// the only assertion that the §2.5 gate still refuses anything at all.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn register_entity_type_columns_tier_without_policies_is_400(pool: PgPool) {
+    async fn register_entity_type_columns_tier_is_registerable_once_rls_is_armed(pool: PgPool) {
         let state = state_with_cache(pool.clone()).await;
         let result = register_entity_type(
             axum::extract::State(state),
@@ -801,27 +818,81 @@ mod db_tests {
             }),
         )
         .await;
+        assert!(
+            result.is_ok(),
+            "claims carries both NOT NULL tenancy columns AND, from migrations 077/079, a \
+             policy for every polcmd plus ENABLE and FORCE — so the §2.5 precondition is \
+             satisfied and the columns tier is registerable; got {result:?}"
+        );
+
+        let tier: Option<String> = sqlx::query_scalar(
+            "SELECT tenancy_tier FROM entity_types WHERE type_name = 'shadow_claim'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .flatten();
+        assert_eq!(
+            tier.as_deref(),
+            Some("columns"),
+            "the registration must persist at the tier that was asked for"
+        );
+    }
+
+    /// The other half of the §2.5 gate: a table 077 does NOT protect.
+    ///
+    /// Without this, PR-17 would have deleted the only assertion that the
+    /// `columns` tier is ever refused — a gate that accepts everything passes a
+    /// success-only test exactly as well as a correct one does.
+    ///
+    /// `match_candidates` is the deliberate target, and picking it took care.
+    /// It is registered in `public.tenancy_exempt` — migration 077 gives it no
+    /// policy and 079 does not FORCE it — so it is exactly a table the
+    /// `columns` tier must still refuse. `oauth_clients`, the other obvious
+    /// candidate, is on `edges::SENSITIVE_TABLES` and is rejected by the
+    /// denylist ABOVE the tier gate with `field = "table_name"`, which would
+    /// have made this test pass for the wrong reason.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_entity_type_columns_tier_on_an_unprotected_table_is_400(pool: PgPool) {
+        let state = state_with_cache(pool.clone()).await;
+        let result = register_entity_type(
+            axum::extract::State(state),
+            axum::Extension(admin_auth(&["entity-types:write"])),
+            Json(RegisterEntityTypeRequest {
+                type_name: "shadow_client".to_string(),
+                schema_name: Some("public".to_string()),
+                table_name: Some("match_candidates".to_string()),
+                id_column: Some("id".to_string()),
+                is_optional: false,
+                tenancy_tier: Some("columns".to_string()),
+            }),
+        )
+        .await;
         match result {
             Err(ApiError::ValidationError {
                 ref field,
                 ref reason,
             }) => {
                 assert_eq!(field, "tenancy_tier");
-                assert!(
-                    reason.contains("FORCE ROW LEVEL SECURITY"),
-                    "claims has both NOT NULL columns already, so the shortfall must be \
-                     the RLS half; got: {reason}"
-                );
+                // BOTH halves, conjoined, as the test this replaced asserted.
+                // `match_candidates` falls short on both — it has no policies
+                // AND no FORCE — so a disjunction would pass while the gate had
+                // stopped reporting the polcmd list, which is the half that
+                // discriminates "no policies" from "no FORCE".
                 assert!(
                     reason.contains("polcmd"),
-                    "the 400 must name the missing policy commands; got: {reason}"
+                    "the 400 must name the missing polcmd coverage; got: {reason}"
+                );
+                assert!(
+                    reason.contains("ROW LEVEL SECURITY"),
+                    "the 400 must name the missing ROW LEVEL SECURITY; got: {reason}"
                 );
             }
-            other => panic!("columns tier without RLS must be a 400; got {other:?}"),
+            other => panic!("columns tier on an unprotected table must be a 400; got {other:?}"),
         }
 
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM entity_types WHERE type_name = 'shadow_claim'",
+            "SELECT COUNT(*) FROM entity_types WHERE type_name = 'shadow_client'",
         )
         .fetch_one(&pool)
         .await

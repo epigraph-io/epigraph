@@ -34,15 +34,40 @@
 //! through `Viewer::resolve` against seeded rows, which is the more honest
 //! fixture anyway: it exercises the real constructor.
 //!
+//! # PR-17: what "under FORCE" means here, and where it is asserted
+//!
+//! The plan's PR-17 *Tests* line asks that this file run under `FORCE`. Two
+//! different things could mean, and only one of them is a real strengthening:
+//!
+//! * **Schema-level** — every `#[sqlx::test(migrations = "../../migrations")]`
+//!   here now provisions a database at head, so the schema carries 077's
+//!   policies and 079's `FORCE`. That happened for free and proves nothing on
+//!   its own.
+//! * **Role-level** — the session is one the policies actually FILTER.
+//!   `#[sqlx::test]` connects as `epigraph`, which is superuser, `BYPASSRLS` and
+//!   the table owner, so **no assertion on the default session is affected by a
+//!   policy at all**. Most of this file is unaffected by that, because GUC
+//!   plumbing is role-independent: `set_config` and `current_setting` behave
+//!   identically for any role, so those tests are complete as they stand.
+//!
+//! The half that is NOT role-independent is the coherence claim itself — that
+//! the group set `$V` binds and the group set the RLS policy reads are the same
+//! set. That one is only observable on a filtered session, and
+//! `the_guc_and_the_policy_agree_on_a_filtered_session` below is where it is
+//! asserted, via `SET SESSION AUTHORIZATION epigraph_app`.
+//!
 //! # What is deliberately NOT here
 //!
 //! Plan §4.5's fourth bullet — the POSITIVE class, "with FORCE on, a `Scoped`
 //! viewer reads back exactly its own N group-private rows through each of the 17
-//! `claim.rs` read functions" — is not in this file. RLS is not `ENABLE`d until
-//! PR-17 and the read functions do not take a `Viewer` until PR-06, so the
-//! assertion would be vacuous today. It belongs to PR-06 (`tenant_isolation.rs`)
-//! and PR-17. This note is the record of that decision, so the absence is not
-//! mistaken for an oversight.
+//! `claim.rs` read functions" — is not in this file. It belongs to PR-06
+//! (`tenant_isolation.rs`) and to `rls_enforcement.rs`. Note also that the
+//! plan's "17" is wrong: it is the count of claim-derived TABLES elsewhere in
+//! the plan. Measured by brace-matching the `#[cfg(test)]` boundary,
+//! `repos/claim.rs` has 81 `pub fn` before the test module, 57 of which take a
+//! `Viewer`, of which 55 are reads. The unit that actually governs them all is
+//! ONE policy, `claims_tenancy`, which is why `rls_enforcement.rs` asserts at
+//! the policy level.
 
 use epigraph_db::{
     repos::AgentRepository, DbError, ScopedPool, SessionGucMode, SystemReason, Viewer,
@@ -649,4 +674,119 @@ fn session_guc_mode_from_env_only_accepts_transaction() {
         SessionGucMode::from_env("  TRANSACTION \n"),
         SessionGucMode::Transaction
     );
+}
+
+// ---------------------------------------------------------------------------
+// PR-17 — the coherence claim on a session the policies actually FILTER
+// ---------------------------------------------------------------------------
+
+/// The group set `$V` binds and the group set the RLS policy reads are the same
+/// set, asserted where that can fail: on a non-owner, non-`BYPASSRLS` session.
+///
+/// Every other test in this file runs on the `#[sqlx::test]` connection, which
+/// is `epigraph` — superuser, `BYPASSRLS`, and the owner of `claims`. A policy
+/// filters none of those, so those tests establish the GUC plumbing (which is
+/// role-independent and genuinely is what they are for) and nothing about
+/// enforcement. Switching `session_user` is the only lever available:
+/// `epigraph_app` is `NOLOGIN` (migration 060) so there is no second DSN, and
+/// `SET ROLE` would change only `current_user` while `epigraph_bypass()` keys on
+/// `session_user`.
+///
+/// The ORDER of the two statements is load-bearing. `acquire_as` stamps the GUCs
+/// first; `SET SESSION AUTHORIZATION` then changes the role WITHOUT clearing
+/// them, because GUCs are session state and a role change is not a reset. That
+/// is what lets one connection carry a real viewer's group set into a filtered
+/// role — and it is also the honest simulation of what step 11d produces.
+///
+/// Three assertions, and the middle one is the calibration: without it, a policy
+/// that returned nothing to anybody would satisfy the third.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_guc_and_the_policy_agree_on_a_filtered_session(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let Env { pool, scoped } = env(pool_opts, conn_opts, SessionGucMode::Session).await;
+
+    let agent = seed_agent(&pool).await;
+    let mine = seed_group(&pool).await;
+    seed_membership(&pool, mine, agent, "admin").await;
+    let theirs = seed_group(&pool).await; // no membership for `agent`
+
+    let my_claim = seed_group_claim(&pool, agent, mine).await;
+    let their_claim = seed_group_claim(&pool, agent, theirs).await;
+
+    let viewer = Viewer::resolve(&pool, agent).await.expect("resolve");
+    let mut c = scoped.acquire_as(&viewer).await.expect("acquire_as");
+
+    // Migration 077 issues the app-role grants itself; NOT re-granting here is
+    // deliberate, because it makes this test depend on the migration rather
+    // than on a fixture that would paper over a missing grant.
+    c.execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("SET SESSION AUTHORIZATION requires a superuser connection");
+
+    let (gucs,): (Vec<Uuid>,) = sqlx::query_as("SELECT epigraph_session_groups()")
+        .fetch_one(&mut *c)
+        .await
+        .expect("epigraph_session_groups() after the role switch");
+    let visible_mine: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = $1")
+        .bind(my_claim)
+        .fetch_one(&mut *c)
+        .await
+        .expect("read my own group-private claim");
+    let visible_theirs: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = $1")
+        .bind(their_claim)
+        .fetch_one(&mut *c)
+        .await
+        .expect("read a claim in a group I am not in");
+    let bypass: bool = sqlx::query_scalar("SELECT epigraph_bypass()")
+        .fetch_one(&mut *c)
+        .await
+        .expect("epigraph_bypass()");
+
+    c.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+
+    assert!(
+        !bypass,
+        "CALIBRATION: this session must NOT hold bypass, or every assertion below passes \
+         vacuously — which is the failure mode the whole file's header warns about"
+    );
+    assert!(
+        sorted(gucs.clone()).contains(&mine),
+        "the viewer's group must still be in epigraph.group_ids after the role switch; \
+         got {gucs:?}"
+    );
+    assert_eq!(
+        visible_mine, 1,
+        "COHERENCE: the group the viewer bound as $V is in the GUC, so claims_tenancy must \
+         admit that group's private claim. Zero here means the qual and the policy disagree — \
+         the fail-closed drift this file exists to catch, indistinguishable from data loss."
+    );
+    assert_eq!(
+        visible_theirs, 0,
+        "the other direction of the same claim: a group NOT in the GUC must be filtered, or \
+         the policy is admitting more than $V would"
+    );
+}
+
+/// Seed a `visibility = 'group'` claim owned by `group`.
+async fn seed_group_claim(pool: &PgPool, agent: Uuid, group: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                             is_current, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.8, $4, true, 'group', $5)",
+    )
+    .bind(id)
+    .bind(format!("qual-guc claim {id}"))
+    .bind(&hash)
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed group claim");
+    id
 }
