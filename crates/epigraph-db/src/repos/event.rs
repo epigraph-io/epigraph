@@ -83,29 +83,93 @@ impl EventRepository {
     /// of this regex. The three must agree; they are cross-referenced in all
     /// three places for that reason.
     ///
-    /// ## ⚠ THE TWO HALVES DIFFER IN AUTHORITY AS OF PR-24 — filed, not silently left
+    /// # BOTH ARMS RUN INSIDE A DEFINER FRAME (PR-25)
     ///
-    /// **Not** a regression in the uuid-extraction rule the paragraph above
-    /// pins: PR-24 changed none of the three scanners, and `rust ⊇ sql` still
-    /// holds. What diverged is the AUTHORITY each half's suppression step runs
-    /// with.
+    /// The two halves no longer differ in AUTHORITY. Nothing about the
+    /// uuid-extraction rule the paragraph above pins has changed — the three
+    /// scanners are untouched and `rust ⊇ sql` still holds; what PR-25 changed
+    /// is where each arm of the suppression step draws its authority from.
     ///
     /// The predicate below is the same set difference `hidden_claim_ids` takes,
-    /// written as `EXISTS(cx) AND NOT EXISTS(c …)`. It has the same structural
-    /// weakness the Rust half had before migration 086: both `EXISTS` arms read
-    /// `claims` directly, so on a role the `claims_tenancy` policy applies to
-    /// they are filtered identically and the inner condition can no longer be
-    /// satisfied. PR-24 repaired the Rust half only, because the SQL half is a
-    /// second surface with its own tests and its own bookkeeping and was not in
-    /// that PR's scope. Recorded as
-    /// `F-PR24-event-list-existence-arm-collapses-under-force` in
-    /// `docs/tenancy/progress.json`.
+    /// written as `EXISTS(cx) AND NOT EXISTS(c …)`. It answers something only
+    /// while the two arms have **different** authority. Read against `claims`
+    /// directly they do not, once migration 079's FORCE posture is live on an
+    /// application role: `claims_tenancy` (077) filters both arms identically,
+    /// the conjunction can never be satisfied, the outer `EXISTS` is always
+    /// false, and **nothing is suppressed**. An always-false suppression test
+    /// is fail-OPEN, not conservative. That was
+    /// `F-PR24-event-list-existence-arm-collapses-under-force`: PR-24 repaired
+    /// the Rust half (`hidden_claim_ids`) and filed this, the SQL half, rather
+    /// than leaving it silent. PR-25 closes it.
     ///
-    /// **No further migration is needed to close it.** 086's
-    /// `public.epigraph_claim_tenancy_by_ids(uuid[])` takes an array, so an
-    /// array-of-one call fits this per-match subquery directly — measured
-    /// working on the throwaway. Latent today, like the Rust half was: every
-    /// environment's DSN is still the owning superuser.
+    /// Both arms now read `public.epigraph_claim_tenancy_by_ids(uuid[])`
+    /// (migration **086**; no second migration was needed — its signature
+    /// already takes an array, so an array-of-one call fits this per-match
+    /// subquery directly), and the `/* {VISIBILITY:c} */` marker is spliced
+    /// over **that function's output** rather than over `claims`. The only
+    /// filter left on either arm is the viewer's own predicate, which is the
+    /// authority this signature promises, and it is independent of whether the
+    /// session is stamped, unstamped, or incoherently stamped.
+    ///
+    /// ## Why the existence arm alone was not enough
+    ///
+    /// Routing only `cx` through the definer and leaving arm 2 on `claims`
+    /// looks sufficient and is not. Arm 2 would still be narrowed by the policy
+    /// to `visibility = 'public'` whatever `$V` binds, because nothing on the
+    /// request path stamps the session GUCs
+    /// (`D-PR17-request-path-never-stamps-session-gucs`) — this function takes
+    /// a raw `&PgPool` and all three callers hand it an unstamped one. A
+    /// group-private claim a MEMBER viewer is entitled to read then looks
+    /// invisible and the event carrying it is dropped: over-suppression, the
+    /// opposite failure, silent and 200-shaped. PR-24 measured that as its
+    /// Mutation B. The arm that catches it here is the member assertion in
+    /// `epigraph-db/tests/rls_enforcement.rs::event_list_still_suppresses_on_the_app_role_under_force`.
+    ///
+    /// ## Two definer calls, not one CTE
+    ///
+    /// `hidden_claim_ids` classifies a caller-supplied array and can therefore
+    /// hoist ONE call over both arms in a CTE. Here the ids arrive from a
+    /// per-row, per-match `regexp_matches` correlation, which no CTE can be
+    /// hoisted over, so the two arms call the definer separately. They cannot
+    /// disagree about the row set: the function is `LANGUAGE sql STABLE`, so
+    /// both calls within one statement are evaluated against one snapshot and
+    /// return the same rows for the same argument. This is the snapshot
+    /// argument, not PR-24's one-CTE argument, which is about making the
+    /// symmetry legible rather than about a divergence risk.
+    ///
+    /// A `Bypass` viewer still short-circuits through the existing mechanism:
+    /// `splice` renders it to a bare separator, the two arms coincide, and the
+    /// difference is empty. Nothing hand-rolls that branch.
+    ///
+    /// ## Ordering: 086 must be applied before a binary carrying this serves traffic
+    ///
+    /// The call is unconditional and has no fallback, so on a pre-086 database
+    /// it raises `42883` on **every** `GET /api/v1/events`, every
+    /// `GET /api/v1/graph/snapshot/:version` and all of MCP `list_events` — the
+    /// last two having no Rust backstop at all. 086's own header states this
+    /// rule for `hidden_claim_ids`; it now covers three more surfaces.
+    /// `server.rs::should_migrate_on_boot` is opt-in, so the ordering is
+    /// enforced by running `epigraph-migrate` first.
+    ///
+    /// ## Scope limit: the control is keyed to `claims` ONLY
+    ///
+    /// Stated because the section above says "both halves now draw the same
+    /// authority from the same definer", and that is a claim about AUTHORITY,
+    /// not about COVERAGE. `public.epigraph_claim_tenancy_by_ids` classifies
+    /// `public.claims` rows and nothing else, so a payload uuid naming a row in
+    /// any other tenanted table — `edges`, `challenges`, `evidence`,
+    /// `perspectives`, `communities`, `contexts`, `frames` — is not classified:
+    /// the existence arm finds nothing, the outer `NOT EXISTS` is true, and the
+    /// event is delivered. That is the same branch the "names a uuid that
+    /// resolves to no `claims` row" survivor below takes, and it is reached for
+    /// the same reason. Live emitters of that shape today are
+    /// `epigraph-mcp/src/tools/edge_mutation.rs` (`edge.deleted`,
+    /// `edge.retired`) and `epigraph-api/src/routes/gaps.rs`
+    /// (`gap.surfaced`). Recorded as
+    /// `F-PR25-event-suppression-is-claims-keyed-only` in
+    /// `docs/tenancy/progress.json`; widening it is a `node_type`-dispatched
+    /// multi-table gate with its own placement reasoning and is deliberately
+    /// not attempted inline here.
     ///
     /// ## Two shapes that deliberately survive the filter
     ///
@@ -127,8 +191,16 @@ impl EventRepository {
     /// ## Cost
     ///
     /// One regex pass over each event row the `created_at` ordering touches,
-    /// plus a primary-key probe per uuid found. The overwhelming majority of
-    /// rows pass, so `LIMIT n` still stops after roughly `n` rows.
+    /// plus — since PR-25 — **two definer invocations** per uuid found rather
+    /// than two primary-key probes on `claims`. `SECURITY DEFINER` blocks
+    /// SQL-function inlining, so the planner cannot see through either call and
+    /// falls back to its default row estimate for both. That is a real hot-path
+    /// change and is accepted as the price of the arms having different
+    /// authority; it is not made better here. Scan cost on this surface is
+    /// tracked separately as `F-graph-snapshot-scan-cost`, which owns
+    /// `graph_snapshot` passing `version + 1` as the limit and filtering
+    /// client-side. The overwhelming majority of rows still pass, so `LIMIT n`
+    /// stops after roughly `n` rows.
     ///
     /// # Errors
     ///
@@ -149,10 +221,14 @@ impl EventRepository {
                      SELECT 1 \
                      FROM regexp_matches(e.payload::text, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-\
 [0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', 'g') AS m \
-                     WHERE EXISTS (SELECT 1 FROM claims cx WHERE cx.id = m[1]::uuid) \
+                     WHERE EXISTS ( \
+                             SELECT 1 \
+                             FROM public.epigraph_claim_tenancy_by_ids(ARRAY[m[1]::uuid]) cx \
+                           ) \
                        AND NOT EXISTS ( \
-                             SELECT 1 FROM claims c \
-                             WHERE c.id = m[1]::uuid /* {VISIBILITY:c} */ \
+                             SELECT 1 \
+                             FROM public.epigraph_claim_tenancy_by_ids(ARRAY[m[1]::uuid]) c \
+                             WHERE true /* {VISIBILITY:c} */ \
                            ) \
                    ) \
              ORDER BY e.created_at DESC LIMIT $3",
@@ -172,6 +248,16 @@ impl EventRepository {
     }
 
     /// Get the latest graph version number.
+    ///
+    /// **Deliberately viewer-less** (recorded by PR-25, which rewrote the doc
+    /// of its `graph_snapshot` caller). `events` carries no tenancy columns and
+    /// no RLS, and the projection is a single global `MAX(graph_version)` — a
+    /// monotonic count of write activity, not a row anyone owns. There is
+    /// nothing here for a viewer predicate to narrow, so this takes no
+    /// `Viewer`. `visibility_lint.rs` inspects `.splice(` bodies and therefore
+    /// cannot see a viewer-less function at all; this note is the record that
+    /// the exclusion is a decision rather than an omission. It is NOT a
+    /// `VISIBILITY-EXEMPT` annotation, which that lint would not read here.
     pub async fn get_latest_version(pool: &PgPool) -> Result<i64, sqlx::Error> {
         let version: Option<i64> = sqlx::query_scalar("SELECT MAX(graph_version) FROM events")
             .fetch_one(pool)

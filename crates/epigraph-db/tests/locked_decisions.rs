@@ -412,6 +412,92 @@
 //!   51, and `bin/server.rs` stays in `EXEMPT` at 3. Only the prose reasons
 //!   change, because the follow-up they pointed at is this PR.
 
+//! ## Status at PR-25
+//!
+//! **PR-25 adds NO migration and does NOT touch any of the four.** Stated
+//! explicitly, following PR-10's and PR-24's precedent. §0.2's rejection trigger
+//! fires on *"a PR that changes an RLS policy, a route split, or a tenancy
+//! column and does not touch this file"* — PR-25 changes none of the three, so
+//! the trigger does not fire and this block is convention rather than
+//! obligation. It is written because the D1 residual PR-24 recorded now applies
+//! to a second function, on strictly worse terms.
+//!
+//! PR-25 repairs `epigraph-db/src/repos/event.rs::EventRepository::list` — the
+//! SQL twin of `hidden_claim_ids`, and the only tenancy control over the event
+//! ROWS returned by the persisted half of `GET /api/v1/events`, by
+//! `GET /api/v1/graph/snapshot/:version`, and by all of MCP `list_events`. Read
+//! "only tenancy control" as a statement about AUTHORITY, not COVERAGE: the
+//! predicate classifies payload uuids against `claims` alone, so a payload
+//! naming a row in another tenanted table is not classified at all, and
+//! `graph_snapshot`'s `current_version` comes from the deliberately viewer-less
+//! `EventRepository::get_latest_version` rather than through this predicate.
+//! Both limits are recorded — the first as the open finding
+//! `F-PR25-event-suppression-is-claims-keyed-only`, the second in that
+//! function's own doc. It routes **both** arms of that predicate
+//! through 086's existing `epigraph_claim_tenancy_by_ids(uuid[])`. No new
+//! migration; no new database object; `d4_migration_086_installs_no_policy`
+//! below is unaffected, and it reads the migration source, not the tree.
+//!
+//! * **No RLS policy, no route split, no tenancy column.** One SQL string
+//!   literal in one repo function, plus one new test and doc corrections. Zero
+//!   `pg_policy` rows read, added, removed or edited; no handler signature
+//!   changes; `public_router_allowlist.rs` and `viewer_route_table_lint.rs` are
+//!   untouched; `tenancy_coverage.rs`' cardinality-12 pin is untouched.
+//! * **D1 — the residual is UNCHANGED IN KIND and WIDER IN BLAST RADIUS.**
+//!   Degraded definer authority is still fail-OPEN, and here it is worse than it
+//!   is for `hidden_claim_ids`. The mechanism is the same: if the frame loses
+//!   its authority (a silently no-opped `ALTER FUNCTION … OWNER TO`, or
+//!   `epigraph_maintenance` losing `SELECT` on `claims`) both arms shrink to the
+//!   rows the policy admits, the existence arm stops finding the row, the
+//!   conjunction is unsatisfiable, and **every** event is returned. What is
+//!   worse is the reach: `routes/events.rs::list_events` at least has a second,
+//!   independent Rust control on its ring-buffer half, whereas `graph_snapshot`
+//!   and MCP `list_events` have **no Rust backstop at all**, and `events`
+//!   carries no RLS of its own. So the `DEFERRED_DEFINER_FUNCTIONS` entry in
+//!   `epigraph-cli/src/bin/tenancy_backfill.rs`, checked by `verify`, is now the
+//!   only thing standing behind three read surfaces instead of two. PR-25 adds
+//!   no new entry there — the function is already registered, and the *same*
+//!   function is what backs both probes — but the stake it carries is larger.
+//!   **That constant's own doc still names only `hidden_claim_ids`**, because
+//!   editing any `epigraph-cli` file would make the `genai` feature gate owed by
+//!   a diff that otherwise touches no crate it gates; the drift is recorded as a
+//!   deferred obligation in `docs/tenancy/progress.json` rather than left to be
+//!   rediscovered, and THIS block is the current statement of the stake.
+//!   `schema_contract.rs::migration_086_read_definer_is_revoked_from_public` is
+//!   likewise untouched and likewise load-bearing for more surfaces.
+//! * **D1 — a missing `EXECUTE` grant is still fail-CLOSED here, but the
+//!   symptom differs from `hidden_claim_ids`' and must not be transcribed from
+//!   it.** There, `42501` becomes a DROP via the PR-10 error trio. Here it
+//!   becomes an `Err` out of `EventRepository::list`, i.e. a 500 on
+//!   `GET /api/v1/events` and on `graph_snapshot` and an error from MCP
+//!   `list_events` — a total outage of the surfaces the predicate protects, not
+//!   a silent leak. The same is true of a `42883` on a pre-086 database.
+//! * **D3 (`public` means any authenticated agent; no anonymous shape)** —
+//!   unchanged. No `Viewer` shape, constructor or `SystemReason` is added;
+//!   `Viewer::system(` and `Viewer::bypass_bind` appear nowhere in the diff. All
+//!   three callers are on the `protected` chain and none moves. The repaired
+//!   statement keeps its `Viewer::splice` marker — over the definer function's
+//!   output rather than over `claims` — so the viewer is spent in SQL exactly as
+//!   `visibility_lint.rs` requires, the bind index stays 4 (the array literal is
+//!   inline, so no positional parameter is added), the guarded
+//!   `if let Some(g) = viewer.group_bind()` bind is preserved, and **no new
+//!   `VISIBILITY-EXEMPT:` entry is taken.** That last is a decision, not luck:
+//!   this is a READ path, which matches none of `EXPECTED_EXEMPTIONS`' three
+//!   categories, and that set's own doc says an exemption on a read path is
+//!   almost always a leak being annotated rather than fixed.
+//! * **No write-side predicate.** 086's function is `STABLE` and its body is a
+//!   `SELECT`; PR-25 adds no SQL of any other kind. `EventRepository::{insert,
+//!   publish_or_log, publish_or_log_conn}` are untouched and PR-16 still owns
+//!   the write-side predicate, including the `create_event` / `publish_event`
+//!   attribution surface. No `FAIL_OPEN_SCOPE_SITES` row moved.
+//! * **The `no_unscoped_pool.rs` counters do not move.** PR-25 converts nothing
+//!   and is explicitly not a conversion shard: `UNCONVERTED` keeps
+//!   `routes/events.rs` at 6 and `routes/webhooks.rs` at 3, `HIGH_WATER` stays
+//!   414, `HIGH_WATER_FILES` 51, `bin/server.rs` stays in `EXEMPT` at 3. Only
+//!   the prose changes, and the do-not-convert rule stays IMPERATIVE — it now
+//!   rests on `D-PR17-request-path-never-stamps-session-gucs` alone, which PR-25
+//!   does not discharge. **§9.2 step 11d remains blocked.**
+
 use sqlx::PgPool;
 use std::collections::BTreeSet;
 
