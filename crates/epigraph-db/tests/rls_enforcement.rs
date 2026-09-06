@@ -1520,3 +1520,289 @@ async fn hidden_claim_ids_still_classifies_on_the_app_role_under_force(pool: PgP
          tree."
     );
 }
+
+// ===========================================================================
+// PR-25 — the SQL twin of the existence probe, on a role a policy filters
+// ===========================================================================
+
+/// `EventRepository::list` must still suppress events on an `epigraph_app`
+/// session with FORCE live.
+///
+/// # This is the ONLY instrument in the tree that discriminates
+///
+/// `list` decides "does this event name a claim that exists but this viewer
+/// cannot read" as a set difference between an existence arm and a
+/// viewer-filtered arm, in SQL. That is informative only while the two arms
+/// have different authority. Before PR-25 both read `claims` directly, so on a
+/// role `claims_tenancy` applies to they were filtered identically, the
+/// conjunction became unsatisfiable, and **nothing was suppressed at all** —
+/// fail-OPEN, and `events` carries no RLS of its own (it is absent from 077 and
+/// from 079's `protected` array, verified in the catalog), so this predicate is
+/// the only tenancy control on that read path. That was
+/// `F-PR24-event-list-existence-arm-collapses-under-force`.
+///
+/// Nothing in the pre-existing suite could see it, and no `epigraph-db` test
+/// called `EventRepository::list` at all. Every other exerciser —
+/// `epigraph-mcp/tests/tenant_isolation_mcp.rs`' four `list_events_*` cases,
+/// `epigraph-api/tests/tenant_isolation_http.rs`,
+/// `epigraph-api/tests/events_unified_test.rs`,
+/// `epigraph-mcp/tests/event_log_wiring_tests.rs` — runs on a pool connected as
+/// the owning superuser, for whom no policy applies. Their answers are
+/// identical before and after this repair. That structural insensitivity, not a
+/// missing edge case, is why this test exists.
+///
+/// # Why an app-role POOL and not `fixture::as_role`
+///
+/// `list` takes a `&PgPool`; `as_role` hands back a `PoolConnection`.
+/// Transcribing the SQL into this file would satisfy the words of the criterion
+/// and not the criterion — the thing under test is the production function. So
+/// this builds a one-connection pool whose `after_connect` issues
+/// `SET SESSION AUTHORIZATION epigraph_app`, the shape
+/// `security_event_log_writes_under_rls_on_the_app_role` and
+/// `hidden_claim_ids_still_classifies_on_the_app_role_under_force` already
+/// establish. `max_connections(1)` is load-bearing for the GUC arm at the end:
+/// a session-level `set_config` only sticks if there is one connection.
+///
+/// # The four properties, and why the second and the calibration are not garnish
+///
+/// 1. an event naming an existing claim the viewer may NOT read is
+///    **suppressed**;
+/// 2. an event naming that same claim is **returned** to a MEMBER of the owning
+///    group — this is the one an existence-arm-only repair fails, because the
+///    viewer-filtered arm would still be narrowed by the policy to
+///    `visibility = 'public'` on an unstamped connection whatever `$V` binds,
+///    so a claim the member is entitled to read looks invisible and its event
+///    is dropped. Over-suppression, the opposite failure;
+/// 3. an event naming **no** uuid at all is returned (most events; `NOT EXISTS`
+///    over an empty match set), and an event naming a uuid that matches **no**
+///    row is returned — the deliberate survivor documented at
+///    `EventRepository::list` and pinned by
+///    `tenant_isolation_mcp.rs::list_events_keeps_an_event_whose_payload_uuid_names_no_claim`;
+/// 4. **calibration** — the same fixture and the same viewer on the OWNER
+///    connection still suppresses the private event. Without (4), a predicate
+///    that suppressed nothing for an unrelated reason (a no-opped `OWNER TO`, a
+///    lost `SELECT` grant on `claims`) satisfies every *positive* assertion
+///    here, and property 1 is the only negative one.
+///
+/// # The GUCs are deliberately left UNSET for the main arms
+///
+/// That is the production shape: all three callers
+/// (`routes/events.rs::list_events`, `routes/events.rs::graph_snapshot`, MCP
+/// `tools/events.rs::list_events`) pass a raw `&PgPool` sourced from
+/// `state.db_pool` / `server.pool`, and nothing on the request path stamps it
+/// (`D-PR17-request-path-never-stamps-session-gucs`). The final arm stamps them
+/// coherently and asserts the answers are *unchanged*, which is the
+/// GUC-independence property the definer frame buys.
+///
+/// Assertions are by id membership, never by position or length: all four
+/// events are inserted with `created_at = NOW()`, so `ORDER BY created_at DESC`
+/// ties are not deterministic.
+///
+/// A `42501` here is a missing `GRANT EXECUTE` from 086, not a broken
+/// predicate: `fixture::grant_app_privileges` grants schema, tables and
+/// sequences and not functions.
+#[sqlx::test(migrations = "../../migrations")]
+async fn event_list_still_suppresses_on_the_app_role_under_force(pool: PgPool) {
+    use epigraph_db::repos::EventRepository;
+    use epigraph_db::Viewer;
+
+    // `member` owns the private claim's group; `stranger` has a personal group
+    // of its own and no membership in `member`'s.
+    let (member_agent, group) = fixture::seed_agent_with_group(&pool, "pr25-member").await;
+    let (stranger_agent, _stranger_group) =
+        fixture::seed_agent_with_group(&pool, "pr25-stranger").await;
+
+    let public_id = fixture::seed_public_claim(&pool, member_agent, "pr25 public claim").await;
+    let private_id =
+        fixture::seed_group_claim(&pool, member_agent, group, "pr25 private claim").await;
+    let absent_id = Uuid::new_v4();
+
+    // Every event carries the same `actor_id`, and every read below filters on
+    // it. That isolates this fixture from any other row in `events` without
+    // relying on `LIMIT` or on the `created_at` ordering.
+    let ev_private = EventRepository::insert(
+        &pool,
+        "pr25.names_private",
+        Some(member_agent),
+        &serde_json::json!({ "claim_id": private_id }),
+    )
+    .await
+    .expect("seed event naming the private claim");
+    let ev_public = EventRepository::insert(
+        &pool,
+        "pr25.names_public",
+        Some(member_agent),
+        &serde_json::json!({ "claim_id": public_id }),
+    )
+    .await
+    .expect("seed event naming the public claim");
+    let ev_no_uuid = EventRepository::insert(
+        &pool,
+        "pr25.names_nothing",
+        Some(member_agent),
+        &serde_json::json!({ "note": "no identifier of any kind in this payload" }),
+    )
+    .await
+    .expect("seed event naming no claim");
+    let ev_absent = EventRepository::insert(
+        &pool,
+        "pr25.names_absent",
+        Some(member_agent),
+        &serde_json::json!({ "claim_id": absent_id }),
+    )
+    .await
+    .expect("seed event naming an id that matches no row");
+
+    // Viewers are resolved the way production resolves them. `Viewer::test_scoped`
+    // is `#[cfg(test)]` on its definition and is not reachable from this crate's
+    // integration tests; see `viewer_fixture.rs`'s module doc.
+    let member = Viewer::resolve(&pool, member_agent)
+        .await
+        .expect("resolve member");
+    let stranger = Viewer::resolve(&pool, stranger_agent)
+        .await
+        .expect("resolve stranger");
+    assert!(
+        member.group_bind().is_some_and(|g| g.contains(&group)),
+        "the member viewer must actually carry the owning group, or property 2 \
+         below is vacuous"
+    );
+    assert!(
+        stranger.group_bind().is_some_and(|g| !g.contains(&group)),
+        "the stranger viewer must NOT carry the owning group, or property 1 \
+         below is vacuous"
+    );
+
+    async fn visible_ids(
+        pool: &PgPool,
+        viewer: &Viewer,
+        actor: Uuid,
+    ) -> std::collections::HashSet<Uuid> {
+        EventRepository::list(pool, viewer, None, Some(actor), 100)
+            .await
+            .expect("EventRepository::list")
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    }
+
+    // ---- (4) CALIBRATION, on the owner connection, BEFORE the app-role arms.
+    // If the private event is not suppressed here the fixture cannot detect a
+    // suppression at all and every assertion after it would be meaningless.
+    let owner_seen = visible_ids(&pool, &stranger, member_agent).await;
+    assert!(
+        !owner_seen.contains(&ev_private),
+        "CALIBRATION: the owner connection must suppress the event naming a \
+         group-private claim from a stranger. It does not, so the fixture — not \
+         the predicate — is what the app-role assertions below would be \
+         measuring."
+    );
+    assert!(
+        owner_seen.contains(&ev_public)
+            && owner_seen.contains(&ev_no_uuid)
+            && owner_seen.contains(&ev_absent),
+        "CALIBRATION: a public claim, no uuid at all, and a uuid naming no row \
+         are all returned. Got: {owner_seen:?}"
+    );
+
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+    let url = fixture::database_url_for(&pool).await;
+    let app_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET SESSION AUTHORIZATION epigraph_app")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("app-role pool");
+
+    // The instrument is not vacuous: this session really is filtered.
+    let visible_to_the_session: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = ANY($1)")
+            .bind(&[public_id, private_id][..])
+            .fetch_one(&app_pool)
+            .await
+            .expect("count under the app role");
+    assert_eq!(
+        visible_to_the_session, 1,
+        "PREMISE: an unstamped epigraph_app session must see exactly the PUBLIC \
+         one of the two seeded rows. Seeing both means FORCE is not in effect \
+         (or the role is a bypass role) and the whole test is vacuous; seeing \
+         neither means a grant is missing."
+    );
+
+    // ---- (1) and (3): the stranger.
+    let seen = visible_ids(&app_pool, &stranger, member_agent).await;
+    assert!(
+        !seen.contains(&ev_private),
+        "an event naming an existing claim this viewer cannot read must be \
+         SUPPRESSED on the app role. Returning it is the collapse this repair \
+         exists to close: both inner arms filtered identically, the conjunction \
+         unsatisfiable, the outer EXISTS always false — fail-OPEN, and `events` \
+         has no RLS behind it. Got: {seen:?}"
+    );
+    assert!(
+        seen.contains(&ev_public),
+        "an event naming a public claim is returned to anyone"
+    );
+    assert!(
+        seen.contains(&ev_no_uuid),
+        "an event naming no uuid at all is returned — NOT EXISTS over an empty \
+         match set"
+    );
+    assert!(
+        seen.contains(&ev_absent),
+        "an event naming a uuid that matches NO row is returned: there is no row \
+         to classify and no owner to protect, and dropping it would make \
+         `graph_snapshot`'s replay depend on referential integrity rather than \
+         on visibility"
+    );
+
+    // ---- (2): the member. This is the property an existence-arm-only repair
+    // fails, and it fails it SILENTLY and in the over-suppressing direction.
+    let for_member = visible_ids(&app_pool, &member, member_agent).await;
+    assert!(
+        for_member.contains(&ev_private),
+        "a member of the owning group must still RECEIVE the event naming its \
+         own group-private claim, on an UNSTAMPED app-role connection — which \
+         is the shape all three callers have. Without this, a predicate that \
+         suppresses every event naming any existing claim passes every \
+         assertion above, and production would silently drop a member's own \
+         group-visible events. Got: {for_member:?}"
+    );
+    assert!(
+        for_member.contains(&ev_public)
+            && for_member.contains(&ev_no_uuid)
+            && for_member.contains(&ev_absent),
+        "the member sees the other three too. Got: {for_member:?}"
+    );
+
+    // ---- GUC-INDEPENDENCE. Stamp the session coherently and assert both
+    // answers are unchanged. The repair puts both arms inside the definer frame,
+    // so the viewer — not `epigraph_session_groups()` — is the only authority
+    // either arm consults.
+    sqlx::query("SELECT set_config('epigraph.group_ids', $1, false)")
+        .bind(group.to_string())
+        .execute(&app_pool)
+        .await
+        .expect("stamp epigraph.group_ids");
+
+    let stamped_member = visible_ids(&app_pool, &member, member_agent).await;
+    let stamped_stranger = visible_ids(&app_pool, &stranger, member_agent).await;
+    assert_eq!(
+        stamped_member, for_member,
+        "stamping must not change the member's answer"
+    );
+    assert_eq!(
+        stamped_stranger, seen,
+        "stamping the OWNING group must not make the private claim's event \
+         visible to a STRANGER. The viewer is the authority here, not the \
+         session GUC — and a test that relied on the GUC instead would have \
+         passed on the unfixed tree."
+    );
+}

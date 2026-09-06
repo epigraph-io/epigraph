@@ -73,35 +73,47 @@
 //!   `F-PR23-existence-probe-collapses-under-force` is closed.
 //!
 //!   **DO NOT convert `routes/webhooks.rs` or `routes/events.rs`. Closing the
-//!   probe did not make them safe to convert, and a shard must not read it that
-//!   way.** The prohibition stands on two things that are still open, and
+//!   probes did not make them safe to convert, and a shard must not read it that
+//!   way.** As of PR-25 the prohibition stands on reason (2) ALONE — reason (1)
+//!   is closed and is kept, not deleted, because the hazard it names is general.
 //!   `docs/tenancy/progress.json`'s `prs.next` is worded to match — if the two
 //!   ever disagree about the FORCE of this rule, that disagreement is itself the
 //!   finding:
 //!
-//!   1. `F-PR24-event-list-existence-arm-collapses-under-force`. The SQL twin of
-//!      the repaired probe — `EventRepository::list`'s suppression predicate,
-//!      which is what serves the *persisted* half of `GET /api/v1/events` and
-//!      all of MCP `list_events` — still reads `claims` directly on both arms
-//!      and still collapses. `routes/events.rs` therefore remains a file whose
-//!      conversion would turn this ratchet green over a control that has stopped
-//!      working, which is exactly the hazard this bullet was written for. PR-24
-//!      moved the reason, it did not remove it. **The same hold applies to
-//!      `crates/epigraph-mcp/src/tools/events.rs`**, which calls
-//!      `EventRepository::list` with no Rust backstop at all — and which this
-//!      ratchet cannot see, because its scan root is `crates/epigraph-api/src`
-//!      and `epigraph-mcp` appears only in the Known-limits section above. No
-//!      counter protects that file, so this sentence is the only control on it.
+//!   1. **CLOSED BY PR-25, recorded rather than removed.**
+//!      `F-PR24-event-list-existence-arm-collapses-under-force` was the SQL twin
+//!      of the repaired probe — `EventRepository::list`'s suppression predicate,
+//!      which serves the *persisted* half of `GET /api/v1/events`, all of
+//!      `GET /api/v1/graph/snapshot/:version`, and all of MCP `list_events`. It
+//!      read `claims` directly on both arms and collapsed the same way. PR-25
+//!      moved both arms into 086's `SECURITY DEFINER` frame; no migration was
+//!      needed. This reason no longer holds the prohibition up — reason (2)
+//!      does, on its own — but the sentence stays, because the hazard is not
+//!      specific to that finding: converting a file whose suppression control
+//!      has stopped working turns this ratchet green over nothing, and the next
+//!      shard must check the control before it checks the counter. **The
+//!      separate hold on `crates/epigraph-mcp/src/tools/events.rs` is NOT
+//!      lifted and never was about conversion**: it calls
+//!      `EventRepository::list` with no Rust backstop at all, and this ratchet
+//!      cannot see it, because its scan root is `crates/epigraph-api/src` and
+//!      `epigraph-mcp` appears only in the Known-limits section above. No
+//!      counter protects that file, so this sentence is still the only control
+//!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d. PR-24 discharged one precondition, not the gate.
+//!      §9.2 step 11d with 414 unconverted sites. **This alone is sufficient for
+//!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
+//!      second; neither discharged the gate, and PR-25 must not be read as
+//!      unblocking step 11d.
 //!
 //!   And independently of both, the conversion is unargued: each file takes a
 //!   raw `&PgPool` as a *parameter* (from `state.db_pool` and from the
 //!   webhook-dispatcher handoff in the EXEMPT `bin/server.rs`), so a conversion
 //!   is a signature change across a process-lifetime task boundary rather than a
-//!   `read_as` swap — and the Rust probe is now correct on an unstamped
-//!   connection, so stamping buys nothing *for that control*. See
-//!   `hidden_claim_ids`' own doc comment for the mechanism.
+//!   `read_as` swap — and BOTH probes (the Rust `hidden_claim_ids` and, since
+//!   PR-25, the SQL `EventRepository::list`) are now correct on an unstamped
+//!   connection, so stamping buys nothing *for those controls*. See
+//!   `hidden_claim_ids`' and `EventRepository::list`'s own doc comments for the
+//!   mechanism.
 //! * **The repo layer does not yet serve this at scale.** Measured under
 //!   `crates/epigraph-db/src/repos/`: 206 `pub async fn` take both a
 //!   `pool: &PgPool` and a `Viewer`, and only 12 `*_conn` siblings exist at

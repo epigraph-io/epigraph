@@ -377,18 +377,22 @@ pub async fn list_events(
 /// `payload_uuid_tests::an_over_long_hex_run_yields_its_prefix_in_both_implementations`,
 /// which records the Postgres output verbatim.
 ///
-/// ## Scope of that superset property — EXTRACTION only (PR-24)
+/// ## Scope of that superset property — EXTRACTION only, still
 ///
-/// `rust ⊇ sql` is a claim about which uuids each side *extracts*, and PR-24
-/// changed neither scanner. It says nothing about what each side then does with
-/// them, and as of PR-24 the two halves no longer agree about THAT: migration
-/// 086 moved `ClaimRepository::hidden_claim_ids` — the suppression step the
-/// in-memory half uses — inside a `SECURITY DEFINER` frame, while the
-/// suppression predicate in `EventRepository::list` still reads `claims`
-/// directly on both of its arms. Filed as
-/// `F-PR24-event-list-existence-arm-collapses-under-force` in
-/// `docs/tenancy/progress.json`; see the `⚠ THE TWO HALVES DO NOT AGREE` section
-/// on `EventRepository::list`. Do not read the paragraph above as covering it.
+/// `rust ⊇ sql` is a claim about which uuids each side *extracts*, and neither
+/// PR-24 nor PR-25 changed either scanner. It says nothing about what each side
+/// then does with them, and the two halves spent one PR disagreeing about THAT:
+/// migration 086 moved `ClaimRepository::hidden_claim_ids` — the suppression
+/// step the in-memory half uses — inside a `SECURITY DEFINER` frame, while the
+/// suppression predicate in `EventRepository::list` still read `claims` directly
+/// on both of its arms. That was
+/// `F-PR24-event-list-existence-arm-collapses-under-force`, and **PR-25 closed
+/// it**: both halves now draw the same authority from the same definer. The
+/// scope caveat itself stands — a future change to either suppression step can
+/// reopen the gap without touching a scanner, so do not read the paragraph
+/// above as covering authority. See the
+/// `BOTH ARMS RUN INSIDE A DEFINER FRAME (PR-25)` section on
+/// `EventRepository::list`.
 ///
 /// # `pub(crate)` since PR-10 — and the asymmetry above is exactly why
 ///
@@ -555,6 +559,31 @@ pub async fn create_event(
 /// uuid that resolves to no `claims` row is deliberately **kept** — see
 /// `EventRepository::list` — so snapshot fidelity does not depend on
 /// referential integrity.
+///
+/// # There is NO Rust backstop on this path (recorded by PR-25)
+///
+/// Unlike `list_events`, this handler does not merge the in-process ring buffer
+/// and therefore never reaches `retain_visible_events` /
+/// `ClaimRepository::hidden_claim_ids`. The suppression predicate inside
+/// `EventRepository::list` is the *entire* tenancy control over the event ROWS
+/// this handler returns, and `events` itself carries no RLS. That makes this a
+/// third caller of that function — the PR-25 scope recon named only two — and it
+/// inherits both halves of the consequence: the repair reaches this route
+/// without a code change here, and a binary carrying that repair on a
+/// **pre-086** database raises `42883` on every call to this route. Run
+/// `epigraph-migrate` first.
+///
+/// Two scope limits on that "entire tenancy control" sentence, both deliberate:
+/// it covers the event rows, NOT `SnapshotResponse.current_version`, which comes
+/// from the viewer-less `EventRepository::get_latest_version` and is a single
+/// global write counter over an un-tenanted table (see that function's doc); and
+/// the predicate itself classifies payload uuids against `claims` only, so a
+/// payload naming a row in another tenanted table is not classified — recorded
+/// as `F-PR25-event-suppression-is-claims-keyed-only`.
+///
+/// The `version + 1` limit below fetches a superset and filters client-side.
+/// That is pre-existing and is tracked as `F-graph-snapshot-scan-cost`, not
+/// something PR-25 introduced or fixed.
 ///
 /// The signature is **not** `#[cfg]`-split; see `list_events`'s doc for why.
 pub async fn graph_snapshot(
