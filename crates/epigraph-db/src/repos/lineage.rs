@@ -234,9 +234,57 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database query fails.
+    ///
+    /// # This is a THIN WRAPPER; the body lives in [`Self::get_lineage_conn`]
+    ///
+    /// PR-26 inverted the usual `*_conn` shape rather than copying ~180 lines of
+    /// SQL into a twin. A duplicated sibling is how `get_by_id_conn` came to
+    /// project seven columns where `get_by_id` projected nine — a divergence
+    /// invisible to every gate, because a dropped column defaults to a plausible
+    /// value rather than erroring. One body cannot drift from itself, and
+    /// `visibility_lint.rs` has one SQL text to police instead of two.
+    ///
+    /// Kept (rather than replaced by the connection-taking form) because
+    /// `epigraph-mcp/src/tools/provenance.rs::get_provenance` calls it with a
+    /// bare `&PgPool`, and because ~20 assertions in
+    /// `epigraph-db/tests/lineage_tests.rs` call it unchanged — which is what
+    /// makes those tests a regression check on the inversion.
+    ///
+    /// Note what the wrapper does and does not buy: it acquires ONE connection
+    /// for all five statements, so they can no longer interleave with another
+    /// request's writes across five separate checkouts. It does not open a
+    /// transaction. A caller that needs the transaction arm reaches
+    /// [`Self::get_lineage_conn`] through `ScopedPool::read_as`.
     #[instrument(skip(pool, viewer))]
     pub async fn get_lineage(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        max_depth: Option<i32>,
+        max_nodes: Option<usize>,
+    ) -> Result<LineageResult, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::get_lineage_conn(&mut conn, viewer, claim_id, max_depth, max_nodes).await
+    }
+
+    /// [`Self::get_lineage`] on a caller-supplied connection.
+    ///
+    /// THE PRIMITIVE. All five statements run on `conn`, so a request path that
+    /// obtained it from `AppState::read_as` gets the whole walk on one
+    /// viewer-stamped connection: the in-query `$V` predicate and the session
+    /// GUCs migration 077's policies read are then populated from the same
+    /// `Viewer` value, for every statement rather than for the first one.
+    ///
+    /// The `&Viewer` is not optional decoration — `visibility_lint.rs::every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt`
+    /// exists because a `*_conn` sibling written without one would pass BOTH
+    /// controls: that lint would not inspect it, and `no_unscoped_pool.rs` would
+    /// count its call site as converted.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any database query fails.
+    #[instrument(skip(conn, viewer))]
+    pub async fn get_lineage_conn(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
@@ -303,7 +351,7 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             lq = lq.bind(g);
         }
-        let lineage_rows: Vec<LineageRow> = lq.fetch_all(pool).await?;
+        let lineage_rows: Vec<LineageRow> = lq.fetch_all(&mut *conn).await?;
 
         // Check for cycles
         let cycle_detected = lineage_rows.iter().any(|r| r.cycle_detected);
@@ -333,7 +381,7 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             eq = eq.bind(g);
         }
-        let edges: Vec<EdgeQueryRow> = eq.fetch_all(pool).await?;
+        let edges: Vec<EdgeQueryRow> = eq.fetch_all(&mut *conn).await?;
 
         // Build parent map
         let mut parent_map: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
@@ -358,7 +406,7 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let evidence_rows: Vec<EvidenceQueryRow> = vq.fetch_all(pool).await?;
+        let evidence_rows: Vec<EvidenceQueryRow> = vq.fetch_all(&mut *conn).await?;
 
         // Build evidence map
         let mut evidence_map: HashMap<Uuid, LineageEvidence> = HashMap::new();
@@ -393,9 +441,26 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             tq = tq.bind(g);
         }
-        let trace_rows: Vec<TraceQueryRow> = tq.fetch_all(pool).await?;
+        let trace_rows: Vec<TraceQueryRow> = tq.fetch_all(&mut *conn).await?;
 
-        // Query trace parents for DAG structure
+        // Query trace parents for DAG structure.
+        //
+        // FOLLOW-UP TRACKED: this statement's filtering behaviour is covered by
+        // `F-PR26-trace-parents-followup` in docs/tenancy/progress.json. The
+        // analysis is deliberately held outside this repository; consult it
+        // before changing this statement or the shape it returns.
+        //
+        // Pre-existing and unchanged by the PR-26 conversion, which moved this
+        // statement onto a different CONNECTION and nothing else.
+        //
+        // DO NOT reach for the exemption convention here as a shortcut. It keys
+        // on `(file, fn)` and `visibility_lint.rs` reads comment TEXT, so using
+        // one in this body would register the WHOLE walk as reviewed-and-exempt
+        // and remove it from
+        // `every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`.
+        // MEASURED, not reasoned: an earlier draft that spelled the annotation
+        // turned `the_exemption_set_is_exactly_what_was_reviewed` red with both
+        // walks added to the exempt set.
         let trace_parent_rows: Vec<TraceParentRow> = if !trace_ids.is_empty() {
             sqlx::query_as(
                 r#"
@@ -405,7 +470,7 @@ impl LineageRepository {
                 "#,
             )
             .bind(&trace_ids)
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?
         } else {
             Vec::new()
@@ -717,9 +782,39 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database query fails.
+    ///
+    /// # This is a THIN WRAPPER; the body lives in [`Self::get_descendants_conn`]
+    ///
+    /// See [`Self::get_lineage`] for why the connection-taking form is the
+    /// primitive rather than a copy-pasted twin. This wrapper has no caller
+    /// outside `epigraph-api` today (measured by grep over `crates/`), and is
+    /// kept anyway: `epigraph-db/tests/lineage_tests.rs` calls it unedited, and
+    /// symmetry between the two walks is what stops a later author from
+    /// "restoring" one of them by duplicating the body.
     #[instrument(skip(pool, viewer))]
     pub async fn get_descendants(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        max_depth: Option<i32>,
+    ) -> Result<LineageResult, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::get_descendants_conn(&mut conn, viewer, claim_id, max_depth).await
+    }
+
+    /// [`Self::get_descendants`] on a caller-supplied connection. THE PRIMITIVE.
+    ///
+    /// The descendant walk is NOT interchangeable with the ancestor one and must
+    /// not be unified with it: it sorts `topological_order` by depth ASCENDING
+    /// where `get_lineage` sorts DESCENDING, it has no `max_nodes` cap, and it
+    /// hardcodes `truncated: false`. Each is paired with its own primitive; only
+    /// the wrapper/primitive duplication was removed.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any database query fails.
+    #[instrument(skip(conn, viewer))]
+    pub async fn get_descendants_conn(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
@@ -785,7 +880,7 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             dq = dq.bind(g);
         }
-        let lineage_rows: Vec<LineageRow> = dq.fetch_all(pool).await?;
+        let lineage_rows: Vec<LineageRow> = dq.fetch_all(&mut *conn).await?;
 
         // Check for cycles
         let cycle_detected = lineage_rows.iter().any(|r| r.cycle_detected);
@@ -815,7 +910,7 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             eq = eq.bind(g);
         }
-        let edges: Vec<EdgeQueryRow> = eq.fetch_all(pool).await?;
+        let edges: Vec<EdgeQueryRow> = eq.fetch_all(&mut *conn).await?;
 
         // Build parent map (source supports target)
         let mut parent_map: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
@@ -840,7 +935,7 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let evidence_rows: Vec<EvidenceQueryRow> = vq.fetch_all(pool).await?;
+        let evidence_rows: Vec<EvidenceQueryRow> = vq.fetch_all(&mut *conn).await?;
 
         // Build evidence map
         let mut evidence_map: HashMap<Uuid, LineageEvidence> = HashMap::new();
@@ -875,9 +970,26 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             tq = tq.bind(g);
         }
-        let trace_rows: Vec<TraceQueryRow> = tq.fetch_all(pool).await?;
+        let trace_rows: Vec<TraceQueryRow> = tq.fetch_all(&mut *conn).await?;
 
-        // Query trace parents for DAG structure
+        // Query trace parents for DAG structure.
+        //
+        // FOLLOW-UP TRACKED: this statement's filtering behaviour is covered by
+        // `F-PR26-trace-parents-followup` in docs/tenancy/progress.json. The
+        // analysis is deliberately held outside this repository; consult it
+        // before changing this statement or the shape it returns.
+        //
+        // Pre-existing and unchanged by the PR-26 conversion, which moved this
+        // statement onto a different CONNECTION and nothing else.
+        //
+        // DO NOT reach for the exemption convention here as a shortcut. It keys
+        // on `(file, fn)` and `visibility_lint.rs` reads comment TEXT, so using
+        // one in this body would register the WHOLE walk as reviewed-and-exempt
+        // and remove it from
+        // `every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`.
+        // MEASURED, not reasoned: an earlier draft that spelled the annotation
+        // turned `the_exemption_set_is_exactly_what_was_reviewed` red with both
+        // walks added to the exempt set.
         let trace_parent_rows: Vec<TraceParentRow> = if !trace_ids.is_empty() {
             sqlx::query_as(
                 r#"
@@ -887,7 +999,7 @@ impl LineageRepository {
                 "#,
             )
             .bind(&trace_ids)
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?
         } else {
             Vec::new()

@@ -486,17 +486,24 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
 /// [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`] inspects only
 /// functions whose PARAMETER LIST mentions `Viewer`. A `*_conn` sibling that
 /// simply omits the `Viewer` parameter is therefore invisible to it — and PR-23
-/// made `*_conn` siblings the standard conversion shape for the 414 sites
+/// made `*_conn` siblings the standard conversion shape for the 407 sites
 /// `epigraph-db/tests/no_unscoped_pool.rs` registers. Without this rule, a
 /// sibling written without a viewer would pass BOTH controls: this file would
 /// not inspect it, and the ratchet would count its call site as converted
 /// because the `.db_pool` access is gone. The two together would certify
 /// "converted" for a read that filters on nothing.
 ///
-/// So the key is the NAME. Twelve `*_conn` functions exist today; three take a
-/// `Viewer` (`ClaimRepository::{get_by_id_conn, list_conn, count_conn}`) and the
-/// nine below are enumerated with reasons. Seven of the nine are writes, where
-/// migration 077's `WITH CHECK` rather than a read predicate is the control.
+/// So the key is the NAME. Fourteen `*_conn` functions exist today; five take a
+/// `Viewer` (`ClaimRepository::{get_by_id_conn, list_conn, count_conn}` and,
+/// from PR-26, `LineageRepository::{get_lineage_conn, get_descendants_conn}`)
+/// and the nine below are enumerated with reasons. Seven of the nine are writes,
+/// where migration 077's `WITH CHECK` rather than a read predicate is the
+/// control.
+///
+/// Counted by this test's own rule — name ends `_conn` AND the parameter list
+/// mentions `PgConnection` — not by a bare grep for `_conn`, which finds a
+/// fifteenth (`ClaimRepository::patch_claim_atomic_conn`, whose parameter is a
+/// `Transaction` rather than a `PgConnection`). Quote the rule with the number.
 #[test]
 fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
     let mut without: Vec<(String, String)> = Vec::new();

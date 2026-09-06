@@ -177,6 +177,28 @@ pub struct TraceNode {
 /// # Responses
 /// - 200: LineageResponse with nodes and edges
 /// - 404: Claim not found
+///
+/// # Tenancy: ONE viewer-stamped connection for the whole request
+///
+/// PR-26 converts this handler's seven raw-pool reads onto
+/// [`AppState::read_as`]. The connection is acquired ONCE, here, and threaded
+/// into both private helpers — including the `Both` arm, which calls both. Two
+/// acquires would be two separately-stamped checkouts (two transactions, in
+/// `SessionGucMode::Transaction`), and a lineage assembled across them can be
+/// internally inconsistent: edges naming claims the claim query did not return.
+///
+/// `read_as` and not `acquire_as`: the latter hard-refuses
+/// `EPIGRAPH_SESSION_GUC_MODE=transaction`, the pooler fallback `bin/server.rs`
+/// advertises to operators.
+///
+/// **Footprint, stated rather than left for a reviewer to find.** The handle is
+/// now held across `1 + 5 + N` statements — the existence probe, the walk's five
+/// statements, and one `get_by_id_conn` per returned claim — and this handler
+/// passes `max_nodes: None`, so `N` is bounded only by `max_depth`. That is one
+/// connection where there were `1 + 5 + N` unstamped checkouts, against a pool
+/// whose `ScopedPoolOptions::default()` is 10 connections, so it is strictly
+/// fewer; but it is a long-lived checkout and a `direction=both` request holds
+/// it across two walks.
 pub async fn get_lineage(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
@@ -192,9 +214,26 @@ pub async fn get_lineage(
     let include_evidence = params.include_evidence.unwrap_or(true);
     let include_traces = params.include_traces.unwrap_or(true);
 
+    // THE ERROR SHAPE IS PART OF THE TEMPLATE (see `routes/conflicts.rs::classify_conflict`).
+    // `read_as`'s refusal reason is a paragraph of internal design prose aimed
+    // at whoever mis-built the `AppState`; `errors.rs` serialises
+    // `ApiError::InternalError { message }` verbatim into the response body, so
+    // it is logged in full and answered with an opaque message.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_lineage",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // First, check if the claim exists (for 404)
     let _root_claim =
-        ClaimRepository::get_by_id(&state.db_pool, &viewer, ClaimId::from_uuid(claim_id))
+        ClaimRepository::get_by_id_conn(&mut read, &viewer, ClaimId::from_uuid(claim_id))
             .await?
             .ok_or_else(|| ApiError::NotFound {
                 entity: "Claim".to_string(),
@@ -205,7 +244,7 @@ pub async fn get_lineage(
     let (nodes, edges, max_depth_reached) = match direction {
         LineageDirection::Ancestors => {
             get_ancestor_lineage(
-                &state,
+                &mut read,
                 &viewer,
                 claim_id,
                 max_depth,
@@ -216,7 +255,7 @@ pub async fn get_lineage(
         }
         LineageDirection::Descendants => {
             get_descendant_lineage(
-                &state,
+                &mut read,
                 &viewer,
                 claim_id,
                 max_depth,
@@ -226,9 +265,11 @@ pub async fn get_lineage(
             .await?
         }
         LineageDirection::Both => {
-            // Get both ancestors and descendants, then merge
+            // Get both ancestors and descendants, then merge. BOTH walks run on
+            // the SAME connection: that is what makes the merged graph a single
+            // consistent read rather than two.
             let (ancestor_nodes, ancestor_edges, ancestor_depth) = get_ancestor_lineage(
-                &state,
+                &mut read,
                 &viewer,
                 claim_id,
                 max_depth,
@@ -237,7 +278,7 @@ pub async fn get_lineage(
             )
             .await?;
             let (descendant_nodes, descendant_edges, descendant_depth) = get_descendant_lineage(
-                &state,
+                &mut read,
                 &viewer,
                 claim_id,
                 max_depth,
@@ -279,6 +320,14 @@ pub async fn get_lineage(
         }
     };
 
+    // Read-only, so an un-committed transaction arm would merely roll back —
+    // but `ScopedRead` has no `Drop` impl and finishing explicitly is what
+    // returns the connection without a wasted round trip under
+    // `SessionGucMode::Transaction`.
+    read.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("Failed to finish the scoped read: {e}"),
+    })?;
+
     // Determine if truncated (there might be more nodes beyond max_depth)
     let truncated = max_depth_reached >= max_depth as u32 && nodes.len() > 1;
 
@@ -295,8 +344,12 @@ pub async fn get_lineage(
 }
 
 /// Get ancestor lineage (claims this claim depends on)
+///
+/// Takes the caller's viewer-stamped connection rather than the `AppState`: the
+/// acquire belongs to [`get_lineage`], which calls this and
+/// [`get_descendant_lineage`] on the SAME handle.
 async fn get_ancestor_lineage(
-    state: &AppState,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     max_depth: i32,
@@ -305,14 +358,14 @@ async fn get_ancestor_lineage(
 ) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32), ApiError> {
     // Use LineageRepository for ancestor traversal
     let lineage_result =
-        LineageRepository::get_lineage(&state.db_pool, viewer, claim_id, Some(max_depth), None)
+        LineageRepository::get_lineage_conn(&mut *conn, viewer, claim_id, Some(max_depth), None)
             .await?;
 
     // If no claims found (empty result), return just the root claim
     if lineage_result.claims.is_empty() {
         // Get the root claim info
         let claim =
-            ClaimRepository::get_by_id(&state.db_pool, viewer, ClaimId::from_uuid(claim_id))
+            ClaimRepository::get_by_id_conn(&mut *conn, viewer, ClaimId::from_uuid(claim_id))
                 .await?
                 .ok_or_else(|| ApiError::NotFound {
                     entity: "Claim".to_string(),
@@ -338,8 +391,11 @@ async fn get_ancestor_lineage(
     let mut edges = Vec::new();
 
     for (id, lineage_claim) in &lineage_result.claims {
-        // Get full claim data to include agent_id and created_at
-        let claim = ClaimRepository::get_by_id(&state.db_pool, viewer, ClaimId::from_uuid(*id))
+        // Get full claim data to include agent_id and created_at.
+        // Reborrowed INSIDE the loop: `lineage_result` is owned, so the walk's
+        // result does not hold the connection, and one acquire serves all N
+        // iterations.
+        let claim = ClaimRepository::get_by_id_conn(&mut *conn, viewer, ClaimId::from_uuid(*id))
             .await?
             .ok_or_else(|| ApiError::NotFound {
                 entity: "Claim".to_string(),
@@ -417,7 +473,7 @@ async fn get_ancestor_lineage(
 /// Delegates to LineageRepository::get_descendants for the recursive CTE query,
 /// then transforms the result to the API response format.
 async fn get_descendant_lineage(
-    state: &AppState,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     max_depth: i32,
@@ -426,14 +482,14 @@ async fn get_descendant_lineage(
 ) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32), ApiError> {
     // Use LineageRepository for descendant traversal
     let lineage_result =
-        LineageRepository::get_descendants(&state.db_pool, viewer, claim_id, Some(max_depth))
+        LineageRepository::get_descendants_conn(&mut *conn, viewer, claim_id, Some(max_depth))
             .await?;
 
     // If no claims found (empty result), return just the root claim
     if lineage_result.claims.is_empty() {
         // Get the root claim info
         let claim =
-            ClaimRepository::get_by_id(&state.db_pool, viewer, ClaimId::from_uuid(claim_id))
+            ClaimRepository::get_by_id_conn(&mut *conn, viewer, ClaimId::from_uuid(claim_id))
                 .await?
                 .ok_or_else(|| ApiError::NotFound {
                     entity: "Claim".to_string(),
@@ -459,8 +515,11 @@ async fn get_descendant_lineage(
     let mut edges = Vec::new();
 
     for (id, lineage_claim) in &lineage_result.claims {
-        // Get full claim data to include agent_id and created_at
-        let claim = ClaimRepository::get_by_id(&state.db_pool, viewer, ClaimId::from_uuid(*id))
+        // Get full claim data to include agent_id and created_at.
+        // Reborrowed INSIDE the loop: `lineage_result` is owned, so the walk's
+        // result does not hold the connection, and one acquire serves all N
+        // iterations.
+        let claim = ClaimRepository::get_by_id_conn(&mut *conn, viewer, ClaimId::from_uuid(*id))
             .await?
             .ok_or_else(|| ApiError::NotFound {
                 entity: "Claim".to_string(),

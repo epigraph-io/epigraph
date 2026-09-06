@@ -68,11 +68,85 @@ pub async fn database_url_for(pool: &PgPool) -> String {
     }
 }
 
-/// A [`ScopedPool`] over the same database as `pool`.
+/// A [`ScopedPool`] over the same database as `pool`, in `Session` mode.
 pub async fn scoped_pool(pool: &PgPool) -> ScopedPool {
-    ScopedPool::connect(&database_url_for(pool).await, SessionGucMode::Session)
+    scoped_pool_with_mode(pool, SessionGucMode::Session).await
+}
+
+/// [`scoped_pool`] with the [`SessionGucMode`] chosen by the caller.
+///
+/// `scoped_pool` hardcodes `Session`, which is the arm that already worked
+/// before `read_as` existed. A test that only exercises it proves the easy half:
+/// in `Session` mode a `ScopedRead` is a bare connection, so "these N statements
+/// run in one transaction" is simply false there, while the identical code in
+/// `Transaction` mode is atomic. Anything claiming atomicity has to drive both,
+/// which is why `qual_guc_coherence.rs` factors its filtered-session case over
+/// the mode rather than duplicating it.
+pub async fn scoped_pool_with_mode(pool: &PgPool, mode: SessionGucMode) -> ScopedPool {
+    ScopedPool::connect(&database_url_for(pool).await, mode)
         .await
         .expect("ScopedPool::connect")
+}
+
+/// A plain [`PgPool`] over the same database as `pool` whose every connection
+/// authenticates as the superuser and is then DOWNGRADED to `role`.
+///
+/// # Why this exists, and why it is not a second DSN
+///
+/// `#[sqlx::test]` connects as `epigraph`, which is superuser, `BYPASSRLS` and
+/// the table owner, so on the pool it hands you **no RLS policy filters
+/// anything**. Every "a stranger cannot read this" assertion written on that
+/// pool observes the in-query `$V` predicate alone — never migration 077's
+/// policies, and never the FORCE differential that makes an UNSTAMPED
+/// connection lose rows to its own owner. A test that cannot see that
+/// differential passes identically on the converted and the unconverted tree.
+///
+/// The routes NOT taken, so nobody re-derives them:
+/// * `session_authorization` as a connect-option — MEASURED not to work:
+///   `PGOPTIONS='-c session_authorization=…'` leaves `current_user` and
+///   `session_user` both at `epigraph`.
+/// * a new LOGIN role — `epigraph_app` is `NOLOGIN` (migration 060) and 077
+///   states the LOGIN is issued out of band and *never in this repository — it
+///   is public*. `CREATE ROLE` is also cluster-global and leaks on panic.
+/// * `ScopedPoolOptions` — it exposes `max_connections` / `acquire_timeout` /
+///   `statement_timeout` and no `after_connect`, so this trick does NOT
+///   generalise to the scoped arm. That limitation is the follow-up's scope,
+///   not a defect in this helper.
+///
+/// What is left is the move `qual_guc_coherence.rs::read_as_filtered_case`
+/// already proves works — connect as the superuser, then
+/// `SET SESSION AUTHORIZATION` on the connection — hoisted into
+/// `PgPoolOptions::after_connect` so that EVERY checkout is filtered and the
+/// pool can be handed to production code that acquires its own connections.
+///
+/// **Do not pair this with [`grant_app_privileges`].** Migration 077 issues the
+/// app-role grants itself; re-granting here would paper over a missing grant,
+/// and a `42501` from this pool is a finding about the migration, not a fixture
+/// bug. (`grant_app_privileges` exists for the `tenancy_required.rs` fixtures,
+/// which run before 077's grants are in play.)
+///
+/// Seeding, and `Viewer::resolve`, must still run on the ORIGINAL superuser
+/// pool: `Viewer::resolve` reads `group_memberships`, and on a downgraded
+/// unstamped session it resolves to an EMPTY group set — which would make every
+/// assertion in the file pass for the wrong reason.
+pub async fn downgraded_pool(pool: &PgPool, role: &str) -> PgPool {
+    use sqlx::Executor;
+    let url = database_url_for(pool).await;
+    // Role names here are test-local literals, never caller data.
+    let role = role.to_string();
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .after_connect(move |conn, _meta| {
+            let role = role.clone();
+            Box::pin(async move {
+                conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("downgraded pool")
 }
 
 /// A bypass viewer under [`SystemReason::SchemaContractTest`].
@@ -206,6 +280,86 @@ pub async fn world_group(pool: &PgPool) -> Uuid {
         .fetch_one(pool)
         .await
         .expect("the world group is seeded by migration 060")
+}
+
+/// A `supports` edge `source -> target`, left exactly as migration 070's
+/// `edges_tenancy` trigger stamps it.
+///
+/// This is what `EdgeRepository::create` produces: the INSERT names no tenancy
+/// columns, and the BEFORE-ROW trigger derives them from the two ENDPOINTS —
+/// public/public gives `('public', world)`, otherwise the surviving private
+/// endpoint's group. Use this when you want an edge that is visible to whoever
+/// can see its endpoints, which is the ordinary case.
+pub async fn seed_edge(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, 'claim', $3, 'claim', 'supports')",
+    )
+    .bind(id)
+    .bind(source)
+    .bind(target)
+    .execute(pool)
+    .await
+    .expect("seed edge");
+    id
+}
+
+/// [`seed_edge`], then FORCE the edge's own tenancy columns to
+/// `(visibility, owner_group_id)`.
+///
+/// # Why the UPDATE, and why declaring the columns on the INSERT is not enough
+///
+/// Migration 070's trigger is `BEFORE INSERT OR UPDATE **OF source_id,
+/// target_id**`. So it rewrites the tenancy columns on every INSERT, and it does
+/// not fire for an UPDATE that touches only `visibility` / `owner_group_id`.
+/// Its INSERT arms honour exactly one declaration — a `('group', G)` edge
+/// between two PUBLIC endpoints, which the meet would widen — and silently
+/// overwrite every other, including a declared `('public', world)`.
+///
+/// That matters far beyond one test, which is why this is a named helper rather
+/// than an inline `UPDATE`: roughly half of the remaining conversion shards walk
+/// a graph, and a graph fixture that lets the trigger stamp the edge gets an
+/// edge whose visibility TRACKS its endpoints'. A "the stranger's private
+/// ancestor is absent" assertion built that way is satisfied by the EDGE
+/// predicate alone and stays green with the claim predicate deleted — a
+/// mutation proof that reports a false pass.
+///
+/// The corollary is that this must be applied ASYMMETRICALLY. Forcing an edge
+/// public on the arm that tests OVER-suppression (the viewer's own private
+/// ancestor, which must remain visible) destroys the calibration that direction
+/// exists to provide.
+///
+/// # `co_owner_group_id` is cleared, and it has to be
+///
+/// The result is a SINGLE-OWNER edge. Migration 072's `edges_co_owner_shape`
+/// is `co_owner_group_id IS NULL OR (visibility = 'group' AND co_owner_group_id
+/// <> owner_group_id)`, and the trigger's cross-group arm sets a co-owner — so
+/// an edge between two claims private to DIFFERENT groups arrives here co-owned,
+/// and forcing it `('public', world)` while leaving the co-owner raises `23514`.
+/// Clearing it is also the semantics a caller of this helper wants: it says
+/// "these are the edge's tenancy columns", and the intersection semantics of a
+/// surviving co-owner would silently add a second condition the caller did not
+/// write.
+pub async fn seed_edge_owned_by(
+    pool: &PgPool,
+    source: Uuid,
+    target: Uuid,
+    visibility: &str,
+    owner_group_id: Uuid,
+) -> Uuid {
+    let id = seed_edge(pool, source, target).await;
+    sqlx::query(
+        "UPDATE edges SET visibility = $2, owner_group_id = $3, co_owner_group_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(visibility)
+    .bind(owner_group_id)
+    .execute(pool)
+    .await
+    .expect("force edge tenancy");
+    id
 }
 
 /// The seeded `epigraph_seed` group (migration 062), which migration 074's
