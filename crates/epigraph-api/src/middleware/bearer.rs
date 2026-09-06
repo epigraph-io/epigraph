@@ -4,6 +4,12 @@
 //! validates it, checks revocation, and injects AuthContext
 //! into request extensions.
 
+// UNSCOPED-POOL-EXEMPT: STRUCTURALLY non-exemptable, not merely unconverted. The single site is
+// `Viewer::resolve`, which BUILDS the viewer every scoped acquire needs; `ScopedPool::acquire_as`
+// takes the very Viewer this call constructs, so stamping the connection first is circular.
+// Recorded as `D-PR17-live-memberships-is-parameterised-not-principal-bound`. This entry must
+// never be "converted" — a shard that tries will deadlock the bootstrap, not fix a leak.
+
 use axum::{extract::State, http::Request, middleware::Next, response::Response};
 
 use crate::errors::ApiError;

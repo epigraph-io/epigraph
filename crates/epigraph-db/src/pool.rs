@@ -917,6 +917,64 @@ impl ScopedPool {
         Ok(ScopedTx(tx, PhantomData))
     }
 
+    /// THE MODE-DISPATCH HELPER: a stamped executor for a **read**, correct in
+    /// either [`SessionGucMode`].
+    ///
+    /// This is the one entry point the request path is meant to convert onto,
+    /// and it exists because neither primitive is usable on its own at a call
+    /// site that must work in both modes:
+    ///
+    /// * [`Self::acquire_as`] hard-refuses [`SessionGucMode::Transaction`],
+    ///   directing the caller to `begin_as`. So a site converted to a literal
+    ///   `acquire_as` makes the transaction-pooler fallback that
+    ///   `bin/server.rs` already advertises (`EPIGRAPH_SESSION_GUC_MODE=transaction`)
+    ///   **unservable at that site** — and unservable is discovered in
+    ///   production, because CI has no pgbouncer fixture.
+    /// * [`Self::begin_as`] works in either mode but costs two extra round
+    ///   trips (`BEGIN` + `COMMIT`) on every read, which is the whole reason
+    ///   `Session` mode is the default.
+    ///
+    /// So the dispatch is: `Session` → [`Self::acquire_as`] (one extra
+    /// statement, no transaction), `Transaction` → [`Self::begin_as`]. Both
+    /// arms `DerefMut` to `PgConnection`, which is what makes a single call
+    /// shape possible at all.
+    ///
+    /// # This helper is for READS. Writes call [`Self::begin_as`] directly.
+    ///
+    /// The two arms differ in a way that is invisible for a read and material
+    /// for a write: in `Session` mode there is **no transaction**, so a
+    /// multi-statement write through this helper is not atomic, while the same
+    /// code in `Transaction` mode is. A helper whose atomicity depends on an
+    /// environment variable is a data-integrity landmine, so it is deliberately
+    /// not offered for writes — and it has no `rollback`, because a `Session`-arm
+    /// rollback could only be a silent no-op. `begin_as` is correct in *both*
+    /// modes and is what a write path should use. (The write-side predicate
+    /// itself is 16b's, not this PR's.)
+    ///
+    /// # [`ScopedRead::commit`] is explicit on purpose
+    ///
+    /// Neither [`ScopedConn`] nor [`ScopedTx`] has a `Drop` impl, so an
+    /// uncommitted sqlx `Transaction` rolls back when dropped. For a read that
+    /// is correct-but-wasteful rather than wrong, which is precisely why the
+    /// commit is not hidden inside the helper: a helper that papered over
+    /// `commit` would make the `Session` and `Transaction` arms behave
+    /// identically for reads and silently differently for anything else.
+    ///
+    /// # Errors
+    /// Propagates [`Self::acquire_as`] / [`Self::begin_as`] — in particular
+    /// `DbError::InvalidData` if `v` is a bypass viewer, which belongs on
+    /// [`Self::unscoped_for_maintenance`] instead.
+    pub async fn read_as(&self, v: &Viewer) -> Result<ScopedRead<'_>, DbError> {
+        // Dispatch to the two existing primitives rather than stamping here.
+        // `apply_session_gucs` is private with exactly two callers, and that is
+        // the structural control behind plan §4.5 requirement 1 — becoming a
+        // third caller would dissolve it while leaving every test green.
+        match self.mode {
+            SessionGucMode::Session => Ok(ScopedRead::Conn(self.acquire_as(v).await?)),
+            SessionGucMode::Transaction => Ok(ScopedRead::Tx(self.begin_as(v).await?)),
+        }
+    }
+
     /// The maintenance escape hatch: an unstamped connection plus the
     /// [`MaintenanceLease`] that [`Viewer::system`] requires.
     ///
@@ -1141,6 +1199,82 @@ impl std::ops::Deref for ScopedTx<'_> {
 impl std::ops::DerefMut for ScopedTx<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+/// A stamped executor for a read, in whichever form the pool's
+/// [`SessionGucMode`] requires. Returned by [`ScopedPool::read_as`].
+///
+/// The variants are public because a caller that genuinely needs to know which
+/// mode it got (a test asserting the dispatch, chiefly) should be able to ask
+/// without a second accessor. Ordinary call sites never match on it: they
+/// `&mut *` it into a `&mut PgConnection` and pass that to the repo layer.
+pub enum ScopedRead<'a> {
+    /// [`SessionGucMode::Session`]: a pooled connection stamped at checkout.
+    Conn(ScopedConn<'a>),
+    /// [`SessionGucMode::Transaction`]: a transaction stamped
+    /// transaction-locally.
+    Tx(ScopedTx<'a>),
+}
+
+// Opaque, for the same reason `ScopedConn`'s is: a derived `Debug` would be a
+// way to print a connection carrying a principal's group set into a log line.
+// The variant name is carried because it is the dispatch decision, not tenancy.
+impl std::fmt::Debug for ScopedRead<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScopedRead::Conn(_) => f.write_str("ScopedRead::Conn"),
+            ScopedRead::Tx(_) => f.write_str("ScopedRead::Tx"),
+        }
+    }
+}
+
+impl ScopedRead<'_> {
+    /// Finish the read: `COMMIT` on the transaction arm, nothing on the session
+    /// arm.
+    ///
+    /// Not called by `Drop` and not hidden inside [`ScopedPool::read_as`] — see
+    /// that function for why. Skipping it on a read is safe (sqlx rolls the
+    /// transaction back on drop, and a read has nothing to lose), but it costs
+    /// a wasted round trip in [`SessionGucMode::Transaction`].
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the commit fails.
+    pub async fn commit(self) -> Result<(), DbError> {
+        match self {
+            // Dropping a `ScopedConn` returns it to the pool, where
+            // `after_release` scrubs the three GUCs. There is nothing to commit.
+            ScopedRead::Conn(_) => Ok(()),
+            ScopedRead::Tx(tx) => tx.commit().await,
+        }
+    }
+
+    /// Which arm the pool's mode selected. For tests that assert the dispatch.
+    #[must_use]
+    pub const fn mode(&self) -> SessionGucMode {
+        match self {
+            ScopedRead::Conn(_) => SessionGucMode::Session,
+            ScopedRead::Tx(_) => SessionGucMode::Transaction,
+        }
+    }
+}
+
+impl std::ops::Deref for ScopedRead<'_> {
+    type Target = PgConnection;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            ScopedRead::Conn(c) => c,
+            ScopedRead::Tx(t) => t,
+        }
+    }
+}
+
+impl std::ops::DerefMut for ScopedRead<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            ScopedRead::Conn(c) => c,
+            ScopedRead::Tx(t) => t,
+        }
     }
 }
 

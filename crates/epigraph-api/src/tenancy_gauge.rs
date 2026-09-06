@@ -29,6 +29,9 @@
 //! `#[cfg(feature = "db")]` while `Metrics::tenancy_undeclared_writes` is
 //! deliberately not.
 
+// UNSCOPED-POOL-EXEMPT: Observability. It counts rows across the whole corpus to measure tenancy
+// coverage; a viewer-scoped gauge would report one tenant's coverage and label it the fleet's.
+
 use crate::metrics::{Metrics, TenancyTableLabel};
 use sqlx::PgPool;
 use std::collections::BTreeSet;

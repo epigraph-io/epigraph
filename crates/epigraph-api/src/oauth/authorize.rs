@@ -6,6 +6,10 @@
 //! the existing Google OIDC redirect flow. The Google callback (Task 8) recovers
 //! the session, provisions the user, renders consent, and mints the code that the
 //! `authorization_code` grant in `/oauth/token` (Task 6) redeems.
+
+// UNSCOPED-POOL-EXEMPT: Pre-authentication by definition. The authorize/callback/consent endpoints
+// sit on the anonymous OAuth router (the surface `public_router_allowlist.rs` pins) and run
+// before any principal exists — establishing one is what they are for.
 #[cfg(feature = "db")]
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::{

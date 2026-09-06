@@ -1,3 +1,12 @@
+// UNSCOPED-POOL-EXEMPT: Boot and spawned long-lived tasks, in TWO different senses — see the
+// matching entry in `epigraph-db/tests/no_unscoped_pool.rs`, which is authoritative for the reason.
+// (a) Boot hydration and the metrics sampler: no principal exists at process start or inside the
+// sampler, so there is nothing to stamp a connection from. (b) The webhook-dispatcher handoff is
+// NOT of that kind: the dispatcher resolves a real `Viewer` per subscription downstream, so a
+// Viewer IS constructible there. It stays unscoped because the visibility probe it depends on
+// (`ClaimRepository::hidden_claim_ids`) needs authority broader than the viewer for its existence
+// arm and cannot be repaired by stamping — see that function's own doc. Exempt-until-that-lands,
+// not exempt-by-definition.
 use epigraph_api::metrics::Metrics;
 use epigraph_api::routes::webhooks::{start_webhook_dispatcher, WebhookDeliveryConfig};
 use epigraph_api::{create_router, ApiConfig, AppState};
@@ -278,11 +287,16 @@ async fn main() {
         // alongside the inner `PgPool`, because `Viewer::system` requires a
         // `MaintenanceLease` and `ScopedPool::unscoped_for_maintenance` is the
         // only mint — a process that throws the `ScopedPool` away can never
-        // construct a bypass viewer for its own backfill routes. Handlers still
-        // read `state.db_pool`; migrating them onto `ScopedPool::acquire_as` is
-        // PR-07/PR-17. PR-15 gave this pool a *sibling*: see the maintenance
-        // pool below, which is where `AppState::maintenance_viewer` now draws
-        // from.
+        // construct a bypass viewer for its own backfill routes. Most handlers
+        // still read the raw pool; the conversion target is `AppState::read_as`
+        // (reads) and `ScopedPool::begin_as` (writes) — NOT `acquire_as`, which
+        // hard-refuses `EPIGRAPH_SESSION_GUC_MODE=transaction`, the pooler
+        // fallback this same file advertises to operators a few lines below.
+        // `epigraph-db/tests/no_unscoped_pool.rs` is the register of what
+        // remains. (This comment previously named `acquire_as` and PR-07/PR-17;
+        // both were stale.) PR-15 gave this pool a *sibling*: see the
+        // maintenance pool below, which is where `AppState::maintenance_viewer`
+        // now draws from.
         let pool = scoped.inner().clone();
         tracing::info!("PostgreSQL connected");
 

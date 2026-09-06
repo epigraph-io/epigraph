@@ -170,9 +170,39 @@ pub async fn classify_conflict(
     State(state): State<AppState>,
     Json(request): Json<ClassifyConflictRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // A connection stamped with THIS viewer's tenancy context, rather than a
+    // checkout from the raw pool. Both reads below then run on it, so the
+    // in-query `$V` predicate and the session GUCs migration 077's policies
+    // read are populated from the same `Viewer` value — which is the property
+    // that stops rows disappearing from their own owners once step 11d points
+    // DATABASE_URL at `epigraph_app`.
+    //
+    // `read_as` and not `acquire_as`: the latter hard-refuses
+    // `EPIGRAPH_SESSION_GUC_MODE=transaction`, the pooler fallback
+    // `bin/server.rs` already advertises to operators.
+    //
+    // THE ERROR SHAPE IS PART OF THE TEMPLATE. `read_as`'s refusal reason is a
+    // paragraph of internal design prose aimed at whoever mis-built the
+    // `AppState` — correct for an operator's log line, wrong for a response
+    // body, which `errors.rs` serialises verbatim into `{"message": …}`. It is
+    // logged in full and answered with an opaque message. Every converted site
+    // should copy this shape rather than `format!`-ing the DbError into the
+    // response.
+    let mut conn = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "classify_conflict",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // Fetch both claims
     let claim_a =
-        epigraph_db::ClaimRepository::get_by_id(&state.db_pool, &viewer, request.claim_a_id.into())
+        epigraph_db::ClaimRepository::get_by_id_conn(&mut conn, &viewer, request.claim_a_id.into())
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to fetch claim A: {e}"),
@@ -183,7 +213,7 @@ pub async fn classify_conflict(
             })?;
 
     let claim_b =
-        epigraph_db::ClaimRepository::get_by_id(&state.db_pool, &viewer, request.claim_b_id.into())
+        epigraph_db::ClaimRepository::get_by_id_conn(&mut conn, &viewer, request.claim_b_id.into())
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to fetch claim B: {e}"),
@@ -192,6 +222,13 @@ pub async fn classify_conflict(
                 entity: "claim".into(),
                 id: request.claim_b_id.to_string(),
             })?;
+
+    // Read-only, so an un-committed transaction arm would merely roll back —
+    // but finishing explicitly returns the connection without a wasted round
+    // trip under `SessionGucMode::Transaction`.
+    conn.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("Failed to finish the scoped read: {e}"),
+    })?;
 
     // Basic classification based on truth values and content
     let truth_diff = (claim_a.truth_value.value() - claim_b.truth_value.value()).abs();
