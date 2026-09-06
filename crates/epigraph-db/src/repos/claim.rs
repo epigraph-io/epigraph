@@ -2883,44 +2883,66 @@ impl ClaimRepository {
     /// *existing-but-invisible* ids come back, so a caller that drops its
     /// records on a non-empty intersection matches the SQL exactly.
     ///
-    /// # ⚠ PRECONDITION FOR PLAN §9.2 STEP 11d — THIS IS NOT A CONVERSION SITE
+    /// # BOTH ARMS RUN INSIDE A DEFINER FRAME — THIS IS STILL NOT A CONVERSION SITE
     ///
-    /// The set difference below asks two questions of the same table: *does
-    /// this id name a row* (first arm) and *may this viewer read it* (second,
-    /// spliced arm). That only answers the question when the first arm can see
-    /// rows the second cannot — i.e. when it runs with authority broader than
-    /// the viewer's.
+    /// The set difference below asks two questions: *does this id name a row*
+    /// (first arm) and *may this viewer read it* (second, spliced arm). It only
+    /// answers anything while the two arms have **different authority**.
     ///
-    /// On today's DSN it does: the connection is the table owner, so no policy
-    /// filters either arm. Once step 11d repoints `DATABASE_URL` at
-    /// `epigraph_app`, both arms are subject to `claims_tenancy` (migration
-    /// 077), whose `USING` predicate is textually what
-    /// [`crate::visibility::Viewer::splice`] emits into the second arm. The two
-    /// arms then coincide and the difference is empty **by construction**,
-    /// whether or not the connection carries the tenancy GUCs. Measured on the
-    /// throwaway test cluster at migration head 91 with FORCE live: empty in
-    /// both the stamped and the unstamped case, against the same fixture where
-    /// the owner connection correctly reports one hidden id.
+    /// Read against `claims` directly, they do not, once migration 079's FORCE
+    /// posture is live on an application role: `claims_tenancy` (077) filters
+    /// both, its `USING` predicate keys on `epigraph_session_groups()` — the
+    /// session GUCs — and the difference collapses. That was
+    /// `F-PR23-existence-probe-collapses-under-force`, and an empty result is
+    /// read by both callers as "nothing is hidden", so the failure was
+    /// uninformative rather than conservative. **It could not be repaired by
+    /// stamping the connection**: `epigraph_bypass()` and
+    /// `epigraph_definer_bypass()` are role-based (`session_user` /
+    /// `current_user`) and unreachable from `ScopedPool::apply_session_gucs`.
     ///
-    /// So this function **cannot** be repaired by stamping the connection, and
-    /// a conversion shard must not "convert" it or its callers
-    /// (`epigraph-api`'s `routes/webhooks.rs` and `routes/events.rs`) onto
-    /// `AppState::read_as`: doing so would make the ratchet in
-    /// `epigraph-db/tests/no_unscoped_pool.rs` green while leaving an existence
-    /// probe that reports nothing regardless of input. An empty result is read
-    /// by both callers as "nothing is hidden", so the failure is uninformative
-    /// rather than conservative.
+    /// Migration **086** repairs it by moving *both* arms into a
+    /// `SECURITY DEFINER` frame — `public.epigraph_claim_tenancy_by_ids(uuid[])`,
+    /// which returns `(id, visibility, owner_group_id)` for caller-named ids and
+    /// never content — and splicing the viewer predicate over that function's
+    /// output instead of over `claims`. The only filter left on either arm is
+    /// then the viewer's own predicate, which is the authority this signature
+    /// promises.
     ///
-    /// The repair is the pattern migration 077 already establishes for the
-    /// structurally identical problem in `Viewer::resolve`: route the
-    /// *existence* arm through a `SECURITY DEFINER` helper that returns ids
-    /// only and no content, the way `epigraph_live_memberships()` does for
-    /// `group_memberships`
-    /// (`repos/group_membership.rs::list_live_for_agent`). That is a migration,
-    /// so it belongs to a numbered follow-up rather than to the code-only PR
-    /// that added this note; it is recorded in `docs/tenancy/progress.json` as
-    /// a hard precondition for step 11d, alongside
-    /// `tenancy_required.rs::a_derived_insert_is_refused_when_the_session_gucs_are_unstamped`.
+    /// ## Why the existence arm alone was not enough
+    ///
+    /// Measured on the throwaway at head 91 with FORCE live. With only the
+    /// existence arm in the frame, the spliced arm is *still* narrowed by the
+    /// policy to `visibility = 'public'` whatever `$V` binds — so on an
+    /// **unstamped** connection carrying a **member** viewer, a group-private
+    /// claim the viewer is entitled to read comes back reported hidden, and
+    /// both callers drop its delivery. That is the shape both call sites
+    /// actually have: they take a raw `&PgPool` as a parameter and nothing
+    /// stamps it (`D-PR17-request-path-never-stamps-session-gucs`). Splicing
+    /// over the function's output is what makes the answer independent of
+    /// whether the session is stamped, unstamped, or incoherently stamped.
+    ///
+    /// ## What did NOT change
+    ///
+    /// * A `Bypass` viewer still short-circuits through the existing mechanism:
+    ///   `splice` renders it to a bare separator, the two arms coincide, and
+    ///   the difference is empty. No hand-rolled branch.
+    /// * The contract above — an id naming **no** row is not reported — is
+    ///   unchanged and is what `locked_decisions.rs` pins for both callers.
+    /// * The two callers (`epigraph-api`'s `routes/webhooks.rs` and
+    ///   `routes/events.rs`) must **still not** be "converted" onto
+    ///   `AppState::read_as`. Closing this probe does not by itself make them
+    ///   safe to convert; that is a separate decision, and the do-not-convert
+    ///   rule in `epigraph-db/tests/no_unscoped_pool.rs` is updated rather than
+    ///   removed. Step 11d also remains blocked on
+    ///   `D-PR17-request-path-never-stamps-session-gucs`; this discharged one
+    ///   precondition, not the gate.
+    ///
+    /// The behaviour is pinned by
+    /// `epigraph-db/tests/rls_enforcement.rs::hidden_claim_ids_still_classifies_on_the_app_role_under_force`,
+    /// which runs on a real `epigraph_app` session and carries an
+    /// owner-connection calibration arm — the unit test below runs on the
+    /// superuser harness pool, where no policy applies, and therefore cannot
+    /// distinguish a working probe from a broken one.
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
@@ -2936,10 +2958,20 @@ impl ClaimRepository {
         // positive `AND (...)` fragment and there is no spelling of the marker
         // that inverts it. Set difference gets the same answer without asking
         // the splice mechanism to do something it was not built for.
+        //
+        // The CTE is not cosmetic: it calls the definer ONCE for both arms, so
+        // the two cannot disagree about the row set, and it gives the spliced
+        // arm an alias to hang `/* {VISIBILITY:c} */` on. `WHERE true` is the
+        // established spelling for a marker with no other predicate to append
+        // to (see `repos/frame.rs`, `repos/community.rs`).
         let sql = viewer.splice(
-            "SELECT id FROM claims WHERE id = ANY($1) \
+            "WITH t AS ( \
+                 SELECT id, visibility, owner_group_id \
+                   FROM public.epigraph_claim_tenancy_by_ids($1) \
+             ) \
+             SELECT id FROM t \
              EXCEPT \
-             SELECT c.id FROM claims c WHERE c.id = ANY($1) /* {VISIBILITY:c} */",
+             SELECT c.id FROM t c WHERE true /* {VISIBILITY:c} */",
             2,
         );
         let mut q = sqlx::query_scalar::<_, uuid::Uuid>(&sql).bind(ids);
@@ -5651,6 +5683,16 @@ mod tests {
     /// `epigraph-api`'s `list_events`. Its contract is narrower than "absent
     /// from the visible set": an id naming NO row must not be reported, or the
     /// caller would drop events for hard-deleted claims and agent ids.
+    ///
+    /// **This is the OWNER-SIDE calibration and is NOT the acceptance test for
+    /// migration 086.** `#[sqlx::test]` hands out a pool connected as the
+    /// owning superuser, for whom RLS does not apply and `FORCE` is irrelevant,
+    /// so it returned exactly these answers before 086 and returns them after —
+    /// it cannot distinguish a working probe from a collapsed one. Its value is
+    /// the other direction: it proves the fixture can detect a hidden id at all.
+    /// The discriminating test is
+    /// `crates/epigraph-db/tests/rls_enforcement.rs::hidden_claim_ids_still_classifies_on_the_app_role_under_force`,
+    /// which runs under `SET SESSION AUTHORIZATION epigraph_app`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn hidden_claim_ids_reports_existing_but_invisible_ids_only(pool: sqlx::PgPool) {
         let agent_id = sqlx::query_scalar::<_, Uuid>(

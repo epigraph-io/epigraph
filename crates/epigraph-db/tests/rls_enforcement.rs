@@ -1302,3 +1302,221 @@ fn guard_subquery_sites_are_enumerated() {
          only thing standing between an app connection and a bypass-running job."
     );
 }
+
+// ===========================================================================
+// PR-24 — the existence probe, on a role a policy actually filters
+// ===========================================================================
+
+/// `ClaimRepository::hidden_claim_ids` must still classify ids on an
+/// `epigraph_app` session with FORCE live.
+///
+/// # This is the acceptance test for migration 086, and it is the ONLY instrument that discriminates
+///
+/// The probe answers "which of these ids name a `claims` row this viewer may
+/// not read" as a set difference between an existence arm and a viewer-filtered
+/// arm. That is informative only while the two arms have different authority.
+/// Before 086 both read `claims` directly, so on a role the policy applies to
+/// they coincided and the difference was empty for every input — and BOTH
+/// callers read an empty set as *"nothing is hidden"*
+/// (`routes/events.rs::retain_visible_events` returns early and keeps every
+/// event; `routes/webhooks.rs::agent_may_receive` returns `true` and delivers).
+/// An always-empty probe is therefore uninformative, not conservative.
+///
+/// Nothing in the pre-existing suite could see that. Every other exerciser —
+/// the `#[sqlx::test]` unit test beside the function, `webhook_tenancy.rs`,
+/// `tenant_isolation_http.rs`, `events_unified_test.rs` — runs on a pool
+/// connected as the owning superuser, for whom no policy applies. Their answers
+/// are identical before and after 086. That structural insensitivity, not a
+/// missing edge case, is why this test exists.
+///
+/// # Why an app-role POOL and not `fixture::as_role`
+///
+/// `hidden_claim_ids` takes a `&PgPool`; `as_role` hands back a
+/// `PoolConnection`. Transcribing the SQL into this file would satisfy the
+/// words of the criterion and not the criterion — the thing under test is the
+/// production function. So this builds a one-connection pool whose
+/// `after_connect` issues `SET SESSION AUTHORIZATION epigraph_app`, the shape
+/// `security_event_log_writes_under_rls_on_the_app_role` above already
+/// establishes. `max_connections(1)` is load-bearing for the GUC arm at the
+/// end: a session-level `set_config` only sticks if there is one connection.
+///
+/// # The four properties, and why the fourth is not garnish
+///
+/// 1. an existing row the viewer may NOT read comes back **in** the hidden set;
+/// 2. an existing row the viewer MAY read does **not** — this is the one an
+///    existence-arm-only repair fails, because the viewer-filtered arm would
+///    still be narrowed by the policy to `visibility = 'public'` on an
+///    unstamped connection, whatever `$V` binds;
+/// 3. an id naming **no** row does not (the contract both callers depend on,
+///    pinned in `locked_decisions.rs`);
+/// 4. **calibration** — the same fixture and the same viewer on the OWNER
+///    connection still reports the hidden id. Without (4), a definer that
+///    returned nothing for an unrelated reason (a no-opped `OWNER TO`, a lost
+///    `SELECT` grant on `claims`, a missing `EXECUTE` grant) satisfies (2) and
+///    (3), which are both negative, and only fails (1) — and a suite of
+///    negative assertions is satisfied by a mechanism that returns nothing to
+///    anybody.
+///
+/// # The GUCs are deliberately left UNSET for the main arms
+///
+/// That is the production shape: both call sites take a raw `&PgPool` as a
+/// parameter, sourced from `state.db_pool` or the webhook-dispatcher handoff,
+/// and nothing on the request path stamps it
+/// (`D-PR17-request-path-never-stamps-session-gucs`). Stamping the owning group
+/// while passing a stranger viewer would pass on the UNFIXED tree, for a reason
+/// unrelated to the repair. The final arm stamps them coherently and asserts the
+/// answers are *unchanged*, which is the GUC-independence property 086 buys.
+///
+/// A `42501` here is a missing `GRANT EXECUTE` from 086, not a broken probe:
+/// `fixture::grant_app_privileges` grants schema, tables and sequences and not
+/// functions.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hidden_claim_ids_still_classifies_on_the_app_role_under_force(pool: PgPool) {
+    use epigraph_db::repos::ClaimRepository;
+    use epigraph_db::Viewer;
+
+    // `member` owns the private claim's group; `stranger` has a personal group
+    // of its own and no membership in `member`'s.
+    let (member_agent, group) = fixture::seed_agent_with_group(&pool, "pr24-member").await;
+    let (stranger_agent, _stranger_group) =
+        fixture::seed_agent_with_group(&pool, "pr24-stranger").await;
+
+    let public_id = fixture::seed_public_claim(&pool, member_agent, "pr24 public claim").await;
+    let private_id =
+        fixture::seed_group_claim(&pool, member_agent, group, "pr24 private claim").await;
+    let absent_id = Uuid::new_v4();
+    let ids = [public_id, private_id, absent_id];
+
+    // Viewers are resolved the way production resolves them. `Viewer::test_scoped`
+    // is `#[cfg(test)]` on its definition and is not reachable from this crate's
+    // integration tests; see `viewer_fixture.rs`'s module doc.
+    let member = Viewer::resolve(&pool, member_agent)
+        .await
+        .expect("resolve member");
+    let stranger = Viewer::resolve(&pool, stranger_agent)
+        .await
+        .expect("resolve stranger");
+    assert!(
+        member.group_bind().is_some_and(|g| g.contains(&group)),
+        "the member viewer must actually carry the owning group, or property 2 \
+         below is vacuous"
+    );
+    assert!(
+        stranger.group_bind().is_some_and(|g| !g.contains(&group)),
+        "the stranger viewer must NOT carry the owning group, or property 1 \
+         below is vacuous"
+    );
+
+    // ---- (4) CALIBRATION, on the owner connection, BEFORE the app-role arms.
+    // If this is empty the fixture cannot detect a hidden id at all and every
+    // assertion after it would be meaningless.
+    let owner_hidden = ClaimRepository::hidden_claim_ids(&pool, &stranger, &ids)
+        .await
+        .expect("owner-connection probe");
+    assert!(
+        owner_hidden.contains(&private_id),
+        "CALIBRATION: the owner connection must report the group-private id as \
+         hidden from a stranger. It does not, so the fixture — not the policy — \
+         is what the app-role assertions below would be measuring."
+    );
+    assert!(
+        !owner_hidden.contains(&public_id) && !owner_hidden.contains(&absent_id),
+        "CALIBRATION: a public row and an id naming no row are not hidden"
+    );
+
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+    let url = fixture::database_url_for(&pool).await;
+    let app_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET SESSION AUTHORIZATION epigraph_app")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("app-role pool");
+
+    // The instrument is not vacuous: this session really is filtered.
+    let visible_to_the_session: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = ANY($1)")
+            .bind(&ids[..])
+            .fetch_one(&app_pool)
+            .await
+            .expect("count under the app role");
+    assert_eq!(
+        visible_to_the_session, 1,
+        "PREMISE: an unstamped epigraph_app session must see exactly the PUBLIC \
+         one of the two seeded rows. Seeing both means FORCE is not in effect \
+         (or the role is a bypass role) and the whole test is vacuous; seeing \
+         neither means a grant is missing."
+    );
+
+    // ---- (1) and (3): the stranger.
+    let hidden = ClaimRepository::hidden_claim_ids(&app_pool, &stranger, &ids)
+        .await
+        .expect("app-role probe, stranger");
+    assert!(
+        hidden.contains(&private_id),
+        "an existing row the viewer cannot read must come back HIDDEN on the \
+         app role. Empty here is the collapse this migration exists to close, \
+         and both callers read empty as \"nothing is hidden\" — so the failure \
+         would be uninformative, not conservative."
+    );
+    assert!(
+        !hidden.contains(&public_id),
+        "a public row is not hidden from anyone"
+    );
+    assert!(
+        !hidden.contains(&absent_id),
+        "an id naming NO row has no owner to protect and must not be reported — \
+         reporting it would drop every event carrying an agent id or a \
+         hard-deleted claim id"
+    );
+    assert_eq!(hidden.len(), 1, "exactly the private id, and nothing else");
+
+    // ---- (2): the member. This is the property an existence-arm-only repair
+    // fails, and it fails it SILENTLY and in the over-suppressing direction.
+    let for_member = ClaimRepository::hidden_claim_ids(&app_pool, &member, &ids)
+        .await
+        .expect("app-role probe, member");
+    assert!(
+        for_member.is_empty(),
+        "nothing is hidden from a member of the owning group, on an UNSTAMPED \
+         app-role connection — which is the shape both call sites have. Without \
+         this, a probe that reports every existing id passes every assertion \
+         above, and production would silently drop a subscriber's own \
+         group-visible events. Got: {for_member:?}"
+    );
+
+    // ---- GUC-INDEPENDENCE. Stamp the session coherently and assert the two
+    // answers are unchanged. The repair puts both arms inside the definer frame,
+    // so the viewer — not `epigraph_session_groups()` — is the only authority
+    // either arm consults.
+    sqlx::query("SELECT set_config('epigraph.group_ids', $1, false)")
+        .bind(group.to_string())
+        .execute(&app_pool)
+        .await
+        .expect("stamp epigraph.group_ids");
+
+    let stamped_member = ClaimRepository::hidden_claim_ids(&app_pool, &member, &ids)
+        .await
+        .expect("app-role probe, member, stamped");
+    let stamped_stranger = ClaimRepository::hidden_claim_ids(&app_pool, &stranger, &ids)
+        .await
+        .expect("app-role probe, stranger, stamped");
+    assert!(
+        stamped_member.is_empty(),
+        "stamping must not change the member's answer; got {stamped_member:?}"
+    );
+    assert_eq!(
+        stamped_stranger, hidden,
+        "stamping the OWNING group must not make the private id readable by a \
+         STRANGER. The viewer is the authority here, not the session GUC — and \
+         a test that relied on the GUC instead would have passed on the unfixed \
+         tree."
+    );
+}

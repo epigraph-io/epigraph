@@ -1000,3 +1000,194 @@ async fn verify_flags_a_cross_group_edge_that_carries_no_co_owner(pool: PgPool) 
         "and verify must clear once the meet is restamped; stderr:\n{stderr}"
     );
 }
+
+/// The PR-24 addition to the definer-ownership pre-flight is LIVE, not a list
+/// edit nobody exercises.
+///
+/// `verify`'s 086 entry is deferred (see
+/// `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`), because plan §9.2 runs
+/// this pre-flight at step 11c — before 070/071/072, and long before 086 — so an
+/// unconditional entry would report `does not exist` and block a correctly
+/// sequenced deploy. A gate is exactly the shape that can be *right in
+/// the runbook and vacuous in CI*: if it never opened, `verify` would be green
+/// for a reason unrelated to the function's ownership, and the gap 086 exists to
+/// instrument would be uninstrumented again.
+///
+/// `#[sqlx::test(migrations = "../../migrations")]` applies 086, so the gate is
+/// open here and the entry must behave exactly like the six from 070/071 —
+/// asserted the same way `verify_fails_when_a_definer_body_is_not_maintenance_owned`
+/// asserts theirs, by reproducing the silent no-op and requiring `verify` to
+/// name the function.
+///
+/// Why this matters more than for 070's bodies, not less: 086's function is what
+/// `ClaimRepository::hidden_claim_ids` reads `claims` through, and it reaches
+/// them only via `claims_tenancy`'s definer-bypass disjunct. An app-owned body
+/// is policy-filtered like any other reader, so it returns FEWER rows **with no
+/// error** and the read-side suppression control degrades back toward reporting
+/// nothing hidden.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_covers_the_086_read_definer_once_its_migration_is_applied(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    seed_undeclared_claim(&pool, agent, "ordinary").await;
+    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
+
+    // PREMISE: the gate is OPEN on this database, i.e. the function really
+    // exists. If it did not, everything below would pass for the wrong reason.
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_claim_tenancy_by_ids')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read pg_proc");
+    assert!(
+        present,
+        "086's function must exist for this test to mean anything — the entry under test is \
+         skipped when it does not"
+    );
+
+    // Reproduce the missing-role deploy: 086's guarded ALTER silently no-opped,
+    // so the body kept the migration runner's ownership rather than the
+    // maintenance role's. `epigraph_app` stands in for any role that is not a
+    // member of epigraph_maintenance.
+    sqlx::query(
+        "ALTER FUNCTION public.epigraph_claim_tenancy_by_ids(uuid[]) OWNER TO epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("re-own the read definer to the app role");
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "verify must refuse a deploy whose 086 read definer is app-owned — an app-owned body \
+         is RLS-filtered, so it returns fewer rows with NO error and hidden_claim_ids degrades \
+         to reporting nothing hidden; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("epigraph_claim_tenancy_by_ids") && stderr.contains("epigraph_maintenance"),
+        "and it must NAME the function and the required owner, or an operator cannot act on \
+         it; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("skipping the ownership check for public.epigraph_claim_tenancy_by_ids"),
+        "the gate must be OPEN here; if verify skipped the entry, this test is \
+         asserting nothing about it; stderr:\n{stderr}"
+    );
+}
+
+/// The other branch of the same gate: when 086's FUNCTION is absent, `verify`
+/// skips its definer body, says so, and still exits 0.
+///
+/// # Why this half needs its own test
+///
+/// [`verify_covers_the_086_read_definer_once_its_migration_is_applied`] can only
+/// ever exercise the OPEN gate, because `#[sqlx::test]` applies every migration.
+/// The closed branch is the one an operator actually meets — plan §9.2 runs this
+/// pre-flight at step 11c, before 070/071/072, with 086 later still — and it was
+/// added precisely so a correctly sequenced deploy is not blocked by a migration
+/// it has not reached yet. An untested "do not block" branch is how a gate that
+/// was supposed to be permissive turns out to be fatal on the one day it runs.
+///
+/// The fixture reproduces that state by DROPPING the function, which is exactly
+/// what a pre-086 database looks like to this gate. It deliberately does NOT
+/// touch `_sqlx_migrations`: the gate reads `pg_proc`, and
+/// [`verify_still_checks_the_086_definer_when_its_migration_row_is_missing`]
+/// below pins the fact that bookkeeping alone can no longer switch it off.
+///
+/// The NOTE assertion is the other half. A skip that printed nothing would make
+/// a green `verify` indistinguishable from "checked and passed", which is the
+/// exact ambiguity 086's header claims this instrument removes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_skips_the_086_definer_and_still_passes_before_that_migration_applies(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    seed_undeclared_claim(&pool, agent, "ordinary").await;
+    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
+
+    // Reproduce "this database has not reached 086 yet" while keeping the rest
+    // of the schema at head, which is the only shape this harness can build.
+    sqlx::query("DROP FUNCTION public.epigraph_claim_tenancy_by_ids(uuid[])")
+        .execute(&pool)
+        .await
+        .expect("drop the 086 read definer");
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "verify must NOT block a deploy that has not applied 086 yet — §9.2 runs this \
+         pre-flight at step 11c, before the migrations that install this function, and the \
+         only remedy a FAIL could print there is \"apply a migration you are not supposed to \
+         have applied yet\"; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("skipping the ownership check for public.epigraph_claim_tenancy_by_ids"),
+        "and it must SAY it skipped, or a green verify cannot be told apart from \"checked and \
+         passed\"; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("FAIL: public.epigraph_claim_tenancy_by_ids"),
+        "a skipped entry must not also be reported as a failure; stderr:\n{stderr}"
+    );
+}
+
+/// Bookkeeping alone cannot switch the 086 check off: a database that HAS the
+/// function but has lost its `_sqlx_migrations` row is still checked.
+///
+/// # Why this case exists (PR-24 land phase)
+///
+/// The first draft of this gate asked `_sqlx_migrations` whether version 86 was
+/// recorded applied. Function-present/row-absent is not a contrived state:
+/// deleting the version row is the documented way to clear a checksum mismatch,
+/// and a dump/restore or a baselined database can carry the function with no row
+/// at all. `migrations/README.md` already documents the same class of drift in
+/// the other direction for 013. On the bookkeeping gate such a database would
+/// have SKIPPED the only catalog check for a silently no-opped
+/// `ALTER FUNCTION ... OWNER TO` and `verify` would still have exited 0 — a green
+/// pre-flight over a possibly app-owned definer frame, which is precisely the
+/// failure 086's registration exists to prevent.
+///
+/// So the gate reads `pg_proc`. This test pins that: the fixture removes the
+/// version row AND re-owns the body to a non-maintenance role, and `verify` must
+/// still FAIL and name the function.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_still_checks_the_086_definer_when_its_migration_row_is_missing(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    seed_undeclared_claim(&pool, agent, "ordinary").await;
+    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
+
+    let removed = sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 86")
+        .execute(&pool)
+        .await
+        .expect("remove the 086 bookkeeping row")
+        .rows_affected();
+    assert_eq!(
+        removed, 1,
+        "the fixture must actually remove the version-86 row, or this test proves nothing"
+    );
+
+    sqlx::query(
+        "ALTER FUNCTION public.epigraph_claim_tenancy_by_ids(uuid[]) OWNER TO epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("re-own the read definer to the app role");
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "the function EXISTS, so its ownership must still be checked however the migration \
+         bookkeeping reads. A gate keyed on _sqlx_migrations would exit 0 here, over an \
+         app-owned definer frame; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("FAIL: public.epigraph_claim_tenancy_by_ids"),
+        "and the failure must name the function; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("skipping the ownership check for public.epigraph_claim_tenancy_by_ids"),
+        "a present function must never be skipped; stderr:\n{stderr}"
+    );
+}

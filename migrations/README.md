@@ -67,7 +67,8 @@ Current reservation:
   | **067** | PR-04 | session / bypass functions (`epigraph_session_groups`, `epigraph_writable_groups`, `epigraph_principal_id`, `epigraph_bypass`, `epigraph_definer_bypass`) |
   | **068–084** | PR-05 … PR-22 | the remaining plan §3.1 migrations, shifted **+4** from the plan's printed numbering after 062 (plan 064 → 068, …, plan 080 → 084) |
   | **085** | PR-10 | `webhook_subscriptions` — **claimed 2026-09-03**, was headroom |
-  | **086–090** | — | remaining headroom |
+  | **086** | PR-24 | `epigraph_claim_tenancy_by_ids` `SECURITY DEFINER` read helper — **claimed 2026-09-06**, was headroom |
+  | **087–090** | — | remaining headroom |
 
   **The post-shift numbers, pinned.** THIS TABLE IS AUTHORITATIVE; plan §3.1's
   own columns are not, and neither is `docs/tenancy/FINAL-PLAN.md`. Derive

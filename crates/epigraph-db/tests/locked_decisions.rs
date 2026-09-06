@@ -336,6 +336,82 @@
 //!   that the database no longer accepts a write into a group the session
 //!   cannot write to, whatever the Rust does.
 
+//! ## Status at PR-24
+//!
+//! **PR-24 adds a migration (086) and does NOT touch any of the four.** Said
+//! explicitly, following PR-10's precedent, because the rejection trigger above
+//! is written to catch exactly the PR that adds a migration and leaves this file
+//! alone.
+//!
+//! * **No RLS policy, and this is checkable rather than narrated.** 086 creates
+//!   one `SECURITY DEFINER` function plus a `REVOKE` and a role-guarded
+//!   `OWNER TO` / `GRANT EXECUTE`. It issues no `CREATE POLICY`, no
+//!   `DROP POLICY`, no `ALTER TABLE … ROW LEVEL SECURITY` and no
+//!   `ALTER TABLE … FORCE`, so it adds, removes and edits **zero** `pg_policy`
+//!   rows. Asserted from the migration source by
+//!   [`d4_migration_086_installs_no_policy`] rather than left to review.
+//! * **D1 (nothing is public by absence, omission, or default-on-error)** —
+//!   reinforced, and the residual is stated in the direction it actually runs,
+//!   because an earlier draft of this bullet had it BACKWARDS. The defect 086
+//!   closes was an existence probe that returned EMPTY for every input once RLS
+//!   was FORCEd on an application role, which both callers read as *"nothing is
+//!   hidden"* — a mechanism that failed toward **delivering**. 086 removes that
+//!   for the intended configuration. It does **not** invert the failure
+//!   direction, and this file must not claim it does:
+//!
+//!   - **Degraded definer AUTHORITY is still fail-OPEN.** Both arms of the set
+//!     difference now draw from the SAME CTE, fed by one call to
+//!     `epigraph_claim_tenancy_by_ids`. If that frame loses its authority — a
+//!     silently no-opped `ALTER FUNCTION … OWNER TO`, so
+//!     `epigraph_definer_bypass()` is false inside it, or `epigraph_maintenance`
+//!     losing `SELECT` on `claims` — the CTE shrinks to the rows the policy
+//!     admits. A public row survives in BOTH arms (it satisfies
+//!     `visibility = 'public'`), the difference empties, and the callers read
+//!     empty as *"nothing is hidden"* and DELIVER. That is the original
+//!     collapse, reached by a different route. **Measured, not deduced:**
+//!     re-owning the function to `epigraph_app` and re-running
+//!     `rls_enforcement.rs::hidden_claim_ids_still_classifies_on_the_app_role_under_force`
+//!     fails it on property 1 — "an existing row the viewer cannot read must
+//!     come back HIDDEN" — i.e. the probe reports NOTHING, not everything.
+//!     **What upholds D1 here is the instrument, not the shape**: the deferred
+//!     entry in
+//!     `epigraph-cli/src/bin/tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`,
+//!     checked by `verify` — whose exit code is the week-11c deploy pre-flight —
+//!     is the only thing standing behind the frame's authority. It gates on the
+//!     function's presence in `pg_proc`, not on `_sqlx_migrations`, so a
+//!     database that lost its bookkeeping row cannot silently skip it.
+//!   - **A missing `EXECUTE` grant IS fail-closed.** It raises `42501`, the call
+//!     returns `Err`, and the PR-10 trio pinned above (`agent_id == None`,
+//!     `Viewer::resolve` errors, `hidden_claim_ids` errors → all DROP) turns
+//!     that into a DROP. That trio is untouched.
+//! * **D3 (`public` means any authenticated agent; no anonymous shape)** —
+//!   unchanged. PR-24 adds no `Viewer` shape, no constructor, and no
+//!   `SystemReason`; `Viewer::bypass_bind` is not consulted and no
+//!   `Viewer::system(` appears in the diff. The repaired statement keeps its
+//!   `Viewer::splice` marker — over the definer function's output rather than
+//!   over `claims` — so the viewer is spent in SQL exactly as
+//!   `visibility_lint.rs` requires, and **no new `VISIBILITY-EXEMPT:` entry is
+//!   taken**. That was a factoring decision, not a coincidence: the shape that
+//!   would have needed one puts the group array inside the definer frame, and
+//!   `EXPECTED_EXEMPTIONS`' own doc says a new exemption on a READ path is
+//!   almost certainly a leak being annotated rather than fixed.
+//! * **No tenancy column.** 086 adds no column to any relation, adds no table,
+//!   and therefore no `tenancy_exempt` row — `tenancy_coverage.rs`'s
+//!   cardinality-12 pin is untouched.
+//! * **No route moved** between the `public` and `protected` chains, and no
+//!   route was added or removed. `public_router_allowlist.rs` and
+//!   `viewer_route_table_lint.rs` are untouched; PR-24 changes no handler
+//!   signature.
+//! * **No write-side predicate.** 086's function is `STABLE` and its body is a
+//!   `SELECT`. The `-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side
+//!   predicate` markers in `repos/claim.rs` are unchanged, and no
+//!   `FAIL_OPEN_SCOPE_SITES` row moved.
+//! * **The `no_unscoped_pool.rs` counters do not move.** PR-24 converts
+//!   nothing: `UNCONVERTED` keeps `routes/events.rs` at 6 and
+//!   `routes/webhooks.rs` at 3, `HIGH_WATER` stays 414 and `HIGH_WATER_FILES`
+//!   51, and `bin/server.rs` stays in `EXEMPT` at 3. Only the prose reasons
+//!   change, because the follow-up they pointed at is this PR.
+
 use sqlx::PgPool;
 use std::collections::BTreeSet;
 
@@ -1375,5 +1451,81 @@ fn d4_the_kill_switch_covers_the_same_relations_as_the_flip() {
         !undo.contains("'rls_canary'"),
         "079-undo.sql must NOT un-FORCE rls_canary: the canary would become visible to the \
          owner and the boot probe would report a false alarm during the rollback itself"
+    );
+}
+
+// ===========================================================================
+// D4 — PR-24's claim that migration 086 installs no policy
+// ===========================================================================
+
+/// Migration 086 adds a `SECURITY DEFINER` read helper and touches no policy.
+///
+/// The `## Status at PR-24` block above states this as fact. §0.2's rejection
+/// trigger fires on *"a PR that changes an RLS policy … and does not touch this
+/// file"*, so the honest discharge is an assertion, not a sentence: a later
+/// edit that slipped a `CREATE POLICY` or an `ALTER TABLE … FORCE` into 086
+/// would make that block false while every other test stayed green, and 086 is
+/// applied by all ~1000 `#[sqlx::test(migrations = "../../migrations")]`
+/// attributes in this workspace, so its blast radius is the whole suite.
+///
+/// Read from the migration SOURCE, not from `pg_policy`: a catalog read would
+/// agree with the migration by construction, and it could not distinguish
+/// "086 installs no policy" from "086 installs one that 079 already installed".
+///
+/// `--` comments are stripped first, for the same reason
+/// [`strip_line_comments`] does it for Rust — 086's header discusses
+/// `claims_tenancy` and its `USING` clause at length, and a scanner that read
+/// prose would find whatever the prose happened to mention. Note that
+/// [`strip_line_comments`] itself keys on `//` and is therefore the WRONG tool
+/// on a `.sql` file; this is the same inline `--` strip
+/// [`d4_the_kill_switch_covers_the_same_relations_as_the_flip`] uses.
+#[test]
+fn d4_migration_086_installs_no_policy() {
+    let raw = include_str!("../../../migrations/086_claim_tenancy_definer.sql");
+    let sql = raw
+        .lines()
+        .map(|l| match l.find("--") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_uppercase();
+
+    for banned in [
+        "CREATE POLICY",
+        "DROP POLICY",
+        "ALTER POLICY",
+        "ROW LEVEL SECURITY",
+        "ALTER TABLE",
+        "ADD COLUMN",
+    ] {
+        assert!(
+            !sql.contains(banned),
+            "migration 086 contains `{banned}`. The `Status at PR-24` block in this file's \
+             module doc asserts that it adds no policy, no FORCE flip and no tenancy column, \
+             and that claim is now false. Either revert the statement or rewrite the block — \
+             do not delete this assertion."
+        );
+    }
+
+    // Inverted half: the assertion must not pass because the file moved or emptied.
+    assert!(
+        sql.contains("CREATE OR REPLACE FUNCTION PUBLIC.EPIGRAPH_CLAIM_TENANCY_BY_IDS")
+            && sql.contains("SECURITY DEFINER")
+            && sql.contains("REVOKE EXECUTE ON FUNCTION"),
+        "086 must still be the definer helper it is documented to be, or the negative \
+         assertions above are vacuous"
+    );
+    // The three parts of 077's idiom that are load-bearing rather than stylistic:
+    // the frame's authority comes from its OWNER, and the app role cannot call
+    // it without an explicit grant (`grant_app_privileges` covers tables only).
+    assert!(
+        sql.contains("OWNER TO EPIGRAPH_MAINTENANCE")
+            && sql.contains("GRANT EXECUTE ON FUNCTION")
+            && sql.contains("SET SEARCH_PATH = PUBLIC, PG_TEMP"),
+        "086 must keep the guarded OWNER TO, the GRANT EXECUTE and the pinned search_path. \
+         The owner is what makes epigraph_definer_bypass() true inside the frame — it is the \
+         MECHANISM, not hardening — and without the grant the app role gets 42501."
     );
 }

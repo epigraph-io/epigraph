@@ -60,15 +60,48 @@
 //!   `routes/webhooks.rs` (3 each). That is a LOWER bound — the needle only
 //!   sees a write whose verb appears on the same line as the pool access — so
 //!   a shard must classify its own sites rather than trusting this figure.
-//! * **Two files below must NOT be converted yet, and converting them would
-//!   turn this ratchet green over a control that had stopped working.**
-//!   `routes/webhooks.rs` and `routes/events.rs` both suppress on
-//!   `ClaimRepository::hidden_claim_ids`, whose first arm is an *existence*
-//!   probe. That arm needs authority broader than the viewer's, which no amount
-//!   of stamping provides — see that function's own doc comment for the
-//!   mechanism and for the `SECURITY DEFINER` shape that repairs it. It is a
-//!   migration, so it belongs to a numbered follow-up, and it is recorded in
-//!   `docs/tenancy/progress.json` as a hard precondition for §9.2 step 11d.
+//! * **Two files below must still NOT be converted, and the reason has
+//!   changed — read this before assuming it is stale.** `routes/webhooks.rs`
+//!   and `routes/events.rs` both suppress on
+//!   `ClaimRepository::hidden_claim_ids`, whose two arms need *different*
+//!   authority and got the same authority once RLS was FORCEd on an
+//!   application role. That was the reason not to convert them: converting
+//!   would have turned this ratchet green over a control that had stopped
+//!   working. **PR-24 repaired the probe itself** — migration 086 moves both
+//!   arms into a `SECURITY DEFINER` frame, so the answer no longer depends on
+//!   the connection's session GUCs at all, and
+//!   `F-PR23-existence-probe-collapses-under-force` is closed.
+//!
+//!   **DO NOT convert `routes/webhooks.rs` or `routes/events.rs`. Closing the
+//!   probe did not make them safe to convert, and a shard must not read it that
+//!   way.** The prohibition stands on two things that are still open, and
+//!   `docs/tenancy/progress.json`'s `prs.next` is worded to match — if the two
+//!   ever disagree about the FORCE of this rule, that disagreement is itself the
+//!   finding:
+//!
+//!   1. `F-PR24-event-list-existence-arm-collapses-under-force`. The SQL twin of
+//!      the repaired probe — `EventRepository::list`'s suppression predicate,
+//!      which is what serves the *persisted* half of `GET /api/v1/events` and
+//!      all of MCP `list_events` — still reads `claims` directly on both arms
+//!      and still collapses. `routes/events.rs` therefore remains a file whose
+//!      conversion would turn this ratchet green over a control that has stopped
+//!      working, which is exactly the hazard this bullet was written for. PR-24
+//!      moved the reason, it did not remove it. **The same hold applies to
+//!      `crates/epigraph-mcp/src/tools/events.rs`**, which calls
+//!      `EventRepository::list` with no Rust backstop at all — and which this
+//!      ratchet cannot see, because its scan root is `crates/epigraph-api/src`
+//!      and `epigraph-mcp` appears only in the Known-limits section above. No
+//!      counter protects that file, so this sentence is the only control on it.
+//!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
+//!      §9.2 step 11d. PR-24 discharged one precondition, not the gate.
+//!
+//!   And independently of both, the conversion is unargued: each file takes a
+//!   raw `&PgPool` as a *parameter* (from `state.db_pool` and from the
+//!   webhook-dispatcher handoff in the EXEMPT `bin/server.rs`), so a conversion
+//!   is a signature change across a process-lifetime task boundary rather than a
+//!   `read_as` swap — and the Rust probe is now correct on an unstamped
+//!   connection, so stamping buys nothing *for that control*. See
+//!   `hidden_claim_ids`' own doc comment for the mechanism.
 //! * **The repo layer does not yet serve this at scale.** Measured under
 //!   `crates/epigraph-db/src/repos/`: 206 `pub async fn` take both a
 //!   `pool: &PgPool` and a `Viewer`, and only 12 `*_conn` siblings exist at
@@ -216,17 +249,21 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     (
         "bin/server.rs",
         3,
-        "Boot and spawned long-lived tasks — but in TWO different senses, and the second is \
-         exempt-until-a-follow-up rather than exempt-by-definition. (a) The webhook-subscription \
-         load at startup and the metrics-sampler handoff: no principal exists at process start or \
-         inside the sampler, so there is nothing to stamp a connection from. (b) The \
-         webhook-dispatcher handoff is NOT of that kind, and an earlier draft of this reason was \
-         factually wrong to say so: the dispatcher resolves a real Viewer per subscription three \
-         files away (routes/webhooks.rs::agent_may_receive), so a Viewer IS constructible there. \
-         It stays unscoped because the visibility probe it depends on, \
-         ClaimRepository::hidden_claim_ids, needs authority broader than the viewer for its \
-         existence arm and cannot be repaired by stamping — see that function's doc, and the \
-         precondition recorded in docs/tenancy/progress.json.",
+        "Boot and spawned long-lived tasks — in TWO different senses, and the second is a \
+         STANDING exemption as of PR-24, no longer exempt-until-a-follow-up. (a) The \
+         webhook-subscription load at startup and the metrics-sampler handoff: no principal \
+         exists at process start or inside the sampler, so there is nothing to stamp a \
+         connection from. (b) The webhook-dispatcher handoff is NOT of that kind, and an earlier \
+         draft of this reason was factually wrong to say so: the dispatcher resolves a real \
+         Viewer per subscription three files away (routes/webhooks.rs::agent_may_receive), so a \
+         Viewer IS constructible there. The follow-up it was waiting on has LANDED — migration \
+         086 repaired ClaimRepository::hidden_claim_ids by putting both arms of its set \
+         difference inside a SECURITY DEFINER frame — and the exemption does not dissolve with \
+         it: the pool is handed over ONCE at process start and travels as a &PgPool parameter \
+         into a detached task, so the site is a process-lifetime handoff rather than a request \
+         whose viewer could stamp it, and the probe it feeds is now correct on an unstamped \
+         connection anyway. Converting it is a separate decision with its own evidence, not a \
+         consequence of 086 — see that function's doc.",
     ),
     (
         "middleware/bearer.rs",

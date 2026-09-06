@@ -905,6 +905,70 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 
 /// The six `SECURITY DEFINER` bodies migrations 070 and 071 install, whose owner
 /// must satisfy `epigraph_definer_bypass()`.
+///
+/// Migration 086's read helper is subject to the same check but lives in
+/// [`DEFERRED_DEFINER_FUNCTIONS`]; [`applicable_definer_functions`] joins the
+/// two. The rest of this comment explains why it is checked here at all, and
+/// why it is not checked unconditionally.
+///
+/// # Why 086's function is checked by THIS gate and not by a new one (PR-24)
+///
+/// `epigraph_claim_tenancy_by_ids` is what
+/// `epigraph-db`'s `ClaimRepository::hidden_claim_ids` reads `claims` through,
+/// and it reaches `claims` only because `claims_tenancy`'s
+/// `OR (SELECT public.epigraph_definer_bypass())` disjunct admits a frame whose
+/// `current_user` is a member of `epigraph_maintenance`. If the guarded
+/// `ALTER FUNCTION ... OWNER TO` in 086 silently no-ops — which is exactly what
+/// 060's `RAISE NOTICE`-only role creation makes possible — the function returns
+/// FEWER rows with no error, and the suppression control it backs degrades to
+/// reporting nothing hidden. That is the same silent failure mode this check
+/// exists for, on a READ path rather than a write one, so it takes the same
+/// instrument rather than a second one.
+///
+/// The predicate is unchanged and is inherited deliberately:
+/// `pg_has_role(owner, 'epigraph_maintenance', 'MEMBER')`, not string equality —
+/// see the comment inside [`verify_definer_ownership`]. This entry therefore
+/// also passes on a superuser-owned body, which is correct, because such a body
+/// satisfies `epigraph_definer_bypass()` too.
+///
+/// It is NOT added to `tenancy_triggers.rs::propagation_function_is_owned_by_the_maintenance_role`
+/// or to `schema_contract.rs::the_five_session_functions_exist`: the first is
+/// scoped by name to 070's propagation trigger bodies and the second to 067's
+/// five session functions, and widening either would make its own doc comment
+/// false.
+///
+/// # ⚠ WHY THE 086 ENTRY IS DEFERRED AND THE OTHER SIX ARE NOT
+///
+/// `verify`'s exit code is the plan's **week-11c** pre-flight, and §9.2 runs it
+/// *before* applying 070/071/072 — 077/078/079 come at 11d and 086 later still.
+/// So at the moment this binary is meant to run, a legitimately-sequenced
+/// database has **not** applied 086, and an unconditional entry would report
+/// `does not exist` and block a working deploy. That is exactly the failure this
+/// check's own predicate comment refuses to commit for the string-equality case,
+/// and it would be worse here, because the documented remedy would be "apply a
+/// migration you are not supposed to have applied yet".
+///
+/// So the 086 entry is skipped **only while the FUNCTION ITSELF is absent from
+/// `pg_proc`**, by [`applicable_definer_functions`]. The six from 070/071 keep
+/// their unconditional semantics: those ARE the migrations 11c applies, so a
+/// missing one there is a real finding.
+///
+/// ## The gate reads `pg_proc`, NOT `_sqlx_migrations` (PR-24 land phase)
+///
+/// The first draft of this gate asked `_sqlx_migrations` whether version 86 was
+/// recorded applied. That is bookkeeping, and bookkeeping and objects drift
+/// apart in BOTH directions: `migrations/README.md` documents version-recorded/
+/// object-gone for 013, and object-present/row-gone is just as reachable —
+/// deleting the version row is the documented way to clear a checksum mismatch,
+/// and a dump/restore or a baselined database can carry the function with no row
+/// at all. On that database the bookkeeping gate would have SKIPPED the only
+/// catalog check for a silently no-opped `OWNER TO` and still exited 0, i.e. a
+/// green pre-flight over a possibly app-owned definer frame.
+///
+/// Gating on the object is strictly stronger and costs nothing operationally:
+/// at step 11c the function legitimately does not exist yet, so the skip still
+/// fires exactly where it was designed to. The version in the tuple survives
+/// only to name the migration in the NOTE an operator reads.
 const DEFINER_FUNCTIONS: &[&str] = &[
     "epigraph_claims_require_tenancy",
     "epigraph_node_tenancy",
@@ -914,13 +978,61 @@ const DEFINER_FUNCTIONS: &[&str] = &[
     "epigraph_ownership_transcribe",
 ];
 
-/// Assert that migrations 070/071 actually re-owned their `SECURITY DEFINER`
+/// Definer bodies installed by a migration LATER than the ones 11c applies, as
+/// `(function name, the migration version that installs it)`.
+///
+/// The version is NOT the gate — [`applicable_definer_functions`] gates on the
+/// function's presence in `pg_proc`. It is carried so the skip NOTE can name the
+/// migration an operator has to apply. See [`DEFINER_FUNCTIONS`]' last section.
+const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[("epigraph_claim_tenancy_by_ids", 86)];
+
+/// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
+/// actually EXISTS on this database.
+///
+/// Presence is read from `pg_proc`, not from `_sqlx_migrations`: a database can
+/// hold the function without the bookkeeping row (a deleted version row after a
+/// checksum re-sync, a dump/restore, a baselined database), and on that shape a
+/// bookkeeping gate would skip the only catalog check for a silently no-opped
+/// `OWNER TO` while still exiting 0.
+///
+/// A skipped entry is announced on stderr rather than dropped silently: an
+/// operator reading a green `verify` must be able to tell "checked and passed"
+/// from "not checked yet".
+async fn applicable_definer_functions(pool: &PgPool) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = DEFINER_FUNCTIONS.iter().map(|s| (*s).to_string()).collect();
+    for (name, version) in DEFERRED_DEFINER_FUNCTIONS {
+        let present: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_proc p
+                              JOIN pg_namespace n ON n.oid = p.pronamespace
+                             WHERE n.nspname = 'public' AND p.proname = $1)",
+        )
+        .bind(name)
+        .fetch_one(pool)
+        .await?;
+        if present {
+            out.push((*name).to_string());
+        } else {
+            eprintln!(
+                "NOTE: skipping the ownership check for public.{name} — the function does not \
+                 exist on this database, so migration {version}, which installs it, has not \
+                 been applied. That is the \
+                 EXPECTED state at plan 9.2 step 11c, which runs this pre-flight before the \
+                 later migrations. Re-run verify after {version} applies; until then this \
+                 definer body is UNCHECKED, not passing."
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Assert that migrations 070/071/086 actually re-owned their `SECURITY DEFINER`
 /// bodies. Returns the number of failing checks.
 ///
 /// # Why this is a `verify` check and not a migration assertion
 ///
-/// Both migrations wrap their `ALTER FUNCTION … OWNER TO epigraph_maintenance`
-/// in `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance')`
+/// All three migrations wrap their `ALTER FUNCTION … OWNER TO
+/// epigraph_maintenance` in
+/// `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance')`
 /// and **silently no-op** when the role is absent. That is not hypothetical:
 /// migration 060 creates the roles inside a `DO` block that catches
 /// `insufficient_privilege` and only `RAISE NOTICE`s, precisely because a
@@ -936,13 +1048,20 @@ const DEFINER_FUNCTIONS: &[&str] = &[
 /// * **071 — an OUTAGE.** `epigraph_definer_bypass()` is
 ///   `pg_has_role(CURRENT_USER, …)` evaluated as the FUNCTION OWNER, so an
 ///   app-owned shim returns false and every `ownership` write raises 42501.
+/// * **086 — a DEGRADED READ CONTROL (PR-24).** `epigraph_claim_tenancy_by_ids`
+///   reaches `claims` only through `claims_tenancy`'s definer-bypass disjunct.
+///   An app-owned body is policy-filtered like any other reader, so it returns
+///   FEWER rows with no error, and `ClaimRepository::hidden_claim_ids` — which
+///   decides what `GET /api/v1/events` and the webhook fan-out suppress —
+///   degrades back toward reporting nothing hidden. Same silent shape as 070's,
+///   on a read path.
 ///
 /// A hard failure inside the migration is the wrong instrument (a failed
 /// migration records no row, so a missing role becomes a permanent restart
 /// loop). `verify`'s exit code is the documented week-11c pre-flight, so the
 /// check belongs here, where an operator can act on it.
 ///
-/// A missing FUNCTION is reported too: 070/071 may have been rolled back
+/// A missing FUNCTION is reported too: 070/071/086 may have been rolled back
 /// without the code being rolled back with them.
 async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
     // The role must exist at all. `epigraph_definer_bypass()` is written to
@@ -956,15 +1075,16 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
     if !role_exists {
         eprintln!(
             "FAIL: role '{MAINTENANCE_ROLE}' does not exist. Migration 060 only RAISE NOTICEs \
-             when the migration role lacks CREATEROLE, and 070/071 then SKIP their \
-             ALTER FUNCTION ... OWNER TO, so both migrations reported success with the \
-             control absent. Provision the role out of band and re-apply 070 and 071."
+             when the migration role lacks CREATEROLE, and 070, 071 and 086 then SKIP their \
+             ALTER FUNCTION ... OWNER TO, so all three migrations reported success with the \
+             control absent. This branch returns BEFORE the per-function checks below, so \
+             none of them ran. Provision the role out of band and re-apply 070, 071 and 086."
         );
         return Ok(1);
     }
 
     let mut failures = 0usize;
-    for f in DEFINER_FUNCTIONS {
+    for f in &applicable_definer_functions(pool).await? {
         // ==============================================================
         // THE PREDICATE IS `pg_has_role(owner, epigraph_maintenance,
         // MEMBER)`, NOT `rolname = 'epigraph_maintenance'`.
@@ -1002,7 +1122,7 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                 failures += 1;
                 eprintln!(
                     "FAIL: SECURITY DEFINER function public.{f} does not exist. \
-                     Apply migrations 070 and 071 before running this."
+                     Apply migrations 070, 071 and 086 before running this."
                 );
             }
             Some((_, true)) => {}
@@ -1010,11 +1130,13 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                 failures += 1;
                 eprintln!(
                     "FAIL: public.{f} is owned by '{rolname}', which is not a member of \
-                     '{MAINTENANCE_ROLE}'. Migrations 070/071 skip their ALTER FUNCTION when \
-                     the role is absent (060 only NOTICEs on insufficient_privilege), so this \
-                     is a SILENT no-op: 070's bodies become RLS-filtered at PR-17 -- arm (b) \
-                     then stamps a private endpoint PUBLIC -- and 071's shim raises 42501 on \
-                     every ownership write. Re-apply 070 and 071 with the role provisioned."
+                     '{MAINTENANCE_ROLE}'. Migrations 070/071/086 skip their ALTER FUNCTION \
+                     when the role is absent (060 only NOTICEs on insufficient_privilege), so \
+                     this is a SILENT no-op: 070's bodies become RLS-filtered at PR-17 -- arm \
+                     (b) then stamps a private endpoint PUBLIC -- 071's shim raises 42501 on \
+                     every ownership write, and 086's read helper returns fewer rows with no \
+                     error, which degrades the read-side suppression control it backs. \
+                     Re-apply 070, 071 and 086 with the role provisioned."
                 );
             }
         }

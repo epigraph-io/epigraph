@@ -3,10 +3,12 @@
 // (a) Boot hydration and the metrics sampler: no principal exists at process start or inside the
 // sampler, so there is nothing to stamp a connection from. (b) The webhook-dispatcher handoff is
 // NOT of that kind: the dispatcher resolves a real `Viewer` per subscription downstream, so a
-// Viewer IS constructible there. It stays unscoped because the visibility probe it depends on
-// (`ClaimRepository::hidden_claim_ids`) needs authority broader than the viewer for its existence
-// arm and cannot be repaired by stamping — see that function's own doc. Exempt-until-that-lands,
-// not exempt-by-definition.
+// Viewer IS constructible there. The follow-up this used to be exempt-until — migration 086, which
+// repaired `ClaimRepository::hidden_claim_ids` by putting both arms of its set difference inside a
+// SECURITY DEFINER frame — has landed, and the exemption STANDS anyway: this pool is handed over
+// once at process start and travels as a `&PgPool` parameter into a detached task, and the probe it
+// feeds is now correct on an unstamped connection. Converting it is a separate decision, not a
+// consequence of 086.
 use epigraph_api::metrics::Metrics;
 use epigraph_api::routes::webhooks::{start_webhook_dispatcher, WebhookDeliveryConfig};
 use epigraph_api::{create_router, ApiConfig, AppState};

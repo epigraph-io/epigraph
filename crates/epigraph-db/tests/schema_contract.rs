@@ -823,3 +823,109 @@ async fn migration_062_refuses_a_nullable_visibility(pool: PgPool) {
 
     tx.rollback().await.expect("rollback");
 }
+
+/// Migration 086's `SECURITY DEFINER` read helper must never be EXECUTE-able by
+/// `PUBLIC`, and its ACL must be EXPLICIT.
+///
+/// # Why the ACL needs its own catalog pin (PR-24 land phase)
+///
+/// `public.epigraph_claim_tenancy_by_ids(uuid[])` is an unfiltered read of
+/// `(id, visibility, owner_group_id)` for arbitrary caller-named claim ids that
+/// runs with `epigraph_maintenance`'s authority and is therefore admitted past
+/// `claims_tenancy` by its definer-bypass disjunct. Its only access control is
+/// 086's `REVOKE EXECUTE … FROM PUBLIC` plus a single `GRANT` to `epigraph_app`.
+///
+/// Postgres grants `EXECUTE` to `PUBLIC` by default on every
+/// `CREATE OR REPLACE FUNCTION`, so **any later migration that redefines this
+/// body — to widen the return set, add a column, or fix a plan — silently
+/// re-grants it to `PUBLIC`**, and nothing else in the workspace would notice:
+/// `locked_decisions.rs::d4_migration_086_installs_no_policy` greps the 086 file
+/// for the word `REVOKE`, which stays true after such a re-grant, and neither
+/// `visibility_lint.rs` nor `no_unscoped_pool.rs` can see a read that goes
+/// through a function taking no `Viewer`.
+///
+/// `proacl IS NOT NULL` is the assertion that actually catches that: the default
+/// ACL is a NULL `proacl`, which MEANS implicit `EXECUTE` to `PUBLIC`. Asked via
+/// `has_function_privilege` rather than by scanning `proacl` text, for the reason
+/// `the_five_session_functions_exist` records above — the owner's own grant
+/// renders as `owner=X/owner` and a text scan for `=X/` matches it.
+///
+/// The positive half is pinned too: without the `GRANT` to `epigraph_app`,
+/// `ClaimRepository::hidden_claim_ids` raises `42501` on its first call on the
+/// application role, which `routes/webhooks.rs::agent_may_receive` maps to
+/// "suppress" (every delivery silently stops) and
+/// `routes/events.rs::retain_visible_events` maps to a 500. That is fail-closed,
+/// but it is a total outage of both surfaces, and `viewer_fixture.rs`'s
+/// `grant_app_privileges` grants schema, tables and sequences and NOT functions —
+/// so 086's own `GRANT` is the only thing that makes the call possible at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_086_read_definer_is_revoked_from_public(pool: PgPool) {
+    let meta: Option<(bool, String)> = sqlx::query_as(
+        "SELECT p.prosecdef, p.provolatile::text \
+           FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_claim_tenancy_by_ids'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let (secdef, volatility) =
+        meta.expect("public.epigraph_claim_tenancy_by_ids must exist (migration 086)");
+    assert!(
+        secdef,
+        "epigraph_claim_tenancy_by_ids must stay SECURITY DEFINER — the definer frame IS the \
+         repair; an INVOKER body is filtered by claims_tenancy like any other reader and \
+         hidden_claim_ids collapses back to reporting nothing hidden"
+    );
+    assert_eq!(
+        volatility, "s",
+        "it must stay STABLE, or the planner cannot hoist it and every caller pays a re-plan"
+    );
+
+    let (public_can_execute,): (bool,) = sqlx::query_as(
+        "SELECT has_function_privilege('public', \
+                'public.epigraph_claim_tenancy_by_ids(uuid[])', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("has_function_privilege lookup");
+    assert!(
+        !public_can_execute,
+        "epigraph_claim_tenancy_by_ids is EXECUTE-able by PUBLIC. It reads claims with the \
+         maintenance role's authority and returns tenancy labels for caller-named ids, so a \
+         PUBLIC grant makes it reachable from any statement any role can run. 086's \
+         `REVOKE EXECUTE … FROM PUBLIC` is what keeps it off that surface — and note that a \
+         later CREATE OR REPLACE of this body RE-GRANTS it to PUBLIC unless the REVOKE is \
+         repeated."
+    );
+
+    let acl: Option<String> = sqlx::query_scalar(
+        "SELECT proacl::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_claim_tenancy_by_ids'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("proacl lookup");
+    assert!(
+        acl.is_some(),
+        "epigraph_claim_tenancy_by_ids must carry an EXPLICIT ACL — a NULL proacl is the \
+         DEFAULT grant, which includes EXECUTE to PUBLIC. This is the assertion that fails \
+         when a later migration re-creates the body and forgets to repeat the REVOKE."
+    );
+
+    let (app_can_execute,): (bool,) = sqlx::query_as(
+        "SELECT has_function_privilege('epigraph_app', \
+                'public.epigraph_claim_tenancy_by_ids(uuid[])', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("has_function_privilege lookup");
+    assert!(
+        app_can_execute,
+        "epigraph_app must hold EXECUTE. Without it hidden_claim_ids raises 42501 on the \
+         application role, which suppresses EVERY webhook delivery and 500s every \
+         GET /api/v1/events page whose payloads carry a uuid — fail-closed, but a total \
+         outage of both surfaces. 086's GRANT is guarded by the same pg_roles check as its \
+         OWNER TO, so a cluster that provisions epigraph_app out of band AFTER 086 applies \
+         gets the function with no grant."
+    );
+}
