@@ -377,6 +377,19 @@ pub async fn list_events(
 /// `payload_uuid_tests::an_over_long_hex_run_yields_its_prefix_in_both_implementations`,
 /// which records the Postgres output verbatim.
 ///
+/// ## Scope of that superset property — EXTRACTION only (PR-24)
+///
+/// `rust ⊇ sql` is a claim about which uuids each side *extracts*, and PR-24
+/// changed neither scanner. It says nothing about what each side then does with
+/// them, and as of PR-24 the two halves no longer agree about THAT: migration
+/// 086 moved `ClaimRepository::hidden_claim_ids` — the suppression step the
+/// in-memory half uses — inside a `SECURITY DEFINER` frame, while the
+/// suppression predicate in `EventRepository::list` still reads `claims`
+/// directly on both of its arms. Filed as
+/// `F-PR24-event-list-existence-arm-collapses-under-force` in
+/// `docs/tenancy/progress.json`; see the `⚠ THE TWO HALVES DO NOT AGREE` section
+/// on `EventRepository::list`. Do not read the paragraph above as covering it.
+///
 /// # `pub(crate)` since PR-10 — and the asymmetry above is exactly why
 ///
 /// `routes/webhooks.rs::deliver_event` applies the same rule to the webhook

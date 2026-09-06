@@ -83,6 +83,30 @@ impl EventRepository {
     /// of this regex. The three must agree; they are cross-referenced in all
     /// three places for that reason.
     ///
+    /// ## ⚠ THE TWO HALVES DIFFER IN AUTHORITY AS OF PR-24 — filed, not silently left
+    ///
+    /// **Not** a regression in the uuid-extraction rule the paragraph above
+    /// pins: PR-24 changed none of the three scanners, and `rust ⊇ sql` still
+    /// holds. What diverged is the AUTHORITY each half's suppression step runs
+    /// with.
+    ///
+    /// The predicate below is the same set difference `hidden_claim_ids` takes,
+    /// written as `EXISTS(cx) AND NOT EXISTS(c …)`. It has the same structural
+    /// weakness the Rust half had before migration 086: both `EXISTS` arms read
+    /// `claims` directly, so on a role the `claims_tenancy` policy applies to
+    /// they are filtered identically and the inner condition can no longer be
+    /// satisfied. PR-24 repaired the Rust half only, because the SQL half is a
+    /// second surface with its own tests and its own bookkeeping and was not in
+    /// that PR's scope. Recorded as
+    /// `F-PR24-event-list-existence-arm-collapses-under-force` in
+    /// `docs/tenancy/progress.json`.
+    ///
+    /// **No further migration is needed to close it.** 086's
+    /// `public.epigraph_claim_tenancy_by_ids(uuid[])` takes an array, so an
+    /// array-of-one call fits this per-match subquery directly — measured
+    /// working on the throwaway. Latent today, like the Rust half was: every
+    /// environment's DSN is still the owning superuser.
+    ///
     /// ## Two shapes that deliberately survive the filter
     ///
     /// * **An event naming no claim at all** — most of them. `NOT EXISTS` over
