@@ -1,5 +1,8 @@
 //! POST /oauth/register — Dynamic client registration (RFC 7591).
 
+// UNSCOPED-POOL-EXEMPT: Pre-authentication. RFC 7591 dynamic client registration CREATES the client;
+// no principal exists until it succeeds.
+
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 

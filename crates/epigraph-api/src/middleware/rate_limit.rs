@@ -13,6 +13,10 @@
 //! - **Unauthenticated requests**: Rate limited by client IP
 //! - **Health endpoints**: Exempt from rate limiting
 
+// UNSCOPED-POOL-EXEMPT: One `db_pool.clone()` handed to a detached task that records security
+// events. It runs after the rate-limit decision and outside any request's viewer scope, and rate
+// limiting precedes authentication, so the request may have no principal to scope to at all.
+
 use axum::{
     body::Body,
     extract::State,

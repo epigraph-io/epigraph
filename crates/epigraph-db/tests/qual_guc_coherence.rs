@@ -70,7 +70,8 @@
 //! the policy level.
 
 use epigraph_db::{
-    repos::AgentRepository, DbError, ScopedPool, SessionGucMode, SystemReason, Viewer,
+    repos::AgentRepository, DbError, ScopedPool, ScopedPoolOptions, SessionGucMode, SystemReason,
+    Viewer,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Executor, PgPool};
@@ -789,4 +790,333 @@ async fn seed_group_claim(pool: &PgPool, agent: Uuid, group: Uuid) -> Uuid {
     .await
     .expect("seed group claim");
     id
+}
+
+// ---------------------------------------------------------------------------
+// `ScopedPool::read_as` — the mode-dispatch helper
+// ---------------------------------------------------------------------------
+//
+// The helper exists because `acquire_as` HARD-REFUSES `Transaction` mode
+// (`transaction_mode_rejects_acquire_as`, above) while `begin_as` costs two
+// extra round trips in `Session` mode. A request path converted onto either
+// primitive alone is therefore either unservable behind a transaction-mode
+// pooler or permanently slower, and the first of those is discovered in
+// production because this repo has no pgbouncer fixture (blocked measurement
+// M5).
+//
+// Every test below runs in BOTH modes on purpose. Testing only the `Session`
+// arm would prove the half that already worked and ship the dispatch — the
+// arm that is the entire reason the helper exists — unexercised.
+
+/// The observations a filtered session makes about a viewer's own rows.
+struct FilteredObservation {
+    gucs: Vec<Uuid>,
+    visible_mine: i64,
+    visible_theirs: i64,
+    bypass: bool,
+    arm: SessionGucMode,
+}
+
+/// Drive `read_as` end to end in `mode`, under `SET SESSION AUTHORIZATION
+/// epigraph_app` so the policies actually filter.
+///
+/// Factored over the mode rather than duplicated so the two arms cannot drift
+/// into asserting different properties — which is how a dispatch helper ends up
+/// with one arm covered and one arm assumed.
+async fn read_as_filtered_case(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+    mode: SessionGucMode,
+) -> FilteredObservation {
+    let Env { pool, scoped } = env(pool_opts, conn_opts, mode).await;
+
+    let agent = seed_agent(&pool).await;
+    let mine = seed_group(&pool).await;
+    seed_membership(&pool, mine, agent, "admin").await;
+    let theirs = seed_group(&pool).await; // no membership for `agent`
+
+    let my_claim = seed_group_claim(&pool, agent, mine).await;
+    let their_claim = seed_group_claim(&pool, agent, theirs).await;
+
+    let viewer = Viewer::resolve(&pool, agent).await.expect("resolve");
+
+    // THE CALL UNDER TEST. Identical source in both modes — that is the claim.
+    let mut r = scoped.read_as(&viewer).await.expect("read_as");
+    let arm = r.mode();
+
+    // As above: migration 077 issues the app-role grants itself, and NOT
+    // re-granting here keeps the test dependent on the migration rather than on
+    // a fixture that would paper over a missing grant.
+    r.execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("SET SESSION AUTHORIZATION requires a superuser connection");
+
+    // Every read below is a SEPARATE statement from the stamp. In `Transaction`
+    // mode that is the point: `set_config(…, is_local => true)` is a silent
+    // no-op outside a transaction block, so observing the group set here at all
+    // proves `read_as` opened one.
+    let (gucs,): (Vec<Uuid>,) = sqlx::query_as("SELECT epigraph_session_groups()")
+        .fetch_one(&mut *r)
+        .await
+        .expect("epigraph_session_groups() after the role switch");
+    let visible_mine: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = $1")
+        .bind(my_claim)
+        .fetch_one(&mut *r)
+        .await
+        .expect("read my own group-private claim");
+    let visible_theirs: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = $1")
+        .bind(their_claim)
+        .fetch_one(&mut *r)
+        .await
+        .expect("read a claim in a group I am not in");
+    let bypass: bool = sqlx::query_scalar("SELECT epigraph_bypass()")
+        .fetch_one(&mut *r)
+        .await
+        .expect("epigraph_bypass()");
+
+    r.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+
+    // The explicit finish: a COMMIT on the transaction arm, nothing on the
+    // session arm. Exercised here so the no-op arm is not merely assumed.
+    r.commit().await.expect("commit");
+
+    assert!(
+        sorted(gucs.clone()).contains(&mine),
+        "the viewer's group must be in epigraph.group_ids on the connection read_as \
+         returned; got {gucs:?}"
+    );
+    FilteredObservation {
+        gucs,
+        visible_mine,
+        visible_theirs,
+        bypass,
+        arm,
+    }
+}
+
+/// Assert the coherence property on one arm's observation.
+fn assert_coherent(o: &FilteredObservation, mode: SessionGucMode) {
+    assert_eq!(
+        o.arm, mode,
+        "read_as must dispatch on the pool's mode: a {mode:?} pool that hands back the other \
+         arm means the helper is not reading `ScopedPool::mode` at all, and the fallback \
+         bin/server.rs advertises is not actually wired"
+    );
+    assert!(
+        !o.bypass,
+        "CALIBRATION ({mode:?}): this session must NOT hold bypass, or every assertion here \
+         passes vacuously — the failure mode this file's header warns about"
+    );
+    assert!(
+        !o.gucs.is_empty(),
+        "CALIBRATION ({mode:?}): an empty group set would satisfy the fail-closed assertion \
+         below for the wrong reason"
+    );
+    assert_eq!(
+        o.visible_mine, 1,
+        "COHERENCE ({mode:?}): the group the viewer bound as $V is in the GUC read_as stamped, \
+         so claims_tenancy must admit that group's private claim. Zero here is the fail-closed \
+         drift that is indistinguishable from data loss — and is exactly the §9.2 step 11d \
+         outage this helper exists to prevent."
+    );
+    assert_eq!(
+        o.visible_theirs, 0,
+        "the other direction ({mode:?}): a group NOT in the GUC must be filtered, or the \
+         policy is admitting more than $V would"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn read_as_agrees_with_the_policy_on_a_filtered_session_in_session_mode(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let o = read_as_filtered_case(pool_opts, conn_opts, SessionGucMode::Session).await;
+    assert_coherent(&o, SessionGucMode::Session);
+}
+
+/// The arm that does not exist without this helper.
+///
+/// `transaction_mode_rejects_acquire_as` pins that the primitive refuses here.
+/// This pins that the helper nonetheless SERVES the same viewer, filtered
+/// correctly, through the identical call site.
+#[sqlx::test(migrations = "../../migrations")]
+async fn read_as_agrees_with_the_policy_on_a_filtered_session_in_transaction_mode(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let o = read_as_filtered_case(pool_opts, conn_opts, SessionGucMode::Transaction).await;
+    assert_coherent(&o, SessionGucMode::Transaction);
+}
+
+/// The direct statement of why the helper is not just an alias for `acquire_as`.
+///
+/// One pool, one viewer, in `Transaction` mode: the primitive refuses and the
+/// helper succeeds. If `read_as` ever collapses to a bare `acquire_as`, this is
+/// the test that fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn read_as_serves_the_viewer_acquire_as_refuses_in_transaction_mode(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let Env { pool, scoped } = env(pool_opts, conn_opts, SessionGucMode::Transaction).await;
+
+    let agent = seed_agent(&pool).await;
+    let g = seed_group(&pool).await;
+    seed_membership(&pool, g, agent, "writer").await;
+    let viewer = Viewer::resolve(&pool, agent).await.expect("resolve");
+
+    let err = scoped
+        .acquire_as(&viewer)
+        .await
+        .expect_err("CALIBRATION: the primitive must still refuse, or this test proves nothing");
+    match err {
+        DbError::InvalidData { reason } => assert!(
+            reason.contains("begin_as"),
+            "the refusal must still name the fallback; got: {reason}"
+        ),
+        other => panic!("expected DbError::InvalidData, got {other:?}"),
+    }
+
+    let mut r = scoped
+        .read_as(&viewer)
+        .await
+        .expect("read_as must serve in transaction mode — that is its entire purpose");
+    assert_eq!(r.mode(), SessionGucMode::Transaction);
+
+    let (observed,): (Vec<Uuid>,) = sqlx::query_as("SELECT epigraph_session_groups()")
+        .fetch_one(&mut *r)
+        .await
+        .expect("epigraph_session_groups()");
+    assert_eq!(
+        sorted(observed),
+        sorted(vec![g]),
+        "the transaction arm must stamp the same group set the session arm would"
+    );
+    r.commit().await.expect("commit");
+}
+
+/// Fail closed: a bypass viewer is refused on BOTH arms.
+///
+/// It emits no predicate and is still filtered by RLS, so on an application
+/// connection it reads zero rows rather than all rows. The helper must not
+/// become the one path that lets one through — a dispatch layer is exactly
+/// where such a guard gets lost.
+#[sqlx::test(migrations = "../../migrations")]
+async fn read_as_refuses_a_bypass_viewer_in_both_modes(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    for mode in [SessionGucMode::Session, SessionGucMode::Transaction] {
+        let Env { pool: _, scoped } = env(pool_opts.clone(), conn_opts.clone(), mode).await;
+
+        let (_conn, lease) = scoped
+            .unscoped_for_maintenance(SystemReason::SchemaContractTest)
+            .await
+            .expect("maintenance lease");
+        let bypass = Viewer::system(&lease, SystemReason::SchemaContractTest);
+
+        // `expect_err` takes a `&str` and does not interpolate, so the mode has
+        // to be formatted explicitly — otherwise the one message that says
+        // WHICH arm of this loop failed prints the braces literally.
+        let err = match scoped.read_as(&bypass).await {
+            Ok(_) => panic!("read_as must refuse a bypass viewer in {mode:?}"),
+            Err(e) => e,
+        };
+        match err {
+            DbError::InvalidData { reason } => assert!(
+                reason.contains("unscoped_for_maintenance"),
+                "the refusal must name where a bypass belongs ({mode:?}); got: {reason}"
+            ),
+            other => panic!("expected DbError::InvalidData in {mode:?}, got {other:?}"),
+        }
+    }
+}
+
+/// The release scrub still runs behind the helper, on both arms.
+///
+/// A dispatch layer that returned a connection the pool no longer scrubs would
+/// reintroduce cross-tenant carry-over — one principal's group set surviving
+/// into the next checkout — while every functional test above stayed green.
+///
+/// # `max_connections(1)`, so "the same connection" is STRUCTURAL
+///
+/// `ScopedPoolOptions::default()` is 10 connections. With it, "a fresh checkout
+/// from the same pool" is the same physical backend only *by construction* —
+/// the pool is cold, one checkout has happened, and sqlx pops an idle
+/// connection before opening a new one — which is an argument about sqlx's
+/// internals rather than an assertion this test makes. Pinning the pool to one
+/// connection makes the recycle the only possible outcome, so a green run
+/// cannot mean "we happened to get a virgin backend".
+///
+/// # The two arms are NOT double coverage of the scrub
+///
+/// Only the `Session` arm exercises it. In `Transaction` mode
+/// `apply_session_gucs` uses `set_config(…, is_local => true)`, so `COMMIT`
+/// discards the GUCs whether or not `after_release` ever ran — that arm would
+/// still pass with the scrub deleted. It is kept because transaction-local
+/// discard is itself worth asserting, and because a reader comparing the arms
+/// should find the asymmetry written down rather than infer it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn read_as_carries_no_tenancy_into_the_next_checkout(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    for mode in [SessionGucMode::Session, SessionGucMode::Transaction] {
+        let pool = pool_opts
+            .clone()
+            .connect_with(conn_opts.clone())
+            .await
+            .expect("seeding pool");
+        let scoped = ScopedPool::connect_with_options(
+            &scoped_url(&conn_opts),
+            mode,
+            ScopedPoolOptions {
+                max_connections: 1,
+                ..ScopedPoolOptions::default()
+            },
+        )
+        .await
+        .expect("single-connection ScopedPool");
+
+        let agent = seed_agent(&pool).await;
+        let g = seed_group(&pool).await;
+        seed_membership(&pool, g, agent, "writer").await;
+        let viewer = Viewer::resolve(&pool, agent).await.expect("resolve");
+
+        {
+            let mut r = scoped.read_as(&viewer).await.expect("read_as");
+            let (observed,): (Vec<Uuid>,) = sqlx::query_as("SELECT epigraph_session_groups()")
+                .fetch_one(&mut *r)
+                .await
+                .expect("epigraph_session_groups()");
+            assert_eq!(
+                sorted(observed),
+                sorted(vec![g]),
+                "CALIBRATION ({mode:?}): the stamp must land, or the emptiness below is vacuous"
+            );
+            r.commit().await.expect("commit");
+        } // release -> after_release scrub
+
+        let mut next = scoped
+            .inner()
+            .acquire()
+            .await
+            .expect("a fresh checkout from the same pool");
+        let carried: String = sqlx::query_scalar(
+            "SELECT COALESCE(current_setting('epigraph.group_ids', true), '') \
+             || COALESCE(current_setting('epigraph.principal_id', true), '')",
+        )
+        .fetch_one(&mut *next)
+        .await
+        .expect("read the tenancy GUCs back");
+        assert!(
+            carried.is_empty(),
+            "a connection released by read_as ({mode:?}) still carries tenancy GUCs \
+             ({carried:?}); a recycled connection can then carry one principal's group set \
+             into another's request"
+        );
+    }
 }

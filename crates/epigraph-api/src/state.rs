@@ -1,3 +1,7 @@
+// UNSCOPED-POOL-EXEMPT: Boot and observability, including the session-GUC probe itself. `probe_session_gucs`,
+// the entity-type cache load, the tenancy-trigger and RLS-posture assertions and the
+// maintenance-viewer path all run at startup or on the maintenance connection. Scoping the probe
+// to a Viewer would make it prove a property of that viewer instead of the pool.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -884,6 +888,61 @@ impl AppState {
         let (conn, lease) = scoped.unscoped_for_maintenance(reason).await?;
         let viewer = epigraph_db::visibility::Viewer::system(&lease, reason);
         Ok((conn, viewer))
+    }
+
+    /// A connection stamped with `viewer`'s tenancy context, in whichever form
+    /// the deployment's [`epigraph_db::SessionGucMode`] requires.
+    ///
+    /// The read-side twin of [`Self::maintenance_viewer`], and the entry point
+    /// the request path converts onto: a handler that has a `Viewer` (from
+    /// `ViewerExtractor`) hands it here and gets back something it can `&mut *`
+    /// into the repo layer, instead of reaching for the raw `db_pool`.
+    ///
+    /// # It REFUSES rather than falling back to `db_pool`, and that is the point
+    ///
+    /// [`Self::scoped`] is an `Option`, and of the thirteen `AppState`
+    /// constructors exactly one — [`Self::with_scoped_pool`], which
+    /// `bin/server.rs` calls — populates it. Every other constructor, including
+    /// the ones the test suite builds state through, leaves it `None`.
+    ///
+    /// So a version of this that fell back to `self.db_pool` when `scoped` is
+    /// `None` would pass every test in the workspace *and be inert in
+    /// production*: the fallback would be the only branch fixtures ever take,
+    /// the stamped branch the only one the server ever takes, and no test could
+    /// tell a correctly plumbed request from an unstamped one. That is the same
+    /// "the control exists only under test" defect the `ScopedPool` module doc
+    /// exists to prevent, and under FORCE it degrades from inert to invisible:
+    /// an unstamped connection makes the RLS policy and the in-query predicate
+    /// disagree, and rows go missing from their own owners with a 200.
+    ///
+    /// Refusing instead means a process that did not build a `ScopedPool`
+    /// cannot serve a scoped read at all — loudly, at the first request, rather
+    /// than silently at step 11d.
+    ///
+    /// # Errors
+    /// * `DbError::InvalidData` when this `AppState` was not built from a
+    ///   `ScopedPool`, or when `viewer` is a bypass viewer — a bypass belongs on
+    ///   [`Self::maintenance_viewer`], because on an application connection it
+    ///   emits no predicate and is still filtered, so it reads zero rows.
+    /// * `DbError::ConnectionFailed` / `DbError::QueryFailed` on the acquire or
+    ///   the stamp.
+    #[cfg(feature = "db")]
+    pub async fn read_as(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+    ) -> Result<epigraph_db::ScopedRead<'_>, epigraph_db::DbError> {
+        let scoped = self
+            .scoped
+            .as_ref()
+            .ok_or_else(|| epigraph_db::DbError::InvalidData {
+                reason: "AppState was not built from a ScopedPool, so this read cannot be \
+                         stamped with the viewer's tenancy context. Refusing rather than \
+                         falling back to the raw pool: an unstamped connection makes the RLS \
+                         policy and the in-query predicate disagree, which hides rows from \
+                         their own owners without an error. Use AppState::with_scoped_pool."
+                    .to_string(),
+            })?;
+        scoped.read_as(viewer).await
     }
 
     /// Create new application state with database pool and custom signature verification state

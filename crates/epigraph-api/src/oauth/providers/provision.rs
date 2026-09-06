@@ -1,5 +1,9 @@
 //! Provider-agnostic provisioning: synthesize client_id, find-or-create, issue tokens.
 
+// UNSCOPED-POOL-EXEMPT: Pre-authentication provisioning: synthesizes a client and issues
+// its first tokens. It runs before the identity it creates exists, so there is no Viewer it
+// could be scoped to.
+
 use axum::{http::StatusCode, Json};
 use chrono::{Duration, Utc};
 

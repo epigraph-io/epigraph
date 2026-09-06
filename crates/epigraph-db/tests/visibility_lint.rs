@@ -250,11 +250,20 @@ struct ViewerFn {
     file: String,
     line: usize,
     name: String,
+    params: String,
     body: String,
 }
 
 /// Every `fn` under `src/repos/` whose parameter list mentions `Viewer`.
 fn viewer_taking_fns() -> Vec<ViewerFn> {
+    repo_fns()
+        .into_iter()
+        .filter(|f| f.params.contains("Viewer"))
+        .collect()
+}
+
+/// Every `fn` under `src/repos/`, with its parameter list and body.
+fn repo_fns() -> Vec<ViewerFn> {
     let mut out = Vec::new();
     for (file, src) in repo_files() {
         let mut from = 0usize;
@@ -297,10 +306,6 @@ fn viewer_taking_fns() -> Vec<ViewerFn> {
                 continue;
             }
             let params = balanced(&src, paren, b'(', b')');
-            if !params.contains("Viewer") {
-                continue;
-            }
-
             let Some(brace_rel) = src[paren + params.len()..].find('{') else {
                 continue;
             };
@@ -311,6 +316,7 @@ fn viewer_taking_fns() -> Vec<ViewerFn> {
                 file: file.clone(),
                 line: src[..at].matches('\n').count() + 1,
                 name,
+                params: params.to_string(),
                 body,
             });
         }
@@ -393,6 +399,164 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
          owns. A new exemption on a READ path is almost certainly a leak being \
          annotated rather than fixed.\n"
     );
+}
+
+/// Repo functions that take a `&mut PgConnection` and NO `Viewer`, each with
+/// the reason. Asserted as an exact set, in both directions, by
+/// [`every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt`].
+///
+/// Keyed on `(file, fn)` the same way [`EXPECTED_EXEMPTIONS`] is, so a new
+/// entry is a visible diff naming the function.
+const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    (
+        "claim.rs",
+        "update_labels_conn",
+        "WRITE. Label mutation on a claim the caller has already fetched under a viewer predicate \
+         on the same connection; under migration 077 the claims_tenancy WITH CHECK (keyed on \
+         epigraph_writable_groups()) is what authorises the row, not a read predicate. The \
+         write-side gate is 16b's, not this lint's.",
+    ),
+    (
+        "claim.rs",
+        "update_trace_id_conn",
+        "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
+         authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
+    ),
+    (
+        "claim.rs",
+        "update_truth_value_conn",
+        "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
+         authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
+    ),
+    (
+        "claim_encryption.rs",
+        "get_by_claim_id_conn",
+        "READ, and the only exempt read that touches a tenanted table — so it is the one to \
+         re-check. Its two callers (routes/claims.rs::get_claim and the batch sibling) both run it \
+         on the SAME transaction immediately after ClaimRepository::get_by_id_conn(&mut tx, \
+         &viewer, id) has already resolved the parent claim under the viewer predicate, so the \
+         authority decision has been made one statement earlier on the same connection. \
+         claim_encryption is additionally in migration 077's `enc` protected array, so RLS \
+         backstops it from step 11d onward. A shard that ever calls this WITHOUT the preceding \
+         gated fetch must give it a Viewer instead of inheriting this entry.",
+    ),
+    (
+        "claim_encryption.rs",
+        "insert_conn",
+        "WRITE. Writes the encryption row for a claim created in the same transaction; the row's \
+         tenancy is the parent claim's, established by the INSERT that precedes it.",
+    ),
+    (
+        "event.rs",
+        "publish_or_log_conn",
+        "WRITE, append-only. Publishes an event row inside the caller's transaction and returns \
+         only the new id. The read side of `events` is where tenancy is enforced \
+         (EventRepository::list, and hidden_claim_ids for the Rust-callable half); an append has \
+         no rows to filter.",
+    ),
+    (
+        "group_key_epoch.rs",
+        "create_epoch_conn",
+        "WRITE. Creates a key epoch for a group inside the membership/rotation transaction that \
+         has already authorised the group. group_key_epochs carries its own policy in migration \
+         077 (section 8), which is what gates the row once step 11d lands.",
+    ),
+    (
+        "oauth_client.rs",
+        "get_by_id_conn",
+        "READ, but of a table with NO tenancy at all. `oauth_clients` has neither `visibility` nor \
+         `owner_group_id`, is in none of migration 077's protected arrays, and 077 states in its \
+         own comment that it deliberately gets NO policy and is NOT in 079's array — because a \
+         policy there would make the token mint's `UPDATE oauth_clients SET agent_id` match zero \
+         rows. There is nothing for a Viewer to filter on; adding one would be decoration.",
+    ),
+    (
+        "provenance.rs",
+        "append_conn",
+        "WRITE, append-only, into `provenance_log`. It records who authorised a write that the \
+         caller has already performed in the same transaction; there is no read whose result could \
+         widen.",
+    ),
+];
+
+/// A `*_conn` sibling must spend a viewer, or say in writing why it has none.
+///
+/// # Why the name and not the signature
+///
+/// [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`] inspects only
+/// functions whose PARAMETER LIST mentions `Viewer`. A `*_conn` sibling that
+/// simply omits the `Viewer` parameter is therefore invisible to it — and PR-23
+/// made `*_conn` siblings the standard conversion shape for the 414 sites
+/// `epigraph-db/tests/no_unscoped_pool.rs` registers. Without this rule, a
+/// sibling written without a viewer would pass BOTH controls: this file would
+/// not inspect it, and the ratchet would count its call site as converted
+/// because the `.db_pool` access is gone. The two together would certify
+/// "converted" for a read that filters on nothing.
+///
+/// So the key is the NAME. Twelve `*_conn` functions exist today; three take a
+/// `Viewer` (`ClaimRepository::{get_by_id_conn, list_conn, count_conn}`) and the
+/// nine below are enumerated with reasons. Seven of the nine are writes, where
+/// migration 077's `WITH CHECK` rather than a read predicate is the control.
+#[test]
+fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
+    let mut without: Vec<(String, String)> = Vec::new();
+    let mut with_viewer = 0usize;
+
+    for f in repo_fns() {
+        if !f.name.ends_with("_conn") {
+            continue;
+        }
+        // `repo_fns` does not strip comments, so a doc line that spells out a
+        // signature could otherwise register as a declaration.
+        if !f.params.contains("PgConnection") {
+            continue;
+        }
+        if f.params.contains("Viewer") {
+            with_viewer += 1;
+        } else {
+            without.push((f.file, f.name));
+        }
+    }
+    without.sort();
+    without.dedup();
+
+    assert!(
+        with_viewer + without.len() >= 12,
+        "found only {} `*_conn` repo fns — the scanner is not matching declarations and this \
+         lint would pass vacuously",
+        with_viewer + without.len()
+    );
+    assert!(
+        with_viewer >= 3,
+        "no `*_conn` sibling takes a Viewer any more ({with_viewer} found). The conversion shape \
+         PR-23 established has been abandoned; that is a decision, not a refactor."
+    );
+
+    let mut want: Vec<(String, String)> = CONN_WITHOUT_VIEWER
+        .iter()
+        .map(|(f, n, _)| ((*f).to_string(), (*n).to_string()))
+        .collect();
+    want.sort();
+
+    assert_eq!(
+        without, want,
+        "\n\nThe set of viewer-less `*_conn` repo fns changed. A `*_conn` sibling is the shape a \
+         conversion shard writes when it moves a handler onto `AppState::read_as`, and one \
+         written WITHOUT a Viewer is invisible to \
+         `every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer` AND counts as converted in \
+         `no_unscoped_pool.rs`. If the new function is a read, give it a `&Viewer` and splice the \
+         marker. If it genuinely has nothing to filter, add it to CONN_WITHOUT_VIEWER with a \
+         reason naming the table and why.\n"
+    );
+
+    for (file, name, reason) in CONN_WITHOUT_VIEWER {
+        assert!(
+            reason.len() > 80,
+            "the reason for {file}::{name} is {} chars. State the table and why it has no \
+             tenancy to filter on, not a label.",
+            reason.len()
+        );
+    }
 }
 
 /// The lint and the repo layer must not drift to spellings of the marker that

@@ -5,6 +5,9 @@
 //! - refresh_token (all client types)
 //! - external provider grant types (registered via providers.toml; e.g. google_id_token, cloudflare_access_jwt)
 
+// UNSCOPED-POOL-EXEMPT: Pre-authentication by definition, and the largest such site. Token issuance is
+// the step that MINTS the principal; a Viewer cannot precede it.
+
 use axum::{
     body::Bytes,
     extract::State,

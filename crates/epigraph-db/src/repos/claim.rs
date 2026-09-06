@@ -2549,7 +2549,27 @@ impl ClaimRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Get a claim by ID within an existing transaction.
+    /// Get a claim by ID on a caller-supplied connection.
+    ///
+    /// The connection-taking twin of [`Self::get_by_id`], and — since PR-23 —
+    /// the shape a request handler reaches through `AppState::read_as`. It
+    /// takes the `Viewer` and splices `/* {VISIBILITY:c} */`, so it is
+    /// visibility-equivalent to its pool-taking sibling.
+    ///
+    /// # It is now FIELD-equivalent too, and it was not before
+    ///
+    /// This function used to select seven columns where `get_by_id` selects
+    /// nine, leaving `claim_from_row`'s defaults (`is_current = true`,
+    /// `supersedes = None`) in place. That is a *widening* default rather than
+    /// a visibility defect — a superseded claim read as current — and it is
+    /// invisible to every gate, because the dropped fields default to plausible
+    /// values instead of erroring. The projection and the post-fix below are
+    /// now the same as `get_by_id`'s, per the `claim_from_row` rule in
+    /// `CLAUDE.md`: extend the caller's `SELECT` and post-fix the `Claim`.
+    ///
+    /// **A `*_conn` sibling is not automatically a drop-in for its pool-taking
+    /// twin.** A conversion shard must diff the projected columns as well as
+    /// the visibility marker.
     pub async fn get_by_id_conn(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
@@ -2560,7 +2580,7 @@ impl ClaimRepository {
         use sqlx::Row;
         let sql = viewer.splice(
             r#"SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
-                      c.created_at, c.updated_at
+                      c.created_at, c.updated_at, c.is_current, c.supersedes
             FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */"#,
             2,
         );
@@ -2573,7 +2593,7 @@ impl ClaimRepository {
         match row {
             Some(row) => {
                 let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
-                Ok(Some(claim_from_row(
+                let mut claim = claim_from_row(
                     row.get("id"),
                     row.get("content"),
                     row.get("agent_id"),
@@ -2581,7 +2601,15 @@ impl ClaimRepository {
                     tv,
                     row.get("created_at"),
                     row.get("updated_at"),
-                )))
+                );
+                // Post-fix retirement state, exactly as `get_by_id` does.
+                // `claims.is_current` is NOT NULL in the schema, so the plain
+                // `bool` decode is safe; `supersedes` is nullable.
+                claim.is_current = row.get::<bool, _>("is_current");
+                claim.supersedes = row
+                    .get::<Option<Uuid>, _>("supersedes")
+                    .map(ClaimId::from_uuid);
+                Ok(Some(claim))
             }
             None => Ok(None),
         }
@@ -2854,6 +2882,45 @@ impl ClaimRepository {
     /// there is no row to classify and no owner to protect. Only
     /// *existing-but-invisible* ids come back, so a caller that drops its
     /// records on a non-empty intersection matches the SQL exactly.
+    ///
+    /// # ⚠ PRECONDITION FOR PLAN §9.2 STEP 11d — THIS IS NOT A CONVERSION SITE
+    ///
+    /// The set difference below asks two questions of the same table: *does
+    /// this id name a row* (first arm) and *may this viewer read it* (second,
+    /// spliced arm). That only answers the question when the first arm can see
+    /// rows the second cannot — i.e. when it runs with authority broader than
+    /// the viewer's.
+    ///
+    /// On today's DSN it does: the connection is the table owner, so no policy
+    /// filters either arm. Once step 11d repoints `DATABASE_URL` at
+    /// `epigraph_app`, both arms are subject to `claims_tenancy` (migration
+    /// 077), whose `USING` predicate is textually what
+    /// [`crate::visibility::Viewer::splice`] emits into the second arm. The two
+    /// arms then coincide and the difference is empty **by construction**,
+    /// whether or not the connection carries the tenancy GUCs. Measured on the
+    /// throwaway test cluster at migration head 91 with FORCE live: empty in
+    /// both the stamped and the unstamped case, against the same fixture where
+    /// the owner connection correctly reports one hidden id.
+    ///
+    /// So this function **cannot** be repaired by stamping the connection, and
+    /// a conversion shard must not "convert" it or its callers
+    /// (`epigraph-api`'s `routes/webhooks.rs` and `routes/events.rs`) onto
+    /// `AppState::read_as`: doing so would make the ratchet in
+    /// `epigraph-db/tests/no_unscoped_pool.rs` green while leaving an existence
+    /// probe that reports nothing regardless of input. An empty result is read
+    /// by both callers as "nothing is hidden", so the failure is uninformative
+    /// rather than conservative.
+    ///
+    /// The repair is the pattern migration 077 already establishes for the
+    /// structurally identical problem in `Viewer::resolve`: route the
+    /// *existence* arm through a `SECURITY DEFINER` helper that returns ids
+    /// only and no content, the way `epigraph_live_memberships()` does for
+    /// `group_memberships`
+    /// (`repos/group_membership.rs::list_live_for_agent`). That is a migration,
+    /// so it belongs to a numbered follow-up rather than to the code-only PR
+    /// that added this note; it is recorded in `docs/tenancy/progress.json` as
+    /// a hard precondition for step 11d, alongside
+    /// `tenancy_required.rs::a_derived_insert_is_refused_when_the_session_gucs_are_unstamped`.
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
@@ -5662,6 +5729,104 @@ mod tests {
         assert!(
             for_member.is_empty(),
             "nothing is hidden from a member of the owning group — without this, a function that reports EVERY id passes the assertions above"
+        );
+    }
+
+    /// `get_by_id_conn` must report retirement state, not `claim_from_row`'s
+    /// defaults.
+    ///
+    /// PR-23 makes the `*_conn` sibling the shape a conversion shard writes
+    /// when it moves a handler onto `AppState::read_as`, and this one used to
+    /// project seven columns where its pool-taking twin projects nine — so a
+    /// superseded claim came back reporting `is_current = true, supersedes =
+    /// None`. No gate could catch it: the dropped fields default to *plausible*
+    /// values instead of erroring, so the only failure is a widened answer.
+    ///
+    /// Asserted against `get_by_id` on the same row rather than against
+    /// literals, so the two cannot drift apart again for either value of the
+    /// field. The CALIBRATION half is the retired row: without it, two
+    /// functions that both returned the defaults would agree and pass.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_by_id_conn_reports_the_same_retirement_state_as_get_by_id(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'conn-parity', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let live_text = format!("live-{}", Uuid::new_v4());
+        let live_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id)
+             VALUES ($1, sha256($1::bytea), 0.5, $2) RETURNING id",
+        )
+        .bind(&live_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // The retired row: is_current = false AND supersedes set, so both
+        // dropped columns carry a value that differs from the default.
+        let retired_text = format!("retired-{}", Uuid::new_v4());
+        let retired_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id,
+                                 is_current, supersedes)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, false, $3) RETURNING id",
+        )
+        .bind(&retired_text)
+        .bind(agent_id)
+        .bind(live_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let viewer = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]);
+        let mut conn = pool.acquire().await.unwrap();
+
+        for id in [live_id, retired_id] {
+            let via_pool = ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(id))
+                .await
+                .unwrap()
+                .expect("public claim is readable");
+            let via_conn =
+                ClaimRepository::get_by_id_conn(&mut conn, &viewer, ClaimId::from_uuid(id))
+                    .await
+                    .unwrap()
+                    .expect("public claim is readable on a connection too");
+
+            assert_eq!(
+                via_conn.is_current, via_pool.is_current,
+                "get_by_id_conn must report the same is_current as get_by_id for {id}; a \
+                 *_conn sibling that drops the column reports every claim as live"
+            );
+            let conn_sup: Option<Uuid> = via_conn.supersedes.map(Into::into);
+            let pool_sup: Option<Uuid> = via_pool.supersedes.map(Into::into);
+            assert_eq!(
+                conn_sup, pool_sup,
+                "get_by_id_conn must report the same supersedes as get_by_id for {id}"
+            );
+        }
+
+        // CALIBRATION: the retired row really does differ from the defaults, or
+        // the parity above is satisfied by two functions returning the same
+        // wrong answer.
+        let retired =
+            ClaimRepository::get_by_id_conn(&mut conn, &viewer, ClaimId::from_uuid(retired_id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            !retired.is_current,
+            "CALIBRATION: the retired fixture must not be current"
+        );
+        let retired_sup: Option<Uuid> = retired.supersedes.map(Into::into);
+        assert_eq!(
+            retired_sup,
+            Some(live_id),
+            "CALIBRATION: the retired fixture must name what it supersedes"
         );
     }
 
