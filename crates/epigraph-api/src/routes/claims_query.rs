@@ -249,8 +249,7 @@ async fn finish_scoped_read(read: epigraph_db::ScopedRead<'_>) -> Result<(), Api
 /// result's visibility therefore rests on `list`/`count`; the prefetch
 /// predicates are defence in depth. **Do not turn either application into a
 /// union or an `OR`.** That would promote a prefetch predicate to load-bearing,
-/// and the two are not interchangeable with `list`'s: `claim_ids_by_evidence_type`
-/// filters `evidence` rows while projecting a `claims` identifier.
+/// and neither prefetch predicate is equivalent to `list`'s.
 #[cfg(feature = "db")]
 pub async fn list_claims_query(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
