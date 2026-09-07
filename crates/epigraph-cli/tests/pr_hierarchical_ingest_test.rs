@@ -25,12 +25,30 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod viewer_fixture;
+
 use epigraph_api::routes;
 use epigraph_api::state::{ApiConfig, AppState};
 
 /// Router mirroring the four routes the CLI hits (submit + edges + claim read + query).
-fn app(pool: PgPool) -> Router {
-    let state = AppState::with_db(pool, ApiConfig::default());
+///
+/// # Why the state is built from a `ScopedPool` and the fn is `async`
+///
+/// PR-28 converted `routes::claims_query::list_claims_query` onto
+/// `AppState::read_as`, which REFUSES rather than falling back when the state
+/// carries no `ScopedPool` — deliberately, because an unstamped connection makes
+/// the RLS policy and the in-query predicate disagree. `AppState::with_db` leaves
+/// `scoped` at `None`, so step 4 below would answer 500 instead of 200.
+///
+/// `with_scoped_pool` and not a hand-set `state.scoped`: it is the constructor
+/// `bin/server.rs` uses, and it sets `db_pool = scoped.inner()` over the same
+/// `#[sqlx::test]` database, so the three other mounted routes and the seeding
+/// done on `pool` are unaffected.
+async fn app(pool: PgPool) -> Router {
+    let state = AppState::with_scoped_pool(
+        viewer_fixture::scoped_pool(&pool).await,
+        ApiConfig::default(),
+    );
     Router::new()
         .route("/api/v1/submit/packet", post(routes::submit::submit_packet))
         .route("/api/v1/edges", post(routes::edges::create_edge))
@@ -113,7 +131,7 @@ async fn pr_ingest_builds_hierarchy_and_resolution_edge(pool: PgPool) {
     let backlog = seed_claim(&pool, agent, "Backlog X. Fixed by PR #999.").await;
     let decoy = seed_claim(&pool, agent, "Unrelated backlog item about PR #123.").await;
 
-    let router = app(pool.clone());
+    let router = app(pool.clone()).await;
 
     // 1) submit the PR node (stable idempotency_key pr:org/repo#999).
     let pr_body = serde_json::json!({

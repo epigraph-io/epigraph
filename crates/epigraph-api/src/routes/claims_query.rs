@@ -171,11 +171,86 @@ pub struct ClaimListResponse {
 // Handler
 // ============================================================================
 
+/// Finish the viewer-stamped read, logging the reason and answering opaquely.
+///
+/// A named helper rather than two copies of PR-26's inline block, because this
+/// handler has TWO return paths — the fast path returns early inside
+/// `if !needs_in_memory_filters` — and an explicit finish is mandatory on both.
+/// [`epigraph_db::ScopedRead`] has no `Drop` impl, so under
+/// `SessionGucMode::Transaction` an un-finished read rolls back silently; the
+/// read is read-only, so nothing is lost, but the connection is then returned a
+/// round trip later than it needed to be. The `Session` arm is a bare
+/// connection and finishing it is a no-op — which is exactly why this must not
+/// be left to the mode: a shard that skips it looks correct in one
+/// configuration and is wasteful in the other.
+///
+/// Same error shape as the acquire: the reason goes to the operator's log, the
+/// client gets an opaque message. A `format!`-ed `DbError` here would render its
+/// `#[source]` driver text into the response body, since `errors.rs` serialises
+/// `ApiError::InternalError { message }` verbatim.
+#[cfg(feature = "db")]
+async fn finish_scoped_read(read: epigraph_db::ScopedRead<'_>) -> Result<(), ApiError> {
+    read.commit().await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_claims_query",
+            "could not finish a viewer-stamped read"
+        );
+        ApiError::InternalError {
+            message: "Failed to finish the scoped read".to_string(),
+        }
+    })
+}
+
 /// List and filter claims from PostgreSQL
 ///
 /// `GET /api/v1/claims`
 ///
 /// Queries the claims table with filtering, sorting, and pagination.
+///
+/// # Tenancy: ONE viewer-stamped connection for the whole request
+///
+/// PR-28 is conversion shard 2 against
+/// `D-PR17-request-path-never-stamps-session-gucs`. It moves this handler's five
+/// raw-pool reads onto [`AppState::read_as`]. The connection is acquired ONCE,
+/// below, and threaded into every statement on both paths.
+///
+/// `read_as` and not `acquire_as`: the latter hard-refuses
+/// `EPIGRAPH_SESSION_GUC_MODE=transaction`, the pooler fallback `bin/server.rs`
+/// advertises to operators, so a site converted that way is unservable in a
+/// configuration this project supports.
+///
+/// Every one of the five is a READ. `ClaimRepository::{list, count,
+/// claim_ids_by_methodology, claim_ids_by_evidence_type}` were all widened to
+/// `<'e, E: sqlx::PgExecutor<'e>>` by PR-27, so this shard authors ZERO new repo
+/// forms and changes NO SQL — the five call sites simply pass `&mut *read`. The
+/// reborrow is explicit at each site on purpose: deref coercion does not fire
+/// against a generic `E`, so `&mut read` would infer `E = &mut ScopedRead<'_>`
+/// and fail the bound.
+///
+/// # Footprint — bounded, unlike PR-26's
+///
+/// `F-PR26-lineage-holds-one-connection-for-n-round-trips` is owed before the
+/// next WALK-shaped handler. This one is not walk-shaped and does not multiply
+/// it: the handle spans at most THREE statements and there is no per-node loop
+/// and no unbounded `N`. The fast path runs `count` + `list` (2); the slow path
+/// runs one or two prefetches + `list` (2-3). The two paths cannot combine,
+/// because `methodology_ids.is_some()` and `evidence_type_ids.is_some()` are
+/// themselves terms of `needs_in_memory_filters` — a fired prefetch FORCES the
+/// slow path, so `count` and a prefetch never run on the same request. Every
+/// in-memory `retain` below runs after the last statement, holding nothing.
+///
+/// # The prefetch sets NARROW, and that is load-bearing
+///
+/// Both `methodology_ids` and `evidence_type_ids` are applied as
+/// `claims.retain(|c| ids.contains(..))` — a set INTERSECTION against a working
+/// set that already came from the viewer-predicated `ClaimRepository::list`. The
+/// result's visibility therefore rests on `list`/`count`; the prefetch
+/// predicates are defence in depth. **Do not turn either application into a
+/// union or an `OR`.** That would promote a prefetch predicate to load-bearing,
+/// and the two are not interchangeable with `list`'s: `claim_ids_by_evidence_type`
+/// filters `evidence` rows while projecting a `claims` identifier.
 #[cfg(feature = "db")]
 pub async fn list_claims_query(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -270,10 +345,33 @@ pub async fn list_claims_query(
         }
     }
 
+    // ---- The one viewer-stamped connection every read below runs on ----
+    //
+    // Acquired HERE and not at the top of the function: the seven validation
+    // early-returns above answer without touching the database, and hoisting the
+    // acquire over them would hold a pooled connection across every 400.
+    //
+    // THE ERROR SHAPE IS PART OF THE TEMPLATE (see `routes/lineage.rs::get_lineage`).
+    // `read_as`'s refusal reason is a paragraph of internal design prose aimed at
+    // whoever mis-built the `AppState`; `errors.rs` serialises
+    // `ApiError::InternalError { message }` verbatim into the response body, so
+    // it is logged in full and answered with an opaque message.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_claims_query",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // ---- Pre-fetch methodology / evidence_type claim ID sets ----
     let methodology_ids: Option<HashSet<uuid::Uuid>> = match params.methodology {
         Some(ref m) => {
-            let ids = ClaimRepository::claim_ids_by_methodology(&state.db_pool, &viewer, m)
+            let ids = ClaimRepository::claim_ids_by_methodology(&mut *read, &viewer, m)
                 .await
                 .map_err(|e| ApiError::InternalError {
                     message: format!("Methodology filter query failed: {}", e),
@@ -285,7 +383,7 @@ pub async fn list_claims_query(
 
     let evidence_type_ids: Option<HashSet<uuid::Uuid>> = match params.evidence_type {
         Some(ref et) => {
-            let ids = ClaimRepository::claim_ids_by_evidence_type(&state.db_pool, &viewer, et)
+            let ids = ClaimRepository::claim_ids_by_evidence_type(&mut *read, &viewer, et)
                 .await
                 .map_err(|e| ApiError::InternalError {
                     message: format!("Evidence type filter query failed: {}", e),
@@ -314,15 +412,18 @@ pub async fn list_claims_query(
         || sort_order != "desc";
 
     if !needs_in_memory_filters {
-        let total =
-            ClaimRepository::count(&state.db_pool, &viewer, params.content_contains.as_deref())
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Database count failed: {}", e),
-                })? as usize;
+        // `count` and `list` are two statements, and `total` is only a truthful
+        // description of `claims` if BOTH saw the same corpus. Running them on
+        // the one stamped handle is what makes that so — under
+        // `SessionGucMode::Transaction` they are also the same transaction.
+        let total = ClaimRepository::count(&mut *read, &viewer, params.content_contains.as_deref())
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Database count failed: {}", e),
+            })? as usize;
 
         let rows = ClaimRepository::list(
-            &state.db_pool,
+            &mut *read,
             &viewer,
             limit as i64,
             offset as i64,
@@ -332,6 +433,8 @@ pub async fn list_claims_query(
         .map_err(|e| ApiError::InternalError {
             message: format!("Database query failed: {}", e),
         })?;
+
+        finish_scoped_read(read).await?;
 
         let paginated: Vec<ClaimSummary> = rows
             .into_iter()
@@ -358,7 +461,7 @@ pub async fn list_claims_query(
     // ---- Slow path: filters/sort require fetching a working set into memory ----
     // Capped at 10_000 rows; the reported `total` reflects the filtered slice.
     let all_claims = ClaimRepository::list(
-        &state.db_pool,
+        &mut *read,
         &viewer,
         10_000,
         0,
@@ -368,6 +471,11 @@ pub async fn list_claims_query(
     .map_err(|e| ApiError::InternalError {
         message: format!("Database query failed: {}", e),
     })?;
+
+    // The last statement on this path. Everything below is in-memory, so the
+    // connection is returned before the filtering, the sort and the pagination
+    // rather than after them.
+    finish_scoped_read(read).await?;
 
     let mut claims: Vec<_> = all_claims.iter().collect();
 
