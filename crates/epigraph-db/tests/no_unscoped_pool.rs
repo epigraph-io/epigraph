@@ -15,7 +15,7 @@
 //! # Why it is SEEDED rather than asserted at zero
 //!
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
-//! lint would fail on day one"*. It would — there are 414 unconverted sites as
+//! lint would fail on day one"*. It would — there are 407 unconverted sites as
 //! of this commit, and a lint that fails on day one is a lint someone deletes
 //! in week two.
 //!
@@ -54,7 +54,7 @@
 //!   against, and the write-side predicate is 16b's, not this PR's. Measured on
 //!   this tree with a same-line name needle (create / insert / update / delete
 //!   / upsert / supersede / revoke / mark_ / record_ / append): **30** of the
-//!   414 sites below are visibly write-shaped, led by
+//!   407 sites below are visibly write-shaped, led by
 //!   `routes/experiment_loop.rs` (5), `routes/tasks.rs` (4) and
 //!   `routes/crud.rs`, `routes/claims.rs`, `routes/workflows.rs`,
 //!   `routes/webhooks.rs` (3 each). That is a LOWER bound — the needle only
@@ -100,9 +100,10 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 414 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 407 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
-//!      second; neither discharged the gate, and PR-25 must not be read as
+//!      second; PR-26 converted the first shard's seven sites. None discharged
+//!      the gate — 407 is not 0 — and neither PR-25 nor PR-26 may be read as
 //!      unblocking step 11d.
 //!
 //!   And independently of both, the conversion is unargued: each file takes a
@@ -116,16 +117,32 @@
 //!   mechanism.
 //! * **The repo layer does not yet serve this at scale.** Measured under
 //!   `crates/epigraph-db/src/repos/`: 206 `pub async fn` take both a
-//!   `pool: &PgPool` and a `Viewer`, and only 12 `*_conn` siblings exist at
-//!   all — of which exactly 3 take a `Viewer`
-//!   (`ClaimRepository::{get_by_id_conn, list_conn, count_conn}`). The pilot
-//!   worked only because one of those three happened to exist. Before a shard
-//!   starts on a 40-site handler, the repo layer needs a `_conn` (or
+//!   `pool: &PgPool` and a `Viewer`, and only 14 `*_conn` siblings exist at
+//!   all — of which exactly 5 take a `Viewer`
+//!   (`ClaimRepository::{get_by_id_conn, list_conn, count_conn}` and, from
+//!   PR-26, `LineageRepository::{get_lineage_conn, get_descendants_conn}`).
+//!   The pilot worked only because one of those happened to exist. Before a
+//!   shard starts on a 40-site handler, the repo layer needs a `_conn` (or
 //!   `impl PgExecutor`) pass; calling `read_as` once per statement instead
 //!   would, in `Session` mode, produce N separately-stamped checkouts with no
 //!   transaction tying them, against a pool whose `ScopedPoolOptions::default()`
 //!   is 10 connections. `visibility_lint.rs::every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt`
 //!   is what stops a shard from writing the `_conn` sibling *without* a viewer.
+//!
+//!   **PR-26 established the shape, and it is NOT a copy-pasted twin.** The
+//!   connection-taking form is the PRIMITIVE and the pool-taking form is a thin
+//!   wrapper that acquires and delegates. Two copies of the same SQL is what
+//!   produced `get_by_id_conn`'s seven-vs-nine projection drift, which no gate
+//!   could see because a dropped column defaults to a plausible value rather
+//!   than erroring. One body cannot drift from itself, the wrapper keeps every
+//!   existing caller (`epigraph-mcp`, ~20 assertions in
+//!   `epigraph-db/tests/lineage_tests.rs`) compiling unedited, and
+//!   `visibility_lint.rs` has one SQL text to police instead of two. Note that
+//!   `every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer` already
+//!   anticipates the wrapper: a body with no `sqlx::query` is skipped as a
+//!   delegating wrapper, because the callee is subject to the same lint.
+//!   **Cost metric for sizing later shards: 2 new connection-taking repo forms
+//!   for 7 converted sites.**
 //! * **Handler-side sizing, re-derived from the router** (the recon's 113/113
 //!   was flagged by its own author as a regex artifact and is not what the code
 //!   says). Enumerating handler idents from every `.route(…)` registration
@@ -369,13 +386,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 414;
+const HIGH_WATER: usize = 407;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
-const HIGH_WATER_FILES: usize = 51;
+const HIGH_WATER_FILES: usize = 50;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 414 sites across 51 files as of this commit. Lower an entry when a shard
+/// 407 sites across 50 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -411,7 +428,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/groups.rs", 12),
     ("routes/hypothesis.rs", 17),
     ("routes/isomorphism.rs", 3),
-    ("routes/lineage.rs", 7),
+    // `routes/lineage.rs` was 7 and is GONE, not zeroed: PR-26, the first
+    // conversion shard, moved all seven onto `AppState::read_as`. `measure()`
+    // only ever emits non-zero entries, so a `0` row could never be satisfied.
     ("routes/methods.rs", 2),
     ("routes/papers.rs", 8),
     ("routes/perspective.rs", 5),
