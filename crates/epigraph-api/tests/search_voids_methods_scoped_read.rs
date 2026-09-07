@@ -367,6 +367,14 @@ async fn the_flat_path_serves_the_viewers_own_group_private_claim(pool: PgPool) 
 /// Fail-closed direction only, for the reason the module doc gives: a stranger's
 /// claim cannot become a candidate, so the three sites downstream of the
 /// candidate pull have no stranger row to lose.
+///
+/// # `graph_neighbors` is asserted SEPARATELY, and it has to be
+///
+/// The handler calls `semantic_graph_neighbors(...).unwrap_or_default()`, so
+/// that site failing produces NO error — just an empty neighbour map and a
+/// `graph_neighbors: null` on every result. An arm that only checked which claim
+/// ids came back would stay green with that site reverted. The neighbour claim
+/// and its edge below exist to give it a value that goes away.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_diverse_path_serves_the_viewers_own_group_private_claim(pool: PgPool) {
     let (agent, group) = seed_agent_with_group(&pool, "svm-diverse-mine").await;
@@ -379,6 +387,15 @@ async fn the_diverse_path_serves_the_viewers_own_group_private_claim(pool: PgPoo
     let mine = seed_group_claim(&pool, agent, group, "diverse: my claim").await;
     set_embedding(&pool, mine, &vec).await;
     attach_theme(&pool, mine, theme).await;
+
+    // The far side of the edge. Deliberately NOT attached to the theme: it must
+    // reach the response through the neighbour join alone, never as a candidate
+    // in its own right. The edge is left for migration 070's trigger to stamp
+    // from its endpoints rather than forced public, so the `claims` predicate is
+    // what admits the neighbour rather than the edge predicate.
+    let neighbor = seed_group_claim(&pool, agent, group, "diverse: my neighbour").await;
+    set_embedding(&pool, neighbor, &vec).await;
+    viewer_fixture::seed_edge(&pool, mine, neighbor).await;
 
     let state = split_state_with_embedder(&pool, embedder).await;
     let out = search(&pool, state, agent, search_request(query, true))
@@ -400,9 +417,26 @@ async fn the_diverse_path_serves_the_viewers_own_group_private_claim(pool: PgPoo
     assert!(
         got.contains(&mine),
         "the viewer's own group-private claim is the only candidate in the only theme, \
-         so it must survive the candidate pull, the full-row fetch and the neighbour \
-         join. Its absence means one of those three ran on a session that could not see \
-         it; got {got:?}"
+         so it must survive the candidate pull and the full-row fetch. Its absence means \
+         one of those two ran on a session that could not see it; got {got:?}"
+    );
+
+    let hit = out
+        .results
+        .iter()
+        .find(|h| h.claim_id == mine)
+        .expect("the claim asserted present above");
+    let neighbors = hit.graph_neighbors.as_ref().expect(
+        "the selected claim has a visible neighbour across an edge, so the neighbour \
+             read must return it. A null here is that site alone reverted: the handler \
+             swallows its error with `unwrap_or_default()`, so it fails as a MISSING \
+             FIELD rather than as a 500",
+    );
+    assert!(
+        neighbors.iter().any(|n| n.claim_id == neighbor),
+        "the neighbour join must return the FAR side of the edge — the id the caller \
+         never named and no upstream read filtered; got {:?}",
+        neighbors.iter().map(|n| n.claim_id).collect::<Vec<_>>()
     );
 }
 
