@@ -115,19 +115,59 @@
 //!   connection, so stamping buys nothing *for those controls*. See
 //!   `hidden_claim_ids`' and `EventRepository::list`'s own doc comments for the
 //!   mechanism.
-//! * **The repo layer does not yet serve this at scale.** Measured under
-//!   `crates/epigraph-db/src/repos/`: 206 `pub async fn` take both a
-//!   `pool: &PgPool` and a `Viewer`, and only 14 `*_conn` siblings exist at
-//!   all — of which exactly 5 take a `Viewer`
+//! * **The repo layer did not serve this at scale. PR-27 fixed the REPO-LAYER
+//!   HALF, for the 188 single-statement viewer-taking reads, and nothing else.**
+//!   Measured under `crates/epigraph-db/src/repos/` before PR-27: 206
+//!   `pub async fn` took both a `pool: &PgPool` and a `Viewer`, and only 14
+//!   `*_conn` siblings existed at all — of which exactly 5 took a `Viewer`
 //!   (`ClaimRepository::{get_by_id_conn, list_conn, count_conn}` and, from
 //!   PR-26, `LineageRepository::{get_lineage_conn, get_descendants_conn}`).
-//!   The pilot worked only because one of those happened to exist. Before a
-//!   shard starts on a 40-site handler, the repo layer needs a `_conn` (or
-//!   `impl PgExecutor`) pass; calling `read_as` once per statement instead
-//!   would, in `Session` mode, produce N separately-stamped checkouts with no
+//!   The pilot worked only because one of those happened to exist. PR-27
+//!   re-measured that set and found 188 of the 206 run exactly one statement on
+//!   the pool parameter and reference it exactly once, so they need no sibling
+//!   at all: their parameter is now `<'e, E: sqlx::PgExecutor<'e>>`, and one
+//!   body serves a pool and a connection alike. A shard that reaches one of
+//!   those 188 no longer has to author a duplicate form for it.
+//!
+//!   **Read that scope literally, because most of the register is NOT reached by
+//!   it.** `prs.next` measures the site distribution as a long tail: 74 of the
+//!   registered sites are `let pool = &state.db_pool` aliases and roughly 70 are
+//!   raw inline `sqlx` written directly in the handler. Neither class routes
+//!   through a repo function at all, so a widened repo-layer bound does nothing
+//!   for either, and both remain each shard's own work. PR-27 converts ZERO
+//!   sites and moves neither constant below.
+//!
+//!   Of the remaining 18, 12 are hard exclusions and 6 are deferred wrappers.
+//!   The exclusion mechanisms, each derived by counting executions of and
+//!   references to the parameter rather than by reading the body narratively:
+//!   a body that runs several statements on it (6 — a by-value `E: PgExecutor`
+//!   is MOVED by its first use, which is why the compiler, not a reviewer,
+//!   enforces this criterion); a body that runs one statement AND then passes
+//!   the parameter on to another repo call (2, `claim.rs::graph_expand_seeds_since`
+//!   and `workflow.rs::resolve_steps_to_heads`); a wrapper that calls
+//!   `Pool::acquire`, which is a `Pool` API a `PgExecutor` does not have (2,
+//!   `LineageRepository::{get_lineage, get_descendants}`); and a wrapper whose
+//!   callee is ITSELF excluded (2, `claim.rs::graph_expand_seeds` and
+//!   `workflow.rs::resolve_step_claim`). The other 6 forward, directly or
+//!   through one further wrapper, to a callee that DID convert — the two-hop
+//!   case is `ClaimThemeRepository::claims_in_themes`, whose callee
+//!   `claims_in_themes_at_dim` is itself an unconverted wrapper over the
+//!   converted `claims_in_themes_at_dim_since` — so they are convertible
+//!   whenever a shard wants them and are deferred only to keep this pass to one
+//!   rule.
+//!
+//!   Do not read the count of unconverted functions as a count of blockers: the
+//!   paragraph this replaced did exactly that. Calling
+//!   `read_as` once per statement remains the wrong answer either way: in
+//!   `Session` mode it would produce N separately-stamped checkouts with no
 //!   transaction tying them, against a pool whose `ScopedPoolOptions::default()`
-//!   is 10 connections. `visibility_lint.rs::every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt`
-//!   is what stops a shard from writing the `_conn` sibling *without* a viewer.
+//!   is 10 connections. Two lints police the two connection-taking shapes:
+//!   `visibility_lint.rs::every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt`
+//!   stops a shard writing a `_conn` sibling *without* a viewer, and — since
+//!   PR-27, because that rule keys on the NAME and so cannot see a generic
+//!   function —
+//!   `visibility_lint.rs::every_executor_taking_repo_fn_takes_a_viewer_or_is_exempt`
+//!   applies the same rule to the `PgExecutor` shape this paragraph recommends.
 //!
 //!   **PR-26 established the shape, and it is NOT a copy-pasted twin.** The
 //!   connection-taking form is the PRIMITIVE and the pool-taking form is a thin
@@ -143,6 +183,29 @@
 //!   delegating wrapper, because the callee is subject to the same lint.
 //!   **Cost metric for sizing later shards: 2 new connection-taking repo forms
 //!   for 7 converted sites.**
+//!
+//!   **PR-27 adds a third shape for the single-statement majority, and this
+//!   paragraph should be read with that scope attached — it does NOT supersede
+//!   PR-26's, and PR-26 did not pay for an overstatement.** Measured on the
+//!   shipped tree: `get_lineage_conn` and `get_descendants_conn` run FIVE
+//!   statements each on one connection, so they are outside the class PR-27
+//!   serves and would have been authored identically had PR-27 landed first.
+//!   Nor are they duplicated bodies — `get_lineage` is 16 lines and
+//!   `get_descendants` 13, each acquiring and delegating, so what exists is one
+//!   primitive plus a thin wrapper and no ~180-line SQL body appears twice
+//!   anywhere in the tree. Acquire-and-delegate remains correct wherever several
+//!   statements must share one connection, which is exactly what
+//!   `LineageRepository`'s walk does and why its two wrappers were left
+//!   untouched.
+//!
+//!   Where a body runs exactly ONE statement there is a third and better shape:
+//!   no wrapper, no primitive, one generic body. That form cannot drift from
+//!   itself either, and it costs zero new entry points. The duplicate-body
+//!   hazard this series keeps naming is demonstrated here by the case PR-27
+//!   actually deleted — `ClaimRepository::count_conn`, a genuinely copy-pasted
+//!   body that had already drifted from `count` in whitespace, now rewritten to
+//!   delegate, so the pool-taking and connection-taking counts share a single
+//!   SQL text rather than two copies.
 //! * **Handler-side sizing, re-derived from the router** (the recon's 113/113
 //!   was flagged by its own author as a regex artifact and is not what the code
 //!   says). Enumerating handler idents from every `.route(…)` registration

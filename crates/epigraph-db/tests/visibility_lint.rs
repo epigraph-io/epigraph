@@ -250,6 +250,12 @@ struct ViewerFn {
     file: String,
     line: usize,
     name: String,
+    /// The generic parameter list between the name and `(`, empty when there is
+    /// none. Captured separately from [`Self::params`] because a bound written
+    /// `fn f<'e, E: sqlx::PgExecutor<'e>>(executor: E, …)` puts the executor
+    /// TYPE here and only the binding `executor: E` in the parameter list, so a
+    /// check keyed on `params` alone cannot see it.
+    generics: String,
     params: String,
     body: String,
 }
@@ -291,10 +297,12 @@ fn repo_fns() -> Vec<ViewerFn> {
             // Skip an optional generic list, then require the parameter list.
             let mut cursor = at + 3 + name_end;
             let rest = src[cursor..].trim_start();
+            let mut generics = String::new();
             if rest.starts_with('<') {
                 let lt = src[cursor..].find('<').expect("just matched") + cursor;
-                let generics = balanced(&src, lt, b'<', b'>');
-                cursor = lt + generics.len();
+                let g = balanced(&src, lt, b'<', b'>');
+                cursor = lt + g.len();
+                generics = g.to_string();
             }
             let Some(paren_rel) = src[cursor..].find('(') else {
                 continue;
@@ -316,6 +324,7 @@ fn repo_fns() -> Vec<ViewerFn> {
                 file: file.clone(),
                 line: src[..at].matches('\n').count() + 1,
                 name,
+                generics,
                 params: params.to_string(),
                 body,
             });
@@ -557,6 +566,101 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
     );
 
     for (file, name, reason) in CONN_WITHOUT_VIEWER {
+        assert!(
+            reason.len() > 80,
+            "the reason for {file}::{name} is {} chars. State the table and why it has no \
+             tenancy to filter on, not a label.",
+            reason.len()
+        );
+    }
+}
+
+/// Repo functions generic over [`sqlx::PgExecutor`] that take NO `Viewer`, each
+/// with the reason. Asserted as an exact set, in both directions, by
+/// [`every_executor_taking_repo_fn_takes_a_viewer_or_is_exempt`].
+///
+/// EMPTY, and that is the measured state rather than an aspiration: all 188
+/// functions PR-27 widened already took a `&Viewer` before it widened them, and
+/// it added no new function. Keyed on `(file, fn)` the same way
+/// [`EXPECTED_EXEMPTIONS`] and [`CONN_WITHOUT_VIEWER`] are, so the first entry is
+/// a visible diff naming the function.
+const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[];
+
+/// A generic-executor repo fn must spend a viewer, or say in writing why it has
+/// none — the same rule [`every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt`]
+/// applies to `*_conn` siblings, for the shape PR-27 introduced.
+///
+/// # Why a second test rather than widening the first
+///
+/// The `_conn` rule keys on the NAME (`ends_with("_conn")`) and then on
+/// `params.contains("PgConnection")`. A function written
+/// `pub async fn f<'e, E: sqlx::PgExecutor<'e>>(executor: E, …)` matches
+/// NEITHER: it has no `_conn` suffix, and its executor type lives in the generic
+/// list rather than the parameter list. Widening the first test cannot reach it,
+/// because the name filter drops it before the parameter filter ever runs.
+///
+/// That matters because the generic form accepts a `&mut PgConnection`, so it is
+/// a connection-taking repo function by capability even though it is not one by
+/// spelling — and PR-27 made it the recommended shape for the single-statement
+/// majority. Without this test the hazard the `_conn` rule's own assert message
+/// names would simply have a second, unguarded spelling: a read written in the
+/// generic form without a `Viewer` would be invisible to
+/// [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`] (which filters
+/// on `params.contains("Viewer")`) while `no_unscoped_pool.rs` counted its call
+/// site as converted, because the `.db_pool` access is gone.
+///
+/// # Non-vacuity
+///
+/// The floor is a floor, not the measurement: 188 such functions exist as of
+/// PR-27, and a later shard widening more must not have to edit this number. A
+/// scanner that stopped matching declarations would fall under it and fail here
+/// rather than passing over an empty set.
+#[test]
+fn every_executor_taking_repo_fn_takes_a_viewer_or_is_exempt() {
+    let mut without: Vec<(String, String)> = Vec::new();
+    let mut with_viewer = 0usize;
+
+    for f in repo_fns() {
+        // Both spellings of the bound: the explicit generic PR-27 used, and
+        // `impl PgExecutor<'_>` in argument position, which is equivalent for a
+        // single use and would otherwise slip past a generics-only check.
+        if !(f.generics.contains("PgExecutor") || f.params.contains("PgExecutor")) {
+            continue;
+        }
+        if f.params.contains("Viewer") {
+            with_viewer += 1;
+        } else {
+            without.push((f.file, f.name));
+        }
+    }
+    without.sort();
+    without.dedup();
+
+    assert!(
+        with_viewer + without.len() >= 150,
+        "found only {} generic-executor repo fns — 188 existed when this lint was written, so \
+         the scanner is not matching declarations and this lint would pass vacuously",
+        with_viewer + without.len()
+    );
+
+    let mut want: Vec<(String, String)> = EXECUTOR_WITHOUT_VIEWER
+        .iter()
+        .map(|(f, n, _)| ((*f).to_string(), (*n).to_string()))
+        .collect();
+    want.sort();
+
+    assert_eq!(
+        without, want,
+        "\n\nThe set of viewer-less generic-executor repo fns changed. A `PgExecutor` parameter \
+         accepts a connection, so this is a connection-taking repo function whatever it is \
+         called, and one written WITHOUT a Viewer is invisible to \
+         `every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer` AND counts as converted in \
+         `no_unscoped_pool.rs`. If the new function is a read, give it a `&Viewer` and splice the \
+         marker. If it genuinely has nothing to filter, add it to EXECUTOR_WITHOUT_VIEWER with a \
+         reason naming the table and why.\n"
+    );
+
+    for (file, name, reason) in EXECUTOR_WITHOUT_VIEWER {
         assert!(
             reason.len() > 80,
             "the reason for {file}::{name} is {} chars. State the table and why it has no \
