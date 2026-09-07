@@ -160,6 +160,28 @@ pub mod workflows;
 /// An ERROR path may drop the read without finishing it. That is the documented
 /// safe case on a read, and every early `?` return in a converted handler relies
 /// on it. Only success paths call this.
+///
+/// # A RULE FOR CONVERTED HANDLERS THAT NOTHING IN THE GATE ENFORCES
+///
+/// Recorded here because this is the one file every remaining conversion shard
+/// reads, and because the property is NEW: before the conversion each read took
+/// its own pooled connection, so an error was contained to that statement.
+///
+/// Under `SessionGucMode::Transaction` the shared [`epigraph_db::ScopedRead`] is
+/// one transaction, and a statement error ABORTS it — every subsequent statement
+/// on that handle then fails, and the abort is silent if the error was swallowed
+/// with `.ok()` or `.unwrap_or_default()`. So a converted handler may swallow an
+/// error only on its LAST statement; anything that reads afterwards must
+/// propagate. A handler that gets this wrong does not fail loudly: it can return
+/// 200 with an empty result set that is indistinguishable from a legitimate
+/// tenancy suppression.
+///
+/// PR-29 has two swallowed-error sites and both are compliant BY POSITION, which
+/// is exactly why the rule is written down rather than left to the next author's
+/// luck: `search.rs::semantic_search`'s `semantic_graph_neighbors(..)
+/// .unwrap_or_default()` has no read after it (its results are already built
+/// from the full-row fetch), and `methods.rs::get_method`'s
+/// `get_evidence_strength(..).ok()` is that handler's final statement.
 #[cfg(feature = "db")]
 pub(crate) async fn finish_scoped_read(
     read: epigraph_db::ScopedRead<'_>,
