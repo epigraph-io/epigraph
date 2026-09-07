@@ -263,6 +263,75 @@ pub async fn seed_group_claim(pool: &PgPool, agent: Uuid, group: Uuid, content: 
     seed_claim(pool, agent, content, "group", group).await
 }
 
+/// A `reasoning_traces` row for `claim`, wired up as that claim's `trace_id`.
+///
+/// Both halves are needed. `ClaimRepository::claim_ids_by_methodology` joins
+/// `claims c INNER JOIN reasoning_traces rt ON c.trace_id = rt.id`, so a trace
+/// that merely names the claim in its own `claim_id` column (which is NOT NULL
+/// and so cannot be omitted) matches nothing; the pointer has to go the other
+/// way too.
+///
+/// `reasoning_type` must be one of the five values
+/// `reasoning_type_valid` admits: deductive, inductive, abductive, analogical,
+/// statistical.
+///
+/// # No tenancy columns are declared, deliberately
+///
+/// `reasoning_traces` is in migration 070's `inheritors` array, and arm (c) of
+/// `epigraph_inherit_tenancy_stmt` is **unconditional** — it has no no-widening
+/// gate, so it overwrites whatever a caller declares with the parent claim's
+/// `(visibility, owner_group_id)`. Declaring them here would be a lie a reader
+/// might then reason from: a derived row's tenancy TRACKS its claim's and
+/// cannot be set apart from it.
+pub async fn seed_reasoning_trace(pool: &PgPool, claim: Uuid, reasoning_type: &str) -> Uuid {
+    let trace: Uuid = sqlx::query_scalar(
+        "INSERT INTO reasoning_traces (claim_id, reasoning_type, confidence, explanation) \
+         VALUES ($1, $2, 0.9, 'seeded by viewer_fixture') RETURNING id",
+    )
+    .bind(claim)
+    .bind(reasoning_type)
+    .fetch_one(pool)
+    .await
+    .expect("seed reasoning trace");
+
+    sqlx::query("UPDATE claims SET trace_id = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(trace)
+        .execute(pool)
+        .await
+        .expect("point the claim at its trace");
+
+    trace
+}
+
+/// An `evidence` row of `evidence_type` attached to `claim`.
+///
+/// `evidence_type` must be one of the seven `evidence_type_valid` admits:
+/// document, observation, testimony, computation, reference, figure,
+/// conversational.
+///
+/// No tenancy columns here either, and for the same reason as
+/// [`seed_reasoning_trace`] — `evidence` is in the same 070 `inheritors` array,
+/// and 070's own comment records that omitting it once stamped the evidence of a
+/// group-private claim as world/public.
+pub async fn seed_evidence(pool: &PgPool, claim: Uuid, evidence_type: &str) -> Uuid {
+    let hash: Vec<u8> = {
+        let mut h = blake3_like(&format!("{claim}:{evidence_type}"));
+        h.truncate(32);
+        h
+    };
+    sqlx::query_scalar(
+        "INSERT INTO evidence (claim_id, evidence_type, content_hash) \
+         VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(claim)
+    .bind(evidence_type)
+    .bind(&hash)
+    .fetch_one(pool)
+    .await
+    .expect("seed evidence")
+}
+
 /// The seeded world group (migration 060/062).
 ///
 /// It **was** the `owner_group_id` DEFAULT every pre-existing row carried;

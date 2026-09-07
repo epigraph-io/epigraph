@@ -15,7 +15,7 @@
 //! # Why it is SEEDED rather than asserted at zero
 //!
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
-//! lint would fail on day one"*. It would — there are 407 unconverted sites as
+//! lint would fail on day one"*. It would — there are 402 unconverted sites as
 //! of this commit, and a lint that fails on day one is a lint someone deletes
 //! in week two.
 //!
@@ -54,7 +54,7 @@
 //!   against, and the write-side predicate is 16b's, not this PR's. Measured on
 //!   this tree with a same-line name needle (create / insert / update / delete
 //!   / upsert / supersede / revoke / mark_ / record_ / append): **30** of the
-//!   407 sites below are visibly write-shaped, led by
+//!   402 sites below are visibly write-shaped, led by
 //!   `routes/experiment_loop.rs` (5), `routes/tasks.rs` (4) and
 //!   `routes/crud.rs`, `routes/claims.rs`, `routes/workflows.rs`,
 //!   `routes/webhooks.rs` (3 each). That is a LOWER bound — the needle only
@@ -100,11 +100,11 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 407 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 402 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
-//!      second; PR-26 converted the first shard's seven sites. None discharged
-//!      the gate — 407 is not 0 — and neither PR-25 nor PR-26 may be read as
-//!      unblocking step 11d.
+//!      second; PR-26 converted the first shard's seven sites and PR-28 the
+//!      second shard's five. None discharged the gate — 402 is not 0 — and
+//!      neither PR-25 nor PR-26 nor PR-28 may be read as unblocking step 11d.
 //!
 //!   And independently of both, the conversion is unargued: each file takes a
 //!   raw `&PgPool` as a *parameter* (from `state.db_pool` and from the
@@ -449,13 +449,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 407;
+const HIGH_WATER: usize = 402;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
-const HIGH_WATER_FILES: usize = 50;
+const HIGH_WATER_FILES: usize = 49;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 407 sites across 50 files as of this commit. Lower an entry when a shard
+/// 402 sites across 49 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -467,7 +467,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/belief.rs", 17),
     ("routes/challenge.rs", 3),
     ("routes/claims.rs", 25),
-    ("routes/claims_query.rs", 5),
+    // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
+    // shard 2, moved all five onto `AppState::read_as`. Same rule as
+    // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
+    // so a `0` row could never be satisfied.
     ("routes/clusters.rs", 1),
     ("routes/community.rs", 5),
     ("routes/computation.rs", 15),
