@@ -64,9 +64,16 @@ pub const MAX_CANDIDATE_POOL: u32 = 1000;
 /// most similar to `query_pgvec`.
 ///
 /// Thin async wrapper over [`ClaimThemeRepository::find_similar_themes_at_dim`]
-/// that flattens [`epigraph_db::DbError`] into [`sqlx::Error`] so existing
-/// callers (REST `search.rs`, MCP `recall.rs`) keep their pre-refactor
-/// error-mapping codepath.
+/// that flattens [`epigraph_db::DbError`] into [`sqlx::Error`] so its callers
+/// keep their pre-refactor error-mapping codepath.
+///
+/// REST `search.rs` is NO LONGER one of them. PR-29 moved
+/// `/api/v1/search/semantic` onto a viewer-stamped connection, and this wrapper
+/// takes a `&PgPool`; widening it here rather than calling the repo directly
+/// would have authored a connection-taking form that neither connection-shape
+/// lint in `epigraph-db/tests/visibility_lint.rs` can see, because their
+/// `repos_dir()` is a non-recursive `read_dir` over `epigraph-db/src/repos`.
+/// The remaining callers are [`run_diverse_pipeline`] and MCP `recall.rs`.
 pub async fn find_similar_themes_at_dim(
     pool: &PgPool,
     query_pgvec: &str,
@@ -108,9 +115,15 @@ pub async fn candidates_in_themes_at_dim(
 /// [`candidates_in_themes_at_dim`] plus an optional `created_at >= since`
 /// candidate window.
 ///
-/// Added as a sibling rather than a seventh parameter on the existing
-/// function so the REST `/api/v1/search/semantic?diverse=true` route keeps
-/// the exact call it has today.
+/// Added as a sibling rather than a seventh parameter on the existing function
+/// so that the callers of [`candidates_in_themes_at_dim`] kept the exact call
+/// they had at the time.
+///
+/// The REST `/api/v1/search/semantic?diverse=true` route was the caller that
+/// rationale was written for, and it is no longer one: PR-29 has it call
+/// `ClaimThemeRepository::claims_in_themes_at_dim_since` directly on a
+/// viewer-stamped connection. See [`find_similar_themes_at_dim`] for why the
+/// route bypasses these wrappers rather than widening them.
 #[allow(clippy::too_many_arguments)]
 pub async fn candidates_in_themes_at_dim_since(
     pool: &PgPool,
